@@ -1,0 +1,52 @@
+{
+  "schema": "music_feature_cache_manifest",
+  "status": "dimension_semantics_pending_documentation",
+  "default_pipeline_reads_raw_wav": true,
+  "items": [
+    {
+      "track_id": "dunhuangwu2",
+      "file": "dunhuangwu2.npy",
+      "shape": [
+        3601,
+        803
+      ],
+      "dtype": "float32",
+      "num_frames": 3601,
+      "feature_dim": 803,
+      "role": "optional_precomputed_music_feature_cache",
+      "enters_training": false,
+      "ground_truth_motion": false,
+      "sha256": "bae2dca8388f30f287152562ea00f9473cc79e864600ffd36380570dbb680389"
+    },
+    {
+      "track_id": "dunhuangwu3",
+      "file": "dunhuangwu3.npy",
+      "shape": [
+        3598,
+        803
+      ],
+      "dtype": "float32",
+      "num_frames": 3598,
+      "feature_dim": 803,
+      "role": "optional_precomputed_music_feature_cache",
+      "enters_training": false,
+      "ground_truth_motion": false,
+      "sha256": "55b5a7c2ed2b8923960afed5f16ef79fd529845a210993f3738e38fb71de4859"
+    },
+    {
+      "track_id": "dunhuangwu4",
+      "file": "dunhuangwu4.npy",
+      "shape": [
+        3601,
+        803
+      ],
+      "dtype": "float32",
+      "num_frames": 3601,
+      "feature_dim": 803,
+      "role": "optional_precomputed_music_feature_cache",
+      "enters_training": false,
+      "ground_truth_motion": false,
+      "sha256": "9eeae040c0e52f9c8ba1171c5d5d5bca9b0aa9b38d0f3a1873d95f17066e5f5d"
+    }
+  ]
+}

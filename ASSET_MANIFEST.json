@@ -1,0 +1,80 @@
+{
+  "mode": "copy",
+  "source_project": "/home/disk/lsm/storage/EDGE",
+  "items": {
+    "music_router": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/output/v21_music_router_985songs_20260605_154801/seed_20260607/checkpoints/best.pt",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt",
+      "mode": "copy",
+      "required": true
+    },
+    "whole_song_planner": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/output/v26_music_dominant_whole_song_planner_985/checkpoints/best.pt",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt",
+      "mode": "copy",
+      "required": true
+    },
+    "duration_model": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/checkpoints/v23_release/v23_v2_5/v23_v2_5_seed20260610_best.pt",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt",
+      "mode": "copy",
+      "required": true
+    },
+    "event_index": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/data/dunhuang_dynamic_event_rag_physical/v21_shared_event_index.json",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json",
+      "mode": "copy",
+      "required": true
+    },
+    "duration_index": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/data/v26_music_dominant_duration_index.npz",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz",
+      "mode": "copy",
+      "required": true
+    },
+    "hierarchy_index": {
+      "exists": false,
+      "source": "/home/disk/lsm/storage/EDGE/data/v26_hierarchy_index.npz",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/hierarchy_index.npz",
+      "mode": "copy",
+      "required": false
+    },
+    "start_pose": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/data/canonical_dunhuang_start_pose.npy",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy",
+      "mode": "copy",
+      "required": false
+    },
+    "test_audio": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/test_music_bank/dunhuangwu2.wav",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/demo.wav",
+      "mode": "copy",
+      "required": true
+    },
+    "bvh_dataset": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/change",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh",
+      "mode": "copy"
+    },
+    "training_music": {
+      "exists": true,
+      "source": "/home/disk/lsm/storage/EDGE/data/v21_router_music_999/splits/train",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/train",
+      "mode": "copy"
+    },
+    "classical_eval": {
+      "exists": false,
+      "source": "",
+      "target": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/classical_eval",
+      "mode": "placeholder"
+    }
+  }
+}

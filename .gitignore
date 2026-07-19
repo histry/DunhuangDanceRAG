@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+logs/
+outputs/
+*.pt
+*.npy
+*.npz
+*.wav
+*.mp3
+
+# Python runtime cache
+*.py[cod]
+# Experiment products
+logs/*
+!logs/.gitkeep
+outputs/*
+!outputs/.gitkeep
+# Local backups
+maintenance_backups/

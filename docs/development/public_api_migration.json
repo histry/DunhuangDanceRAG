@@ -1,0 +1,58 @@
+{
+  "project": "/home/disk/lsm/storage/DunhuangDanceRAG",
+  "backup": "/home/disk/lsm/storage/DunhuangDanceRAG/maintenance_backups/public_api_performer_20260719_194006",
+  "renamed": [
+    [
+      "model/v21_music_router.py",
+      "model/music_motion_router.py"
+    ],
+    [
+      "model/v21_style_ranker.py",
+      "model/style_ranker.py"
+    ],
+    [
+      "model/v21_transition.py",
+      "model/transition_model.py"
+    ],
+    [
+      "model/v22_turn_pace.py",
+      "model/turn_pace_model.py"
+    ],
+    [
+      "model/v23_monotonic_duration.py",
+      "model/duration_predictor.py"
+    ],
+    [
+      "model/v26_whole_song_planner.py",
+      "model/whole_song_planner.py"
+    ]
+  ],
+  "weights_moved": [
+    [
+      "model/emotion_conditioned_refiner.pt",
+      "assets/weights/motion/emotion_refiner.pt"
+    ],
+    [
+      "model/phrase_refiner.pt",
+      "assets/weights/motion/phrase_refiner.pt"
+    ]
+  ],
+  "backups_deleted": [
+    "model/emotion_conditioned_refiner.py.bak_20260603_124515",
+    "model/diffusion.py.bak_x0_recon_final"
+  ],
+  "references_rewritten": [
+    "PATH_MIGRATION.json",
+    "scheduling/build_duration_index.py",
+    "scheduling/schedule_multi_music.py",
+    "scheduling/schedule_whole_song.py"
+  ],
+  "installed": [
+    "data_pipeline/split_sources.py",
+    "routing/performer_policy.py",
+    "scripts/generate_test_set.sh",
+    "scripts/generate_only.sh",
+    "configs/performer_policy.env",
+    "tests/test_performer_policy.py"
+  ]
+}

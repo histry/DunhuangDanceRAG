@@ -1,0 +1,131 @@
+{
+  "schema": "dunhuang_motion_source_manifest",
+  "num_sources": 12,
+  "performer_group_histogram": {
+    "female": 4,
+    "male": 8,
+    "unknown": 0
+  },
+  "sources": [
+    {
+      "source_id": "female_36pose_1",
+      "file": "female_36pose_1.bvh",
+      "performer_group": "female",
+      "dance_category": "36pose",
+      "take_id": 1,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "female_36pose_2",
+      "file": "female_36pose_2.bvh",
+      "performer_group": "female",
+      "dance_category": "36pose",
+      "take_id": 2,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "female_lotus",
+      "file": "female_lotus.bvh",
+      "performer_group": "female",
+      "dance_category": "lotus",
+      "take_id": null,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "female_mediation",
+      "file": "female_mediation.bvh",
+      "performer_group": "female",
+      "dance_category": "mediation",
+      "take_id": null,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_36pose_1",
+      "file": "male_36pose_1.bvh",
+      "performer_group": "male",
+      "dance_category": "36pose",
+      "take_id": 1,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_36pose_2",
+      "file": "male_36pose_2.bvh",
+      "performer_group": "male",
+      "dance_category": "36pose",
+      "take_id": 2,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_drum_1",
+      "file": "male_drum_1.bvh",
+      "performer_group": "male",
+      "dance_category": "drum",
+      "take_id": 1,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_drum_2",
+      "file": "male_drum_2.bvh",
+      "performer_group": "male",
+      "dance_category": "drum",
+      "take_id": 2,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_mediation",
+      "file": "male_mediation.bvh",
+      "performer_group": "male",
+      "dance_category": "mediation",
+      "take_id": null,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_pipa_1",
+      "file": "male_pipa_1.bvh",
+      "performer_group": "male",
+      "dance_category": "pipa",
+      "take_id": 1,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_pipa_2",
+      "file": "male_pipa_2.bvh",
+      "performer_group": "male",
+      "dance_category": "pipa",
+      "take_id": 2,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    },
+    {
+      "source_id": "male_ribbon",
+      "file": "male_ribbon.bvh",
+      "performer_group": "male",
+      "dance_category": "ribbon",
+      "take_id": null,
+      "skeleton_id": "change_bvh_native",
+      "role": "motion_source",
+      "enters_source_disjoint_split": true
+    }
+  ]
+}

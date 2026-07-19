@@ -1,0 +1,31 @@
+{
+  "schema": "whole_song_test_set",
+  "num_tracks": 3,
+  "canonical_format": "wav",
+  "tracks": [
+    {
+      "track_id": "dunhuangwu2",
+      "canonical_audio": "audio/dunhuangwu2.wav",
+      "original_audio": "original/dunhuangwu2.mp3",
+      "auxiliary": "features/dunhuangwu2.npy",
+      "role": "whole_song_test",
+      "enters_training": false
+    },
+    {
+      "track_id": "dunhuangwu3",
+      "canonical_audio": "audio/dunhuangwu3.wav",
+      "original_audio": "original/dunhuangwu3.mp3",
+      "auxiliary": "features/dunhuangwu3.npy",
+      "role": "whole_song_test",
+      "enters_training": false
+    },
+    {
+      "track_id": "dunhuangwu4",
+      "canonical_audio": "audio/dunhuangwu4.wav",
+      "original_audio": "original/dunhuangwu4.mp3",
+      "auxiliary": "features/dunhuangwu4.npy",
+      "role": "whole_song_test",
+      "enters_training": false
+    }
+  ]
+}
