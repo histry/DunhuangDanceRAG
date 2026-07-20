@@ -348,7 +348,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args(argv)
 
-    import tools.v46_motionrag_diff as v46  # local latest core
+    import training.motion_models as v46  # local latest core
 
     cfg = v46.V46Config.from_json(args.config).apply_env()
     out_dir = Path(args.out_db)

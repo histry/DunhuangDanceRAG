@@ -25,6 +25,7 @@ source configs/scheduler.env
 [[ -f configs/geometry.env ]] && source configs/geometry.env
 # shellcheck disable=SC1091
 source configs/research.env
+[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
 
 [[ -f "$ROOT_DIR/configs/performer_policy.env" ]] && source "$ROOT_DIR/configs/performer_policy.env"
 

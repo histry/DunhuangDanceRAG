@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import routing.boundary_closed_loop as base  # noqa: E402
+import tools.v46_46_boundary_closed_loop as base  # noqa: E402
 from contracts.heading import (  # noqa: E402
     EDGE_DIM,
     ROOT_X_IDX,

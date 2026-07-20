@@ -10,6 +10,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_ROOT"
 source configs/paths.env
 source configs/experiment.env
+[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
 
 [[ -f "$ROOT_DIR/configs/performer_policy.env" ]] && source "$ROOT_DIR/configs/performer_policy.env"
 export RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"

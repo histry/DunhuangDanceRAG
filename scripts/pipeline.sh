@@ -12,6 +12,7 @@ cd "$ROOT_DIR"
 
 source configs/scheduler.env
 source configs/anatomy.env
+[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
 
 PY="${V46_51_PYTHON}"
 [[ -x "$PY" ]] || {
@@ -88,7 +89,7 @@ echo "========== 3. SOURCE SPLIT BEFORE EVENT SLICING =========="
   --train_ratio "$V46_51_TRAIN_RATIO" \
   --val_ratio "$V46_51_VAL_RATIO" \
   --test_ratio "$V46_51_TEST_RATIO" \
-  --mode symlink \
+  --mode copy \
   --overwrite
 
 echo "========== 4. BUILD SPLIT-SPECIFIC HEADING EVENT DATABASES =========="

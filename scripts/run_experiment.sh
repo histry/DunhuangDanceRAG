@@ -8,6 +8,7 @@ set -Eeuo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
 
 ROOT_DIR="${ROOT_DIR:-/home/disk/lsm/storage/EDGE}"
 cd "$ROOT_DIR"
