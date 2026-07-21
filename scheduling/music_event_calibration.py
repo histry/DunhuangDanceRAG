@@ -73,7 +73,15 @@ def classify_phrase_event(w: np.ndarray) -> Tuple[str, Dict[str, float]]:
     return "neutral_flow", s
 
 
-def build_phrase_query(w: np.ndarray, start: int, end: int) -> Tuple[np.ndarray, str]:
+def build_phrase_query(
+    w: np.ndarray,
+    start: int,
+    end: int,
+    fps: float = 30.0,
+) -> Tuple[np.ndarray, str]:
+    rate = float(fps)
+    if not np.isfinite(rate) or rate <= 0.0:
+        raise ValueError("fps must be finite and positive")
     event, s = classify_phrase_event(w)
     upper, torso, lower = EVENT_DESIRED[event]
     positive_trend = max(s["arousal_trend"], s["tension_trend"], 0.0)
@@ -91,7 +99,9 @@ def build_phrase_query(w: np.ndarray, start: int, end: int) -> Tuple[np.ndarray,
             np.clip(negative_trend * 6.0, 0.0, 1.0),
             np.clip(s["accent_mean"], 0.0, 1.0),
             np.clip(s["novelty"], 0.0, 1.0),
-            np.clip((end - start) / 60.0, 0.0, 1.0),
+            # Historical /60 at 30 FPS represented a two-second scale.  Keep
+            # that semantic while making it invariant to the sampled rate.
+            np.clip(((end - start) / rate) / 2.0, 0.0, 1.0),
         ],
         dtype=np.float32,
     )

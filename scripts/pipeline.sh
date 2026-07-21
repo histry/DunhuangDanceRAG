@@ -39,13 +39,22 @@ V44_CKPT="${V44_CKPT:-$OUT_ROOT/v44_train_only_contrastive.pt}"
 V45_CKPT="${V45_CKPT:-$OUT_ROOT/v45_train_only_refiner.pt}"
 V46_CKPT="${V46_CKPT:-$OUT_ROOT/v46_train_only_diffusion.pt}"
 
+SCHEDULER_CHECKPOINT_DIR="${SCHEDULER_CHECKPOINT_DIR:-$OUT_ROOT/checkpoints}"
+SCHEDULER_TRAIN_DIR="${SCHEDULER_TRAIN_DIR:-$OUT_ROOT/scheduler_training}"
+FORMAL_ROUTER_CKPT="${FORMAL_ROUTER_CKPT:-$SCHEDULER_CHECKPOINT_DIR/music_motion_router.pt}"
+FORMAL_DURATION_CKPT="${FORMAL_DURATION_CKPT:-$SCHEDULER_CHECKPOINT_DIR/duration_predictor.pt}"
+FORMAL_PLANNER_CKPT="${FORMAL_PLANNER_CKPT:-$SCHEDULER_CHECKPOINT_DIR/whole_song_planner.pt}"
+# The historical 985-song Router contributes only its music encoder.  Its
+# motion encoder is tied to the old Event-DB and is never reused.
+MUSIC_ENCODER_PRIOR_CKPT="${V46_54_MUSIC_ENCODER_PRIOR_CKPT:-${V46_51_ROUTER_CKPT:-}}"
+
 SCHEDULE_ROOT="${SCHEDULE_ROOT:-$OUT_ROOT/fresh_schedule}"
 FRESH_MSSD="${FRESH_MSSD:-$SCHEDULE_ROOT/current_wav.final.mssd.json}"
 FINAL_NPY="${FINAL_NPY:-$OUT_ROOT/v46_51_final.npy}"
 FINAL_REPORT="${FINAL_REPORT:-$OUT_ROOT/v46_51_final.report.json}"
 FINAL_MP4="${FINAL_MP4:-$OUT_ROOT/v46_51_final.scientific_fixed.mp4}"
 
-mkdir -p "$OUT_ROOT"
+mkdir -p "$OUT_ROOT" "$SCHEDULER_CHECKPOINT_DIR" "$SCHEDULER_TRAIN_DIR"
 
 require_file() {
   local p="$1"
@@ -164,38 +173,112 @@ export V46_51_DURATION_INDEX_NPZ="$ALIGNED_INDEX_NPZ"
 # Generation DB. It may be rebuilt separately from this aligned index later.
 export V46_51_HIERARCHY_INDEX_NPZ=""
 
-echo "========== 7. TRAIN V44 ON TRAIN SOURCES + NON-TEST MUSIC =========="
 read -r -a MUSIC_DIR_ARRAY <<< "$MUSIC_DIRS"
 for d in "${MUSIC_DIR_ARRAY[@]}"; do
-  if [[ "$d" == *"test_music_bank"* ]]; then
-    echo "[FATAL] test_music_bank must not enter V44 training: $d" >&2
+  if [[ "$d" == *"test_music_bank"* || "$d" == *"classical_eval"* ]]; then
+    echo "[FATAL] evaluation music must not enter training: $d" >&2
     exit 2
   fi
 done
 
-if [[ "$V46_51_RETRAIN_V44" == "1" ]]; then
-  "$PY" training/motion_models.py \
-    --config "$CONFIG" \
-    train-contrastive \
-    --db "$TRAIN_AESD" \
-    --out "$V44_CKPT" \
-    --unpaired_audio_dirs "${MUSIC_DIR_ARRAY[@]}" \
-    --epochs "$V44_EPOCHS"
+ROUTER_DATA="$SCHEDULER_TRAIN_DIR/router_training.npz"
+DURATION_DATA="$SCHEDULER_TRAIN_DIR/duration_training.npz"
+PLANNER_DATA="$SCHEDULER_TRAIN_DIR/planner_training.npz"
+
+echo "========== 7. BUILD + TRAIN FORMAL MUSIC-MOTION ROUTER =========="
+if [[ "$V46_51_RETRAIN_ROUTER" == "1" ]]; then
+  require_file "$MUSIC_ENCODER_PRIOR_CKPT" \
+    "historical music-semantic Router prior"
+  "$PY" training/music_router.py build-dataset \
+    --index_json "$ALIGNED_INDEX_JSON" \
+    --index_npz "$ALIGNED_INDEX_NPZ" \
+    --music_dirs "${MUSIC_DIR_ARRAY[@]}" \
+    --cache_dir "$SCHEDULER_TRAIN_DIR/music_feature_cache" \
+    --out "$ROUTER_DATA" \
+    --fps "$V46_51_FPS" \
+    --phrases "$V46_54_ROUTER_PHRASES_PER_SONG" \
+    --positives_per_phrase "$V46_54_ROUTER_POSITIVES_PER_PHRASE" \
+    --negatives_per_positive "$V46_54_ROUTER_NEGATIVES_PER_POSITIVE"
+  "$PY" training/music_router.py train \
+    --data "$ROUTER_DATA" \
+    --index_json "$ALIGNED_INDEX_JSON" \
+    --index_npz "$ALIGNED_INDEX_NPZ" \
+    --music_prior_ckpt "$MUSIC_ENCODER_PRIOR_CKPT" \
+    --freeze_music_encoder "$V46_54_FREEZE_MUSIC_ENCODER" \
+    --out "$FORMAL_ROUTER_CKPT" \
+    --fps "$V46_51_FPS" \
+    --epochs "$V46_54_ROUTER_EPOCHS" \
+    --batch_size "$V46_54_ROUTER_BATCH"
 else
-  require_file "$V44_CKPT" "V44 checkpoint"
+  require_file "$FORMAL_ROUTER_CKPT" "formal Router checkpoint"
 fi
 
-echo "========== 7B. RESOLVE ROUTER/PLANNER/DURATION FOR NO-TRAINING REGRESSION =========="
-ASSET_JSON="$OUT_ROOT/scheduler_assets.json"
-ASSET_ENV="$OUT_ROOT/scheduler_assets.env"
-"$PY" scheduling/resolve_assets.py \
-  --out_json "$ASSET_JSON" \
-  --out_env "$ASSET_ENV"
-# shellcheck disable=SC1090
-source "$ASSET_ENV"
+echo "========== 7B. BUILD + TRAIN FORMAL DURATION MODEL =========="
+if [[ "$V46_51_RETRAIN_DURATION" == "1" ]]; then
+  "$PY" training/duration_model.py build-dataset \
+    --index_json "$ALIGNED_INDEX_JSON" \
+    --index_npz "$ALIGNED_INDEX_NPZ" \
+    --out "$DURATION_DATA" \
+    --fps "$V46_51_FPS" \
+    --window_len "${V46_54_DURATION_WINDOW_FRAMES:-0}" \
+    --augmentations_per_event "$V46_54_DURATION_AUGMENTATIONS"
+  "$PY" training/duration_model.py train \
+    --data "$DURATION_DATA" \
+    --index_json "$ALIGNED_INDEX_JSON" \
+    --index_npz "$ALIGNED_INDEX_NPZ" \
+    --out "$FORMAL_DURATION_CKPT" \
+    --fps "$V46_51_FPS" \
+    --epochs "$V46_54_DURATION_EPOCHS" \
+    --batch_size "$V46_54_DURATION_BATCH"
+else
+  require_file "$FORMAL_DURATION_CKPT" "formal Duration checkpoint"
+fi
+
+echo "========== 7C. BUILD + TRAIN FORMAL WHOLE-SONG PLANNER =========="
+if [[ "$V46_51_RETRAIN_PLANNER" == "1" ]]; then
+  "$PY" training/whole_song_planner.py build-dataset \
+    --index_json "$ALIGNED_INDEX_JSON" \
+    --index_npz "$ALIGNED_INDEX_NPZ" \
+    --router_ckpt "$FORMAL_ROUTER_CKPT" \
+    --duration_ckpt "$FORMAL_DURATION_CKPT" \
+    --music_dirs "${MUSIC_DIR_ARRAY[@]}" \
+    --cache_dir "$SCHEDULER_TRAIN_DIR/whole_song_feature_cache" \
+    --out "$PLANNER_DATA" \
+    --fps "$V46_51_FPS" \
+    --cooldown_slots "$V46_54_EVENT_COOLDOWN_SLOTS"
+  "$PY" training/whole_song_planner.py train \
+    --data "$PLANNER_DATA" \
+    --index_json "$ALIGNED_INDEX_JSON" \
+    --index_npz "$ALIGNED_INDEX_NPZ" \
+    --out "$FORMAL_PLANNER_CKPT" \
+    --fps "$V46_51_FPS" \
+    --epochs "$V46_54_PLANNER_EPOCHS" \
+    --batch_size "$V46_54_PLANNER_BATCH"
+else
+  require_file "$FORMAL_PLANNER_CKPT" "formal Planner checkpoint"
+fi
+
+export V46_51_ROUTER_CKPT="$FORMAL_ROUTER_CKPT"
+export V46_51_PLANNER_CKPT="$FORMAL_PLANNER_CKPT"
+export V46_51_V23_CKPT="$FORMAL_DURATION_CKPT"
+export V46_51_RESOLVED_INDEX_JSON="$ALIGNED_INDEX_JSON"
+export V46_51_RESOLVED_DURATION_INDEX_NPZ="$ALIGNED_INDEX_NPZ"
+export V46_51_RESOLVED_ROUTER_CKPT="$FORMAL_ROUTER_CKPT"
+export V46_51_RESOLVED_PLANNER_CKPT="$FORMAL_PLANNER_CKPT"
+export V46_51_RESOLVED_V23_CKPT="$FORMAL_DURATION_CKPT"
+
+echo "========== 7D. VALIDATE FORMAL SCHEDULER ASSET BUNDLE =========="
+"$PY" scheduling/build_asset_bundle.py \
+  --index_json "$ALIGNED_INDEX_JSON" \
+  --index_npz "$ALIGNED_INDEX_NPZ" \
+  --router_ckpt "$FORMAL_ROUTER_CKPT" \
+  --planner_ckpt "$FORMAL_PLANNER_CKPT" \
+  --duration_ckpt "$FORMAL_DURATION_CKPT" \
+  --fps "$V46_51_FPS" \
+  --out "$ALIGNED_SCHEDULER_DIR/scheduler_asset_bundle.json"
 
 if [[ "$V46_54_RUN_PRETRAIN_REGRESSION" == "1" ]]; then
-  echo "========== 7C. SAME-WAV NO-TRAINING ROUTE/ACTION REGRESSION =========="
+  echo "========== 7E. SAME-WAV NO-TRAINING ROUTE/ACTION REGRESSION =========="
   PRETRAIN_REGRESSION_DIR="$OUT_ROOT/pretrain_same_wav_regression_${RUN_TAG}"
   "$PY" scripts/run_no_training_regression.py \
     --audio "$AUDIO" \
@@ -213,15 +296,18 @@ if [[ "$V46_54_RUN_PRETRAIN_REGRESSION" == "1" ]]; then
     "same-WAV regression gate"
 fi
 
-echo "========== 7D. REGRESSION-PASSED: REBUILD ROUTER/PLANNER/DURATION FORMAL ASSET BUNDLE =========="
-"$PY" scheduling/build_asset_bundle.py \
-  --index_json "$V46_51_RESOLVED_INDEX_JSON" \
-  --index_npz "$V46_51_RESOLVED_DURATION_INDEX_NPZ" \
-  --router_ckpt "$V46_51_RESOLVED_ROUTER_CKPT" \
-  --planner_ckpt "$V46_51_RESOLVED_PLANNER_CKPT" \
-  --duration_ckpt "$V46_51_RESOLVED_V23_CKPT" \
-  --fps "$V46_51_FPS" \
-  --out "$ALIGNED_SCHEDULER_DIR/scheduler_asset_bundle.json"
+echo "========== 7F. TRAIN V44 ON TRAIN SOURCES + NON-TEST MUSIC =========="
+if [[ "$V46_51_RETRAIN_V44" == "1" ]]; then
+  "$PY" training/motion_models.py \
+    --config "$CONFIG" \
+    train-contrastive \
+    --db "$TRAIN_AESD" \
+    --out "$V44_CKPT" \
+    --unpaired_audio_dirs "${MUSIC_DIR_ARRAY[@]}" \
+    --epochs "$V44_EPOCHS"
+else
+  require_file "$V44_CKPT" "V44 checkpoint"
+fi
 
 echo "========== 8. TRAIN V45 ON TRAIN-SOURCE CANONICAL EVENTS =========="
 if [[ "$V46_51_RETRAIN_V45" == "1" ]]; then

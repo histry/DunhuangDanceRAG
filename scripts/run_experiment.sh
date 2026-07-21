@@ -23,6 +23,9 @@ export V44_CKPT="${V44_CKPT:-$OUT_ROOT/checkpoints/semantic_retriever.pt}"
 export V45_CKPT="${V45_CKPT:-$OUT_ROOT/checkpoints/boundary_refiner.pt}"
 export V46_CKPT="${V46_CKPT:-$OUT_ROOT/checkpoints/local_diffusion.pt}"
 export V46_53_GROUNDER_CKPT="${V46_53_GROUNDER_CKPT:-$OUT_ROOT/checkpoints/grounder.pt}"
+# Historical music-domain knowledge is transferred only into the formal
+# Router's music branch.  The Event-DB-specific motion branch is retrained.
+export V46_54_MUSIC_ENCODER_PRIOR_CKPT="${V46_54_MUSIC_ENCODER_PRIOR_CKPT:-${MUSIC_ROUTER_WEIGHT:-$ROOT_DIR/assets/weights/music/router.pt}}"
 export FINAL_NPY="${FINAL_NPY:-$OUT_ROOT/results/motion.npy}"
 export FINAL_REPORT="${FINAL_REPORT:-$OUT_ROOT/results/report.json}"
 export FINAL_MP4="${FINAL_MP4:-$OUT_ROOT/results/video.mp4}"

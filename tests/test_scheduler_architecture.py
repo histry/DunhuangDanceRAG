@@ -21,6 +21,11 @@ class SchedulerArchitectureTests(unittest.TestCase):
             "scheduling/transition_diffusion.py",
             "motion_geometry/heading.py",
             "support/scheduler_common.py",
+            "support/scheduler_checkpoint_contracts.py",
+            "training/music_corpus.py",
+            "training/music_router.py",
+            "training/duration_model.py",
+            "training/whole_song_planner.py",
         ]
         legacy = [
             "vendor/edge_scheduler",
@@ -90,6 +95,54 @@ class SchedulerArchitectureTests(unittest.TestCase):
         start = source.index(marker)
         block = source[start : start + 700]
         self.assertIn('--fps "$V46_51_FPS"', block)
+
+    def test_pipeline_trains_scheduler_models_before_regression_and_v45(self):
+        source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
+        markers = [
+            "training/music_router.py train",
+            "training/duration_model.py train",
+            "training/whole_song_planner.py train",
+            "scheduling/build_asset_bundle.py",
+            "scripts/run_no_training_regression.py",
+            "train-refiner",
+            "train-diffusion",
+        ]
+        positions = [source.index(marker) for marker in markers]
+        self.assertEqual(sorted(positions), positions)
+        self.assertNotIn("scheduling/resolve_assets.py", source)
+
+    def test_planner_duration_clamp_is_physical_time_aware(self):
+        source = (ROOT / "model" / "whole_song_planner.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("self.duration_min_frames", source)
+        self.assertIn("self.duration_max_frames", source)
+        self.assertNotIn("clamp(8.0, 600.0)", source)
+
+    def test_planner_weak_labels_include_boundary_compatibility(self):
+        source = (ROOT / "training" / "whole_song_planner.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("transition_cost_from_arrays", source)
+        self.assertIn("entry_angular_velocity_radps", source)
+        self.assertIn("exit_angular_velocity_radps", source)
+
+    def test_runtime_scheduler_validates_full_checkpoint_contract(self):
+        source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("assert_scheduler_checkpoint_contract", source)
+        self.assertIn('metadata["event_db_contract"]', source)
+
+    def test_duration_dynamics_use_intrinsic_physical_time(self):
+        source = (ROOT / "model" / "duration_predictor.py").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("def _duration_dynamics_features")
+        block = source[start : start + 4300]
+        self.assertIn("matrix_to_axis_angle(relative)", block)
+        self.assertIn("* float(self.fps)", block)
+        self.assertIn("/ float(self.fps)", block)
 
     def test_pipeline_supplies_renderer_fps_contract(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")

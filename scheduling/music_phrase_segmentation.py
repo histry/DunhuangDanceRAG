@@ -196,12 +196,12 @@ def _snap_to_rhythm(
     return int(lo + np.argmax(evidence))
 
 
-def boundary_evidence(features: np.ndarray) -> np.ndarray:
+def boundary_evidence(features: np.ndarray, fps: float = 30.0) -> np.ndarray:
     """Return frame-level evidence for phrase or sub-phrase boundaries."""
     x = np.asarray(features, dtype=np.float32)
     if x.ndim != 2 or x.shape[1] < 12:
         raise ValueError(f"Expected [T,12+] features, got {x.shape}")
-    novelty = structural_novelty(x)
+    novelty = structural_novelty(x, fps=float(fps))
     evidence = (
         0.34 * robust_01(x[:, 2])
         + 0.28 * robust_01(x[:, 1])
@@ -260,13 +260,14 @@ def _subslot_boundaries(
     slots: int,
     min_frames: int,
     snap_radius: int,
+    fps: float,
 ) -> List[int]:
     slots = max(1, int(slots))
     start = int(phrase.start)
     end = int(phrase.end)
     if slots <= 1 or end - start < slots * min_frames:
         return [start, end]
-    evidence = boundary_evidence(features)
+    evidence = boundary_evidence(features, fps=float(fps))
     boundaries = [start]
     for i in range(1, slots):
         ideal = int(round(start + i * (end - start) / float(slots)))
@@ -339,10 +340,19 @@ def split_music_phrases_for_events(
         reason = "long_phrase" if count > 1 else "single"
         if count > 1 and phrase.music_event in {"calm_flow", "release"}:
             reason = "anti_static_calm_phrase"
-        boundaries = _subslot_boundaries(x, phrase, count, min_frames=min_frames, snap_radius=snap_radius)
+        boundaries = _subslot_boundaries(
+            x,
+            phrase,
+            count,
+            min_frames=min_frames,
+            snap_radius=snap_radius,
+            fps=float(fps),
+        )
         actual_count = len(boundaries) - 1
         for sub_index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
-            query, event = calibrated_phrase_query(x[start:end], int(start), int(end))
+            query, event = calibrated_phrase_query(
+                x[start:end], int(start), int(end), fps=float(fps)
+            )
             planner = phrase_planner_feature(x, int(start), int(end), np.asarray(query, dtype=np.float32))
             rhythm = phrase_rhythm_profile(x, int(start), int(end), fps)
             slot_index = len(slots_out)
@@ -536,7 +546,9 @@ def segment_music_phrases(
 
     phrases: List[MusicPhrase] = []
     for index, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
-        query, event = calibrated_phrase_query(x[start:end], start, end)
+        query, event = calibrated_phrase_query(
+            x[start:end], start, end, fps=float(fps)
+        )
         confidence = float(score[start]) if 0 < start < len(score) else 0.0
         planner = phrase_planner_feature(x, start, end, query)
         rhythm = phrase_rhythm_profile(x, start, end, fps)

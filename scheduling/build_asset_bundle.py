@@ -10,7 +10,14 @@ from typing import Sequence
 
 import torch
 
+from motion_geometry.rotations import (
+    ROT6D_LAYOUT_PYTORCH3D_ROW,
+    normalize_rot6d_layout,
+)
 from scheduling.index_io import load_shared_index
+from support.scheduler_checkpoint_contracts import (
+    assert_scheduler_checkpoint_contract,
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -21,7 +28,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def checkpoint_summary(path: Path, role: str, expected_fps: float) -> dict:
+def checkpoint_summary(
+    path: Path,
+    role: str,
+    expected_fps: float,
+    event_db_contract: dict,
+    index_json: Path,
+    index_npz: Path,
+) -> dict:
     raw = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(raw, dict):
         raise RuntimeError(f"Checkpoint is not a mapping: {path}")
@@ -31,17 +45,19 @@ def checkpoint_summary(path: Path, role: str, expected_fps: float) -> dict:
     config = raw.get("config", {})
     if not isinstance(config, dict):
         raise RuntimeError(f"Checkpoint config is not a mapping: {path}")
-    declared_fps = config.get("fps", raw.get("fps"))
-    if declared_fps is None:
-        raise RuntimeError(
-            f"{role} checkpoint has no FPS contract: {path}. Rebuild the asset "
-            "instead of stamping legacy weights with a new rate."
-        )
-    if abs(float(declared_fps) - float(expected_fps)) > 1.0e-6:
-        raise RuntimeError(
-            f"{role} checkpoint FPS mismatch: checkpoint={declared_fps}, "
-            f"asset_bundle={expected_fps}, path={path}"
-        )
+    contract = assert_scheduler_checkpoint_contract(
+        raw,
+        role=role,
+        runtime_fps=expected_fps,
+        event_db_contract=event_db_contract,
+        index_json=index_json,
+        index_npz=index_npz,
+        path=str(path),
+        allow_legacy_30fps=False,
+    )
+    if contract is None:  # pragma: no cover - prohibited above
+        raise RuntimeError(f"Formal Scheduler contract missing: {path}")
+    declared_fps = float(contract["fps"])
     declared_layout = raw.get(
         "rot6d_layout",
         raw.get("config", {}).get("rot6d_layout"),
@@ -51,7 +67,18 @@ def checkpoint_summary(path: Path, role: str, expected_fps: float) -> dict:
             raise RuntimeError(
                 f"Duration checkpoint has no explicit Rot6D layout contract: {path}"
             )
-        effective_layout = str(declared_layout)
+        effective_layout = normalize_rot6d_layout(str(declared_layout))
+        if effective_layout != ROT6D_LAYOUT_PYTORCH3D_ROW:
+            raise RuntimeError(
+                f"Duration checkpoint top-level Rot6D layout is incompatible: "
+                f"{declared_layout!r}, path={path}"
+            )
+        if effective_layout != str(contract.get("model_rot6d_layout")):
+            raise RuntimeError(
+                f"Duration checkpoint Rot6D layout disagrees with its Scheduler "
+                f"contract: top_level={effective_layout!r}, "
+                f"contract={contract.get('model_rot6d_layout')!r}, path={path}"
+            )
         rotation_policy = (
             "checkpoint must explicitly declare pytorch3d_row; scheduler "
             "adapts it at the canonical-column boundary"
@@ -68,6 +95,7 @@ def checkpoint_summary(path: Path, role: str, expected_fps: float) -> dict:
         "effective_rot6d_layout": effective_layout,
         "rotation_contract_policy": rotation_policy,
         "num_state_tensors": len(state),
+        "scheduler_contract": contract,
     }
 
 
@@ -107,20 +135,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         "index_json_sha256": sha256_file(Path(args.index_json)),
         "index_npz_sha256": sha256_file(Path(args.index_npz)),
         "checkpoints": {
-            name: checkpoint_summary(path, name, float(args.fps))
+            name: checkpoint_summary(
+                path,
+                name,
+                float(args.fps),
+                metadata["event_db_contract"],
+                Path(args.index_json),
+                Path(args.index_npz),
+            )
             for name, path in paths.items()
         },
         "asset_bundle_rebuilt": True,
-        "checkpoint_weights_reused": True,
         "checkpoint_policy": (
-            "Router/Planner/Duration model weights are immutable inputs; the "
-            "Generation-DB-aligned index, hashes and compatibility manifest "
-            "are rebuilt after the no-training regression passes."
+            "Router/Duration/Planner are trained from the current ordered "
+            "Generation Event-DB. Only the historical Router music encoder "
+            "may be imported as a frozen semantic prior. A previously produced "
+            "formal checkpoint is accepted only when all content hashes match."
         ),
-        "training_order": [
+        "required_lifecycle": [
             "build_generation_aligned_scheduler_index",
+            "train_router_from_music_encoder_prior",
+            "train_duration_with_explicit_native_rot6d_layout",
+            "train_whole_song_planner",
+            "validate_scheduler_asset_bundle",
             "same_wav_no_training_regression",
-            "rebuild_and_validate_router_planner_duration_asset_bundle",
             "train_v45",
             "train_v46",
         ],

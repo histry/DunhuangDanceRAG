@@ -243,6 +243,7 @@ class V23MonotonicDurationNet(nn.Module):
         tau_dilations: Sequence[int] = (1, 2, 4, 8, 16, 32),
         slow_feature_span: int = 10,
         ordinal_blend: float = 0.82,
+        fps: float = 30.0,
     ) -> None:
         super().__init__()
         self.motion_dim = int(motion_dim)
@@ -251,6 +252,9 @@ class V23MonotonicDurationNet(nn.Module):
         self.window_len = int(window_len)
         self.slow_feature_span = int(slow_feature_span)
         self.ordinal_blend = float(np.clip(ordinal_blend, 0.5, 1.0))
+        self.fps = float(fps)
+        if not np.isfinite(self.fps) or self.fps <= 0.0:
+            raise ValueError(f"fps must be finite and positive, got {fps!r}")
         edges = _validate_duration_edges(duration_edges, self.window_len)
         self.register_buffer("duration_edges", torch.tensor(edges, dtype=torch.float32), persistent=True)
         self.num_duration_bins = len(edges) - 1
@@ -329,33 +333,60 @@ class V23MonotonicDurationNet(nn.Module):
     def _duration_dynamics_features(self, motion: torch.Tensor, edit_mask: torch.Tensor) -> torch.Tensor:
         batch_size, time_steps, _ = motion.shape
         rotations = motion[..., ROT].reshape(batch_size, time_steps, 24, 6)
-        rotation_velocity = _frame_difference(rotations)
+        rotation_matrices = rotation_6d_to_matrix(rotations)
+        rotation_velocity = torch.zeros(
+            (batch_size, time_steps, 24, 3),
+            device=motion.device,
+            dtype=motion.dtype,
+        )
+        if time_steps > 1:
+            relative = torch.matmul(
+                rotation_matrices[:, :-1].transpose(-1, -2),
+                rotation_matrices[:, 1:],
+            )
+            rotation_velocity[:, 1:] = (
+                matrix_to_axis_angle(relative) * float(self.fps)
+            )
+            rotation_velocity[:, 0] = rotation_velocity[:, 1]
         joint_speed = torch.linalg.vector_norm(rotation_velocity, dim=-1)
         lower = joint_speed[..., 0:8].mean(dim=-1)
         torso = joint_speed[..., 8:14].mean(dim=-1)
         upper = joint_speed[..., 14:24].mean(dim=-1)
         full = joint_speed.mean(dim=-1)
 
-        lower_acc = torch.abs(_frame_difference(lower))
-        torso_acc = torch.abs(_frame_difference(torso))
-        upper_acc = torch.abs(_frame_difference(upper))
+        lower_acc = torch.abs(_frame_difference(lower)) * float(self.fps)
+        torso_acc = torch.abs(_frame_difference(torso)) * float(self.fps)
+        upper_acc = torch.abs(_frame_difference(upper)) * float(self.fps)
 
-        slow_delta = _span_difference(rotations, self.slow_feature_span)
-        slow_speed = torch.linalg.vector_norm(slow_delta, dim=-1) / float(max(self.slow_feature_span, 1))
+        span = max(1, min(int(self.slow_feature_span), time_steps - 1))
+        slow_velocity = torch.zeros_like(rotation_velocity)
+        if time_steps > span:
+            slow_relative = torch.matmul(
+                rotation_matrices[:, :-span].transpose(-1, -2),
+                rotation_matrices[:, span:],
+            )
+            slow_velocity[:, span:] = matrix_to_axis_angle(slow_relative) * (
+                float(self.fps) / float(span)
+            )
+            slow_velocity[:, :span] = slow_velocity[:, span : span + 1]
+        slow_speed = torch.linalg.vector_norm(slow_velocity, dim=-1)
         slow_lower = slow_speed[..., 0:8].mean(dim=-1)
         slow_torso = slow_speed[..., 8:14].mean(dim=-1)
         slow_upper = slow_speed[..., 14:24].mean(dim=-1)
 
-        root_velocity = _frame_difference(motion[..., ROOT])
+        root_velocity = _frame_difference(motion[..., ROOT]) * float(self.fps)
         root_speed = torch.linalg.vector_norm(root_velocity, dim=-1)
-        yaw = root_yaw_velocity_dps(motion) / 180.0
+        yaw = root_yaw_velocity_dps(motion, fps=self.fps) / 180.0
         yaw = torch.cat([yaw[:, :1], yaw], dim=1)
         yaw = torch.clamp(yaw, -4.0, 4.0)
-        yaw_acc = torch.abs(_frame_difference(yaw))
-        cumulative_yaw = torch.cumsum(torch.abs(yaw), dim=1)
+        yaw_acc = torch.abs(_frame_difference(yaw)) * float(self.fps)
+        cumulative_yaw = torch.cumsum(torch.abs(yaw) / float(self.fps), dim=1)
         cumulative_yaw = cumulative_yaw / cumulative_yaw[:, -1:].clamp_min(1e-6)
 
-        contact_switch = torch.abs(_frame_difference(motion[..., CONTACT])).mean(dim=-1)
+        contact_switch = (
+            torch.abs(_frame_difference(motion[..., CONTACT])).mean(dim=-1)
+            * float(self.fps)
+        )
         time = torch.linspace(0.0, 1.0, time_steps, device=motion.device, dtype=motion.dtype)
         time = time[None].expand(batch_size, -1)
         mask = edit_mask.to(motion.dtype).clamp(0.0, 1.0)
@@ -392,9 +423,9 @@ class V23MonotonicDurationNet(nn.Module):
         batch_size, time_steps, _ = motion.shape
         velocity = torch.zeros_like(motion)
         if time_steps > 1:
-            velocity[:, 1:] = motion[:, 1:] - motion[:, :-1]
+            velocity[:, 1:] = (motion[:, 1:] - motion[:, :-1]) * float(self.fps)
             velocity[:, 0] = velocity[:, 1]
-        yaw = root_yaw_velocity_dps(motion)
+        yaw = root_yaw_velocity_dps(motion, fps=self.fps)
         yaw = torch.cat([yaw[:, :1], yaw], dim=1) / 300.0
         yaw = torch.clamp(yaw, -3.0, 3.0)[..., None]
         time = torch.linspace(0.0, 1.0, time_steps, device=motion.device, dtype=motion.dtype)
@@ -580,6 +611,7 @@ def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") ->
         tau_dilations=config.get("tau_dilations", [1, 2, 4, 8, 16, 32]),
         slow_feature_span=int(config.get("slow_feature_span", 10)),
         ordinal_blend=float(config.get("ordinal_blend", 0.82)),
+        fps=float(config.get("fps", checkpoint.get("fps", 30.0))),
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()

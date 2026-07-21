@@ -70,7 +70,7 @@ from scheduling.music_phrase_segmentation import (
 )
 from scheduling.deep_music_features import phrase_semantic_matrix
 from scheduling.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
-from support.checkpoint_contracts import assert_checkpoint_fps
+from support.scheduler_checkpoint_contracts import assert_scheduler_checkpoint_contract
 from motion_geometry.heading import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
 
 
@@ -365,13 +365,23 @@ def planner_bundle_lengths(path: str, fps: float) -> Tuple[int, ...]:
     return tuple(int(x) for x in config.get("transition_lengths", fallback))
 
 
-def validate_checkpoint_fps(path: str, role: str, fps: float) -> None:
-    """Reject Scheduler checkpoints trained under an unknown or other frame rate."""
+def validate_scheduler_checkpoint(
+    path: str,
+    role: str,
+    fps: float,
+    event_db_contract: Dict[str, Any],
+    index_json: str,
+    index_npz: str,
+) -> None:
+    """Reject checkpoints trained against another rate or ordered Event-DB."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    assert_checkpoint_fps(
+    assert_scheduler_checkpoint_contract(
         checkpoint,
-        role=role,
+        role=role.lower(),
         runtime_fps=float(fps),
+        event_db_contract=event_db_contract,
+        index_json=index_json,
+        index_npz=index_npz,
         path=str(path),
     )
 
@@ -1163,10 +1173,31 @@ def main() -> None:
         for item in items
     ]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    validate_checkpoint_fps(args.router_ckpt, "Router", float(args.fps))
-    validate_checkpoint_fps(args.v23_ckpt, "Duration", float(args.fps))
+    validate_scheduler_checkpoint(
+        args.router_ckpt,
+        "Router",
+        float(args.fps),
+        metadata["event_db_contract"],
+        args.index_json,
+        args.duration_index_npz,
+    )
+    validate_scheduler_checkpoint(
+        args.v23_ckpt,
+        "Duration",
+        float(args.fps),
+        metadata["event_db_contract"],
+        args.index_json,
+        args.duration_index_npz,
+    )
     if args.planner_ckpt:
-        validate_checkpoint_fps(args.planner_ckpt, "Planner", float(args.fps))
+        validate_scheduler_checkpoint(
+            args.planner_ckpt,
+            "Planner",
+            float(args.fps),
+            metadata["event_db_contract"],
+            args.index_json,
+            args.duration_index_npz,
+        )
     router = load_router_checkpoint(args.router_ckpt, device=device)
     transition_bundle = load_optional_transition(
         args.transition_ckpt,

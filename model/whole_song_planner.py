@@ -9,6 +9,7 @@ overrides this fallback.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict
 
@@ -33,12 +34,24 @@ class V26WholeSongPlanner(nn.Module):
         dropout: float = 0.15,
         num_event_types: int = len(EVENT_TYPES),
         transition_lengths: tuple[int, ...] = MUSIC_DOMINANT_TRANSITION_LENGTHS,
+        fps: float = 30.0,
+        min_duration_seconds: float = 8.0 / 30.0,
+        max_duration_seconds: float = 20.0,
     ) -> None:
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_event_types = int(num_event_types)
         self.transition_lengths = tuple(int(x) for x in transition_lengths)
+        self.fps = float(fps)
+        if not math.isfinite(self.fps) or self.fps <= 0.0:
+            raise ValueError(f"fps must be finite and positive, got {fps!r}")
+        self.duration_min_frames = float(min_duration_seconds) * self.fps
+        self.duration_max_frames = float(max_duration_seconds) * self.fps
+        if self.duration_min_frames <= 0.0 or self.duration_max_frames <= self.duration_min_frames:
+            raise ValueError(
+                "Planner duration limits must be positive and strictly ordered"
+            )
         self.input_projection = nn.Sequential(
             nn.LayerNorm(feature_dim),
             nn.Linear(feature_dim, hidden_dim),
@@ -69,7 +82,9 @@ class V26WholeSongPlanner(nn.Module):
         return {
             "event_logits": self.event_head(hidden),
             "log_duration": log_duration,
-            "duration_frames": torch.exp(log_duration).clamp(8.0, 600.0),
+            "duration_frames": torch.exp(log_duration).clamp(
+                self.duration_min_frames, self.duration_max_frames
+            ),
             "transition_logits": self.transition_head(hidden),
             "activity": torch.sigmoid(self.activity_head(hidden).squeeze(-1)),
             "hidden": hidden,
@@ -90,6 +105,9 @@ def load_v26_planner_checkpoint(
         dropout=float(config.get("dropout", 0.15)),
         num_event_types=int(config.get("num_event_types", len(EVENT_TYPES))),
         transition_lengths=tuple(config.get("transition_lengths", MUSIC_DOMINANT_TRANSITION_LENGTHS)),
+        fps=float(config.get("fps", 30.0)),
+        min_duration_seconds=float(config.get("min_duration_seconds", 8.0 / 30.0)),
+        max_duration_seconds=float(config.get("max_duration_seconds", 20.0)),
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device)
