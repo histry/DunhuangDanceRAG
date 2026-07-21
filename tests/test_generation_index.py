@@ -62,6 +62,31 @@ class GenerationIndexTests(unittest.TestCase):
             finally:
                 arrays.close()
 
+    def test_builder_rejects_database_without_canonical_fps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            motion_path = root / "event.npy"
+            np.save(motion_path, identity_motion(24))
+            db_path = root / "events_aesd.npz"
+            np.savez_compressed(
+                db_path,
+                paths=np.asarray([str(motion_path)], dtype=object),
+                source_uids=np.asarray(["source_a"], dtype=object),
+                starts=np.asarray([0]),
+                ends=np.asarray([24]),
+                frames=np.asarray([24]),
+                skeleton_contract_json=np.asarray(
+                    skeleton_contract_json(),
+                    dtype=object,
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "no canonical_fps contract"):
+                build_generation_index(
+                    db_path,
+                    root / "index.json",
+                    root / "index.npz",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

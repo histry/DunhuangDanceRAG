@@ -123,6 +123,29 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertIn("contact_speed_threshold_mps", source)
         self.assertIn("* float(self.data_fps)", source)
 
+    def test_scheduler_profiles_preserve_external_fps(self):
+        for relative in ("configs/scheduler.env", "configs/experiment.env"):
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn(
+                'export V46_51_FPS="${V46_51_FPS:-30}"',
+                source,
+            )
+            self.assertIn(
+                'export V46_49_RETARGET_FPS="${V46_49_RETARGET_FPS:-$V46_51_FPS}"',
+                source,
+            )
+            self.assertNotIn("export V46_51_FPS=30", source)
+            self.assertNotIn("export V46_49_RETARGET_FPS=30", source)
+
+    def test_scheduler_passes_physical_rate_to_deep_music_features(self):
+        source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        marker = "phrase_semantic_matrix("
+        start = source.index(marker)
+        block = source[start : start + 600]
+        self.assertIn("fps=float(args.fps)", block)
+
 
 if __name__ == "__main__":
     unittest.main()

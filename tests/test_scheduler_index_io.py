@@ -17,7 +17,14 @@ class SchedulerIndexPathTests(unittest.TestCase):
     @staticmethod
     def _write_minimal_aligned_index(root: Path, layout=None):
         index = root / "event_index.json"
-        metadata = {"items": [{"pkl": "event.pkl"}]}
+        metadata = {
+            "items": [
+                {
+                    "pkl": "event.pkl",
+                    "event_uid": "evt_test_contract",
+                }
+            ]
+        }
         if layout is not None:
             metadata["rot6d_layout"] = layout
         index.write_text(json.dumps(metadata), encoding="utf-8")

@@ -777,6 +777,7 @@ def generate_one(
         cache_dir=args.deep_music_cache or args.feature_dir,
         require_deep=bool(args.require_deep_music),
         min_deep_success=float(args.deep_music_min_success),
+        fps=float(args.fps),
     )
     predictions = planner_predictions(phrases, planner_bundle, device, fps=float(args.fps))
     selected_state = choose_events(

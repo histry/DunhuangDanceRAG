@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from support.event_identity import (
+    event_uid_from_item,
     event_uids_from_generation_db,
     make_event_db_contract,
     stable_event_uid,
@@ -35,6 +36,7 @@ class EventIdentityTests(unittest.TestCase):
             "starts": np.asarray([0, 10]),
             "ends": np.asarray([10, 20]),
             "frames": np.asarray([10, 10]),
+            "canonical_fps": np.asarray([30.0, 30.0]),
         }
         uids = event_uids_from_generation_db(db)
         normal = make_event_db_contract(uids)
@@ -79,6 +81,46 @@ class EventIdentityTests(unittest.TestCase):
             source_fps=60.0,
         )
         self.assertEqual(left, right)
+
+    def test_generation_db_without_time_or_fps_fails_closed(self):
+        db = {
+            "paths": np.asarray(["a.npy"], dtype=object),
+            "source_uids": np.asarray(["a"], dtype=object),
+            "starts": np.asarray([0]),
+            "ends": np.asarray([30]),
+            "frames": np.asarray([30]),
+        }
+        with self.assertRaisesRegex(RuntimeError, "physical time fields"):
+            event_uids_from_generation_db(db)
+
+    def test_item_with_physical_time_does_not_need_frame_rate(self):
+        uid = event_uid_from_item(
+            {
+                "source_uid": "a",
+                "source_start": 30,
+                "source_end": 90,
+                "source_start_seconds": 1.0,
+                "source_end_seconds": 3.0,
+            }
+        )
+        expected = stable_event_uid(
+            source_uid="a",
+            start=60,
+            end=180,
+            source_fps=60.0,
+        )
+        self.assertEqual(uid, expected)
+
+    def test_item_without_time_or_fps_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "explicit FPS contract"):
+            event_uid_from_item(
+                {
+                    "source_uid": "a",
+                    "source_start": 0,
+                    "source_end": 30,
+                },
+                position=7,
+            )
 
 
 if __name__ == "__main__":

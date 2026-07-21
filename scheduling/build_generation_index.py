@@ -127,6 +127,11 @@ def build_generation_index(
             "Generation DB SMPL24 skeleton mismatch: "
             f"db={db_skeleton.get('sha256')!r}, runtime={skeleton_fingerprint()!r}"
         )
+    if "canonical_fps" not in db:
+        raise RuntimeError(
+            "Generation DB has no canonical_fps contract; rebuild it with "
+            "events.build_database instead of assuming 30 FPS."
+        )
     event_uids = event_uids_from_generation_db(db)
     contract = make_event_db_contract(event_uids)
 
@@ -145,16 +150,17 @@ def build_generation_index(
     heading_quality = _array(db, "event_heading_quality", count, 0.5).astype(np.float32)
     yaw = _array(db, "event_net_yaw_rad", count, 0.0).astype(np.float32)
     durations_sec = _array(db, "durations", count, 0.0).astype(np.float32)
-    if "canonical_fps" in db:
-        canonical_fps = np.asarray(db["canonical_fps"], dtype=np.float32)
-        if canonical_fps.ndim == 0:
-            canonical_fps = np.full(count, float(canonical_fps), dtype=np.float32)
-        if len(canonical_fps) != count:
-            raise RuntimeError(
-                f"Generation DB canonical_fps has {len(canonical_fps)}, expected {count}"
-            )
-    else:
-        canonical_fps = np.full(count, 30.0, dtype=np.float32)
+    canonical_fps = np.asarray(db["canonical_fps"], dtype=np.float32)
+    if canonical_fps.ndim == 0:
+        canonical_fps = np.full(count, float(canonical_fps), dtype=np.float32)
+    if len(canonical_fps) != count:
+        raise RuntimeError(
+            f"Generation DB canonical_fps has {len(canonical_fps)}, expected {count}"
+        )
+    if not np.all(np.isfinite(canonical_fps)) or np.any(canonical_fps <= 0.0):
+        raise RuntimeError(
+            "Generation DB canonical_fps values must all be finite and positive"
+        )
     fps_values = sorted({float(value) for value in canonical_fps})
     if len(fps_values) != 1:
         raise RuntimeError(
@@ -166,6 +172,21 @@ def build_generation_index(
     source_end_seconds = np.asarray(
         db.get("source_end_seconds", ends / canonical_fps), dtype=np.float64
     )
+    if source_start_seconds.ndim == 0:
+        source_start_seconds = np.full(count, float(source_start_seconds), dtype=np.float64)
+    if source_end_seconds.ndim == 0:
+        source_end_seconds = np.full(count, float(source_end_seconds), dtype=np.float64)
+    if len(source_start_seconds) != count or len(source_end_seconds) != count:
+        raise RuntimeError(
+            "Generation DB physical time fields must align with the event count: "
+            f"start={len(source_start_seconds)}, end={len(source_end_seconds)}, expected={count}"
+        )
+    if not np.all(np.isfinite(source_start_seconds)) or not np.all(
+        np.isfinite(source_end_seconds)
+    ):
+        raise RuntimeError("Generation DB physical time fields must be finite")
+    if np.any(source_end_seconds < source_start_seconds):
+        raise RuntimeError("Generation DB contains an event whose physical end precedes its start")
 
     raw_descriptors: list[np.ndarray] = []
     embeddings: list[np.ndarray] = []

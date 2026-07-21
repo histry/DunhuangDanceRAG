@@ -66,8 +66,69 @@ def _package_version(name: str) -> str:
         return "unknown"
 
 
-def phrase_rule_semantic(phrase: Any) -> np.ndarray:
+def _audio_fingerprint(path: Path) -> str:
+    """Hash audio content so same-name replacements cannot reuse stale features."""
+    digest = hashlib.sha256()
+    if not path.is_file():
+        digest.update(str(path.expanduser().resolve()).encode("utf-8"))
+        return "missing_" + digest.hexdigest()[:16]
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def _phrase_fingerprint(phrases: Sequence[Any]) -> str:
+    fields = (
+        "start",
+        "end",
+        "length",
+        "music_event",
+        "energy",
+        "onset",
+        "beat_density",
+        "tension",
+        "calmness",
+        "boundary_accent_strength",
+    )
+    payload = [
+        {name: getattr(phrase, name, None) for name in fields}
+        for phrase in phrases
+    ]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _backend_fingerprint(enabled: bool, model_name: str) -> str:
+    payload = {
+        "enabled": bool(enabled),
+        "model_name": str(model_name).lower(),
+        "checkpoint": os.environ.get("V27_CLAP_CKPT", ""),
+        "amodel": os.environ.get("V27_CLAP_AMODEL", ""),
+        "device": os.environ.get("V27_CLAP_DEVICE", ""),
+        "fusion": _bool_env("V27_CLAP_ENABLE_FUSION", False),
+        "filelist": _bool_env("V27_CLAP_USE_FILELIST", False),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _validated_fps(fps: float) -> float:
+    value = float(fps)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"fps must be finite and positive, got {fps!r}")
+    return value
+
+
+def phrase_rule_semantic(phrase: Any, fps: float = 30.0) -> np.ndarray:
     """Return a 12D semantic proxy aligned with hierarchy raw features."""
+    fps = _validated_fps(fps)
     music_event = str(getattr(phrase, "music_event", "neutral_flow"))
     group_map = {
         "calm_flow": 1,
@@ -96,7 +157,8 @@ def phrase_rule_semantic(phrase: Any) -> np.ndarray:
         0.0,
         1.0,
     )
-    duration = np.clip((float(getattr(phrase, "length", 60)) - 24.0) / 120.0, 0.0, 1.0)
+    duration_seconds = float(getattr(phrase, "length", 2.0 * fps)) / fps
+    duration = np.clip((duration_seconds - 0.8) / 4.0, 0.0, 1.0)
     style = np.clip(0.50 + 0.30 * calm + 0.20 * tension, 0.0, 1.0)
     quality = np.clip(0.55 + 0.25 * beat + 0.20 * boundary, 0.0, 1.0)
     safety = np.clip(0.68 + 0.20 * calm - 0.15 * onset, 0.0, 1.0)
@@ -108,14 +170,21 @@ def _deep_mode_success(mode: str) -> bool:
     return mode in {"laion_clap", "laion_clap_filelist", "msclap", "msclap_file"}
 
 
-def _load_audio_segment(audio_path: Path, phrase: Any) -> Tuple[np.ndarray | None, int, str, float, float]:
+def _load_audio_segment(
+    audio_path: Path,
+    phrase: Any,
+    fps: float,
+) -> Tuple[np.ndarray | None, int, str, float, float]:
+    fps = _validated_fps(fps)
     try:
         import librosa  # type: ignore
     except Exception as exc:
         return None, 0, f"librosa_unavailable:{exc}", 0.0, 0.0
 
-    start_sec = float(getattr(phrase, "start", 0)) / 30.0
-    end_sec = max(start_sec + 0.25, float(getattr(phrase, "end", getattr(phrase, "start", 0) + 30)) / 30.0)
+    start_frame = float(getattr(phrase, "start", 0))
+    end_frame = float(getattr(phrase, "end", start_frame + fps))
+    start_sec = start_frame / fps
+    end_sec = max(start_sec + 0.25, end_frame / fps)
     try:
         y, sr = librosa.load(str(audio_path), sr=48000, mono=True, offset=start_sec, duration=end_sec - start_sec)
     except Exception as exc:
@@ -207,9 +276,18 @@ def _get_msclap_model() -> Any:
     return model
 
 
-def _try_clap_phrase_embedding(audio_path: Path, phrase: Any, model_name: str) -> Tuple[np.ndarray | None, str]:
+def _try_clap_phrase_embedding(
+    audio_path: Path,
+    phrase: Any,
+    model_name: str,
+    fps: float,
+) -> Tuple[np.ndarray | None, str]:
     """Best-effort CLAP/MSCLAP phrase embedding with explicit failure mode."""
-    y, sr, audio_mode, _start_sec, _end_sec = _load_audio_segment(audio_path, phrase)
+    y, sr, audio_mode, _start_sec, _end_sec = _load_audio_segment(
+        audio_path,
+        phrase,
+        fps,
+    )
     if y is None:
         return None, audio_mode
 
@@ -253,7 +331,15 @@ def _try_clap_phrase_embedding(audio_path: Path, phrase: Any, model_name: str) -
     return None, f"unsupported_model:{model_name}"
 
 
-def _meta_from_modes(audio_path: str | Path, enabled: bool, model_name: str, phrases: Sequence[Any], modes: Sequence[str], semantic: np.ndarray) -> Dict[str, Any]:
+def _meta_from_modes(
+    audio_path: str | Path,
+    enabled: bool,
+    model_name: str,
+    phrases: Sequence[Any],
+    modes: Sequence[str],
+    semantic: np.ndarray,
+    fps: float,
+) -> Dict[str, Any]:
     deep_success = int(sum(1 for mode in modes if _deep_mode_success(str(mode))))
     fallback = int(len(modes) - deep_success)
     backends = []
@@ -264,6 +350,7 @@ def _meta_from_modes(audio_path: str | Path, enabled: bool, model_name: str, phr
         "audio": str(audio_path),
         "enabled": bool(enabled),
         "model_name": str(model_name),
+        "phrase_fps": float(fps),
         "num_phrases": int(len(phrases)),
         "modes": [str(x) for x in modes],
         "unique_modes": sorted({str(x).split(":")[0] for x in modes}),
@@ -303,35 +390,52 @@ def phrase_semantic_matrix(
     cache_dir: str | Path | None = None,
     require_deep: bool = False,
     min_deep_success: float = 0.80,
+    fps: float = 30.0,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    fps = _validated_fps(fps)
     audio = Path(audio_path)
     cache_path = None
+    audio_hash = _audio_fingerprint(audio)
+    phrase_hash = _phrase_fingerprint(phrases)
+    backend_hash = _backend_fingerprint(enabled, model_name)
     cache_key = (
         f"{audio.stem}_v27_semantic_{model_name}_{len(phrases)}"
-        f"_ckpt{hashlib.sha1(os.environ.get('V27_CLAP_CKPT', '').encode('utf-8')).hexdigest()[:8]}"
-        f"_file{int(_bool_env('V27_CLAP_USE_FILELIST', False))}.npz"
+        f"_fps{fps:g}"
+        f"_audio{audio_hash}_phrases{phrase_hash}_backend{backend_hash}.npz"
     )
     if cache_dir:
         cache = Path(cache_dir)
         cache.mkdir(parents=True, exist_ok=True)
         cache_path = cache / cache_key
         if cache_path.is_file():
-            data = np.load(cache_path, allow_pickle=True)
-            semantic = np.asarray(data["semantic"], dtype=np.float32)
-            meta = json.loads(str(data["meta"].item()))
-            if require_deep:
-                _assert_deep_success(meta, min_deep_success)
-            return semantic, meta
+            with np.load(cache_path, allow_pickle=True) as data:
+                semantic = np.asarray(data["semantic"], dtype=np.float32)
+                meta = json.loads(str(data["meta"].item()))
+            cached_fps = meta.get("phrase_fps")
+            if cached_fps is not None and np.isclose(
+                float(cached_fps),
+                fps,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                if require_deep:
+                    _assert_deep_success(meta, min_deep_success)
+                return semantic, meta
 
     rows = []
     modes = []
     for phrase in phrases:
-        rule = phrase_rule_semantic(phrase)
+        rule = phrase_rule_semantic(phrase, fps=fps)
         if enabled:
-            emb, mode = _try_clap_phrase_embedding(audio, phrase, model_name)
+            emb, mode = _try_clap_phrase_embedding(
+                audio,
+                phrase,
+                model_name,
+                fps=fps,
+            )
             if emb is not None and emb.size > 0 and np.all(np.isfinite(emb)):
                 proj = _projection_matrix(int(emb.size), 12)
-                deep = _normalize(np.asarray(emb, dtype=np.float32).reshape(1, -1) @ proj)[0]
+                deep = _normalize(np.asarray(emb, dtype=np.float32).reshape(1, -1) @ proj)
                 rows.append(_normalize(0.50 * rule + 0.50 * deep))
                 modes.append(mode)
                 continue
@@ -341,7 +445,15 @@ def phrase_semantic_matrix(
         rows.append(rule)
 
     semantic = np.stack(rows).astype(np.float32) if rows else np.zeros((0, 12), dtype=np.float32)
-    meta = _meta_from_modes(audio_path, enabled, model_name, phrases, modes, semantic)
+    meta = _meta_from_modes(
+        audio_path,
+        enabled,
+        model_name,
+        phrases,
+        modes,
+        semantic,
+        fps=fps,
+    )
     if require_deep:
         _assert_deep_success(meta, min_deep_success)
     if cache_path is not None:

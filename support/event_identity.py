@@ -88,12 +88,23 @@ def event_uids_from_generation_db(db: Mapping[str, Any]) -> np.ndarray:
         raise RuntimeError(f"source_start_seconds has {len(start_seconds)} rows, expected {count}")
     if end_seconds is not None and len(end_seconds) != count:
         raise RuntimeError(f"source_end_seconds has {len(end_seconds)} rows, expected {count}")
-    raw_fps = db.get("canonical_fps", db.get("fps", 30.0))
-    fps_values = np.asarray(raw_fps, dtype=np.float64)
-    if fps_values.ndim == 0:
-        fps_values = np.full(count, float(fps_values), dtype=np.float64)
-    elif len(fps_values) != count:
-        raise RuntimeError(f"canonical_fps has {len(fps_values)} rows, expected {count}")
+    raw_fps = db.get("canonical_fps", db.get("fps"))
+    if raw_fps is None:
+        if start_seconds is None or end_seconds is None:
+            raise RuntimeError(
+                "Cannot derive stable event_uid without physical time fields or "
+                "an explicit canonical_fps/fps contract"
+            )
+        # FPS is ignored by stable_event_uid when both physical endpoints exist.
+        fps_values = np.ones(count, dtype=np.float64)
+    else:
+        fps_values = np.asarray(raw_fps, dtype=np.float64)
+        if fps_values.ndim == 0:
+            fps_values = np.full(count, float(fps_values), dtype=np.float64)
+        elif len(fps_values) != count:
+            raise RuntimeError(f"canonical_fps has {len(fps_values)} rows, expected {count}")
+        if not np.all(np.isfinite(fps_values)) or np.any(fps_values <= 0.0):
+            raise RuntimeError("canonical_fps/fps values must all be finite and positive")
     return np.asarray(
         [
             stable_event_uid(
@@ -119,15 +130,26 @@ def event_uid_from_item(item: Mapping[str, Any], position: int = -1) -> str:
     start = item.get("source_start", item.get("start", 0))
     end = item.get("source_end", item.get("end", start))
     frames = item.get("length", item.get("frames", max(0, int(end) - int(start))))
+    start_seconds = item.get("source_start_seconds", item.get("start_seconds"))
+    end_seconds = item.get("source_end_seconds", item.get("end_seconds"))
+    source_fps = item.get("canonical_fps", item.get("target_fps", item.get("fps")))
+    if source_fps is None:
+        if start_seconds is None or end_seconds is None:
+            location = f" at position {position}" if position >= 0 else ""
+            raise RuntimeError(
+                "Cannot derive stable event_uid"
+                f"{location} without physical time fields or an explicit FPS contract"
+            )
+        source_fps = 1.0
     return stable_event_uid(
         source_uid=item.get("source_uid", item.get("source_id", "unknown")),
         source_file=item.get("source_file", item.get("pkl", item.get("path", ""))),
         start=start,
         end=end,
         frames=frames,
-        source_fps=item.get("canonical_fps", item.get("target_fps", item.get("fps", 30.0))),
-        start_seconds=item.get("source_start_seconds", item.get("start_seconds")),
-        end_seconds=item.get("source_end_seconds", item.get("end_seconds")),
+        source_fps=source_fps,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
     )
 
 
