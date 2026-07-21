@@ -14,10 +14,10 @@ from motion_geometry.rotations import (
 )
 
 
-def load_transition_diffusion(*args, **kwargs):
+def load_transition_diffusion(*args, fps=None, **kwargs):
     from training.transition_diffusion import load_transition_diffusion as implementation
 
-    bundle = implementation(*args, **kwargs)
+    bundle = implementation(*args, fps=fps, **kwargs)
     if bundle is None:
         return None
     config = bundle.get("config", {})
@@ -46,6 +46,7 @@ def sample_transition_diffusion(
     steps=36,
     previous_context=None,
     next_context=None,
+    fps=30.0,
 ):
     from training.transition_diffusion import sample_transition_diffusion as implementation
 
@@ -74,6 +75,7 @@ def sample_transition_diffusion(
         steps=steps,
         previous_context=to_native(previous_context),
         next_context=to_native(next_context),
+        fps=fps,
     )
     output = convert_motion_rot6d_layout_np(
         generated,

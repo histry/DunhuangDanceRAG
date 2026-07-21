@@ -48,11 +48,13 @@ from support.transition_quality import (
     accept_candidate,
     transition_risk,
 )
+from support.checkpoint_contracts import assert_checkpoint_fps
 
 
 def load_transition_diffusion(
     path: str | Path,
     device: torch.device | str = "cpu",
+    fps: float | None = None,
 ) -> Dict[str, Any] | None:
     if not path:
         return None
@@ -63,6 +65,13 @@ def load_transition_diffusion(
     checkpoint = torch.load(
         checkpoint_path, map_location=device, weights_only=False
     )
+    if fps is not None:
+        assert_checkpoint_fps(
+            checkpoint,
+            role="Transition diffusion",
+            runtime_fps=float(fps),
+            path=str(checkpoint_path),
+        )
     config_values = dict(checkpoint.get("config", {}))
     architecture = str(config_values.get("architecture", ""))
     supported = {
@@ -254,7 +263,11 @@ def sample_transition_diffusion(
     steps: int = 36,
     previous_context: np.ndarray | None = None,
     next_context: np.ndarray | None = None,
+    fps: float = 30.0,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"fps must be finite and positive, got {fps!r}")
     k = int(length)
     if k <= 0:
         return np.zeros((0, MOTION_DIM), np.float32), {
@@ -322,7 +335,7 @@ def sample_transition_diffusion(
     ).reshape(1, k, 1)
 
     baseline_risk = transition_risk(
-        previous, baseline, following
+        previous, baseline, following, fps=fps
     )
     baseline_absolute_safe, baseline_gate = accept_candidate(
         baseline_risk,
@@ -396,7 +409,7 @@ def sample_transition_diffusion(
             baseline, generated, trust
         )
         risk = transition_risk(
-            previous, candidate, following
+            previous, candidate, following, fps=fps
         )
         safe, gate = accept_candidate(
             baseline_risk,
@@ -509,7 +522,7 @@ def sample_transition_diffusion(
                 baseline, generated, trust
             )
             blended_risk = transition_risk(
-                previous, blended_candidate, following
+                previous, blended_candidate, following, fps=fps
             )
             blended_safe, blended_gate = accept_candidate(
                 baseline_risk,
@@ -632,6 +645,7 @@ def sample_transition_diffusion(
             "v34_continuous_c3_contact_inr_latent_diffusion",
         "checkpoint": str(bundle.get("path", "")),
         "continuous_time": True,
+        "fps": fps,
         "contact_aware": True,
         "candidate_count": candidate_count,
         "accepted_count": len(accepted),

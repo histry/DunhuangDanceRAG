@@ -45,6 +45,22 @@ class BoundaryContractTest(unittest.TestCase):
         self.assertIn("root_y_gap_m", report)
         self.assertTrue(np.isfinite(float(report["score"])))
 
+    def test_physical_windows_scale_with_fps(self):
+        a30 = identity_motion(30)
+        a60 = identity_motion(60)
+        report30 = transition_multiscale_risk(
+            a30, np.zeros((0, 151), np.float32), a30, fps=30.0
+        )
+        report60 = transition_multiscale_risk(
+            a60, np.zeros((0, 151), np.float32), a60, fps=60.0
+        )
+        self.assertEqual(report30["tangent_window_frames"], 8)
+        self.assertEqual(report60["tangent_window_frames"], 16)
+        self.assertAlmostEqual(
+            report30["tangent_window_seconds"],
+            report60["tangent_window_seconds"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

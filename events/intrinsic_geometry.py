@@ -36,7 +36,7 @@ from contracts.gravity import (
     fk24_np,
 )
 
-SCHEMA = "v46_53_intrinsic_event_geometry_v1"
+SCHEMA = "v46_53_intrinsic_event_geometry_v2_physical_time"
 
 BODY_PARTS: Dict[str, Tuple[int, ...]] = {
     "root_torso": (0, 3, 6, 9, 12, 15),
@@ -169,7 +169,14 @@ def _geometry_descriptor(
 
     contacts = np.clip(x[:, :4], 0.0, 1.0)
     desc.extend(np.mean(contacts, axis=0).tolist())
-    desc.extend(np.mean(np.abs(np.diff(contacts, axis=0)), axis=0).tolist() if t > 1 else [0.0] * 4)
+    desc.extend(
+        (
+            np.mean(np.abs(np.diff(contacts, axis=0)), axis=0)
+            * float(fps)
+        ).tolist()
+        if t > 1
+        else [0.0] * 4
+    )
 
     desc.extend(_posture_onehot(posture).tolist())
     desc.extend(_hash_onehot(family, 16).tolist())
@@ -250,6 +257,9 @@ def _diagonal_w2_barycenter(
 
 
 def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: float = 30.0) -> Dict[str, Any]:
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"fps must be finite and positive, got {fps!r}")
     with np.load(db_path, allow_pickle=True) as data:
         payload: Dict[str, Any] = {k: data[k] for k in data.files}
     paths = np.asarray(payload["paths"], dtype=object)
@@ -261,7 +271,8 @@ def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: floa
     anatomy_q = np.asarray(payload.get("anatomy_quality", np.ones(n, np.float32) * 0.5), dtype=np.float32)
     old_q = np.asarray(payload.get("event_quality_scores", np.ones(n, np.float32) * 0.5), dtype=np.float32)
 
-    edge_frames = _env_int("V46_53_EVENT_EDGE_FRAMES", 6)
+    edge_frames_30fps = _env_int("V46_53_EVENT_EDGE_FRAMES", 6)
+    edge_frames = max(1, int(round(edge_frames_30fps * fps / 30.0)))
     rows, w0, w1, a0, a1, parts, structure_q = [], [], [], [], [], [], []
     diagnostics: List[dict] = []
     for i, path in enumerate(paths.tolist()):
@@ -305,6 +316,7 @@ def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: floa
 
     payload.update({
         "v46_53_geometry_schema_version": np.asarray(SCHEMA, dtype=object),
+        "v46_53_geometry_fps": np.asarray(fps, dtype=np.float32),
         "v46_53_geometry_desc": geometry,
         "v46_53_geometry_desc_z": geometry_z,
         "v46_53_geometry_mean": mean.astype(np.float32),
@@ -336,6 +348,9 @@ def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: floa
         "backup": str(backup),
         "num_events": int(n),
         "geometry_dim": int(geometry.shape[1]),
+        "fps": fps,
+        "edge_frames": int(edge_frames),
+        "edge_window_seconds": float(edge_frames / fps),
         "body_parts": list(BODY_PARTS),
         "quality": {
             "min": float(combined_q.min()),

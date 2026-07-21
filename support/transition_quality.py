@@ -169,7 +169,10 @@ def transition_risk(
     ta = np.diff(tv, axis=0) * fps
     tj = np.diff(ta, axis=0) * fps
     joint_jerk = _rms(tj)
-    high_frequency = _rms(np.diff(tj, axis=0)) if len(tj) > 1 else joint_jerk
+    high_frequency = (
+        _rms(np.diff(tj, axis=0) * float(fps))
+        if len(tj) > 1 else joint_jerk
+    )
 
     context_angular = angular_velocity_np(context) * fps
     context_angular_acc = np.diff(context_angular, axis=0) * fps
@@ -202,7 +205,7 @@ def transition_risk(
     penetration = np.maximum(ground - feet[..., 1] - 0.008, 0.0)
     foot_penetration = float(np.mean(penetration**2))
     contact_switch = (
-        float(np.abs(np.diff(predicted_contact, axis=0)).mean())
+        float(np.abs(np.diff(predicted_contact, axis=0)).mean()) * float(fps)
         if len(predicted_contact) > 1 else 0.0
     )
 
@@ -236,7 +239,9 @@ def transition_risk(
         + 0.001 * boundary_angular_jerk_max
         + 2.00 * foot_slip
         + 6.00 * foot_penetration
-        + 0.25 * contact_switch
+        # Contact change is a physical probability-change rate (1/s).  The
+        # coefficient preserves the historical 30 FPS score scale.
+        + (0.25 / 30.0) * contact_switch
         + 2.00 * max_rotation_step
         + 4.00 * exit_rotation_step
         + 3.00 * exit_fk_jump

@@ -4161,7 +4161,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         cond_batch = []
         for _ in range(bs):
             clean = sample_motion_window(paths, cfg.window_len, cfg)
-            bad, seam = degrade_for_refiner(clean)
+            bad, seam = degrade_for_refiner(clean, cfg=cfg)
             clean_batch.append(clean)
             bad_batch.append(bad)
             seam_batch.append(seam)

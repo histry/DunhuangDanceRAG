@@ -146,6 +146,33 @@ class SchedulerArchitectureTests(unittest.TestCase):
         block = source[start : start + 600]
         self.assertIn("fps=float(args.fps)", block)
 
+    def test_optional_transition_models_receive_runtime_fps(self):
+        source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        transition_start = source.index("transition_bundle = load_optional_transition(")
+        transition_block = source[transition_start : transition_start + 260]
+        self.assertIn("fps=float(args.fps)", transition_block)
+        diffusion_start = source.index(
+            "args.transition_diffusion_bundle = ("
+        )
+        diffusion_block = source[diffusion_start : diffusion_start + 360]
+        self.assertIn("fps=float(args.fps)", diffusion_block)
+        sample_start = source.index("transition, diffusion_meta = sample_transition_diffusion(")
+        sample_block = source[sample_start : sample_start + 700]
+        self.assertIn("previous_context=contents[slot - 1]", sample_block)
+        self.assertIn("next_context=content", sample_block)
+        self.assertIn("fps=float(args.fps)", sample_block)
+
+    def test_refiner_training_passes_multirate_config_to_corruption(self):
+        source = (ROOT / "training" / "motion_models.py").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("def train_refiner(")
+        block = source[start : start + 1800]
+        self.assertIn("degrade_for_refiner(clean, cfg=cfg)", block)
+        self.assertNotIn("degrade_for_refiner(clean)\n", block)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,41 @@ def _arg_value(argv: Sequence[str], flag: str) -> Optional[str]:
     return args[idx + 1] if idx + 1 < len(args) else None
 
 
+def _runtime_fps(argv: Sequence[str]) -> float:
+    """Resolve one generation FPS and reject conflicting contracts."""
+    values: Dict[str, float] = {}
+    config_path = _arg_value(argv, "--config")
+    if config_path:
+        path = Path(config_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Generation config does not exist: {path}")
+        config = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Generation config is not a mapping: {path}")
+        if config.get("fps") is not None:
+            values["config"] = float(config["fps"])
+    for name in ("V46_FPS", "V46_51_FPS"):
+        raw = os.environ.get(name)
+        if raw is not None and str(raw).strip():
+            values[name] = float(raw)
+    if not values:
+        values["legacy_default"] = 30.0
+    for source, value in values.items():
+        if not np.isfinite(value) or value <= 0.0:
+            raise RuntimeError(
+                f"Invalid generation FPS from {source}: {value!r}"
+            )
+    reference = next(iter(values.values()))
+    mismatched = {
+        source: value
+        for source, value in values.items()
+        if abs(value - reference) > 1.0e-6
+    }
+    if mismatched:
+        raise RuntimeError(f"Conflicting generation FPS contracts: {values}")
+    return float(reference)
+
+
 def _db_value(db: Dict[str, Any], key: str, event_id: int, default: Any) -> Any:
     try:
         arr = np.asarray(db[key])
@@ -315,6 +350,7 @@ def _patch_report(
     report_path: Path,
     contract: Dict[str, Any],
     motion_path: Optional[Path] = None,
+    fps: float = 30.0,
 ) -> None:
     if not report_path.is_file():
         return
@@ -351,7 +387,7 @@ def _patch_report(
         if np.asarray(x).ndim == 3:
             x = np.asarray(x)[0]
 
-        m = anatomy_metrics_np(x)
+        m = anatomy_metrics_np(x, fps=float(fps))
         ok, reasons = evaluate_anatomy_contract(m)
 
         report["v46_52_final_anatomy"] = {
@@ -369,6 +405,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     schedule = _arg_value(args, "--slots_json")
     report_json = _arg_value(args, "--json")
     output = _arg_value(args, "--out")
+    fps = _runtime_fps(args)
     if not audio or not schedule:
         raise RuntimeError("V46.52 requires --audio and a fresh --slots_json")
     required_run_id = os.environ.get("V46_51_SCHEDULE_RUN_ID")
@@ -377,7 +414,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     contract = audit_contract(
         audio=audio,
         schedule=schedule,
-        fps=float(os.environ.get("V46_FPS", "30")),
+        fps=fps,
         required_run_id=required_run_id,
         require_fresh=True,
         max_frame_error=int(float(os.environ.get("V46_51_MAX_FRAME_ERROR", "2"))),
@@ -394,6 +431,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(report_json),
             contract,
             motion_path=Path(output) if output else None,
+            fps=fps,
         )
     return rc
 

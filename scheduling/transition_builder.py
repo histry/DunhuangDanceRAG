@@ -14,9 +14,14 @@ from motion_geometry.rotations import (
     normalize_rot6d_layout,
 )
 from support.scheduler_common import CONTACT, ROOT_Y, ROT
+from support.checkpoint_contracts import assert_checkpoint_fps
 
 
-def load_optional_transition(path: str, device: torch.device):
+def load_optional_transition(
+    path: str,
+    device: torch.device,
+    fps: float | None = None,
+):
     if not path:
         return None
     checkpoint_path = Path(path)
@@ -28,6 +33,13 @@ def load_optional_transition(path: str, device: torch.device):
         map_location="cpu",
         weights_only=False,
     )
+    if fps is not None:
+        assert_checkpoint_fps(
+            checkpoint,
+            role="Transition",
+            runtime_fps=float(fps),
+            path=str(checkpoint_path),
+        )
     bundle["dpn_lo"] = np.asarray(
         checkpoint.get("dpn_lo", np.zeros((20,), dtype=np.float32)),
         dtype=np.float32,

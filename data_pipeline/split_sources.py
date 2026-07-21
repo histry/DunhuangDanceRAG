@@ -348,6 +348,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         choices=["symlink", "hardlink", "copy"],
         default="symlink",
     )
+    parser.add_argument(
+        "--allow_unknown_performer_group",
+        action="store_true",
+        help=(
+            "Allow public datasets without trustworthy gender metadata. "
+            "Unknown remains an explicit stratum and is never imputed."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
 
@@ -388,9 +396,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for row in records
         if row["performer_group"] == "unknown"
     ]
-    if unknown:
+    if unknown and not args.allow_unknown_performer_group:
         raise RuntimeError(
-            "Unknown performer_group for sources: %s" % unknown
+            "Unknown performer_group for sources: %s. Pass "
+            "--allow_unknown_performer_group for datasets such as AIST++ "
+            "whose released motion metadata does not declare gender." % unknown
         )
 
     target = exact_split_counts(
@@ -481,6 +491,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "materialization_requested": args.mode,
         "materialization_actual": dict(materialization),
         "num_sources": len(records),
+        "unknown_performer_group_allowed": bool(
+            args.allow_unknown_performer_group
+        ),
+        "unknown_performer_group_sources": sorted(unknown),
         "splits": {
             split: {
                 "sources": len(rows),

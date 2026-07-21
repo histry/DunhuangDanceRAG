@@ -430,6 +430,9 @@ def normalize_slot(slot0: dict, meta: Dict[str, Any], index: int, fps: float, so
 
 
 def parse_descriptor_file(path: str | Path, *, require_final_schedule: bool = False, fps: float = 30.0, temperature: float = 0.65, usage: str = "auto") -> Tuple[List[dict], np.ndarray, Dict[str, Any]]:
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"fps must be finite and positive, got {fps!r}")
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(str(p))
@@ -459,6 +462,28 @@ def parse_descriptor_file(path: str | Path, *, require_final_schedule: bool = Fa
     if usage != "auto":
         meta["usage_request"] = usage
     final = is_final_schedule_meta(meta)
+    declared_fps = meta.get("fps")
+    if final:
+        if declared_fps is None:
+            raise RuntimeError(
+                f"Final MSSD descriptor has no FPS contract: {p}"
+            )
+        try:
+            declared_fps = float(declared_fps)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Final MSSD descriptor has invalid FPS metadata: {declared_fps!r}"
+            ) from exc
+        if not np.isfinite(declared_fps) or declared_fps <= 0.0:
+            raise RuntimeError(
+                f"Final MSSD descriptor has invalid FPS metadata: {declared_fps!r}"
+            )
+        if abs(declared_fps - fps) > 1.0e-6:
+            raise RuntimeError(
+                "Final MSSD FPS contract mismatch: "
+                f"descriptor={declared_fps}, runtime={fps}, path={p}"
+            )
+    meta["fps"] = fps if declared_fps is None else float(declared_fps)
     if require_final_schedule and not final:
         raise RuntimeError(
             f"MSSD strict generation requires final schedule, but descriptor is not final: {p}; "
@@ -548,6 +573,12 @@ def load_descriptor_for_audio(audio_path: str | Path, *, descriptor_dirs: Any = 
 
 def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any]) -> Dict[str, Any]:
     total = int(sum(int(s.get("target_frames", 0)) for s in slots))
+    final = is_final_schedule_meta(meta)
+    if final and meta.get("fps") is None:
+        raise RuntimeError("Final MSSD descriptor metadata must declare fps")
+    fps = float(meta.get("fps", 30.0))
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise RuntimeError(f"MSSD descriptor metadata has invalid fps: {fps!r}")
     out = {
         "descriptor_type": "music_semantic_slot_descriptor",
         "descriptor_schema_version": MSSD_SCHEMA_VERSION,
@@ -555,7 +586,7 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
         "is_final_schedule": bool(meta.get("is_final_schedule", True)),
         "slot_source": str(meta.get("slot_source", "v21_router_v26_planner")),
         "audio": str(audio),
-        "fps": float(meta.get("fps", 30.0)),
+        "fps": fps,
         "num_slots": int(len(slots)),
         "total_target_frames": total,
         "slots": slots,

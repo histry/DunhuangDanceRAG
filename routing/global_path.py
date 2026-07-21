@@ -382,6 +382,7 @@ def _patch_report(
     report_path: Path,
     duration_guard: Optional[Mapping[str, Any]] = None,
     motion_path: Optional[Path] = None,
+    fps: float = 30.0,
 ) -> None:
     if not report_path.is_file():
         return
@@ -403,7 +404,10 @@ def _patch_report(
 
     if resolved_motion is not None:
         x = np.load(resolved_motion, allow_pickle=True)
-        report["v46_53_final_intrinsic_audit"] = audit_motion(x)
+        report["v46_53_final_intrinsic_audit"] = audit_motion(
+            x,
+            fps=float(fps),
+        )
         report["v46_53_final_motion_path"] = str(resolved_motion)
     v52.save_json(report, report_path)
 
@@ -414,6 +418,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     schedule = v52._arg_value(args, "--slots_json")
     report_json = v52._arg_value(args, "--json")
     output = v52._arg_value(args, "--out")
+    fps = v52._runtime_fps(args)
     if not audio or not schedule or not output:
         raise RuntimeError("V46.53 requires --audio, a fresh --slots_json, and --out")
     required_run_id = os.environ.get("V46_51_SCHEDULE_RUN_ID")
@@ -422,7 +427,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     contract = v52.audit_contract(
         audio=audio,
         schedule=schedule,
-        fps=float(os.environ.get("V46_FPS", "30")),
+        fps=fps,
         required_run_id=required_run_id,
         require_fresh=True,
         max_frame_error=int(float(os.environ.get("V46_51_MAX_FRAME_ERROR", "2"))),
@@ -440,7 +445,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         duration_guard = _dynamic_duration_guard(
             Path(output),
             contract,
-            fps=float(os.environ.get("V46_FPS", "30")),
+            fps=fps,
         )
     if report_json:
         resolved_output = Path(output)
@@ -449,12 +454,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(report_json),
             contract,
             motion_path=resolved_output,
+            fps=fps,
         )
 
         _patch_report(
             Path(report_json),
             duration_guard=duration_guard,
             motion_path=resolved_output,
+            fps=fps,
         )
     return rc
 

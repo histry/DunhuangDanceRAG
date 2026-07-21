@@ -21,6 +21,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from motion_geometry.smpl24 import skeleton_contract
+from support.checkpoint_contracts import (
+    assert_checkpoint_fps,
+    checkpoint_declared_fps,
+)
 
 RATE_FIELDS = (
     "window_len",
@@ -69,6 +73,72 @@ def _checkpoint_for_rate(args: argparse.Namespace, fps: int) -> str | None:
     return getattr(args, f"duration_ckpt_{fps}")
 
 
+def _load_checkpoint_contract(path: Path) -> dict[str, Any]:
+    # Import lazily so dry-run planning remains usable in lightweight
+    # environments that do not install the training runtime.
+    import torch
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Checkpoint is not a mapping: {path}")
+    return checkpoint
+
+
+def _preflight_rate_specific_checkpoints(args: argparse.Namespace) -> dict[str, Any]:
+    """Fail before costly data builds when a formal asset is absent or stale."""
+
+    if not args.execute:
+        return {}
+
+    report: dict[str, Any] = {}
+    missing_arguments: list[str] = []
+    for fps in (30, 60):
+        for role, prefix in (
+            ("Router", "router_ckpt"),
+            ("Planner", "planner_ckpt"),
+            ("Duration", "duration_ckpt"),
+        ):
+            argument = f"{prefix}_{fps}"
+            raw_path = getattr(args, argument, None)
+            if not raw_path:
+                missing_arguments.append(f"--{argument}")
+                continue
+
+            path = Path(raw_path).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Formal {fps} FPS {role} checkpoint does not exist: {path}"
+                )
+
+            checkpoint = _load_checkpoint_contract(path)
+            # A formal rebuild must never inherit the legacy-baseline escape
+            # hatch, even if it happens to be present in the parent shell.
+            if checkpoint_declared_fps(checkpoint) is None:
+                raise RuntimeError(
+                    f"Formal {fps} FPS {role} checkpoint {path} has no FPS "
+                    "contract; rebuild the rate-specific asset."
+                )
+            declared = assert_checkpoint_fps(
+                checkpoint,
+                role=role,
+                runtime_fps=float(fps),
+                path=str(path),
+            )
+            report[f"{role.lower()}_{fps}"] = {
+                "path": str(path),
+                "sha256": _sha256(path),
+                "fps": declared,
+            }
+
+    if missing_arguments:
+        joined = ", ".join(missing_arguments)
+        raise RuntimeError(
+            "Formal multi-rate build requires all rate-specific Scheduler "
+            f"checkpoints before execution; missing: {joined}"
+        )
+    return report
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source_dirs", nargs="+", required=True, help="BVH/AIST++ roots; each root gets an isolated retarget cache.")
@@ -91,6 +161,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--train_v45_v46", action="store_true")
     parser.add_argument("--refiner_steps", type=int)
     parser.add_argument("--diffusion_steps", type=int)
+    parser.add_argument("--split_seed", type=int, default=20260718)
+    parser.add_argument("--train_ratio", type=float, default=0.67)
+    parser.add_argument("--val_ratio", type=float, default=0.165)
+    parser.add_argument("--test_ratio", type=float, default=0.165)
     args = parser.parse_args(argv)
 
     if args.execute and args.train_v45_v46 and not args.regression_audio:
@@ -99,17 +173,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "can gate training for both frame-rate branches."
         )
 
+    checkpoint_preflight = _preflight_rate_specific_checkpoints(args)
+
     output_root = Path(args.output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    base = json.loads(Path(args.base_config).read_text(encoding="utf-8"))
+    base_config_path = Path(args.base_config).expanduser()
+    if not base_config_path.is_absolute():
+        base_config_path = ROOT / base_config_path
+    base_config_path = base_config_path.resolve()
+    base = json.loads(base_config_path.read_text(encoding="utf-8"))
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     python = sys.executable
-    intervals = output_root / "canonical30" / "event_intervals.json"
+    intervals_root = output_root / "canonical_intervals"
     plan: dict[str, Any] = {
-        "schema": "dunhuang_multirate_build_plan_v1",
+        "schema": "dunhuang_multirate_build_plan_v2_source_disjoint",
         "source_dirs": [str(Path(p).resolve()) for p in args.source_dirs],
+        "base_config": str(base_config_path),
         "skeleton_contract": skeleton_contract(),
+        "checkpoint_preflight": checkpoint_preflight,
         "branches": {},
     }
 
@@ -118,6 +200,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         branch = output_root / name
         config = branch / "motion_model.json"
         profile = _write_profile(base, float(fps), config)
+        branch_env = dict(env)
+        branch_env.update({
+            "V46_FPS": str(float(fps)),
+            "V46_51_FPS": str(float(fps)),
+            "V46_49_RETARGET_FPS": str(float(fps)),
+            "V46_53_GROUNDER_CKPT": str(
+                branch / "checkpoints" / "dual_branch_grounder.pt"
+            ),
+        })
         cache_dirs: list[Path] = []
         commands: list[list[str]] = []
         for index, raw in enumerate(args.source_dirs):
@@ -137,28 +228,56 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command.append("--overwrite")
             commands.append(command)
 
-        event_db = branch / "event_db"
-        event_command = [
-            python, "-m", "events.build_database",
-            "--motion_dirs", *[str(path) for path in cache_dirs],
-            "--out_db", str(event_db),
-            "--config", str(config),
+        cache_root = branch / "retarget_cache"
+        split_root = branch / "retarget_cache_split"
+        split_command = [
+            python, "-m", "data_pipeline.split_sources",
+            "--cache_root", str(cache_root),
+            "--out_root", str(split_root),
+            "--seed", str(args.split_seed),
+            "--train_ratio", str(args.train_ratio),
+            "--val_ratio", str(args.val_ratio),
+            "--test_ratio", str(args.test_ratio),
+            "--mode", "hardlink",
+            "--allow_unknown_performer_group",
         ]
         if args.overwrite:
-            event_command.append("--overwrite")
-        if fps == 30:
-            event_command.extend(("--canonical_intervals_out", str(intervals)))
-        else:
-            event_command.extend(("--canonical_intervals_in", str(intervals)))
-        commands.append(event_command)
+            split_command.append("--overwrite")
+        commands.append(split_command)
 
-        semantic_db = event_db / "events_aesd.npz"
-        commands.append([
-            python, "-m", "events.build_semantics",
-            "--db", str(event_db / "events.npz"),
-            "--out", str(semantic_db),
-            "--json", str(event_db / "events_aesd.report.json"),
-        ])
+        event_db_root = branch / "event_db"
+        semantic_dbs: dict[str, Path] = {}
+        for split in ("train", "val", "test"):
+            event_db = event_db_root / split
+            intervals = intervals_root / f"{split}.json"
+            event_command = [
+                python, "-m", "events.build_pipeline",
+                "--motion_dirs", str(split_root / split),
+                "--out_db", str(event_db),
+                "--config", str(config),
+            ]
+            if args.overwrite:
+                event_command.append("--overwrite")
+            if fps == 30:
+                event_command.extend((
+                    "--canonical_intervals_out", str(intervals)
+                ))
+            else:
+                event_command.extend((
+                    "--canonical_intervals_in", str(intervals)
+                ))
+            commands.append(event_command)
+
+            semantic_db = event_db / "events_aesd.npz"
+            semantic_dbs[split] = semantic_db
+            commands.append([
+                python, "-m", "events.build_semantics",
+                "--db", str(event_db / "events.npz"),
+                "--out", str(semantic_db),
+                "--json", str(event_db / "events_aesd.report.json"),
+            ])
+
+        semantic_db = semantic_dbs["train"]
         scheduler = branch / "scheduler"
         base_index = scheduler / "event_index.base.npz"
         commands.append([
@@ -227,14 +346,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "config": str(config),
             "config_sha256": _sha256(config),
             "profile": profile,
-            "event_db": str(semantic_db),
+            "source_split": str(split_root / "source_split_manifest.json"),
+            "event_dbs": {
+                split: str(path) for split, path in semantic_dbs.items()
+            },
+            "training_event_db": str(semantic_db),
             "scheduler_index": str(scheduler / "event_index.json"),
             "duration_index": str(scheduler / "duration_index.npz"),
             "asset_bundle": str(scheduler / "asset_bundle.json"),
             "commands": commands,
         }
         for command in commands:
-            _run(command, execute=args.execute, env=env)
+            _run(command, execute=args.execute, env=branch_env)
 
     plan_path = output_root / "multirate_build_manifest.json"
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")

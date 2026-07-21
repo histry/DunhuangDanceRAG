@@ -70,6 +70,7 @@ from scheduling.music_phrase_segmentation import (
 )
 from scheduling.deep_music_features import phrase_semantic_matrix
 from scheduling.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
+from support.checkpoint_contracts import assert_checkpoint_fps
 from motion_geometry.heading import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
 
 
@@ -367,26 +368,12 @@ def planner_bundle_lengths(path: str, fps: float) -> Tuple[int, ...]:
 def validate_checkpoint_fps(path: str, role: str, fps: float) -> None:
     """Reject Scheduler checkpoints trained under an unknown or other frame rate."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(f"{role} checkpoint is not a mapping: {path}")
-    config = checkpoint.get("config", {})
-    if not isinstance(config, dict):
-        raise RuntimeError(f"{role} checkpoint config is not a mapping: {path}")
-    declared = config.get("fps", checkpoint.get("fps"))
-    if declared is None:
-        legacy_ok = (
-            abs(float(fps) - 30.0) < 1.0e-6
-            and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS", "0") == "1"
-        )
-        if legacy_ok:
-            return
-        raise RuntimeError(
-            f"{role} checkpoint has no FPS contract: {path}. Rebuild the rate-specific asset."
-        )
-    if abs(float(declared) - float(fps)) > 1.0e-6:
-        raise RuntimeError(
-            f"{role} checkpoint FPS mismatch: checkpoint={declared}, runtime={fps}, path={path}"
-        )
+    assert_checkpoint_fps(
+        checkpoint,
+        role=role,
+        runtime_fps=float(fps),
+        path=str(path),
+    )
 
 
 def choose_events(
@@ -890,6 +877,9 @@ def generate_one(
                     device=device,
                     blend=args.transition_diffusion_blend,
                     steps=args.transition_diffusion_steps,
+                    previous_context=contents[slot - 1],
+                    next_context=content,
+                    fps=float(args.fps),
                 )
                 transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
             else:
@@ -1178,8 +1168,20 @@ def main() -> None:
     if args.planner_ckpt:
         validate_checkpoint_fps(args.planner_ckpt, "Planner", float(args.fps))
     router = load_router_checkpoint(args.router_ckpt, device=device)
-    transition_bundle = load_optional_transition(args.transition_ckpt, device)
-    args.transition_diffusion_bundle = load_transition_diffusion(args.transition_diffusion_ckpt, device) if args.transition_diffusion and args.transition_diffusion_ckpt else None
+    transition_bundle = load_optional_transition(
+        args.transition_ckpt,
+        device,
+        fps=float(args.fps),
+    )
+    args.transition_diffusion_bundle = (
+        load_transition_diffusion(
+            args.transition_diffusion_ckpt,
+            device,
+            fps=float(args.fps),
+        )
+        if args.transition_diffusion and args.transition_diffusion_ckpt
+        else None
+    )
     v23_bundle = load_duration_checkpoint(args.v23_ckpt, device=device)
     planner_bundle = load_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
 

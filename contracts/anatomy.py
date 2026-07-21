@@ -95,6 +95,13 @@ POSTURE_ORDER = {
 }
 
 
+def _frames_at_rate(frames_at_30fps: int, fps: float, minimum: int = 1) -> int:
+    rate = float(fps)
+    if not np.isfinite(rate) or rate <= 0.0:
+        raise ValueError(f"fps must be finite and positive, got {fps!r}")
+    return max(int(minimum), int(round(int(frames_at_30fps) * rate / 30.0)))
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
@@ -569,7 +576,10 @@ def event_anatomy_features(motion: np.ndarray, fps: float = 30.0) -> Dict[str, A
     ) / max(REST_BODY_HEIGHT, 1e-6)
     metrics = anatomy_metrics_np(x, fps=fps)
     detail = evaluate_anatomy_contract_detailed(metrics)
-    edge_n = max(1, min(len(x), env_int("V46_52_EVENT_EDGE_FRAMES", 6)))
+    edge_n = min(
+        len(x),
+        _frames_at_rate(env_int("V46_52_EVENT_EDGE_FRAMES", 6), fps),
+    )
     return {
         "anatomy_valid": bool(detail["hard_ok"]),
         "anatomy_hard_valid": bool(detail["hard_ok"]),
@@ -611,10 +621,16 @@ def transition_anatomy_risk(
     p = _as_motion(previous)
     b = _as_motion(transition) if len(transition) else np.zeros((0, EDGE_DIM), np.float32)
     f = _as_motion(following)
-    context = np.concatenate([p[-8:], b, f[:8]], axis=0)
+    context_n = _frames_at_rate(8, fps)
+    event_context_n = _frames_at_rate(12, fps)
+    context = np.concatenate([p[-context_n:], b, f[:context_n]], axis=0)
     m = anatomy_metrics_np(context, fps=fps)
-    pfeat = event_anatomy_features(p[-min(len(p), 12):], fps=fps)
-    ffeat = event_anatomy_features(f[:min(len(f), 12)], fps=fps)
+    pfeat = event_anatomy_features(
+        p[-min(len(p), event_context_n):], fps=fps
+    )
+    ffeat = event_anatomy_features(
+        f[:min(len(f), event_context_n)], fps=fps
+    )
     posture_gap = posture_distance(pfeat["posture_exit"], ffeat["posture_entry"])
     pelvis_gap = abs(float(pfeat["pelvis_height_exit_norm"]) - float(ffeat["pelvis_height_entry_norm"]))
     body_gap = abs(float(pfeat["body_height_exit_norm"]) - float(ffeat["body_height_entry_norm"]))
@@ -659,7 +675,7 @@ def align_core_floor_np(
     if previous is None or not len(previous) or not len(c):
         return c, {"enabled": False, "reason": "no_previous"}
     p = _as_motion(previous)
-    n = max(2, min(12, len(p), len(c)))
+    n = max(2, min(_frames_at_rate(12, fps), len(p), len(c)))
     jp = fk24_np(p[-n:])
     jc = fk24_np(c[:n])
     prev_floor = float(np.percentile(jp[:, list(FOOT_JOINTS), 1], 10))
