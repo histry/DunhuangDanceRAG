@@ -25,49 +25,24 @@ except Exception:  # pragma: no cover
     torch = None
     F = None
 
-EDGE_DIM = 151
-CONTACT = slice(0, 4)
-ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX = 4, 5, 6
-ROT6D_START, ROT6D_END = 7, 151
-NUM_JOINTS = 24
-FOOT_JOINTS = (7, 8, 10, 11)
+from motion_geometry.rotations import matrix_to_rot6d_np, rot6d_to_matrix_np
+from motion_geometry.smpl24 import (
+    CONTACT,
+    FOOT_JOINTS,
+    MOTION_DIM as EDGE_DIM,
+    NUM_JOINTS,
+    OFFSETS,
+    PARENTS,
+    ROOT_X_IDX,
+    ROOT_Y_IDX,
+    ROOT_Z_IDX,
+    ROT6D_END,
+    ROT6D_START,
+)
+
 PELVIS = 0
 NECK = 12
 HEAD = 15
-
-PARENTS = np.asarray(
-    [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21],
-    dtype=np.int64,
-)
-OFFSETS = np.asarray(
-    [
-        [0.0000, 0.0000, 0.0000],
-        [0.05858135, -0.08228004, -0.01766408],
-        [-0.06030973, -0.09051332, -0.01354254],
-        [0.00443945, 0.12440352, -0.03838522],
-        [0.04345142, -0.38646945, 0.00803700],
-        [-0.04325663, -0.38368791, -0.00484304],
-        [0.00448844, 0.13795640, 0.02682033],
-        [-0.01479032, -0.42687458, -0.03742800],
-        [0.01905555, -0.42004550, -0.03456167],
-        [-0.00226458, 0.05603239, 0.00285505],
-        [0.04105436, -0.06028581, 0.12204243],
-        [-0.03483987, -0.06210566, 0.13032329],
-        [-0.01339020, 0.21163553, -0.03346758],
-        [0.07170245, 0.11399969, -0.01889817],
-        [-0.08295366, 0.11247234, -0.02370739],
-        [0.01011321, 0.08893734, 0.05040987],
-        [0.12292141, 0.04520509, -0.01904600],
-        [-0.11322832, 0.04685326, -0.00847207],
-        [0.25533190, -0.01564902, -0.02294649],
-        [-0.26012748, -0.01436928, -0.03126873],
-        [0.26570925, 0.01269811, -0.00737473],
-        [-0.26910836, 0.00679372, -0.00602676],
-        [0.08669055, -0.01063603, -0.01559429],
-        [-0.08875370, -0.00865157, -0.01010708],
-    ],
-    dtype=np.float32,
-)
 
 
 @dataclass
@@ -86,28 +61,6 @@ class GravityThresholds:
 def identity6d_np(shape_prefix: Tuple[int, ...] = ()) -> np.ndarray:
     base = np.asarray([1, 0, 0, 0, 1, 0], dtype=np.float32)
     return np.broadcast_to(base, tuple(shape_prefix) + (6,)).copy()
-
-
-def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    a1, a2 = x[..., :3], x[..., 3:6]
-    n1 = np.linalg.norm(a1, axis=-1, keepdims=True)
-    b1 = a1 / np.maximum(n1, 1e-8)
-    a2o = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
-    n2 = np.linalg.norm(a2o, axis=-1, keepdims=True)
-    b2 = a2o / np.maximum(n2, 1e-8)
-    b3 = np.cross(b1, b2)
-    out = np.stack([b1, b2, b3], axis=-1)
-    bad = (~np.isfinite(out).all(axis=(-2, -1))) | (n1[..., 0] < 1e-7) | (n2[..., 0] < 1e-7)
-    if np.any(bad):
-        out = out.copy()
-        out[bad] = np.eye(3, dtype=np.float32)
-    return out.astype(np.float32)
-
-
-def matrix_to_rot6d_np(m: np.ndarray) -> np.ndarray:
-    m = np.asarray(m, dtype=np.float32)
-    return np.concatenate([m[..., :, 0], m[..., :, 1]], axis=-1).astype(np.float32)
 
 
 def fk24_np(motion: np.ndarray) -> np.ndarray:
@@ -175,7 +128,7 @@ def gravity_metrics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, float
         "pelvis_y_p95": float(np.percentile(pelvis[:, 1], 95)),
         "floor_y": floor_y,
         "foot_height_above_floor_p95": float(np.percentile(feet[..., 1] - floor_y, 95)),
-        "foot_speed_xz_p95_mpf": float(np.percentile(foot_vel_xz, 95)),
+        "foot_speed_xz_p95_mps": float(np.percentile(foot_vel_xz * float(fps), 95)),
     }
 
 

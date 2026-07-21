@@ -414,6 +414,8 @@ def normalize_slot(slot0: dict, meta: Dict[str, Any], index: int, fps: float, so
     # Preserve V26 raw fields in a predictable namespace for auditing.
     if "event_id" in slot and "v26_event_id" not in out:
         out["v26_event_id"] = slot.get("event_id")
+    if "event_uid" in slot and "v26_event_uid" not in out:
+        out["v26_event_uid"] = slot.get("event_uid")
     if "event_index" in slot and "v26_event_index" not in out:
         out["v26_event_index"] = slot.get("event_index")
     if "family_id" in slot and "v26_family_id" not in out:
@@ -561,7 +563,15 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
         "segments": slots,
         "provenance": dict(meta.get("provenance", {})),
     }
-    for k in ["router_ckpt", "planner_ckpt", "v23_ckpt", "raw_schedule_json", "schedule_summary_json"]:
+    for k in [
+        "router_ckpt",
+        "planner_ckpt",
+        "v23_ckpt",
+        "raw_schedule_json",
+        "schedule_summary_json",
+        "event_db_contract",
+        "transition_budget",
+    ]:
         if k in meta and meta[k]:
             out[k] = meta[k]
     return out

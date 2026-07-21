@@ -21,61 +21,28 @@ import torch
 from pytorch3d.transforms import (
     axis_angle_to_matrix,
     matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
+)
+from motion_geometry.rotations import (
+    matrix_to_rot6d_torch as matrix_to_rotation_6d,
+    rot6d_to_matrix_torch as rotation_6d_to_matrix,
+)
+from motion_geometry.smpl24 import (
+    CONTACT,
+    JOINT_NAMES as SMPL_JOINT_NAMES,
+    MOTION_DIM,
+    NUM_JOINTS,
+    OFFSETS as SMPL_OFFSETS,
+    PARENTS as SMPL_PARENTS,
+    ROOT,
+    ROOT_X_IDX as ROOT_X,
+    ROOT_Y_IDX as ROOT_Y,
+    ROOT_Z_IDX as ROOT_Z,
+    ROT6D_END,
+    ROT6D_START,
 )
 
-CONTACT = slice(0, 4)
-ROOT = slice(4, 7)
-ROOT_X = 4
-ROOT_Y = 5
-ROOT_Z = 6
-ROT = slice(7, 151)
-ROOT_ROT6D = slice(7, 13)
-NUM_JOINTS = 24
-MOTION_DIM = 151
-
-SMPL_JOINT_NAMES = (
-    "root", "lhip", "rhip", "belly", "lknee", "rknee", "spine",
-    "lankle", "rankle", "chest", "ltoes", "rtoes", "neck",
-    "linshoulder", "rinshoulder", "head", "lshoulder", "rshoulder",
-    "lelbow", "relbow", "lwrist", "rwrist", "lhand", "rhand",
-)
-
-SMPL_PARENTS = (
-    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
-    9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21,
-)
-
-SMPL_OFFSETS = np.asarray(
-    [
-        [0.0, 0.0, 0.0],
-        [0.05858135, -0.08228004, -0.01766408],
-        [-0.06030973, -0.09051332, -0.01354254],
-        [0.00443945, 0.12440352, -0.03838522],
-        [0.04345142, -0.38646945, 0.008037],
-        [-0.04325663, -0.38368791, -0.00484304],
-        [0.00448844, 0.1379564, 0.02682033],
-        [-0.01479032, -0.42687458, -0.037428],
-        [0.01905555, -0.4200455, -0.03456167],
-        [-0.00226458, 0.05603239, 0.00285505],
-        [0.04105436, -0.06028581, 0.12204243],
-        [-0.03483987, -0.06210566, 0.13032329],
-        [-0.0133902, 0.21163553, -0.03346758],
-        [0.07170245, 0.11399969, -0.01889817],
-        [-0.08295366, 0.11247234, -0.02370739],
-        [0.01011321, 0.08893734, 0.05040987],
-        [0.12292141, 0.04520509, -0.019046],
-        [-0.11322832, 0.04685326, -0.00847207],
-        [0.2553319, -0.01564902, -0.02294649],
-        [-0.26012748, -0.01436928, -0.03126873],
-        [0.26570925, 0.01269811, -0.00737473],
-        [-0.26910836, 0.00679372, -0.00602676],
-        [0.08669055, -0.01063603, -0.01559429],
-        [-0.0887537, -0.00865157, -0.01010708],
-    ],
-    dtype=np.float32,
-)
+ROT = slice(ROT6D_START, ROT6D_END)
+ROOT_ROT6D = slice(ROT6D_START, ROT6D_START + 6)
 
 
 def smootherstep01(x):
@@ -304,36 +271,9 @@ def make_so3_transition(
 
 
 def resample_motion_so3_np(motion: np.ndarray, positions: np.ndarray) -> np.ndarray:
-    x = _validate_motion_np(motion)
-    positions = np.asarray(positions, dtype=np.float32).reshape(-1)
-    positions = np.clip(positions, 0.0, max(len(x) - 1, 0))
-    if len(x) == 1:
-        return np.repeat(x, len(positions), axis=0)
+    from motion_geometry.resampling import resample_edge151_np
 
-    lo = np.floor(positions).astype(np.int64)
-    hi = np.minimum(lo + 1, len(x) - 1)
-    alpha = positions - lo.astype(np.float32)
-    nearest = np.rint(positions).astype(np.int64)
-
-    out = np.zeros((len(positions), MOTION_DIM), dtype=np.float32)
-    out[:, CONTACT] = x[nearest, CONTACT]
-    for dim in (ROOT_X, ROOT_Y, ROOT_Z):
-        out[:, dim] = np.interp(
-            positions, np.arange(len(x), dtype=np.float32), x[:, dim]
-        ).astype(np.float32)
-
-    with torch.no_grad():
-        matrices = motion_rotation_matrices_torch(torch.from_numpy(x))
-        r0 = matrices[torch.from_numpy(lo).long()]
-        r1 = matrices[torch.from_numpy(hi).long()]
-        relative = torch.matmul(r0.transpose(-1, -2), r1)
-        tangent = matrix_to_axis_angle(relative)
-        delta = axis_angle_to_matrix(
-            torch.from_numpy(alpha).float()[:, None, None] * tangent
-        )
-        interp = torch.matmul(r0, delta)
-        out[:, ROT] = matrix_to_rotation_6d(interp).reshape(len(out), -1).cpu().numpy()
-    return out.astype(np.float32)
+    return resample_edge151_np(_validate_motion_np(motion), positions=positions)
 
 
 def dampen_event_edges_so3(
@@ -511,10 +451,13 @@ def endpoint_metrics_np(prev: np.ndarray, nxt: np.ndarray, fps: float = 30.0) ->
     pair_yaw = root_yaw_np(np.stack([a[-1], b[0]], axis=0))
     yaw_gap = abs(float(pair_yaw[1] - pair_yaw[0]))
     return {
-        # Backward-compatible normalized fields used by the V26 scheduler.
         "pose_jump": float(torch.sqrt(torch.mean(pose_angle**2)).item() / np.pi),
-        "velocity_jump": float(torch.sqrt(torch.mean(velocity_jump**2)).item()),
-        "acceleration_jump": float(torch.sqrt(torch.mean(acceleration_jump**2)).item()),
+        "angular_velocity_jump_radps_rms": float(
+            torch.sqrt(torch.mean(velocity_jump**2)).item() * fps
+        ),
+        "angular_acceleration_jump_radps2_rms": float(
+            torch.sqrt(torch.mean(acceleration_jump**2)).item() * fps * fps
+        ),
         "contact_jump": float(np.abs(a[-1, CONTACT] - b[0, CONTACT]).mean()),
         "yaw_gap_deg": float(yaw_gap * 180.0 / np.pi),
         # Interpretable scientific fields.
@@ -543,21 +486,21 @@ def jitter_statistics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, obj
         per_joint.append(
             {
                 "joint": name,
-                "jerk_p95": float(np.percentile(values, 95)) if len(values) else 0.0,
-                "jerk_max": float(values.max()) if len(values) else 0.0,
+                "jerk_p95_mps3": float(np.percentile(values, 95)) if len(values) else 0.0,
+                "jerk_max_mps3": float(values.max()) if len(values) else 0.0,
             }
         )
-    per_joint.sort(key=lambda row: row["jerk_p95"], reverse=True)
+    per_joint.sort(key=lambda row: row["jerk_p95_mps3"], reverse=True)
 
     frame_score = jerk_norm.mean(axis=1) if len(jerk_norm) else np.zeros((0,))
     top_indices = np.argsort(frame_score)[::-1][: min(20, len(frame_score))]
     return {
-        "joint_acceleration_p95": float(np.percentile(acc_norm, 95)) if acc_norm.size else 0.0,
-        "joint_acceleration_max": float(acc_norm.max()) if acc_norm.size else 0.0,
-        "joint_jerk_p95": float(np.percentile(jerk_norm, 95)) if jerk_norm.size else 0.0,
-        "joint_jerk_max": float(jerk_norm.max()) if jerk_norm.size else 0.0,
-        "angular_jerk_p95": float(np.percentile(np.linalg.norm(angular_jerk, axis=-1), 95)) if angular_jerk.size else 0.0,
-        "root_y_acceleration_p95": float(
+        "joint_acceleration_p95_mps2": float(np.percentile(acc_norm, 95)) if acc_norm.size else 0.0,
+        "joint_acceleration_max_mps2": float(acc_norm.max()) if acc_norm.size else 0.0,
+        "joint_jerk_p95_mps3": float(np.percentile(jerk_norm, 95)) if jerk_norm.size else 0.0,
+        "joint_jerk_max_mps3": float(jerk_norm.max()) if jerk_norm.size else 0.0,
+        "angular_jerk_p95_radps3": float(np.percentile(np.linalg.norm(angular_jerk, axis=-1), 95)) if angular_jerk.size else 0.0,
+        "root_y_acceleration_p95_mps2": float(
             np.percentile(np.abs(np.diff(x[:, ROOT_Y], n=2)) * fps * fps, 95)
         ) if len(x) >= 3 else 0.0,
         "per_joint_jerk": per_joint,
@@ -565,7 +508,7 @@ def jitter_statistics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, obj
             {
                 "frame": int(i + 2),
                 "time_seconds": float((i + 2) / fps),
-                "mean_joint_jerk": float(frame_score[i]),
+                "mean_joint_jerk_mps3": float(frame_score[i]),
             }
             for i in top_indices
         ],

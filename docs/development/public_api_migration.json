@@ -45,7 +45,7 @@
     "PATH_MIGRATION.json",
     "scheduling/build_duration_index.py",
     "scheduling/schedule_multi_music.py",
-    "scheduling/schedule_whole_song.py"
+    "scheduling/whole_song_scheduler.py"
   ],
   "installed": [
     "data_pipeline/split_sources.py",

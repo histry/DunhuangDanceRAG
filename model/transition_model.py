@@ -9,9 +9,15 @@ from typing import Any, Dict, Iterable, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from motion_geometry.rotations import (
+    CANONICAL_ROT6D_LAYOUT,
+    ROT6D_LAYOUT_PYTORCH3D_ROW,
+    normalize_rot6d_layout,
+)
 
 
 TRANSITION_LENGTHS = (4, 6, 8, 10, 12, 16)
+NATIVE_ROT6D_LAYOUT = ROT6D_LAYOUT_PYTORCH3D_ROW
 
 
 class V21TransitionDurationPredictor(nn.Module):
@@ -111,6 +117,14 @@ class V21EndpointTransitionRefiner(nn.Module):
 def load_transition_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = dict(checkpoint.get("config", {}))
+    checkpoint_layout = normalize_rot6d_layout(
+        checkpoint.get("rot6d_layout", config.get("rot6d_layout", NATIVE_ROT6D_LAYOUT))
+    )
+    if checkpoint_layout != NATIVE_ROT6D_LAYOUT:
+        raise RuntimeError(
+            "This historical transition architecture expects PyTorch3D-row "
+            f"Rot6D, but checkpoint declares {checkpoint_layout!r}."
+        )
     dpn = V21TransitionDurationPredictor(
         input_dim=int(config.get("dpn_input_dim", 20)),
         hidden_dim=int(config.get("dpn_hidden_dim", 192)),
@@ -132,4 +146,12 @@ def load_transition_checkpoint(path: str | Path, device: torch.device | str = "c
         "refiner": refiner,
         "config": config,
         "transition_lengths": tuple(config.get("transition_lengths", TRANSITION_LENGTHS)),
+        "rot6d_layout": checkpoint_layout,
+        "canonical_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
     }
+
+
+# Version-free class names for new code. Historical checkpoint state keys are
+# intentionally unchanged.
+TransitionDurationPredictor = V21TransitionDurationPredictor
+EndpointTransitionRefiner = V21EndpointTransitionRefiner

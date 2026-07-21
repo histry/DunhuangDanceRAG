@@ -26,6 +26,34 @@ except Exception:  # pragma: no cover
 
 EPS = 1.0e-8
 
+ROT6D_LAYOUT_COLUMN = "column"
+ROT6D_LAYOUT_PYTORCH3D_ROW = "pytorch3d_row"
+CANONICAL_ROT6D_LAYOUT = ROT6D_LAYOUT_COLUMN
+
+
+def normalize_rot6d_layout(layout: str | None) -> str:
+    """Return a stable serialized name for a supported Rot6D layout."""
+
+    value = str(layout or CANONICAL_ROT6D_LAYOUT).strip().lower().replace("-", "_")
+    aliases = {
+        "column": ROT6D_LAYOUT_COLUMN,
+        "columns": ROT6D_LAYOUT_COLUMN,
+        "column_concat": ROT6D_LAYOUT_COLUMN,
+        "edge_column": ROT6D_LAYOUT_COLUMN,
+        "row": ROT6D_LAYOUT_PYTORCH3D_ROW,
+        "rows": ROT6D_LAYOUT_PYTORCH3D_ROW,
+        "row_concat": ROT6D_LAYOUT_PYTORCH3D_ROW,
+        "pytorch3d": ROT6D_LAYOUT_PYTORCH3D_ROW,
+        "pytorch3d_row": ROT6D_LAYOUT_PYTORCH3D_ROW,
+    }
+    try:
+        return aliases[value]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported Rot6D layout {layout!r}; expected one of "
+            f"{sorted(set(aliases.values()))}"
+        ) from exc
+
 
 def _as_float_np(x: np.ndarray) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
@@ -79,6 +107,76 @@ def matrix_to_rot6d_np(m: np.ndarray, project: bool = True) -> np.ndarray:
     return np.concatenate([r[..., :, 0], r[..., :, 1]], axis=-1).astype(np.float32)
 
 
+def rot6d_to_matrix_layout_np(
+    x: np.ndarray,
+    layout: str = CANONICAL_ROT6D_LAYOUT,
+    project: bool = True,
+) -> np.ndarray:
+    """Decode either the canonical column or historical PyTorch3D row layout."""
+
+    normalized = normalize_rot6d_layout(layout)
+    matrix = rot6d_to_matrix_np(x, project=False)
+    if normalized == ROT6D_LAYOUT_PYTORCH3D_ROW:
+        matrix = np.swapaxes(matrix, -1, -2)
+    return project_to_so3_np(matrix) if project else matrix.astype(np.float32)
+
+
+def matrix_to_rot6d_layout_np(
+    m: np.ndarray,
+    layout: str = CANONICAL_ROT6D_LAYOUT,
+    project: bool = True,
+) -> np.ndarray:
+    """Encode a rotation using an explicitly declared Rot6D layout."""
+
+    normalized = normalize_rot6d_layout(layout)
+    matrix = project_to_so3_np(m) if project else _as_float_np(m)
+    if normalized == ROT6D_LAYOUT_PYTORCH3D_ROW:
+        matrix = np.swapaxes(matrix, -1, -2)
+    return matrix_to_rot6d_np(matrix, project=False)
+
+
+def convert_rot6d_layout_np(
+    x: np.ndarray,
+    source_layout: str,
+    target_layout: str,
+) -> np.ndarray:
+    """Convert Rot6D values while preserving their physical rotations."""
+
+    source = normalize_rot6d_layout(source_layout)
+    target = normalize_rot6d_layout(target_layout)
+    values = _as_float_np(x)
+    if source == target:
+        return values.copy()
+    matrix = rot6d_to_matrix_layout_np(values, source)
+    return matrix_to_rot6d_layout_np(matrix, target)
+
+
+def convert_motion_rot6d_layout_np(
+    motion: np.ndarray,
+    source_layout: str,
+    target_layout: str,
+    rotation_start: int = 7,
+    rotation_end: int = 151,
+    num_joints: int = 24,
+) -> np.ndarray:
+    """Convert the rotation channels of one frame or a motion batch."""
+
+    values = _as_float_np(motion).copy()
+    if values.shape[-1] < rotation_end:
+        raise ValueError(
+            f"Motion requires at least {rotation_end} channels, got {values.shape}"
+        )
+    rotations = values[..., rotation_start:rotation_end].reshape(
+        values.shape[:-1] + (num_joints, 6)
+    )
+    values[..., rotation_start:rotation_end] = convert_rot6d_layout_np(
+        rotations,
+        source_layout,
+        target_layout,
+    ).reshape(values.shape[:-1] + (num_joints * 6,))
+    return values.astype(np.float32)
+
+
 def so3_geodesic_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Geodesic angle on SO(3), in radians.
 
@@ -108,7 +206,7 @@ def so3_log_np(m: np.ndarray) -> np.ndarray:
         return Rotation.from_matrix(flat).as_rotvec().reshape(*shape, 3).astype(np.float32)
 
     tr = np.trace(flat, axis1=-2, axis2=-1)
-    angle = np.arccos(np.clip((tr - 1.0) * 0.5, -1.0, 1.0))
+    cosine = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
     vee = np.stack(
         [
             flat[:, 2, 1] - flat[:, 1, 2],
@@ -117,13 +215,35 @@ def so3_log_np(m: np.ndarray) -> np.ndarray:
         ],
         axis=-1,
     )
+    sine = 0.5 * np.linalg.norm(vee, axis=-1)
+    angle = np.arctan2(sine, cosine)
     out = np.zeros_like(vee)
     small = angle < 1.0e-5
-    regular = ~small
+    near_pi = np.abs(np.pi - angle) < 1.0e-4
+    regular = ~(small | near_pi)
     out[small] = 0.5 * vee[small]
     if np.any(regular):
         scale = angle[regular] / np.maximum(2.0 * np.sin(angle[regular]), 1.0e-7)
         out[regular] = vee[regular] * scale[:, None]
+    if np.any(near_pi):
+        near = flat[near_pi]
+        symmetric = 0.5 * (near + np.eye(3, dtype=np.float64)[None])
+        diagonal = np.clip(np.diagonal(symmetric, axis1=-2, axis2=-1), 0.0, None)
+        largest = np.argmax(diagonal, axis=-1)
+        axes = np.zeros((len(near), 3), dtype=np.float64)
+        for axis_index in range(3):
+            mask = largest == axis_index
+            if not np.any(mask):
+                continue
+            component = np.sqrt(np.maximum(diagonal[mask, axis_index], EPS))
+            selected = symmetric[mask]
+            candidate = selected[:, :, axis_index] / component[:, None]
+            axes[mask] = candidate
+        axes /= np.maximum(np.linalg.norm(axes, axis=-1, keepdims=True), EPS)
+        near_vee = vee[near_pi]
+        flip = np.sum(axes * near_vee, axis=-1) < 0.0
+        axes[flip] *= -1.0
+        out[near_pi] = axes * angle[near_pi, None]
     return out.reshape(*shape, 3).astype(np.float32)
 
 
@@ -205,6 +325,41 @@ def matrix_to_rot6d_torch(m: "torch.Tensor") -> "torch.Tensor":
     return torch.cat([m[..., :, 0], m[..., :, 1]], dim=-1)
 
 
+def rot6d_to_matrix_layout_torch(
+    x: "torch.Tensor",
+    layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> "torch.Tensor":
+    normalized = normalize_rot6d_layout(layout)
+    matrix = rot6d_to_matrix_torch(x)
+    if normalized == ROT6D_LAYOUT_PYTORCH3D_ROW:
+        matrix = matrix.transpose(-1, -2)
+    return matrix
+
+
+def matrix_to_rot6d_layout_torch(
+    m: "torch.Tensor",
+    layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> "torch.Tensor":
+    normalized = normalize_rot6d_layout(layout)
+    matrix = m.transpose(-1, -2) if normalized == ROT6D_LAYOUT_PYTORCH3D_ROW else m
+    return matrix_to_rot6d_torch(matrix)
+
+
+def convert_rot6d_layout_torch(
+    x: "torch.Tensor",
+    source_layout: str,
+    target_layout: str,
+) -> "torch.Tensor":
+    source = normalize_rot6d_layout(source_layout)
+    target = normalize_rot6d_layout(target_layout)
+    if source == target:
+        return x.clone()
+    return matrix_to_rot6d_layout_torch(
+        rot6d_to_matrix_layout_torch(x, source),
+        target,
+    )
+
+
 def so3_geodesic_torch(a: "torch.Tensor", b: "torch.Tensor") -> "torch.Tensor":
     if torch is None:
         raise RuntimeError("PyTorch is required")
@@ -218,6 +373,50 @@ def so3_geodesic_torch(a: "torch.Tensor", b: "torch.Tensor") -> "torch.Tensor":
     ], dim=-1)
     sin = 0.5 * torch.linalg.norm(vee, dim=-1)
     return torch.atan2(sin, cos)
+
+
+def so3_log_torch(m: "torch.Tensor") -> "torch.Tensor":
+    """Differentiable Log map for the small relative rotations in motion data."""
+    if torch is None:
+        raise RuntimeError("PyTorch is required")
+    trace = torch.diagonal(m, dim1=-2, dim2=-1).sum(dim=-1)
+    cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    vee = torch.stack(
+        [
+            m[..., 2, 1] - m[..., 1, 2],
+            m[..., 0, 2] - m[..., 2, 0],
+            m[..., 1, 0] - m[..., 0, 1],
+        ],
+        dim=-1,
+    )
+    sine = 0.5 * torch.linalg.norm(vee, dim=-1)
+    angle = torch.atan2(sine, cosine)
+    small = angle.abs() < 1.0e-4
+    near_pi = (torch.pi - angle).abs() < 1.0e-4
+    regular_scale = angle / (2.0 * torch.sin(angle).clamp_min(1.0e-7))
+    small_scale = 0.5 + angle.square() / 12.0
+    scale = torch.where(small, small_scale, regular_scale)
+    result = vee * scale[..., None]
+
+    if torch.any(near_pi):
+        identity = torch.eye(3, dtype=m.dtype, device=m.device)
+        symmetric = 0.5 * (m[near_pi] + identity)
+        diagonal = torch.diagonal(symmetric, dim1=-2, dim2=-1).clamp_min(0.0)
+        largest = diagonal.argmax(dim=-1)
+        columns = symmetric.transpose(-1, -2)
+        gather_index = largest[:, None, None].expand(-1, 1, 3)
+        selected = torch.gather(columns, 1, gather_index).squeeze(1)
+        component = torch.sqrt(
+            torch.gather(diagonal, 1, largest[:, None]).squeeze(1).clamp_min(EPS)
+        )
+        axis = selected / component[:, None]
+        axis = F.normalize(axis, dim=-1, eps=EPS)
+        near_vee = vee[near_pi]
+        flip = (axis * near_vee).sum(dim=-1) < 0.0
+        axis = torch.where(flip[:, None], -axis, axis)
+        result = result.clone()
+        result[near_pi] = axis * angle[near_pi, None]
+    return result
 
 
 def validate_rot6d_roundtrip_np(x: np.ndarray) -> dict:

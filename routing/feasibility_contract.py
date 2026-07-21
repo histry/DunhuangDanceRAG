@@ -18,8 +18,9 @@ The research policy is intentionally asymmetric:
   reason-specific rescue tiers;
 * a music slot is split, while preserving its total frame budget, when no
   duration-feasible event exists in the expanded candidate pool;
-* scheduler event IDs are treated as provenance only.  Current-DB retrieval is
-  always authoritative.
+* legacy scheduler event IDs/indices are treated as provenance only.  A stable
+  event UID is authoritative only after the Scheduler and Generation DB
+  fingerprints have been validated by the base loader.
 
 The implementation is installed after ``v46_53_heading_closed_loop`` has
 installed its own patches.  It is API-compatible with the current public main
@@ -261,17 +262,47 @@ _PROVENANCE_ONLY_KEYS = {
     "v26_time_warp_ratio", "resampling", "time_warp_ratio",
 }
 
+_STABLE_IDENTITY_KEYS = ("v26_event_uid", "event_uid")
 
-def sanitize_slot(slot: Mapping[str, Any], fps: float) -> Dict[str, Any]:
-    """Remove old scheduler event identity while preserving music timing/semantics."""
+
+def sanitize_slot(
+    slot: Mapping[str, Any],
+    fps: float,
+    *,
+    aligned_event_db: bool = False,
+) -> Dict[str, Any]:
+    """Remove legacy identity and retain a contract-validated stable UID.
+
+    ``event_id`` and ``event_index`` are run-local historical values and can
+    never identify a row in a rebuilt Generation DB.  ``event_uid`` is stable,
+    but is accepted only when the caller has already proved that the MSSD and
+    Generation DB ordered fingerprints match.
+    """
     source = dict(slot)
     provenance = {key: source.get(key) for key in _PROVENANCE_ONLY_KEYS if key in source}
     out = {key: value for key, value in source.items() if key not in _PROVENANCE_ONLY_KEYS}
+    stable_uid = next(
+        (
+            str(source.get(key)).strip()
+            for key in _STABLE_IDENTITY_KEYS
+            if source.get(key) is not None and str(source.get(key)).strip()
+        ),
+        "",
+    )
+    for key in _STABLE_IDENTITY_KEYS:
+        out.pop(key, None)
+    if stable_uid and aligned_event_db:
+        out["v26_event_uid"] = stable_uid
+        out["event_uid"] = stable_uid
+    elif stable_uid:
+        provenance["event_uid"] = stable_uid
     target = slot_target_frames(out, fps=fps)
     out["target_frames"] = int(target)
     out["duration"] = float(target / max(float(fps), 1e-6))
     out["duration_sec"] = float(out["duration"])
-    out["scheduler_event_identity_authoritative"] = False
+    out["scheduler_event_identity_authoritative"] = bool(
+        stable_uid and aligned_event_db
+    )
     if provenance:
         out["scheduler_event_provenance"] = provenance
     return out
@@ -494,7 +525,8 @@ def install(v53: Any) -> Dict[str, Any]:
     original_assemble = v50.assemble_event_heading_reference
 
     def research_load_slots_and_candidates(v46: Any, args: Any, cfg: Any):
-        # Build the expanded retrieval report from current music semantics.
+        # The base loader performs the Scheduler/Generation DB fingerprint
+        # check and seeds the exact scheduled event_uid.  Never bypass it.
         try:
             cfg.classification_report_topk = max(
                 int(getattr(cfg, "classification_report_topk", 8)),
@@ -503,28 +535,41 @@ def install(v53: Any) -> Dict[str, Any]:
         except Exception:
             pass
 
-        db = v46.load_db(args.db)
-        contrastive = v46.load_contrastive(getattr(args, "contrastive", None), cfg)
-        slots, slot_feat = v46.audio_slots(
-            args.audio,
+        (
+            db,
+            contrastive,
+            slots,
+            slot_feat,
+            path_idx,
+            retrieval_report,
+            candidate_lists,
+        ) = original_load(
+            v46,
+            args,
             cfg,
-            args.slot_seconds,
-            getattr(args, "slots_json", None),
         )
-        slots, slot_feat = base.merge_short_terminal_slot(slots, slot_feat, cfg)
         fps = float(getattr(cfg, "fps", 30.0))
-        slots = [sanitize_slot(slot, fps) for slot in slots]
+        aligned_event_db = env_bool("V46_54_REQUIRE_ALIGNED_EVENT_DB", True)
+        slots = [
+            sanitize_slot(
+                slot,
+                fps,
+                aligned_event_db=aligned_event_db,
+            )
+            for slot in slots
+        ]
         features = np.asarray(slot_feat, dtype=np.float32)
 
         passes: List[Dict[str, Any]] = []
         performer_report: Dict[str, Any] = {}
         for split_pass in range(policy.max_slot_split_passes + 1):
-            path_idx, retrieval_report = v46.retrieve_schedule(
-                slots, features, db, cfg, contrastive
-            )
-            candidate_lists = base.extract_candidate_lists(
-                path_idx, retrieval_report, db, cfg
-            )
+            if split_pass > 0:
+                path_idx, retrieval_report = v46.retrieve_schedule(
+                    slots, features, db, cfg, contrastive
+                )
+                candidate_lists = base.extract_candidate_lists(
+                    path_idx, retrieval_report, db, cfg
+                )
             candidate_lists, performer_report = filter_candidate_lists(
                 candidate_lists, db, policy
             )

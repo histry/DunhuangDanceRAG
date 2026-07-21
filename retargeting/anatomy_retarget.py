@@ -325,13 +325,19 @@ def _fit_target_motion_research(
     feet = joints[:, list(FOOT_JOINTS)]
     speed = np.zeros(feet.shape[:2], dtype=np.float32)
     if T > 1:
-        speed[1:] = np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+        speed[1:] = (
+            np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+            * float(cfg.target_fps)
+        )
     height = feet[..., 1] - fitted_floor
-    contacts = (height <= float(cfg.contact_height_m)) & (speed <= float(cfg.contact_speed_mpf))
-    if legacy.median_filter is not None and cfg.contact_median_size > 1:
+    contacts = (height <= float(cfg.contact_height_m)) & (speed <= float(cfg.contact_speed_mps))
+    contact_median_size = max(1, int(round(float(cfg.contact_median_seconds) * float(cfg.target_fps))))
+    if contact_median_size % 2 == 0:
+        contact_median_size += 1
+    if legacy.median_filter is not None and contact_median_size > 1:
         contacts = legacy.median_filter(
             contacts.astype(np.uint8),
-            size=(int(cfg.contact_median_size), 1),
+            size=(contact_median_size, 1),
             mode="nearest",
         ).astype(bool)
     motion[:, CONTACT] = contacts.astype(np.float32)

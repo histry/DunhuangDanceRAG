@@ -3,7 +3,9 @@
 # followed by the preserved V46.51/V46.52/V46.53 training and generation stack.
 set -Eeuo pipefail
 
-ROOT_DIR="${ROOT_DIR:-/home/disk/lsm/storage/EDGE}"
+ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export ROOT_DIR
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$ROOT_DIR"
 
 [[ -f configs/scheduler.env ]] || {
@@ -42,7 +44,7 @@ export OUT_ROOT
 export ROOT_DIR
 export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
 export V46_53_GROUNDER_CKPT="${V46_53_GROUNDER_CKPT:-$OUT_ROOT/v46_53_dual_branch_grounder.pt}"
-PY="${V46_51_PYTHON:-/home/disk/lsm/conda_envs/edge/bin/python}"
+PY="${V46_51_PYTHON:-${PYTHON_BIN:-python}}"
 export V46_51_PYTHON="$PY"
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 [[ -x "$PY" ]] || { echo "[FATAL] Python not executable: $PY" >&2; exit 2; }

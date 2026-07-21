@@ -14,64 +14,11 @@ from matplotlib.colors import ListedColormap
 from pytorch3d.transforms import (axis_angle_to_quaternion, quaternion_apply,
                                   quaternion_multiply)
 from tqdm import tqdm
+from motion_geometry.smpl24 import JOINT_NAMES, OFFSETS, PARENTS
 
-smpl_joints = [
-    "root",  # 0
-    "lhip",  # 1
-    "rhip",  # 2
-    "belly", # 3
-    "lknee", # 4
-    "rknee", # 5
-    "spine", # 6
-    "lankle",# 7
-    "rankle",# 8
-    "chest", # 9
-    "ltoes", # 10
-    "rtoes", # 11
-    "neck",  # 12
-    "linshoulder", # 13
-    "rinshoulder", # 14
-    "head", # 15
-    "lshoulder", # 16
-    "rshoulder",  # 17
-    "lelbow", # 18
-    "relbow",  # 19
-    "lwrist", # 20
-    "rwrist", # 21
-    "lhand", # 22
-    "rhand", # 23
-]
-
-smpl_parents = [
-    -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21,
-]
-
-smpl_offsets = [
-    [0.0, 0.0, 0.0],
-    [0.05858135, -0.08228004, -0.01766408],
-    [-0.06030973, -0.09051332, -0.01354254],
-    [0.00443945, 0.12440352, -0.03838522],
-    [0.04345142, -0.38646945, 0.008037],
-    [-0.04325663, -0.38368791, -0.00484304],
-    [0.00448844, 0.1379564, 0.02682033],
-    [-0.01479032, -0.42687458, -0.037428],
-    [0.01905555, -0.4200455, -0.03456167],
-    [-0.00226458, 0.05603239, 0.00285505],
-    [0.04105436, -0.06028581, 0.12204243],
-    [-0.03483987, -0.06210566, 0.13032329],
-    [-0.0133902, 0.21163553, -0.03346758],
-    [0.07170245, 0.11399969, -0.01889817],
-    [-0.08295366, 0.11247234, -0.02370739],
-    [0.01011321, 0.08893734, 0.05040987],
-    [0.12292141, 0.04520509, -0.019046],
-    [-0.11322832, 0.04685326, -0.00847207],
-    [0.2553319, -0.01564902, -0.02294649],
-    [-0.26012748, -0.01436928, -0.03126873],
-    [0.26570925, 0.01269811, -0.00737473],
-    [-0.26910836, 0.00679372, -0.00602676],
-    [0.08669055, -0.01063603, -0.01559429],
-    [-0.0887537, -0.00865157, -0.01010708],
-]
+smpl_joints = list(JOINT_NAMES)
+smpl_parents = PARENTS.tolist()
+smpl_offsets = OFFSETS.tolist()
 
 
 def set_line_data_3d(line, x):
@@ -222,7 +169,11 @@ def skeleton_render(
     camera_mode="follow",
     output_path=None,
     render_smooth_window=9,
+    fps=30.0,
 ):
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"fps must be positive and finite, got {fps!r}")
     if render:
         Path(out).mkdir(parents=True, exist_ok=True)
         num_steps = poses.shape[0]
@@ -275,7 +226,7 @@ def skeleton_render(
             plot_single_pose,
             num_steps,
             fargs=(vis_poses, lines, ax, camera_centers, camera_radius, z_limits, scat, contact),
-            interval=1000 // 30,
+            interval=1000.0 / fps,
         )
 
     if sound:
@@ -284,7 +235,7 @@ def skeleton_render(
             temp_dir = TemporaryDirectory(dir=out)
             videoname = os.path.join(temp_dir.name, f"{epoch}.mp4")
             writer = animation.FFMpegWriter(
-                fps=30,
+                fps=fps,
                 bitrate=4000,
                 codec="libx264",
                 extra_args=["-pix_fmt", "yuv420p"],

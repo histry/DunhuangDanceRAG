@@ -7,7 +7,6 @@ export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 
-ROOT_DIR="${ROOT_DIR:-/home/disk/lsm/storage/EDGE}"
 cd "$ROOT_DIR"
 
 source configs/scheduler.env
@@ -148,6 +147,22 @@ else
   GENERATION_DB="$TRAIN_AESD"
 fi
 
+echo "========== 6C. BUILD GENERATION-ALIGNED SCHEDULER INDEX =========="
+ALIGNED_SCHEDULER_DIR="$OUT_ROOT/scheduler_generation_assets"
+ALIGNED_INDEX_JSON="$ALIGNED_SCHEDULER_DIR/event_index.json"
+ALIGNED_INDEX_NPZ="$ALIGNED_SCHEDULER_DIR/duration_index.npz"
+mkdir -p "$ALIGNED_SCHEDULER_DIR"
+"$PY" scheduling/build_generation_index.py \
+  --db "$GENERATION_DB" \
+  --out_json "$ALIGNED_INDEX_JSON" \
+  --out_npz "$ALIGNED_INDEX_NPZ" \
+  --report "$ALIGNED_SCHEDULER_DIR/build_report.json"
+export V46_51_INDEX_JSON="$ALIGNED_INDEX_JSON"
+export V46_51_DURATION_INDEX_NPZ="$ALIGNED_INDEX_NPZ"
+# A hierarchy built for the old 4225-event snapshot is never reused with the
+# Generation DB. It may be rebuilt separately from this aligned index later.
+export V46_51_HIERARCHY_INDEX_NPZ=""
+
 echo "========== 7. TRAIN V44 ON TRAIN SOURCES + NON-TEST MUSIC =========="
 read -r -a MUSIC_DIR_ARRAY <<< "$MUSIC_DIRS"
 for d in "${MUSIC_DIR_ARRAY[@]}"; do
@@ -168,6 +183,44 @@ if [[ "$V46_51_RETRAIN_V44" == "1" ]]; then
 else
   require_file "$V44_CKPT" "V44 checkpoint"
 fi
+
+echo "========== 7B. RESOLVE ROUTER/PLANNER/DURATION FOR NO-TRAINING REGRESSION =========="
+ASSET_JSON="$OUT_ROOT/scheduler_assets.json"
+ASSET_ENV="$OUT_ROOT/scheduler_assets.env"
+"$PY" scheduling/resolve_assets.py \
+  --out_json "$ASSET_JSON" \
+  --out_env "$ASSET_ENV"
+# shellcheck disable=SC1090
+source "$ASSET_ENV"
+
+if [[ "$V46_54_RUN_PRETRAIN_REGRESSION" == "1" ]]; then
+  echo "========== 7C. SAME-WAV NO-TRAINING ROUTE/ACTION REGRESSION =========="
+  PRETRAIN_REGRESSION_DIR="$OUT_ROOT/pretrain_same_wav_regression_${RUN_TAG}"
+  "$PY" scripts/run_no_training_regression.py \
+    --audio "$AUDIO" \
+    --index_json "$V46_51_RESOLVED_INDEX_JSON" \
+    --index_npz "$V46_51_RESOLVED_DURATION_INDEX_NPZ" \
+    --router_ckpt "$V46_51_RESOLVED_ROUTER_CKPT" \
+    --planner_ckpt "$V46_51_RESOLVED_PLANNER_CKPT" \
+    --duration_ckpt "$V46_51_RESOLVED_V23_CKPT" \
+    --config "$CONFIG" \
+    --out_dir "$PRETRAIN_REGRESSION_DIR" \
+    --fps "$V46_51_FPS" \
+    --max_source_share "$V46_54_MAX_SOURCE_SHARE" \
+    --max_transition_fraction "$V46_51_MAX_TRANSITION_FRACTION"
+  require_file "$PRETRAIN_REGRESSION_DIR/regression_gate.json" \
+    "same-WAV regression gate"
+fi
+
+echo "========== 7D. REGRESSION-PASSED: REBUILD ROUTER/PLANNER/DURATION FORMAL ASSET BUNDLE =========="
+"$PY" scheduling/build_asset_bundle.py \
+  --index_json "$V46_51_RESOLVED_INDEX_JSON" \
+  --index_npz "$V46_51_RESOLVED_DURATION_INDEX_NPZ" \
+  --router_ckpt "$V46_51_RESOLVED_ROUTER_CKPT" \
+  --planner_ckpt "$V46_51_RESOLVED_PLANNER_CKPT" \
+  --duration_ckpt "$V46_51_RESOLVED_V23_CKPT" \
+  --fps "$V46_51_FPS" \
+  --out "$ALIGNED_SCHEDULER_DIR/scheduler_asset_bundle.json"
 
 echo "========== 8. TRAIN V45 ON TRAIN-SOURCE CANONICAL EVENTS =========="
 if [[ "$V46_51_RETRAIN_V45" == "1" ]]; then
@@ -194,14 +247,9 @@ else
   require_file "$V46_CKPT" "V46 checkpoint"
 fi
 
-echo "========== 10. RESOLVE FIXED TRAINED V21/V26/V23 ASSETS =========="
-ASSET_JSON="$OUT_ROOT/scheduler_assets.json"
-ASSET_ENV="$OUT_ROOT/scheduler_assets.env"
-"$PY" scheduling/resolve_assets.py \
-  --out_json "$ASSET_JSON" \
-  --out_env "$ASSET_ENV"
-# shellcheck disable=SC1090
-source "$ASSET_ENV"
+echo "========== 10. USE VALIDATED GENERATION-ALIGNED SCHEDULER ASSETS =========="
+require_file "$ALIGNED_SCHEDULER_DIR/scheduler_asset_bundle.json" \
+  "Router/Planner/Duration asset bundle"
 
 echo "========== 11. REBUILD SCHEDULE FROM CURRENT WAV =========="
 AUDIO_SHA="$(sha256sum "$AUDIO" | awk '{print $1}')"
@@ -228,6 +276,10 @@ FRESH_ARGS=(
   --calm_max_single_event_seconds "$V46_51_CALM_MAX_SINGLE_EVENT_SECONDS"
   --min_subphrase_seconds "$V46_51_MIN_SUBPHRASE_SECONDS"
   --max_events_per_phrase "$V46_51_MAX_EVENTS_PER_PHRASE"
+  --transition_min_frames "$V46_51_TRANSITION_MIN_FRAMES"
+  --transition_max_frames "$V46_51_TRANSITION_MAX_FRAMES"
+  --max_transition_fraction "$V46_51_MAX_TRANSITION_FRACTION"
+  --transition_budget_min_frames "$V46_51_TRANSITION_BUDGET_MIN_FRAMES"
   --slot_beat_snap_seconds "$V46_51_SLOT_BEAT_SNAP_SECONDS"
   --beam_size "$V46_51_BEAM_SIZE"
   --candidate_top_k "$V46_51_CANDIDATE_TOP_K"
@@ -331,6 +383,7 @@ echo "========== 17. SCIENTIFIC FIXED-CAMERA RENDER =========="
   --motion "$FINAL_NPY" \
   --audio "$AUDIO" \
   --output "$FINAL_MP4" \
+  --fps "$V46_51_FPS" \
   --camera_mode fixed \
   --render_smooth_window 1 \
   --gravity_audit_json "$OUT_ROOT/final.render_gravity.json"

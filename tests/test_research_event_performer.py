@@ -26,11 +26,11 @@ class ResearchEventPerformerMetadataTest(unittest.TestCase):
                 ], dtype=object),
             )
             report = augment_events_npz(str(path), require_known=True)
-            db = np.load(path, allow_pickle=True)
-            self.assertEqual(
-                list(db["performer_groups"]),
-                ["female", "male"],
-            )
+            with np.load(path, allow_pickle=True) as db:
+                self.assertEqual(
+                    list(db["performer_groups"]),
+                    ["female", "male"],
+                )
             self.assertEqual(report["performer_group_histogram"]["female"], 1)
 
 

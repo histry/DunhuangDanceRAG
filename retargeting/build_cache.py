@@ -71,6 +71,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--allow_partial", action="store_true")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--target_fps", type=float, choices=(30.0, 60.0), default=None)
+    ap.add_argument(
+        "--smpl_scaling_mode",
+        choices=("canonical_body", "scale_translation", "inverse_scale_translation"),
+        default="canonical_body",
+    )
     args = ap.parse_args(argv)
 
     in_dir = Path(args.in_dir).resolve()
@@ -83,6 +89,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg = legacy.RetargetConfig.from_env()
     if args.device:
         cfg.device = args.device
+    if args.target_fps is not None:
+        cfg.target_fps = float(args.target_fps)
     allow_partial = bool(args.allow_partial or env_bool("V46_52_ALLOW_PARTIAL_RETARGET", True))
     min_ok = max(3, min(len(files), env_int("V46_52_MIN_OK_SOURCES", min(8, len(files)))))
 
@@ -124,7 +132,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     else:
                         # Existing official-SMPL loader remains supported. Its strict
                         # report must still pass the source-safety report validator.
-                        motion, rep = load_official_smpl_motion(candidate, target_fps=float(cfg.target_fps))
+                        motion, rep = load_official_smpl_motion(
+                            candidate,
+                            target_fps=float(cfg.target_fps),
+                            scaling_mode=str(args.smpl_scaling_mode),
+                        )
                         rep = dict(rep)
                         rep.setdefault("source_gate_ok", bool(rep.get("anatomy_ok", False)))
                         rep["version"] = str(rep.get("version", "official_smpl")) + "_v46_53_1"
@@ -151,6 +163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "requires_gravity_ok": True,
                     "requires_fit_ok": True,
                     "official_smpl_preferred": env_bool("V46_52_PREFER_OFFICIAL_SMPL", True),
+                    "canonical_fps": float(cfg.target_fps),
+                    "smpl_scaling_mode": str(args.smpl_scaling_mode),
                 },
             })
             valid, reasons = _report_valid(rep)
@@ -184,6 +198,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "minimum_ok_sources": int(min_ok),
         "split_feasible": bool(split_ok),
         "allow_partial": bool(allow_partial),
+        "canonical_fps": float(cfg.target_fps),
+        "smpl_scaling_mode": str(args.smpl_scaling_mode),
         "all_ok": bool(all_ok),
         "policy": {
             "source_gate": "catastrophic numerical/physical failures only",

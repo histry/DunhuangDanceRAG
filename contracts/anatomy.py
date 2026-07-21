@@ -733,11 +733,12 @@ def geodesic_c2_bridge_np(
 
     p0 = a[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
     p1 = z[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
-    v0 = p[-1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - p[-2, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] if len(p) > 1 else np.zeros(3, np.float32)
-    v1 = f[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - f[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] if len(f) > 1 else np.zeros(3, np.float32)
-    max_vel = env_float("V46_52_BRIDGE_ROOT_VEL_CLIP_MPF", 0.08)
-    v0 = np.clip(v0, -max_vel, max_vel) * float(frames + 1)
-    v1 = np.clip(v1, -max_vel, max_vel) * float(frames + 1)
+    v0 = (p[-1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - p[-2, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]) * float(fps) if len(p) > 1 else np.zeros(3, np.float32)
+    v1 = (f[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - f[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]) * float(fps) if len(f) > 1 else np.zeros(3, np.float32)
+    max_vel = env_float("V46_52_BRIDGE_ROOT_VEL_CLIP_MPS", 2.4)
+    duration_seconds = float(frames + 1) / max(float(fps), 1.0e-8)
+    v0 = np.clip(v0, -max_vel, max_vel) * duration_seconds
+    v1 = np.clip(v1, -max_vel, max_vel) * duration_seconds
     h00, h10 = 2*u**3 - 3*u**2 + 1, u**3 - 2*u**2 + u
     h01, h11 = -2*u**3 + 3*u**2, u**3 - u**2
     root = h00[:, None]*p0 + h10[:, None]*v0 + h01[:, None]*p1 + h11[:, None]*v1

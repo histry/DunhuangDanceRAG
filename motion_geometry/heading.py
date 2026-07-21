@@ -16,11 +16,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
-import torch
-from pytorch3d.transforms import (
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
+try:
+    import torch
+except Exception:  # pragma: no cover - NumPy-only audit environments
+    torch = None
+
+from motion_geometry.rotations import (
+    CANONICAL_ROT6D_LAYOUT,
+    matrix_to_rot6d_layout_np,
+    relative_rotvec_np,
+    rot6d_to_matrix_layout_np,
+    rot6d_to_matrix_layout_torch,
+    so3_exp_np,
+    so3_log_torch,
 )
 
 CONTACT = slice(0, 4)
@@ -79,23 +87,26 @@ def _moving_average(x: np.ndarray, window: int = 5) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid").astype(np.float32)
 
 
-def root_rotation_matrices_np(motion: np.ndarray) -> np.ndarray:
+def root_rotation_matrices_np(
+    motion: np.ndarray,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> np.ndarray:
     x = np.asarray(motion, dtype=np.float32)
     if x.ndim != 2 or x.shape[-1] != 151:
         raise ValueError(f"Expected [T,151], got {x.shape}")
-    root6d = torch.from_numpy(x[:, ROOT_ROT6D]).float()
-    with torch.no_grad():
-        matrices = rotation_6d_to_matrix(root6d)
-    return matrices.cpu().numpy().astype(np.float32)
+    return rot6d_to_matrix_layout_np(x[:, ROOT_ROT6D], rot6d_layout).astype(np.float32)
 
 
-def root_yaw_np(motion: np.ndarray) -> np.ndarray:
+def root_yaw_np(
+    motion: np.ndarray,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> np.ndarray:
     """Return unwrapped root yaw in radians.
 
     EDGE/SMPL is Y-up.  We use atan2(R[0,2], R[2,2]), which measures the
     forward-axis rotation around Y.
     """
-    matrices = root_rotation_matrices_np(motion)
+    matrices = root_rotation_matrices_np(motion, rot6d_layout=rot6d_layout)
     yaw = np.arctan2(matrices[:, 0, 2], matrices[:, 2, 2])
     return np.unwrap(yaw).astype(np.float32)
 
@@ -104,8 +115,9 @@ def yaw_speed_dps_np(
     motion: np.ndarray,
     fps: float = FPS_DEFAULT,
     smooth_window: int = 5,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
 ) -> np.ndarray:
-    yaw = root_yaw_np(motion)
+    yaw = root_yaw_np(motion, rot6d_layout=rot6d_layout)
     if len(yaw) < 2:
         return np.zeros((0,), dtype=np.float32)
     speed = np.abs(np.diff(yaw)) * float(fps) * 180.0 / np.pi
@@ -122,6 +134,7 @@ def detect_turn_events(
     max_events: int | None = None,
     search_start: int = 0,
     search_end: int | None = None,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
 ) -> List[TurnEvent]:
     """Detect non-overlapping root-yaw turn events.
 
@@ -130,7 +143,12 @@ def detect_turn_events(
     fraction of the peak.  Nearby candidates are suppressed by peak strength.
     """
     x = np.asarray(motion, dtype=np.float32)
-    speed = yaw_speed_dps_np(x, fps=fps, smooth_window=5)
+    speed = yaw_speed_dps_np(
+        x,
+        fps=fps,
+        smooth_window=5,
+        rot6d_layout=rot6d_layout,
+    )
     if len(speed) == 0:
         return []
 
@@ -156,7 +174,7 @@ def detect_turn_events(
                 break
     kept.sort()
 
-    yaw = root_yaw_np(x)
+    yaw = root_yaw_np(x, rot6d_layout=rot6d_layout)
     events: List[TurnEvent] = []
     for peak in kept:
         threshold = max(float(min_peak_dps) * 0.45, float(speed[peak]) * float(threshold_ratio))
@@ -194,6 +212,7 @@ def summarize_turns(
     motion: np.ndarray,
     fps: float = FPS_DEFAULT,
     min_peak_dps: float = 35.0,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
 ) -> Dict[str, Any]:
     events = detect_turn_events(
         motion,
@@ -203,6 +222,7 @@ def summarize_turns(
         min_gap=12,
         min_duration=3,
         max_events=None,
+        rot6d_layout=rot6d_layout,
     )
     length = max(len(motion), 1)
     if not events:
@@ -295,7 +315,11 @@ def turn_speed_penalty(
     }
 
 
-def resample_motion_so3(motion: np.ndarray, source_positions: np.ndarray) -> np.ndarray:
+def resample_motion_so3(
+    motion: np.ndarray,
+    source_positions: np.ndarray,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> np.ndarray:
     """Resample EDGE motion at arbitrary floating source positions.
 
     Contacts use nearest-neighbour sampling, root xyz uses linear interpolation,
@@ -318,20 +342,18 @@ def resample_motion_so3(motion: np.ndarray, source_positions: np.ndarray) -> np.
     for dim in (ROOT_X, ROOT_Y, ROOT_Z):
         out[:, dim] = np.interp(positions, base_t, x[:, dim]).astype(np.float32)
 
-    rot6d = torch.from_numpy(x[:, ROT].reshape(len(x), 24, 6)).float()
-    with torch.no_grad():
-        matrices = rotation_6d_to_matrix(rot6d)
-        lo_t = torch.from_numpy(lo).long()
-        hi_t = torch.from_numpy(hi).long()
-        alpha_t = torch.from_numpy(alpha).float()
-        r0 = matrices[lo_t]
-        r1 = matrices[hi_t]
-        relative = torch.matmul(r0.transpose(-1, -2), r1)
-        axis_angle = matrix_to_axis_angle(relative)
-        delta = torch.from_numpy(alpha[:, None, None]).float() * axis_angle
-        from pytorch3d.transforms import axis_angle_to_matrix
-        interp = torch.matmul(r0, axis_angle_to_matrix(delta))
-        out[:, ROT] = matrix_to_rotation_6d(interp).reshape(len(positions), 144).cpu().numpy().astype(np.float32)
+    matrices = rot6d_to_matrix_layout_np(
+        x[:, ROT].reshape(len(x), 24, 6),
+        rot6d_layout,
+    )
+    r0 = matrices[lo]
+    r1 = matrices[hi]
+    tangent = relative_rotvec_np(r0, r1)
+    interp = r0 @ so3_exp_np(alpha[:, None, None] * tangent)
+    out[:, ROT] = matrix_to_rot6d_layout_np(
+        interp,
+        rot6d_layout,
+    ).reshape(len(positions), 144)
     return out
 
 
@@ -400,11 +422,17 @@ def make_fast_turn_corruption(
     return corrupted.astype(np.float32), mask.astype(np.float32), info
 
 
-def motion_query_from_dynamics(motion: np.ndarray) -> np.ndarray:
+def motion_query_from_dynamics(
+    motion: np.ndarray,
+    fps: float = FPS_DEFAULT,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> np.ndarray:
     """Build a weak 12D music-like condition from motion dynamics."""
     x = np.asarray(motion, dtype=np.float32)
     rot = x[:, ROT].reshape(len(x), 24, 6)
-    vel = np.diff(rot, axis=0, prepend=rot[:1])
+    matrices = rot6d_to_matrix_layout_np(rot, rot6d_layout)
+    core = relative_rotvec_np(matrices[:-1], matrices[1:]) * float(fps) if len(x) > 1 else np.zeros((0, 24, 3), dtype=np.float32)
+    vel = np.concatenate([np.zeros((1, 24, 3), dtype=np.float32), core], axis=0)
     frame = np.linalg.norm(vel.reshape(len(x), -1), axis=-1)
     energy = float(np.mean(frame))
     p90 = float(np.percentile(frame, 90)) if len(frame) else 0.0
@@ -416,7 +444,8 @@ def motion_query_from_dynamics(motion: np.ndarray) -> np.ndarray:
     upper = float(np.linalg.norm(vel[:, 14:24].reshape(len(x), -1), axis=-1).mean())
     torso = float(np.linalg.norm(vel[:, 8:14].reshape(len(x), -1), axis=-1).mean())
     lower = float(np.linalg.norm(vel[:, 0:8].reshape(len(x), -1), axis=-1).mean())
-    support = float(np.abs(np.diff(x[:, CONTACT], axis=0)).sum() / max(len(x) - 1, 1))
+    duration_seconds = max((len(x) - 1) / max(float(fps), 1.0e-8), 1.0 / max(float(fps), 1.0e-8))
+    support = float(np.abs(np.diff(x[:, CONTACT], axis=0)).sum() / duration_seconds)
     smooth = 1.0 / (1.0 + float(np.var(frame)))
     raw = np.asarray(
         [
@@ -430,7 +459,7 @@ def motion_query_from_dynamics(motion: np.ndarray) -> np.ndarray:
             build,
             release,
             p90 / (energy + 1e-6),
-            float(np.linalg.norm(rot[-1] - rot[0])) if len(rot) else 0.0,
+            float(np.mean(np.linalg.norm(relative_rotvec_np(matrices[0], matrices[-1]), axis=-1))) if len(rot) else 0.0,
             len(x) / 72.0,
         ],
         dtype=np.float32,
@@ -440,25 +469,36 @@ def motion_query_from_dynamics(motion: np.ndarray) -> np.ndarray:
     return np.clip(raw / (scales + 1e-8), 0.0, 1.0).astype(np.float32)
 
 
-def project_rot6d_np(motion: np.ndarray) -> np.ndarray:
+def project_rot6d_np(
+    motion: np.ndarray,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> np.ndarray:
     """Project rotation channels back onto valid SO(3) 6D representation."""
     x = np.asarray(motion, dtype=np.float32).copy()
-    rot = torch.from_numpy(x[:, ROT].reshape(len(x), 24, 6)).float()
-    with torch.no_grad():
-        x[:, ROT] = matrix_to_rotation_6d(rotation_6d_to_matrix(rot)).reshape(len(x), 144).cpu().numpy()
+    rot = x[:, ROT].reshape(len(x), 24, 6)
+    x[:, ROT] = matrix_to_rot6d_layout_np(
+        rot6d_to_matrix_layout_np(rot, rot6d_layout),
+        rot6d_layout,
+    ).reshape(len(x), 144)
     return x.astype(np.float32)
 
 
-def torch_root_yaw_velocity_dps(motion: torch.Tensor, fps: float = FPS_DEFAULT) -> torch.Tensor:
+def torch_root_yaw_velocity_dps(
+    motion: torch.Tensor,
+    fps: float = FPS_DEFAULT,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+) -> torch.Tensor:
     """Differentiable approximate frame-wise root yaw velocity in deg/s.
 
     motion: [B,T,151].  The Y component of the relative rotation axis-angle is
     used as the signed yaw increment.  This is stable for the small frame-to-
     frame rotations present in dance motion.
     """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for differentiable yaw velocity")
     root6d = motion[..., ROOT_ROT6D]
-    matrices = rotation_6d_to_matrix(root6d)
+    matrices = rot6d_to_matrix_layout_torch(root6d, rot6d_layout)
     relative = torch.matmul(matrices[:, :-1].transpose(-1, -2), matrices[:, 1:])
-    axis_angle = matrix_to_axis_angle(relative)
+    axis_angle = so3_log_torch(relative)
     yaw_delta = axis_angle[..., 1]
     return yaw_delta * float(fps) * (180.0 / np.pi)

@@ -106,8 +106,8 @@ class RetargetConfig:
     # ===== V46.49.4 ABSOLUTE ROOT ORIENTATION CONTRACT END =====
     gradient_clip: float = 2.0
     contact_height_m: float = 0.055
-    contact_speed_mpf: float = 0.025
-    contact_median_size: int = 5
+    contact_speed_mps: float = 0.75
+    contact_median_seconds: float = 1.0 / 6.0
     localize_root_xz: bool = True
     floor_to_zero: bool = True
     hard_gravity_gate: bool = True
@@ -153,8 +153,8 @@ class RetargetConfig:
             root_orientation_lock=b("V46_49_ROOT_ORIENTATION_LOCK", True),
             gradient_clip=f("V46_49_RETARGET_GRAD_CLIP", 2.0),
             contact_height_m=f("V46_49_CONTACT_HEIGHT_M", 0.055),
-            contact_speed_mpf=f("V46_49_CONTACT_SPEED_MPF", 0.025),
-            contact_median_size=i("V46_49_CONTACT_MEDIAN", 5),
+            contact_speed_mps=f("V46_49_CONTACT_SPEED_MPS", 0.75),
+            contact_median_seconds=f("V46_49_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0),
             localize_root_xz=b("V46_49_LOCALIZE_ROOT_XZ", True),
             floor_to_zero=b("V46_49_FLOOR_TO_ZERO", True),
             hard_gravity_gate=b("V46_49_GRAVITY_HARD_FAIL", True),
@@ -1096,13 +1096,19 @@ def fit_target_motion(
     feet = joints[:, list(FOOT_JOINTS)]
     speed = np.zeros(feet.shape[:2], dtype=np.float32)
     if T > 1:
-        speed[1:] = np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+        speed[1:] = (
+            np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+            * float(cfg.target_fps)
+        )
     height = feet[..., 1] - fitted_floor
-    contacts = (height <= float(cfg.contact_height_m)) & (speed <= float(cfg.contact_speed_mpf))
-    if median_filter is not None and cfg.contact_median_size > 1:
+    contacts = (height <= float(cfg.contact_height_m)) & (speed <= float(cfg.contact_speed_mps))
+    contact_median_size = max(1, int(round(float(cfg.contact_median_seconds) * float(cfg.target_fps))))
+    if contact_median_size % 2 == 0:
+        contact_median_size += 1
+    if median_filter is not None and contact_median_size > 1:
         contacts = median_filter(
             contacts.astype(np.uint8),
-            size=(int(cfg.contact_median_size), 1),
+            size=(contact_median_size, 1),
             mode="nearest",
         ).astype(bool)
     motion[:, 0:4] = contacts.astype(np.float32)

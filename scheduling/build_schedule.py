@@ -43,12 +43,18 @@ def require_file(path: str | Path, label: str) -> Path:
     return p.resolve()
 
 
-def run_checked(cmd: Sequence[str], *, env: Optional[Dict[str, str]] = None) -> None:
+def run_checked(
+    cmd: Sequence[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    cwd: str | Path = ROOT,
+) -> None:
     print("[RUN]", shlex.join([str(x) for x in cmd]), flush=True)
     subprocess.run(
         [str(x) for x in cmd],
         check=True,
         env=env,
+        cwd=str(cwd),
     )
 
 
@@ -76,13 +82,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--max_seconds", type=float, default=0.0)
     ap.add_argument("--min_phrase_seconds", type=float, default=2.5)
     ap.add_argument("--max_phrase_seconds", type=float, default=7.5)
-    ap.add_argument("--max_phrases", type=int, default=160)
+    ap.add_argument("--max_phrases", type=int, default=96)
     ap.add_argument("--boundary_quantile", type=float, default=0.68)
     ap.add_argument("--beat_snap_seconds", type=float, default=0.35)
-    ap.add_argument("--max_single_event_seconds", type=float, default=3.20)
-    ap.add_argument("--calm_max_single_event_seconds", type=float, default=2.80)
-    ap.add_argument("--min_subphrase_seconds", type=float, default=1.60)
-    ap.add_argument("--max_events_per_phrase", type=int, default=4)
+    ap.add_argument("--max_single_event_seconds", type=float, default=5.00)
+    ap.add_argument("--calm_max_single_event_seconds", type=float, default=4.50)
+    ap.add_argument("--min_subphrase_seconds", type=float, default=2.50)
+    ap.add_argument("--max_events_per_phrase", type=int, default=2)
+    ap.add_argument("--transition_min_frames", type=int, default=8)
+    ap.add_argument("--transition_max_frames", type=int, default=24)
+    ap.add_argument("--max_transition_fraction", type=float, default=0.20)
+    ap.add_argument("--transition_budget_min_frames", type=int, default=6)
+    ap.add_argument("--max_source_run", type=int, default=2)
+    ap.add_argument("--max_source_share", type=float, default=0.40)
+    ap.add_argument("--min_source_share_slots", type=int, default=6)
     ap.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
 
     ap.add_argument("--beam_size", type=int, default=24)
@@ -169,18 +182,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     feature_dir.mkdir(parents=True, exist_ok=True)
     deep_cache.mkdir(parents=True, exist_ok=True)
 
-    scheduler_script = require_file(
-        ROOT / "tools" / "schedule_v26_whole_song.py",
-        "current V26 scheduler",
-    )
-    descriptor_script = require_file(
-        ROOT / "tools" / "v46_38_build_music_semantic_slot_descriptor.py",
-        "current V46.38 MSSD converter",
-    )
-
     scheduler_cmd: List[str] = [
         sys.executable,
-        str(scheduler_script),
+        "-m",
+        "scheduling.whole_song_scheduler",
         "--index_json",
         str(index_json),
         "--duration_index_npz",
@@ -227,6 +232,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(args.min_subphrase_seconds),
         "--max_events_per_phrase",
         str(args.max_events_per_phrase),
+        "--transition_min_frames",
+        str(args.transition_min_frames),
+        "--transition_max_frames",
+        str(args.transition_max_frames),
+        "--max_transition_fraction",
+        str(args.max_transition_fraction),
+        "--transition_budget_min_frames",
+        str(args.transition_budget_min_frames),
+        "--max_source_run",
+        str(args.max_source_run),
+        "--max_source_share",
+        str(args.max_source_share),
+        "--min_source_share_slots",
+        str(args.min_source_share_slots),
         "--slot_beat_snap_seconds",
         str(args.slot_beat_snap_seconds),
         "--beam_size",
@@ -277,11 +296,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scheduler_cmd += ["--hyperbolic_ckpt", str(hyperbolic_ckpt)]
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT) + (
-        os.pathsep + env["PYTHONPATH"]
-        if env.get("PYTHONPATH")
-        else ""
-    )
+
+    python_paths = [
+        str(ROOT),
+    ]
+
+    if env.get("PYTHONPATH"):
+        python_paths.append(env["PYTHONPATH"])
+
+    env["PYTHONPATH"] = os.pathsep.join(python_paths)
     env["V46_51_SCHEDULE_RUN_ID"] = str(args.run_id)
     run_checked(scheduler_cmd, env=env)
 
@@ -297,7 +320,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     temporary_descriptor = run_dir / "descriptor_unstamped.json"
     converter_cmd = [
         sys.executable,
-        str(descriptor_script),
+        "-m",
+        "scheduling.music_slot_descriptor",
         "--audio",
         str(audio),
         "--out_json",

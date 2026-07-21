@@ -20,8 +20,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from scheduling.extract_music_features import extract_audio_features
-from scheduling.music_event_calibrated import build_phrase_query as calibrated_phrase_query
+from scheduling.audio_features import extract_audio_features
+from scheduling.music_event_calibration import build_phrase_query as calibrated_phrase_query
 
 
 @dataclass(frozen=True)
@@ -439,8 +439,13 @@ def phrase_rhythm_profile(
         0.0,
         1.0,
     )
-    transition_frames = int(round(12.0 + 36.0 * transition_slow - 12.0 * transition_fast))
-    transition_frames = int(np.clip(transition_frames, 12, 48))
+    rate_scale = float(fps) / 30.0
+    transition_frames = int(
+        round((12.0 + 36.0 * transition_slow - 12.0 * transition_fast) * rate_scale)
+    )
+    transition_frames = int(
+        np.clip(transition_frames, round(12.0 * rate_scale), round(48.0 * rate_scale))
+    )
     if section > 0.70 and calm > 0.55:
         profile = "section_sustain"
     elif transition_fast > 0.62 and accent > 0.50:

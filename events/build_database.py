@@ -30,6 +30,12 @@ from contracts.heading import (  # noqa: E402
     adaptive_event_segments,
     enforce_event_heading_contract,
 )
+from support.event_identity import (  # noqa: E402
+    EVENT_UID_SCHEMA,
+    event_uids_from_generation_db,
+    make_event_db_contract,
+)
+from motion_geometry.smpl24 import skeleton_contract  # noqa: E402
 
 
 def jsonable(x: Any) -> Any:
@@ -200,7 +206,30 @@ def save_db(
     ).astype(np.float32)
 
     db_path = out_dir / "events.npz"
+    identity_seed = {
+        "paths": _field_array(meta, "path", "", object),
+        "source_uids": _field_array(meta, "source_uid", "unknown", object),
+        "source_files": _field_array(meta, "source_file", "", object),
+        "starts": _field_array(meta, "start", 0, np.int32),
+        "ends": _field_array(meta, "end", 0, np.int32),
+        "frames": _field_array(meta, "frames", 0, np.int32),
+        "source_start_seconds": _field_array(meta, "source_start_seconds", 0.0, np.float64),
+        "source_end_seconds": _field_array(meta, "source_end_seconds", 0.0, np.float64),
+        "canonical_fps": _field_array(meta, "canonical_fps", float(cfg.fps), np.float32),
+    }
+    event_uids = event_uids_from_generation_db(identity_seed)
+    identity_contract = make_event_db_contract(event_uids)
     payload: Dict[str, Any] = {
+        "event_uid_schema_version": np.asarray(
+            EVENT_UID_SCHEMA, dtype=object
+        ),
+        "skeleton_contract_json": np.asarray(
+            json.dumps(skeleton_contract(), sort_keys=True), dtype=object
+        ),
+        "event_uids": event_uids,
+        "event_db_contract_json": np.asarray(
+            json.dumps(identity_contract, sort_keys=True), dtype=object
+        ),
         "heading_contract_schema_version": np.asarray(
             "v46_50_event_heading_contract", dtype=object
         ),
@@ -274,6 +303,15 @@ def save_db(
         "frames": _field_array(meta, "frames", 0, np.int32),
         "starts": _field_array(meta, "start", 0, np.int32),
         "ends": _field_array(meta, "end", 0, np.int32),
+        "source_start_seconds": _field_array(
+            meta, "source_start_seconds", 0.0, np.float64
+        ),
+        "source_end_seconds": _field_array(
+            meta, "source_end_seconds", 0.0, np.float64
+        ),
+        "canonical_fps": _field_array(
+            meta, "canonical_fps", float(cfg.fps), np.float32
+        ),
         "music": np.stack(music_feats).astype(np.float32),
         "music_mask": np.asarray(music_masks, dtype=np.float32),
 
@@ -346,11 +384,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out_db", required=True)
     ap.add_argument("--config", default="configs/motion_model.json")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument(
+        "--canonical_intervals_in",
+        default=None,
+        help="Reuse FPS-independent [start_seconds,end_seconds] intervals from the canonical 30 FPS DB.",
+    )
+    ap.add_argument(
+        "--canonical_intervals_out",
+        default=None,
+        help="Write kept event intervals for a later rate-specific DB build.",
+    )
     args = ap.parse_args(argv)
 
     import training.motion_models as v46  # local latest core
 
     cfg = v46.V46Config.from_json(args.config).apply_env()
+    interval_lookup: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    expected_interval_count: Optional[int] = None
+    if args.canonical_intervals_in:
+        interval_payload = json.loads(
+            Path(args.canonical_intervals_in).read_text(encoding="utf-8")
+        )
+        if interval_payload.get("schema") != "canonical_event_intervals_v1":
+            raise RuntimeError(
+                f"Unsupported canonical interval schema: {interval_payload.get('schema')!r}"
+            )
+        expected_interval_count = int(interval_payload.get("num_intervals", 0))
+        for row in interval_payload.get("intervals", []):
+            key = (str(row["source_uid"]), int(row.get("seq_id", 0)))
+            interval_lookup.setdefault(key, []).append(dict(row))
+    kept_intervals: List[Dict[str, Any]] = []
     out_dir = Path(args.out_db)
     if out_dir.exists() and args.overwrite:
         import shutil
@@ -398,6 +461,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sem = v46.parse_change_bvh_semantics(original_source)
         strong_base = v46.strong_action_semantics_from_meta(sem)
         semantic_meta = {**sem, **strong_base}
+        source_uid = str(sem.get("source_uid") or Path(original_source).stem)
 
         for seq_id, seq0 in enumerate(seqs):
             seq, contract = v46.enforce_edge151_contract_np(
@@ -407,17 +471,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 derive_contact=True,
                 project_rot=True,
             )
-            segments, seg_report = adaptive_event_segments(
-                seq,
-                semantic_meta,
-                fps=float(cfg.fps),
-            )
+            interval_key = (source_uid, int(seq_id))
+            canonical_segment_rows: List[Optional[Dict[str, Any]]]
+            if interval_lookup:
+                canonical_rows = interval_lookup.get(interval_key)
+                if not canonical_rows:
+                    raise RuntimeError(
+                        f"Canonical interval manifest has no source/sequence {interval_key!r}"
+                    )
+                segments = []
+                for row in canonical_rows:
+                    st = int(round(float(row["start_seconds"]) * float(cfg.fps)))
+                    ed = int(round(float(row["end_seconds"]) * float(cfg.fps)))
+                    st = max(0, min(st, len(seq) - 1))
+                    ed = max(st + 1, min(ed, len(seq)))
+                    segments.append((st, ed))
+                canonical_segment_rows = [dict(row) for row in canonical_rows]
+                seg_report = {
+                    "schema": "canonical_event_intervals_v1",
+                    "source_fps": float(cfg.fps),
+                    "num_segments": len(segments),
+                    "manifest": str(Path(args.canonical_intervals_in).resolve()),
+                }
+            else:
+                segments, seg_report = adaptive_event_segments(
+                    seq,
+                    semantic_meta,
+                    fps=float(cfg.fps),
+                    min_event_frames=int(cfg.min_event_frames),
+                    max_event_frames=int(cfg.max_event_frames),
+                )
+                canonical_segment_rows = [None] * len(segments)
             kept_here = 0
             dropped_here = 0
 
             for seg_idx, (st, ed) in enumerate(segments):
+                canonical_row = canonical_segment_rows[seg_idx]
                 raw_clip = seq[st:ed].astype(np.float32)
                 if len(raw_clip) < int(cfg.min_event_frames):
+                    if canonical_row is not None:
+                        raise RuntimeError(
+                            "Canonical event became too short at the target FPS: "
+                            f"source={interval_key!r}, interval={canonical_row}, "
+                            f"frames={len(raw_clip)}, minimum={cfg.min_event_frames}"
+                        )
                     continue
 
                 clip, heading = enforce_event_heading_contract(
@@ -426,6 +523,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     fps=float(cfg.fps),
                 )
                 if not bool(heading.get("valid", False)):
+                    if canonical_row is not None:
+                        raise RuntimeError(
+                            "Canonical 30 FPS event failed the target-rate heading contract: "
+                            f"source={interval_key!r}, interval={canonical_row}, "
+                            f"reason={heading.get('reason')!r}"
+                        )
                     dropped_here += 1
                     dropped_events.append({
                         "source": original_source,
@@ -448,9 +551,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     project_rot=True,
                 )
                 out_path = event_dir / f"event_{event_idx:07d}.npy"
-                source_uid = str(
-                    sem.get("source_uid")
-                    or Path(original_source).stem
+                identity_start_seconds = (
+                    float(canonical_row["start_seconds"])
+                    if canonical_row is not None
+                    else float(st) / float(cfg.fps)
+                )
+                identity_end_seconds = (
+                    float(canonical_row["end_seconds"])
+                    if canonical_row is not None
+                    else float(ed) / float(cfg.fps)
                 )
                 base_meta = {
                     **sem,
@@ -467,6 +576,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "event_start": int(st),
                     "event_end": int(ed),
                     "event_source_frames": int(len(seq)),
+                    # Preserve the canonical manifest interval verbatim.  The
+                    # local frame bounds are quantized execution details and
+                    # must not change event identity across FPS branches.
+                    "source_start_seconds": identity_start_seconds,
+                    "source_end_seconds": identity_end_seconds,
+                    "canonical_fps": float(cfg.fps),
                     "event_position_mid": float((st + ed) * 0.5 / max(len(seq), 1)),
                     "resample_report": {
                         "resampled": False,
@@ -541,6 +656,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         1.0,
                     )
                 )
+                kept_intervals.append({
+                    "source_uid": source_uid,
+                    "source_file": original_source,
+                    "seq_id": int(seq_id),
+                    "start_seconds": float(item["source_start_seconds"]),
+                    "end_seconds": float(item["source_end_seconds"]),
+                })
 
                 event_idx += 1
                 kept_here += 1
@@ -565,6 +687,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not meta:
         raise RuntimeError(
             "No valid V46.50 events built. Check retarget cache contracts and heading filters."
+        )
+    if expected_interval_count is not None and len(meta) != expected_interval_count:
+        raise RuntimeError(
+            "Target-rate Event-DB does not preserve the canonical event set: "
+            f"expected={expected_interval_count}, built={len(meta)}"
         )
 
     db_path = save_db(
@@ -625,6 +752,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         json.dumps(jsonable(report), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if args.canonical_intervals_out:
+        interval_path = Path(args.canonical_intervals_out)
+        interval_path.parent.mkdir(parents=True, exist_ok=True)
+        interval_path.write_text(
+            json.dumps(
+                {
+                    "schema": "canonical_event_intervals_v1",
+                    "canonical_source_fps": float(cfg.fps),
+                    "num_intervals": len(kept_intervals),
+                    "intervals": kept_intervals,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     print(json.dumps({
         "db": str(db_path),
         "report": str(report_path),

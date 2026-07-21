@@ -27,8 +27,8 @@ def augment_events_npz(path: str, require_known: bool = True) -> Dict[str, Any]:
     if not target.is_file():
         raise FileNotFoundError(target)
 
-    db = np.load(str(target), allow_pickle=True)
-    payload = {key: db[key] for key in db.files}
+    with np.load(str(target), allow_pickle=True) as db:
+        payload = {key: db[key] for key in db.files}
     paths = np.asarray(payload["paths"], dtype=object)
     sources = np.asarray(
         payload.get("source_uids", paths),

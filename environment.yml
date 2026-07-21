@@ -12,5 +12,5 @@ dependencies:
       - torch==2.8.0
       - torchvision==0.23.0
       - torchaudio==2.8.0
-      - -r requirements-edge.txt
+      - -r requirements-core.txt
       - pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@b6a77ad7aaf41ed90fca80ce6a2bac3c462a7881

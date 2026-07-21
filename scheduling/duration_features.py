@@ -13,14 +13,15 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
+from motion_geometry.rotations import (
+    CANONICAL_ROT6D_LAYOUT,
+    matrix_to_rot6d_np,
+    relative_rotvec_np,
+    rot6d_to_matrix_np,
+    so3_exp_np,
 )
 
-from support.turn_utils import (
+from motion_geometry.heading import (
     CONTACT,
     ROT,
     ROOT_ROT6D,
@@ -161,9 +162,13 @@ def signed_yaw_speed_dps_np(
     motion: np.ndarray,
     fps: float = 30.0,
     smooth_window: int = 5,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
 ) -> np.ndarray:
     """Signed root-yaw velocity in degrees per second."""
-    yaw = root_yaw_np(np.asarray(motion, dtype=np.float32))
+    yaw = root_yaw_np(
+        np.asarray(motion, dtype=np.float32),
+        rot6d_layout=rot6d_layout,
+    )
     if len(yaw) < 2:
         return np.zeros((0,), dtype=np.float32)
     delta = np.diff(yaw).astype(np.float32)
@@ -220,6 +225,7 @@ def full_body_activity_envelope(
     fps: float = 30.0,
     smooth_window: int = 9,
     slow_pose_span: int = 10,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
 ) -> np.ndarray:
     """Slow-motion-aware full-body phase activity.
 
@@ -258,7 +264,12 @@ def full_body_activity_envelope(
     contact_change[1:] = np.abs(np.diff(x[:, CONTACT], axis=0)).mean(axis=1)
     contact_change[0] = contact_change[1]
 
-    signed_yaw = signed_yaw_speed_dps_np(x, fps=fps, smooth_window=9)
+    signed_yaw = signed_yaw_speed_dps_np(
+        x,
+        fps=fps,
+        smooth_window=9,
+        rot6d_layout=rot6d_layout,
+    )
     yaw_frame = np.zeros((t,), dtype=np.float32)
     if len(signed_yaw):
         yaw_frame[1:] = np.abs(signed_yaw)
@@ -579,6 +590,9 @@ def detect_natural_turn_events(
     split_score_threshold: float = 0.68,
     long_split_score_threshold: float = 0.42,
     min_direction_consistency: float = 0.18,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
+    smooth_window: int = 9,
+    minimum_input_frames: int = 24,
 ) -> List[NaturalTurnEvent]:
     """Detect slow, complete and phase-consistent Dunhuang turn events.
 
@@ -592,11 +606,16 @@ def detect_natural_turn_events(
        being cropped to a constant maximum-duration label.
     """
     x = np.asarray(motion, dtype=np.float32)
-    if x.ndim != 2 or x.shape[-1] != 151 or len(x) < max(24, min_duration + 6):
+    if x.ndim != 2 or x.shape[-1] != 151 or len(x) < max(int(minimum_input_frames), min_duration + 6):
         return []
 
-    yaw = root_yaw_np(x)
-    signed_speed = signed_yaw_speed_dps_np(x, fps=fps, smooth_window=9)
+    yaw = root_yaw_np(x, rot6d_layout=rot6d_layout)
+    signed_speed = signed_yaw_speed_dps_np(
+        x,
+        fps=fps,
+        smooth_window=max(1, int(smooth_window)),
+        rot6d_layout=rot6d_layout,
+    )
     absolute_speed = np.abs(signed_speed)
     if len(absolute_speed) < 3:
         return []
@@ -612,8 +631,9 @@ def detect_natural_turn_events(
     activity = full_body_activity_envelope(
         x,
         fps=fps,
-        smooth_window=9,
+        smooth_window=max(1, int(smooth_window)),
         slow_pose_span=slow_pose_span,
+        rot6d_layout=rot6d_layout,
     )
     slow_progress = multi_scale_pose_progress(x, span=slow_pose_span)
 
@@ -821,7 +841,7 @@ def make_fast_turn_corruption_v2(
     output_frames = np.arange(n, dtype=np.float32)
     source_positions = np.interp(output_frames, output_control, source_control).astype(np.float32)
 
-    from support.turn_utils import resample_motion_so3
+    from motion_geometry.heading import resample_motion_so3
 
     corrupted = resample_motion_so3(x, source_positions)
     corrupted_start = int(output_pre)
@@ -903,15 +923,21 @@ def build_v23_condition(
     event_start: int,
     event_end: int,
     fps: float = 30.0,
+    rot6d_layout: str = CANONICAL_ROT6D_LAYOUT,
 ) -> np.ndarray:
     """Build the 17D inference-safe condition from observed motion only."""
     x = np.asarray(observed_motion, dtype=np.float32)
-    query = motion_query_from_dynamics(x)
+    query = motion_query_from_dynamics(x, fps=fps, rot6d_layout=rot6d_layout)
     event_start = int(np.clip(event_start, 0, len(x) - 2))
     event_end = int(np.clip(event_end, event_start + 1, len(x) - 1))
-    speed = yaw_speed_dps_np(x, fps=fps, smooth_window=5)
+    speed = yaw_speed_dps_np(
+        x,
+        fps=fps,
+        smooth_window=5,
+        rot6d_layout=rot6d_layout,
+    )
     local_speed = speed[event_start : min(event_end, len(speed))]
-    yaw = root_yaw_np(x)
+    yaw = root_yaw_np(x, rot6d_layout=rot6d_layout)
     path_angle = float(np.sum(np.abs(np.diff(yaw[event_start : event_end + 1]))) * 180.0 / np.pi)
     peak = float(local_speed.max()) if len(local_speed) else 0.0
     mean = float(local_speed.mean()) if len(local_speed) else 0.0
@@ -985,16 +1011,11 @@ def blend_motion_so3_np(base: np.ndarray, candidate: np.ndarray, alpha: np.ndarr
     out[:, CONTACT] = np.where(a[:, None] >= 0.5, candidate[:, CONTACT], base[:, CONTACT])
     out[:, ROOT] = (1.0 - a[:, None]) * base[:, ROOT] + a[:, None] * candidate[:, ROOT]
 
-    b = torch.from_numpy(base[:, ROT].reshape(len(base), 24, 6)).float()
-    c = torch.from_numpy(candidate[:, ROT].reshape(len(base), 24, 6)).float()
-    with torch.no_grad():
-        rb = rotation_6d_to_matrix(b)
-        rc = rotation_6d_to_matrix(c)
-        relative = torch.matmul(rb.transpose(-1, -2), rc)
-        axis_angle = matrix_to_axis_angle(relative)
-        delta = axis_angle_to_matrix(axis_angle * torch.from_numpy(a[:, None, None]).float())
-        blended = torch.matmul(rb, delta)
-        out[:, ROT] = matrix_to_rotation_6d(blended).reshape(len(base), 144).cpu().numpy()
+    rb = rot6d_to_matrix_np(base[:, ROT].reshape(len(base), 24, 6))
+    rc = rot6d_to_matrix_np(candidate[:, ROT].reshape(len(base), 24, 6))
+    tangent = relative_rotvec_np(rb, rc)
+    blended = rb @ so3_exp_np(tangent * a[:, None, None])
+    out[:, ROT] = matrix_to_rot6d_np(blended).reshape(len(base), 144)
     return out.astype(np.float32)
 
 

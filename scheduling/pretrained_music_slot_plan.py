@@ -9,7 +9,7 @@ MotionRAG-Diff generator by producing a V46-compatible --slots_json file.
 
 Priority order
 --------------
-1) Strict/preferred: call scheduling/schedule_whole_song.py with --router_ckpt
+1) Strict/preferred: call scheduling.whole_song_scheduler with --router_ckpt
    and optional --planner_ckpt.  This uses the trained V21 music router and V26
    whole-song planner to segment an unseen song and produce a schedule.
 2) Optional controlled fallback: if V46_34_ALLOW_SEMANTIC_FALLBACK=1, build a
@@ -259,10 +259,10 @@ def run_v26_scheduler(args: argparse.Namespace, schedule_dir: Path) -> Optional[
     required = [args.index_json, args.duration_index_npz, args.v23_ckpt]
     if not all(required):
         return None
-    if not Path("scheduling/schedule_whole_song.py").exists():
+    if not Path("scheduling/whole_song_scheduler.py").exists():
         return None
     cmd = [
-        sys.executable, "scheduling/schedule_whole_song.py",
+        sys.executable, "-m", "scheduling.whole_song_scheduler",
         "--index_json", str(args.index_json),
         "--duration_index_npz", str(args.duration_index_npz),
         "--music", str(args.audio),

@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from routing.diversity import select_safe_diverse_proposal
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -326,7 +327,10 @@ def assemble_event_heading_reference(
                 detail["hard_reject"] = True
                 pen += 1e6
             preordered.append((float(pen), int(event_id), detail))
-        preordered.sort(key=lambda row: row[0])
+        primary_event_id = int(candidates[0])
+        preordered.sort(
+            key=lambda row: (0 if int(row[1]) == primary_event_id else 1, row[0])
+        )
 
         max_trials = max(
             1,
@@ -353,30 +357,13 @@ def assemble_event_heading_reference(
             )
             proposals.append((proposal, extra))
 
-        safe = [row for row in proposals if row[0].safe]
-        if safe:
-            selected_prop, selected_extra = min(
-                safe, key=lambda row: float(row[0].risk_score)
-            )
-            selected_prop.decision = (
-                "accepted_heading_physics_safe"
-                if selected_prop.rank == 0
-                else "reselected_heading_physics_safe"
-            )
-        else:
-            non_hard = [
-                row
-                for row in proposals
-                if not bool(row[1]["heading_detail"].get("hard_reject", False))
-            ]
-            if not non_hard:
-                raise RuntimeError(
-                    f"V46.50 heading contract exhausted candidates for slot {slot_idx}"
-                )
-            selected_prop, selected_extra = min(
-                non_hard, key=lambda row: float(row[0].risk_score)
-            )
-            selected_prop.decision = "minimum_violation_rescue"
+        selected_prop, selected_extra, decision = select_safe_diverse_proposal(
+            proposals,
+            db=db,
+            selected_event_ids=[int(pair[0]) for pair in selected],
+            primary_event_id=primary_event_id,
+        )
+        selected_prop.decision = decision
 
         piece = selected_prop.motion_piece.astype(np.float32)
         transition_span = None
@@ -438,6 +425,8 @@ def assemble_event_heading_reference(
             "combined_candidate_score": float(selected_prop.risk_score),
             "safe_predicted": bool(selected_prop.safe),
             "decision": selected_prop.decision,
+            "primary_event_id": primary_event_id,
+            "diversity": dict(selected_extra.get("diversity", {})),
             "length_policy": selected_prop.length_info,
             "contract_after_align": selected_prop.align_report,
             "event_turn_intent": intent,
@@ -469,6 +458,7 @@ def assemble_event_heading_reference(
                         ex["event_meta"].get("event_turn_intent", "none")
                     ),
                     "decision": pp.decision,
+                    "diversity": dict(ex.get("diversity", {})),
                 }
                 for pp, ex in proposals
             ],
@@ -603,6 +593,7 @@ def apply_generators_with_heading_guard(
         if hasattr(v46, "audit_motion_np")
         else {}
     )
+    stage["final_physical_gate"] = base.physical_quality_gate(stage["final_audit"])
     return motion.astype(np.float32), stage
 
 
@@ -632,7 +623,7 @@ def _patch_final_report(args: Any) -> None:
             x = x[0]
         report["v46_50_final_heading_metrics"] = heading_metrics_np(
             x,
-            fps=30.0,
+            fps=float(getattr(args, "fps", os.environ.get("V46_51_FPS", 30.0))),
         )
     path.write_text(
         json.dumps(base.jsonable(report), ensure_ascii=False, indent=2),

@@ -250,8 +250,8 @@ def _diagonal_w2_barycenter(
 
 
 def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: float = 30.0) -> Dict[str, Any]:
-    data = np.load(db_path, allow_pickle=True)
-    payload: Dict[str, Any] = {k: data[k] for k in data.files}
+    with np.load(db_path, allow_pickle=True) as data:
+        payload: Dict[str, Any] = {k: data[k] for k in data.files}
     paths = np.asarray(payload["paths"], dtype=object)
     n = len(paths)
     posture = _event_array(payload, "posture_mode", n, "standing")

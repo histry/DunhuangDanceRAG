@@ -1,0 +1,41 @@
+{
+  "schema": "dunhuang_multirate_profiles_v1",
+  "canonical_comparison_rate": 30.0,
+  "profiles": {
+    "fps30": {
+      "fps": 30.0,
+      "frame_scale_from_base30": 1.0,
+      "role": "canonical_primary_comparison"
+    },
+    "fps60": {
+      "fps": 60.0,
+      "frame_scale_from_base30": 2.0,
+      "role": "independent_high_rate_branch"
+    },
+    "fps30_to_60": {
+      "source_fps": 30.0,
+      "fps": 60.0,
+      "role": "so3_upsampling_ablation_only",
+      "train_models": false
+    }
+  },
+  "rate_scaled_config_fields": [
+    "window_len",
+    "hop_len",
+    "min_event_frames",
+    "max_event_frames",
+    "overlap",
+    "ik_chunk",
+    "ik_chunk_overlap"
+  ],
+  "rate_invariant_units": {
+    "contact_speed": "m/s",
+    "foot_skate": "m/s",
+    "linear_velocity": "m/s",
+    "linear_acceleration": "m/s^2",
+    "linear_jerk": "m/s^3",
+    "angular_velocity": "rad/s",
+    "angular_acceleration": "rad/s^2",
+    "event_identity": "source_uid plus microsecond interval"
+  }
+}

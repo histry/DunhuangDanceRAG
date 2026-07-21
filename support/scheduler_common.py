@@ -1,0 +1,36 @@
+"""Scheduler-facing facade over the canonical EDGE151 support contract."""
+from support.common import (
+    CONTACT,
+    EVENT_TO_ID,
+    EVENT_TYPES,
+    ROOT_X,
+    ROOT_Y,
+    ROOT_Z,
+    ROT,
+    apply_start_anchor,
+    event_compatibility,
+    json_safe,
+    load_motion,
+    make_geodesic_transition,
+    make_linear_transition,
+    motion_boundary_metrics,
+    transition_cost_from_arrays,
+)
+
+__all__ = [
+    "CONTACT",
+    "EVENT_TO_ID",
+    "EVENT_TYPES",
+    "ROOT_X",
+    "ROOT_Y",
+    "ROOT_Z",
+    "ROT",
+    "apply_start_anchor",
+    "event_compatibility",
+    "json_safe",
+    "load_motion",
+    "make_geodesic_transition",
+    "make_linear_transition",
+    "motion_boundary_metrics",
+    "transition_cost_from_arrays",
+]

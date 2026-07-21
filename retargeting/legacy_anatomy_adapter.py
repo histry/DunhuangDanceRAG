@@ -13,9 +13,8 @@ import copy
 import json
 import math
 import os
-import pickle
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -25,12 +24,6 @@ try:
     from scipy.ndimage import median_filter
 except Exception:  # pragma: no cover
     median_filter = None
-
-try:
-    from scipy.spatial.transform import Rotation, Slerp
-except Exception:  # pragma: no cover
-    Rotation = None
-    Slerp = None
 
 import retargeting.bvh_solver as legacy
 from contracts.gravity import (
@@ -52,6 +45,7 @@ from contracts.anatomy import (
     env_int,
     evaluate_anatomy_contract,
 )
+from retargeting.smpl_adapter import load_smpl24_parameters
 
 CONTACT = slice(0, 4)
 ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX = 4, 5, 6
@@ -186,8 +180,13 @@ def _fit_chunk_anatomy(
     return final_root, final_rot, last
 
 
-def _strict_contract(motion: np.ndarray, legacy_report: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    gravity = gravity_metrics_np(motion, 30.0)
+def _strict_contract(
+    motion: np.ndarray,
+    legacy_report: Dict[str, Any],
+    fps: Optional[float] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    resolved_fps = float(fps if fps is not None else legacy_report.get("target_fps", 30.0))
+    gravity = gravity_metrics_np(motion, resolved_fps)
     gravity_th = GravityThresholds(
         torso_up_cos_p05_min=env_float("V46_52_GRAVITY_TORSO_P05_MIN", 0.55),
         torso_up_cos_median_min=env_float("V46_52_GRAVITY_TORSO_MEDIAN_MIN", 0.76),
@@ -196,7 +195,7 @@ def _strict_contract(motion: np.ndarray, legacy_report: Dict[str, Any]) -> Tuple
         horizontal_body_ratio_max=env_float("V46_52_HORIZONTAL_BODY_RATIO_MAX", 0.04),
     )
     gravity_ok, gravity_reasons = evaluate_gravity_contract(gravity, gravity_th)
-    anatomy = anatomy_metrics_np(motion, fps=30.0)
+    anatomy = anatomy_metrics_np(motion, fps=resolved_fps)
     anatomy_th = AnatomyThresholds.from_env()
     anatomy_ok, anatomy_reasons = evaluate_anatomy_contract(anatomy, anatomy_th)
     fit_p95 = float(legacy_report.get("fit", {}).get("fit_rmse_p95_m", 1e9))
@@ -211,6 +210,7 @@ def _strict_contract(motion: np.ndarray, legacy_report: Dict[str, Any]) -> Tuple
         reasons.append(f"fit_rmse_p95_m={fit_p95:.6g} > {fit_limit:.6g}")
     report = {
         "schema": "v46_52_strict_motion_contract",
+        "fps": resolved_fps,
         "ok": bool(gravity_ok and anatomy_ok and fit_ok),
         "reasons": reasons,
         "gravity": gravity,
@@ -256,107 +256,28 @@ def retarget_bvh_anatomy(path: str | Path, cfg: Optional[Any] = None) -> Tuple[n
     return motion.astype(np.float32), report
 
 
-def _load_pickle_or_npz(path: Path) -> Dict[str, Any]:
-    if path.suffix.lower() == ".npz":
-        obj = np.load(path, allow_pickle=True)
-        return {k: obj[k] for k in obj.files}
-    with path.open("rb") as f:
-        obj = pickle.load(f)
-    if isinstance(obj, dict):
-        return obj
-    raise ValueError(f"Expected dict-like SMPL file: {path}")
-
-
-def _first_key(data: Dict[str, Any], keys: Sequence[str]) -> Optional[Any]:
-    for k in keys:
-        if k in data:
-            return data[k]
-    return None
-
-
-def _resample_smpl(rotvec: np.ndarray, trans: np.ndarray, src_fps: float, dst_fps: float) -> Tuple[np.ndarray, np.ndarray]:
-    if abs(float(src_fps) - float(dst_fps)) < 1e-5:
-        return rotvec.astype(np.float32), trans.astype(np.float32)
-    duration = (len(rotvec) - 1) / max(float(src_fps), 1e-8)
-    n = max(2, int(round(duration * float(dst_fps))) + 1)
-    old_t = np.arange(len(rotvec), dtype=np.float64) / float(src_fps)
-    new_t = np.minimum(np.arange(n, dtype=np.float64) / float(dst_fps), old_t[-1])
-    trans_out = np.stack([np.interp(new_t, old_t, trans[:, d]) for d in range(3)], axis=-1).astype(np.float32)
-    if Rotation is None or Slerp is None:
-        flat = rotvec.reshape(len(rotvec), -1)
-        rv = np.stack([np.interp(new_t, old_t, flat[:, d]) for d in range(flat.shape[1])], axis=-1)
-        return rv.reshape(n, NUM_JOINTS, 3).astype(np.float32), trans_out
-    out = np.empty((n, NUM_JOINTS, 3), dtype=np.float32)
-    for j in range(NUM_JOINTS):
-        r = Rotation.from_rotvec(rotvec[:, j])
-        out[:, j] = Slerp(old_t, r)(new_t).as_rotvec().astype(np.float32)
-    return out, trans_out
-
-
-def load_official_smpl_motion(path: str | Path, target_fps: float = 30.0) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Load official fitted SMPL pose/trans parameters directly into EDGE151D."""
-    p = Path(path)
-    data = _load_pickle_or_npz(p)
-    poses = _first_key(data, ("poses", "pose", "smpl_pose", "body_pose", "full_pose"))
-    trans = _first_key(data, ("trans", "transl", "translations", "root_translation", "root_trans"))
-    if poses is None:
-        raise ValueError(f"No SMPL pose key found in {p}; keys={sorted(data.keys())}")
-    poses = np.asarray(poses, dtype=np.float32)
-    if poses.ndim == 2 and poses.shape[1] >= 72:
-        rotvec = poses[:, :72].reshape(len(poses), NUM_JOINTS, 3)
-    elif poses.ndim == 3 and poses.shape[1:] == (NUM_JOINTS, 3):
-        rotvec = poses
-    else:
-        raise ValueError(f"Unsupported SMPL pose shape in {p}: {poses.shape}")
-    if trans is None:
-        trans_arr = np.zeros((len(rotvec), 3), dtype=np.float32)
-    else:
-        trans_arr = np.asarray(trans, dtype=np.float32).reshape(len(rotvec), 3)
-    fps_value = _first_key(data, ("mocap_framerate", "fps", "frame_rate", "framerate"))
-    src_fps = float(np.asarray(fps_value).reshape(-1)[0]) if fps_value is not None else 30.0
-    rotvec, trans_arr = _resample_smpl(rotvec, trans_arr, src_fps, target_fps)
-
-    if Rotation is not None:
-        mats = Rotation.from_rotvec(rotvec.reshape(-1, 3)).as_matrix().reshape(len(rotvec), NUM_JOINTS, 3, 3).astype(np.float32)
-    else:
-        # Torch conversion is available in the project's training environment.
-        from pytorch3d.transforms import axis_angle_to_matrix
-        mats = axis_angle_to_matrix(torch.as_tensor(rotvec)).cpu().numpy().astype(np.float32)
-
-    motion = np.zeros((len(rotvec), EDGE_DIM), dtype=np.float32)
-    motion[:, 4:7] = trans_arr
-    motion[:, 7:151] = matrix_to_rot6d_np(mats).reshape(len(rotvec), -1)
-    if env_bool("V46_52_LOCALIZE_ROOT_XZ", True):
-        motion[:, ROOT_X_IDX] -= motion[0, ROOT_X_IDX]
-        motion[:, ROOT_Z_IDX] -= motion[0, ROOT_Z_IDX]
-    joints = fk24_np(motion)
-    floor = float(np.percentile(joints[:, list(FOOT_JOINTS), 1], 5))
-    motion[:, ROOT_Y_IDX] -= floor
-    joints[..., 1] -= floor
-
-    feet = joints[:, list(FOOT_JOINTS)]
-    speed = np.zeros(feet.shape[:2], dtype=np.float32)
-    if len(feet) > 1:
-        speed[1:] = np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
-    contact = (feet[..., 1] <= env_float("V46_52_CONTACT_HEIGHT_M", 0.055)) & (
-        speed <= env_float("V46_52_CONTACT_SPEED_MPF", 0.025)
+def load_official_smpl_motion(
+    path: str | Path,
+    target_fps: float = 30.0,
+    scaling_mode: Optional[str] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Load generic/AIST++ fitted SMPL parameters into canonical EDGE151."""
+    motion, adapter_report = load_smpl24_parameters(
+        path,
+        target_fps=float(target_fps),
+        scaling_mode=scaling_mode or os.environ.get("AISTPP_SCALING_MODE", "canonical_body"),
+        localize_root_xz=env_bool("V46_52_LOCALIZE_ROOT_XZ", True),
+        contact_height_m=env_float("V46_52_CONTACT_HEIGHT_M", 0.055),
+        contact_speed_mps=env_float("V46_52_CONTACT_SPEED_MPS", 0.75),
+        contact_median_seconds=env_float("V46_52_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0),
     )
-    if median_filter is not None:
-        contact = median_filter(contact.astype(np.uint8), size=(5, 1), mode="nearest").astype(bool)
-    motion[:, CONTACT] = contact.astype(np.float32)
-
     base_report = {
-        "source": str(p),
-        "source_format": "official_smpl_parameters",
-        "source_fps": src_fps,
-        "target_fps": float(target_fps),
-        "source_frames": int(len(poses)),
-        "target_frames": int(len(motion)),
+        **adapter_report,
         "fit": {"fit_rmse_p95_m": 0.0, "direct_smpl": True},
     }
     ok, contract = _strict_contract(motion, base_report)
     report = {
-        "version": "v46_52_direct_official_smpl",
+        "version": "v46_54_canonical_smpl24_adapter",
         **base_report,
         "v46_52_contract": contract,
         "anatomy": contract["anatomy"],
@@ -367,5 +288,7 @@ def load_official_smpl_motion(path: str | Path, target_fps: float = 30.0) -> Tup
         "ok": bool(ok),
     }
     if env_bool("V46_52_HARD_RETARGET_GATE", True) and not ok:
-        raise RuntimeError(f"V46.52 direct SMPL contract failed for {p}: " + " | ".join(contract["reasons"]))
+        raise RuntimeError(
+            f"V46.52 direct SMPL contract failed for {path}: " + " | ".join(contract["reasons"])
+        )
     return motion.astype(np.float32), report

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V26 music-dominant whole-song ChoreoRAG scheduler.
+"""Music-dominant whole-song ChoreoRAG scheduler.
 
 Main change from the previous V26:
 - music controls phrase speed and transition intent;
@@ -14,29 +14,33 @@ import argparse
 import glob
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
+from motion_geometry.rotations import (
+    CANONICAL_ROT6D_LAYOUT,
+    matrix_to_rot6d_np,
+    relative_rotvec_np,
+    rot6d_to_matrix_np,
+    so3_exp_np,
+    so3_geodesic_np,
+    tangent_blend_np,
 )
 
 from model.music_motion_router import load_router_checkpoint
-from model.duration_predictor import load_v23_checkpoint
-from model.whole_song_planner import load_v26_planner_checkpoint
-from scheduling.schedule_multi_music import (
+from model.duration_predictor import load_duration_checkpoint
+from model.whole_song_planner import load_planner_checkpoint
+from scheduling.index_io import load_shared_index, resolve_event_motion_path
+from scheduling.retrieval import precompute_music_similarity
+from scheduling.transition_builder import (
     load_optional_transition,
-    load_shared_index,
-    precompute_music_similarity,
     refine_transition,
 )
-from support.common import (
+from support.scheduler_common import (
     CONTACT,
     EVENT_TYPES,
     ROOT_X,
@@ -46,11 +50,12 @@ from support.common import (
     event_compatibility,
     json_safe,
     load_motion,
-    make_linear_transition,
+    make_geodesic_transition,
+    motion_boundary_metrics,
     transition_cost_from_arrays,
 )
-from events.event_resampling import resample_event_with_v23
-from scheduling.global_duration_alignment import allocate_whole_song_durations
+from scheduling.event_resampling import resample_event
+from scheduling.duration_alignment import allocate_whole_song_durations
 from scheduling.hierarchical_graph_scheduler import (
     build_slot_query,
     graph_edge_penalty as hierarchical_graph_edge_penalty,
@@ -64,8 +69,8 @@ from scheduling.music_phrase_segmentation import (
     whole_song_features,
 )
 from scheduling.deep_music_features import phrase_semantic_matrix
-from training.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
-from support.turn_utils import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
+from scheduling.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
+from motion_geometry.heading import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
 
 
 @dataclass
@@ -88,6 +93,7 @@ def planner_predictions(
     phrases: Sequence[MusicPhrase],
     planner_bundle,
     device: torch.device,
+    fps: float,
 ) -> Dict[str, np.ndarray]:
     k = len(phrases)
     if planner_bundle is None:
@@ -106,7 +112,8 @@ def planner_predictions(
         )
         # Music-dominant fallback: phrase length is the first duration prior;
         # natural duration will constrain this later in the global allocator.
-        durations = np.asarray([max(12, p.length - (0 if i == 0 else p.transition_base_frames)) for i, p in enumerate(phrases)], dtype=np.float32)
+        minimum = max(1, int(round(0.4 * float(fps))))
+        durations = np.asarray([max(minimum, p.length - (0 if i == 0 else p.transition_base_frames)) for i, p in enumerate(phrases)], dtype=np.float32)
         transitions = np.asarray([0] + [2] * max(0, k - 1), dtype=np.int64)
         activity = np.asarray([float(np.asarray(p.query)[0]) for p in phrases], dtype=np.float32)
         return {
@@ -130,20 +137,8 @@ def planner_predictions(
     }
 
 
-def boundary_metrics(prev: np.ndarray, nxt: np.ndarray) -> Dict[str, float]:
-    pv = prev[-1, ROT] - prev[-2, ROT] if len(prev) > 1 else np.zeros((144,), dtype=np.float32)
-    nv = nxt[1, ROT] - nxt[0, ROT] if len(nxt) > 1 else np.zeros((144,), dtype=np.float32)
-    pa = prev[-1, ROT] - 2.0 * prev[-2, ROT] + prev[-3, ROT] if len(prev) > 2 else np.zeros((144,), dtype=np.float32)
-    na = nxt[2, ROT] - 2.0 * nxt[1, ROT] + nxt[0, ROT] if len(nxt) > 2 else np.zeros((144,), dtype=np.float32)
-    yaw = root_yaw_np(np.stack([prev[-1], nxt[0]], axis=0).astype(np.float32))
-    yaw_gap_deg = float(abs(yaw[1] - yaw[0]) * 180.0 / np.pi) if len(yaw) == 2 else 0.0
-    return {
-        "pose_jump": float(np.linalg.norm(prev[-1, ROT] - nxt[0, ROT]) / np.sqrt(144.0)),
-        "velocity_jump": float(np.linalg.norm(pv - nv) / np.sqrt(144.0)),
-        "acceleration_jump": float(np.linalg.norm(pa - na) / np.sqrt(144.0)),
-        "contact_jump": float(np.abs(prev[-1, CONTACT] - nxt[0, CONTACT]).mean()),
-        "yaw_gap_deg": yaw_gap_deg,
-    }
+def boundary_metrics(prev: np.ndarray, nxt: np.ndarray, fps: float = 30.0) -> Dict[str, float]:
+    return motion_boundary_metrics(prev, nxt, fps=fps)
 
 
 def smootherstep01(value: float) -> float:
@@ -167,25 +162,53 @@ def dampen_event_edges(motion: np.ndarray, edge_frames: int, strength: float) ->
 
     left_start = x[0].copy()
     left_end = x[n + 1].copy()
+    left_start_rot = rot6d_to_matrix_np(left_start[ROT].reshape(24, 6))
+    left_end_rot = rot6d_to_matrix_np(left_end[ROT].reshape(24, 6))
     for i in range(1, n + 1):
         u = i / float(n + 1)
         eased = smootherstep01(u)
         target = (1.0 - eased) * left_start + eased * left_end
         weight = s * (1.0 - eased)
-        x[i, ROT] = (1.0 - weight) * x[i, ROT] + weight * target[ROT]
+        target_rot = tangent_blend_np(
+            left_start_rot,
+            left_end_rot,
+            np.full((24,), eased, dtype=np.float32),
+        )
+        current_rot = rot6d_to_matrix_np(x[i, ROT].reshape(24, 6))
+        x[i, ROT] = matrix_to_rot6d_np(
+            tangent_blend_np(
+                current_rot,
+                target_rot,
+                np.full((24,), weight, dtype=np.float32),
+            )
+        ).reshape(-1)
         x[i, 5] = (1.0 - weight) * x[i, 5] + weight * target[5]
 
     right_start_index = len(x) - n - 2
     right_end_index = len(x) - 1
     right_start = x[right_start_index].copy()
     right_end = x[right_end_index].copy()
+    right_start_rot = rot6d_to_matrix_np(right_start[ROT].reshape(24, 6))
+    right_end_rot = rot6d_to_matrix_np(right_end[ROT].reshape(24, 6))
     span = max(right_end_index - right_start_index, 1)
     for idx in range(right_start_index + 1, right_end_index):
         u = (idx - right_start_index) / float(span)
         eased = smootherstep01(u)
         target = (1.0 - eased) * right_start + eased * right_end
         weight = s * eased
-        x[idx, ROT] = (1.0 - weight) * x[idx, ROT] + weight * target[ROT]
+        target_rot = tangent_blend_np(
+            right_start_rot,
+            right_end_rot,
+            np.full((24,), eased, dtype=np.float32),
+        )
+        current_rot = rot6d_to_matrix_np(x[idx, ROT].reshape(24, 6))
+        x[idx, ROT] = matrix_to_rot6d_np(
+            tangent_blend_np(
+                current_rot,
+                target_rot,
+                np.full((24,), weight, dtype=np.float32),
+            )
+        ).reshape(-1)
         x[idx, 5] = (1.0 - weight) * x[idx, 5] + weight * target[5]
 
     x[:, ROOT_X] = 0.0
@@ -211,16 +234,10 @@ def root_geodesic6d(start_frame: np.ndarray, end_frame: np.ndarray, length: int)
         axis=0,
     )
     alphas = np.asarray([smootherstep01((i + 1) / float(k + 1)) for i in range(k)], dtype=np.float32)
-    with torch.no_grad():
-        matrices = rotation_6d_to_matrix(torch.from_numpy(roots).float())
-        r0 = matrices[0]
-        r1 = matrices[1]
-        relative = r0.transpose(0, 1) @ r1
-        axis_angle = matrix_to_axis_angle(relative[None])[0]
-        steps = axis_angle_to_matrix(torch.from_numpy(alphas).float()[:, None] * axis_angle[None])
-        interp = r0[None] @ steps
-        root6d = matrix_to_rotation_6d(interp).cpu().numpy()
-    return root6d.astype(np.float32)
+    matrices = rot6d_to_matrix_np(roots)
+    tangent = relative_rotvec_np(matrices[0], matrices[1])
+    interpolation = matrices[0][None] @ so3_exp_np(alphas[:, None] * tangent[None])
+    return matrix_to_rot6d_np(interpolation).astype(np.float32)
 
 
 def enforce_yaw_safe_transition(transition: np.ndarray, prev: np.ndarray, nxt: np.ndarray) -> np.ndarray:
@@ -237,12 +254,14 @@ def enforce_yaw_safe_transition(transition: np.ndarray, prev: np.ndarray, nxt: n
 
 def music_transition_frames(phrase: MusicPhrase, args: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
     base = int(phrase.transition_base_frames)
+    frames_24 = int(round(24.0 * float(args.fps) / 30.0))
+    frames_18 = int(round(18.0 * float(args.fps) / 30.0))
     if phrase.transition_profile == "accent_cut":
-        base = min(base, 24)
+        base = min(base, frames_24)
     elif phrase.transition_profile in {"calm_sustain", "section_sustain"}:
-        base = max(base, 24)
+        base = max(base, frames_24)
     elif phrase.transition_profile == "tense_drive":
-        base = int(round(0.65 * base + 0.35 * 18))
+        base = int(round(0.65 * base + 0.35 * frames_18))
     base = int(np.clip(base, args.transition_min_frames, args.transition_max_frames))
     return base, {
         "music_transition_frames": base,
@@ -259,14 +278,14 @@ def music_transition_frames(phrase: MusicPhrase, args: argparse.Namespace) -> Tu
 
 def physical_min_transition_frames(metrics: Dict[str, float], args: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
     pose = float(metrics.get("pose_jump", 0.0))
-    vel = float(metrics.get("velocity_jump", 0.0))
-    acc = float(metrics.get("acceleration_jump", 0.0))
+    vel = float(metrics.get("angular_velocity_jump_radps", 0.0))
+    acc = float(metrics.get("angular_acceleration_jump_radps2", 0.0))
     contact = float(metrics.get("contact_jump", 0.0))
     yaw_gap = float(metrics.get("yaw_gap_deg", 0.0))
     extra = (
         args.physical_pose_frames * min(pose / max(args.pose_jump_reference, 1e-6), 2.0)
-        + args.physical_velocity_frames * min(vel / max(args.velocity_jump_reference, 1e-6), 2.0)
-        + args.physical_acceleration_frames * min(acc / max(args.acceleration_jump_reference, 1e-6), 2.0)
+        + args.physical_velocity_frames * min(vel / max(args.velocity_jump_reference_radps, 1e-6), 2.0)
+        + args.physical_acceleration_frames * min(acc / max(args.acceleration_jump_reference_radps2, 1e-6), 2.0)
         + args.physical_contact_frames * contact
     )
     yaw_frames = int(math.ceil(
@@ -280,8 +299,8 @@ def physical_min_transition_frames(metrics: Dict[str, float], args: argparse.Nam
     return frames, {
         "physical_min_frames": frames,
         "pose_jump": pose,
-        "velocity_jump": vel,
-        "acceleration_jump": acc,
+        "angular_velocity_jump_radps": vel,
+        "angular_acceleration_jump_radps2": acc,
         "contact_jump": contact,
         "yaw_gap_deg": yaw_gap,
         "yaw_required_frames": yaw_frames,
@@ -294,12 +313,12 @@ def dynamic_transition_len(
     phrase: MusicPhrase,
     args: argparse.Namespace,
 ) -> Tuple[int, Dict[str, Any]]:
-    metrics = boundary_metrics(prev_motion, next_motion)
+    metrics = boundary_metrics(prev_motion, next_motion, fps=float(args.fps))
     music_len, music_meta = music_transition_frames(phrase, args)
     physical_len, physical_meta = physical_min_transition_frames(metrics, args)
     chosen = max(music_len, physical_len)
     if phrase.transition_profile == "accent_cut" and physical_len <= music_len:
-        chosen = min(chosen, 24)
+        chosen = min(chosen, int(round(24.0 * float(args.fps) / 30.0)))
     chosen = int(np.clip(chosen, args.transition_min_frames, args.transition_max_frames))
     slot_budget_cap = max(0, int(phrase.length) - int(args.min_content_frames))
     slot_budget_capped_from = None
@@ -321,11 +340,53 @@ def dynamic_transition_len(
     return chosen, meta
 
 
-def planner_bundle_lengths(path: str) -> Tuple[int, ...]:
+def planner_bundle_lengths(path: str, fps: float) -> Tuple[int, ...]:
     if not path:
-        return (12, 16, 20, 24, 30, 36, 42, 48)
+        return tuple(int(round(x * float(fps) / 30.0)) for x in (12, 16, 20, 24, 30, 36, 42, 48))
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    return tuple(int(x) for x in checkpoint.get("config", {}).get("transition_lengths", (12, 16, 20, 24, 30, 36, 42, 48)))
+    config = checkpoint.get("config", {})
+    checkpoint_fps = config.get("fps")
+    if checkpoint_fps is None:
+        legacy_ok = (
+            abs(float(fps) - 30.0) < 1.0e-6
+            and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS", "0") == "1"
+        )
+        if not legacy_ok:
+            raise RuntimeError(
+                f"Planner checkpoint {path} has no FPS contract. Rebuild it for {fps} FPS. "
+                "Legacy weights are allowed only for the explicit 30 FPS parity baseline."
+            )
+    elif abs(float(checkpoint_fps) - float(fps)) > 1.0e-6:
+        raise RuntimeError(
+            f"Planner checkpoint FPS mismatch: checkpoint={checkpoint_fps}, runtime={fps}"
+        )
+    fallback = tuple(int(round(x * float(fps) / 30.0)) for x in (12, 16, 20, 24, 30, 36, 42, 48))
+    return tuple(int(x) for x in config.get("transition_lengths", fallback))
+
+
+def validate_checkpoint_fps(path: str, role: str, fps: float) -> None:
+    """Reject Scheduler checkpoints trained under an unknown or other frame rate."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"{role} checkpoint is not a mapping: {path}")
+    config = checkpoint.get("config", {})
+    if not isinstance(config, dict):
+        raise RuntimeError(f"{role} checkpoint config is not a mapping: {path}")
+    declared = config.get("fps", checkpoint.get("fps"))
+    if declared is None:
+        legacy_ok = (
+            abs(float(fps) - 30.0) < 1.0e-6
+            and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS", "0") == "1"
+        )
+        if legacy_ok:
+            return
+        raise RuntimeError(
+            f"{role} checkpoint has no FPS contract: {path}. Rebuild the rate-specific asset."
+        )
+    if abs(float(declared) - float(fps)) > 1.0e-6:
+        raise RuntimeError(
+            f"{role} checkpoint FPS mismatch: checkpoint={declared}, runtime={fps}, path={path}"
+        )
 
 
 def choose_events(
@@ -366,7 +427,7 @@ def choose_events(
     families = [str(item.get("family_id", "")) for item in items]
     queries = [np.asarray(p.query, dtype=np.float32) for p in phrases]
     similarities = precompute_music_similarity(router, queries, motion_desc, device)
-    transition_choices = planner_bundle_lengths(args.planner_ckpt)
+    transition_choices = planner_bundle_lengths(args.planner_ckpt, fps=float(args.fps))
 
     beam = [CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
@@ -464,11 +525,34 @@ def choose_events(
                     continue
                 family = families[idx]
                 same_family = sum(1 for previous in state.selected if families[previous] == family)
+                candidate_source = str(
+                    items[idx].get("source_uid", items[idx].get("source_id", "unknown"))
+                )
                 same_source = sum(
                     1
                     for previous in state.selected
-                    if int(items[previous].get("source_id", -1)) == int(items[idx].get("source_id", -2))
+                    if str(items[previous].get("source_uid", items[previous].get("source_id", "unknown")))
+                    == candidate_source
                 )
+                source_run = 0
+                for previous in reversed(state.selected):
+                    previous_source = str(
+                        items[previous].get(
+                            "source_uid", items[previous].get("source_id", "unknown")
+                        )
+                    )
+                    if previous_source != candidate_source:
+                        break
+                    source_run += 1
+                if source_run >= int(args.max_source_run):
+                    continue
+                projected_slots = len(state.selected) + 1
+                projected_source_share = (same_source + 1) / max(1, projected_slots)
+                if (
+                    projected_slots >= int(args.min_source_share_slots)
+                    and projected_source_share > float(args.max_source_share)
+                ):
+                    continue
                 if args.hard_family_unique and same_family > 0:
                     continue
 
@@ -487,13 +571,17 @@ def choose_events(
                         entry_pose[idx],
                         entry_vel[idx],
                     )
-                    candidate_boundary = boundary_metrics(motions[previous], motions[idx])
+                    candidate_boundary = boundary_metrics(
+                        motions[previous], motions[idx], fps=float(args.fps)
+                    )
                     boundary_velocity_penalty = min(
-                        candidate_boundary["velocity_jump"] / max(args.velocity_jump_reference, 1e-6),
+                        candidate_boundary["angular_velocity_jump_radps"]
+                        / max(args.velocity_jump_reference_radps, 1e-6),
                         args.boundary_penalty_cap,
                     )
                     boundary_acceleration_penalty = min(
-                        candidate_boundary["acceleration_jump"] / max(args.acceleration_jump_reference, 1e-6),
+                        candidate_boundary["angular_acceleration_jump_radps2"]
+                        / max(args.acceleration_jump_reference_radps2, 1e-6),
                         args.boundary_penalty_cap,
                     )
                     if args.music_dominant_timing:
@@ -545,7 +633,10 @@ def choose_events(
                     "predicted_motion_event": predicted_event,
                     "predicted_duration": predicted_duration,
                     "event_index": idx,
+                    "event_uid": str(items[idx]["event_uid"]),
                     "event_id": str(items[idx].get("event_id", idx)),
+                    "source_uid": candidate_source,
+                    "projected_source_share": float(projected_source_share),
                     "family_id": family,
                     "motion_event": event_types[idx],
                     "natural_duration": float(natural[idx]),
@@ -601,6 +692,40 @@ def choose_events(
     return beam[0]
 
 
+def cap_transition_budget(
+    transition_lengths: Sequence[int],
+    *,
+    total_frames: int,
+    max_fraction: float,
+    minimum_nonzero: int,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Cap total transition coverage while preserving every real boundary."""
+    values = [max(0, int(value)) for value in transition_lengths]
+    if values:
+        values[0] = 0
+    before = int(sum(values))
+    budget = max(0, int(math.floor(float(total_frames) * float(max_fraction))))
+    active = [index for index, value in enumerate(values) if index > 0 and value > 0]
+    floor = max(1, int(minimum_nonzero))
+    if active and floor * len(active) > budget:
+        floor = max(1, budget // len(active))
+    while sum(values) > budget:
+        reducible = [index for index in active if values[index] > floor]
+        if not reducible:
+            break
+        index = max(reducible, key=lambda i: values[i])
+        values[index] -= 1
+    return values, {
+        "before_frames": before,
+        "after_frames": int(sum(values)),
+        "total_frames": int(total_frames),
+        "max_fraction": float(max_fraction),
+        "actual_fraction": float(sum(values) / max(1, int(total_frames))),
+        "minimum_nonzero_frames": int(floor),
+        "capped": bool(values != [max(0, int(x)) if i else 0 for i, x in enumerate(transition_lengths)]),
+    }
+
+
 def generate_one(
     audio_path: Path,
     arrays,
@@ -653,7 +778,7 @@ def generate_one(
         require_deep=bool(args.require_deep_music),
         min_deep_success=float(args.deep_music_min_success),
     )
-    predictions = planner_predictions(phrases, planner_bundle, device)
+    predictions = planner_predictions(phrases, planner_bundle, device, fps=float(args.fps))
     selected_state = choose_events(
         phrases,
         phrase_semantics,
@@ -673,7 +798,7 @@ def generate_one(
     planner_durations = [float(x) for x in predictions["durations"]]
     event_types = [part["motion_event"] for part in selected_state.parts]
     music_events = [phrase.music_event for phrase in phrases]
-    transition_lengths = selected_state.transition_lengths
+    transition_lengths = list(selected_state.transition_lengths)
     transition_lengths[0] = 0
     if args.lock_music_boundaries:
         for i, phrase in enumerate(phrases):
@@ -687,6 +812,17 @@ def generate_one(
                 meta["pre_allocation_capped_from"] = previous
                 meta["dominant_reason"] = "slot_budget"
                 selected_state.parts[i]["transition_meta"] = meta
+    transition_lengths, transition_budget = cap_transition_budget(
+        transition_lengths,
+        total_frames=len(features),
+        max_fraction=args.max_transition_fraction,
+        minimum_nonzero=args.transition_budget_min_frames,
+    )
+    for index, value in enumerate(transition_lengths):
+        selected_state.parts[index]["transition_len"] = int(value)
+        meta = dict(selected_state.parts[index].get("transition_meta", {}))
+        meta["global_transition_budget"] = transition_budget
+        selected_state.parts[index]["transition_meta"] = meta
     music_speed_factors = [phrase.speed_factor for phrase in phrases]
     music_content_targets = [max(args.min_content_frames, phrase.length - transition_lengths[i]) for i, phrase in enumerate(phrases)]
     allocation = allocate_whole_song_durations(
@@ -712,11 +848,12 @@ def generate_one(
     contents: List[np.ndarray] = []
     resampling_reports: List[Dict[str, Any]] = []
     for idx, target_len in zip(selected_state.selected, allocation["content_lengths"]):
-        content, report = resample_event_with_v23(
+        content, report = resample_event(
             motions[idx],
             int(target_len),
             v23_bundle,
             device,
+            fps=float(args.fps),
             min_turn_angle=args.v23_min_turn_angle,
             min_peak_dps=args.v23_min_peak_dps,
         )
@@ -731,7 +868,7 @@ def generate_one(
     for slot, content in enumerate(contents):
         if slot > 0:
             k = int(transition_lengths[slot])
-            rough = make_linear_transition(contents[slot - 1], content, k)
+            rough = make_geodesic_transition(contents[slot - 1], content, k)
             transition = refine_transition(
                 transition_bundle,
                 rough,
@@ -756,7 +893,9 @@ def generate_one(
                 transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
             else:
                 diffusion_meta = {"enabled": False}
-            metrics = boundary_metrics(contents[slot - 1], content)
+            metrics = boundary_metrics(
+                contents[slot - 1], content, fps=float(args.fps)
+            )
             metrics["transition_len"] = k
             metrics["transition_meta"] = selected_state.parts[slot].get("transition_meta", {})
             metrics["transition_diffusion"] = diffusion_meta
@@ -785,6 +924,21 @@ def generate_one(
         "version": "v26_music_dominant_whole_song_choreorag",
         "audio": str(audio_path),
         "audio_meta": audio_meta,
+        "rotation_contract": {
+            "motion_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
+            "event_index_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
+            "duration_checkpoint_rot6d_layout": v23_bundle.get("rot6d_layout"),
+            "transition_checkpoint_rot6d_layout": (
+                transition_bundle.get("rot6d_layout")
+                if transition_bundle is not None
+                else None
+            ),
+            "transition_diffusion_checkpoint_rot6d_layout": (
+                args.transition_diffusion_bundle.get("rot6d_layout")
+                if args.transition_diffusion_bundle is not None
+                else None
+            ),
+        },
         "planner_mode": str(predictions["mode"][0]),
         "music_semantic": semantic_meta,
         "segmentation": {
@@ -796,6 +950,8 @@ def generate_one(
             "effective_slot_boundaries": [int(phrases[0].start)] + [int(p.end) for p in phrases] if phrases else [],
         },
         "allocation": allocation,
+        "event_db_contract": dict(getattr(args, "event_db_contract", {})),
+        "transition_budget": transition_budget,
         "score": selected_state.score,
         "schedule": [],
         "boundary_metrics": boundary_reports,
@@ -866,18 +1022,24 @@ def main() -> None:
     parser.add_argument("--start_pose", default="")
     parser.add_argument("--start_anchor_blend", type=int, default=8)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument(
+        "--frame_parameters_fps",
+        type=float,
+        default=30.0,
+        help="Reference rate for CLI values named *_frames; they are scaled to --fps.",
+    )
     parser.add_argument("--max_seconds", type=float, default=0.0)
     parser.add_argument("--min_phrase_seconds", type=float, default=2.5)
     parser.add_argument("--max_phrase_seconds", type=float, default=7.5)
     parser.add_argument("--boundary_quantile", type=float, default=0.68)
     parser.add_argument("--beat_snap_seconds", type=float, default=0.35)
-    parser.add_argument("--max_phrases", type=int, default=160)
+    parser.add_argument("--max_phrases", type=int, default=96)
     parser.add_argument("--multi_event_phrases", type=_bool_arg, default=True)
     parser.add_argument("--lock_music_boundaries", type=_bool_arg, default=True)
-    parser.add_argument("--max_single_event_seconds", type=float, default=3.20)
-    parser.add_argument("--calm_max_single_event_seconds", type=float, default=2.80)
-    parser.add_argument("--min_subphrase_seconds", type=float, default=1.60)
-    parser.add_argument("--max_events_per_phrase", type=int, default=4)
+    parser.add_argument("--max_single_event_seconds", type=float, default=5.00)
+    parser.add_argument("--calm_max_single_event_seconds", type=float, default=4.50)
+    parser.add_argument("--min_subphrase_seconds", type=float, default=2.50)
+    parser.add_argument("--max_events_per_phrase", type=int, default=2)
     parser.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
     parser.add_argument("--beam_size", type=int, default=24)
     parser.add_argument("--candidate_top_k", type=int, default=256)
@@ -918,6 +1080,9 @@ def main() -> None:
     parser.add_argument("--mmr_weight", type=float, default=0.40)
     parser.add_argument("--family_repeat_weight", type=float, default=0.58)
     parser.add_argument("--source_repeat_weight", type=float, default=0.18)
+    parser.add_argument("--max_source_run", type=int, default=2)
+    parser.add_argument("--max_source_share", type=float, default=0.40)
+    parser.add_argument("--min_source_share_slots", type=int, default=6)
     parser.add_argument("--hard_family_unique", action="store_true")
     parser.add_argument("--global_music_weight", type=float, default=1.60)
     parser.add_argument("--global_natural_weight", type=float, default=0.85)
@@ -927,16 +1092,18 @@ def main() -> None:
     parser.add_argument("--max_time_warp", type=float, default=1.50)
     parser.add_argument("--allow_music_bound_override", type=_bool_arg, default=True)
     parser.add_argument("--music_dominant_timing", type=_bool_arg, default=True)
-    parser.add_argument("--transition_min_frames", type=int, default=12)
-    parser.add_argument("--transition_max_frames", type=int, default=48)
+    parser.add_argument("--transition_min_frames", type=int, default=8)
+    parser.add_argument("--transition_max_frames", type=int, default=24)
+    parser.add_argument("--max_transition_fraction", type=float, default=0.20)
+    parser.add_argument("--transition_budget_min_frames", type=int, default=6)
     parser.add_argument("--transition_diffusion", type=_bool_arg, default=False)
     parser.add_argument("--transition_diffusion_blend", type=float, default=0.45)
     parser.add_argument("--transition_diffusion_steps", type=int, default=12)
     parser.add_argument("--transition_yaw_limit_dps", type=float, default=220.0)
     parser.add_argument("--yaw_transition_safety_factor", type=float, default=1.90)
     parser.add_argument("--pose_jump_reference", type=float, default=0.120)
-    parser.add_argument("--velocity_jump_reference", type=float, default=0.010)
-    parser.add_argument("--acceleration_jump_reference", type=float, default=0.018)
+    parser.add_argument("--velocity_jump_reference_radps", type=float, default=0.30)
+    parser.add_argument("--acceleration_jump_reference_radps2", type=float, default=16.20)
     parser.add_argument("--physical_pose_frames", type=float, default=8.0)
     parser.add_argument("--physical_velocity_frames", type=float, default=10.0)
     parser.add_argument("--physical_acceleration_frames", type=float, default=8.0)
@@ -944,6 +1111,26 @@ def main() -> None:
     parser.add_argument("--v23_min_turn_angle", type=float, default=10.0)
     parser.add_argument("--v23_min_peak_dps", type=float, default=14.0)
     args = parser.parse_args()
+    if args.fps <= 0.0 or args.frame_parameters_fps <= 0.0:
+        raise ValueError("fps and frame_parameters_fps must be positive")
+    frame_scale = float(args.fps) / float(args.frame_parameters_fps)
+    for name in (
+        "start_anchor_blend",
+        "anti_static_min_content_frames",
+        "edge_damping_frames",
+        "min_content_frames",
+        "transition_min_frames",
+        "transition_max_frames",
+        "transition_budget_min_frames",
+    ):
+        setattr(args, name, max(1, int(round(float(getattr(args, name)) * frame_scale))))
+    for name in (
+        "physical_pose_frames",
+        "physical_velocity_frames",
+        "physical_acceleration_frames",
+        "physical_contact_frames",
+    ):
+        setattr(args, name, float(getattr(args, name)) * frame_scale)
 
     paths = [Path(x) for x in args.music]
     if args.music_glob:
@@ -957,29 +1144,66 @@ def main() -> None:
     if not args.feature_dir:
         args.feature_dir = str(out_dir / "music_features")
 
-    _, arrays, items = load_shared_index(Path(args.index_json), Path(args.duration_index_npz))
+    index_json = Path(args.index_json).resolve()
+    metadata, arrays, items = load_shared_index(
+        index_json,
+        Path(args.duration_index_npz),
+    )
+    index_rates = [float(value) for value in metadata.get("canonical_fps_values", [])]
+    legacy_30_ok = (
+        not index_rates
+        and abs(float(args.fps) - 30.0) < 1.0e-6
+        and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_INDEX", "0") == "1"
+    )
+    if not legacy_30_ok and index_rates != [float(args.fps)]:
+        raise RuntimeError(
+            "Scheduler FPS contract mismatch: "
+            f"index={index_rates!r}, runtime={[float(args.fps)]!r}. "
+            "Use the rate-specific Event-DB, Scheduler index and duration assets."
+        )
+    args.event_db_contract = dict(metadata["event_db_contract"])
     if "natural_duration" not in arrays.files:
         raise RuntimeError(
             "duration_index_npz lacks natural_duration. Run scheduling/build_duration_index.py first."
         )
     hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz, hyperbolic_ckpt=args.hyperbolic_ckpt)
     motions = [
-        load_motion(Path(str(item.get("pkl", item.get("path", "")))))
+        load_motion(resolve_event_motion_path(item, index_json, metadata=metadata))
         for item in items
     ]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    validate_checkpoint_fps(args.router_ckpt, "Router", float(args.fps))
+    validate_checkpoint_fps(args.v23_ckpt, "Duration", float(args.fps))
+    if args.planner_ckpt:
+        validate_checkpoint_fps(args.planner_ckpt, "Planner", float(args.fps))
     router = load_router_checkpoint(args.router_ckpt, device=device)
     transition_bundle = load_optional_transition(args.transition_ckpt, device)
     args.transition_diffusion_bundle = load_transition_diffusion(args.transition_diffusion_ckpt, device) if args.transition_diffusion and args.transition_diffusion_ckpt else None
-    v23_bundle = load_v23_checkpoint(args.v23_ckpt, device=device)
-    planner_bundle = load_v26_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
+    v23_bundle = load_duration_checkpoint(args.v23_ckpt, device=device)
+    planner_bundle = load_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
 
     summary = {
         "version": "v26_music_dominant_whole_song_choreorag",
+        "rotation_contract": {
+            "motion_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
+            "event_index_rot6d_layout": metadata["rot6d_layout"],
+            "duration_checkpoint_rot6d_layout": v23_bundle.get("rot6d_layout"),
+            "transition_checkpoint_rot6d_layout": (
+                transition_bundle.get("rot6d_layout")
+                if transition_bundle is not None
+                else None
+            ),
+            "transition_diffusion_checkpoint_rot6d_layout": (
+                args.transition_diffusion_bundle.get("rot6d_layout")
+                if args.transition_diffusion_bundle is not None
+                else None
+            ),
+        },
         "planner_ckpt": args.planner_ckpt,
         "router_ckpt": args.router_ckpt,
         "v23_ckpt": args.v23_ckpt,
         "transition_ckpt": args.transition_ckpt,
+        "event_db_contract": dict(metadata["event_db_contract"]),
         "results": {},
     }
     for path in paths:

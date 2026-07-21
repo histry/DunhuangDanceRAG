@@ -10,11 +10,10 @@ export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 [[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
 
-ROOT_DIR="${ROOT_DIR:-/home/disk/lsm/storage/EDGE}"
 cd "$ROOT_DIR"
 
 export ROOT_DIR
-export V46_51_PYTHON="${V46_51_PYTHON:-/home/disk/lsm/conda_envs/edge/bin/python}"
+export V46_51_PYTHON="${V46_51_PYTHON:-${PYTHON_BIN:-python}}"
 export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
 export MUSIC_DIRS="${MUSIC_DIRS:-$ROOT_DIR/data/v21_router_music_999/splits/train}"
 export AUDIO="${1:-${AUDIO:-$ROOT_DIR/test_music_bank/dunhuangwu2.wav}}"

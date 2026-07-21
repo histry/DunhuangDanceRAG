@@ -17,3 +17,10 @@ outputs/*
 !outputs/.gitkeep
 # Local backups
 maintenance_backups/
+migration_baseline/
+*.before_report_path_fix_*
+assets/indexes/event_index.json.before_event_store_*
+assets/indexes/scheduler_event_store_manifest.json
+
+# Project-local scheduler assets are reproducibility inputs, not source code.
+assets/events/scheduler_event_store/

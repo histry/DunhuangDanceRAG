@@ -206,7 +206,7 @@ def _robust_scale(x: np.ndarray) -> np.ndarray:
     return np.clip((a - p10) / max(float(p90 - p10), 1e-6), 0.0, 1.0)
 
 
-def local_rotation_energy_np(motion: np.ndarray) -> np.ndarray:
+def local_rotation_energy_np(motion: np.ndarray, fps: float = 30.0) -> np.ndarray:
     x = np.asarray(motion, dtype=np.float32)
     r = rot6d_to_matrix_np(
         x[:, ROT6D_START:ROT6D_END].reshape(len(x), NUM_JOINTS, 6)
@@ -217,7 +217,7 @@ def local_rotation_energy_np(motion: np.ndarray) -> np.ndarray:
     trace = np.trace(rel, axis1=-2, axis2=-1)
     angle = np.arccos(np.clip((trace - 1.0) * 0.5, -1.0, 1.0))
     # Exclude root so heading does not masquerade as local artistic activity.
-    e = np.mean(np.abs(angle[:, 1:]), axis=1)
+    e = np.mean(np.abs(angle[:, 1:]), axis=1) * float(fps)
     return np.concatenate([[e[0]], e]).astype(np.float32)
 
 
@@ -365,10 +365,10 @@ def infer_turn_intent(
     p95 = float(metrics["yaw_speed_deg_s_p95"])
     duration = float(metrics["duration_seconds"])
 
-    local_e = local_rotation_energy_np(motion)
+    local_e = local_rotation_energy_np(motion, fps=fps)
     local_p95 = float(np.percentile(local_e, 95)) if local_e.size else 0.0
     root_dominance = float(
-        np.radians(p95) / max(local_p95 * float(fps), 1e-5)
+        np.radians(p95) / max(local_p95, 1e-5)
     )
 
     if strength >= 0.80 and (net >= 270.0 or absolute >= 360.0):
@@ -399,7 +399,7 @@ def infer_turn_intent(
         "intent": intent,
         "confidence": float(np.clip(confidence, 0.0, 1.0)),
         "semantic_turn_strength": strength,
-        "local_rotation_energy_p95_rad_per_frame": local_p95,
+        "local_rotation_energy_p95_rad_s": local_p95,
         "root_rotation_dominance": root_dominance,
         "metrics": metrics,
     }
@@ -480,8 +480,8 @@ def enforce_event_heading_contract(
         "before_budget": before,
         "after_budget": after,
         "budget_violation_deg": float(budget_violation_deg),
-        "local_rotation_energy_p95_rad_per_frame": float(
-            inferred["local_rotation_energy_p95_rad_per_frame"]
+        "local_rotation_energy_p95_rad_s": float(
+            inferred["local_rotation_energy_p95_rad_s"]
         ),
         "root_rotation_dominance": float(inferred["root_rotation_dominance"]),
     }
@@ -511,6 +511,8 @@ def adaptive_event_segments(
     motion: np.ndarray,
     meta: Mapping[str, Any],
     fps: float = 30.0,
+    min_event_frames: Optional[int] = None,
+    max_event_frames: Optional[int] = None,
 ) -> Tuple[List[Tuple[int, int]], Dict[str, Any]]:
     """Motion-adaptive event segmentation.
 
@@ -520,15 +522,32 @@ def adaptive_event_segments(
     x = np.asarray(motion, dtype=np.float32)
     T = len(x)
     min_sec, max_sec = _semantic_duration_range(meta)
-    min_frames = max(
+    semantic_min_frames = max(
         env_int("V46_50_MIN_EVENT_FRAMES", int(round(min_sec * fps))),
         int(round(0.8 * fps)),
     )
-    max_frames = min(
+    semantic_max_frames = min(
         env_int("V46_50_MAX_EVENT_FRAMES", int(round(max_sec * fps))),
         int(round(env_float("V46_50_GLOBAL_MAX_EVENT_SECONDS", 6.0) * fps)),
     )
-    max_frames = max(max_frames, min_frames + 1)
+    # The project-level motion contract is authoritative.  The semantic range
+    # only chooses a preferred duration inside those reproducible bounds.
+    hard_min = (
+        max(1, int(min_event_frames))
+        if min_event_frames is not None
+        else max(1, semantic_min_frames)
+    )
+    hard_max = (
+        max(2, int(max_event_frames))
+        if max_event_frames is not None
+        else max(hard_min + 1, semantic_max_frames)
+    )
+    if hard_max <= hard_min:
+        raise ValueError(
+            f"Invalid event duration contract: min={hard_min}, max={hard_max}"
+        )
+    min_frames = int(np.clip(semantic_min_frames, hard_min, hard_max - 1))
+    max_frames = int(np.clip(semantic_max_frames, min_frames + 1, hard_max))
     preferred = int(round(0.5 * (min_frames + max_frames)))
 
     if T <= max_frames:
@@ -542,13 +561,13 @@ def adaptive_event_segments(
         }
 
     local_e = moving_average(
-        local_rotation_energy_np(x),
+        local_rotation_energy_np(x, fps=fps),
         max(3, int(round(0.20 * fps))),
     )
     root = x[:, [ROOT_X_IDX, ROOT_Z_IDX]]
     root_speed = np.zeros(T, dtype=np.float32)
     if T > 1:
-        root_speed[1:] = np.linalg.norm(root[1:] - root[:-1], axis=-1)
+        root_speed[1:] = np.linalg.norm(root[1:] - root[:-1], axis=-1) * float(fps)
         root_speed[0] = root_speed[1]
     yaw = unwrap_root_yaw_np(x)
     yaw_speed = np.abs(np.gradient(yaw) * fps)
@@ -611,7 +630,16 @@ def adaptive_event_segments(
     if cursor < T:
         if segments and T - cursor < min_frames:
             a, _ = segments[-1]
-            segments[-1] = (a, T)
+            total = T - a
+            if total <= max_frames:
+                segments[-1] = (a, T)
+            else:
+                # Rebalance the tail instead of merging a short remainder into
+                # an over-long event.  Both final events remain within the
+                # configured project-level duration contract.
+                split = T - min_frames
+                segments[-1] = (a, split)
+                segments.append((split, T))
         else:
             segments.append((cursor, T))
 

@@ -391,6 +391,36 @@ def _pad_or_trim_feature(feature: np.ndarray, seq_len: int) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def _resample_feature_rate(
+    feature: np.ndarray,
+    source_fps: float,
+    target_fps: float,
+) -> np.ndarray:
+    """Resample time-major conditioning features without changing duration."""
+
+    x = np.asarray(feature, dtype=np.float32)
+    source_fps = float(source_fps)
+    target_fps = float(target_fps)
+    if x.ndim != 2:
+        raise ValueError(f"Expected time-major [T,D] features, got {x.shape}")
+    if source_fps <= 0.0 or target_fps <= 0.0:
+        raise ValueError("feature FPS values must be positive")
+    if len(x) <= 1 or abs(source_fps - target_fps) < 1.0e-8:
+        return x.copy()
+
+    target_len = max(
+        2,
+        int(round(((len(x) - 1) / source_fps) * target_fps)) + 1,
+    )
+    old_t = np.arange(len(x), dtype=np.float64) / source_fps
+    new_t = np.arange(target_len, dtype=np.float64) / target_fps
+    new_t = np.minimum(new_t, old_t[-1])
+    return np.stack(
+        [np.interp(new_t, old_t, x[:, dim]) for dim in range(x.shape[1])],
+        axis=-1,
+    ).astype(np.float32)
+
+
 def _onset_from_audio_feature(feature: torch.Tensor, seq_len: int) -> torch.Tensor:
     if feature.ndim != 2:
         return torch.zeros((seq_len, 1), dtype=torch.float32)
@@ -421,13 +451,28 @@ class AISTPPDataset(Dataset):
         include_contacts: bool = True,
         force_reload: bool = False,
         return_traj: bool = False,
+        data_fps: int = 30,
+        raw_fps: int = 60,
+        feature_fps: float = 30.0,
+        contact_speed_threshold_mps: float = 0.3,
     ):
         _require_xz_trajectory_contract("AISTPPDataset")
         self.return_traj = return_traj
         self.data_path = data_path
-        self.raw_fps = 60
-        self.data_fps = 30
-        assert self.data_fps <= self.raw_fps
+        self.raw_fps = int(raw_fps)
+        self.data_fps = int(data_fps)
+        self.feature_fps = float(feature_fps)
+        self.include_contacts = bool(include_contacts)
+        self.contact_speed_threshold_mps = float(contact_speed_threshold_mps)
+        if self.raw_fps <= 0 or self.data_fps <= 0 or self.feature_fps <= 0.0:
+            raise ValueError("raw_fps, data_fps and feature_fps must be positive")
+        if self.data_fps > self.raw_fps or self.raw_fps % self.data_fps != 0:
+            raise ValueError(
+                "AIST++ stride adapter requires raw_fps to be an integer multiple "
+                f"of data_fps, got raw_fps={self.raw_fps}, data_fps={self.data_fps}"
+            )
+        if self.contact_speed_threshold_mps < 0.0:
+            raise ValueError("contact_speed_threshold_mps must be non-negative")
         self.data_stride = self.raw_fps // self.data_fps
 
         self.train = train
@@ -437,12 +482,18 @@ class AISTPPDataset(Dataset):
         self.normalizer = normalizer
         self.data_len = data_len
 
-        pickle_name = "processed_train_data.pkl" if train else "processed_test_data.pkl"
+        split_name = "train" if train else "test"
+        contact_tag = "contacts" if self.include_contacts else "no_contacts"
+        pickle_name = (
+            f"processed_{split_name}_raw{self.raw_fps}_fps{self.data_fps}_"
+            f"feat{self.feature_fps:g}_{contact_tag}.pkl"
+        )
         backup_path = Path(backup_path)
         backup_path.mkdir(parents=True, exist_ok=True)
 
         if not train and normalizer is not None:
-            pickle.dump(normalizer, open(os.path.join(backup_path, "normalizer.pkl"), "wb"))
+            normalizer_name = f"normalizer_fps{self.data_fps}_{contact_tag}.pkl"
+            pickle.dump(normalizer, open(os.path.join(backup_path, normalizer_name), "wb"))
 
         if not force_reload and pickle_name in os.listdir(backup_path):
             print("Using cached dataset...")
@@ -465,7 +516,12 @@ class AISTPPDataset(Dataset):
 
     def __getitem__(self, idx):
         filename_ = self.data["filenames"][idx]
-        feature = torch.from_numpy(_pad_or_trim_feature(np.load(filename_), self.seq_len)).float()
+        raw_feature = _resample_feature_rate(
+            np.load(filename_),
+            source_fps=self.feature_fps,
+            target_fps=self.data_fps,
+        )
+        feature = torch.from_numpy(_pad_or_trim_feature(raw_feature, self.seq_len)).float()
         pose = self.data["pose"][idx]
         cond = {
             "audio": feature,
@@ -519,9 +575,14 @@ class AISTPPDataset(Dataset):
 
         positions = smpl.forward(local_q, root_pos)
         feet = positions[:, :, (7, 8, 10, 11)]
-        feetv = torch.zeros(feet.shape[:3])
-        feetv[:, :-1] = (feet[:, 1:] - feet[:, :-1]).norm(dim=-1)
-        contacts = (feetv < 0.01).to(local_q)
+        foot_speed = torch.zeros(feet.shape[:3])
+        foot_speed[:, :-1] = (
+            (feet[:, 1:] - feet[:, :-1]).norm(dim=-1) * float(self.data_fps)
+        )
+        if self.include_contacts:
+            contacts = (foot_speed < self.contact_speed_threshold_mps).to(local_q)
+        else:
+            contacts = torch.zeros_like(foot_speed).to(local_q)
         local_q = ax_to_6v(local_q)
         global_pose_vec_input = vectorize_many([contacts, root_pos, local_q]).float().detach()
 
@@ -537,9 +598,18 @@ class AISTPPDataset(Dataset):
 
 
 class OrderedMusicDataset(Dataset):
-    def __init__(self, data_path: str, train: bool = False, feature_type: str = "hybrid", data_name: str = "aist"):
+    def __init__(
+        self,
+        data_path: str,
+        train: bool = False,
+        feature_type: str = "hybrid",
+        data_name: str = "aist",
+        data_fps: int = 30,
+    ):
         self.data_path = data_path
-        self.data_fps = 30
+        self.data_fps = int(data_fps)
+        if self.data_fps <= 0:
+            raise ValueError("data_fps must be positive")
         self.feature_type = feature_type
         self.test_list = set(["mLH4", "mKR2", "mBR0", "mLO2", "mJB5", "mWA0", "mJS3", "mMH3", "mHO5", "mPO1"])
         self.train = train

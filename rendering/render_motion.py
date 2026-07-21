@@ -48,7 +48,7 @@ def sanitize_contacts(c, T):
     return c[:T]
 
 
-def render_one(motion, audio, output, camera_mode, smooth):
+def render_one(motion, audio, output, camera_mode, smooth, fps):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     T = len(motion)
     pos = torch.as_tensor(motion[:, 4:7], dtype=torch.float32, device=device).unsqueeze(0)
@@ -71,6 +71,7 @@ def render_one(motion, audio, output, camera_mode, smooth):
         camera_mode=camera_mode,
         output_path=output,
         render_smooth_window=max(1, int(smooth)),
+        fps=float(fps),
     )
 
 
@@ -81,9 +82,17 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--camera_mode", choices=["fixed", "follow"], default="fixed")
     ap.add_argument("--render_smooth_window", type=int, default=1)
+    ap.add_argument(
+        "--fps",
+        type=float,
+        default=float(os.environ.get("V46_51_FPS", 30.0)),
+    )
     ap.add_argument("--gravity_audit_json", default=None)
     ap.add_argument("--allow_invalid_gravity", action="store_true")
     args = ap.parse_args()
+
+    if not np.isfinite(args.fps) or args.fps <= 0.0:
+        raise ValueError(f"--fps must be positive and finite, got {args.fps!r}")
 
     if not Path(args.motion).is_file():
         raise FileNotFoundError(args.motion)
@@ -113,7 +122,14 @@ def main():
     audit_path.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if len(batch) == 1:
-        render_one(batch[0], args.audio, args.output, args.camera_mode, args.render_smooth_window)
+        render_one(
+            batch[0],
+            args.audio,
+            args.output,
+            args.camera_mode,
+            args.render_smooth_window,
+            args.fps,
+        )
     else:
         stem, ext = os.path.splitext(args.output)
         for i, motion in enumerate(batch):
@@ -123,6 +139,7 @@ def main():
                 f"{stem}_b{i:02d}{ext or '.mp4'}",
                 args.camera_mode,
                 args.render_smooth_window,
+                args.fps,
             )
     print(f"[DONE] rendered {len(batch)} sequence(s); audit={audit_path}")
 

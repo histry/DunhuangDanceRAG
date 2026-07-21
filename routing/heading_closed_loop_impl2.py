@@ -254,7 +254,68 @@ def _install_patches() -> None:
     v4650.apply_generators_with_heading_guard = _apply_generators_v52
 
 
-def _patch_report(report_path: Path, contract: Dict[str, Any]) -> None:
+def _resolve_motion_path(
+    report_path: Path,
+    report: Dict[str, Any],
+    explicit_motion_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolve the generated NPY without assuming a *.report.json name."""
+
+    raw_candidates = []
+
+    if explicit_motion_path is not None:
+        raw_candidates.append(Path(explicit_motion_path))
+
+    for key in ("motion", "output", "motion_path", "npy"):
+        value = report.get(key)
+        if value:
+            raw_candidates.append(Path(str(value)))
+
+    if report_path.name.endswith(".report.json"):
+        prefix = report_path.name[:-len(".report.json")]
+        raw_candidates.append(report_path.with_name(prefix + ".npy"))
+
+    # Current research launcher uses results/report.json + results/motion.npy.
+    raw_candidates.append(report_path.with_name("motion.npy"))
+
+    checked = set()
+
+    for raw in raw_candidates:
+        raw = Path(raw).expanduser()
+
+        if raw.is_absolute():
+            variants = [raw]
+        else:
+            variants = [
+                report_path.parent / raw,
+                ROOT / raw,
+                raw,
+            ]
+
+        for candidate in variants:
+            try:
+                candidate = candidate.resolve()
+            except Exception:
+                continue
+
+            key = str(candidate)
+
+            if key in checked:
+                continue
+
+            checked.add(key)
+
+            if candidate.is_file() and candidate.suffix.lower() == ".npy":
+                return candidate
+
+    return None
+
+
+def _patch_report(
+    report_path: Path,
+    contract: Dict[str, Any],
+    motion_path: Optional[Path] = None,
+) -> None:
     if not report_path.is_file():
         return
     try:
@@ -278,14 +339,27 @@ def _patch_report(report_path: Path, contract: Dict[str, Any]) -> None:
         "gap_count": contract.get("gap_count"),
     }
     report["v46_52_env"] = {k: v for k, v in os.environ.items() if k.startswith("V46_52_")}
-    motion_path = Path(str(report_path).replace(".report.json", ".npy"))
-    if motion_path.is_file():
-        x = np.load(motion_path, allow_pickle=True)
+    resolved_motion = _resolve_motion_path(
+        report_path,
+        report,
+        explicit_motion_path=motion_path,
+    )
+
+    if resolved_motion is not None:
+        x = np.load(resolved_motion, allow_pickle=True)
+
         if np.asarray(x).ndim == 3:
             x = np.asarray(x)[0]
+
         m = anatomy_metrics_np(x)
         ok, reasons = evaluate_anatomy_contract(m)
-        report["v46_52_final_anatomy"] = {"ok": ok, "reasons": reasons, **m}
+
+        report["v46_52_final_anatomy"] = {
+            "ok": ok,
+            "reasons": reasons,
+            "motion_path": str(resolved_motion),
+            **m,
+        }
     save_json(report, report_path)
 
 
@@ -294,6 +368,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     audio = _arg_value(args, "--audio")
     schedule = _arg_value(args, "--slots_json")
     report_json = _arg_value(args, "--json")
+    output = _arg_value(args, "--out")
     if not audio or not schedule:
         raise RuntimeError("V46.52 requires --audio and a fresh --slots_json")
     required_run_id = os.environ.get("V46_51_SCHEDULE_RUN_ID")
@@ -315,7 +390,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _install_patches()
     rc = int(v4650.main(args))
     if report_json:
-        _patch_report(Path(report_json), contract)
+        _patch_report(
+            Path(report_json),
+            contract,
+            motion_path=Path(output) if output else None,
+        )
     return rc
 
 

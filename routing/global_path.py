@@ -32,6 +32,7 @@ from routing.performer_policy import (
     performer_switch_penalty,
     resolve_candidate_policy,
 )
+from routing.diversity import diversity_assessment, event_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -187,6 +188,9 @@ def _global_route_preorder(
             family = str(_db_value(db, "event_families", event_id, "unknown"))
             source = str(_db_value(db, "source_uids", event_id, "unknown"))
             for score, path, usage in beams:
+                diversity = diversity_assessment(db, event_id, path)
+                if not bool(diversity["hard_valid"]):
+                    continue
                 step_score = unary
                 if path:
                     step_score -= _global_transition_energy(db, path[-1], event_id)
@@ -197,10 +201,16 @@ def _global_route_preorder(
                     step_score -= performer_switch_penalty(db, path[-1], event_id, slot)
                 # Capped run-local diversity rather than an unbounded global ban.
                 step_score -= min(0.30, 0.04 * usage.get("family::" + family, 0))
+                step_score -= float(diversity["penalty"])
                 ns = dict(usage)
                 ns["family::" + family] = ns.get("family::" + family, 0) + 1
                 ns["source::" + source] = ns.get("source::" + source, 0) + 1
                 new.append((score + step_score, path + [event_id], ns))
+        if not new:
+            raise RuntimeError(
+                "V46.53 global route diversity/cooldown contract exhausted "
+                f"all candidates for slot {i}"
+            )
         new.sort(key=lambda row: row[0], reverse=True)
         beams = new[:beam_size]
         trace.append({"slot": i, "candidates": unary_rows, "best_prefix_score": float(beams[0][0])})
@@ -217,6 +227,8 @@ def _global_route_preorder(
         "beam_size": beam_size,
         "candidate_topk": topk,
         "chosen_event_path": chosen,
+        "chosen_event_uids": [event_identity(db, event_id)["event_uid"] for event_id in chosen],
+        "chosen_source_uids": [event_identity(db, event_id)["source_uid"] for event_id in chosen],
         "performer_policy": performer_policy,
         "best_score": float(beams[0][0]),
         "trace": trace,
@@ -366,7 +378,11 @@ def _dynamic_duration_guard(
     return report
 
 
-def _patch_report(report_path: Path, duration_guard: Optional[Mapping[str, Any]] = None) -> None:
+def _patch_report(
+    report_path: Path,
+    duration_guard: Optional[Mapping[str, Any]] = None,
+    motion_path: Optional[Path] = None,
+) -> None:
     if not report_path.is_file():
         return
     try:
@@ -374,22 +390,21 @@ def _patch_report(report_path: Path, duration_guard: Optional[Mapping[str, Any]]
     except Exception:
         return
     report["version"] = SCHEMA
-    report["v46_53_global_route"] = _GLOBAL_ROUTE_REPORT
+    if _GLOBAL_ROUTE_REPORT:
+        report["v46_53_global_route"] = _GLOBAL_ROUTE_REPORT
     report["v46_53_env"] = {k: v for k, v in os.environ.items() if k.startswith("V46_53_")}
     if duration_guard is not None:
         report["v46_53_dynamic_duration"] = dict(duration_guard)
-    motion_path = Path(str(report_path).replace(".report.json", ".npy"))
-    if not motion_path.is_file():
-        # V46.46 names may be used by the preserved base.
-        try:
-            candidate = Path(report.get("output", ""))
-            if candidate.is_file():
-                motion_path = candidate
-        except Exception:
-            pass
-    if motion_path.is_file():
-        x = np.load(motion_path, allow_pickle=True)
+    resolved_motion = v52._resolve_motion_path(
+        report_path,
+        report,
+        explicit_motion_path=motion_path,
+    )
+
+    if resolved_motion is not None:
+        x = np.load(resolved_motion, allow_pickle=True)
         report["v46_53_final_intrinsic_audit"] = audit_motion(x)
+        report["v46_53_final_motion_path"] = str(resolved_motion)
     v52.save_json(report, report_path)
 
 
@@ -428,8 +443,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             fps=float(os.environ.get("V46_FPS", "30")),
         )
     if report_json:
-        v52._patch_report(Path(report_json), contract)
-        _patch_report(Path(report_json), duration_guard=duration_guard)
+        resolved_output = Path(output)
+
+        v52._patch_report(
+            Path(report_json),
+            contract,
+            motion_path=resolved_output,
+        )
+
+        _patch_report(
+            Path(report_json),
+            duration_guard=duration_guard,
+            motion_path=resolved_output,
+        )
     return rc
 
 

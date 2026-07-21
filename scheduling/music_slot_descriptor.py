@@ -3,7 +3,7 @@
 """Build a final V46.38 Music Semantic Slot Descriptor from V21/V26/V23 schedule output.
 
 This script can either reuse an existing `*_v26.schedule_report.json` or invoke
-`scheduling/schedule_whole_song.py` with trained V21/V26/V23 checkpoints and then
+`scheduling.whole_song_scheduler` with trained scheduler checkpoints and then
 convert the schedule report into a strict final descriptor.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from events.semantic_descriptor import (  # noqa: E402
+from scheduling.descriptor_schema import (  # noqa: E402
     MSSD_SCHEMA_VERSION,
     build_descriptor_object,
     json_load,
@@ -69,7 +69,8 @@ def find_existing_report(schedule_dir: Path, audio: Path) -> Optional[Path]:
 def run_v26_schedule(args: argparse.Namespace) -> None:
     cmd = [
         sys.executable,
-        "scheduling/schedule_whole_song.py",
+        "-m",
+        "scheduling.whole_song_scheduler",
         "--index_json", args.index_json,
         "--duration_index_npz", args.duration_index_npz,
         "--music", args.audio,
@@ -92,7 +93,7 @@ def run_v26_schedule(args: argparse.Namespace) -> None:
     print("[V46.38 MSSD SCHEDULE]", " ".join(cmd), flush=True)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    subprocess.run(cmd, check=True, env=env)
+    subprocess.run(cmd, check=True, env=env, cwd=str(ROOT))
 
 
 def convert_report_to_descriptor(report_path: Path, args: argparse.Namespace) -> Dict[str, Any]:
@@ -113,9 +114,11 @@ def convert_report_to_descriptor(report_path: Path, args: argparse.Namespace) ->
         "planner_ckpt": args.planner_ckpt,
         "v23_ckpt": args.v23_ckpt,
         "raw_schedule_json": str(report_path),
+        "event_db_contract": dict(report.get("event_db_contract", {})),
+        "transition_budget": dict(report.get("transition_budget", {})),
         "schedule_summary_json": str(Path(args.schedule_dir) / "V26_WHOLE_SONG_SUMMARY.json"),
         "provenance": {
-            "builder": "scheduling/build_music_semantic_slot_descriptor.py",
+            "builder": "scheduling.music_slot_descriptor",
             "source_report": str(report_path),
             "strict_generation_descriptor": True,
         },

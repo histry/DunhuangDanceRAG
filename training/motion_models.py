@@ -50,7 +50,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -73,70 +73,30 @@ except Exception:  # pragma: no cover
     nn = None
     F = None
 
-ROOT_X_IDX = 4
-ROOT_Y_IDX = 5
-ROOT_Z_IDX = 6
-ROT6D_START = 7
-ROT6D_END = 151
-EDGE_DIM = 151
-NUM_JOINTS = 24
-DEFAULT_FOOT_JOINTS = (7, 8, 10, 11)
+from motion_geometry.smpl24 import (
+    FOOT_JOINTS as DEFAULT_FOOT_JOINTS,
+    MOTION_DIM as EDGE_DIM,
+    NUM_JOINTS,
+    OFFSETS,
+    PARENTS,
+    ROOT_X_IDX,
+    ROOT_Y_IDX,
+    ROOT_Z_IDX,
+    ROT6D_END,
+    ROT6D_START,
+    SMPL24_SKELETON_SCHEMA,
+    skeleton_fingerprint,
+)
+from motion_geometry.rotations import (
+    CANONICAL_ROT6D_LAYOUT,
+    matrix_to_rot6d_np as _contract_matrix_to_rot6d_np,
+    matrix_to_rot6d_torch as _contract_matrix_to_rot6d_torch,
+    rot6d_to_matrix_np as _contract_rot6d_to_matrix_np,
+    rot6d_to_matrix_torch as _contract_rot6d_to_matrix_torch,
+)
+
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
-
-FALLBACK_PARENTS = np.array(
-    [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21],
-    dtype=np.int64,
-)
-FALLBACK_OFFSETS = np.array(
-    [
-        [0.0000, 0.0000, 0.0000],
-        [0.0586, -0.0823, 0.0177],
-        [-0.0603, -0.0905, 0.0135],
-        [0.0044, 0.1244, -0.0384],
-        [0.0435, -0.3865, 0.0080],
-        [-0.0433, -0.3837, -0.0048],
-        [0.0045, 0.1379, 0.0268],
-        [-0.0148, -0.4269, -0.0374],
-        [0.0195, -0.4200, -0.0346],
-        [-0.0023, 0.0560, 0.0029],
-        [0.0411, -0.0603, 0.1220],
-        [-0.0348, -0.0621, 0.1309],
-        [0.0264, 0.2146, -0.0375],
-        [0.0714, 0.1138, -0.0189],
-        [-0.0824, 0.1125, -0.0237],
-        [0.0103, 0.0889, 0.0504],
-        [0.1229, 0.0452, -0.0190],
-        [-0.1132, 0.0469, -0.0085],
-        [0.2553, -0.0156, -0.0229],
-        [-0.2601, -0.0144, -0.0319],
-        [0.2657, 0.0127, -0.0074],
-        [-0.2691, 0.0067, -0.0060],
-        [0.0867, -0.0106, -0.0156],
-        [-0.0888, -0.0087, -0.0101],
-    ],
-    dtype=np.float32,
-)
-
-
-def _load_repo_fk_tree() -> Tuple[np.ndarray, np.ndarray, str]:
-    """Try to reuse the local EDGE repository FK constants."""
-    candidates = [
-        "tools.v41b_inject_min_foot_y_to_db",
-        "tools.v42_root_footplant_physics_optimizer",
-    ]
-    for name in candidates:
-        try:
-            mod = __import__(name, fromlist=["PARENTS", "OFFSETS"])
-            parents = np.asarray(getattr(mod, "PARENTS"), dtype=np.int64)
-            offsets = np.asarray(getattr(mod, "OFFSETS"), dtype=np.float32)
-            if parents.shape[0] == NUM_JOINTS and offsets.shape == (NUM_JOINTS, 3):
-                return parents, offsets, name
-        except Exception:
-            pass
-    return FALLBACK_PARENTS, FALLBACK_OFFSETS, "fallback_smpl_like_tree"
-
-
-PARENTS, OFFSETS, FK_TREE_SOURCE = _load_repo_fk_tree()
+FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 
 
 def now_tag() -> str:
@@ -227,6 +187,20 @@ def resample_motion_np(motion: np.ndarray, new_len: int) -> np.ndarray:
     motion = np.asarray(motion, dtype=np.float32)
     if new_len <= 1 or motion.shape[0] <= 1:
         return np.repeat(motion[:1], max(1, new_len), axis=0)
+    if motion.ndim == 2 and motion.shape[1] >= EDGE_DIM:
+        from motion_geometry.resampling import resample_edge151_np
+
+        canonical = resample_edge151_np(motion[:, :EDGE_DIM], target_frames=int(new_len))
+        if motion.shape[1] == EDGE_DIM:
+            return canonical
+        # Non-EDGE extension channels remain ordinary Euclidean signals.
+        old_x = np.linspace(0.0, 1.0, motion.shape[0])
+        new_x = np.linspace(0.0, 1.0, int(new_len))
+        extra = np.stack(
+            [np.interp(new_x, old_x, motion[:, d]) for d in range(EDGE_DIM, motion.shape[1])],
+            axis=-1,
+        ).astype(np.float32)
+        return np.concatenate([canonical, extra], axis=-1)
     old_x = np.linspace(0.0, 1.0, motion.shape[0])
     new_x = np.linspace(0.0, 1.0, new_len)
     out = np.empty((new_len, motion.shape[1]), dtype=np.float32)
@@ -571,14 +545,7 @@ def load_motion_file(path: str | Path) -> List[np.ndarray]:
 
 
 def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
-    a1 = x[..., 0:3]
-    a2 = x[..., 3:6]
-    b1 = a1 / np.maximum(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-8)
-    dot = np.sum(b1 * a2, axis=-1, keepdims=True)
-    b2 = a2 - dot * b1
-    b2 = b2 / np.maximum(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-8)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=-1).astype(np.float32)
+    return _contract_rot6d_to_matrix_np(x)
 
 
 def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
@@ -593,12 +560,7 @@ def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
     saved Event-RAG clips and makes strict raw-rot6d audit fail even after
     projection.
     """
-    m = np.asarray(mat, dtype=np.float32)
-    if m.shape[-2:] != (3, 3):
-        raise ValueError(f"matrix_to_rot6d_np expects [...,3,3], got {m.shape}")
-    c0 = m[..., :, 0]
-    c1 = m[..., :, 1]
-    return np.concatenate([c0, c1], axis=-1).astype(np.float32)
+    return _contract_matrix_to_rot6d_np(mat)
 
 
 def fk_24_np(motion: np.ndarray) -> np.ndarray:
@@ -626,13 +588,7 @@ def fk_24_np(motion: np.ndarray) -> np.ndarray:
 
 
 def rot6d_to_matrix_torch(x):
-    a1 = x[..., 0:3]
-    a2 = x[..., 3:6]
-    b1 = F.normalize(a1, dim=-1, eps=1e-8)
-    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(b2, dim=-1, eps=1e-8)
-    b3 = torch.cross(b1, b2, dim=-1)
-    return torch.stack([b1, b2, b3], dim=-1)
+    return _contract_rot6d_to_matrix_torch(x)
 
 
 def matrix_to_rot6d_torch(mat):
@@ -642,9 +598,7 @@ def matrix_to_rot6d_torch(mat):
     mat[..., :, 0:2].reshape(...) interleaves rows and corrupts identity
     rotations as [1,0,0,1,0,0] instead of [1,0,0,0,1,0].
     """
-    c0 = mat[..., :, 0]
-    c1 = mat[..., :, 1]
-    return torch.cat([c0, c1], dim=-1)
+    return _contract_matrix_to_rot6d_torch(mat)
 
 
 def project_rot6d_torch(x):
@@ -763,38 +717,47 @@ class V46Config:
     top_k: int = 32
     beam_size: int = 8
     overlap: int = 12
+    transition_train_min_seconds: float = 10.0 / 30.0
+    transition_train_max_seconds: float = 28.0 / 30.0
+    transition_mask_halo_seconds: float = 6.0 / 30.0
     retrieval_source_penalty: float = 0.08
     retrieval_transition_penalty: float = 0.65
     retrieval_warp_penalty: float = 0.18
     retrieval_repeat_penalty: float = 0.15
     ik_enable: bool = True
-    ik_iters: int = 80
-    ik_lr: float = 0.035
+    ik_iters: int = 120
+    ik_lr: float = 0.020
     ik_chunk: int = 240
     ik_pose_w: float = 0.035
     ik_temporal_w: float = 0.055
-    ik_root_w: float = 0.015
-    ik_contact_w: float = 1.0
-    ik_penetration_w: float = 0.60
-    ik_contact_high: float = 0.58
-    ik_contact_low: float = 0.38
-    ik_height_margin: float = 0.050
-    ik_speed_gate_mpf: float = 0.035
-    ik_max_delta_rot: float = 0.65
+    ik_root_w: float = 0.010
+    ik_contact_w: float = 8.0
+    ik_penetration_w: float = 12.0
+    ik_contact_high: float = 0.70
+    ik_contact_low: float = 0.45
+    ik_height_margin: float = 0.035
+    ik_speed_gate_mps: float = 0.36
+    ik_contact_break_speed_mps: float = 0.54
+    ik_hard_contact_lock: bool = True
+    ik_hard_contact_min_confidence: float = 0.85
+    ik_max_delta_rot: float = 0.30
     # V46.4: cloud-step is not a release / continue any more.  Large XZ travel
     # in contact is classified by speed and then mapped to a sliding anchor.
     # This avoids the Footskate Forgiveness Paradox: severe slow AI drifting is
     # still locked, while true Dunhuang cloud-step gets a smooth moving target.
-    ik_slide_release_m: float = 0.12
-    ik_slide_release_min_frames: int = 4
+    ik_slide_release_m: float = 0.05
+    ik_slide_release_min_seconds: float = 4.0 / 30.0
     ik_cloud_step_speed_mps: float = 0.15
-    ik_sliding_anchor_window: int = 10
+    ik_sliding_anchor_seconds: float = 10.0 / 30.0
     ik_cloud_speed_cv_max: float = 1.75
     # V46.1: root-Y ballistic/damping pass. It is deliberately C1-safe and
     # never breaks a damping cycle mid-contact.
-    root_y_physics_enable: bool = True
+    # Disabled by default: contact labels must first pass the final contact
+    # reconstruction gate.  Enabling ballistics on sparse/corrupt contacts can
+    # manufacture long root-Y excursions that are not present in the event.
+    root_y_physics_enable: bool = False
     root_y_flight_strength: float = 0.18
-    root_y_min_flight_frames: int = 3
+    root_y_min_flight_seconds: float = 3.0 / 30.0
     # V46.3: biological fuse. If the no-contact interval is longer than this,
     # treat it as corrupted contact labels / bad upstream generation, not a
     # real human jump. Do not inject a huge ballistic parabola or landing dip.
@@ -817,8 +780,20 @@ class V46Config:
     rollback_skate_ratio: float = 1.18
     rollback_jerk_ratio: float = 1.18
     rollback_penetration_margin_m: float = 0.012
-    rollback_root_delta_max_m: float = 0.18
+    rollback_root_delta_max_m: float = 0.12
+    ik_commit_skate_p95_max_mps: float = 0.18
+    ik_commit_skate_max_mps: float = 0.60
+    ik_commit_penetration_min_m: float = -0.050
+    ik_commit_jerk_p95_max_mps3: float = 810.0
+    ik_commit_jerk_max_mps3: float = 1620.0
+    ik_commit_root_delta_max_m: float = 0.12
+    ik_post_stabilize_enable: bool = True
+    ik_post_stabilize_passes: int = 2
 
+    # Controls use of a trained V44 model during generation.  Training remains
+    # an explicit CLI operation, so this switch must not silently suppress a
+    # user-invoked train-contrastive command.
+    contrastive_enable: bool = True
     # V46.8: require real audio features for V44; false keeps the weak-proxy
     # fallback for smoke tests, while reports mark it as weak supervision.
     contrastive_require_real_music: bool = False
@@ -853,9 +828,27 @@ class V46Config:
         cfg = V46Config()
         if path and Path(path).exists():
             data = load_json(path)
+            if "fps" in data:
+                cfg.fps = float(data["fps"])
             for k, v in data.items():
                 if hasattr(cfg, k):
                     setattr(cfg, k, v)
+            # Read historical 30 FPS configs without keeping per-frame units
+            # in the runtime contract.  Newly written configs use SI names.
+            legacy = {
+                "ik_speed_gate_mpf": ("ik_speed_gate_mps", cfg.fps),
+                "ik_contact_break_speed_mpf": ("ik_contact_break_speed_mps", cfg.fps),
+                "ik_commit_skate_p95_max_mpf": ("ik_commit_skate_p95_max_mps", cfg.fps),
+                "ik_commit_skate_max_mpf": ("ik_commit_skate_max_mps", cfg.fps),
+                "ik_commit_jerk_p95_max": ("ik_commit_jerk_p95_max_mps3", cfg.fps ** 3),
+                "ik_commit_jerk_max": ("ik_commit_jerk_max_mps3", cfg.fps ** 3),
+                "ik_slide_release_min_frames": ("ik_slide_release_min_seconds", 1.0 / cfg.fps),
+                "ik_sliding_anchor_window": ("ik_sliding_anchor_seconds", 1.0 / cfg.fps),
+                "root_y_min_flight_frames": ("root_y_min_flight_seconds", 1.0 / cfg.fps),
+            }
+            for old, (new, scale) in legacy.items():
+                if old in data and new not in data:
+                    setattr(cfg, new, float(data[old]) * float(scale))
         return cfg
 
     def apply_env(self) -> "V46Config":
@@ -890,20 +883,36 @@ class V46Config:
             "V46_ROUTE_SOURCE_RUN_HARD_PENALTY": ("route_source_run_hard_penalty", float),
             "V46_ROUTE_SEMANTIC_BONUS_SCALE": ("route_semantic_bonus_scale", float),
             "V46_OVERLAP": ("overlap", int),
+            "V46_TRANSITION_TRAIN_MIN_SECONDS": ("transition_train_min_seconds", float),
+            "V46_TRANSITION_TRAIN_MAX_SECONDS": ("transition_train_max_seconds", float),
+            "V46_TRANSITION_MASK_HALO_SECONDS": ("transition_mask_halo_seconds", float),
             "V46_WINDOW_LEN": ("window_len", int),
             "V46_HOP_LEN": ("hop_len", int),
             "V46_MIN_EVENT_FRAMES": ("min_event_frames", int),
             "V46_MAX_EVENT_FRAMES": ("max_event_frames", int),
             "V46_ENABLE_CONTRASTIVE": ("contrastive_enable", lambda x: bool(int(x))),
             "V46_IK_ITERS": ("ik_iters", int),
+            "V46_IK_CONTACT_W": ("ik_contact_w", float),
+            "V46_IK_PENETRATION_W": ("ik_penetration_w", float),
+            "V46_IK_CONTACT_HIGH": ("ik_contact_high", float),
+            "V46_IK_CONTACT_LOW": ("ik_contact_low", float),
+            "V46_IK_SPEED_GATE_MPS": ("ik_speed_gate_mps", float),
+            "V46_IK_CONTACT_BREAK_SPEED_MPS": ("ik_contact_break_speed_mps", float),
+            "V46_IK_HARD_CONTACT_LOCK": ("ik_hard_contact_lock", lambda x: bool(int(x))),
+            "V46_IK_HARD_CONTACT_MIN_CONFIDENCE": ("ik_hard_contact_min_confidence", float),
             "V46_IK_SLIDE_RELEASE_M": ("ik_slide_release_m", float),
             "V46_IK_CLOUD_STEP_SPEED_MPS": ("ik_cloud_step_speed_mps", float),
-            "V46_IK_SLIDING_ANCHOR_WINDOW": ("ik_sliding_anchor_window", int),
+            "V46_IK_SLIDING_ANCHOR_SECONDS": ("ik_sliding_anchor_seconds", float),
             "V46_IK_CLOUD_SPEED_CV_MAX": ("ik_cloud_speed_cv_max", float),
             "V46_IK_CLOUD_ROOT_MIN_TRAVEL_M": ("ik_cloud_root_min_travel_m", float),
             "V46_IK_CLOUD_DIRECTION_COS_MIN": ("ik_cloud_direction_cos_min", float),
             "V46_IK_CLOUD_ROOT_FOOT_REL_MAX_M": ("ik_cloud_root_foot_rel_max_m", float),
             "V46_IK_CHUNK_OVERLAP": ("ik_chunk_overlap", int),
+            "V46_IK_POST_STABILIZE_ENABLE": ("ik_post_stabilize_enable", lambda x: bool(int(x))),
+            "V46_IK_POST_STABILIZE_PASSES": ("ik_post_stabilize_passes", int),
+            "V46_IK_COMMIT_JERK_P95_MAX_MPS3": ("ik_commit_jerk_p95_max_mps3", float),
+            "V46_IK_COMMIT_JERK_MAX_MPS3": ("ik_commit_jerk_max_mps3", float),
+            "V46_IK_COMMIT_ROOT_DELTA_MAX_M": ("ik_commit_root_delta_max_m", float),
             "V46_ROLLBACK_SKATE_RATIO": ("rollback_skate_ratio", float),
             "V46_ROLLBACK_JERK_RATIO": ("rollback_jerk_ratio", float),
             "V46_ROLLBACK_PENETRATION_MARGIN_M": ("rollback_penetration_margin_m", float),
@@ -917,7 +926,7 @@ class V46Config:
             "V46_UNPAIRED_DISABLE_MOTION_PROXY": ("unpaired_disable_motion_proxy", lambda x: bool(int(x))),
             "V46_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
             "V46_ENABLE_ROOT_Y_PHYSICS": ("root_y_physics_enable", lambda x: bool(int(x))),
-            "V46_ROOT_Y_MIN_FLIGHT_FRAMES": ("root_y_min_flight_frames", int),
+            "V46_ROOT_Y_MIN_FLIGHT_SECONDS": ("root_y_min_flight_seconds", float),
             "V46_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
             "V46_DIFFUSION_STEPS": ("diffusion_steps", int),
             "V46_DEVICE": ("device", str),
@@ -953,24 +962,90 @@ class V46Config:
         return self
 
 
+MOTION_CHECKPOINT_CONTRACT_SCHEMA = "dunhuang_motion_checkpoint_contract_v2"
+
+
+def motion_checkpoint_contract(cfg: V46Config, role: str) -> Dict[str, Any]:
+    """Return the immutable representation/time contract embedded in a checkpoint."""
+    return {
+        "schema": MOTION_CHECKPOINT_CONTRACT_SCHEMA,
+        "role": str(role),
+        "fps": float(cfg.fps),
+        "motion_dim": int(EDGE_DIM),
+        "window_len": int(cfg.window_len),
+        "window_seconds": float(cfg.window_len) / max(float(cfg.fps), 1.0e-8),
+        "rot6d_layout": CANONICAL_ROT6D_LAYOUT,
+        "skeleton_schema": SMPL24_SKELETON_SCHEMA,
+        "skeleton_sha256": skeleton_fingerprint(),
+        "derivative_units": {
+            "linear_velocity": "m/s",
+            "linear_acceleration": "m/s^2",
+            "linear_jerk": "m/s^3",
+            "angular_velocity": "rad/s",
+            "angular_acceleration": "rad/s^2",
+        },
+    }
+
+
+def assert_motion_checkpoint_contract(
+    checkpoint: Dict[str, Any],
+    cfg: V46Config,
+    path: str | Path,
+    role: str,
+) -> None:
+    """Reject mixed-FPS, mixed-Rot6D and mixed-skeleton model assets."""
+    actual = checkpoint.get("motion_contract")
+    if not isinstance(actual, dict):
+        if os.environ.get("V46_ALLOW_LEGACY_CHECKPOINT_CONTRACT", "0") == "1" and abs(float(cfg.fps) - 30.0) < 1.0e-6:
+            return
+        raise RuntimeError(
+            f"Checkpoint {path} has no {MOTION_CHECKPOINT_CONTRACT_SCHEMA}. "
+            "It must be rebuilt for this repository contract. For a read-only "
+            "30 FPS parity baseline only, set V46_ALLOW_LEGACY_CHECKPOINT_CONTRACT=1."
+        )
+
+    expected = motion_checkpoint_contract(cfg, role)
+    mismatches: List[str] = []
+    for key in ("schema", "role", "motion_dim", "rot6d_layout", "skeleton_schema", "skeleton_sha256"):
+        if actual.get(key) != expected[key]:
+            mismatches.append(f"{key}: checkpoint={actual.get(key)!r}, runtime={expected[key]!r}")
+    try:
+        if abs(float(actual.get("fps")) - expected["fps"]) > 1.0e-6:
+            mismatches.append(f"fps: checkpoint={actual.get('fps')!r}, runtime={expected['fps']!r}")
+    except (TypeError, ValueError):
+        mismatches.append(f"fps: checkpoint={actual.get('fps')!r}, runtime={expected['fps']!r}")
+    if role in {"v45_refiner", "v46_diffusion"}:
+        if int(actual.get("window_len", -1)) != expected["window_len"]:
+            mismatches.append(
+                f"window_len: checkpoint={actual.get('window_len')!r}, runtime={expected['window_len']!r}"
+            )
+    if mismatches:
+        raise RuntimeError(
+            f"Checkpoint contract mismatch for {path}: " + "; ".join(mismatches)
+        )
+
+
 def event_descriptor(motion: np.ndarray, fps: float = 30.0) -> np.ndarray:
     motion = np.asarray(motion, dtype=np.float32)
     T = motion.shape[0]
     joints = fk_24_np(motion)
     root = motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
     root_v = np.zeros_like(root)
-    root_v[1:] = root[1:] - root[:-1]
+    root_v[1:] = (root[1:] - root[:-1]) * float(fps)
     joint_v = np.zeros_like(joints)
-    joint_v[1:] = joints[1:] - joints[:-1]
+    joint_v[1:] = (joints[1:] - joints[:-1]) * float(fps)
     foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
     foot_vxz = np.zeros(foot.shape[:2], dtype=np.float32)
-    foot_vxz[1:] = np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+    foot_vxz[1:] = (
+        np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+        * float(fps)
+    )
     foot_y = foot[..., 1]
     floor = np.percentile(foot_y.reshape(-1), 5)
-    contact = (foot_y < floor + 0.05) & (foot_vxz < 0.035)
+    contact = (foot_y < floor + 0.05) & (foot_vxz < 0.75)
     yaw = root_yaw_np(motion)
     yaw_v = np.zeros_like(yaw)
-    yaw_v[1:] = angle_diff(yaw[1:], yaw[:-1])
+    yaw_v[1:] = angle_diff(yaw[1:], yaw[:-1]) * float(fps)
     lower_ids = [1, 2, 4, 5, 7, 8, 10, 11]
     upper_ids = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
     lower_energy = float(np.mean(np.linalg.norm(joint_v[:, lower_ids], axis=-1)))
@@ -992,7 +1067,7 @@ def event_descriptor(motion: np.ndarray, fps: float = 30.0) -> np.ndarray:
             np.mean(contact[:, 2:]),
             np.mean(foot_vxz),
             np.percentile(foot_vxz, 95),
-            float(np.sum(yaw_v)),
+            float(angle_diff(yaw[-1:], yaw[:1])[0]) if len(yaw) else 0.0,
             float(np.mean(np.abs(yaw_v))),
             float(np.percentile(np.abs(yaw_v), 95)),
             float(np.max(root[:, 1]) - np.min(root[:, 1])),
@@ -1009,17 +1084,23 @@ def event_descriptor(motion: np.ndarray, fps: float = 30.0) -> np.ndarray:
     return desc[:32].astype(np.float32)
 
 
-def motion_boundary_state(motion: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def motion_boundary_state(
+    motion: np.ndarray,
+    fps: float = 30.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     joints = fk_24_np(motion)
     v = np.zeros_like(joints)
-    v[1:] = joints[1:] - joints[:-1]
+    v[1:] = (joints[1:] - joints[:-1]) * float(fps)
     entry = np.concatenate([joints[0].reshape(-1), v[min(1, len(v) - 1)].reshape(-1)], axis=0)
     exit_ = np.concatenate([joints[-1].reshape(-1), v[-1].reshape(-1)], axis=0)
     foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
     foot_vxz = np.zeros(foot.shape[:2], dtype=np.float32)
-    foot_vxz[1:] = np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+    foot_vxz[1:] = (
+        np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+        * float(fps)
+    )
     floor = np.percentile(foot[..., 1].reshape(-1), 5)
-    contact = ((foot[..., 1] < floor + 0.05) & (foot_vxz < 0.035)).astype(np.float32)
+    contact = ((foot[..., 1] < floor + 0.05) & (foot_vxz < 0.75)).astype(np.float32)
     return entry.astype(np.float32), exit_.astype(np.float32), contact[0], contact[-1]
 
 
@@ -1169,7 +1250,7 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
     x = np.asarray(motion, dtype=np.float32)[:, :EDGE_DIM]
     T = int(x.shape[0])
     margin = float(getattr(cfg, "ik_height_margin", 0.05))
-    speed_gate = float(getattr(cfg, "ik_speed_gate_mpf", 0.035))
+    speed_gate = float(getattr(cfg, "ik_speed_gate_mps", 0.36))
     report = {"source_hint": str(source_hint), "mode": "uninitialized"}
     contacts = np.zeros((T, 4), dtype=np.float32)
     if T <= 0:
@@ -1182,7 +1263,10 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
         foot = joints[:, foot_ids]
         foot_vxz = np.zeros(foot.shape[:2], dtype=np.float32)
         if T > 1:
-            foot_vxz[1:] = np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+            foot_vxz[1:] = (
+                np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+                * float(cfg.fps)
+            )
         floor_y = float(np.nanpercentile(foot[..., 1].reshape(-1), 5))
         near = foot[..., 1] <= floor_y + max(0.015, margin)
         slow = foot_vxz <= max(0.01, speed_gate)
@@ -1197,7 +1281,7 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
             "floor_y": floor_y,
             "contact_ratio": float(contacts.mean()),
             "height_margin": float(margin),
-            "speed_gate_mpf": float(speed_gate),
+            "speed_gate_mps": float(speed_gate),
         })
         return contacts.astype(np.float32), report
     except Exception as exc:
@@ -1212,7 +1296,10 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
     root = x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
     root_speed = np.zeros((T,), dtype=np.float32)
     if T > 1:
-        root_speed[1:] = np.linalg.norm(root[1:, [0, 2]] - root[:-1, [0, 2]], axis=-1)
+        root_speed[1:] = (
+            np.linalg.norm(root[1:, [0, 2]] - root[:-1, [0, 2]], axis=-1)
+            * float(cfg.fps)
+        )
     root_floor = float(np.nanpercentile(root[:, 1], 20)) if T else 0.0
     near_root = root[:, 1] <= root_floor + max(0.02, margin)
     slow_root = root_speed <= max(0.02, speed_gate * 2.0)
@@ -1228,7 +1315,7 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
         "uncertain_contact_value": float(uncertain),
         "release_contact_value": float(release),
         "height_margin": float(margin),
-        "speed_gate_mpf": float(speed_gate),
+        "speed_gate_mps": float(speed_gate),
         "warning": "FK unavailable; foot-specific contacts cannot be recovered, so fallback intentionally avoids strong IK anchoring.",
     })
     return contacts.astype(np.float32), report
@@ -3023,7 +3110,7 @@ def add_event_to_db_lists(
     )
     np.save(out_path, clip.astype(np.float32))
     desc = event_descriptor(clip, cfg.fps)
-    entry, exit_, c0, c1 = motion_boundary_state(clip)
+    entry, exit_, c0, c1 = motion_boundary_state(clip, fps=float(cfg.fps))
     if matched_audio:
         try:
             music_feat = audio_feature_for_motion_clip(matched_audio, st, clip.shape[0], cfg)
@@ -3055,6 +3142,16 @@ def add_event_to_db_lists(
         "end": int(st + clip.shape[0]),
         "frames": int(clip.shape[0]),
         "duration": float(clip.shape[0] / max(float(cfg.fps), 1e-6)),
+        "source_start_seconds": float(
+            base_meta.get("source_start_seconds", st / max(float(cfg.fps), 1e-6))
+        ),
+        "source_end_seconds": float(
+            base_meta.get(
+                "source_end_seconds",
+                (st + clip.shape[0]) / max(float(cfg.fps), 1e-6),
+            )
+        ),
+        "canonical_fps": float(base_meta.get("canonical_fps", cfg.fps)),
         "label": str(base_meta.get("label", infer_label_from_filename(base_meta.get("source_file", out_path)))),
         "parent_label": str(base_meta.get("parent_label", base_meta.get("label", "unknown"))),
         "fragment_index": int(base_meta.get("fragment_index", 0) or 0),
@@ -3939,6 +4036,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
         "music_mean": music_mean.astype(np.float32),
         "music_std": music_std.astype(np.float32),
         "pair_report": pair_report,
+        "motion_contract": motion_checkpoint_contract(cfg, "v44_contrastive"),
     }
     torch.save(ckpt, out)
     print(json.dumps({"contrastive_ckpt": str(out), "num_pairs": int(N), "supervision_mode": supervision_mode, "pair_report": pair_report}, ensure_ascii=False, indent=2))
@@ -4002,9 +4100,9 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
         x, _ = enforce_edge151_contract_np(x, cfg, source_hint="v46_33_degrade_too_short", derive_contact=True, project_rot=True)
         return x.astype(np.float32), seam
 
-    min_w = _v46_33_cfg_int(cfg, "transition_train_min_frames", "V46_TRANSITION_TRAIN_MIN_FRAMES", 10)
-    max_w = _v46_33_cfg_int(cfg, "transition_train_max_frames", "V46_TRANSITION_TRAIN_MAX_FRAMES", 28)
-    halo = _v46_33_cfg_int(cfg, "transition_mask_halo", "V46_TRANSITION_MASK_HALO", 6)
+    min_w = max(1, int(round(float(cfg.transition_train_min_seconds) * float(cfg.fps))))
+    max_w = max(min_w, int(round(float(cfg.transition_train_max_seconds) * float(cfg.fps))))
+    halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     max_w = max(min_w, min(max_w, max(4, T // 3)))
     w = random.randint(max(4, min_w), max_w)
     c = random.randint(max(2, T // 5), max(3, 4 * T // 5))
@@ -4085,7 +4183,12 @@ def train_refiner(args: argparse.Namespace) -> int:
             print(f"[V45 refiner] step={step} loss={loss.item():.6f} rec={rec.item():.6f}")
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"version": "v45_refiner", "state_dict": model.state_dict(), "config": dataclasses.asdict(cfg)}, out)
+    torch.save({
+        "version": "v45_refiner",
+        "state_dict": model.state_dict(),
+        "config": dataclasses.asdict(cfg),
+        "motion_contract": motion_checkpoint_contract(cfg, "v45_refiner"),
+    }, out)
     print(json.dumps({"refiner_ckpt": str(out), "steps": steps}, ensure_ascii=False, indent=2))
     return 0
 
@@ -4195,7 +4298,13 @@ def train_diffusion(args: argparse.Namespace) -> int:
             print(f"[V46 diffusion] step={step} loss={loss.item():.6f} noise={loss_noise.item():.6f}")
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"version": "v46_conditional_residual_diffusion", "state_dict": model.state_dict(), "config": dataclasses.asdict(cfg), "diffusion_steps": Tdiff}, out)
+    torch.save({
+        "version": "v46_conditional_residual_diffusion",
+        "state_dict": model.state_dict(),
+        "config": dataclasses.asdict(cfg),
+        "diffusion_steps": Tdiff,
+        "motion_contract": motion_checkpoint_contract(cfg, "v46_diffusion"),
+    }, out)
     print(json.dumps({"diffusion_ckpt": str(out), "steps": steps}, ensure_ascii=False, indent=2))
     return 0
 
@@ -4221,9 +4330,12 @@ def _v46_trusted_torch_load(path, map_location=None, **_unused_kwargs):
 # ===== TRUSTED LOCAL CKPT LOAD FIX END =====
 
 def load_contrastive(path: Optional[str], cfg: V46Config):
+    if not bool(cfg.contrastive_enable):
+        return None
     if torch is None or not path or not Path(path).exists():
         return None
     ckpt = _v46_trusted_torch_load(path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, path, "v44_contrastive")
     model = ContrastiveModel(ckpt.get("feat_dim", 32), ckpt.get("embed_dim", cfg.embed_dim)).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.music_mean = np.asarray(ckpt.get("music_mean", np.zeros((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
@@ -4787,7 +4899,10 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     if b_clip.shape[0] >= 2:
         v1 = (b_clip[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - b_clip[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
     # Bound bridge tangents to avoid long-range root launches at mismatched clips.
-    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mpf", "V46_TRANSITION_ROOT_TANGENT_MAX_MPF", 0.045)
+    fps = max(float(cfg.fps), 1.0e-8)
+    v0 *= fps
+    v1 *= fps
+    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mps", "V46_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35)
     for vv in (v0, v1):
         norm = float(np.linalg.norm(vv[[0, 2]]))
         if norm > max_step:
@@ -4797,7 +4912,7 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     h10 = tt ** 3 - 2 * tt ** 2 + tt
     h01 = -2 * tt ** 3 + 3 * tt ** 2
     h11 = tt ** 3 - tt ** 2
-    scale = float(n + 1)
+    scale = float(n + 1) / fps
     root = h00 * p0[None] + h10 * (v0[None] * scale) + h01 * p1[None] + h11 * (v1[None] * scale)
     out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
 
@@ -4981,7 +5096,10 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     if b_clip.shape[0] >= 2:
         v1 = (b_clip[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - b_clip[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
     # Bound bridge tangents to avoid long-range root launches at mismatched clips.
-    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mpf", "V46_TRANSITION_ROOT_TANGENT_MAX_MPF", 0.045)
+    fps = max(float(cfg.fps), 1.0e-8)
+    v0 *= fps
+    v1 *= fps
+    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mps", "V46_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35)
     for vv in (v0, v1):
         norm = float(np.linalg.norm(vv[[0, 2]]))
         if norm > max_step:
@@ -4991,7 +5109,7 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     h10 = tt ** 3 - 2 * tt ** 2 + tt
     h01 = -2 * tt ** 3 + 3 * tt ** 2
     h11 = tt ** 3 - tt ** 2
-    scale = float(n + 1)
+    scale = float(n + 1) / fps
     root = h00 * p0[None] + h10 * (v0[None] * scale) + h01 * p1[None] + h11 * (v1[None] * scale)
     out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
 
@@ -5175,7 +5293,10 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     if b_clip.shape[0] >= 2:
         v1 = (b_clip[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - b_clip[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
     # Bound bridge tangents to avoid long-range root launches at mismatched clips.
-    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mpf", "V46_TRANSITION_ROOT_TANGENT_MAX_MPF", 0.045)
+    fps = max(float(cfg.fps), 1.0e-8)
+    v0 *= fps
+    v1 *= fps
+    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mps", "V46_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35)
     for vv in (v0, v1):
         norm = float(np.linalg.norm(vv[[0, 2]]))
         if norm > max_step:
@@ -5185,7 +5306,7 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     h10 = tt ** 3 - 2 * tt ** 2 + tt
     h01 = -2 * tt ** 3 + 3 * tt ** 2
     h11 = tt ** 3 - tt ** 2
-    scale = float(n + 1)
+    scale = float(n + 1) / fps
     root = h00 * p0[None] + h10 * (v0[None] * scale) + h01 * p1[None] + h11 * (v1[None] * scale)
     out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
 
@@ -5403,7 +5524,7 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
 def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: V46Config) -> np.ndarray:
     """Build precise transition mask with optional halo and low core mask."""
     core_val = _v46_33_cfg_float(cfg, "transition_core_mask_value", "V46_TRANSITION_CORE_MASK_VALUE", 0.0)
-    halo = _v46_33_cfg_int(cfg, "transition_mask_halo", "V46_TRANSITION_MASK_HALO", 6)
+    halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     mask = np.full((int(T), 1), float(core_val), dtype=np.float32)
     for sp in transition_spans:
         if sp is None or len(sp) < 2:
@@ -5431,7 +5552,7 @@ def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]
 def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: V46Config) -> np.ndarray:
     """Build precise transition mask with optional halo and low core mask."""
     core_val = _v46_33_cfg_float(cfg, "transition_core_mask_value", "V46_TRANSITION_CORE_MASK_VALUE", 0.0)
-    halo = _v46_33_cfg_int(cfg, "transition_mask_halo", "V46_TRANSITION_MASK_HALO", 6)
+    halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     mask = np.full((int(T), 1), float(core_val), dtype=np.float32)
     for sp in transition_spans:
         if sp is None or len(sp) < 2:
@@ -5459,7 +5580,7 @@ def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]
 def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: V46Config) -> np.ndarray:
     """Build precise transition mask with optional halo and low core mask."""
     core_val = _v46_33_cfg_float(cfg, "transition_core_mask_value", "V46_TRANSITION_CORE_MASK_VALUE", 0.0)
-    halo = _v46_33_cfg_int(cfg, "transition_mask_halo", "V46_TRANSITION_MASK_HALO", 6)
+    halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     mask = np.full((int(T), 1), float(core_val), dtype=np.float32)
     for sp in transition_spans:
         if sp is None or len(sp) < 2:
@@ -5538,6 +5659,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         return refined.astype(np.float32)
 
     ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v45_refiner")
     model = TemporalRefiner(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
@@ -5605,6 +5727,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
     noise_scale = _v46_33_cfg_float(cfg, "diffusion_reference_noise_scale", "V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.03)
 
     ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -5673,9 +5796,12 @@ def derive_contacts_np(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     foot_y = foot[..., 1]
     floor_y = float(np.percentile(foot_y.reshape(-1), 5))
     vel = np.zeros(foot.shape[:2], dtype=np.float32)
-    vel[1:] = np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+    vel[1:] = (
+        np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
+        * float(cfg.fps)
+    )
     height_score = np.clip(1.0 - (foot_y - floor_y) / max(cfg.ik_height_margin, 1e-6), 0.0, 1.0)
-    speed_score = np.clip(1.0 - vel / max(cfg.ik_speed_gate_mpf, 1e-6), 0.0, 1.0)
+    speed_score = np.clip(1.0 - vel / max(cfg.ik_speed_gate_mps, 1e-6), 0.0, 1.0)
     conf = 0.62 * height_score + 0.38 * speed_score
     clean = np.zeros_like(conf, dtype=bool)
     for f in range(conf.shape[1]):
@@ -5686,7 +5812,14 @@ def derive_contacts_np(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
             elif p <= cfg.ik_contact_low:
                 state = False
             clean[t, f] = state
-        clean[:, f] = median_bool_filter(clean[:, f], 5)
+        median_frames = max(1, int(round(float(cfg.fps) / 6.0)))
+        if median_frames % 2 == 0:
+            median_frames += 1
+        clean[:, f] = median_bool_filter(clean[:, f], median_frames)
+        # A support contact cannot coexist with a large horizontal foot step.
+        # This hard veto prevents hysteresis from carrying a stale contact
+        # label across a transition spike and makes foot-skate metrics honest.
+        clean[vel[:, f] > float(getattr(cfg, "ik_contact_break_speed_mps", 0.54)), f] = False
     return clean, conf.astype(np.float32), floor_y, foot.astype(np.float32)
 
 
@@ -5718,7 +5851,7 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
        whose first derivative is zero at takeoff and landing boundaries.
     3) Micro-Flight Shock Bug: landing damping is applied only when the
        immediately preceding flight island is a real effective flight. The same
-       cfg.root_y_min_flight_frames threshold gates both parabola and damping,
+       physical-time flight threshold gates both parabola and damping,
        so a 1-2 frame denoising gap cannot create a ghost landing hit.
     4) Space-Jump Bug: extremely long no-contact islands are treated as broken
        contact labels / bad upstream generation and are fused off before the
@@ -5735,7 +5868,7 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
     any_contact = contacts.any(axis=1)
     is_flight = ~any_contact
     fps = max(float(cfg.fps), 1e-6)
-    min_effective_flight = max(1, int(cfg.root_y_min_flight_frames))
+    min_effective_flight = max(1, int(round(float(cfg.root_y_min_flight_seconds) * fps)))
     max_biological_flight_s = float(max(cfg.root_y_max_flight_seconds, 1.0 / fps))
     max_biological_flight_frames = max(min_effective_flight, int(round(max_biological_flight_s * fps)))
 
@@ -5915,13 +6048,13 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
     skipped_short = 0
     preview: List[Dict[str, object]] = []
 
-    win = max(3, int(cfg.ik_sliding_anchor_window))
+    win = max(3, int(round(float(cfg.ik_sliding_anchor_seconds) * float(cfg.fps))))
     if win % 2 == 0:
         win += 1
     half = win // 2
     speed_thr = float(cfg.ik_cloud_step_speed_mps)
     span_thr = float(cfg.ik_slide_release_m)
-    min_frames = int(cfg.ik_slide_release_min_frames)
+    min_frames = max(1, int(round(float(cfg.ik_slide_release_min_seconds) * float(cfg.fps))))
     speed_cv_max = float(cfg.ik_cloud_speed_cv_max)
     root_min_travel = float(cfg.ik_cloud_root_min_travel_m)
     direction_cos_min = float(cfg.ik_cloud_direction_cos_min)
@@ -6029,10 +6162,13 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
             anchor = native_foot[start:anchor_end, f].mean(axis=0)
             locked_segments += 1
             for k, t in enumerate(range(start, end)):
-                phase_in = min(1.0, k / 6.0)
-                phase_out = min(1.0, (end - 1 - t) / 6.0)
-                w = min(float(smoothstep01(phase_in)), float(smoothstep01(phase_out)))
-                targets[t, f] = (1 - w) * native_foot[t, f] + w * anchor
+                if bool(getattr(cfg, "ik_hard_contact_lock", True)):
+                    targets[t, f] = anchor
+                else:
+                    phase_in = min(1.0, k / 6.0)
+                    phase_out = min(1.0, (end - 1 - t) / 6.0)
+                    w = min(float(smoothstep01(phase_in)), float(smoothstep01(phase_out)))
+                    targets[t, f] = (1 - w) * native_foot[t, f] + w * anchor
             if len(preview) < 32:
                 preview.append({
                     "foot": int(f), "start": int(start), "end": int(end),
@@ -6130,7 +6266,15 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
             mm[:, ROT6D_START:ROT6D_END] = rot.reshape(L, -1)
             joints = fk_24_torch(mm)
             foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
-            w = (contact * confidence).unsqueeze(-1)
+            minimum_confidence = float(
+                getattr(cfg, "ik_hard_contact_min_confidence", 0.85)
+            )
+            effective_confidence = torch.where(
+                contact > 0,
+                torch.clamp(confidence, min=minimum_confidence),
+                confidence,
+            )
+            w = (contact * effective_confidence).unsqueeze(-1)
             foot_loss = ((foot - target) ** 2 * w).sum() / w.sum().clamp_min(1.0)
             pose_loss = F.smooth_l1_loss(rr, base_rot)
             if L > 1:
@@ -6146,6 +6290,15 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
             loss.backward()
             torch.nn.utils.clip_grad_norm_([lower_rot, root], 1.0)
             opt.step()
+            with torch.no_grad():
+                root.copy_(
+                    base_root
+                    + torch.clamp(
+                        root - base_root,
+                        -float(cfg.rollback_root_delta_max_m),
+                        float(cfg.rollback_root_delta_max_m),
+                    )
+                )
             if float(loss.detach().cpu()) < best_loss:
                 best_loss = float(loss.detach().cpu())
                 best_motion = mm.detach().cpu().numpy()
@@ -6169,26 +6322,107 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
         with torch.no_grad():
             x = torch.from_numpy(out_all[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)).float()
             out_all[:, ROT6D_START:ROT6D_END] = project_rot6d_torch(x).numpy().reshape(T, -1)
+    post_stabilize_report: Dict[str, Any] = {
+        "enabled": bool(cfg.ik_post_stabilize_enable),
+        "applied": False,
+        "passes": 0,
+        "kernel": [0.0625, 0.25, 0.375, 0.25, 0.0625],
+        "scope": "root_xyz_and_lower_body_rot6d",
+    }
+    if bool(cfg.ik_post_stabilize_enable) and T >= 5:
+        candidate_before_stabilize = out_all.copy()
+        audit_before_stabilize = audit_motion_np(candidate_before_stabilize, cfg)
+        kernel = np.asarray([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
+
+        def binomial_filter_time(values: np.ndarray) -> np.ndarray:
+            pad = len(kernel) // 2
+            padded = np.pad(
+                values,
+                [(pad, pad)] + [(0, 0)] * (values.ndim - 1),
+                mode="edge",
+            )
+            filtered = np.zeros_like(values, dtype=np.float32)
+            for offset, weight in enumerate(kernel):
+                filtered += float(weight) * padded[offset:offset + len(values)]
+            return filtered
+
+        stabilized = candidate_before_stabilize.copy()
+        rotations = stabilized[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)
+        lower = np.asarray(LOWER_BODY_JOINTS, dtype=np.int64)
+        passes = max(0, int(cfg.ik_post_stabilize_passes))
+        for _ in range(passes):
+            stabilized[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = binomial_filter_time(
+                stabilized[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+            )
+            rotations[:, lower] = binomial_filter_time(rotations[:, lower])
+            rotations[:, lower] = matrix_to_rot6d_np(
+                rot6d_to_matrix_np(rotations[:, lower])
+            )
+        stabilized[:, ROT6D_START:ROT6D_END] = rotations.reshape(T, -1)
+        audit_stabilized = audit_motion_np(stabilized, cfg)
+        stabilization_safe = bool(
+            audit_stabilized["foot_skate_mps_p95"] <= float(cfg.ik_commit_skate_p95_max_mps)
+            and audit_stabilized["foot_skate_mps_max"] <= float(cfg.ik_commit_skate_max_mps)
+            and audit_stabilized["foot_penetration_min_m"] >= float(cfg.ik_commit_penetration_min_m)
+            and audit_stabilized["joint_jerk_mps3_p95"] <= audit_before_stabilize["joint_jerk_mps3_p95"]
+            and audit_stabilized["joint_jerk_mps3_max"] <= audit_before_stabilize["joint_jerk_mps3_max"]
+        )
+        if passes > 0 and stabilization_safe:
+            out_all = stabilized
+        post_stabilize_report.update({
+            "applied": bool(passes > 0 and stabilization_safe),
+            "passes": int(passes),
+            "safe": bool(stabilization_safe),
+            "audit_before": audit_before_stabilize,
+            "audit_candidate": audit_stabilized,
+        })
     audit_before = audit_motion_np(motion, cfg)
     audit_after = audit_motion_np(out_all, cfg)
     root_delta = np.linalg.norm(out_all[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]], axis=1)
     rollback_reasons: List[str] = []
-    if audit_after["foot_skate_p95_mpf"] > max(audit_before["foot_skate_p95_mpf"] * float(cfg.rollback_skate_ratio), audit_before["foot_skate_p95_mpf"] + 0.002):
+    if audit_after["foot_skate_mps_p95"] > max(
+        audit_before["foot_skate_mps_p95"] * float(cfg.rollback_skate_ratio),
+        audit_before["foot_skate_mps_p95"] + 0.06,
+    ):
         rollback_reasons.append("foot_skate_p95_worse")
-    if audit_after["mean_joint_jerk_p95"] > max(audit_before["mean_joint_jerk_p95"] * float(cfg.rollback_jerk_ratio), audit_before["mean_joint_jerk_p95"] + 1e-4):
+    if audit_after["joint_jerk_mps3_p95"] > max(
+        audit_before["joint_jerk_mps3_p95"] * float(cfg.rollback_jerk_ratio),
+        audit_before["joint_jerk_mps3_p95"] + 2.7,
+    ):
         rollback_reasons.append("joint_jerk_p95_worse")
     if audit_after["foot_penetration_min_m"] < audit_before["foot_penetration_min_m"] - float(cfg.rollback_penetration_margin_m):
         rollback_reasons.append("floor_penetration_worse")
     if root_delta.size and float(root_delta.max()) > float(cfg.rollback_root_delta_max_m):
         rollback_reasons.append("root_delta_too_large")
-    rollback = bool(rollback_reasons)
+    absolute_commit_reasons: List[str] = []
+    if audit_after["foot_skate_mps_p95"] > float(cfg.ik_commit_skate_p95_max_mps):
+        absolute_commit_reasons.append("absolute_foot_skate_p95")
+    if audit_after["foot_skate_mps_max"] > float(cfg.ik_commit_skate_max_mps):
+        absolute_commit_reasons.append("absolute_foot_skate_max")
+    if audit_after["foot_penetration_min_m"] < float(cfg.ik_commit_penetration_min_m):
+        absolute_commit_reasons.append("absolute_foot_penetration")
+    if audit_after["joint_jerk_mps3_p95"] > float(cfg.ik_commit_jerk_p95_max_mps3):
+        absolute_commit_reasons.append("absolute_joint_jerk_p95")
+    if audit_after["joint_jerk_mps3_max"] > float(cfg.ik_commit_jerk_max_mps3):
+        absolute_commit_reasons.append("absolute_joint_jerk_max")
+    if root_delta.size and float(root_delta.max()) > float(cfg.ik_commit_root_delta_max_m):
+        absolute_commit_reasons.append("absolute_root_delta")
+    # Both relative and absolute gates are mandatory.  An absolute threshold
+    # must never hide a large regression against an already smoother input.
+    rollback = bool(rollback_reasons or absolute_commit_reasons)
     final = motion.copy() if rollback else out_all
+    # Contacts are an observation of the final FK state.  Never retain stale
+    # logits from the pre-IK/refiner motion after geometry has changed.
+    final_contacts, final_confidence, final_floor_y, _ = derive_contacts_np(final, cfg)
+    final = final.copy().astype(np.float32)
+    final[:, :4] = final_contacts.astype(np.float32)
     report = {
         "version": "v46_8_true_lower_body_ik_root_aware_sliding_anchor_weighted_chunks_strict_rollback",
         "enabled": True,
         "writes_lower_body_rot6d": True,
         "root_y_physics": root_y_report,
         "ik_target_generator": target_meta,
+        "post_ik_stabilization": post_stabilize_report,
         "lower_body_joints": list(map(int, LOWER_BODY_JOINTS)),
         "foot_joint_ids": list(map(int, DEFAULT_FOOT_JOINTS)),
         "floor_y": float(floor_y),
@@ -6212,9 +6446,15 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
         "root_delta_max_m": float(root_delta.max()) if root_delta.size else 0.0,
         "root_delta_p95_m": float(np.percentile(root_delta, 95)) if root_delta.size else 0.0,
         "rollback_reasons": rollback_reasons,
+        "absolute_commit_reasons": absolute_commit_reasons,
+        "absolute_commit_gate_passed": not absolute_commit_reasons,
         "audit_before": audit_before,
         "audit_after_candidate": audit_after,
         "rollback_triggered": rollback,
+        "final_contact_recomputed": True,
+        "final_contact_ratio": float(final_contacts.mean()),
+        "final_contact_confidence_mean": float(final_confidence.mean()),
+        "final_contact_floor_y": float(final_floor_y),
         "audit_final": audit_motion_np(final, cfg),
     }
     return final.astype(np.float32), report
@@ -6222,43 +6462,40 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
 
 def audit_motion_np(motion: np.ndarray, cfg: Optional[V46Config] = None) -> dict:
     cfg = cfg or V46Config()
-    joints = fk_24_np(motion)
-    foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
-    foot_y = foot[..., 1]
-    floor_y = float(np.percentile(foot_y.reshape(-1), 5))
-    vel = np.zeros(foot.shape[:2], dtype=np.float32)
-    vel[1:] = np.linalg.norm(foot[1:, :, [0, 2]] - foot[:-1, :, [0, 2]], axis=-1)
     contacts, _, _, _ = derive_contacts_np(motion, cfg)
-    skate = vel[contacts] if contacts.any() else vel.reshape(-1)
-    if joints.shape[0] >= 4:
-        jerk = np.diff(joints, n=3, axis=0)
-        jerk_frame = np.linalg.norm(jerk, axis=-1).mean(axis=-1)
-        jerk_p95 = float(np.percentile(jerk_frame, 95))
-        jerk_max = float(np.max(jerk_frame))
-    else:
-        jerk_p95 = 0.0
-        jerk_max = 0.0
-    return {
-        "frames": int(motion.shape[0]),
-        "floor_y": floor_y,
-        "contact_ratio": float(contacts.mean()),
-        "foot_skate_mean_mpf": float(np.mean(skate)) if skate.size else 0.0,
-        "foot_skate_p95_mpf": float(np.percentile(skate, 95)) if skate.size else 0.0,
-        "foot_skate_max_mpf": float(np.max(skate)) if skate.size else 0.0,
-        "foot_penetration_min_m": float(np.min(foot_y - floor_y)),
-        "mean_joint_jerk_p95": jerk_p95,
-        "mean_joint_jerk_max": jerk_max,
-        "root_y_range_m": float(np.max(motion[:, ROOT_Y_IDX]) - np.min(motion[:, ROOT_Y_IDX])),
-    }
+    audited_motion = np.asarray(motion, dtype=np.float32).copy()
+    audited_motion[:, :4] = contacts.astype(np.float32)
+    from motion_geometry.physical import motion_physical_metrics_np
+
+    report = motion_physical_metrics_np(audited_motion, fps=float(cfg.fps))
+    report["root_y_range_m"] = float(
+        np.max(audited_motion[:, ROOT_Y_IDX]) - np.min(audited_motion[:, ROOT_Y_IDX])
+    )
+    return report
 
 
-def render_if_possible(motion_path: str, audio_path: Optional[str], output_mp4: Optional[str], render_script: str = "rendering/render_motion.py") -> None:
+def render_if_possible(
+    motion_path: str,
+    audio_path: Optional[str],
+    output_mp4: Optional[str],
+    render_script: str = "rendering/render_motion.py",
+    fps: float = 30.0,
+) -> None:
     if not output_mp4 or not audio_path:
         return
     if not Path(render_script).exists() or not Path(audio_path).exists():
         print("[V46 WARN] render skipped: render script or audio missing", file=sys.stderr)
         return
-    cmd = [sys.executable, render_script, "--motion", motion_path, "--audio", audio_path, "--output", output_mp4, "--camera_mode", "follow", "--render_smooth_window", "5"]
+    cmd = [
+        sys.executable,
+        render_script,
+        "--motion", motion_path,
+        "--audio", audio_path,
+        "--output", output_mp4,
+        "--fps", str(float(fps)),
+        "--camera_mode", "follow",
+        "--render_smooth_window", "5",
+    ]
     print("[V46 RENDER]", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -6374,7 +6611,13 @@ def generate(args: argparse.Namespace) -> int:
     json_path = args.json or str(out).replace(".npy", ".v46_33_report.json")
     save_json(report, json_path)
     if args.render_output:
-        render_if_possible(str(out), args.audio, args.render_output, args.render_script)
+        render_if_possible(
+            str(out),
+            args.audio,
+            args.render_output,
+            args.render_script,
+            fps=float(cfg.fps),
+        )
     print(json.dumps({"motion": str(out), "motion_ref": motion_ref_path, "transition_mask": mask_path, "json": json_path, "frames": int(motion.shape[0]), "final_audit": report["final_audit"]}, ensure_ascii=False, indent=2))
     return 0
 
@@ -6596,7 +6839,7 @@ def _v46_38_audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 
             print(f"[V46.38 MSSD] loaded sidecar descriptor: audio={path} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
             return slots, feats
     if strict:
-        raise RuntimeError("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but no final MSSD/slots_json was provided. Build it with scheduling/build_music_semantic_slot_descriptor.py")
+        raise RuntimeError("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but no final MSSD/slots_json was provided. Build it with python -m scheduling.music_slot_descriptor")
     return audio_slots_v46_default(path, cfg, slot_seconds, slots_json)
 
 
@@ -7133,13 +7376,14 @@ def _v46_41_kinematic_stats(motion, cfg):
         stats["floor_y"] = float(np.percentile(foot_y.reshape(-1), 5))
         stats["foot_penetration_min_m"] = float(np.min(foot_y - stats["floor_y"]))
         if joints.shape[0] >= 4:
-            vel = np.diff(joints, axis=0)
-            acc = np.diff(joints, n=2, axis=0)
-            jerk = np.diff(joints, n=3, axis=0)
-            stats["joint_vel_p95"] = float(np.percentile(np.linalg.norm(vel, axis=-1).mean(axis=-1), 95))
-            stats["joint_acc_max"] = float(np.max(np.linalg.norm(acc, axis=-1).mean(axis=-1)))
-            stats["joint_jerk_max"] = float(np.max(np.linalg.norm(jerk, axis=-1).mean(axis=-1)))
-            stats["joint_jerk_p95"] = float(np.percentile(np.linalg.norm(jerk, axis=-1).mean(axis=-1), 95))
+            fps = float(cfg.fps)
+            vel = np.diff(joints, axis=0) * fps
+            acc = np.diff(joints, n=2, axis=0) * fps ** 2
+            jerk = np.diff(joints, n=3, axis=0) * fps ** 3
+            stats["joint_velocity_p95_mps"] = float(np.percentile(np.linalg.norm(vel, axis=-1).mean(axis=-1), 95))
+            stats["joint_acceleration_max_mps2"] = float(np.max(np.linalg.norm(acc, axis=-1).mean(axis=-1)))
+            stats["joint_jerk_max_mps3"] = float(np.max(np.linalg.norm(jerk, axis=-1).mean(axis=-1)))
+            stats["joint_jerk_p95_mps3"] = float(np.percentile(np.linalg.norm(jerk, axis=-1).mean(axis=-1), 95))
         bone_vars = []
         for j in range(1, min(NUM_JOINTS, len(PARENTS))):
             pa = int(PARENTS[j])
@@ -7190,18 +7434,18 @@ def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
         reasons.append("floor_shift_exceeded")
     if float(c.get("bone_length_violation_max_m", 0.0)) > _v46_41_env_float("V46_41_KBO_BONE_LENGTH_EPS_M", 0.02):
         reasons.append("bone_length_violation")
-    if float(c.get("joint_acc_max", 0.0)) > _v46_41_env_float("V46_41_KBO_ACC_MAX", 3.0):
+    if float(c.get("joint_acceleration_max_mps2", 0.0)) > _v46_41_env_float("V46_41_KBO_ACC_MAX_MPS2", 2700.0):
         reasons.append("acceleration_spike")
-    if float(c.get("joint_jerk_max", 0.0)) > _v46_41_env_float("V46_41_KBO_JERK_MAX", 3.0):
+    if float(c.get("joint_jerk_max_mps3", 0.0)) > _v46_41_env_float("V46_41_KBO_JERK_MAX_MPS3", 81000.0):
         reasons.append("jerk_spike")
-    if float(c.get("mean_joint_jerk_p95", c.get("joint_jerk_p95", 0.0))) > max(
-        float(r.get("mean_joint_jerk_p95", r.get("joint_jerk_p95", 0.0))) * _v46_41_env_float("V46_41_KBO_JERK_RATIO", 2.5),
-        float(r.get("mean_joint_jerk_p95", r.get("joint_jerk_p95", 0.0))) + _v46_41_env_float("V46_41_KBO_JERK_MARGIN", 0.15),
+    if float(c.get("joint_jerk_mps3_p95", c.get("joint_jerk_p95_mps3", 0.0))) > max(
+        float(r.get("joint_jerk_mps3_p95", r.get("joint_jerk_p95_mps3", 0.0))) * _v46_41_env_float("V46_41_KBO_JERK_RATIO", 2.5),
+        float(r.get("joint_jerk_mps3_p95", r.get("joint_jerk_p95_mps3", 0.0))) + _v46_41_env_float("V46_41_KBO_JERK_MARGIN_MPS3", 4050.0),
     ):
         reasons.append("jerk_p95_worse")
-    if float(c.get("foot_skate_p95_mpf", 0.0)) > max(
-        float(r.get("foot_skate_p95_mpf", 0.0)) * _v46_41_env_float("V46_41_KBO_SKATE_RATIO", 2.5),
-        float(r.get("foot_skate_p95_mpf", 0.0)) + _v46_41_env_float("V46_41_KBO_SKATE_MARGIN", 0.06),
+    if float(c.get("foot_skate_mps_p95", 0.0)) > max(
+        float(r.get("foot_skate_mps_p95", 0.0)) * _v46_41_env_float("V46_41_KBO_SKATE_RATIO", 2.5),
+        float(r.get("foot_skate_mps_p95", 0.0)) + _v46_41_env_float("V46_41_KBO_SKATE_MARGIN_MPS", 1.8),
     ):
         reasons.append("skate_p95_worse")
     if float(c.get("foot_penetration_min_m", 0.0)) < float(r.get("foot_penetration_min_m", 0.0)) - _v46_41_env_float("V46_41_KBO_PENETRATION_MARGIN_M", 0.20):
@@ -7344,6 +7588,7 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     trans_strength = _v46_41_env_float("V46_DIFFUSION_TRANSITION_STRENGTH", 0.25)
     noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
     ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -7772,9 +8017,9 @@ def _v46_42_kbo_early_abort(candidate, reference, cfg, stage="diffusion_early_ab
         reasons.append("floor_shift_exceeded")
     if float(c.get("bone_length_violation_max_m", 0.0)) > _v46_41_env_float("V46_41_KBO_BONE_LENGTH_EPS_M", 0.02) * max(1.0, relax):
         reasons.append("bone_length_violation")
-    if float(c.get("joint_acc_max", 0.0)) > _v46_41_env_float("V46_41_KBO_ACC_MAX", 3.0) * max(1.0, relax):
+    if float(c.get("joint_acceleration_max_mps2", 0.0)) > _v46_41_env_float("V46_41_KBO_ACC_MAX_MPS2", 2700.0) * max(1.0, relax):
         reasons.append("acceleration_spike")
-    if float(c.get("joint_jerk_max", 0.0)) > _v46_41_env_float("V46_41_KBO_JERK_MAX", 3.0) * max(1.0, relax):
+    if float(c.get("joint_jerk_max_mps3", 0.0)) > _v46_41_env_float("V46_41_KBO_JERK_MAX_MPS3", 81000.0) * max(1.0, relax):
         reasons.append("jerk_spike")
     # Anchor check is also weighted by dynamic MSA; do not reject high-energy windows solely due to anchor.
     if _v46_41_env_bool("V46_41_KBO_STAGE_ANCHOR_ENABLE", True):
@@ -7865,6 +8110,7 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     trans_strength = _v46_41_env_float("V46_DIFFUSION_TRANSITION_STRENGTH", 0.25)
     noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
     ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -8017,17 +8263,18 @@ def _v46_43_robust_derivative_stats(motion, cfg):
     try:
         joints = fk_24_np(m)
         st["fk_finite"] = bool(np.isfinite(joints).all())
-        vel = np.diff(joints, axis=0)
-        acc = np.diff(joints, n=2, axis=0)
-        jerk = np.diff(joints, n=3, axis=0)
+        fps = float(cfg.fps)
+        vel = np.diff(joints, axis=0) * fps
+        acc = np.diff(joints, n=2, axis=0) * fps ** 2
+        jerk = np.diff(joints, n=3, axis=0) * fps ** 3
         acc_n = np.linalg.norm(acc, axis=-1).mean(axis=-1) if acc.size else np.zeros((1,), dtype=np.float32)
         jerk_n = np.linalg.norm(jerk, axis=-1).mean(axis=-1) if jerk.size else np.zeros((1,), dtype=np.float32)
-        st["joint_acc_p95"] = float(np.percentile(acc_n, 95))
-        st["joint_acc_p99"] = float(np.percentile(acc_n, 99))
-        st["joint_acc_max_diag"] = float(np.max(acc_n))
-        st["joint_jerk_p95"] = float(np.percentile(jerk_n, 95))
-        st["joint_jerk_p99"] = float(np.percentile(jerk_n, 99))
-        st["joint_jerk_max_diag"] = float(np.max(jerk_n))
+        st["joint_acceleration_p95_mps2"] = float(np.percentile(acc_n, 95))
+        st["joint_acceleration_p99_mps2"] = float(np.percentile(acc_n, 99))
+        st["joint_acceleration_max_mps2_diag"] = float(np.max(acc_n))
+        st["joint_jerk_p95_mps3"] = float(np.percentile(jerk_n, 95))
+        st["joint_jerk_p99_mps3"] = float(np.percentile(jerk_n, 99))
+        st["joint_jerk_max_mps3_diag"] = float(np.max(jerk_n))
         # Bone-length variance should be extremely small for a valid FK skeleton.
         bone_vars = []
         for j in range(1, min(NUM_JOINTS, len(PARENTS))):
@@ -8078,11 +8325,11 @@ def _v46_43_early_abort_oracle(candidate, reference, cfg, stage="diffusion_early
 
     # Derivative barriers are soft in early-abort mode. They need co-occurring
     # fatal evidence, or a very large robust p99 excursion when the user enables it.
-    acc_thr = _v46_41_env_float("V46_41_KBO_ACC_MAX", 3.0) * max(1.0, relax)
-    jerk_thr = _v46_41_env_float("V46_41_KBO_JERK_MAX", 3.0) * max(1.0, relax)
-    if float(c.get("joint_acc_p99", 0.0)) > acc_thr:
+    acc_thr = _v46_41_env_float("V46_41_KBO_ACC_MAX_MPS2", 2700.0) * max(1.0, relax)
+    jerk_thr = _v46_41_env_float("V46_41_KBO_JERK_MAX_MPS3", 81000.0) * max(1.0, relax)
+    if float(c.get("joint_acceleration_p99_mps2", 0.0)) > acc_thr:
         soft.append("robust_acc_p99_spike")
-    if float(c.get("joint_jerk_p99", 0.0)) > jerk_thr:
+    if float(c.get("joint_jerk_p99_mps3", 0.0)) > jerk_thr:
         soft.append("robust_jerk_p99_spike")
 
     if _v46_41_env_bool("V46_41_KBO_STAGE_ANCHOR_ENABLE", True):
@@ -8182,11 +8429,12 @@ def _v46_41_apply_stage_prior(motion, cfg, strength=None, global_start=0):
     # local foot/root dynamics and prevents rubber-band deceleration.
     max_delta = _v46_43_env_float("V46_43_MSA_MAX_OFFSET_DELTA_M", _v46_41_env_float("V46_41_MSA_MAX_DELTA_M", 0.06))
     corr = np.clip(corr, -max_delta, max_delta)
-    max_corr_vel = _v46_43_env_float("V46_43_MSA_MAX_CORRECTION_VEL_MPF", 0.006)
+    max_corr_vel = _v46_43_env_float("V46_43_MSA_MAX_CORRECTION_VEL_MPS", 0.18)
+    max_corr_step = max_corr_vel / max(float(cfg.fps), 1.0e-8)
     if len(corr) > 1 and max_corr_vel > 0:
         smooth_corr = corr.copy()
         for t in range(1, len(smooth_corr)):
-            step = np.clip(smooth_corr[t] - smooth_corr[t-1], -max_corr_vel, max_corr_vel)
+            step = np.clip(smooth_corr[t] - smooth_corr[t-1], -max_corr_step, max_corr_step)
             smooth_corr[t] = smooth_corr[t-1] + step
         corr = smooth_corr
     alpha = float(base_alpha) * w[:, 0]
@@ -8201,7 +8449,7 @@ def _v46_41_apply_stage_prior(motion, cfg, strength=None, global_start=0):
         "effective_strength_min": float(base_alpha * float(np.min(w))) if len(w) else 0.0,
         "correction_lowpass_sigma": float(sigma),
         "max_offset_delta_m": float(max_delta),
-        "max_correction_velocity_mpf": float(max_corr_vel),
+        "max_correction_velocity_mps": float(max_corr_vel),
         "interpretation": "low-frequency drift correction only; leap/high-root-speed frames are released",
     })
     return m.astype(np.float32), meta
@@ -8235,6 +8483,7 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     trans_strength = _v46_41_env_float("V46_DIFFUSION_TRANSITION_STRENGTH", 0.25)
     noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
     ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)

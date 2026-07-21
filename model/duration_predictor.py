@@ -28,11 +28,21 @@ from pytorch3d.transforms import (
     matrix_to_rotation_6d,
     rotation_6d_to_matrix,
 )
+from motion_geometry.rotations import (
+    CANONICAL_ROT6D_LAYOUT,
+    ROT6D_LAYOUT_PYTORCH3D_ROW,
+    normalize_rot6d_layout,
+)
 
 CONTACT = slice(0, 4)
 ROOT = slice(4, 7)
 ROT = slice(7, 151)
 ROOT_ROT6D = slice(7, 13)
+
+# This historical network was trained with PyTorch3D's row-concatenated 6D
+# representation.  Project callers use the column-concatenated canonical
+# contract and must adapt at the checkpoint boundary.
+NATIVE_ROT6D_LAYOUT = ROT6D_LAYOUT_PYTORCH3D_ROW
 
 
 class FiLMBlock1D(nn.Module):
@@ -550,6 +560,14 @@ class V23MonotonicDurationNet(nn.Module):
 def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = dict(checkpoint.get("config", {}))
+    checkpoint_layout = normalize_rot6d_layout(
+        checkpoint.get("rot6d_layout", config.get("rot6d_layout", NATIVE_ROT6D_LAYOUT))
+    )
+    if checkpoint_layout != NATIVE_ROT6D_LAYOUT:
+        raise RuntimeError(
+            "This duration architecture decodes Rot6D with PyTorch3D rows, but "
+            f"checkpoint declares rot6d_layout={checkpoint_layout!r}."
+        )
     duration_edges = config.get("duration_edges", [12, 24, 37, 50, 63, 76, 89])
     model = V23MonotonicDurationNet(
         motion_dim=int(config.get("motion_dim", 151)),
@@ -573,4 +591,17 @@ def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") ->
         "selection_score": checkpoint.get("selection_score", float("inf")),
         "val_metrics": checkpoint.get("val_metrics", {}),
         "stage": checkpoint.get("stage", config.get("stage", "unknown")),
+        "rot6d_layout": checkpoint_layout,
+        "canonical_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
     }
+
+
+# Version-free public API; historical names remain for checkpoint compatibility.
+DurationPredictor = V23MonotonicDurationNet
+
+
+def load_duration_checkpoint(
+    path: str | Path,
+    device: torch.device | str = "cpu",
+) -> Dict[str, Any]:
+    return load_v23_checkpoint(path, device=device)

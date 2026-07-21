@@ -68,6 +68,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from motion_geometry.resampling import resample_edge151_np
+from support.common import make_geodesic_transition
+from support.event_identity import (
+    assert_same_event_db_contract,
+    event_uids_from_generation_db,
+    make_event_db_contract,
+    normalize_event_db_contract,
+)
 
 
 EDGE_DIM = 151
@@ -162,15 +170,7 @@ def resample_motion(v46, motion: np.ndarray, target_len: int) -> np.ndarray:
     x = _as_motion_array(motion)
     if x.shape[0] == target_len:
         return x.copy().astype(np.float32)
-    if hasattr(v46, "resample_motion_np"):
-        return _as_motion_array(v46.resample_motion_np(x, target_len))
-    old = np.linspace(0.0, 1.0, x.shape[0], dtype=np.float32)
-    new = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
-    y = np.empty((target_len, x.shape[1]), dtype=np.float32)
-    for d in range(x.shape[1]):
-        y[:, d] = np.interp(new, old, x[:, d]).astype(np.float32)
-    y[:, CONTACT] = (y[:, CONTACT] >= 0.5).astype(np.float32)
-    return y.astype(np.float32)
+    return _as_motion_array(resample_edge151_np(x, target_frames=target_len))
 
 
 def load_event_motion(v46, path: str | Path, cfg: Any, source_hint: str) -> np.ndarray:
@@ -285,11 +285,13 @@ def transition_risk(v46, previous: np.ndarray, transition: np.ndarray, following
 
 
 def risk_score(risk: Dict[str, Any]) -> float:
-    # Normalized scalar used for search and fallback selection.
-    bj = float(risk.get("boundary_joint_jerk_max", risk.get("joint_jerk", 0.0))) / max(env_float("V46_46_NORM_BOUNDARY_JERK", 5000.0), 1e-6)
-    fk = float(risk.get("exit_fk_jump", 0.0)) / max(env_float("V46_46_NORM_EXIT_FK", 0.040), 1e-6)
-    rot = float(risk.get("exit_rotation_step_rad", 0.0)) / max(env_float("V46_46_NORM_EXIT_ROT", 0.12), 1e-6)
-    slip = float(risk.get("foot_slip", 0.0)) / max(env_float("V46_46_NORM_FOOT_SLIP", 0.22), 1e-6)
+    # Normalized scalar used for search and fallback selection.  Every
+    # kinematic threshold is named with its SI unit so 30/60 FPS runs share
+    # exactly the same physical contract.
+    bj = float(risk.get("boundary_joint_jerk_max", risk.get("joint_jerk", 0.0))) / max(env_float("V46_46_NORM_BOUNDARY_JERK_MPS3", 5000.0), 1e-6)
+    fk = float(risk.get("exit_fk_jump", 0.0)) / max(env_float("V46_46_NORM_EXIT_FK_JUMP_M", 0.040), 1e-6)
+    rot = float(risk.get("exit_rotation_step_rad", 0.0)) / max(env_float("V46_46_NORM_EXIT_ROT_RAD", 0.12), 1e-6)
+    slip = float(risk.get("foot_slip", 0.0)) / max(env_float("V46_46_NORM_FOOT_SLIP_MPS", 0.22), 1e-6)
     cs = float(risk.get("contact_switch", 0.0)) / max(env_float("V46_46_NORM_CONTACT_SWITCH", 0.45), 1e-6)
     total = float(risk.get("total", 0.0)) / max(env_float("V46_46_NORM_TOTAL", 1.0), 1e-6)
     return float(0.30 * total + 0.24 * bj + 0.22 * fk + 0.14 * rot + 0.07 * slip + 0.03 * cs)
@@ -297,11 +299,11 @@ def risk_score(risk: Dict[str, Any]) -> float:
 
 def risk_safe(risk: Dict[str, Any]) -> bool:
     return bool(
-        float(risk.get("boundary_joint_jerk_max", 0.0)) <= env_float("V46_46_MAX_BOUNDARY_JERK", 5000.0)
-        and float(risk.get("exit_fk_jump", 0.0)) <= env_float("V46_46_MAX_EXIT_FK", 0.040)
-        and float(risk.get("exit_rotation_step_rad", 0.0)) <= env_float("V46_46_MAX_EXIT_ROT", 0.12)
-        and float(risk.get("foot_slip", 0.0)) <= env_float("V46_46_MAX_FOOT_SLIP", 0.28)
-        and float(risk.get("foot_penetration", 0.0)) <= env_float("V46_46_MAX_FOOT_PENETRATION", 0.0025)
+        float(risk.get("boundary_joint_jerk_max", 0.0)) <= env_float("V46_46_MAX_BOUNDARY_JERK_MPS3", 650.0)
+        and float(risk.get("exit_fk_jump", 0.0)) <= env_float("V46_46_MAX_EXIT_FK_JUMP_M", 0.015)
+        and float(risk.get("exit_rotation_step_rad", 0.0)) <= env_float("V46_46_MAX_EXIT_ROT_RAD", 0.08)
+        and float(risk.get("foot_slip", 0.0)) <= env_float("V46_46_MAX_FOOT_SLIP_MPS", 0.06)
+        and float(risk.get("foot_penetration", 0.0)) <= env_float("V46_46_MAX_FOOT_PENETRATION_M2", 0.001)
     )
 
 
@@ -444,14 +446,12 @@ def build_bridge(v46, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: A
                 return enforce_contract(v46, bridge, cfg, source_hint=f"v46_46_bridge:{name}")
             except Exception:
                 pass
-    # Last fallback: smooth interpolation in 151D, then contract.
-    a = prev[-1].copy()
-    b = core[0].copy()
-    u = (np.arange(1, trans_len + 1, dtype=np.float32) / float(trans_len + 1))[:, None]
-    smooth = u * u * (3.0 - 2.0 * u)
-    bridge = (1.0 - smooth) * a[None] + smooth * b[None]
-    bridge[:, CONTACT] = (bridge[:, CONTACT] >= 0.5).astype(np.float32)
-    return enforce_contract(v46, bridge, cfg, source_hint="v46_46_bridge:fallback_smooth")
+    # The final fallback still has to honor the same geometry contract as the
+    # primary bridge: Euclidean root translation, discrete contact, and SO(3)
+    # interpolation for every joint.  Projecting a linearly blended Rot6D
+    # vector is not equivalent, especially close to pi.
+    bridge = make_geodesic_transition(prev, core, trans_len)
+    return enforce_contract(v46, bridge, cfg, source_hint="v46_46_bridge:fallback_geodesic")
 
 
 @dataclass
@@ -660,25 +660,44 @@ def transition_spans_from_report(assembly_report: Sequence[Dict[str, Any]]) -> L
 
 
 def make_seam_mask(v46, T: int, transition_spans: Sequence[Sequence[int]], cfg: Any) -> Tuple[np.ndarray, List[int], str]:
+    def finish(raw_mask: np.ndarray, centers: List[int], policy: str):
+        mask = np.asarray(raw_mask, dtype=np.float32).reshape(int(T), -1)
+        max_ratio = float(np.clip(env_float("V46_54_MAX_TRANSITION_MASK_RATIO", 0.25), 0.0, 1.0))
+        active = np.flatnonzero(mask[:, 0] > 1e-6)
+        budget = int(math.floor(int(T) * max_ratio))
+        if len(active) > budget and budget >= 0:
+            keep = np.zeros((int(T),), dtype=bool)
+            if centers and budget > 0:
+                radius = max(0, budget // max(1, 2 * len(centers)))
+                for center in centers:
+                    keep[max(0, center - radius) : min(int(T), center + radius + 1)] = True
+                if int(keep.sum()) > budget:
+                    kept = np.flatnonzero(keep)[:budget]
+                    keep[:] = False
+                    keep[kept] = True
+            mask[~keep, :] = 0.0
+            policy += "+coverage_cap"
+        return mask, centers, policy
+
     if transition_spans and hasattr(v46, "make_transition_budget_mask"):
         try:
             mask = v46.make_transition_budget_mask(T, transition_spans, cfg)
             centers = [int((int(a) + int(b)) // 2) for a, b in transition_spans]
-            return np.asarray(mask, dtype=np.float32), centers, "v46_46_transition_spans"
+            return finish(mask, centers, "v46_46_transition_spans")
         except Exception:
             pass
     centers = [int((int(a) + int(b)) // 2) for a, b in transition_spans]
     if hasattr(v46, "make_boundary_mask"):
         try:
             mask = v46.make_boundary_mask(T, centers, width=env_int("V46_46_FALLBACK_MASK_WIDTH", 24))
-            return np.asarray(mask, dtype=np.float32), centers, "v46_46_fallback_boundary_mask"
+            return finish(mask, centers, "v46_46_fallback_boundary_mask")
         except Exception:
             pass
     mask = np.zeros((int(T), 1), dtype=np.float32)
     width = env_int("V46_46_FALLBACK_MASK_WIDTH", 24)
     for c in centers:
         mask[max(0, c - width):min(T, c + width), 0] = 1.0
-    return mask, centers, "v46_46_local_fallback_boundary_mask"
+    return finish(mask, centers, "v46_46_local_fallback_boundary_mask")
 
 
 def compute_condition(slot_feat: np.ndarray, db: Dict[str, Any]) -> np.ndarray:
@@ -707,7 +726,34 @@ def apply_generators(v46, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: n
         motion, ik_report = v46.true_lower_body_ik(motion, cfg)
     stage["v43_true_ik"] = ik_report
     stage["final_audit"] = v46.audit_motion_np(motion, cfg) if hasattr(v46, "audit_motion_np") else {}
+    stage["final_physical_gate"] = physical_quality_gate(stage["final_audit"])
     return motion.astype(np.float32), stage
+
+
+def physical_quality_gate(audit: Dict[str, Any]) -> Dict[str, Any]:
+    limits = {
+        "foot_skate_mps_p95": env_float("V46_54_MAX_FOOT_SKATE_P95_MPS", 0.18),
+        "foot_skate_mps_max": env_float("V46_54_MAX_FOOT_SKATE_MAX_MPS", 0.60),
+        "foot_penetration_min_m": env_float("V46_54_MIN_FOOT_PENETRATION_M", -0.050),
+        "joint_jerk_mps3_p95": env_float("V46_54_MAX_JOINT_JERK_P95_MPS3", 810.0),
+        "joint_jerk_mps3_max": env_float("V46_54_MAX_JOINT_JERK_MAX_MPS3", 1620.0),
+        "root_y_range_m": env_float("V46_54_MAX_ROOT_Y_RANGE_M", 0.45),
+    }
+    reasons: List[str] = []
+    for key in (
+        "foot_skate_mps_p95",
+        "foot_skate_mps_max",
+        "joint_jerk_mps3_p95",
+        "joint_jerk_mps3_max",
+        "root_y_range_m",
+    ):
+        if float(audit.get(key, float("inf"))) > float(limits[key]):
+            reasons.append(f"{key}_too_high")
+    if float(audit.get("foot_penetration_min_m", float("-inf"))) < float(
+        limits["foot_penetration_min_m"]
+    ):
+        reasons.append("foot_penetration_too_low")
+    return {"ok": not reasons, "reasons": reasons, "limits": limits, "audit": dict(audit)}
 
 
 def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str, Any]], cfg: Any) -> List[Dict[str, Any]]:
@@ -756,6 +802,18 @@ def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str
             "transition_len": int(max(0, t1 - t0)),
             "core_warp": float(assembly_report[i].get("core_warp", 0.0)),
         }
+        # Explicit-unit fields are the canonical report API.  The historical
+        # names above remain for old analysis notebooks during migration.
+        row.update(
+            {
+                "predicted_boundary_jerk_mps3": row["predicted_boundary_jerk"],
+                "predicted_exit_fk_jump_m": row["predicted_exit_fk_jump"],
+                "actual_boundary_jerk_mps3": row["actual_boundary_jerk"],
+                "actual_exit_fk_jump_m": row["actual_exit_fk_jump"],
+                "actual_foot_slip_mps": row["actual_foot_slip"],
+                "actual_foot_penetration_m2": row["actual_foot_penetration"],
+            }
+        )
         rows.append(row)
     return rows
 
@@ -772,6 +830,9 @@ def write_audit_csv(rows: Sequence[Dict[str, Any]], path: str | Path) -> None:
         "actual_risk_score", "actual_boundary_jerk", "actual_exit_fk_jump",
         "actual_exit_rotation_step_rad", "actual_foot_slip", "actual_foot_penetration",
         "actual_contact_switch", "core_warp", "safe", "decision",
+        "predicted_boundary_jerk_mps3", "predicted_exit_fk_jump_m",
+        "actual_boundary_jerk_mps3", "actual_exit_fk_jump_m",
+        "actual_foot_slip_mps", "actual_foot_penetration_m2",
     ]
     with p.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
@@ -780,19 +841,39 @@ def write_audit_csv(rows: Sequence[Dict[str, Any]], path: str | Path) -> None:
             writer.writerow({k: r.get(k) for k in keys})
 
 
-def render_if_possible(v46, motion_path: str, audio_path: Optional[str], output_mp4: Optional[str], render_script: str = "rendering/render_motion.py") -> None:
+def render_if_possible(
+    v46,
+    motion_path: str,
+    audio_path: Optional[str],
+    output_mp4: Optional[str],
+    render_script: str = "rendering/render_motion.py",
+    fps: float = 30.0,
+) -> None:
     if not output_mp4:
         return
     if hasattr(v46, "render_if_possible"):
         try:
-            v46.render_if_possible(motion_path, audio_path, output_mp4, render_script)
+            v46.render_if_possible(
+                motion_path,
+                audio_path,
+                output_mp4,
+                render_script,
+                fps=float(fps),
+            )
             return
         except Exception as exc:
             print(f"[V46.46 WARN] v46.render_if_possible failed: {exc}", file=sys.stderr)
     if not audio_path or not Path(render_script).exists():
         print("[V46.46 WARN] render skipped", file=sys.stderr)
         return
-    cmd = [sys.executable, render_script, "--motion", motion_path, "--audio", audio_path, "--output", output_mp4]
+    cmd = [
+        sys.executable,
+        render_script,
+        "--motion", motion_path,
+        "--audio", audio_path,
+        "--output", output_mp4,
+        "--fps", str(float(fps)),
+    ]
     subprocess.run(cmd, check=False)
 
 
@@ -891,11 +972,48 @@ def merge_short_terminal_slot(
 
 def load_slots_and_candidates(v46, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
     db = v46.load_db(args.db)
+    event_uids = event_uids_from_generation_db(db)
+    db["event_uids"] = event_uids
+    db_contract = make_event_db_contract(event_uids)
+    strict_identity = env_bool("V46_54_REQUIRE_ALIGNED_EVENT_DB", True)
+    descriptor_contract = None
+    slots_json = getattr(args, "slots_json", None)
+    if slots_json and Path(slots_json).is_file():
+        descriptor_obj = json.loads(Path(slots_json).read_text(encoding="utf-8"))
+        descriptor_contract = normalize_event_db_contract(
+            descriptor_obj.get("event_db_contract")
+        )
+    if strict_identity:
+        assert_same_event_db_contract(
+            db_contract,
+            descriptor_contract,
+            context="Scheduler/Generation Event-DB alignment",
+        )
     contrastive = v46.load_contrastive(getattr(args, "contrastive", None), cfg)
     slots, slot_feat = v46.audio_slots(args.audio, cfg, args.slot_seconds, getattr(args, "slots_json", None))
     slots, slot_feat = merge_short_terminal_slot(slots, slot_feat, cfg)
     path_idx, retrieval_report = v46.retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
     candidate_lists = extract_candidate_lists(path_idx, retrieval_report, db, cfg)
+    uid_to_index = {str(uid): index for index, uid in enumerate(event_uids)}
+    for slot_index, slot in enumerate(slots):
+        scheduled_uid = slot.get("v26_event_uid", slot.get("event_uid"))
+        if not scheduled_uid:
+            if strict_identity:
+                raise RuntimeError(f"Slot {slot_index} has no stable v26_event_uid")
+            continue
+        scheduled_uid = str(scheduled_uid)
+        if scheduled_uid not in uid_to_index:
+            raise RuntimeError(
+                f"Slot {slot_index} references event_uid={scheduled_uid!r} outside Generation DB"
+            )
+        exact_index = int(uid_to_index[scheduled_uid])
+        path_idx[slot_index] = exact_index
+        candidate_lists[slot_index] = [exact_index] + [
+            int(value) for value in candidate_lists[slot_index] if int(value) != exact_index
+        ]
+        retrieval_report[slot_index]["scheduled_event_uid"] = scheduled_uid
+        retrieval_report[slot_index]["scheduled_generation_event_index"] = exact_index
+        retrieval_report[slot_index]["event_db_contract"] = db_contract
     return db, contrastive, list(slots), np.asarray(slot_feat, dtype=np.float32), list(map(int, path_idx)), list(retrieval_report), candidate_lists
 
 
@@ -978,6 +1096,16 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     if best_payload is None:
         raise RuntimeError("Closed-loop generation produced no payload")
 
+    final_gate = physical_quality_gate(
+        best_payload["stage_reports"].get("final_audit", {})
+    )
+    best_payload["stage_reports"]["final_physical_gate"] = final_gate
+    if env_bool("V46_54_REQUIRE_FINAL_PHYSICAL_GATE", True) and not final_gate["ok"]:
+        raise RuntimeError(
+            "Final physical gate rejected generated motion: "
+            + ",".join(final_gate["reasons"])
+        )
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.save(out, best_payload["motion"].astype(np.float32))
@@ -1017,6 +1145,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "risk_adaptive_transition_enabled": env_bool("V46_46_RISK_ADAPT_TRANSITION_ENABLE", True),
             "simulated_edge_risk_enabled": True,
             "env": {k: v for k, v in os.environ.items() if k.startswith("V46_46_")},
+            "diversity_env": {k: v for k, v in os.environ.items() if k.startswith("V46_54_")},
         },
         "stage_reports": {
             "retrieval": retrieval_report,
@@ -1033,6 +1162,16 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "actual_boundary_jerk_p95": float(np.percentile([r.get("actual_boundary_jerk", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_exit_fk_jump_p95": float(np.percentile([r.get("actual_exit_fk_jump", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_foot_slip_p95": float(np.percentile([r.get("actual_foot_slip", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "actual_boundary_jerk_p95_mps3": float(np.percentile([r.get("actual_boundary_jerk_mps3", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "actual_exit_fk_jump_p95_m": float(np.percentile([r.get("actual_exit_fk_jump_m", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "actual_foot_slip_p95_mps": float(np.percentile([r.get("actual_foot_slip_mps", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "physical_units": {
+                "boundary_jerk": "m/s^3",
+                "exit_fk_jump": "m",
+                "exit_rotation_step": "rad/frame",
+                "foot_slip": "m/s",
+                "foot_penetration": "m^2_mean_squared_depth",
+            },
         },
         "final_audit": best_payload["stage_reports"].get("final_audit", {}),
     }
@@ -1040,7 +1179,14 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     save_json(report, json_path)
 
     if args.render_output:
-        render_if_possible(v46, str(out), args.audio, args.render_output, args.render_script)
+        render_if_possible(
+            v46,
+            str(out),
+            args.audio,
+            args.render_output,
+            args.render_script,
+            fps=float(getattr(cfg, "fps", 30.0)),
+        )
 
     print(json.dumps(jsonable({
         "motion": str(out),

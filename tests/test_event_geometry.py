@@ -42,10 +42,10 @@ class EventGeometryTest(unittest.TestCase):
                 desc=np.zeros((4, 32), dtype=np.float32),
             )
             rep = augment_database(db)
-            obj = np.load(db, allow_pickle=True)
-            self.assertIn("v46_53_geometry_desc_z", obj.files)
-            self.assertIn("v46_53_shared_embedding", obj.files)
-            self.assertEqual(obj["v46_53_geometry_desc_z"].shape[0], 4)
+            with np.load(db, allow_pickle=True) as obj:
+                self.assertIn("v46_53_geometry_desc_z", obj.files)
+                self.assertIn("v46_53_shared_embedding", obj.files)
+                self.assertEqual(obj["v46_53_geometry_desc_z"].shape[0], 4)
             self.assertTrue(rep["ok"])
 
 

@@ -26,20 +26,26 @@ import numpy as np
 import torch
 
 from model.music_motion_router import load_router_checkpoint
-from model.transition_model import TRANSITION_LENGTHS, load_transition_checkpoint
-from scheduling.extract_music_features import extract_audio_features
-from scheduling.music_event_calibrated import build_phrase_query as calibrated_phrase_query
+from model.transition_model import TRANSITION_LENGTHS
+from scheduling.audio_features import extract_audio_features
+from scheduling.index_io import load_shared_index, resolve_event_motion_path
+from scheduling.music_event_calibration import build_phrase_query as calibrated_phrase_query
+from scheduling.retrieval import precompute_music_similarity
+from scheduling.transition_builder import (
+    load_optional_transition,
+    predict_transition_length as predict_transition_len,
+    refine_transition,
+)
 from support.common import (
     CONTACT,
     ROOT_X,
-    ROOT_Y,
     ROOT_Z,
     ROT,
     apply_start_anchor,
     event_compatibility,
     json_safe,
     load_motion,
-    make_linear_transition,
+    make_geodesic_transition,
     pad_or_trim_motion,
     resample_motion,
     transition_cost_from_arrays,
@@ -65,17 +71,6 @@ class ScheduleResult:
     score: float
     slot_parts: List[Dict[str, Any]]
     motion: np.ndarray
-
-
-def load_shared_index(json_path: Path, npz_path: Path):
-    meta = json.loads(json_path.read_text(encoding="utf-8"))
-    arrays = np.load(npz_path, allow_pickle=True)
-    items = meta["items"]
-    n = len(items)
-    for key in ("motion_desc", "mmr_embed", "entry_pose", "exit_pose", "entry_vel", "exit_vel", "length"):
-        if len(arrays[key]) != n:
-            raise RuntimeError(f"Index mismatch: {key} has {len(arrays[key])}, metadata has {n}")
-    return meta, arrays, items
 
 
 def music_event_from_window(w: np.ndarray) -> str:
@@ -216,107 +211,6 @@ def load_optional_router(path: str, device: torch.device):
     if not p.is_file():
         raise FileNotFoundError(p)
     return load_router_checkpoint(p, device=device)
-
-
-def load_optional_transition(path: str, device: torch.device):
-    if not path:
-        return None
-    p = Path(path)
-    if not p.is_file():
-        raise FileNotFoundError(p)
-    bundle = load_transition_checkpoint(p, device=device)
-    checkpoint = torch.load(p, map_location="cpu", weights_only=False)
-    bundle["dpn_lo"] = np.asarray(checkpoint.get("dpn_lo", np.zeros((20,), dtype=np.float32)), dtype=np.float32)
-    bundle["dpn_hi"] = np.asarray(checkpoint.get("dpn_hi", np.ones((20,), dtype=np.float32)), dtype=np.float32)
-    return bundle
-
-
-def dpn_feature(prev_motion: np.ndarray, next_motion: np.ndarray, query: np.ndarray) -> np.ndarray:
-    pose_diff = prev_motion[-1] - next_motion[0]
-    pv = prev_motion[-1] - prev_motion[-2] if len(prev_motion) > 1 else np.zeros((151,), dtype=np.float32)
-    nv = next_motion[1] - next_motion[0] if len(next_motion) > 1 else np.zeros((151,), dtype=np.float32)
-    base = np.asarray(
-        [
-            np.linalg.norm(pose_diff[ROT]) / np.sqrt(144.0),
-            np.linalg.norm(pv[ROT] - nv[ROT]) / np.sqrt(144.0),
-            abs(float(pose_diff[ROOT_Y])),
-            float(np.abs(pose_diff[CONTACT]).mean()),
-            float(np.linalg.norm(prev_motion[-1, ROT] - prev_motion[0, ROT]) / np.sqrt(144.0)),
-            float(np.linalg.norm(next_motion[-1, ROT] - next_motion[0, ROT]) / np.sqrt(144.0)),
-            float(len(prev_motion) / 72.0),
-            float(len(next_motion) / 72.0),
-        ],
-        dtype=np.float32,
-    )
-    return np.concatenate([base, np.asarray(query, dtype=np.float32).reshape(12)], axis=0)
-
-
-def rule_transition_len(event: str, next_event: str, query: np.ndarray) -> int:
-    energy = float(query[0])
-    if event in {"accent", "climax"} or next_event in {"high_tension", "arm_flourish"}:
-        return 6 if energy > 0.65 else 8
-    if event == "section_change" or next_event == "support_shift":
-        return 12
-    if event in {"calm_flow", "release"}:
-        return 14
-    return 10
-
-
-def predict_transition_len(
-    transition_bundle,
-    prev_motion: np.ndarray,
-    next_motion: np.ndarray,
-    query: np.ndarray,
-    music_event: str,
-    next_event: str,
-    device: torch.device,
-) -> int:
-    if transition_bundle is None:
-        return rule_transition_len(music_event, next_event, query)
-    feature = dpn_feature(prev_motion, next_motion, query)
-    lo = transition_bundle["dpn_lo"]
-    hi = transition_bundle["dpn_hi"]
-    feature = np.clip((feature - lo) / (hi - lo + 1e-8), 0.0, 1.0).astype(np.float32)
-    with torch.no_grad():
-        logits = transition_bundle["dpn"](torch.from_numpy(feature[None]).to(device))
-        idx = int(logits.argmax(dim=-1).item())
-    return int(transition_bundle["transition_lengths"][idx])
-
-
-def refine_transition(
-    transition_bundle,
-    rough: np.ndarray,
-    start_pose: np.ndarray,
-    end_pose: np.ndarray,
-    query: np.ndarray,
-    device: torch.device,
-) -> np.ndarray:
-    if transition_bundle is None or len(rough) < 2:
-        return rough
-    with torch.no_grad():
-        pred = transition_bundle["refiner"](
-            torch.from_numpy(rough[None]).to(device),
-            torch.from_numpy(start_pose[None]).to(device),
-            torch.from_numpy(end_pose[None]).to(device),
-            torch.from_numpy(query[None]).to(device),
-            torch.ones((1, len(rough)), dtype=torch.float32, device=device),
-        )[0]
-    return pred.detach().cpu().numpy().astype(np.float32)
-
-
-def precompute_music_similarity(router, queries: Sequence[np.ndarray], motion_desc: np.ndarray, device: torch.device) -> np.ndarray:
-    q = np.stack(queries).astype(np.float32)
-    if router is None:
-        # Hand-crafted descriptors are already normalized to approximately [0,1].
-        dist = np.linalg.norm(q[:, None, :] - motion_desc[None, :, :], axis=-1)
-        return (1.0 - dist / np.sqrt(motion_desc.shape[1])).astype(np.float32)
-    with torch.no_grad():
-        q_t = torch.from_numpy(q).to(device)
-        m_t = torch.from_numpy(motion_desc).to(device)
-        q_e = router.encode_music(q_t)
-        m_e = router.encode_motion(m_t)
-        sim = q_e @ m_e.t()
-    return sim.detach().cpu().numpy().astype(np.float32)
 
 
 def schedule_one(
@@ -477,7 +371,7 @@ def schedule_one(
         content[:, ROOT_X] = 0.0
         content[:, ROOT_Z] = 0.0
         if previous_content is not None and k > 0:
-            rough = make_linear_transition(previous_content, content, k)
+            rough = make_geodesic_transition(previous_content, content, k)
             transition = refine_transition(
                 transition_bundle,
                 rough,
@@ -580,10 +474,11 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     feature_dir = Path(args.feature_dir) if args.feature_dir else out_dir / "music_features"
-    meta, arrays, items = load_shared_index(Path(args.index_json), Path(args.index_npz))
+    index_json = Path(args.index_json).resolve()
+    meta, arrays, items = load_shared_index(index_json, Path(args.index_npz))
     motions: List[np.ndarray] = []
     for item in items:
-        p = Path(str(item.get("pkl", item.get("path", ""))))
+        p = resolve_event_motion_path(item, index_json, metadata=meta)
         motions.append(load_motion(p))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

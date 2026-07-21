@@ -100,3 +100,11 @@ def load_v26_planner_checkpoint(
 # Public, version-free API. The historical class alias remains only for
 # checkpoint compatibility and is not used in public file names.
 WholeSongPlanner = V26WholeSongPlanner
+
+
+def load_planner_checkpoint(
+    path: str | Path,
+    device: torch.device | str = "cpu",
+) -> Dict[str, Any]:
+    """Load a historical planner checkpoint through the public API."""
+    return load_v26_planner_checkpoint(path, device=device)

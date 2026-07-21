@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Shared utilities for V21 scalable multi-music Dunhuang ChoreoRAG.
+"""Shared utilities for scalable multi-music Dunhuang ChoreoRAG.
 
-The module is deliberately standalone and depends only on numpy / torch plus
-standard-library packages. It keeps the EDGE 151D contract:
+The module depends on the repository's canonical motion-geometry contract and
+keeps the EDGE 151D representation:
   [0:4]   foot contacts
   [4:7]   root xyz
   [7:151] 24 joints x 6D rotations
@@ -17,6 +17,18 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
+
+from motion_geometry.rotations import (
+    angular_acceleration_np,
+    angular_velocity_np,
+    matrix_to_rot6d_np,
+    relative_rotvec_np,
+    rot6d_to_matrix_np,
+    so3_geodesic_np,
+    tangent_blend_np,
+)
+from motion_geometry.resampling import resample_edge151_np
+from motion_geometry.heading import root_yaw_np
 
 CONTACT = slice(0, 4)
 ROOT_X = 4
@@ -122,18 +134,18 @@ def resample_motion(motion: np.ndarray, target_len: int) -> np.ndarray:
     x = np.asarray(motion, dtype=np.float32)
     if target_len <= 0:
         raise ValueError("target_len must be positive")
+    if x.ndim == 2 and x.shape[1] == 151:
+        return resample_edge151_np(x, target_frames=int(target_len))
     if len(x) == target_len:
         return x.copy()
     if len(x) == 1:
         return np.repeat(x, target_len, axis=0)
     old_t = np.linspace(0.0, 1.0, len(x), dtype=np.float32)
     new_t = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
-    y = np.empty((target_len, x.shape[1]), dtype=np.float32)
-    for d in range(x.shape[1]):
-        y[:, d] = np.interp(new_t, old_t, x[:, d]).astype(np.float32)
-    # Contacts should remain discrete-ish.
-    y[:, CONTACT] = (y[:, CONTACT] >= 0.5).astype(np.float32)
-    return y
+    return np.stack(
+        [np.interp(new_t, old_t, x[:, d]) for d in range(x.shape[1])],
+        axis=-1,
+    ).astype(np.float32)
 
 
 def robust_scale(values: np.ndarray, lo: np.ndarray | None = None, hi: np.ndarray | None = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -155,7 +167,7 @@ def _joint_group_activity(rot_vel: np.ndarray, start: int, end: int) -> float:
     return float(np.linalg.norm(group.reshape(len(group), -1), axis=-1).mean())
 
 
-def motion_descriptor_raw(motion: np.ndarray) -> np.ndarray:
+def motion_descriptor_raw(motion: np.ndarray, fps: float = 30.0) -> np.ndarray:
     """Return 12D motion descriptor aligned with the music query descriptor.
 
     Dimensions:
@@ -176,11 +188,12 @@ def motion_descriptor_raw(motion: np.ndarray) -> np.ndarray:
     if x.ndim != 2 or x.shape[-1] != 151:
         raise ValueError(f"Expected [T,151], got {x.shape}")
     rot = x[:, ROT].reshape(len(x), 24, 6)
+    matrices = rot6d_to_matrix_np(rot)
     if len(x) > 1:
-        d = rot[1:] - rot[:-1]
+        d = angular_velocity_np(matrices, fps=float(fps))
         frame_energy = np.linalg.norm(d.reshape(len(d), -1), axis=-1)
     else:
-        d = np.zeros((0, 24, 6), dtype=np.float32)
+        d = np.zeros((0, 24, 3), dtype=np.float32)
         frame_energy = np.zeros((0,), dtype=np.float32)
     full = float(frame_energy.mean()) if len(frame_energy) else 0.0
     upper = _joint_group_activity(d, 14, 24)
@@ -189,8 +202,9 @@ def motion_descriptor_raw(motion: np.ndarray) -> np.ndarray:
     pose_range = float(np.std(rot.reshape(len(rot), -1), axis=0).mean()) if len(rot) else 0.0
     smoothness = 1.0 / (1.0 + float(np.var(frame_energy)) if len(frame_energy) else 1.0)
     contacts = x[:, CONTACT]
-    support = float(np.abs(np.diff(contacts, axis=0)).sum() / max(len(x) - 1, 1)) if len(x) > 1 else 0.0
-    q = max(2, min(8, max(len(frame_energy) // 4, 2)))
+    duration_seconds = max((len(x) - 1) / max(float(fps), 1.0e-8), 1.0 / max(float(fps), 1.0e-8))
+    support = float(np.abs(np.diff(contacts, axis=0)).sum() / duration_seconds) if len(x) > 1 else 0.0
+    q = max(2, min(len(frame_energy), int(round(0.25 * float(fps)))))
     if len(frame_energy):
         entry = float(frame_energy[:q].mean())
         exit_ = float(frame_energy[-q:].mean())
@@ -201,8 +215,11 @@ def motion_descriptor_raw(motion: np.ndarray) -> np.ndarray:
     build = max(0.0, exit_ - entry)
     release = max(0.0, entry - exit_)
     accent = peak / (mean_e + 1e-6)
-    change = float(np.linalg.norm(rot[-1] - rot[0])) if len(rot) else 0.0
-    duration = float(len(x))
+    change = float(np.mean(so3_geodesic_np(matrices[0], matrices[-1]))) if len(rot) else 0.0
+    # This descriptor measures the sampled physical trajectory span.  Keep it
+    # separate from Scheduler occupancy, which intentionally uses N / FPS for
+    # an exclusive [start, end) frame interval.
+    duration = float(duration_seconds)
     return np.asarray(
         [full, upper, torso, lower, pose_range, smoothness, support, build, release, accent, change, duration],
         dtype=np.float32,
@@ -216,12 +233,17 @@ def _fixed_projection(in_dim: int, out_dim: int = 64) -> np.ndarray:
     return matrix.astype(np.float32)
 
 
-def motion_mmr_embedding(motion: np.ndarray, out_dim: int = 64) -> np.ndarray:
+def motion_mmr_embedding(motion: np.ndarray, out_dim: int = 64, fps: float = 30.0) -> np.ndarray:
     """Compact deterministic style/dynamics embedding for MMR diversity."""
     x = resample_motion(localize_root(motion), 48)
     rot = x[:, ROT].reshape(48, 24, 6)
-    vel = np.diff(rot, axis=0, prepend=rot[:1])
-    acc = np.diff(vel, axis=0, prepend=vel[:1])
+    duration_seconds = max((len(motion) - 1) / max(float(fps), 1.0e-8), 1.0 / max(float(fps), 1.0e-8))
+    effective_fps = float(47.0 / duration_seconds)
+    matrices = rot6d_to_matrix_np(rot)
+    velocity_core = angular_velocity_np(matrices, fps=effective_fps)
+    acceleration_core = angular_acceleration_np(matrices, fps=effective_fps)
+    vel = np.concatenate([np.zeros((1, 24, 3), dtype=np.float32), velocity_core], axis=0)
+    acc = np.concatenate([np.zeros((2, 24, 3), dtype=np.float32), acceleration_core], axis=0)[:48]
     groups = ((0, 8), (8, 14), (14, 24))
     feats: List[np.ndarray] = []
     for start, end in groups:
@@ -237,10 +259,11 @@ def motion_mmr_embedding(motion: np.ndarray, out_dim: int = 64) -> np.ndarray:
         spec = np.abs(np.fft.rfft(g - g.mean(axis=0, keepdims=True), axis=0))[1:4]
         feats.append(spec.mean(axis=0))
     root = x[:, 4:7]
+    root_velocity = np.diff(root, axis=0) * effective_fps
     contacts = x[:, CONTACT]
     feats.extend([
-        root.mean(axis=0), root.std(axis=0), np.abs(np.diff(root, axis=0)).mean(axis=0),
-        contacts.mean(axis=0), np.abs(np.diff(contacts, axis=0)).mean(axis=0),
+        root.mean(axis=0), root.std(axis=0), np.abs(root_velocity).mean(axis=0),
+        contacts.mean(axis=0), np.abs(np.diff(contacts, axis=0)).mean(axis=0) * effective_fps,
     ])
     raw = np.concatenate([np.asarray(f, dtype=np.float32).reshape(-1) for f in feats])
     proj = raw @ _fixed_projection(raw.size, out_dim)
@@ -283,11 +306,101 @@ def transition_cost_from_arrays(
     next_entry: np.ndarray,
     next_vel: np.ndarray,
 ) -> float:
-    pose_jump = float(np.linalg.norm(prev_exit[ROT] - next_entry[ROT]) / math.sqrt(144.0))
-    vel_jump = float(np.linalg.norm(prev_vel[ROT] - next_vel[ROT]) / math.sqrt(144.0))
+    prev_rotation = rot6d_to_matrix_np(
+        np.asarray(prev_exit[ROT], dtype=np.float32).reshape(24, 6)
+    )
+    next_rotation = rot6d_to_matrix_np(
+        np.asarray(next_entry[ROT], dtype=np.float32).reshape(24, 6)
+    )
+    relative = np.swapaxes(prev_rotation, -1, -2) @ next_rotation
+    trace = np.trace(relative, axis1=-2, axis2=-1)
+    pose_angles = np.arccos(np.clip((trace - 1.0) * 0.5, -1.0, 1.0))
+    pose_jump = float(np.sqrt(np.mean(np.square(pose_angles))))
+
+    # The stored velocity arrays belong to historical Router/Planner assets and
+    # remain Euclidean 151D values.  Decode the physical endpoint rotations for
+    # pose distance, while keeping this legacy velocity term checkpoint-safe.
+    vel_jump = float(
+        np.linalg.norm(prev_vel[ROT] - next_vel[ROT]) / math.sqrt(144.0)
+    )
     root_y_jump = abs(float(prev_exit[ROOT_Y] - next_entry[ROOT_Y]))
     contact_jump = float(np.abs(prev_exit[CONTACT] - next_entry[CONTACT]).mean())
     return pose_jump + 0.35 * vel_jump + 0.50 * root_y_jump + 0.15 * contact_jump
+
+
+def motion_boundary_metrics(
+    prev: np.ndarray,
+    nxt: np.ndarray,
+    fps: float = 30.0,
+) -> Dict[str, float]:
+    """Intrinsic pose/dynamics metrics for two EDGE151 motion endpoints."""
+    previous = np.asarray(prev, dtype=np.float32)
+    following = np.asarray(nxt, dtype=np.float32)
+    previous_rotation = rot6d_to_matrix_np(
+        previous[:, ROT].reshape(len(previous), 24, 6)
+    )
+    following_rotation = rot6d_to_matrix_np(
+        following[:, ROT].reshape(len(following), 24, 6)
+    )
+    previous_velocity = (
+        relative_rotvec_np(previous_rotation[-2], previous_rotation[-1])
+        if len(previous) > 1
+        else np.zeros((24, 3), dtype=np.float32)
+    )
+    following_velocity = (
+        relative_rotvec_np(following_rotation[0], following_rotation[1])
+        if len(following) > 1
+        else np.zeros((24, 3), dtype=np.float32)
+    )
+    previous_velocity_before = (
+        relative_rotvec_np(previous_rotation[-3], previous_rotation[-2])
+        if len(previous) > 2
+        else previous_velocity
+    )
+    following_velocity_after = (
+        relative_rotvec_np(following_rotation[1], following_rotation[2])
+        if len(following) > 2
+        else following_velocity
+    )
+    previous_velocity *= float(fps)
+    following_velocity *= float(fps)
+    previous_velocity_before *= float(fps)
+    following_velocity_after *= float(fps)
+    previous_acceleration = (previous_velocity - previous_velocity_before) * float(fps)
+    following_acceleration = (following_velocity_after - following_velocity) * float(fps)
+    yaw = root_yaw_np(
+        np.stack([previous[-1], following[0]], axis=0).astype(np.float32)
+    )
+    yaw_delta = (
+        float(np.arctan2(np.sin(yaw[1] - yaw[0]), np.cos(yaw[1] - yaw[0])))
+        if len(yaw) == 2
+        else 0.0
+    )
+    return {
+        "pose_jump": float(
+            np.sqrt(
+                np.mean(
+                    np.square(
+                        so3_geodesic_np(previous_rotation[-1], following_rotation[0])
+                    )
+                )
+            )
+        ),
+        "angular_velocity_jump_radps": float(
+            np.sqrt(np.mean(np.square(previous_velocity - following_velocity)))
+        ),
+        "angular_acceleration_jump_radps2": float(
+            np.sqrt(
+                np.mean(
+                    np.square(previous_acceleration - following_acceleration)
+                )
+            )
+        ),
+        "contact_jump": float(
+            np.abs(previous[-1, CONTACT] - following[0, CONTACT]).mean()
+        ),
+        "yaw_gap_deg": float(abs(yaw_delta) * 180.0 / np.pi),
+    }
 
 
 def smoothstep(x: float) -> float:
@@ -295,20 +408,39 @@ def smoothstep(x: float) -> float:
     return v * v * (3.0 - 2.0 * v)
 
 
-def make_linear_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np.ndarray:
+def make_geodesic_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np.ndarray:
+    """Build a geometry-aware EDGE151 transition.
+
+    Root translation is eased in Euclidean space, rotations follow the SO(3)
+    shortest path, and contact channels switch discretely.
+    """
     k = max(0, int(length))
     if k == 0:
         return np.zeros((0, 151), dtype=np.float32)
     out = np.zeros((k, 151), dtype=np.float32)
     a0 = np.asarray(prev[-1], dtype=np.float32)
     a1 = np.asarray(nxt[0], dtype=np.float32)
+    r0 = rot6d_to_matrix_np(a0[ROT].reshape(24, 6))
+    r1 = rot6d_to_matrix_np(a1[ROT].reshape(24, 6))
     for i in range(k):
         alpha = smoothstep((i + 1) / (k + 1))
         out[i] = (1.0 - alpha) * a0 + alpha * a1
-        out[i, CONTACT] = a1[CONTACT]
-        out[i, ROOT_X] = 0.0
-        out[i, ROOT_Z] = 0.0
+        # Contacts are categorical support observations.  Switch once at the
+        # temporal midpoint instead of activating the target support pattern
+        # on the first bridge frame.
+        out[i, CONTACT] = a0[CONTACT] if alpha < 0.5 else a1[CONTACT]
+        blended = tangent_blend_np(
+            r0,
+            r1,
+            np.full((24,), alpha, dtype=np.float32),
+        )
+        out[i, ROT] = matrix_to_rot6d_np(blended).reshape(-1)
     return out
+
+
+def make_linear_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np.ndarray:
+    """Compatibility alias for historical Scheduler/checkpoint tooling."""
+    return make_geodesic_transition(prev, nxt, length)
 
 
 def apply_start_anchor(motion: np.ndarray, start_pose: np.ndarray, blend_frames: int = 8) -> np.ndarray:
@@ -322,10 +454,17 @@ def apply_start_anchor(motion: np.ndarray, start_pose: np.ndarray, blend_frames:
     x[0, ROT] = s[ROT]
     x[:, ROOT_X] = 0.0
     x[:, ROOT_Z] = 0.0
+    anchor_rotation = rot6d_to_matrix_np(s[ROT].reshape(24, 6))
+    target_rotations = rot6d_to_matrix_np(x[:bf, ROT].reshape(bf, 24, 6))
     for t in range(1, bf):
         alpha = smoothstep(t / max(bf - 1, 1))
         x[t, ROOT_Y] = (1.0 - alpha) * s[ROOT_Y] + alpha * x[t, ROOT_Y]
-        x[t, ROT] = (1.0 - alpha) * s[ROT] + alpha * x[t, ROT]
+        blended = tangent_blend_np(
+            anchor_rotation,
+            target_rotations[t],
+            np.full((24,), alpha, dtype=np.float32),
+        )
+        x[t, ROT] = matrix_to_rot6d_np(blended).reshape(-1)
     return x
 
 

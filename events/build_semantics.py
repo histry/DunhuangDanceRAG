@@ -37,6 +37,11 @@ from events.semantic_descriptor import (  # noqa: E402
     stage_affordance_from_probs,
     vector_to_prob_dict,
 )
+from support.event_identity import (  # noqa: E402
+    EVENT_UID_SCHEMA,
+    event_uids_from_generation_db,
+    make_event_db_contract,
+)
 
 
 def _arr(db: Dict[str, Any], key: str, n: int, default: Any, dtype=object) -> np.ndarray:
@@ -190,6 +195,13 @@ def main(argv: List[str] | None = None) -> int:
         risk_numeric_rows.append(json.dumps(rn, ensure_ascii=False, sort_keys=True))
 
     out = dict(db)
+    event_uids = event_uids_from_generation_db(out)
+    event_contract = make_event_db_contract(event_uids)
+    out["event_uid_schema_version"] = np.asarray(EVENT_UID_SCHEMA, dtype=object)
+    out["event_uids"] = event_uids
+    out["event_db_contract_json"] = np.asarray(
+        json.dumps(event_contract, sort_keys=True), dtype=object
+    )
     out["aesd_schema_version"] = np.asarray(AESD_SCHEMA_VERSION, dtype=object)
     out["aesd_label_names"] = np.asarray(MUSIC_SEMANTIC_LABELS, dtype=object)
     out["aesd_semantics"] = np.asarray(aesd, dtype=object)
@@ -214,6 +226,7 @@ def main(argv: List[str] | None = None) -> int:
         "input_db": str(src),
         "output_db": str(out_path),
         "num_events": int(n),
+        "event_db_contract": event_contract,
         "label_names": MUSIC_SEMANTIC_LABELS,
         "event_semantic_histogram": hist,
         "boundary_risk_histogram": risk_hist,
