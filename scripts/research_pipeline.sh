@@ -86,6 +86,7 @@ FINAL_NPY="${FINAL_NPY:-$OUT_ROOT/v46_51_final.npy}"
 echo "========== 2. FINAL POSTURE-AWARE ANATOMY AUDIT =========="
 "$PY" evaluation/audit_motion.py \
   --input "$FINAL_NPY" \
+  --fps "${V46_51_FPS:-30}" \
   --out "$OUT_ROOT/final.v46_53_1_anatomy.json" \
   --csv "$OUT_ROOT/final.v46_53_1_anatomy.csv"
 

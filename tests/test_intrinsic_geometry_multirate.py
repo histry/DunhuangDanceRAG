@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from contracts.gravity import identity6d_np
-from events.intrinsic_geometry import _geometry_descriptor
+from events.intrinsic_geometry import _database_fps, _geometry_descriptor
 
 
 def motion_at_rate(fps: float) -> np.ndarray:
@@ -17,6 +17,12 @@ def motion_at_rate(fps: float) -> np.ndarray:
 
 
 class IntrinsicGeometryMultirateTests(unittest.TestCase):
+    def test_database_rate_contract_rejects_mixed_rates(self):
+        with self.assertRaisesRegex(RuntimeError, "exactly one positive rate"):
+            _database_fps(
+                {"canonical_fps": np.asarray([30.0, 60.0], dtype=np.float32)}
+            )
+
     def test_contact_change_descriptor_uses_per_second_units(self):
         rows = []
         for fps in (30.0, 60.0):

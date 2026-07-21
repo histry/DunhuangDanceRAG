@@ -98,6 +98,36 @@ class SchedulerArchitectureTests(unittest.TestCase):
         block = source[start : start + 500]
         self.assertIn('--fps "$V46_51_FPS"', block)
 
+    def test_pipeline_supplies_all_audit_fps_contracts(self):
+        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "evaluation/audit_gravity.py",
+            "evaluation/audit_heading.py",
+        ):
+            positions = []
+            cursor = 0
+            while True:
+                index = pipeline.find(marker, cursor)
+                if index < 0:
+                    break
+                positions.append(index)
+                cursor = index + len(marker)
+            self.assertTrue(positions, marker)
+            for index in positions:
+                self.assertIn(
+                    '--fps "$V46_51_FPS"', pipeline[index : index + 450]
+                )
+
+        research = (ROOT / "scripts" / "research_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        index = research.index("evaluation/audit_motion.py")
+        self.assertIn(
+            '--fps "${V46_51_FPS:-30}"', research[index : index + 450]
+        )
+
     def test_runtime_launchers_do_not_embed_machine_specific_paths(self):
         paths = [
             ROOT / "scripts" / "pipeline.sh",
@@ -135,7 +165,24 @@ class SchedulerArchitectureTests(unittest.TestCase):
                 source,
             )
             self.assertNotIn("export V46_51_FPS=30", source)
+            self.assertIn('export V46_FPS="$V46_51_FPS"', source)
             self.assertNotIn("export V46_49_RETARGET_FPS=30", source)
+
+    def test_motion_config_reads_canonical_pipeline_fps(self):
+        source = (ROOT / "training" / "motion_models.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"V46_FPS": ("fps", float)', source)
+
+    def test_pipeline_trains_motion_models_with_source_disjoint_validation(self):
+        source = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        for command in ("train-refiner", "train-diffusion"):
+            start = source.index(command)
+            block = source[start : start + 350]
+            self.assertIn('--db "$TRAIN_AESD"', block)
+            self.assertIn('--val_db "$VAL_AESD"', block)
 
     def test_scheduler_passes_physical_rate_to_deep_music_features(self):
         source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(

@@ -600,9 +600,10 @@ def apply_generators_with_heading_guard(
 def _patch_final_report(args: Any) -> None:
     path = Path(
         args.json
-        or str(args.out).replace(
-            ".npy",
-            ".v46_46_closed_loop_report.json",
+        or str(
+            Path(args.out).with_name(
+                Path(args.out).stem + ".v46_46_closed_loop_report.json"
+            )
         )
     )
     if not path.is_file():

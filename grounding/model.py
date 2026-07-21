@@ -91,6 +91,108 @@ def _farr(db: Mapping[str, Any], key: str, n: int, default: float) -> np.ndarray
     return np.ones(n, dtype=np.float32) * float(default)
 
 
+def _scalar(db: Mapping[str, Any], key: str) -> Any:
+    if key not in db:
+        return None
+    value = np.asarray(db[key])
+    if value.size != 1:
+        raise RuntimeError(f"Grounding contract field {key!r} must be scalar")
+    scalar = value.reshape(-1)[0]
+    return scalar.item() if hasattr(scalar, "item") else scalar
+
+
+def _load_grounder_checkpoint(path: Path) -> Dict[str, Any]:
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch < 2.0
+        checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Grounder checkpoint is not a mapping: {path}")
+    return checkpoint
+
+
+def _training_geometry_contract(
+    db: Mapping[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    if "v46_53_geometry_desc" not in db:
+        raise RuntimeError("Run v46_53 event geometry augmentation before grounding")
+    schema = _scalar(db, "v46_53_geometry_schema_version")
+    fps = _scalar(db, "v46_53_geometry_fps")
+    skeleton = _scalar(db, "skeleton_contract_json")
+    if schema is None or fps is None or skeleton is None:
+        raise RuntimeError(
+            "Grounder training database lacks geometry FPS/schema or skeleton contract"
+        )
+    raw = np.asarray(db["v46_53_geometry_desc"], dtype=np.float32)
+    mean = np.asarray(db.get("v46_53_geometry_mean"), dtype=np.float32)
+    std = np.asarray(db.get("v46_53_geometry_std"), dtype=np.float32)
+    if raw.ndim != 2 or mean.shape != (1, raw.shape[1]) or std.shape != (1, raw.shape[1]):
+        raise RuntimeError(
+            "Grounder geometry statistics have incompatible shapes: "
+            f"raw={raw.shape}, mean={mean.shape}, std={std.shape}"
+        )
+    if not np.isfinite(raw).all() or not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise RuntimeError("Grounder geometry/statistics contain NaN or Inf")
+    if np.any(std <= 0.0):
+        raise RuntimeError("Grounder geometry standard deviations must be positive")
+    normalized = ((raw - mean) / std).astype(np.float32)
+    contract = {
+        "geometry_schema": str(schema),
+        "fps": float(fps),
+        "skeleton_contract_json": str(skeleton),
+        "geometry_dim": int(raw.shape[1]),
+    }
+    return normalized, mean, std, contract
+
+
+def _geometry_for_checkpoint(
+    db: Mapping[str, Any], checkpoint: Mapping[str, Any]
+) -> np.ndarray:
+    """Transform any split with train-only geometry statistics."""
+
+    if "v46_53_geometry_desc" not in db:
+        raise RuntimeError("V46.53 raw geometry descriptor is missing")
+    schema = _scalar(db, "v46_53_geometry_schema_version")
+    fps = _scalar(db, "v46_53_geometry_fps")
+    skeleton = _scalar(db, "skeleton_contract_json")
+    expected = checkpoint.get("geometry_contract")
+    if not isinstance(expected, Mapping):
+        raise RuntimeError(
+            "Grounder checkpoint has no train-split geometry contract; rebuild it"
+        )
+    mismatches = []
+    if str(schema) != str(expected.get("geometry_schema")):
+        mismatches.append(
+            f"geometry_schema: db={schema!r}, checkpoint={expected.get('geometry_schema')!r}"
+        )
+    try:
+        if abs(float(fps) - float(expected.get("fps"))) > 1.0e-6:
+            mismatches.append(f"fps: db={fps!r}, checkpoint={expected.get('fps')!r}")
+    except (TypeError, ValueError):
+        mismatches.append(f"fps: db={fps!r}, checkpoint={expected.get('fps')!r}")
+    if str(skeleton) != str(expected.get("skeleton_contract_json")):
+        mismatches.append("skeleton_contract_json")
+    raw = np.asarray(db["v46_53_geometry_desc"], dtype=np.float32)
+    dimension = int(expected.get("geometry_dim", -1))
+    if raw.ndim != 2 or raw.shape[1] != dimension:
+        mismatches.append(f"geometry_dim: db={raw.shape}, checkpoint={dimension}")
+    if mismatches:
+        raise RuntimeError("Grounder geometry contract mismatch: " + "; ".join(mismatches))
+
+    mean = np.asarray(checkpoint.get("geometry_train_mean"), dtype=np.float32)
+    std = np.asarray(checkpoint.get("geometry_train_std"), dtype=np.float32)
+    if mean.shape != (1, dimension) or std.shape != (1, dimension):
+        raise RuntimeError(
+            "Grounder checkpoint has invalid train statistics: "
+            f"mean={mean.shape}, std={std.shape}, dim={dimension}"
+        )
+    if not np.isfinite(raw).all() or not np.isfinite(mean).all() or not np.isfinite(std).all():
+        raise RuntimeError("Grounder geometry/statistics contain NaN or Inf")
+    if np.any(std <= 0.0):
+        raise RuntimeError("Grounder train standard deviations must be positive")
+    return ((raw - mean) / std).astype(np.float32)
+
+
 def _normalize_probs(value: Any, top: Optional[str] = None) -> np.ndarray:
     labels = list(MUSIC_SEMANTIC_LABELS)
     out = np.zeros(len(labels), dtype=np.float32)
@@ -285,9 +387,9 @@ def train_grounder(
         raise RuntimeError("PyTorch is required to train V46.53 grounding")
     raw = np.load(db_path, allow_pickle=True)
     db = {k: raw[k] for k in raw.files}
-    if "v46_53_geometry_desc_z" not in db:
-        raise RuntimeError("Run v46_53_event_geometry augmentation before grounding training")
-    geometry = np.asarray(db["v46_53_geometry_desc_z"], dtype=np.float32)
+    geometry, geometry_mean, geometry_std, geometry_contract = (
+        _training_geometry_contract(db)
+    )
     semantic, top, posture, family = event_semantic_matrix(db)
     quality = np.asarray(db.get("v46_53_combined_quality", np.ones(len(geometry), np.float32)), dtype=np.float32)
     sources = np.asarray(db.get("source_uids", np.asarray(["unknown"] * len(geometry), object)), dtype=object)
@@ -406,11 +508,18 @@ def train_grounder(
         "music_semantic_labels": list(MUSIC_SEMANTIC_LABELS),
         "history": history,
         "seed": int(seed),
+        "geometry_contract": geometry_contract,
+        "geometry_train_mean": geometry_mean,
+        "geometry_train_std": geometry_std,
     }, out_path)
 
     payload = dict(db)
     payload["v46_53_grounding_schema_version"] = np.asarray(SCHEMA, dtype=object)
     payload["v46_53_grounding_embedding"] = event_embed
+    payload["v46_53_grounder_geometry_z"] = geometry
+    payload["v46_53_grounder_normalization"] = np.asarray(
+        "train_split_statistics", dtype=object
+    )
     backup = db_path.with_name(db_path.stem + ".pre_v46_53_grounding.npz")
     if not backup.exists():
         shutil.copy2(db_path, backup)
@@ -427,6 +536,8 @@ def train_grounder(
         "embedding_dim": int(event_embed.shape[1]),
         "steps": int(steps),
         "history": history,
+        "geometry_contract": geometry_contract,
+        "normalization": "train_split_statistics",
         "ok": True,
     }
     out_path.with_suffix(out_path.suffix + ".json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -439,9 +550,8 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
         raise RuntimeError("PyTorch is required for V46.53 grounding embedding")
     raw = np.load(db_path, allow_pickle=True)
     db = {k: raw[k] for k in raw.files}
-    if "v46_53_geometry_desc_z" not in db:
-        raise RuntimeError("V46.53 geometry augmentation is missing")
-    ckpt = torch.load(checkpoint, map_location="cpu")
+    ckpt = _load_grounder_checkpoint(checkpoint)
+    geom = _geometry_for_checkpoint(db, ckpt)
     model = DualBranchGrounder(
         geometry_dim=int(ckpt["geometry_dim"]),
         semantic_dim=int(ckpt["semantic_dim"]),
@@ -452,7 +562,6 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
     model.load_state_dict(ckpt["state_dict"], strict=True)
     device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("V46_53_GROUNDER_INFER_CUDA", False) else "cpu")
     model.to(device).eval()
-    geom = np.asarray(db["v46_53_geometry_desc_z"], dtype=np.float32)
     sem, _, _, _ = event_semantic_matrix(db)
     quality = np.asarray(db.get("v46_53_combined_quality", np.ones(len(geom), np.float32)), dtype=np.float32)
     with torch.no_grad():
@@ -464,6 +573,10 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
     payload = dict(db)
     payload["v46_53_grounding_schema_version"] = np.asarray(SCHEMA, dtype=object)
     payload["v46_53_grounding_embedding"] = event_embed
+    payload["v46_53_grounder_geometry_z"] = geom
+    payload["v46_53_grounder_normalization"] = np.asarray(
+        "train_split_statistics", dtype=object
+    )
     np.savez_compressed(db_path, **payload)
     report = {
         "schema": SCHEMA,
@@ -473,6 +586,7 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
         "events": int(len(geom)),
         "embedding_dim": int(event_embed.shape[1]),
         "mode": "train-checkpoint embedding only",
+        "normalization": "train_split_statistics",
         "ok": True,
     }
     db_path.with_name(db_path.stem + ".v46_53_grounding.json").write_text(
@@ -492,8 +606,9 @@ class GroundingRuntime:
         self.model = None
         self.event_embedding = np.asarray(db.get("v46_53_grounding_embedding", np.zeros((len(self.event_probs), 1), np.float32)), dtype=np.float32)
         self.device = None
-        if torch is not None and self.checkpoint and Path(self.checkpoint).is_file() and "v46_53_geometry_desc_z" in db:
-            ckpt = torch.load(self.checkpoint, map_location="cpu")
+        if torch is not None and self.checkpoint and Path(self.checkpoint).is_file() and "v46_53_geometry_desc" in db:
+            ckpt = _load_grounder_checkpoint(Path(self.checkpoint))
+            aligned_geometry = _geometry_for_checkpoint(db, ckpt)
             self.model = DualBranchGrounder(
                 geometry_dim=int(ckpt["geometry_dim"]),
                 semantic_dim=int(ckpt["semantic_dim"]),
@@ -507,11 +622,16 @@ class GroundingRuntime:
             self.model.to(self.device)
             if self.event_embedding.ndim != 2 or self.event_embedding.shape[1] != int(ckpt.get("embed", 96)):
                 sem, _, _, _ = event_semantic_matrix(db)
-                geom = np.asarray(db["v46_53_geometry_desc_z"], dtype=np.float32)
-                quality = np.asarray(db.get("v46_53_combined_quality", np.ones(len(geom), np.float32)), dtype=np.float32)
+                quality = np.asarray(
+                    db.get(
+                        "v46_53_combined_quality",
+                        np.ones(len(aligned_geometry), np.float32),
+                    ),
+                    dtype=np.float32,
+                )
                 with torch.no_grad():
                     self.event_embedding = self.model.encode_event(
-                        torch.from_numpy(geom).to(self.device),
+                        torch.from_numpy(aligned_geometry).to(self.device),
                         torch.from_numpy(sem).to(self.device),
                         torch.from_numpy(quality).to(self.device),
                     ).cpu().numpy().astype(np.float32)

@@ -84,11 +84,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not db_path.is_file():
         raise FileNotFoundError(str(db_path))
 
-    fps = float(os.environ.get("V46_FPS", os.environ.get("V46_51_FPS", "30")))
     geometry_report = augment_database(
         db_path,
         out_dir / "events.v46_53_geometry.audit.json",
-        fps=fps,
+        # Event-DB canonical_fps is authoritative.  Reading an unrelated shell
+        # default here previously allowed 60 FPS databases to be augmented as
+        # if they were 30 FPS when this wrapper was invoked standalone.
+        fps=None,
     )
 
     split = _split_name(out_dir)

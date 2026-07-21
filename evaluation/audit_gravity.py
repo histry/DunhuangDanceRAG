@@ -19,10 +19,10 @@ import numpy as np
 from contracts.gravity import GravityThresholds, evaluate_gravity_contract, gravity_metrics_np
 
 
-def audit_one(path: Path, thresholds: GravityThresholds) -> dict:
+def audit_one(path: Path, thresholds: GravityThresholds, fps: float) -> dict:
     arr = np.load(path, allow_pickle=True)
     if arr.ndim == 3 and arr.shape[0] == 1: arr = arr[0]
-    metrics = gravity_metrics_np(arr)
+    metrics = gravity_metrics_np(arr, fps=float(fps))
     ok, reasons = evaluate_gravity_contract(metrics, thresholds)
     return {"path": str(path), "shape": list(arr.shape), "ok": bool(ok), "reasons": reasons, **metrics}
 
@@ -56,6 +56,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--csv", default=None)
     ap.add_argument("--allow_failed", action="store_true")
+    ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--profile", choices=["auto", "source", "final"], default="auto")
     ap.add_argument("--torso_p05_min", type=float, default=None)
     ap.add_argument("--torso_median_min", type=float, default=None)
@@ -63,6 +64,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--feet_ratio_min", type=float, default=None)
     ap.add_argument("--horizontal_ratio_max", type=float, default=None)
     args = ap.parse_args(argv)
+    if not np.isfinite(args.fps) or args.fps <= 0.0:
+        raise ValueError(f"--fps must be positive and finite, got {args.fps!r}")
 
     profile = args.profile
     if profile == "auto": profile = "source" if args.motion_dir else "final"
@@ -94,11 +97,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     rows = []
     for i, p in enumerate(paths, 1):
-        row = audit_one(p, th); rows.append(row)
+        row = audit_one(p, th, args.fps); rows.append(row)
         print(f"[{i}/{len(paths)}] profile={profile} ok={row['ok']} torso_p05={row['torso_up_cos_p05']:.3f} horizontal={row['horizontal_body_ratio']:.3f} {p}", flush=True)
     failed = [r for r in rows if not r["ok"]]
     summary = {
         "version": "v46_53_1_context_aware_gravity_audit", "profile": profile,
+        "fps": float(args.fps),
         "thresholds": th.to_dict(), "num_motions": len(rows), "num_passed": len(rows)-len(failed),
         "num_failed": len(failed), "all_ok": not failed,
         "torso_up_cos_p05_min_observed": min(r["torso_up_cos_p05"] for r in rows),

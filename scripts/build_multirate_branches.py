@@ -333,8 +333,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             ])
 
         if args.train_v45_v46:
-            refiner = [python, "training/motion_models.py", "--config", str(config), "train-refiner", "--db", str(semantic_db), "--out", str(branch / "checkpoints" / "boundary_refiner.pt")]
-            diffusion = [python, "training/motion_models.py", "--config", str(config), "train-diffusion", "--db", str(semantic_db), "--out", str(branch / "checkpoints" / "local_diffusion.pt")]
+            refiner = [python, "training/motion_models.py", "--config", str(config), "train-refiner", "--db", str(semantic_db), "--val_db", str(semantic_dbs["val"]), "--out", str(branch / "checkpoints" / "boundary_refiner.pt")]
+            diffusion = [python, "training/motion_models.py", "--config", str(config), "train-diffusion", "--db", str(semantic_db), "--val_db", str(semantic_dbs["val"]), "--out", str(branch / "checkpoints" / "local_diffusion.pt")]
             if args.refiner_steps:
                 refiner.extend(("--steps", str(args.refiner_steps)))
             if args.diffusion_steps:

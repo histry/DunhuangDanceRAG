@@ -24,6 +24,51 @@ from contracts.heading import (  # noqa: E402
     slot_turn_policy,
     wrap_angle,
 )
+from support.event_identity import (  # noqa: E402
+    event_uids_from_generation_db,
+    make_event_db_contract,
+    normalize_event_db_contract,
+)
+
+
+def _resolve_motion_ref_path(
+    report_path: Path,
+    motion_path: Path,
+    raw_reference: Any,
+) -> Path:
+    candidates: List[Path] = []
+    if raw_reference:
+        raw = Path(str(raw_reference)).expanduser()
+        if raw.is_absolute():
+            candidates.append(raw)
+        else:
+            candidates.extend((report_path.parent / raw, Path.cwd() / raw))
+    if motion_path.suffix.lower() == ".npy":
+        candidates.append(
+            motion_path.with_name(motion_path.stem + ".motion_ref.npy")
+        )
+    checked = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        checked.append(str(resolved))
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        f"Cannot resolve motion_ref for report={report_path}; checked={checked}"
+    )
+
+
+def _database_fps(db: Dict[str, Any]) -> float:
+    if "canonical_fps" not in db:
+        raise RuntimeError("Generation DB has no canonical_fps contract")
+    values = np.asarray(db["canonical_fps"], dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    unique = np.unique(np.round(values, decimals=6))
+    if unique.size != 1 or float(unique[0]) <= 0.0:
+        raise RuntimeError(
+            f"Generation DB canonical_fps is not unique and positive: {unique.tolist()}"
+        )
+    return float(unique[0])
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -36,20 +81,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--allow_failed", action="store_true")
     args = ap.parse_args(argv)
+    if not np.isfinite(args.fps) or args.fps <= 0.0:
+        raise ValueError(f"--fps must be positive and finite, got {args.fps!r}")
 
-    motion = np.load(args.motion, allow_pickle=True).astype(np.float32)
+    motion_path = Path(args.motion).expanduser().resolve()
+    report_path = Path(args.report).expanduser().resolve()
+    motion = np.load(motion_path, allow_pickle=True).astype(np.float32)
     if motion.ndim == 3:
         motion = motion[0]
-    report = json.loads(Path(args.report).read_text(encoding="utf-8"))
-    data = np.load(args.db, allow_pickle=True)
-    db = {k: data[k] for k in data.files}
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    with np.load(args.db, allow_pickle=True) as data:
+        db = {k: data[k] for k in data.files}
 
-    motion_ref_path = Path(
-        report.get("motion_ref_path")
-        or str(args.motion).replace(".npy", ".motion_ref.npy")
+    db_fps = _database_fps(db)
+    if abs(db_fps - float(args.fps)) > 1.0e-6:
+        raise RuntimeError(
+            f"Heading audit FPS mismatch: Generation DB={db_fps}, runtime={args.fps}"
+        )
+    report_fps = report.get("fps", report.get("config", {}).get("fps"))
+    try:
+        if abs(float(report_fps) - float(args.fps)) > 1.0e-6:
+            raise RuntimeError(
+                f"Heading audit FPS mismatch: report={report_fps}, runtime={args.fps}"
+            )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Generation report has invalid FPS: {report_fps!r}") from exc
+
+    computed_db_contract = make_event_db_contract(
+        event_uids_from_generation_db(db)
     )
-    if not motion_ref_path.is_file():
-        raise FileNotFoundError(motion_ref_path)
+    report_db_contract = normalize_event_db_contract(
+        report.get("event_db_contract")
+    )
+    if report_db_contract != computed_db_contract:
+        raise RuntimeError(
+            "Heading audit Event-DB mismatch: "
+            f"report={report_db_contract}, Generation DB={computed_db_contract}"
+        )
+
+    motion_ref_path = _resolve_motion_ref_path(
+        report_path,
+        motion_path,
+        report.get("motion_ref_path"),
+    )
     reference = np.load(motion_ref_path, allow_pickle=True).astype(np.float32)
     if reference.ndim == 3:
         reference = reference[0]
@@ -70,6 +144,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows: List[Dict[str, Any]] = []
     nonturn_budget_fail = 0
     intent_mismatch_fail = 0
+    invalid_event_reference_count = 0
 
     intents = np.asarray(db.get("event_turn_intents", []), dtype=object)
     budgets = np.asarray(db.get("event_yaw_budget_rad", []), dtype=np.float32)
@@ -79,6 +154,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         event_id = int(row0.get("event_id", -1))
         core = row0.get("core_span")
         if event_id < 0 or core is None or len(core) < 2:
+            invalid_event_reference_count += 1
+            continue
+        if event_id >= len(intents):
+            invalid_event_reference_count += 1
             continue
         a, b = max(0, int(core[0])), min(len(motion), int(core[1]))
         if b <= a:
@@ -133,6 +212,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         reasons.append(f"nonturn_budget_fail={nonturn_budget_fail}")
     if intent_mismatch_fail:
         reasons.append(f"intent_mismatch_fail={intent_mismatch_fail}")
+    if invalid_event_reference_count:
+        reasons.append(
+            f"invalid_event_reference_count={invalid_event_reference_count}"
+        )
     if not report.get("event_heading_planner"):
         reasons.append("missing_event_heading_planner_report")
 
@@ -143,11 +226,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "motion": args.motion,
         "report": args.report,
         "db": args.db,
+        "fps": float(args.fps),
+        "event_db_contract": computed_db_contract,
         "frames": int(len(motion)),
         "planned_heading_error_deg_p95": planned_error_p95,
         "planned_heading_error_deg_max": planned_error_max,
         "nonturn_budget_fail_count": int(nonturn_budget_fail),
         "intent_mismatch_fail_count": int(intent_mismatch_fail),
+        "invalid_event_reference_count": int(invalid_event_reference_count),
         "whole_song_heading_metrics": heading_metrics_np(motion, fps=args.fps),
         "rows": rows,
     }

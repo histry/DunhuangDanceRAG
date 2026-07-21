@@ -37,6 +37,7 @@ from contracts.gravity import (
 )
 
 SCHEMA = "v46_53_intrinsic_event_geometry_v2_physical_time"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 BODY_PARTS: Dict[str, Tuple[int, ...]] = {
     "root_torso": (0, 3, 6, 9, 12, 15),
@@ -84,6 +85,30 @@ def _load_motion(path: str) -> np.ndarray:
     if x.ndim != 2 or x.shape[1] < EDGE_DIM:
         raise ValueError(f"Expected [T,{EDGE_DIM}] event, got {x.shape}: {path}")
     return x[:, :EDGE_DIM]
+
+
+def _resolve_event_motion_path(raw_value: Any, db_path: Path) -> Path:
+    raw = Path(str(raw_value)).expanduser()
+    candidates = [raw] if raw.is_absolute() else [
+        PROJECT_ROOT / raw,
+        db_path.parent / raw,
+        Path.cwd() / raw,  # compatibility only
+    ]
+    checked: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(key)
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        f"Cannot resolve event motion {raw_value!r} from Event-DB {db_path}; "
+        f"checked={checked}"
+    )
 
 
 def _pad_edge(x: np.ndarray, length: int, from_end: bool = False) -> np.ndarray:
@@ -256,12 +281,42 @@ def _diagonal_w2_barycenter(
     )
 
 
-def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: float = 30.0) -> Dict[str, Any]:
+def _database_fps(payload: Mapping[str, Any]) -> Optional[float]:
+    if "canonical_fps" not in payload:
+        return None
+    values = np.asarray(payload["canonical_fps"], dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    unique = np.unique(np.round(values, decimals=6))
+    if unique.size != 1 or float(unique[0]) <= 0.0:
+        raise RuntimeError(
+            "Event-DB canonical_fps must contain exactly one positive rate; "
+            f"found={unique.tolist()}"
+        )
+    return float(unique[0])
+
+
+def augment_database(
+    db_path: Path,
+    audit_path: Optional[Path] = None,
+    fps: Optional[float] = None,
+) -> Dict[str, Any]:
+    with np.load(db_path, allow_pickle=True) as data:
+        payload: Dict[str, Any] = {k: data[k] for k in data.files}
+    declared_fps = _database_fps(payload)
+    if fps is None:
+        if declared_fps is None:
+            raise RuntimeError(
+                f"Event-DB has no canonical_fps contract: {db_path}"
+            )
+        fps = declared_fps
     fps = float(fps)
     if not np.isfinite(fps) or fps <= 0.0:
         raise ValueError(f"fps must be finite and positive, got {fps!r}")
-    with np.load(db_path, allow_pickle=True) as data:
-        payload: Dict[str, Any] = {k: data[k] for k in data.files}
+    if declared_fps is not None and abs(declared_fps - fps) > 1.0e-6:
+        raise RuntimeError(
+            "Intrinsic geometry FPS mismatch: "
+            f"Event-DB={declared_fps}, requested={fps}, path={db_path}"
+        )
     paths = np.asarray(payload["paths"], dtype=object)
     n = len(paths)
     posture = _event_array(payload, "posture_mode", n, "standing")
@@ -276,7 +331,8 @@ def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: floa
     rows, w0, w1, a0, a1, parts, structure_q = [], [], [], [], [], [], []
     diagnostics: List[dict] = []
     for i, path in enumerate(paths.tolist()):
-        motion = _load_motion(str(path))
+        resolved_path = _resolve_event_motion_path(path, db_path)
+        motion = _load_motion(str(resolved_path))
         item = _geometry_descriptor(
             motion,
             posture=str(posture[i]),
@@ -294,7 +350,7 @@ def augment_database(db_path: Path, audit_path: Optional[Path] = None, fps: floa
         structure_q.append(float(item["structure_quality"]))
         diagnostics.append({
             "event_id": int(i),
-            "path": str(path),
+            "path": str(resolved_path),
             "omega_p95": float(item["omega_p95"]),
             "alpha_p95": float(item["alpha_p95"]),
             "structure_quality": float(item["structure_quality"]),
@@ -375,12 +431,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
     ap.add_argument("--audit", default=None)
-    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Optional assertion; by default FPS is read from Event-DB canonical_fps.",
+    )
     args = ap.parse_args(argv)
     report = augment_database(
         Path(args.db),
         Path(args.audit) if args.audit else None,
-        fps=float(args.fps),
+        fps=args.fps,
     )
     print(json.dumps({k: report[k] for k in ("schema", "num_events", "geometry_dim", "quality", "ok")}, ensure_ascii=False, indent=2))
     return 0

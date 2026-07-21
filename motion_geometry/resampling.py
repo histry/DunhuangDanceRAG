@@ -10,6 +10,7 @@ from motion_geometry.rotations import (
     relative_rotvec_np,
     rot6d_to_matrix_np,
     so3_exp_np,
+    tangent_blend_np,
 )
 from motion_geometry.smpl24 import (
     CONTACT,
@@ -105,3 +106,44 @@ def resample_edge151_np(
     interpolated = resample_rotations_so3_np(rotations, p)
     out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(interpolated).reshape(len(p), -1)
     return out
+
+
+def blend_edge151_geodesic_np(
+    reference: np.ndarray,
+    proposal: np.ndarray,
+    weight: np.ndarray | float,
+    *,
+    max_rotation_rad: Optional[float] = None,
+) -> np.ndarray:
+    """Blend an EDGE151 proposal without ever adding or averaging Rot6D values.
+
+    Contacts remain those of ``reference`` (callers may recompute them from FK),
+    root translation is blended in R3, and joint rotations are composed through
+    tangent residuals on SO(3).  An optional angular cap is applied per joint.
+    """
+    ref = np.asarray(reference, dtype=np.float32)
+    cand = np.asarray(proposal, dtype=np.float32)
+    if ref.shape != cand.shape or ref.ndim != 2 or ref.shape[1] != MOTION_DIM:
+        raise ValueError(f"Expected matching [T,{MOTION_DIM}] arrays, got {ref.shape} and {cand.shape}")
+    raw_weight = np.asarray(weight, dtype=np.float32)
+    if raw_weight.ndim == 0:
+        frame_weight = np.full((len(ref), 1), float(raw_weight), dtype=np.float32)
+    else:
+        frame_weight = raw_weight.reshape(len(ref), -1)[:, :1]
+    frame_weight = np.clip(frame_weight, 0.0, 1.0)
+
+    out = ref.copy()
+    out[:, ROOT] = ref[:, ROOT] + (cand[:, ROOT] - ref[:, ROOT]) * frame_weight
+    r0 = rot6d_to_matrix_np(ref[:, ROT6D_START:ROT6D_END].reshape(len(ref), NUM_JOINTS, 6))
+    r1 = rot6d_to_matrix_np(cand[:, ROT6D_START:ROT6D_END].reshape(len(ref), NUM_JOINTS, 6))
+    if max_rotation_rad is not None:
+        cap = float(max_rotation_rad)
+        if not np.isfinite(cap) or cap <= 0.0:
+            raise ValueError("max_rotation_rad must be finite and positive")
+        delta = relative_rotvec_np(r0, r1)
+        magnitude = np.linalg.norm(delta, axis=-1, keepdims=True)
+        delta *= np.minimum(1.0, cap / np.maximum(magnitude, 1.0e-8))
+        r1 = r0 @ so3_exp_np(delta)
+    blended = tangent_blend_np(r0, r1, frame_weight[:, None, :])
+    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(blended).reshape(len(ref), -1)
+    return out.astype(np.float32)

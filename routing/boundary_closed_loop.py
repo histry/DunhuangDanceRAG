@@ -972,9 +972,12 @@ def merge_short_terminal_slot(
 
 def load_slots_and_candidates(v46, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
     db = v46.load_db(args.db)
+    if hasattr(v46, "_training_db_contract"):
+        v46._training_db_contract(db, cfg, "Closed-loop Generation")
     event_uids = event_uids_from_generation_db(db)
     db["event_uids"] = event_uids
     db_contract = make_event_db_contract(event_uids)
+    cfg._event_db_contract = db_contract
     strict_identity = env_bool("V46_54_REQUIRE_ALIGNED_EVENT_DB", True)
     descriptor_contract = None
     slots_json = getattr(args, "slots_json", None)
@@ -1107,12 +1110,14 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         )
 
     out = Path(args.out)
+    if out.suffix.lower() != ".npy":
+        raise ValueError(f"--out must end in .npy, got {out}")
     out.parent.mkdir(parents=True, exist_ok=True)
     np.save(out, best_payload["motion"].astype(np.float32))
-    motion_ref_path = str(out).replace(".npy", ".motion_ref.npy")
-    mask_path = str(out).replace(".npy", ".transition_mask.npy")
-    audit_csv_path = str(out).replace(".npy", ".boundary_audit.csv")
-    audit_json_path = str(out).replace(".npy", ".boundary_audit.json")
+    motion_ref_path = str(out.with_name(out.stem + ".motion_ref.npy"))
+    mask_path = str(out.with_name(out.stem + ".transition_mask.npy"))
+    audit_csv_path = str(out.with_name(out.stem + ".boundary_audit.csv"))
+    audit_json_path = str(out.with_name(out.stem + ".boundary_audit.json"))
     np.save(motion_ref_path, best_payload["motion_ref"].astype(np.float32))
     np.save(mask_path, best_payload["seam_mask"].astype(np.float32))
     write_audit_csv(best_payload["boundary_rows"], audit_csv_path)
@@ -1126,6 +1131,8 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "version": "v46_46_boundary_simulated_closed_loop_scheduler",
         "audio": args.audio,
         "db": args.db,
+        "fps": float(getattr(cfg, "fps", 30.0)),
+        "event_db_contract": make_event_db_contract(db["event_uids"]),
         "config": dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else jsonable(cfg),
         "selected_event_indices_initial_v46": path_idx,
         "selected_event_indices_final": selected_event_indices,
@@ -1175,7 +1182,9 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         },
         "final_audit": best_payload["stage_reports"].get("final_audit", {}),
     }
-    json_path = args.json or str(out).replace(".npy", ".v46_46_closed_loop_report.json")
+    json_path = args.json or str(
+        out.with_name(out.stem + ".v46_46_closed_loop_report.json")
+    )
     save_json(report, json_path)
 
     if args.render_output:

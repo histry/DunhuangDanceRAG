@@ -52,6 +52,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--allow_failed", action="store_true")
     args = ap.parse_args(argv)
+    if not np.isfinite(args.fps) or args.fps <= 0.0:
+        raise ValueError(f"--fps must be positive and finite, got {args.fps!r}")
 
     paths = [Path(args.input)] if args.input else sorted(Path(args.motion_dir).rglob("*.npy"))
     # Exclude known generated helper arrays.
@@ -64,6 +66,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rows.append({"path": str(path), "ok": False, "reasons": [str(exc)], "gravity_ok": False, "anatomy_ok": False})
     summary = {
         "schema": "v46_52_combined_motion_contract_audit",
+        "fps": float(args.fps),
         "count": len(rows),
         "ok_count": sum(bool(r["ok"]) for r in rows),
         "failed_count": sum(not bool(r["ok"]) for r in rows),

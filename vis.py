@@ -3,11 +3,9 @@ import shlex
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import librosa as lr
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
-import soundfile as sf
 import torch
 from matplotlib import cm
 from matplotlib.colors import ListedColormap
@@ -243,6 +241,13 @@ def skeleton_render(
             anim.save(videoname, writer=writer)
 
         if stitch:
+            try:
+                import librosa as lr
+                import soundfile as sf
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Audio stitching requires optional packages librosa and soundfile"
+                ) from exc
             assert isinstance(name, (list, tuple)), "For stitching, name must be a list or tuple"
             output_stem = audio_output_stem(name)
             name_ = [os.path.splitext(x)[0] + ".wav" for x in name]

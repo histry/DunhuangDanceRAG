@@ -17,7 +17,6 @@ import numpy as np
 import torch
 from pytorch3d.transforms import matrix_to_axis_angle
 
-from vis import SMPLSkeleton, skeleton_render
 from contracts.gravity import (
     GravityThresholds,
     evaluate_gravity_contract,
@@ -49,6 +48,13 @@ def sanitize_contacts(c, T):
 
 
 def render_one(motion, audio, output, camera_mode, smooth, fps):
+    try:
+        from vis import SMPLSkeleton, skeleton_render
+    except ImportError as exc:
+        raise RuntimeError(
+            "Motion rendering requires the optional visualization dependencies "
+            "from requirements-core.txt (matplotlib and its runtime stack)."
+        ) from exc
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     T = len(motion)
     pos = torch.as_tensor(motion[:, 4:7], dtype=torch.float32, device=device).unsqueeze(0)
@@ -102,7 +108,7 @@ def main():
     batch = as_batch(np.load(args.motion, allow_pickle=True))
     reports = []
     for i, motion in enumerate(batch):
-        metrics = gravity_metrics_np(motion)
+        metrics = gravity_metrics_np(motion, fps=float(args.fps))
         ok, reasons = evaluate_gravity_contract(metrics, GravityThresholds())
         reports.append({"batch": i, "ok": ok, "reasons": reasons, **metrics})
         print(json.dumps(reports[-1], ensure_ascii=False, indent=2))

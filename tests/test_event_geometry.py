@@ -40,8 +40,11 @@ class EventGeometryTest(unittest.TestCase):
                 anatomy_quality=np.asarray([0.9, 0.8, 0.85, 0.75], dtype=np.float32),
                 event_quality_scores=np.asarray([0.8, 0.7, 0.75, 0.65], dtype=np.float32),
                 desc=np.zeros((4, 32), dtype=np.float32),
+                canonical_fps=np.full(4, 30.0, dtype=np.float32),
             )
             rep = augment_database(db)
+            with self.assertRaisesRegex(RuntimeError, "FPS mismatch"):
+                augment_database(db, fps=60.0)
             with np.load(db, allow_pickle=True) as obj:
                 self.assertIn("v46_53_geometry_desc_z", obj.files)
                 self.assertIn("v46_53_shared_embedding", obj.files)

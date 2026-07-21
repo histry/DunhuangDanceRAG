@@ -85,6 +85,7 @@ from motion_geometry.smpl24 import (
     ROT6D_END,
     ROT6D_START,
     SMPL24_SKELETON_SCHEMA,
+    skeleton_contract,
     skeleton_fingerprint,
 )
 from motion_geometry.rotations import (
@@ -93,7 +94,15 @@ from motion_geometry.rotations import (
     matrix_to_rot6d_torch as _contract_matrix_to_rot6d_torch,
     rot6d_to_matrix_np as _contract_rot6d_to_matrix_np,
     rot6d_to_matrix_torch as _contract_rot6d_to_matrix_torch,
+    tangent_blend_np,
 )
+from support.event_identity import (
+    assert_same_event_db_contract,
+    event_uids_from_generation_db,
+    make_event_db_contract,
+    normalize_event_db_contract,
+)
+from motion_geometry.resampling import blend_edge151_geodesic_np
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
@@ -853,6 +862,7 @@ class V46Config:
 
     def apply_env(self) -> "V46Config":
         env_map = {
+            "V46_FPS": ("fps", float),
             "V46_ENABLE_TRUE_IK": ("ik_enable", lambda x: bool(int(x))),
             "V46_ENABLE_REFINER": ("refiner_enable", lambda x: bool(int(x))),
             "V46_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
@@ -1022,6 +1032,18 @@ def assert_motion_checkpoint_contract(
     if mismatches:
         raise RuntimeError(
             f"Checkpoint contract mismatch for {path}: " + "; ".join(mismatches)
+        )
+    expected_db = normalize_event_db_contract(
+        getattr(cfg, "_event_db_contract", None)
+    )
+    if expected_db is not None:
+        checkpoint_db = normalize_event_db_contract(
+            checkpoint.get("training_event_db_contract")
+        )
+        assert_same_event_db_contract(
+            expected_db,
+            checkpoint_db,
+            context=f"{role} checkpoint/Generation Event-DB alignment ({path})",
         )
 
 
@@ -3936,9 +3958,149 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
     return music, motion, desc_mean.astype(np.float32), desc_std.astype(np.float32), report
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _object_scalar(value: Any) -> Any:
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return value.item()
+    return value
+
+
+def _resolve_training_motion_path(raw_value: Any, db_path: Path) -> Path:
+    """Resolve an Event-DB motion without depending on the process CWD."""
+    raw = Path(str(raw_value)).expanduser()
+    candidates = [raw] if raw.is_absolute() else [
+        PROJECT_ROOT / raw,
+        db_path.parent / raw,
+        Path.cwd() / raw,  # compatibility only
+    ]
+    checked: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(key)
+        if resolved.is_file():
+            return resolved
+    raise FileNotFoundError(
+        f"Cannot resolve training motion {raw_value!r} from Event-DB {db_path}; "
+        f"checked={checked}"
+    )
+
+
 def load_db(db_path: str | Path) -> dict:
-    data = np.load(db_path, allow_pickle=True)
-    return {k: data[k] for k in data.files}
+    path = Path(db_path).expanduser().resolve()
+    with np.load(path, allow_pickle=True) as data:
+        db = {k: data[k] for k in data.files}
+    if "paths" in db:
+        db["paths"] = np.asarray(
+            [_resolve_training_motion_path(value, path) for value in db["paths"]],
+            dtype=object,
+        )
+    db["_database_path"] = str(path)
+    return db
+
+
+def _training_db_contract(db: Dict[str, Any], cfg: V46Config, label: str) -> Dict[str, Any]:
+    """Validate the immutable geometry/time/identity contract of a training DB."""
+    paths = np.asarray(db.get("paths", []), dtype=object)
+    desc = np.asarray(db.get("desc", []), dtype=np.float32)
+    desc_z = np.asarray(db.get("desc_z", []), dtype=np.float32)
+    count = int(len(paths))
+    if count < 1:
+        raise RuntimeError(f"{label} Event-DB is empty")
+    if desc.shape != (count, 32) or desc_z.shape != (count, 32):
+        raise RuntimeError(
+            f"{label} descriptor contract mismatch: desc={desc.shape}, "
+            f"desc_z={desc_z.shape}, expected=({count}, 32)"
+        )
+
+    fps_values = np.asarray(db.get("canonical_fps", []), dtype=np.float64).reshape(-1)
+    if fps_values.size == 1:
+        fps_values = np.full(count, float(fps_values[0]), dtype=np.float64)
+    if fps_values.size != count or not np.all(np.isfinite(fps_values)) or np.any(fps_values <= 0.0):
+        raise RuntimeError(f"{label} Event-DB has no valid per-event canonical_fps contract")
+    unique_fps = np.unique(np.round(fps_values, decimals=6))
+    if len(unique_fps) != 1:
+        raise RuntimeError(f"{label} Event-DB mixes canonical FPS values: {unique_fps.tolist()}")
+    database_fps = float(unique_fps[0])
+    if abs(database_fps - float(cfg.fps)) > 1.0e-6:
+        raise RuntimeError(
+            f"{label} Event-DB FPS={database_fps:g} does not match runtime/config FPS={float(cfg.fps):g}"
+        )
+
+    raw_skeleton = _object_scalar(db.get("skeleton_contract_json"))
+    if isinstance(raw_skeleton, bytes):
+        raw_skeleton = raw_skeleton.decode("utf-8")
+    if not isinstance(raw_skeleton, str):
+        raise RuntimeError(f"{label} Event-DB has no SMPL24 skeleton contract")
+    try:
+        declared_skeleton = json.loads(raw_skeleton)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{label} Event-DB skeleton contract is invalid JSON") from exc
+    expected_skeleton = skeleton_contract()
+    for key in ("schema", "motion_dim", "rot6d_layout", "sha256"):
+        if declared_skeleton.get(key) != expected_skeleton[key]:
+            raise RuntimeError(
+                f"{label} Event-DB skeleton {key} mismatch: "
+                f"database={declared_skeleton.get(key)!r}, runtime={expected_skeleton[key]!r}"
+            )
+
+    event_uids = event_uids_from_generation_db(db)
+    identity = make_event_db_contract(event_uids)
+    declared_identity = normalize_event_db_contract(db.get("event_db_contract_json"))
+    if declared_identity is None:
+        raise RuntimeError(f"{label} Event-DB has no declared event identity contract")
+    assert_same_event_db_contract(
+        identity,
+        declared_identity,
+        context=f"{label} Event-DB identity",
+    )
+    return {
+        "database_path": str(db.get("_database_path", "")),
+        "canonical_fps": database_fps,
+        "num_events": count,
+        "event_db_contract": identity,
+        "skeleton_schema": expected_skeleton["schema"],
+        "skeleton_sha256": expected_skeleton["sha256"],
+        "descriptor_dim": 32,
+    }
+
+
+def _validate_source_disjoint(
+    train_db: Dict[str, Any],
+    validation_db: Dict[str, Any],
+) -> Dict[str, Any]:
+    train_sources = {str(value) for value in np.asarray(train_db.get("source_uids", []), dtype=object)}
+    validation_sources = {str(value) for value in np.asarray(validation_db.get("source_uids", []), dtype=object)}
+    if not train_sources or not validation_sources:
+        raise RuntimeError("Source-disjoint validation requires source_uids in both Event-DBs")
+    overlap = sorted(train_sources & validation_sources)
+    if overlap:
+        raise RuntimeError(f"Train/validation source leakage detected: {overlap[:20]}")
+    return {
+        "train_sources": len(train_sources),
+        "validation_sources": len(validation_sources),
+        "overlap": overlap,
+    }
+
+
+def _descriptor_values_in_training_coordinates(
+    db: Dict[str, Any],
+    train_db: Dict[str, Any],
+) -> np.ndarray:
+    raw = np.asarray(db["desc"], dtype=np.float32)
+    mean = np.asarray(train_db["desc_mean"], dtype=np.float32).reshape(1, -1)
+    std = np.asarray(train_db["desc_std"], dtype=np.float32).reshape(1, -1)
+    if raw.shape[1:] != mean.shape[1:] or mean.shape != std.shape:
+        raise RuntimeError(
+            f"Descriptor normalization mismatch: raw={raw.shape}, mean={mean.shape}, std={std.shape}"
+        )
+    return np.clip((raw - mean) / np.maximum(std, 1.0e-6), -8.0, 8.0).astype(np.float32)
 
 
 def train_contrastive(args: argparse.Namespace) -> int:
@@ -3954,6 +4116,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
+    database_contract = _training_db_contract(db, cfg, "V44 training")
     motion_db = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_weight", 0.35)))
     supervision_mode = "weak_motion_proxy"
     pair_report: Dict[str, object] = {}
@@ -4037,6 +4200,8 @@ def train_contrastive(args: argparse.Namespace) -> int:
         "music_std": music_std.astype(np.float32),
         "pair_report": pair_report,
         "motion_contract": motion_checkpoint_contract(cfg, "v44_contrastive"),
+        "training_event_db_contract": database_contract["event_db_contract"],
+        "training_database": database_contract,
     }
     torch.save(ckpt, out)
     print(json.dumps({"contrastive_ckpt": str(out), "num_pairs": int(N), "supervision_mode": supervision_mode, "pair_report": pair_report}, ensure_ascii=False, indent=2))
@@ -4069,11 +4234,23 @@ class TemporalRefiner(nn.Module):
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[V46Config] = None) -> np.ndarray:
     """Sample a training window and keep the EDGE-151D contract after resampling."""
     p = str(random.choice(paths.tolist()))
+    return load_motion_window(p, target_len, cfg)
+
+
+def load_motion_window(
+    path: str | Path,
+    target_len: int,
+    cfg: Optional[V46Config] = None,
+    *,
+    random_crop: bool = True,
+) -> np.ndarray:
+    """Load one event and return a contract-valid fixed-length training window."""
+    p = str(path)
     m = np.load(p).astype(np.float32)
     if m.shape[0] == target_len:
         out = m
     elif m.shape[0] > target_len:
-        st = random.randint(0, m.shape[0] - target_len)
+        st = random.randint(0, m.shape[0] - target_len) if random_crop else (m.shape[0] - target_len) // 2
         out = m[st:st + target_len]
     else:
         out = resample_motion_np(m, target_len)
@@ -4139,6 +4316,114 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
     return x.astype(np.float32), np.clip(seam, 0.0, 1.0).astype(np.float32)
 
 
+def _validation_indices(count: int, maximum: int = 16) -> List[int]:
+    if count < 1:
+        return []
+    return sorted(set(np.linspace(0, count - 1, min(count, maximum), dtype=np.int64).tolist()))
+
+
+def _evaluate_refiner_validation(
+    model: Any,
+    validation_db: Dict[str, Any],
+    train_db: Dict[str, Any],
+    cfg: V46Config,
+    device: Any,
+) -> Dict[str, Any]:
+    indices = _validation_indices(len(validation_db["paths"]))
+    cond_z = _descriptor_values_in_training_coordinates(validation_db, train_db)
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    random.seed(int(cfg.seed) + 45001)
+    np.random.seed(int(cfg.seed) + 45001)
+    rec_values: List[float] = []
+    velocity_values: List[float] = []
+    model.eval()
+    try:
+        with torch.no_grad():
+            for idx in indices:
+                clean = load_motion_window(
+                    validation_db["paths"][idx], cfg.window_len, cfg, random_crop=False
+                )
+                bad, seam = degrade_for_refiner(clean, cfg=cfg)
+                clean_t = torch.from_numpy(clean[None]).float().to(device)
+                bad_t = torch.from_numpy(bad[None]).float().to(device)
+                seam_t = torch.from_numpy(seam[None]).float().to(device)
+                cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
+                pred = bad_t + model(bad_t, cond_t, seam_t) * (0.35 + 0.65 * seam_t)
+                rec_values.append(float(F.smooth_l1_loss(pred, clean_t).cpu()))
+                velocity_values.append(float(F.smooth_l1_loss(
+                    pred[:, 1:] - pred[:, :-1],
+                    clean_t[:, 1:] - clean_t[:, :-1],
+                ).cpu()))
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        model.train()
+    return {
+        "num_windows": len(indices),
+        "reconstruction_smooth_l1": float(np.mean(rec_values)) if rec_values else None,
+        "velocity_smooth_l1_per_frame": float(np.mean(velocity_values)) if velocity_values else None,
+        "descriptor_coordinates": "training_event_db",
+    }
+
+
+def _evaluate_diffusion_validation(
+    model: Any,
+    validation_db: Dict[str, Any],
+    train_db: Dict[str, Any],
+    cfg: V46Config,
+    device: Any,
+    abar: Any,
+    diffusion_steps: int,
+) -> Dict[str, Any]:
+    indices = _validation_indices(len(validation_db["paths"]))
+    cond_z = _descriptor_values_in_training_coordinates(validation_db, train_db)
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    random.seed(int(cfg.seed) + 46001)
+    np.random.seed(int(cfg.seed) + 46001)
+    torch.manual_seed(int(cfg.seed) + 46001)
+    noise_values: List[float] = []
+    velocity_values: List[float] = []
+    model.eval()
+    try:
+        with torch.no_grad():
+            for sample_index, idx in enumerate(indices):
+                clean = load_motion_window(
+                    validation_db["paths"][idx], cfg.window_len, cfg, random_crop=False
+                )
+                retrieval, seam = degrade_for_refiner(clean, severity=0.045, cfg=cfg)
+                x0 = torch.from_numpy(clean[None]).float().to(device)
+                retr = torch.from_numpy(retrieval[None]).float().to(device)
+                seam_t = torch.from_numpy(seam[None]).float().to(device)
+                cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
+                timestep = int(round(sample_index * max(diffusion_steps - 1, 0) / max(len(indices) - 1, 1)))
+                t = torch.full((1,), timestep, dtype=torch.long, device=device)
+                noise = torch.randn_like(x0)
+                a = abar[t].view(1, 1, 1)
+                x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
+                pred_noise = model(x_t, retr, cond_t, seam_t, t)
+                noise_values.append(float(F.mse_loss(pred_noise, noise).cpu()))
+                x0_hat = (x_t - torch.sqrt(1.0 - a) * pred_noise) / torch.sqrt(a).clamp_min(1.0e-6)
+                velocity_values.append(float(F.smooth_l1_loss(
+                    x0_hat[:, 1:] - x0_hat[:, :-1],
+                    x0[:, 1:] - x0[:, :-1],
+                ).cpu()))
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        model.train()
+    return {
+        "num_windows": len(indices),
+        "noise_mse": float(np.mean(noise_values)) if noise_values else None,
+        "velocity_smooth_l1_per_frame": float(np.mean(velocity_values)) if velocity_values else None,
+        "descriptor_coordinates": "training_event_db",
+    }
+
+
 def train_refiner(args: argparse.Namespace) -> int:
     if torch is None:
         raise RuntimeError("PyTorch is required for V45 training.")
@@ -4147,8 +4432,19 @@ def train_refiner(args: argparse.Namespace) -> int:
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
+    database_contract = _training_db_contract(db, cfg, "V45 training")
     paths = db["paths"]
-    desc_mean = np.asarray(db["desc_z"], dtype=np.float32).mean(axis=0)
+    desc_z = _descriptor_values_in_training_coordinates(db, db)
+    validation_db = None
+    validation_report: Dict[str, Any] = {"enabled": False}
+    if getattr(args, "val_db", None):
+        validation_db = load_db(args.val_db)
+        validation_contract = _training_db_contract(validation_db, cfg, "V45 validation")
+        validation_report = {
+            "enabled": True,
+            "database": validation_contract,
+            "source_disjoint": _validate_source_disjoint(db, validation_db),
+        }
     device = torch.device(cfg.device)
     model = TemporalRefiner(EDGE_DIM, 32).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
@@ -4160,12 +4456,13 @@ def train_refiner(args: argparse.Namespace) -> int:
         seam_batch = []
         cond_batch = []
         for _ in range(bs):
-            clean = sample_motion_window(paths, cfg.window_len, cfg)
+            idx = random.randrange(len(paths))
+            clean = load_motion_window(paths[idx], cfg.window_len, cfg)
             bad, seam = degrade_for_refiner(clean, cfg=cfg)
             clean_batch.append(clean)
             bad_batch.append(bad)
             seam_batch.append(seam)
-            cond_batch.append(desc_mean)
+            cond_batch.append(desc_z[idx])
         clean_t = torch.from_numpy(np.stack(clean_batch)).float().to(device)
         bad_t = torch.from_numpy(np.stack(bad_batch)).float().to(device)
         seam_t = torch.from_numpy(np.stack(seam_batch)).float().to(device)
@@ -4181,6 +4478,10 @@ def train_refiner(args: argparse.Namespace) -> int:
         opt.step()
         if step % 200 == 0 or step == steps - 1:
             print(f"[V45 refiner] step={step} loss={loss.item():.6f} rec={rec.item():.6f}")
+    if validation_db is not None:
+        validation_report["metrics"] = _evaluate_refiner_validation(
+            model, validation_db, db, cfg, device
+        )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -4188,8 +4489,16 @@ def train_refiner(args: argparse.Namespace) -> int:
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "motion_contract": motion_checkpoint_contract(cfg, "v45_refiner"),
+        "training_event_db_contract": database_contract["event_db_contract"],
+        "training_database": database_contract,
+        "descriptor_normalization": {
+            "source": "training_event_db",
+            "mean": np.asarray(db["desc_mean"], dtype=np.float32),
+            "std": np.asarray(db["desc_std"], dtype=np.float32),
+        },
+        "validation": validation_report,
     }, out)
-    print(json.dumps({"refiner_ckpt": str(out), "steps": steps}, ensure_ascii=False, indent=2))
+    print(json.dumps({"refiner_ckpt": str(out), "steps": steps, "validation": validation_report}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -4250,8 +4559,19 @@ def train_diffusion(args: argparse.Namespace) -> int:
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
+    database_contract = _training_db_contract(db, cfg, "V46 training")
     paths = db["paths"]
-    desc_z = np.asarray(db["desc_z"], dtype=np.float32)
+    desc_z = _descriptor_values_in_training_coordinates(db, db)
+    validation_db = None
+    validation_report: Dict[str, Any] = {"enabled": False}
+    if getattr(args, "val_db", None):
+        validation_db = load_db(args.val_db)
+        validation_contract = _training_db_contract(validation_db, cfg, "V46 validation")
+        validation_report = {
+            "enabled": True,
+            "database": validation_contract,
+            "source_disjoint": _validate_source_disjoint(db, validation_db),
+        }
     device = torch.device(cfg.device)
     model = DiffusionDenoiser(EDGE_DIM, 32).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
@@ -4296,6 +4616,10 @@ def train_diffusion(args: argparse.Namespace) -> int:
         opt.step()
         if step % 250 == 0 or step == steps - 1:
             print(f"[V46 diffusion] step={step} loss={loss.item():.6f} noise={loss_noise.item():.6f}")
+    if validation_db is not None:
+        validation_report["metrics"] = _evaluate_diffusion_validation(
+            model, validation_db, db, cfg, device, abar, Tdiff
+        )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -4304,8 +4628,16 @@ def train_diffusion(args: argparse.Namespace) -> int:
         "config": dataclasses.asdict(cfg),
         "diffusion_steps": Tdiff,
         "motion_contract": motion_checkpoint_contract(cfg, "v46_diffusion"),
+        "training_event_db_contract": database_contract["event_db_contract"],
+        "training_database": database_contract,
+        "descriptor_normalization": {
+            "source": "training_event_db",
+            "mean": np.asarray(db["desc_mean"], dtype=np.float32),
+            "std": np.asarray(db["desc_std"], dtype=np.float32),
+        },
+        "validation": validation_report,
     }, out)
-    print(json.dumps({"diffusion_ckpt": str(out), "steps": steps}, ensure_ascii=False, indent=2))
+    print(json.dumps({"diffusion_ckpt": str(out), "steps": steps, "validation": validation_report}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -5625,11 +5957,17 @@ def analytic_residual_refine(motion: np.ndarray, seam_positions: Sequence[int], 
         right = out[b - 1].copy()
         x = np.linspace(0, 1, b - a, dtype=np.float32)[:, None]
         cubic = x * x * (3 - 2 * x)
-        bridge = (1 - cubic) * left + cubic * right
+        bridge = resample_motion_np(
+            np.stack([left, right], axis=0).astype(np.float32),
+            b - a,
+        )
+        bridge[:, ROOT_X_IDX:ROOT_Z_IDX + 1] = (
+            (1 - cubic) * left[None, ROOT_X_IDX:ROOT_Z_IDX + 1]
+            + cubic * right[None, ROOT_X_IDX:ROOT_Z_IDX + 1]
+        )
         # Only blend root and rotations near boundary; keep original high-frequency content.
         w = np.sin(np.linspace(0, math.pi, b - a, dtype=np.float32))[:, None] ** 2
-        idx = list(range(ROOT_X_IDX, ROOT_Z_IDX + 1)) + list(range(ROT6D_START, ROT6D_END))
-        out[a:b, idx] = (1 - 0.35 * w) * out[a:b, idx] + 0.35 * w * bridge[:, idx]
+        out[a:b] = blend_edge151_geodesic_np(out[a:b], bridge, 0.35 * w)
     out[:, ROOT_Y_IDX] = smooth_np(out[:, ROOT_Y_IDX:ROOT_Y_IDX + 1], 1.0)[:, 0]
     return out.astype(np.float32)
 
@@ -6515,6 +6853,8 @@ def generate(args: argparse.Namespace) -> int:
     if torch is not None:
         torch.manual_seed(cfg.seed)
     db = load_db(args.db)
+    database_contract = _training_db_contract(db, cfg, "Generation")
+    cfg._event_db_contract = database_contract["event_db_contract"]
     contrastive = load_contrastive(args.contrastive, cfg)
     slots, slot_feat = audio_slots(args.audio, cfg, args.slot_seconds, args.slots_json)
     path_idx, retrieval_report = retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
@@ -6668,12 +7008,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     r = sub.add_parser("train-refiner", help="V45 residual Motion Refiner training")
     r.add_argument("--db", required=True)
+    r.add_argument("--val_db", default=None, help="Source-disjoint validation Event-DB used for contract and leakage gates")
     r.add_argument("--out", required=True)
     r.add_argument("--steps", type=int, default=None)
     r.set_defaults(func=train_refiner)
 
     d = sub.add_parser("train-diffusion", help="V46 conditional residual diffusion training")
     d.add_argument("--db", required=True)
+    d.add_argument("--val_db", default=None, help="Source-disjoint validation Event-DB used for contract and leakage gates")
     d.add_argument("--out", required=True)
     d.add_argument("--steps", type=int, default=None)
     d.add_argument("--diffusion_steps", type=int, default=None)
@@ -7491,13 +7833,21 @@ def _v46_41_safe_residual(candidate, reference, seam_mask, cfg, stage="stage", g
     trans = _v46_41_env_float(f"V46_41_{stage.upper()}_TRANSITION_COMMIT", trans_default)
     w = np.clip(core + (trans - core) * sm.astype(np.float32), 0.0, 1.0)
     delta = cand - ref
-    out = ref.copy().astype(np.float32)
+    bounded = cand.copy().astype(np.float32)
     root_xz_max = _v46_41_env_float("V46_41_ROOT_XZ_DELTA_MAX_M", 0.05)
     root_y_max = _v46_41_env_float("V46_41_ROOT_Y_DELTA_MAX_M", 0.02)
-    rot_max = _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12)
     for idx, mx in [(ROOT_X_IDX, root_xz_max), (ROOT_Y_IDX, root_y_max), (ROOT_Z_IDX, root_xz_max)]:
-        out[:, idx] = ref[:, idx] + np.clip(delta[:, idx], -mx, mx) * w[:, 0]
-    out[:, ROT6D_START:ROT6D_END] = ref[:, ROT6D_START:ROT6D_END] + np.clip(delta[:, ROT6D_START:ROT6D_END], -rot_max, rot_max) * w
+        bounded[:, idx] = ref[:, idx] + np.clip(delta[:, idx], -mx, mx)
+    max_rotation_rad = _v46_41_env_float(
+        "V46_41_ROTATION_DELTA_MAX_RAD",
+        _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12),
+    )
+    out = blend_edge151_geodesic_np(
+        ref,
+        bounded,
+        w,
+        max_rotation_rad=max_rotation_rad,
+    )
     out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_41_safe_residual:{stage}", derive_contact=True, project_rot=True)
     out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_TRANSACTION_STRENGTH", 0.08))
     ok, reasons, detail = _v46_41_kbo(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
@@ -7535,10 +7885,13 @@ def _v46_41_deterministic_bridge(reference, seam_mask, cfg, stage="fallback", gl
             left = ref[a - 1].copy(); right = ref[b].copy()
             x = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
             cubic = x * x * (3.0 - 2.0 * x)
-            bridge = (1.0 - cubic) * left[None] + cubic * right[None]
-        idxs = [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX] + list(range(ROT6D_START, ROT6D_END))
+            bridge = resample_motion_np(np.stack([left, right], axis=0), n)
+            bridge[:, ROOT_X_IDX:ROOT_Z_IDX + 1] = (
+                (1.0 - cubic) * left[None, ROOT_X_IDX:ROOT_Z_IDX + 1]
+                + cubic * right[None, ROOT_X_IDX:ROOT_Z_IDX + 1]
+            )
         w = np.clip(sm[a:b], 0.0, 1.0) * float(fallback_strength)
-        out[a:b, idxs] = out[a:b, idxs] * (1.0 - w) + bridge[:, idxs] * w
+        out[a:b] = blend_edge151_geodesic_np(out[a:b], bridge, w)
         reports.append({"span": [int(a), int(b)], "frames": int(n)})
     out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_41_deterministic_bridge:{stage}", derive_contact=True, project_rot=True)
     out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_FALLBACK_STRENGTH", 0.10))
@@ -8046,13 +8399,21 @@ def _v46_41_safe_residual(candidate, reference, seam_mask, cfg, stage="stage", g
     trans = _v46_41_env_float(f"V46_41_{stage.upper()}_TRANSITION_COMMIT", trans_default)
     w = np.clip(core + (trans - core) * sm.astype(np.float32), 0.0, 1.0)
     delta = cand - ref
-    out = ref.copy().astype(np.float32)
+    bounded = cand.copy().astype(np.float32)
     root_xz_max = _v46_41_env_float("V46_41_ROOT_XZ_DELTA_MAX_M", 0.05)
     root_y_max = _v46_41_env_float("V46_41_ROOT_Y_DELTA_MAX_M", 0.02)
-    rot_max = _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12)
     for idx, mx in [(ROOT_X_IDX, root_xz_max), (ROOT_Y_IDX, root_y_max), (ROOT_Z_IDX, root_xz_max)]:
-        out[:, idx] = ref[:, idx] + np.clip(delta[:, idx], -mx, mx) * w[:, 0]
-    out[:, ROT6D_START:ROT6D_END] = ref[:, ROT6D_START:ROT6D_END] + np.clip(delta[:, ROT6D_START:ROT6D_END], -rot_max, rot_max) * w
+        bounded[:, idx] = ref[:, idx] + np.clip(delta[:, idx], -mx, mx)
+    max_rotation_rad = _v46_41_env_float(
+        "V46_41_ROTATION_DELTA_MAX_RAD",
+        _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12),
+    )
+    out = blend_edge151_geodesic_np(
+        ref,
+        bounded,
+        w,
+        max_rotation_rad=max_rotation_rad,
+    )
     out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_42_safe_residual:{stage}", derive_contact=True, project_rot=True)
     out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_TRANSACTION_STRENGTH", 0.08), global_start=global_start)
     ok, reasons, detail = _v46_41_kbo(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
@@ -8090,10 +8451,13 @@ def _v46_41_deterministic_bridge(reference, seam_mask, cfg, stage="fallback", gl
             left = ref[a - 1].copy(); right = ref[b].copy()
             x = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
             cubic = x * x * (3.0 - 2.0 * x)
-            bridge = (1.0 - cubic) * left[None] + cubic * right[None]
-        idxs = [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX] + list(range(ROT6D_START, ROT6D_END))
+            bridge = resample_motion_np(np.stack([left, right], axis=0), n)
+            bridge[:, ROOT_X_IDX:ROOT_Z_IDX + 1] = (
+                (1.0 - cubic) * left[None, ROOT_X_IDX:ROOT_Z_IDX + 1]
+                + cubic * right[None, ROOT_X_IDX:ROOT_Z_IDX + 1]
+            )
         w = np.clip(sm[a:b], 0.0, 1.0) * float(fallback_strength)
-        out[a:b, idxs] = out[a:b, idxs] * (1.0 - w) + bridge[:, idxs] * w
+        out[a:b] = blend_edge151_geodesic_np(out[a:b], bridge, w)
         reports.append({"span": [int(a), int(b)], "frames": int(n)})
     out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_42_deterministic_bridge:{stage}", derive_contact=True, project_rot=True)
     out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_FALLBACK_STRENGTH", 0.10), global_start=global_start)
@@ -8530,13 +8894,21 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
                 # Important: do NOT call strict safe_residual before early KBO.
                 # Bound channel residuals lightly without running final KBO.
                 delta = probe - retr_in
-                bounded = retr_in.copy().astype(np.float32)
+                bounded_proposal = probe.copy().astype(np.float32)
                 root_xz = _v46_41_env_float("V46_41_ROOT_XZ_DELTA_MAX_M", 0.05) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
                 root_y = _v46_41_env_float("V46_41_ROOT_Y_DELTA_MAX_M", 0.02) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
-                rot = _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
                 for idx, mx in [(ROOT_X_IDX, root_xz), (ROOT_Y_IDX, root_y), (ROOT_Z_IDX, root_xz)]:
-                    bounded[:, idx] = retr_in[:, idx] + np.clip(delta[:, idx], -mx, mx) * np.clip(mask_in[:, 0], 0.0, 1.0)
-                bounded[:, ROT6D_START:ROT6D_END] = retr_in[:, ROT6D_START:ROT6D_END] + np.clip(delta[:, ROT6D_START:ROT6D_END], -rot, rot) * np.clip(mask_in, 0.0, 1.0)
+                    bounded_proposal[:, idx] = retr_in[:, idx] + np.clip(delta[:, idx], -mx, mx)
+                rotation_cap = _v46_41_env_float(
+                    "V46_41_ROTATION_DELTA_MAX_RAD",
+                    _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12),
+                ) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
+                bounded = blend_edge151_geodesic_np(
+                    retr_in,
+                    bounded_proposal,
+                    np.clip(mask_in, 0.0, 1.0),
+                    max_rotation_rad=rotation_cap,
+                )
                 bounded, _ = enforce_edge151_contract_np(bounded, cfg, source_hint="v46_43_diffusion_early_probe_bounded_no_strict_kbo", derive_contact=True, project_rot=True)
                 ok, reasons, detail = _v46_43_early_abort_oracle(bounded, retr_in, cfg, stage="diffusion_early_abort_probe", global_start=global_start)
                 _V46_43_EARLY_ABORT_TRACE.append({"ti": int(ti), "ok": bool(ok), "reasons": reasons, "detail": detail})

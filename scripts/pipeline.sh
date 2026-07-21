@@ -77,6 +77,7 @@ fi
 echo "========== 2. RETARGET GRAVITY AUDIT =========="
 "$PY" evaluation/audit_gravity.py \
   --motion_dir "$RETARGET_CACHE" \
+  --fps "$V46_51_FPS" \
   --out "$OUT_ROOT/retarget_cache.gravity.json" \
   --csv "$OUT_ROOT/retarget_cache.gravity.csv"
 
@@ -228,6 +229,7 @@ if [[ "$V46_51_RETRAIN_V45" == "1" ]]; then
     --config "$CONFIG" \
     train-refiner \
     --db "$TRAIN_AESD" \
+    --val_db "$VAL_AESD" \
     --out "$V45_CKPT" \
     --steps "$V45_STEPS"
 else
@@ -240,6 +242,7 @@ if [[ "$V46_51_RETRAIN_V46" == "1" ]]; then
     --config "$CONFIG" \
     train-diffusion \
     --db "$TRAIN_AESD" \
+    --val_db "$VAL_AESD" \
     --out "$V46_CKPT" \
     --steps "$V46_STEPS" \
     --diffusion_steps "$V46_DIFFUSION_STEPS"
@@ -339,6 +342,7 @@ echo "========== 13. V46.51 HEADING/BOUNDARY CLOSED-LOOP GENERATION =========="
 echo "========== 14. FINAL GRAVITY AUDIT =========="
 "$PY" evaluation/audit_gravity.py \
   --input "$FINAL_NPY" \
+  --fps "$V46_51_FPS" \
   --out "$OUT_ROOT/final.gravity.json" \
   --csv "$OUT_ROOT/final.gravity.csv"
 
@@ -347,6 +351,7 @@ echo "========== 15. FINAL HEADING-PLAN AUDIT =========="
   --motion "$FINAL_NPY" \
   --report "$FINAL_REPORT" \
   --db "$GENERATION_DB" \
+  --fps "$V46_51_FPS" \
   --out "$OUT_ROOT/final.heading.json" \
   --csv "$OUT_ROOT/final.heading.csv"
 
