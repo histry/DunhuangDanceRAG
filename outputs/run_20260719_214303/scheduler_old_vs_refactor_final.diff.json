@@ -1,0 +1,95 @@
+{
+  "schema": "scheduler_end_to_end_differential_v1",
+  "inputs": {
+    "old_motion": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\fresh_schedule\\resume_local_index_20260721_110312_36ce6f03d7a8\\raw_v26_schedule\\dunhuangwu2_v26.npy",
+    "old_report": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\fresh_schedule\\resume_local_index_20260721_110312_36ce6f03d7a8\\raw_v26_schedule\\dunhuangwu2_v26.schedule_report.json",
+    "new_motion": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\same_wav_regression_refactor_final\\schedule\\dunhuangwu2_v26.npy",
+    "new_report": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\same_wav_regression_refactor_final\\schedule\\dunhuangwu2_v26.schedule_report.json",
+    "audio": "D:\\DunhuangDanceRAG\\assets\\music\\test\\audio\\dunhuangwu2.wav",
+    "audio_sha256": "36ce6f03d7a8c57507071fcd74429562b256c03f5523c7e0657f0d1037cd598c",
+    "old_rot6d_layout": "column",
+    "new_rot6d_layout": "column"
+  },
+  "hashes": {
+    "old_motion_sha256": "420c5f44d42bea9eec57b57fd1fc06579cfabc958335e1fac6acf8a1e54f558a",
+    "new_motion_sha256": "1af05c234533ec9677eabe49c1df30196b88009f368107fbce7d89fc22119140",
+    "old_report_sha256": "778e6a18f64d9f5978e2ba1821c9bc6e3903e05fed50931d2b82b6129c3a2abf",
+    "new_report_sha256": "367aeb6c5488690bb6c57252b5e40ab9d2ce476cc829ea2c5c822ae6983b1454"
+  },
+  "contracts": {
+    "old_rotation_contract": null,
+    "new_rotation_contract": {
+      "motion_rot6d_layout": "column",
+      "event_index_rot6d_layout": "column",
+      "duration_checkpoint_rot6d_layout": "pytorch3d_row",
+      "transition_checkpoint_rot6d_layout": null,
+      "transition_diffusion_checkpoint_rot6d_layout": null
+    }
+  },
+  "route": {
+    "old_slots": 51,
+    "new_slots": 37,
+    "event_id": {
+      "field": "event_id",
+      "compared": 37,
+      "exact": 0,
+      "exact_ratio": 0.0,
+      "lengths_equal": false
+    },
+    "family_id": {
+      "field": "family_id",
+      "compared": 37,
+      "exact": 0,
+      "exact_ratio": 0.0,
+      "lengths_equal": false
+    },
+    "transition_len": {
+      "field": "transition_len",
+      "compared": 37,
+      "exact": 1,
+      "exact_ratio": 0.02702702702702703,
+      "lengths_equal": false
+    },
+    "allocated_content_len": {
+      "field": "allocated_content_len",
+      "compared": 37,
+      "exact": 0,
+      "exact_ratio": 0.0,
+      "lengths_equal": false
+    },
+    "old_score": 198.63499158106723,
+    "new_score": -232.27727071682594,
+    "score_abs_delta": 430.91226229789316
+  },
+  "motion": {
+    "shape": [
+      3601,
+      151
+    ],
+    "contact_abs_mean": 0.27693694829940796,
+    "contact_abs_max": 1.0,
+    "root_abs_mean_m": 0.3456137776374817,
+    "root_abs_max_m": 1.1836706399917603,
+    "rot6d_raw_abs_mean": 0.23997122049331665,
+    "rot6d_raw_abs_max": 1.9902477264404297,
+    "rotation_geodesic_rad": {
+      "mean": 0.7028676867485046,
+      "p50": 0.5664834976196289,
+      "p95": 1.8067864358425119,
+      "p99": 2.6122981047630325,
+      "p100": 3.140043258666992,
+      "joint_ratio_over_1e-4": 0.916643524946774,
+      "frame_ratio_over_1e-4": 1.0
+    }
+  },
+  "acceptance": {
+    "exact_frame_count": true,
+    "exact_route": false,
+    "exact_transition_lengths": false,
+    "exact_content_lengths": false,
+    "rotation_p95_below_1e-4_rad": false,
+    "rotation_max_below_0_1_rad": false,
+    "root_max_below_1e-4_m": false,
+    "passed": false
+  }
+}

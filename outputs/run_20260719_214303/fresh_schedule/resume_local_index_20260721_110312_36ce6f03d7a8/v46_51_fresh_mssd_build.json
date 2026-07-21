@@ -1,0 +1,33 @@
+{
+  "schema": "v46_51_fresh_wav_mssd_build",
+  "ok": true,
+  "run_id": "resume_local_index_20260721_110312_36ce6f03d7a8",
+  "run_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8",
+  "audio": {
+    "path": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav",
+    "name": "dunhuangwu2.wav",
+    "stem": "dunhuangwu2",
+    "suffix": ".wav",
+    "sha256": "36ce6f03d7a8c57507071fcd74429562b256c03f5523c7e0657f0d1037cd598c",
+    "size_bytes": 7682170,
+    "mtime_ns": 1784459617222623598,
+    "fps": 30.0,
+    "target_frames": 3601,
+    "decoder": "python_wave",
+    "channels": 2,
+    "sample_width_bytes": 2,
+    "sample_rate": 16000,
+    "sample_frames": 1920523,
+    "duration_seconds": 120.0326875
+  },
+  "out_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json",
+  "contract_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json.contract.json",
+  "contract_csv": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json.contract.csv",
+  "raw_schedule_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule/dunhuangwu2_v26.schedule_report.json",
+  "raw_schedule_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule",
+  "feature_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/music_features",
+  "num_slots": 51,
+  "total_target_frames": 3601,
+  "deep_music_features": true,
+  "require_deep_music": true
+}

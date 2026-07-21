@@ -1,0 +1,456 @@
+{
+  "schema": "performer_aware_source_disjoint_cache_split",
+  "ok": true,
+  "reasons": [],
+  "cache_root": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache",
+  "out_root": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split",
+  "seed": 20260718,
+  "split_ratios": {
+    "train": 0.67,
+    "val": 0.165,
+    "test": 0.165
+  },
+  "target_counts": {
+    "train": 8,
+    "val": 2,
+    "test": 2
+  },
+  "performer_capacities": {
+    "female": {
+      "train": 2,
+      "val": 1,
+      "test": 1
+    },
+    "male": {
+      "train": 6,
+      "val": 1,
+      "test": 1
+    }
+  },
+  "assignment_unit": "source_uid_before_event_slicing",
+  "assignment_algorithm": "exact_global_capacity_performer_stratified_dance_category_aware_deterministic",
+  "materialization_requested": "copy",
+  "materialization_actual": {
+    "copy": 24
+  },
+  "num_sources": 12,
+  "splits": {
+    "train": {
+      "sources": 8,
+      "source_uids": [
+        "female_36pose_2",
+        "female_lotus",
+        "male_36pose_1",
+        "male_36pose_2",
+        "male_drum_1",
+        "male_drum_2",
+        "male_pipa_1",
+        "male_pipa_2"
+      ],
+      "performer_group_histogram": {
+        "female": 2,
+        "male": 6
+      },
+      "dance_key_histogram": {
+        "thirty_six_postures": 3,
+        "lotus_steps": 1,
+        "lei_gong_drum": 2,
+        "pipa_behind_back": 2
+      },
+      "records": [
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_2.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_2.retarget.json",
+          "relative_motion": "female_36pose_2.npy",
+          "relative_report": "female_36pose_2.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_36pose_2.bvh",
+          "source_uid": "female_36pose_2",
+          "dance_key": "thirty_six_postures",
+          "performer_group": "female",
+          "source_anatomy_quality": 0.8624693791687159,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "female_36pose_2",
+            "source_group": "female_36pose_2",
+            "gender": "female",
+            "dance_key": "thirty_six_postures",
+            "dance_category": "Ji Yue Tian Thirty-Six Postures",
+            "semantic_role": "iconic_pose_sequence",
+            "semantic_text": "female Ji Yue Tian Thirty-Six Postures take 2; role=iconic_pose_sequence",
+            "take_id": 2,
+            "source_take": 2,
+            "label": "thirty_six_postures_take2",
+            "parent_label": "thirty_six_postures",
+            "raw_stem": "female_36pose_2"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/female_36pose_2.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/female_36pose_2.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_lotus.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_lotus.retarget.json",
+          "relative_motion": "female_lotus.npy",
+          "relative_report": "female_lotus.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_lotus.bvh",
+          "source_uid": "female_lotus",
+          "dance_key": "lotus_steps",
+          "performer_group": "female",
+          "source_anatomy_quality": 0.9536018635846639,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "female_lotus",
+            "source_group": "female_lotus",
+            "gender": "female",
+            "dance_key": "lotus_steps",
+            "dance_category": "Lotus Steps",
+            "semantic_role": "flowing_footwork",
+            "semantic_text": "female Lotus Steps; role=flowing_footwork",
+            "take_id": -1,
+            "source_take": -1,
+            "label": "lotus_steps",
+            "parent_label": "lotus_steps",
+            "raw_stem": "female_lotus"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/female_lotus.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/female_lotus.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_1.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_1.retarget.json",
+          "relative_motion": "male_36pose_1.npy",
+          "relative_report": "male_36pose_1.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_36pose_1.bvh",
+          "source_uid": "male_36pose_1",
+          "dance_key": "thirty_six_postures",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.9437740859411826,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_36pose_1",
+            "source_group": "male_36pose_1",
+            "gender": "male",
+            "dance_key": "thirty_six_postures",
+            "dance_category": "Ji Yue Tian Thirty-Six Postures",
+            "semantic_role": "iconic_pose_sequence",
+            "semantic_text": "male Ji Yue Tian Thirty-Six Postures take 1; role=iconic_pose_sequence",
+            "take_id": 1,
+            "source_take": 1,
+            "label": "thirty_six_postures_take1",
+            "parent_label": "thirty_six_postures",
+            "raw_stem": "male_36pose_1"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_36pose_1.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_36pose_1.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_2.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_2.retarget.json",
+          "relative_motion": "male_36pose_2.npy",
+          "relative_report": "male_36pose_2.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_36pose_2.bvh",
+          "source_uid": "male_36pose_2",
+          "dance_key": "thirty_six_postures",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.8636535721631219,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_36pose_2",
+            "source_group": "male_36pose_2",
+            "gender": "male",
+            "dance_key": "thirty_six_postures",
+            "dance_category": "Ji Yue Tian Thirty-Six Postures",
+            "semantic_role": "iconic_pose_sequence",
+            "semantic_text": "male Ji Yue Tian Thirty-Six Postures take 2; role=iconic_pose_sequence",
+            "take_id": 2,
+            "source_take": 2,
+            "label": "thirty_six_postures_take2",
+            "parent_label": "thirty_six_postures",
+            "raw_stem": "male_36pose_2"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_36pose_2.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_36pose_2.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_1.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_1.retarget.json",
+          "relative_motion": "male_drum_1.npy",
+          "relative_report": "male_drum_1.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_drum_1.bvh",
+          "source_uid": "male_drum_1",
+          "dance_key": "lei_gong_drum",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.8649943261691267,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_drum_1",
+            "source_group": "male_drum_1",
+            "gender": "male",
+            "dance_key": "lei_gong_drum",
+            "dance_category": "Lei Gong Drum",
+            "semantic_role": "percussive_high_energy",
+            "semantic_text": "male Lei Gong Drum take 1; role=percussive_high_energy",
+            "take_id": 1,
+            "source_take": 1,
+            "label": "lei_gong_drum_take1",
+            "parent_label": "lei_gong_drum",
+            "raw_stem": "male_drum_1"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_drum_1.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_drum_1.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_2.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_2.retarget.json",
+          "relative_motion": "male_drum_2.npy",
+          "relative_report": "male_drum_2.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_drum_2.bvh",
+          "source_uid": "male_drum_2",
+          "dance_key": "lei_gong_drum",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.9105838356402983,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_drum_2",
+            "source_group": "male_drum_2",
+            "gender": "male",
+            "dance_key": "lei_gong_drum",
+            "dance_category": "Lei Gong Drum",
+            "semantic_role": "percussive_high_energy",
+            "semantic_text": "male Lei Gong Drum take 2; role=percussive_high_energy",
+            "take_id": 2,
+            "source_take": 2,
+            "label": "lei_gong_drum_take2",
+            "parent_label": "lei_gong_drum",
+            "raw_stem": "male_drum_2"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_drum_2.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_drum_2.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_1.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_1.retarget.json",
+          "relative_motion": "male_pipa_1.npy",
+          "relative_report": "male_pipa_1.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_pipa_1.bvh",
+          "source_uid": "male_pipa_1",
+          "dance_key": "pipa_behind_back",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.8358517451785342,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_pipa_1",
+            "source_group": "male_pipa_1",
+            "gender": "male",
+            "dance_key": "pipa_behind_back",
+            "dance_category": "Playing the Pipa Behind the Back",
+            "semantic_role": "instrument_upper_body_motif",
+            "semantic_text": "male Playing the Pipa Behind the Back take 1; role=instrument_upper_body_motif",
+            "take_id": 1,
+            "source_take": 1,
+            "label": "pipa_behind_back_take1",
+            "parent_label": "pipa_behind_back",
+            "raw_stem": "male_pipa_1"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_pipa_1.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_pipa_1.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_2.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_2.retarget.json",
+          "relative_motion": "male_pipa_2.npy",
+          "relative_report": "male_pipa_2.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_pipa_2.bvh",
+          "source_uid": "male_pipa_2",
+          "dance_key": "pipa_behind_back",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.8468927313152935,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_pipa_2",
+            "source_group": "male_pipa_2",
+            "gender": "male",
+            "dance_key": "pipa_behind_back",
+            "dance_category": "Playing the Pipa Behind the Back",
+            "semantic_role": "instrument_upper_body_motif",
+            "semantic_text": "male Playing the Pipa Behind the Back take 2; role=instrument_upper_body_motif",
+            "take_id": 2,
+            "source_take": 2,
+            "label": "pipa_behind_back_take2",
+            "parent_label": "pipa_behind_back",
+            "raw_stem": "male_pipa_2"
+          },
+          "split": "train",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_pipa_2.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/train/male_pipa_2.retarget.json"
+        }
+      ]
+    },
+    "val": {
+      "sources": 2,
+      "source_uids": [
+        "female_mediation",
+        "male_ribbon"
+      ],
+      "performer_group_histogram": {
+        "female": 1,
+        "male": 1
+      },
+      "dance_key_histogram": {
+        "revelation_meditation": 1,
+        "sogdian_whirl": 1
+      },
+      "records": [
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_mediation.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_mediation.retarget.json",
+          "relative_motion": "female_mediation.npy",
+          "relative_report": "female_mediation.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+          "source_uid": "female_mediation",
+          "dance_key": "revelation_meditation",
+          "performer_group": "female",
+          "source_anatomy_quality": 0.7997231358263089,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "female_mediation",
+            "source_group": "female_mediation",
+            "gender": "female",
+            "dance_key": "revelation_meditation",
+            "dance_category": "Revelation Meditation",
+            "semantic_role": "calm_meditative_flow",
+            "semantic_text": "female Revelation Meditation; role=calm_meditative_flow",
+            "take_id": -1,
+            "source_take": -1,
+            "label": "revelation_meditation",
+            "parent_label": "revelation_meditation",
+            "raw_stem": "female_mediation"
+          },
+          "split": "val",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_ribbon.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_ribbon.retarget.json",
+          "relative_motion": "male_ribbon.npy",
+          "relative_report": "male_ribbon.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh",
+          "source_uid": "male_ribbon",
+          "dance_key": "sogdian_whirl",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.9643125042243538,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_ribbon",
+            "source_group": "male_ribbon",
+            "gender": "male",
+            "dance_key": "sogdian_whirl",
+            "dance_category": "Sogdian Whirl / Ribbon Flow",
+            "semantic_role": "flowing_turning_motif",
+            "semantic_text": "male Sogdian Whirl / Ribbon Flow; role=flowing_turning_motif",
+            "take_id": -1,
+            "source_take": -1,
+            "label": "sogdian_whirl",
+            "parent_label": "sogdian_whirl",
+            "raw_stem": "male_ribbon"
+          },
+          "split": "val",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/male_ribbon.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/male_ribbon.retarget.json"
+        }
+      ]
+    },
+    "test": {
+      "sources": 2,
+      "source_uids": [
+        "female_36pose_1",
+        "male_mediation"
+      ],
+      "performer_group_histogram": {
+        "female": 1,
+        "male": 1
+      },
+      "dance_key_histogram": {
+        "thirty_six_postures": 1,
+        "revelation_meditation": 1
+      },
+      "records": [
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_1.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_1.retarget.json",
+          "relative_motion": "female_36pose_1.npy",
+          "relative_report": "female_36pose_1.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_36pose_1.bvh",
+          "source_uid": "female_36pose_1",
+          "dance_key": "thirty_six_postures",
+          "performer_group": "female",
+          "source_anatomy_quality": 0.9050702927970308,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "female_36pose_1",
+            "source_group": "female_36pose_1",
+            "gender": "female",
+            "dance_key": "thirty_six_postures",
+            "dance_category": "Ji Yue Tian Thirty-Six Postures",
+            "semantic_role": "iconic_pose_sequence",
+            "semantic_text": "female Ji Yue Tian Thirty-Six Postures take 1; role=iconic_pose_sequence",
+            "take_id": 1,
+            "source_take": 1,
+            "label": "thirty_six_postures_take1",
+            "parent_label": "thirty_six_postures",
+            "raw_stem": "female_36pose_1"
+          },
+          "split": "test",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/test/female_36pose_1.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/test/female_36pose_1.retarget.json"
+        },
+        {
+          "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_mediation.npy",
+          "report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_mediation.retarget.json",
+          "relative_motion": "male_mediation.npy",
+          "relative_report": "male_mediation.retarget.json",
+          "original_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_mediation.bvh",
+          "source_uid": "male_mediation",
+          "dance_key": "revelation_meditation",
+          "performer_group": "male",
+          "source_anatomy_quality": 0.8044412368952107,
+          "source_gate_reasons": [],
+          "semantic": {
+            "source_uid": "male_mediation",
+            "source_group": "male_mediation",
+            "gender": "male",
+            "dance_key": "revelation_meditation",
+            "dance_category": "Revelation Meditation",
+            "semantic_role": "calm_meditative_flow",
+            "semantic_text": "male Revelation Meditation; role=calm_meditative_flow",
+            "take_id": -1,
+            "source_take": -1,
+            "label": "revelation_meditation",
+            "parent_label": "revelation_meditation",
+            "raw_stem": "male_mediation"
+          },
+          "split": "test",
+          "split_motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/test/male_mediation.npy",
+          "split_report": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/test/male_mediation.retarget.json"
+        }
+      ]
+    }
+  },
+  "overlap": {
+    "train_val": [],
+    "train_test": [],
+    "val_test": []
+  },
+  "policy": {
+    "split_before_event_slicing": true,
+    "validation_and_test_cover_both_known_performer_groups": true,
+    "training_retrieval_uses_train_motion_only": true
+  }
+}

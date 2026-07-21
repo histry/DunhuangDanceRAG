@@ -1,0 +1,101 @@
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events_aesd.npz",
+  "num_events": 136,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 111,
+    "lyrical_flow": 0,
+    "instrument_phrase": 0,
+    "percussive_accent": 0,
+    "turning_climax": 25,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 100,
+    "medium": 16,
+    "high": 20
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "revelation_meditation",
+    "source_group": "female_mediation",
+    "source_uid": "female_mediation",
+    "dance_key": "revelation_meditation",
+    "dance_category": "Revelation Meditation",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.37186896800994873,
+      "pose_hold": 0.5934489965438843,
+      "lyrical_flow": 0.0,
+      "instrument_phrase": 0.034682080149650574,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.0,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "calm",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 3.8333332538604736,
+    "natural_duration_range_sec": [
+      2.0,
+      6.0
+    ],
+    "event_quality_score": 0.9352619647979736,
+    "semantic_confidence": 0.9377018213272095,
+    "boundary_risk_score": 0.005138223192261648,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.0002998073274890582,
+      "exit_velocity_norm": 2.139517164323479e-05,
+      "entry_exit_pose_gap_self": 2.091212991217617e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_mediation::revelation_meditation::pose_motif"
+  }
+}

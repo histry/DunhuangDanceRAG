@@ -1,0 +1,33 @@
+{
+  "schema": "v46_51_scheduler_asset_resolution",
+  "root": "/home/disk/lsm/storage/DunhuangDanceRAG",
+  "assets": {
+    "index_json": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json",
+    "duration_index_npz": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz",
+    "router_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt",
+    "planner_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt",
+    "v23_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt",
+    "hierarchy_index_npz": "/home/disk/lsm/storage/EDGE/data/v26_hierarchical_event_index.npz",
+    "start_pose": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy"
+  },
+  "resolution_sources": {
+    "index_json": "environment:V46_51_INDEX_JSON",
+    "duration_index_npz": "environment:V46_51_DURATION_INDEX_NPZ",
+    "router_ckpt": "environment:V46_51_ROUTER_CKPT",
+    "planner_ckpt": "environment:V46_51_PLANNER_CKPT",
+    "v23_ckpt": "environment:V46_51_V23_CKPT",
+    "hierarchy_index_npz": "environment:V46_51_HIERARCHY_INDEX_NPZ",
+    "start_pose": "environment:V46_51_START_POSE"
+  },
+  "required_assets": [
+    "duration_index_npz",
+    "index_json",
+    "planner_ckpt",
+    "router_ckpt",
+    "v23_ckpt"
+  ],
+  "optional_assets": [
+    "hierarchy_index_npz",
+    "start_pose"
+  ]
+}

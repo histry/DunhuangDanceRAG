@@ -1,0 +1,10 @@
+{
+  "schema": "v46_53_dual_branch_structure_guided_grounding_v1",
+  "db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events.npz",
+  "checkpoint": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/checkpoints/grounder.pt",
+  "device": "cpu",
+  "events": 136,
+  "embedding_dim": 96,
+  "mode": "train-checkpoint embedding only",
+  "ok": true
+}

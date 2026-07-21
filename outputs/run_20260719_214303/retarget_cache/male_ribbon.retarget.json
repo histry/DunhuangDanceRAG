@@ -1,0 +1,573 @@
+{
+  "version": "v46_52_anatomy_constrained_bvh_retarget_v46_53_1",
+  "source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh",
+  "source_fps": 59.998800023999515,
+  "target_fps": 30.0,
+  "source_frames": 4746,
+  "target_frames": 2374,
+  "source_joint_count": 24,
+  "source_position_contract": {
+    "version": "v46_49_2_nonroot_position_contract",
+    "root_position": "retained",
+    "nonroot_position_mode": "ignore",
+    "hierarchy_offsets": "retained"
+  },
+  "mapping": {
+    "0": {
+      "source_index": 0,
+      "source_name": "Hips"
+    },
+    "1": {
+      "source_index": 16,
+      "source_name": "LeftHip"
+    },
+    "2": {
+      "source_index": 20,
+      "source_name": "RightHip"
+    },
+    "4": {
+      "source_index": 17,
+      "source_name": "LeftKnee"
+    },
+    "5": {
+      "source_index": 21,
+      "source_name": "RightKnee"
+    },
+    "6": {
+      "source_index": 1,
+      "source_name": "Chest"
+    },
+    "7": {
+      "source_index": 18,
+      "source_name": "LeftAnkle"
+    },
+    "8": {
+      "source_index": 22,
+      "source_name": "RightAnkle"
+    },
+    "9": {
+      "source_index": 2,
+      "source_name": "Chest2"
+    },
+    "10": {
+      "source_index": 19,
+      "source_name": "LeftAnkle_EndSite"
+    },
+    "11": {
+      "source_index": 23,
+      "source_name": "RightAnkle_EndSite"
+    },
+    "12": {
+      "source_index": 3,
+      "source_name": "Neck"
+    },
+    "13": {
+      "source_index": 6,
+      "source_name": "LeftCollar"
+    },
+    "14": {
+      "source_index": 11,
+      "source_name": "RightCollar"
+    },
+    "15": {
+      "source_index": 4,
+      "source_name": "Head"
+    },
+    "16": {
+      "source_index": 7,
+      "source_name": "LeftShoulder"
+    },
+    "17": {
+      "source_index": 12,
+      "source_name": "RightShoulder"
+    },
+    "18": {
+      "source_index": 8,
+      "source_name": "LeftElbow"
+    },
+    "19": {
+      "source_index": 13,
+      "source_name": "RightElbow"
+    },
+    "20": {
+      "source_index": 9,
+      "source_name": "LeftWrist"
+    },
+    "21": {
+      "source_index": 14,
+      "source_name": "RightWrist"
+    },
+    "22": {
+      "source_index": 10,
+      "source_name": "LeftWrist_EndSite"
+    },
+    "23": {
+      "source_index": 15,
+      "source_name": "RightWrist_EndSite"
+    }
+  },
+  "similarity": {
+    "scale": 0.02523970351301502,
+    "basis_rotation": [
+      [
+        0.999916136264801,
+        0.012919608503580093,
+        -0.000899661798030138
+      ],
+      [
+        0.0002549678029026836,
+        0.049815621227025986,
+        0.9987583756446838
+      ],
+      [
+        0.012948385439813137,
+        -0.9986748695373535,
+        0.04980814829468727
+      ]
+    ],
+    "translation": [
+      -0.515830934047699,
+      -1.032472848892212,
+      0.10721269994974136
+    ],
+    "det_basis_rotation": 1.0
+  },
+  "config": {
+    "target_fps": 30.0,
+    "device": "cuda",
+    "chunk_frames": 256,
+    "chunk_overlap": 64,
+    "iterations": 280,
+    "learning_rate": 0.018,
+    "keypoint_weight": 30.0,
+    "root_weight": 8.0,
+    "temporal_velocity_weight": 0.22,
+    "temporal_acceleration_weight": 0.06,
+    "pose_prior_weight": 0.006,
+    "upright_weight": 5.0,
+    "head_order_weight": 2.0,
+    "feet_order_weight": 1.5,
+    "floor_weight": 4.0,
+    "root_velocity_weight": 1.5,
+    "root_orientation_lock": false,
+    "gradient_clip": 2.0,
+    "contact_height_m": 0.055,
+    "contact_speed_mpf": 0.025,
+    "contact_median_size": 5,
+    "localize_root_xz": true,
+    "floor_to_zero": true,
+    "hard_gravity_gate": false,
+    "gravity_torso_p05_min": 0.3,
+    "fit_rmse_p95_max_m": 0.14,
+    "seed": 1234
+  },
+  "fit": {
+    "floor_y_after": 0.0,
+    "contact_ratio": 0.2495787700084246,
+    "fit_rmse_mean_m": 0.04077623412013054,
+    "fit_rmse_p95_m": 0.043607903830707076,
+    "root_orientation_contract": {
+      "version": "v46_53_1_soft_source_body_frame_contract",
+      "mode": "soft_geodesic_anchor",
+      "root_translation": "optimized",
+      "root_orientation": "optimized_with_source_body_frame_prior",
+      "local_joints_1_to_23": "optimized"
+    },
+    "overlap_fusion": "weighted_rotation_matrix_then_svd_so3_projection",
+    "chunk_reports": [
+      {
+        "start": 0,
+        "end": 256,
+        "loss": 0.6341418623924255,
+        "key": 0.02503785863518715,
+        "root_anchor": 0.02848673425614834,
+        "so3_velocity": 0.004091920331120491,
+        "so3_acceleration": 3.0876145362854004,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 0.0,
+        "anatomy_local_limit": 0.0,
+        "anatomy_spine": 0.0,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.047904253005981445,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 192,
+        "end": 448,
+        "loss": 0.6331982612609863,
+        "key": 0.024975430220365524,
+        "root_anchor": 0.029159903526306152,
+        "so3_velocity": 0.009881867095828056,
+        "so3_acceleration": 6.3567609786987305,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 0.0,
+        "anatomy_local_limit": 0.0,
+        "anatomy_spine": 0.0,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.04733512923121452,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 384,
+        "end": 640,
+        "loss": 0.6135237216949463,
+        "key": 0.024011554196476936,
+        "root_anchor": 0.03674694150686264,
+        "so3_velocity": 0.1181136891245842,
+        "so3_acceleration": 18.54337501525879,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 3.201560684829019e-05,
+        "anatomy_local_limit": 1.0560687769611832e-05,
+        "anatomy_spine": 8.33861548699133e-08,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.06435590982437134,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 576,
+        "end": 832,
+        "loss": 0.6190873384475708,
+        "key": 0.02400360256433487,
+        "root_anchor": 0.04154285788536072,
+        "so3_velocity": 0.23387354612350464,
+        "so3_acceleration": 37.74981689453125,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 6.823986041126773e-06,
+        "anatomy_local_limit": 5.756996962480443e-11,
+        "anatomy_spine": 1.705953309283359e-06,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.08705979585647583,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 768,
+        "end": 1024,
+        "loss": 0.6187946796417236,
+        "key": 0.02404910884797573,
+        "root_anchor": 0.0395628958940506,
+        "so3_velocity": 0.2110915184020996,
+        "so3_acceleration": 43.07445526123047,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 2.414117261650972e-05,
+        "anatomy_local_limit": 6.046131602488458e-06,
+        "anatomy_spine": 1.5006945659479243e-06,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.09718207269906998,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 960,
+        "end": 1216,
+        "loss": 0.6202084422111511,
+        "key": 0.023905456066131592,
+        "root_anchor": 0.03734191507101059,
+        "so3_velocity": 0.33864498138427734,
+        "so3_acceleration": 58.957916259765625,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 0.00014646947965957224,
+        "anatomy_local_limit": 4.854553480981849e-05,
+        "anatomy_spine": 2.0822014334953565e-07,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.1494770646095276,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 1152,
+        "end": 1408,
+        "loss": 0.6183304786682129,
+        "key": 0.02381093241274357,
+        "root_anchor": 0.04112599790096283,
+        "so3_velocity": 0.3325718343257904,
+        "so3_acceleration": 57.748470306396484,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 5.87620979786152e-06,
+        "anatomy_local_limit": 1.244104964825965e-06,
+        "anatomy_spine": 5.359736974241969e-07,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.1548895686864853,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 1344,
+        "end": 1600,
+        "loss": 0.6360204219818115,
+        "key": 0.024087045341730118,
+        "root_anchor": 0.04562145099043846,
+        "so3_velocity": 0.6050214767456055,
+        "so3_acceleration": 96.88291931152344,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 0.00010653344361344352,
+        "anatomy_local_limit": 3.424021269893274e-05,
+        "anatomy_spine": 9.532008675705583e-07,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.10642651468515396,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 1536,
+        "end": 1792,
+        "loss": 0.6314226984977722,
+        "key": 0.023933663964271545,
+        "root_anchor": 0.0366656556725502,
+        "so3_velocity": 0.6623853445053101,
+        "so3_acceleration": 97.54535675048828,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 0.0002738300827331841,
+        "anatomy_local_limit": 8.99052174645476e-05,
+        "anatomy_spine": 1.0286084943800233e-06,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.07601909339427948,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 1728,
+        "end": 1984,
+        "loss": 0.6766446828842163,
+        "key": 0.024947550147771835,
+        "root_anchor": 0.049135319888591766,
+        "so3_velocity": 0.852637767791748,
+        "so3_acceleration": 206.47900390625,
+        "upright": 0.0,
+        "penetration": 1.0492127330508083e-05,
+        "anatomy_total": 0.0011402023956179619,
+        "anatomy_local_limit": 0.0003718758816830814,
+        "anatomy_spine": 6.028350071574096e-06,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.46000224351882935,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 1920,
+        "end": 2176,
+        "loss": 0.6720583438873291,
+        "key": 0.025035273283720016,
+        "root_anchor": 0.04872091859579086,
+        "so3_velocity": 0.7012748718261719,
+        "so3_acceleration": 183.85430908203125,
+        "upright": 0.0,
+        "penetration": 6.98048233971349e-06,
+        "anatomy_total": 0.001054222579114139,
+        "anatomy_local_limit": 0.00034985641832463443,
+        "anatomy_spine": 1.0435587682877667e-06,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.41019195318222046,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 2112,
+        "end": 2368,
+        "loss": 0.6305143237113953,
+        "key": 0.024151969701051712,
+        "root_anchor": 0.0409560352563858,
+        "so3_velocity": 0.3961050510406494,
+        "so3_acceleration": 81.2759780883789,
+        "upright": 0.0,
+        "penetration": 4.173334673396312e-06,
+        "anatomy_total": 0.0002536140091251582,
+        "anatomy_local_limit": 8.371700823772699e-05,
+        "anatomy_spine": 6.157447955956741e-07,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.16103707253932953,
+        "iterations": 280,
+        "learning_rate": 0.018
+      },
+      {
+        "start": 2304,
+        "end": 2374,
+        "loss": 0.6244750618934631,
+        "key": 0.023697655647993088,
+        "root_anchor": 0.04379716143012047,
+        "so3_velocity": 0.5024951100349426,
+        "so3_acceleration": 84.4732666015625,
+        "upright": 0.0,
+        "penetration": 0.0,
+        "anatomy_total": 0.0008277386077679694,
+        "anatomy_local_limit": 0.0002749389095697552,
+        "anatomy_spine": 7.304697078325262e-07,
+        "anatomy_torso": 0.0,
+        "anatomy_collision": 0.0,
+        "style_gate_mean": 0.19987636804580688,
+        "iterations": 280,
+        "learning_rate": 0.018
+      }
+    ],
+    "heading_contract": {
+      "version": "v46_49_3_absolute_heading_contract",
+      "mode": "stabilize",
+      "persistent_drift_ratio": 0.05686604886267902,
+      "longest_candidate_drift_seconds": 2.3,
+      "removed_turns": -0.10071022861994867,
+      "correction_speed_deg_s_p95": 4.638008737564086,
+      "raw": {
+        "net_turns": 4.815507395063766,
+        "absolute_turns": 10.714233008001603,
+        "yaw_speed_deg_s_p50": 14.197811126708984,
+        "yaw_speed_deg_s_p95": 208.83378524780233,
+        "yaw_speed_deg_s_max": 500.60540771484375,
+        "active_turn_ratio": 0.7299915754001685,
+        "longest_active_turn_seconds": 9.4
+      },
+      "corrected": {
+        "net_turns": 4.91621716833777,
+        "absolute_turns": 10.68169459392359,
+        "yaw_speed_deg_s_p50": 13.658499240875244,
+        "yaw_speed_deg_s_p95": 208.83435668945273,
+        "yaw_speed_deg_s_max": 500.60504150390625,
+        "active_turn_ratio": 0.7291491154170177,
+        "longest_active_turn_seconds": 9.4
+      }
+    }
+  },
+  "gravity": {
+    "frames": 2374,
+    "fps": 30.0,
+    "nonfinite_count": 0,
+    "torso_up_cos_p05": 0.8784262329339981,
+    "torso_up_cos_median": 0.9840555787086487,
+    "torso_up_cos_p95": 0.9982905596494674,
+    "torso_abs_up_cos_p05": 0.8784262329339981,
+    "horizontal_body_ratio": 0.0,
+    "head_above_pelvis_ratio": 1.0,
+    "neck_above_pelvis_ratio": 1.0,
+    "feet_below_pelvis_ratio": 1.0,
+    "root_up_cos_p05": 0.9217670738697052,
+    "root_up_cos_median": 0.9842299222946167,
+    "pelvis_y_p05": 0.504838414490223,
+    "pelvis_y_p95": 1.0714903533458708,
+    "floor_y": -2.9802322387695312e-08,
+    "foot_height_above_floor_p95": 0.3338792398571968,
+    "foot_speed_xz_p95_mpf": 0.09582060389220715
+  },
+  "gravity_thresholds": {
+    "torso_up_cos_p05_min": 0.3,
+    "torso_up_cos_median_min": 0.55,
+    "head_above_pelvis_ratio_min": 0.85,
+    "feet_below_pelvis_ratio_min": 0.85,
+    "horizontal_body_ratio_max": 0.2,
+    "nonfinite_count_max": 0
+  },
+  "gravity_ok": true,
+  "gravity_reasons": [],
+  "fit_ok": true,
+  "ok": true,
+  "schema": "v46_53_1_source_safety_retarget",
+  "anatomy": {
+    "schema": "v46_53_1_posture_aware_anatomy_contract",
+    "frames": 2374,
+    "fps": 30.0,
+    "nonfinite_count": 0,
+    "rot_orthogonality_p95": 2.668219352131018e-07,
+    "rot_orthogonality_max": 4.938227675665985e-07,
+    "rot_det_abs_error_p95": 1.1920928955078125e-07,
+    "rot_det_min": 0.9999998211860657,
+    "raw_local_angle_violation_ratio": 0.008407048581859028,
+    "local_angle_violation_ratio": 0.007950716090985677,
+    "local_angle_severe_ratio": 7.020499859590003e-05,
+    "local_angle_p95_deg": 65.3358991285224,
+    "local_angle_max_deg": 179.32943725585938,
+    "spine_cumulative_angle_p95_rad": 2.2506368160247803,
+    "spine_cumulative_angle_p95_deg": 128.95199077498143,
+    "spine_cumulative_angle_max_deg": 149.41038513183594,
+    "torso_compression_ratio_p01": 0.8945111149549484,
+    "torso_compression_ratio_p05": 0.9207733899354935,
+    "torso_compression_ratio_median": 0.9801346063613892,
+    "neck_compression_ratio_p01": 0.9086419510841369,
+    "neck_compression_ratio_p05": 0.9289009243249893,
+    "body_height_ratio_p05": 0.7802544444799423,
+    "body_height_ratio_median": 1.0727283954620361,
+    "torso_up_cos_p05": 0.8784262329339981,
+    "torso_up_cos_median": 0.9840555787086487,
+    "pelvis_height_norm_p05": 0.6210340648889543,
+    "pelvis_height_norm_median": 1.1936826705932617,
+    "pelvis_height_norm_p95": 1.3181089401245116,
+    "knee_angle_p05_deg": 65.55222727048125,
+    "elbow_angle_p05_deg": 107.69912941583068,
+    "knee_collapse_ratio": 0.0,
+    "elbow_collapse_ratio": 0.0,
+    "self_collision_severe_ratio": 0.0,
+    "wrist_torso_distance_p01_m": 0.3198295509815216,
+    "knee_separation_p01_m": 0.1676442563533783,
+    "floor_y": -2.9802322387695312e-08,
+    "support_floor_y": -2.9802322387695312e-08,
+    "stage_floor_y": 0.0,
+    "floor_reference_mode": "stage_zero",
+    "foot_penetration_p01_m": -0.04048188701272011,
+    "foot_penetration_min_m": -0.11069069802761078,
+    "bone_length_drift_max": 2.822651010583779e-06,
+    "posture_entry": "standing",
+    "posture_exit": "standing",
+    "posture_mode": "standing",
+    "posture_distribution": {
+      "aerial": 0.04759898904802022,
+      "deep_squat": 0.04170176916596462,
+      "floor_pose": 0.004633529907329402,
+      "half_squat": 0.007160909856781803,
+      "standing": 0.8989048020219039
+    },
+    "anatomy_quality": 0.9643125042243538
+  },
+  "anatomy_thresholds": {
+    "nonfinite_count_max": 0,
+    "rot_orthogonality_p95_max": 0.0003,
+    "rot_det_abs_error_p95_max": 0.0003,
+    "local_angle_severe_ratio_max": 0.012,
+    "spine_cumulative_angle_p95_max_rad": 3.2288591161895095,
+    "torso_compression_ratio_p01_min": 0.34,
+    "neck_compression_ratio_p01_min": 0.36,
+    "self_collision_severe_ratio_max": 0.08,
+    "foot_penetration_p01_min_m": -0.08,
+    "bone_length_drift_max": 0.0003,
+    "anatomy_quality_min": 0.18
+  },
+  "anatomy_ok": true,
+  "fit_rmse_p95_m": 0.043607903830707076,
+  "fit_rmse_p95_max_m": 0.14,
+  "source_gate_ok": true,
+  "source_gate_reasons": [],
+  "event_gate_required": true,
+  "output": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_ribbon.npy",
+  "source_relative": "male_ribbon.bvh",
+  "preferred_source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh",
+  "source_used": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh",
+  "representation_fallbacks": [],
+  "v46_53_1_cache_contract": {
+    "schema": "v46_53_1_source_safe_retarget_cache",
+    "source_gate": "catastrophic_only",
+    "event_quality_gate_deferred": true,
+    "requires_gravity_ok": true,
+    "requires_fit_ok": true,
+    "official_smpl_preferred": true
+  }
+}

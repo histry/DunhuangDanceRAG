@@ -1,0 +1,10 @@
+{
+  "schema": "event_performer_metadata",
+  "event_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events.npz",
+  "num_events": 412,
+  "performer_group_histogram": {
+    "female": 283,
+    "male": 129
+  },
+  "unknown_is_error": true
+}

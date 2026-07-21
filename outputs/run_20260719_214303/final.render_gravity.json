@@ -1,0 +1,25 @@
+[
+  {
+    "batch": 0,
+    "ok": true,
+    "reasons": [],
+    "frames": 3601,
+    "fps": 30.0,
+    "nonfinite_count": 0,
+    "torso_up_cos_p05": 0.9402911067008972,
+    "torso_up_cos_median": 0.9882494807243347,
+    "torso_up_cos_p95": 0.9970911145210266,
+    "torso_abs_up_cos_p05": 0.9402911067008972,
+    "horizontal_body_ratio": 0.0,
+    "head_above_pelvis_ratio": 1.0,
+    "neck_above_pelvis_ratio": 1.0,
+    "feet_below_pelvis_ratio": 1.0,
+    "root_up_cos_p05": 0.9175046682357788,
+    "root_up_cos_median": 0.9671416282653809,
+    "pelvis_y_p05": 1.0455200672149658,
+    "pelvis_y_p95": 1.1765189170837402,
+    "floor_y": 0.1297783948481083,
+    "foot_height_above_floor_p95": 0.5369494557380676,
+    "foot_speed_xz_p95_mpf": 0.025435571465641234
+  }
+]

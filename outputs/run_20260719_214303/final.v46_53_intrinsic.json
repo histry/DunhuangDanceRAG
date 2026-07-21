@@ -1,0 +1,9 @@
+{
+  "schema": "v46_53_bidirectional_tangent_boundary_v1",
+  "frames": 3601,
+  "angular_velocity_p95_rad_s": 0.8957227140665062,
+  "angular_acceleration_p95_rad_s2": 8.67960810661316,
+  "root_velocity_p95_m_s": 0.08178962096571911,
+  "root_acceleration_p95_m_s2": 1.293573272228241,
+  "ok": true
+}

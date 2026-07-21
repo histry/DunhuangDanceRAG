@@ -1,0 +1,66 @@
+{
+  "schema": "same_wav_no_training_regression_v1",
+  "ok": false,
+  "reasons": [
+    "foot_skate_p95_mpf_too_high",
+    "foot_skate_max_mpf_too_high",
+    "foot_penetration_too_low"
+  ],
+  "audio": "D:\\DunhuangDanceRAG\\assets\\music\\test\\audio\\dunhuangwu2.wav",
+  "schedule_report": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\same_wav_regression_refactor\\schedule\\dunhuangwu2_v26.schedule_report.json",
+  "action_motion": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\same_wav_regression_refactor\\same_wav_no_training_action.npy",
+  "event_db_contract": {
+    "schema": "dunhuang_event_db_contract_v1",
+    "num_events": 1570,
+    "ordered_event_uid_sha256": "76817549fcf3f455fde2ec6764a77371552bcac4a77b8b2e0289145385568ba7"
+  },
+  "route": {
+    "num_slots": 37,
+    "unique_events": 37,
+    "unique_ratio": 1.0,
+    "adjacent_repeats": 0,
+    "source_counts": {
+      "male_pipa_1": 5,
+      "male_36pose_1": 7,
+      "female_lotus": 6,
+      "male_36pose_2": 7,
+      "female_36pose_2": 7,
+      "male_pipa_2": 3,
+      "male_drum_2": 2
+    },
+    "max_source_share": 0.1891891891891892,
+    "transition_fraction": 0.1999444598722577
+  },
+  "ik": {
+    "enabled": false,
+    "contact_recomputed": true,
+    "confidence_mean": 0.34880658984184265,
+    "floor_y": 0.03617532551288605
+  },
+  "physical": {
+    "ok": false,
+    "reasons": [
+      "foot_skate_p95_mpf_too_high",
+      "foot_skate_max_mpf_too_high",
+      "foot_penetration_too_low"
+    ],
+    "limits": {
+      "foot_skate_p95_mpf": 0.006,
+      "foot_skate_max_mpf": 0.02,
+      "foot_penetration_min_m": -0.02,
+      "mean_joint_jerk_p95": 0.025
+    },
+    "audit": {
+      "frames": 3601,
+      "floor_y": 0.03617532551288605,
+      "contact_ratio": 0.09941682865870592,
+      "foot_skate_mean_mpf": 0.002517573069781065,
+      "foot_skate_p95_mpf": 0.007705938536673784,
+      "foot_skate_max_mpf": 0.058631859719753265,
+      "foot_penetration_min_m": -0.11452673375606537,
+      "mean_joint_jerk_p95": 0.00769517058506608,
+      "mean_joint_jerk_max": 0.13798391819000244,
+      "root_y_range_m": 0.36578720808029175
+    }
+  }
+}

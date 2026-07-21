@@ -1,0 +1,2 @@
+path,ok,frames,torso_up_cos_p05,torso_up_cos_median,horizontal_body_ratio,head_above_pelvis_ratio,feet_below_pelvis_ratio,root_up_cos_p05,nonfinite_count,reasons
+/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.npy,True,3601,0.9402911067008972,0.9882494807243347,0.0,1.0,1.0,0.9175046682357788,0,

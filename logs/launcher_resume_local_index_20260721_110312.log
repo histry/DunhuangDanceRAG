@@ -1,0 +1,1382 @@
+nohup: 忽略输入
+[RUN] AUDIO=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav
+[RUN] OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303
+[RUN] LOG=/home/disk/lsm/storage/DunhuangDanceRAG/logs/pipeline_resume_local_index_20260721_110312.log
+========== V46.53.1 RESEARCH CONTRACT REPAIR ==========
+ROOT_DIR=/home/disk/lsm/storage/DunhuangDanceRAG
+OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303
+AUDIO=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav
+MUSIC_DIRS=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/train
+CHANGE_BVH_DIR=/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh
+MIN_OK_SOURCES=8
+SPLIT=0.67/0.165/0.165
+REBUILD_RETARGET=0
+REBUILD_DB=0
+RETRAIN_V44/V45/V46=0/0/0
+GROUNDER_CKPT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/checkpoints/grounder.pt
+========================================================
+========== 0A. REAL-DATA PREFLIGHT ==========
+{
+  "schema": "real_data_preflight",
+  "root": "/home/disk/lsm/storage/DunhuangDanceRAG",
+  "audio": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav",
+  "music_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/train",
+  "change_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh",
+  "bvh_sources": [
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_36pose_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_36pose_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_lotus.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_36pose_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_36pose_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_drum_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_drum_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_mediation.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_pipa_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_pipa_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh"
+  ],
+  "num_bvh_sources": 12,
+  "training_music_count": 788,
+  "expected_training_music_count": 788,
+  "runtime": {
+    "torch": "2.8.0+cu128",
+    "cuda_available": true,
+    "cuda_device": "NVIDIA GeForce RTX 4090",
+    "split_counts_at_discovered_sources": {
+      "train": 8,
+      "val": 2,
+      "test": 2
+    }
+  },
+  "warnings": [],
+  "errors": [],
+  "ok": true
+}
+========== 0B. V46.53 + V46.53.1 CONTRACT TESTS ==========
+test_degenerate_rot6d_is_detected_or_projected (test_anatomy.TestV4652Anatomy) ... ok
+test_geodesic_bridge (test_anatomy.TestV4652Anatomy) ... ok
+test_identity_contract (test_anatomy.TestV4652Anatomy) ... ok
+test_penetration_uses_absolute_stage_floor (test_anatomy.TestV4652Anatomy) ... ok
+test_mask_and_tangent_merge (test_boundary_contract.BoundaryContractTest) ... ok
+test_transition_report (test_boundary_contract.BoundaryContractTest) ... ok
+test_mild_event_limit_is_soft_not_catastrophic (test_contract.ContractSeparationTests) ... ok
+test_source_gate_ignores_mild_limit_ratio (test_contract.ContractSeparationTests) ... ok
+test_source_gate_rejects_severe_rotation (test_contract.ContractSeparationTests) ... ok
+test_audio_derived_frames (test_dynamic_duration.DynamicDurationContractTest) ... ok
+test_detects_fixed_length_mismatch (test_dynamic_duration.DynamicDurationContractTest) ... ok
+test_schema_preserving_augmentation (test_event_geometry.EventGeometryTest) ... ok
+test_fixed_female (test_performer_policy.PerformerPolicyTest) ... ok
+test_switch_penalty (test_performer_policy.PerformerPolicyTest) ... ok
+test_metadata_is_added (test_research_event_performer.ResearchEventPerformerMetadataTest) ... ok
+test_duration_contract (test_research_feasibility.ResearchFeasibilityTest) ... ok
+test_scheduler_event_identity_is_provenance_only (test_research_feasibility.ResearchFeasibilityTest) ... ok
+test_four_female_eight_male (test_research_performer_split.ResearchPerformerSplitTest) ... ok
+test_column_concat_roundtrip (test_rotation_contract.RotationContractTest) ... ok
+test_log_exp_roundtrip (test_rotation_contract.RotationContractTest) ... ok
+test_matrix_average_projection_is_proper_rotation (test_rotation_fusion.RotationFusionTests) ... ok
+test_assignment_is_disjoint_and_exact (test_split.ExactSourceSplitTests) ... ok
+test_nonempty_exact_counts (test_split.ExactSourceSplitTests) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 0.451s
+
+OK
+========== 1. PRESERVED TRAINING/GENERATION PIPELINE ==========
+========== V46.51 FORMAL PATHS ==========
+PY=/home/disk/lsm/conda_envs/edge/bin/python3.9
+OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303
+AUDIO=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav
+CHANGE_BVH_DIR=/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh
+CONFIG=configs/motion_model.json
+DB_MODE=paper_train_only
+========== 1. STRICT V46.49.4 RETARGET CACHE ==========
+========== 2. RETARGET GRAVITY AUDIT ==========
+[1/12] profile=source ok=True torso_p05=0.736 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_1.npy
+[2/12] profile=source ok=True torso_p05=0.610 horizontal=0.002 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_2.npy
+[3/12] profile=source ok=True torso_p05=0.685 horizontal=0.001 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_lotus.npy
+[4/12] profile=source ok=True torso_p05=0.822 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_mediation.npy
+[5/12] profile=source ok=True torso_p05=0.671 horizontal=0.006 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_1.npy
+[6/12] profile=source ok=True torso_p05=0.502 horizontal=0.007 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_2.npy
+[7/12] profile=source ok=True torso_p05=0.358 horizontal=0.049 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_1.npy
+[8/12] profile=source ok=True torso_p05=0.571 horizontal=0.008 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_2.npy
+[9/12] profile=source ok=True torso_p05=0.928 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_mediation.npy
+[10/12] profile=source ok=True torso_p05=0.644 horizontal=0.013 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_1.npy
+[11/12] profile=source ok=True torso_p05=0.637 horizontal=0.017 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_2.npy
+[12/12] profile=source ok=True torso_p05=0.878 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_ribbon.npy
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache.gravity.json",
+  "profile": "source",
+  "num_motions": 12,
+  "num_failed": 0,
+  "all_ok": true
+}
+========== 3. SOURCE SPLIT BEFORE EVENT SLICING ==========
+{
+  "manifest": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/source_split_manifest.json",
+  "ok": true,
+  "reasons": [],
+  "target_counts": {
+    "train": 8,
+    "val": 2,
+    "test": 2
+  },
+  "performer_capacities": {
+    "female": {
+      "train": 2,
+      "val": 1,
+      "test": 1
+    },
+    "male": {
+      "train": 6,
+      "val": 1,
+      "test": 1
+    }
+  }
+}
+========== 4. BUILD SPLIT-SPECIFIC HEADING EVENT DATABASES ==========
+========== 5. SPLIT EVENT-DB HARD AUDITS ==========
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/train.event_heading.audit.json",
+  "ok": true,
+  "reasons": [],
+  "num_events": 1570,
+  "num_source_uids": 8,
+  "intent_histogram": {
+    "none": 1549,
+    "uncertain_turn": 21
+  },
+  "entry_heading_abs_deg_p95": 0.7237562090158461
+}
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/val.event_heading.audit.json",
+  "ok": true,
+  "reasons": [],
+  "num_events": 136,
+  "num_source_uids": 2,
+  "intent_histogram": {
+    "explicit_spin": 5,
+    "none": 118,
+    "turn": 13
+  },
+  "entry_heading_abs_deg_p95": 0.6983053684234619
+}
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/test.event_heading.audit.json",
+  "ok": true,
+  "reasons": [],
+  "num_events": 412,
+  "num_source_uids": 2,
+  "intent_histogram": {
+    "none": 412
+  },
+  "entry_heading_abs_deg_p95": 0.5675107598304746
+}
+========== 6. AESD ENRICHMENT PER SPLIT ==========
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events_aesd.npz",
+  "num_events": 1570,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 1060,
+    "lyrical_flow": 0,
+    "instrument_phrase": 1,
+    "percussive_accent": 509,
+    "turning_climax": 0,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 900,
+    "medium": 231,
+    "high": 439
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "thirty_six_postures_take2",
+    "source_group": "female_36pose_2",
+    "source_uid": "female_36pose_2",
+    "dance_key": "thirty_six_postures",
+    "dance_category": "Ji Yue Tian Thirty-Six Postures",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.12797074019908905,
+      "pose_hold": 0.6855576038360596,
+      "lyrical_flow": 0.05118829756975174,
+      "instrument_phrase": 0.0840950608253479,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.05118829756975174,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "moderate",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 2.633333444595337,
+    "natural_duration_range_sec": [
+      1.2000000476837158,
+      3.799999952316284
+    ],
+    "event_quality_score": 0.8997308611869812,
+    "semantic_confidence": 0.9232660531997681,
+    "boundary_risk_score": 0.015889092332145083,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.00048037499396337406,
+      "exit_velocity_norm": 0.0005064580796493425,
+      "entry_exit_pose_gap_self": 3.03121250908589e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_36pose_2::thirty_six_postures::pose_motif"
+  }
+}
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events_aesd.npz",
+  "num_events": 136,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 111,
+    "lyrical_flow": 0,
+    "instrument_phrase": 0,
+    "percussive_accent": 0,
+    "turning_climax": 25,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 100,
+    "medium": 16,
+    "high": 20
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "revelation_meditation",
+    "source_group": "female_mediation",
+    "source_uid": "female_mediation",
+    "dance_key": "revelation_meditation",
+    "dance_category": "Revelation Meditation",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.37186896800994873,
+      "pose_hold": 0.5934489965438843,
+      "lyrical_flow": 0.0,
+      "instrument_phrase": 0.034682080149650574,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.0,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "calm",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 3.8333332538604736,
+    "natural_duration_range_sec": [
+      2.0,
+      6.0
+    ],
+    "event_quality_score": 0.9352619647979736,
+    "semantic_confidence": 0.9377018213272095,
+    "boundary_risk_score": 0.005138223192261648,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.0002998073274890582,
+      "exit_velocity_norm": 2.139517164323479e-05,
+      "entry_exit_pose_gap_self": 2.091212991217617e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_mediation::revelation_meditation::pose_motif"
+  }
+}
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events_aesd.npz",
+  "num_events": 412,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 412,
+    "lyrical_flow": 0,
+    "instrument_phrase": 0,
+    "percussive_accent": 0,
+    "turning_climax": 0,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 308,
+    "medium": 45,
+    "high": 59
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "thirty_six_postures_take1",
+    "source_group": "female_36pose_1",
+    "source_uid": "female_36pose_1",
+    "dance_key": "thirty_six_postures",
+    "dance_category": "Ji Yue Tian Thirty-Six Postures",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.12797074019908905,
+      "pose_hold": 0.6855576038360596,
+      "lyrical_flow": 0.05118829756975174,
+      "instrument_phrase": 0.0840950682759285,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.05118829756975174,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "moderate",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 2.4666666984558105,
+    "natural_duration_range_sec": [
+      1.2000000476837158,
+      3.799999952316284
+    ],
+    "event_quality_score": 0.9191914200782776,
+    "semantic_confidence": 0.9376741051673889,
+    "boundary_risk_score": 0.0057320443011121824,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.00014884916082438495,
+      "exit_velocity_norm": 0.00014343502051714394,
+      "entry_exit_pose_gap_self": 5.5750730098225176e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_36pose_1::thirty_six_postures::pose_motif"
+  }
+}
+========== 7. TRAIN V44 ON TRAIN SOURCES + NON-TEST MUSIC ==========
+========== 8. TRAIN V45 ON TRAIN-SOURCE CANONICAL EVENTS ==========
+========== 9. TRAIN V46 ON TRAIN-SOURCE CANONICAL EVENTS ==========
+========== 10. RESOLVE FIXED TRAINED V21/V26/V23 ASSETS ==========
+{
+  "schema": "v46_51_scheduler_asset_resolution",
+  "root": "/home/disk/lsm/storage/DunhuangDanceRAG",
+  "assets": {
+    "index_json": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json",
+    "duration_index_npz": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz",
+    "router_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt",
+    "planner_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt",
+    "v23_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt",
+    "hierarchy_index_npz": "/home/disk/lsm/storage/EDGE/data/v26_hierarchical_event_index.npz",
+    "start_pose": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy"
+  },
+  "resolution_sources": {
+    "index_json": "environment:V46_51_INDEX_JSON",
+    "duration_index_npz": "environment:V46_51_DURATION_INDEX_NPZ",
+    "router_ckpt": "environment:V46_51_ROUTER_CKPT",
+    "planner_ckpt": "environment:V46_51_PLANNER_CKPT",
+    "v23_ckpt": "environment:V46_51_V23_CKPT",
+    "hierarchy_index_npz": "environment:V46_51_HIERARCHY_INDEX_NPZ",
+    "start_pose": "environment:V46_51_START_POSE"
+  },
+  "required_assets": [
+    "duration_index_npz",
+    "index_json",
+    "planner_ckpt",
+    "router_ckpt",
+    "v23_ckpt"
+  ],
+  "optional_assets": [
+    "hierarchy_index_npz",
+    "start_pose"
+  ]
+}
+========== 11. REBUILD SCHEDULE FROM CURRENT WAV ==========
+[RUN] /home/disk/lsm/conda_envs/edge/bin/python3.9 /home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/schedule_v26_whole_song.py --index_json /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json --duration_index_npz /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz --music /home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav --out_dir /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule --router_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt --planner_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt --v23_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt --feature_dir /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/music_features --deep_music_cache /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/deep_music_cache --fps 30.0 --max_seconds 0.0 --min_phrase_seconds 2.5 --max_phrase_seconds 7.5 --boundary_quantile 0.68 --beat_snap_seconds 0.35 --max_phrases 160 --multi_event_phrases 1 --lock_music_boundaries 1 --music_dominant_timing 1 --max_single_event_seconds 3.2 --calm_max_single_event_seconds 2.8 --min_subphrase_seconds 1.6 --max_events_per_phrase 4 --slot_beat_snap_seconds 0.25 --beam_size 24 --candidate_top_k 256 --hierarchical_retrieval 1 --graph_scheduler 1 --graph_node_top_k 96 --graph_edge_weight 0.45 --graph_hard_prune 0 --graph_hard_prune_threshold 1.35 --deep_music_features 1 --deep_music_model clap --deep_music_weight 0.25 --require_deep_music 1 --deep_music_min_success 0.8 --transition_diffusion 0 --transition_diffusion_blend 0.18 --transition_diffusion_steps 32 --hierarchy_index_npz /home/disk/lsm/storage/EDGE/data/v26_hierarchical_event_index.npz --start_pose /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy
+/home/disk/lsm/conda_envs/edge/lib/python3.9/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+/home/disk/lsm/conda_envs/edge/lib/python3.9/site-packages/torch/functional.py:554: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at /pytorch/aten/src/ATen/native/TensorShape.cpp:4322.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Load our best checkpoint in the paper.
+The checkpoint is already downloaded
+Load Checkpoint...
+logit_scale_a 	 Loaded
+logit_scale_t 	 Loaded
+audio_branch.spectrogram_extractor.stft.conv_real.weight 	 Loaded
+audio_branch.spectrogram_extractor.stft.conv_imag.weight 	 Loaded
+audio_branch.logmel_extractor.melW 	 Loaded
+audio_branch.bn0.weight 	 Loaded
+audio_branch.bn0.bias 	 Loaded
+audio_branch.patch_embed.proj.weight 	 Loaded
+audio_branch.patch_embed.proj.bias 	 Loaded
+audio_branch.patch_embed.norm.weight 	 Loaded
+audio_branch.patch_embed.norm.bias 	 Loaded
+audio_branch.layers.0.blocks.0.norm1.weight 	 Loaded
+audio_branch.layers.0.blocks.0.norm1.bias 	 Loaded
+audio_branch.layers.0.blocks.0.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.0.blocks.0.attn.qkv.weight 	 Loaded
+audio_branch.layers.0.blocks.0.attn.qkv.bias 	 Loaded
+audio_branch.layers.0.blocks.0.attn.proj.weight 	 Loaded
+audio_branch.layers.0.blocks.0.attn.proj.bias 	 Loaded
+audio_branch.layers.0.blocks.0.norm2.weight 	 Loaded
+audio_branch.layers.0.blocks.0.norm2.bias 	 Loaded
+audio_branch.layers.0.blocks.0.mlp.fc1.weight 	 Loaded
+audio_branch.layers.0.blocks.0.mlp.fc1.bias 	 Loaded
+audio_branch.layers.0.blocks.0.mlp.fc2.weight 	 Loaded
+audio_branch.layers.0.blocks.0.mlp.fc2.bias 	 Loaded
+audio_branch.layers.0.blocks.1.norm1.weight 	 Loaded
+audio_branch.layers.0.blocks.1.norm1.bias 	 Loaded
+audio_branch.layers.0.blocks.1.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.0.blocks.1.attn.qkv.weight 	 Loaded
+audio_branch.layers.0.blocks.1.attn.qkv.bias 	 Loaded
+audio_branch.layers.0.blocks.1.attn.proj.weight 	 Loaded
+audio_branch.layers.0.blocks.1.attn.proj.bias 	 Loaded
+audio_branch.layers.0.blocks.1.norm2.weight 	 Loaded
+audio_branch.layers.0.blocks.1.norm2.bias 	 Loaded
+audio_branch.layers.0.blocks.1.mlp.fc1.weight 	 Loaded
+audio_branch.layers.0.blocks.1.mlp.fc1.bias 	 Loaded
+audio_branch.layers.0.blocks.1.mlp.fc2.weight 	 Loaded
+audio_branch.layers.0.blocks.1.mlp.fc2.bias 	 Loaded
+audio_branch.layers.0.downsample.reduction.weight 	 Loaded
+audio_branch.layers.0.downsample.norm.weight 	 Loaded
+audio_branch.layers.0.downsample.norm.bias 	 Loaded
+audio_branch.layers.1.blocks.0.norm1.weight 	 Loaded
+audio_branch.layers.1.blocks.0.norm1.bias 	 Loaded
+audio_branch.layers.1.blocks.0.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.1.blocks.0.attn.qkv.weight 	 Loaded
+audio_branch.layers.1.blocks.0.attn.qkv.bias 	 Loaded
+audio_branch.layers.1.blocks.0.attn.proj.weight 	 Loaded
+audio_branch.layers.1.blocks.0.attn.proj.bias 	 Loaded
+audio_branch.layers.1.blocks.0.norm2.weight 	 Loaded
+audio_branch.layers.1.blocks.0.norm2.bias 	 Loaded
+audio_branch.layers.1.blocks.0.mlp.fc1.weight 	 Loaded
+audio_branch.layers.1.blocks.0.mlp.fc1.bias 	 Loaded
+audio_branch.layers.1.blocks.0.mlp.fc2.weight 	 Loaded
+audio_branch.layers.1.blocks.0.mlp.fc2.bias 	 Loaded
+audio_branch.layers.1.blocks.1.norm1.weight 	 Loaded
+audio_branch.layers.1.blocks.1.norm1.bias 	 Loaded
+audio_branch.layers.1.blocks.1.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.1.blocks.1.attn.qkv.weight 	 Loaded
+audio_branch.layers.1.blocks.1.attn.qkv.bias 	 Loaded
+audio_branch.layers.1.blocks.1.attn.proj.weight 	 Loaded
+audio_branch.layers.1.blocks.1.attn.proj.bias 	 Loaded
+audio_branch.layers.1.blocks.1.norm2.weight 	 Loaded
+audio_branch.layers.1.blocks.1.norm2.bias 	 Loaded
+audio_branch.layers.1.blocks.1.mlp.fc1.weight 	 Loaded
+audio_branch.layers.1.blocks.1.mlp.fc1.bias 	 Loaded
+audio_branch.layers.1.blocks.1.mlp.fc2.weight 	 Loaded
+audio_branch.layers.1.blocks.1.mlp.fc2.bias 	 Loaded
+audio_branch.layers.1.downsample.reduction.weight 	 Loaded
+audio_branch.layers.1.downsample.norm.weight 	 Loaded
+audio_branch.layers.1.downsample.norm.bias 	 Loaded
+audio_branch.layers.2.blocks.0.norm1.weight 	 Loaded
+audio_branch.layers.2.blocks.0.norm1.bias 	 Loaded
+audio_branch.layers.2.blocks.0.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.2.blocks.0.attn.qkv.weight 	 Loaded
+audio_branch.layers.2.blocks.0.attn.qkv.bias 	 Loaded
+audio_branch.layers.2.blocks.0.attn.proj.weight 	 Loaded
+audio_branch.layers.2.blocks.0.attn.proj.bias 	 Loaded
+audio_branch.layers.2.blocks.0.norm2.weight 	 Loaded
+audio_branch.layers.2.blocks.0.norm2.bias 	 Loaded
+audio_branch.layers.2.blocks.0.mlp.fc1.weight 	 Loaded
+audio_branch.layers.2.blocks.0.mlp.fc1.bias 	 Loaded
+audio_branch.layers.2.blocks.0.mlp.fc2.weight 	 Loaded
+audio_branch.layers.2.blocks.0.mlp.fc2.bias 	 Loaded
+audio_branch.layers.2.blocks.1.norm1.weight 	 Loaded
+audio_branch.layers.2.blocks.1.norm1.bias 	 Loaded
+audio_branch.layers.2.blocks.1.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.2.blocks.1.attn.qkv.weight 	 Loaded
+audio_branch.layers.2.blocks.1.attn.qkv.bias 	 Loaded
+audio_branch.layers.2.blocks.1.attn.proj.weight 	 Loaded
+audio_branch.layers.2.blocks.1.attn.proj.bias 	 Loaded
+audio_branch.layers.2.blocks.1.norm2.weight 	 Loaded
+audio_branch.layers.2.blocks.1.norm2.bias 	 Loaded
+audio_branch.layers.2.blocks.1.mlp.fc1.weight 	 Loaded
+audio_branch.layers.2.blocks.1.mlp.fc1.bias 	 Loaded
+audio_branch.layers.2.blocks.1.mlp.fc2.weight 	 Loaded
+audio_branch.layers.2.blocks.1.mlp.fc2.bias 	 Loaded
+audio_branch.layers.2.blocks.2.norm1.weight 	 Loaded
+audio_branch.layers.2.blocks.2.norm1.bias 	 Loaded
+audio_branch.layers.2.blocks.2.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.2.blocks.2.attn.qkv.weight 	 Loaded
+audio_branch.layers.2.blocks.2.attn.qkv.bias 	 Loaded
+audio_branch.layers.2.blocks.2.attn.proj.weight 	 Loaded
+audio_branch.layers.2.blocks.2.attn.proj.bias 	 Loaded
+audio_branch.layers.2.blocks.2.norm2.weight 	 Loaded
+audio_branch.layers.2.blocks.2.norm2.bias 	 Loaded
+audio_branch.layers.2.blocks.2.mlp.fc1.weight 	 Loaded
+audio_branch.layers.2.blocks.2.mlp.fc1.bias 	 Loaded
+audio_branch.layers.2.blocks.2.mlp.fc2.weight 	 Loaded
+audio_branch.layers.2.blocks.2.mlp.fc2.bias 	 Loaded
+audio_branch.layers.2.blocks.3.norm1.weight 	 Loaded
+audio_branch.layers.2.blocks.3.norm1.bias 	 Loaded
+audio_branch.layers.2.blocks.3.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.2.blocks.3.attn.qkv.weight 	 Loaded
+audio_branch.layers.2.blocks.3.attn.qkv.bias 	 Loaded
+audio_branch.layers.2.blocks.3.attn.proj.weight 	 Loaded
+audio_branch.layers.2.blocks.3.attn.proj.bias 	 Loaded
+audio_branch.layers.2.blocks.3.norm2.weight 	 Loaded
+audio_branch.layers.2.blocks.3.norm2.bias 	 Loaded
+audio_branch.layers.2.blocks.3.mlp.fc1.weight 	 Loaded
+audio_branch.layers.2.blocks.3.mlp.fc1.bias 	 Loaded
+audio_branch.layers.2.blocks.3.mlp.fc2.weight 	 Loaded
+audio_branch.layers.2.blocks.3.mlp.fc2.bias 	 Loaded
+audio_branch.layers.2.blocks.4.norm1.weight 	 Loaded
+audio_branch.layers.2.blocks.4.norm1.bias 	 Loaded
+audio_branch.layers.2.blocks.4.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.2.blocks.4.attn.qkv.weight 	 Loaded
+audio_branch.layers.2.blocks.4.attn.qkv.bias 	 Loaded
+audio_branch.layers.2.blocks.4.attn.proj.weight 	 Loaded
+audio_branch.layers.2.blocks.4.attn.proj.bias 	 Loaded
+audio_branch.layers.2.blocks.4.norm2.weight 	 Loaded
+audio_branch.layers.2.blocks.4.norm2.bias 	 Loaded
+audio_branch.layers.2.blocks.4.mlp.fc1.weight 	 Loaded
+audio_branch.layers.2.blocks.4.mlp.fc1.bias 	 Loaded
+audio_branch.layers.2.blocks.4.mlp.fc2.weight 	 Loaded
+audio_branch.layers.2.blocks.4.mlp.fc2.bias 	 Loaded
+audio_branch.layers.2.blocks.5.norm1.weight 	 Loaded
+audio_branch.layers.2.blocks.5.norm1.bias 	 Loaded
+audio_branch.layers.2.blocks.5.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.2.blocks.5.attn.qkv.weight 	 Loaded
+audio_branch.layers.2.blocks.5.attn.qkv.bias 	 Loaded
+audio_branch.layers.2.blocks.5.attn.proj.weight 	 Loaded
+audio_branch.layers.2.blocks.5.attn.proj.bias 	 Loaded
+audio_branch.layers.2.blocks.5.norm2.weight 	 Loaded
+audio_branch.layers.2.blocks.5.norm2.bias 	 Loaded
+audio_branch.layers.2.blocks.5.mlp.fc1.weight 	 Loaded
+audio_branch.layers.2.blocks.5.mlp.fc1.bias 	 Loaded
+audio_branch.layers.2.blocks.5.mlp.fc2.weight 	 Loaded
+audio_branch.layers.2.blocks.5.mlp.fc2.bias 	 Loaded
+audio_branch.layers.2.downsample.reduction.weight 	 Loaded
+audio_branch.layers.2.downsample.norm.weight 	 Loaded
+audio_branch.layers.2.downsample.norm.bias 	 Loaded
+audio_branch.layers.3.blocks.0.norm1.weight 	 Loaded
+audio_branch.layers.3.blocks.0.norm1.bias 	 Loaded
+audio_branch.layers.3.blocks.0.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.3.blocks.0.attn.qkv.weight 	 Loaded
+audio_branch.layers.3.blocks.0.attn.qkv.bias 	 Loaded
+audio_branch.layers.3.blocks.0.attn.proj.weight 	 Loaded
+audio_branch.layers.3.blocks.0.attn.proj.bias 	 Loaded
+audio_branch.layers.3.blocks.0.norm2.weight 	 Loaded
+audio_branch.layers.3.blocks.0.norm2.bias 	 Loaded
+audio_branch.layers.3.blocks.0.mlp.fc1.weight 	 Loaded
+audio_branch.layers.3.blocks.0.mlp.fc1.bias 	 Loaded
+audio_branch.layers.3.blocks.0.mlp.fc2.weight 	 Loaded
+audio_branch.layers.3.blocks.0.mlp.fc2.bias 	 Loaded
+audio_branch.layers.3.blocks.1.norm1.weight 	 Loaded
+audio_branch.layers.3.blocks.1.norm1.bias 	 Loaded
+audio_branch.layers.3.blocks.1.attn.relative_position_bias_table 	 Loaded
+audio_branch.layers.3.blocks.1.attn.qkv.weight 	 Loaded
+audio_branch.layers.3.blocks.1.attn.qkv.bias 	 Loaded
+audio_branch.layers.3.blocks.1.attn.proj.weight 	 Loaded
+audio_branch.layers.3.blocks.1.attn.proj.bias 	 Loaded
+audio_branch.layers.3.blocks.1.norm2.weight 	 Loaded
+audio_branch.layers.3.blocks.1.norm2.bias 	 Loaded
+audio_branch.layers.3.blocks.1.mlp.fc1.weight 	 Loaded
+audio_branch.layers.3.blocks.1.mlp.fc1.bias 	 Loaded
+audio_branch.layers.3.blocks.1.mlp.fc2.weight 	 Loaded
+audio_branch.layers.3.blocks.1.mlp.fc2.bias 	 Loaded
+audio_branch.norm.weight 	 Loaded
+audio_branch.norm.bias 	 Loaded
+audio_branch.tscam_conv.weight 	 Loaded
+audio_branch.tscam_conv.bias 	 Loaded
+audio_branch.head.weight 	 Loaded
+audio_branch.head.bias 	 Loaded
+text_branch.embeddings.word_embeddings.weight 	 Loaded
+text_branch.embeddings.position_embeddings.weight 	 Loaded
+text_branch.embeddings.token_type_embeddings.weight 	 Loaded
+text_branch.embeddings.LayerNorm.weight 	 Loaded
+text_branch.embeddings.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.0.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.0.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.0.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.0.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.0.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.0.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.0.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.0.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.0.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.0.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.0.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.0.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.0.output.dense.weight 	 Loaded
+text_branch.encoder.layer.0.output.dense.bias 	 Loaded
+text_branch.encoder.layer.0.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.0.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.1.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.1.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.1.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.1.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.1.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.1.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.1.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.1.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.1.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.1.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.1.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.1.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.1.output.dense.weight 	 Loaded
+text_branch.encoder.layer.1.output.dense.bias 	 Loaded
+text_branch.encoder.layer.1.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.1.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.2.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.2.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.2.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.2.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.2.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.2.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.2.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.2.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.2.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.2.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.2.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.2.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.2.output.dense.weight 	 Loaded
+text_branch.encoder.layer.2.output.dense.bias 	 Loaded
+text_branch.encoder.layer.2.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.2.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.3.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.3.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.3.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.3.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.3.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.3.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.3.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.3.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.3.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.3.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.3.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.3.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.3.output.dense.weight 	 Loaded
+text_branch.encoder.layer.3.output.dense.bias 	 Loaded
+text_branch.encoder.layer.3.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.3.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.4.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.4.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.4.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.4.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.4.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.4.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.4.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.4.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.4.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.4.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.4.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.4.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.4.output.dense.weight 	 Loaded
+text_branch.encoder.layer.4.output.dense.bias 	 Loaded
+text_branch.encoder.layer.4.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.4.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.5.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.5.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.5.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.5.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.5.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.5.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.5.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.5.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.5.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.5.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.5.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.5.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.5.output.dense.weight 	 Loaded
+text_branch.encoder.layer.5.output.dense.bias 	 Loaded
+text_branch.encoder.layer.5.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.5.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.6.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.6.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.6.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.6.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.6.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.6.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.6.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.6.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.6.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.6.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.6.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.6.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.6.output.dense.weight 	 Loaded
+text_branch.encoder.layer.6.output.dense.bias 	 Loaded
+text_branch.encoder.layer.6.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.6.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.7.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.7.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.7.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.7.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.7.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.7.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.7.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.7.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.7.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.7.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.7.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.7.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.7.output.dense.weight 	 Loaded
+text_branch.encoder.layer.7.output.dense.bias 	 Loaded
+text_branch.encoder.layer.7.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.7.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.8.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.8.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.8.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.8.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.8.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.8.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.8.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.8.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.8.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.8.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.8.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.8.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.8.output.dense.weight 	 Loaded
+text_branch.encoder.layer.8.output.dense.bias 	 Loaded
+text_branch.encoder.layer.8.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.8.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.9.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.9.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.9.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.9.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.9.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.9.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.9.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.9.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.9.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.9.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.9.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.9.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.9.output.dense.weight 	 Loaded
+text_branch.encoder.layer.9.output.dense.bias 	 Loaded
+text_branch.encoder.layer.9.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.9.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.10.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.10.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.10.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.10.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.10.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.10.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.10.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.10.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.10.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.10.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.10.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.10.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.10.output.dense.weight 	 Loaded
+text_branch.encoder.layer.10.output.dense.bias 	 Loaded
+text_branch.encoder.layer.10.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.10.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.11.attention.self.query.weight 	 Loaded
+text_branch.encoder.layer.11.attention.self.query.bias 	 Loaded
+text_branch.encoder.layer.11.attention.self.key.weight 	 Loaded
+text_branch.encoder.layer.11.attention.self.key.bias 	 Loaded
+text_branch.encoder.layer.11.attention.self.value.weight 	 Loaded
+text_branch.encoder.layer.11.attention.self.value.bias 	 Loaded
+text_branch.encoder.layer.11.attention.output.dense.weight 	 Loaded
+text_branch.encoder.layer.11.attention.output.dense.bias 	 Loaded
+text_branch.encoder.layer.11.attention.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.11.attention.output.LayerNorm.bias 	 Loaded
+text_branch.encoder.layer.11.intermediate.dense.weight 	 Loaded
+text_branch.encoder.layer.11.intermediate.dense.bias 	 Loaded
+text_branch.encoder.layer.11.output.dense.weight 	 Loaded
+text_branch.encoder.layer.11.output.dense.bias 	 Loaded
+text_branch.encoder.layer.11.output.LayerNorm.weight 	 Loaded
+text_branch.encoder.layer.11.output.LayerNorm.bias 	 Loaded
+text_branch.pooler.dense.weight 	 Loaded
+text_branch.pooler.dense.bias 	 Loaded
+text_transform.sequential.0.weight 	 Loaded
+text_transform.sequential.0.bias 	 Loaded
+text_transform.sequential.3.weight 	 Loaded
+text_transform.sequential.3.bias 	 Loaded
+text_projection.0.weight 	 Loaded
+text_projection.0.bias 	 Loaded
+text_projection.2.weight 	 Loaded
+text_projection.2.bias 	 Loaded
+audio_transform.sequential.0.weight 	 Loaded
+audio_transform.sequential.0.bias 	 Loaded
+audio_transform.sequential.3.weight 	 Loaded
+audio_transform.sequential.3.bias 	 Loaded
+audio_projection.0.weight 	 Loaded
+audio_projection.0.bias 	 Loaded
+audio_projection.2.weight 	 Loaded
+audio_projection.2.bias 	 Loaded
+[SAVED] dunhuangwu2: frames=3601 phrases=51
+summary: /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule/V26_WHOLE_SONG_SUMMARY.json
+[RUN] /home/disk/lsm/conda_envs/edge/bin/python3.9 /home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/v46_38_build_music_semantic_slot_descriptor.py --audio /home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav --out_json /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/descriptor_unstamped.json --router_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt --planner_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt --v23_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt --index_json /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json --duration_index_npz /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz --feature_dir /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/music_features --schedule_dir /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule --fps 30.0 --min_phrase_seconds 2.5 --max_phrase_seconds 7.5 --max_phrases 160 --hierarchy_index_npz /home/disk/lsm/storage/EDGE/data/v26_hierarchical_event_index.npz
+{
+  "out_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/descriptor_unstamped.json",
+  "descriptor_type": "music_semantic_slot_descriptor",
+  "usage": "generate_schedule",
+  "is_final_schedule": true,
+  "slot_source": "v21_router_v26_planner",
+  "num_slots": 51,
+  "total_target_frames": 3601,
+  "raw_schedule_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule/dunhuangwu2_v26.schedule_report.json",
+  "first_slot": {
+    "slot": 0,
+    "music_start": 0,
+    "music_end": 59,
+    "music_length": 59,
+    "music_event": "calm_flow",
+    "music_speed_factor": 0.72,
+    "music_transition_profile": "section_sustain",
+    "boundary_accent_strength": 0.5455830812454228,
+    "predicted_motion_event": "calm_flow",
+    "predicted_duration": 56.07481002807617,
+    "event_index": 689,
+    "event_id": "src0040_ev0050_wmx_002_Take_000_002123_002172",
+    "family_id": "40:3",
+    "motion_event": "calm_flow",
+    "natural_duration": 49.0,
+    "slot_content_target": 59.0,
+    "target_natural_duration": 42.48,
+    "transition_len": 0,
+    "transition_meta": {},
+    "style": 0.8475660085678101,
+    "quality": 0.9803929924964905,
+    "safety": 0.9452715516090393,
+    "music_similarity": 0.8631234169006348,
+    "event_compatibility": 1.0,
+    "duration_match": 0.8465160131454468,
+    "planner_duration_match": 0.873832643032074,
+    "activity_match": 0.9829787015914917,
+    "anti_static_penalty": 0.0,
+    "turn_peak_dps": 0.0,
+    "turn_angle_deg": 0.0,
+    "turn_penalty": 0.0,
+    "candidate_top_k": 256,
+    "graph_node_top_k": 96,
+    "hierarchy_enabled": true,
+    "hierarchy_query_group": 1,
+    "hierarchy_score": 0.8733376860618591,
+    "hierarchy_hyper_score": 0.8636126518249512,
+    "hierarchy_coarse_score": 1.0,
+    "hierarchy_activity_score": 0.8030564785003662,
+    "hierarchy_turn_score": 0.8104637861251831,
+    "hierarchy_semantic_score": 0.0,
+    "transition_cost": 0.0,
+    "boundary_velocity_penalty": 0.0,
+    "boundary_acceleration_penalty": 0.0,
+    "graph_scheduler_enabled": true,
+    "graph_edge_cost": 0.0,
+    "graph_edge_meta": {},
+    "mmr_penalty": 0.0,
+    "score": 4.827213287353516,
+    "slot_meta": {
+      "slot_index": 0,
+      "source_phrase_index": 0,
+      "source_phrase_start": 0,
+      "source_phrase_end": 126,
+      "subslot_index": 0,
+      "subslot_count": 2,
+      "split_reason": "anti_static_calm_phrase",
+      "source_music_event": "calm_flow",
+      "slot_start": 0,
+      "slot_end": 59,
+      "slot_length": 59
+    },
+    "allocated_content_len": 59,
+    "allocated_phrase_total": 59,
+    "time_warp_ratio": 1.2040816326530612,
+    "resampling": {
+      "method": "uniform_so3",
+      "source_len": 49,
+      "target_len": 59
+    },
+    "target_frames": 59,
+    "start": 0.0,
+    "end": 1.9666666666666666,
+    "duration": 1.9666666666666666,
+    "slot_source": "v21_router_v26_planner",
+    "music_alignment_label": "calm_meditative",
+    "music_semantic_top_label": "calm_meditative",
+    "slot_id": 0,
+    "start_sec": 0.0,
+    "end_sec": 1.9666666666666666,
+    "duration_sec": 1.9666666666666666,
+    "descriptor_type": "music_semantic_slot",
+    "descriptor_schema_version": "v46_38_mssd_aesd_routing_descriptor",
+    "usage": "generate_schedule",
+    "is_final_schedule": true,
+    "slot_plan_source": "v21_router_v26_planner",
+    "feature": [
+      1.9666666984558105,
+      0.03999999910593033,
+      0.019999999552965164,
+      0.019999999552965164,
+      0.012000000104308128,
+      0.029999999329447746,
+      0.02199999988079071,
+      0.02500000037252903,
+      0.019999999552965164,
+      1.0099999904632568,
+      0.8500000238418579,
+      0.0,
+      0.0,
+      0.019999999552965164,
+      0.009999999776482582,
+      0.0,
+      0.009999999776482582,
+      0.012000000104308128,
+      0.012000000104308128,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.3499999940395355,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      6.893431680511652e-13,
+      6.401043974382792e-13,
+      1.0
+    ],
+    "role": "calm",
+    "slot_role": "calm",
+    "music_semantic_probs": {
+      "calm_meditative": 1.0,
+      "pose_hold": 4.923879771794037e-13,
+      "lyrical_flow": 4.923879771794037e-13,
+      "instrument_phrase": 4.923879771794037e-13,
+      "percussive_accent": 4.923879771794037e-13,
+      "turning_climax": 4.923879771794037e-13,
+      "footwork_flow": 4.923879771794037e-13,
+      "aerial_curve": 4.923879771794037e-13
+    },
+    "energy_label": "calm",
+    "rhythm_label": "sustained",
+    "preferred_dance_keys": [
+      "revelation_meditation",
+      "thirty_six_postures",
+      "lotus_steps"
+    ],
+    "slot_preferred_dance_keys": [
+      "revelation_meditation",
+      "thirty_six_postures",
+      "lotus_steps"
+    ],
+    "preferred_semantic_roles": [],
+    "external_music_semantic_source": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule/dunhuangwu2_v26.schedule_report.json",
+    "v26_event_id": "src0040_ev0050_wmx_002_Take_000_002123_002172",
+    "v26_event_index": 689,
+    "v26_family_id": "40:3",
+    "v26_allocated_content_len": 59,
+    "v26_allocated_phrase_total": 59,
+    "v26_time_warp_ratio": 1.2040816326530612,
+    "start_frame": 0,
+    "end_frame": 59
+  },
+  "last_slot": {
+    "slot": 50,
+    "music_start": 3521,
+    "music_end": 3601,
+    "music_length": 80,
+    "music_event": "calm_flow",
+    "music_speed_factor": 0.72,
+    "music_transition_profile": "section_sustain",
+    "boundary_accent_strength": 0.44784364104270963,
+    "predicted_motion_event": "calm_flow",
+    "predicted_duration": 52.9404411315918,
+    "event_index": 1274,
+    "event_id": "src0010_ev0281_dyl_003_Take_002_012522_012558",
+    "family_id": "10:20",
+    "motion_event": "calm_flow",
+    "natural_duration": 36.0,
+    "slot_content_target": 40.0,
+    "target_natural_duration": 28.799999999999997,
+    "transition_len": 40,
+    "transition_meta": {
+      "music_transition_frames": 40,
+      "transition_profile": "section_sustain",
+      "boundary_accent_strength": 0.44784364104270963,
+      "speed_factor": 0.72,
+      "energy": 0.0,
+      "onset": 0.20511165261268616,
+      "beat_density": 0.0,
+      "tension": 0.3662562966346741,
+      "calmness": 0.7957006692886353,
+      "physical_min_frames": 29,
+      "pose_jump": 0.2645840843518575,
+      "velocity_jump": 0.0008685651700943708,
+      "acceleration_jump": 0.0006873077557732662,
+      "contact_jump": 0.0,
+      "yaw_gap_deg": 23.378014613735512,
+      "yaw_required_frames": 7,
+      "chosen_transition_frames": 40,
+      "slot_budget_cap": 68,
+      "slot_budget_capped_from": null,
+      "dominant_reason": "music",
+      "candidate_boundary": {
+        "pose_jump": 0.2645840843518575,
+        "velocity_jump": 0.0008685651700943708,
+        "acceleration_jump": 0.0006873077557732662,
+        "contact_jump": 0.0,
+        "yaw_gap_deg": 23.378014613735512
+      }
+    },
+    "style": 0.794562578201294,
+    "quality": 0.9309900403022766,
+    "safety": 0.9891988635063171,
+    "music_similarity": 0.683939516544342,
+    "event_compatibility": 1.0,
+    "duration_match": 0.75,
+    "planner_duration_match": 0.6800094842910767,
+    "activity_match": 0.8777326345443726,
+    "anti_static_penalty": 0.0,
+    "turn_peak_dps": 0.0,
+    "turn_angle_deg": 0.0,
+    "turn_penalty": 0.0,
+    "candidate_top_k": 256,
+    "graph_node_top_k": 96,
+    "hierarchy_enabled": true,
+    "hierarchy_query_group": 1,
+    "hierarchy_score": 0.9013973474502563,
+    "hierarchy_hyper_score": 0.9036090970039368,
+    "hierarchy_coarse_score": 1.0,
+    "hierarchy_activity_score": 0.9587259888648987,
+    "hierarchy_turn_score": 0.803721010684967,
+    "hierarchy_semantic_score": 0.0,
+    "transition_cost": 0.324191805817342,
+    "boundary_velocity_penalty": 0.08685651700943708,
+    "boundary_acceleration_penalty": 0.0381837642096259,
+    "graph_scheduler_enabled": true,
+    "graph_edge_cost": 0.0,
+    "graph_edge_meta": {
+      "graph_hierarchy_distance": 0.03375696390867233,
+      "graph_coarse_jump": 0.0,
+      "graph_activity_jump": 0.005092896521091461,
+      "graph_turn_jump": 0.0,
+      "graph_reset_allow": 0.4663140025734903,
+      "graph_reset_penalty": 0.0,
+      "graph_activity_penalty": 0.0,
+      "graph_trend_penalty": 0.0,
+      "graph_hierarchy_jump_penalty": 0.0,
+      "graph_edge_penalty": 0.0
+    },
+    "mmr_penalty": 0.9776577353477478,
+    "score": 198.63499158106723,
+    "slot_meta": {
+      "slot_index": 50,
+      "source_phrase_index": 28,
+      "source_phrase_start": 3449,
+      "source_phrase_end": 3601,
+      "subslot_index": 1,
+      "subslot_count": 2,
+      "split_reason": "anti_static_calm_phrase",
+      "source_music_event": "calm_flow",
+      "slot_start": 3521,
+      "slot_end": 3601,
+      "slot_length": 80
+    },
+    "allocated_content_len": 40,
+    "allocated_phrase_total": 80,
+    "time_warp_ratio": 1.1111111111111112,
+    "resampling": {
+      "method": "uniform_so3",
+      "source_len": 36,
+      "target_len": 40
+    },
+    "target_frames": 80,
+    "start": 117.36666666666669,
+    "end": 120.03333333333336,
+    "duration": 2.6666666666666665,
+    "slot_source": "v21_router_v26_planner",
+    "music_alignment_label": "calm_meditative",
+    "music_semantic_top_label": "calm_meditative",
+    "slot_id": 50,
+    "start_sec": 117.36666666666669,
+    "end_sec": 120.03333333333336,
+    "duration_sec": 2.6666666666666665,
+    "descriptor_type": "music_semantic_slot",
+    "descriptor_schema_version": "v46_38_mssd_aesd_routing_descriptor",
+    "usage": "generate_schedule",
+    "is_final_schedule": true,
+    "slot_plan_source": "v21_router_v26_planner",
+    "feature": [
+      2.6666667461395264,
+      0.03999999910593033,
+      0.019999999552965164,
+      0.019999999552965164,
+      0.012000000104308128,
+      0.029999999329447746,
+      0.02199999988079071,
+      0.02500000037252903,
+      0.019999999552965164,
+      1.0099999904632568,
+      0.8500000238418579,
+      0.0,
+      0.0,
+      0.019999999552965164,
+      0.009999999776482582,
+      0.0,
+      0.009999999776482582,
+      0.012000000104308128,
+      0.012000000104308128,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.3499999940395355,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      6.893431680511652e-13,
+      6.401043974382792e-13,
+      1.0
+    ],
+    "role": "calm",
+    "slot_role": "calm",
+    "music_semantic_probs": {
+      "calm_meditative": 1.0,
+      "pose_hold": 4.923879771794037e-13,
+      "lyrical_flow": 4.923879771794037e-13,
+      "instrument_phrase": 4.923879771794037e-13,
+      "percussive_accent": 4.923879771794037e-13,
+      "turning_climax": 4.923879771794037e-13,
+      "footwork_flow": 4.923879771794037e-13,
+      "aerial_curve": 4.923879771794037e-13
+    },
+    "energy_label": "calm",
+    "rhythm_label": "sustained",
+    "preferred_dance_keys": [
+      "revelation_meditation",
+      "thirty_six_postures",
+      "lotus_steps"
+    ],
+    "slot_preferred_dance_keys": [
+      "revelation_meditation",
+      "thirty_six_postures",
+      "lotus_steps"
+    ],
+    "preferred_semantic_roles": [],
+    "external_music_semantic_source": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule/dunhuangwu2_v26.schedule_report.json",
+    "v26_event_id": "src0010_ev0281_dyl_003_Take_002_012522_012558",
+    "v26_event_index": 1274,
+    "v26_family_id": "10:20",
+    "v26_allocated_content_len": 40,
+    "v26_allocated_phrase_total": 80,
+    "v26_time_warp_ratio": 1.1111111111111112,
+    "start_frame": 3521,
+    "end_frame": 3601
+  }
+}
+{
+  "schema": "v46_51_fresh_wav_mssd_build",
+  "ok": true,
+  "run_id": "resume_local_index_20260721_110312_36ce6f03d7a8",
+  "run_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8",
+  "audio": {
+    "path": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav",
+    "name": "dunhuangwu2.wav",
+    "stem": "dunhuangwu2",
+    "suffix": ".wav",
+    "sha256": "36ce6f03d7a8c57507071fcd74429562b256c03f5523c7e0657f0d1037cd598c",
+    "size_bytes": 7682170,
+    "mtime_ns": 1784459617222623598,
+    "fps": 30.0,
+    "target_frames": 3601,
+    "decoder": "python_wave",
+    "channels": 2,
+    "sample_width_bytes": 2,
+    "sample_rate": 16000,
+    "sample_frames": 1920523,
+    "duration_seconds": 120.0326875
+  },
+  "out_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json",
+  "contract_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json.contract.json",
+  "contract_csv": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json.contract.csv",
+  "raw_schedule_json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule/dunhuangwu2_v26.schedule_report.json",
+  "raw_schedule_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/raw_v26_schedule",
+  "feature_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_local_index_20260721_110312_36ce6f03d7a8/music_features",
+  "num_slots": 51,
+  "total_target_frames": 3601,
+  "deep_music_features": true,
+  "require_deep_music": true
+}
+========== 12. FRESH-WAV CONTRACT RECHECK ==========
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule.contract.json",
+  "ok": true,
+  "reasons": [],
+  "audio_sha256": "36ce6f03d7a8c57507071fcd74429562b256c03f5523c7e0657f0d1037cd598c",
+  "num_slots": 51,
+  "total_target_frames": 3601,
+  "expected_audio_target_frames": 3601,
+  "frame_error": 0,
+  "overlap_count": 0,
+  "gap_count": 0
+}
+========== 13. V46.51 HEADING/BOUNDARY CLOSED-LOOP GENERATION ==========
+[V46.38 MSSD] loaded descriptor: /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/current_wav.final.mssd.json slots=51 usage=generate_schedule final=True source=v21_router_v26_planner
+{
+  "motion": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.npy",
+  "motion_ref": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.motion_ref.npy",
+  "transition_mask": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.transition_mask.npy",
+  "json": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/report.json",
+  "boundary_audit_csv": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.boundary_audit.csv",
+  "frames": 3601,
+  "boundary_audit_summary": {
+    "num_boundaries": 50,
+    "safe_boundaries": 49,
+    "unsafe_boundaries": 1,
+    "actual_boundary_jerk_p95": 533.6722595214843,
+    "actual_exit_fk_jump_p95": 0.0032096611235614644,
+    "actual_foot_slip_p95": 0.23274092630759402
+  },
+  "final_audit": {
+    "frames": 3601,
+    "floor_y": 0.13698518946766852,
+    "contact_ratio": 0.242154956956401,
+    "foot_skate_mean_mpf": 0.003768101567402482,
+    "foot_skate_p95_mpf": 0.012071173451840857,
+    "foot_skate_max_mpf": 0.04286349192261696,
+    "foot_penetration_min_m": -0.07001391053199768,
+    "mean_joint_jerk_p95": 0.01585858734324574,
+    "mean_joint_jerk_max": 0.03912067040801048,
+    "root_y_range_m": 0.16318607330322266
+  }
+}
+Traceback (most recent call last):
+  File "/home/disk/lsm/conda_envs/edge/lib/python3.9/site-packages/numpy/lib/npyio.py", line 465, in load
+    return pickle.load(fid, **pickle_kwargs)
+_pickle.UnpicklingError: invalid load key, '{'.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/routing/closed_loop.py", line 7, in <module>
+    raise SystemExit(main())
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/routing/research_closed_loop.py", line 17, in main
+    return int(latest.main(argv))
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/routing/global_path.py", line 431, in main
+    v52._patch_report(Path(report_json), contract)
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/routing/heading_closed_loop_impl2.py", line 283, in _patch_report
+    x = np.load(motion_path, allow_pickle=True)
+  File "/home/disk/lsm/conda_envs/edge/lib/python3.9/site-packages/numpy/lib/npyio.py", line 467, in load
+    raise pickle.UnpicklingError(
+_pickle.UnpicklingError: Failed to interpret file PosixPath('/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/report.json') as a pickle

@@ -1,0 +1,533 @@
+========== V46.53.1 RESEARCH CONTRACT REPAIR ==========
+ROOT_DIR=/home/disk/lsm/storage/DunhuangDanceRAG
+OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303
+AUDIO=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav
+MUSIC_DIRS=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/train
+CHANGE_BVH_DIR=/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh
+MIN_OK_SOURCES=8
+SPLIT=0.67/0.165/0.165
+REBUILD_RETARGET=0
+REBUILD_DB=0
+RETRAIN_V44/V45/V46=0/0/0
+GROUNDER_CKPT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/checkpoints/grounder.pt
+========================================================
+========== 0A. REAL-DATA PREFLIGHT ==========
+{
+  "schema": "real_data_preflight",
+  "root": "/home/disk/lsm/storage/DunhuangDanceRAG",
+  "audio": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav",
+  "music_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/train",
+  "change_dir": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh",
+  "bvh_sources": [
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_36pose_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_36pose_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_lotus.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_36pose_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_36pose_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_drum_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_drum_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_mediation.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_pipa_1.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_pipa_2.bvh",
+    "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh"
+  ],
+  "num_bvh_sources": 12,
+  "training_music_count": 788,
+  "expected_training_music_count": 788,
+  "runtime": {
+    "torch": "2.8.0+cu128",
+    "cuda_available": true,
+    "cuda_device": "NVIDIA GeForce RTX 4090",
+    "split_counts_at_discovered_sources": {
+      "train": 8,
+      "val": 2,
+      "test": 2
+    }
+  },
+  "warnings": [],
+  "errors": [],
+  "ok": true
+}
+========== 0B. V46.53 + V46.53.1 CONTRACT TESTS ==========
+test_degenerate_rot6d_is_detected_or_projected (test_anatomy.TestV4652Anatomy) ... ok
+test_geodesic_bridge (test_anatomy.TestV4652Anatomy) ... ok
+test_identity_contract (test_anatomy.TestV4652Anatomy) ... ok
+test_penetration_uses_absolute_stage_floor (test_anatomy.TestV4652Anatomy) ... ok
+test_mask_and_tangent_merge (test_boundary_contract.BoundaryContractTest) ... ok
+test_transition_report (test_boundary_contract.BoundaryContractTest) ... ok
+test_mild_event_limit_is_soft_not_catastrophic (test_contract.ContractSeparationTests) ... ok
+test_source_gate_ignores_mild_limit_ratio (test_contract.ContractSeparationTests) ... ok
+test_source_gate_rejects_severe_rotation (test_contract.ContractSeparationTests) ... ok
+test_audio_derived_frames (test_dynamic_duration.DynamicDurationContractTest) ... ok
+test_detects_fixed_length_mismatch (test_dynamic_duration.DynamicDurationContractTest) ... ok
+test_schema_preserving_augmentation (test_event_geometry.EventGeometryTest) ... ok
+test_fixed_female (test_performer_policy.PerformerPolicyTest) ... ok
+test_switch_penalty (test_performer_policy.PerformerPolicyTest) ... ok
+test_metadata_is_added (test_research_event_performer.ResearchEventPerformerMetadataTest) ... ok
+test_duration_contract (test_research_feasibility.ResearchFeasibilityTest) ... ok
+test_scheduler_event_identity_is_provenance_only (test_research_feasibility.ResearchFeasibilityTest) ... ok
+test_four_female_eight_male (test_research_performer_split.ResearchPerformerSplitTest) ... ok
+test_column_concat_roundtrip (test_rotation_contract.RotationContractTest) ... ok
+test_log_exp_roundtrip (test_rotation_contract.RotationContractTest) ... ok
+test_matrix_average_projection_is_proper_rotation (test_rotation_fusion.RotationFusionTests) ... ok
+test_assignment_is_disjoint_and_exact (test_split.ExactSourceSplitTests) ... ok
+test_nonempty_exact_counts (test_split.ExactSourceSplitTests) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 0.439s
+
+OK
+========== 1. PRESERVED TRAINING/GENERATION PIPELINE ==========
+========== V46.51 FORMAL PATHS ==========
+PY=/home/disk/lsm/conda_envs/edge/bin/python3.9
+OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303
+AUDIO=/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav
+CHANGE_BVH_DIR=/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh
+CONFIG=configs/motion_model.json
+DB_MODE=paper_train_only
+========== 1. STRICT V46.49.4 RETARGET CACHE ==========
+========== 2. RETARGET GRAVITY AUDIT ==========
+[1/12] profile=source ok=True torso_p05=0.736 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_1.npy
+[2/12] profile=source ok=True torso_p05=0.610 horizontal=0.002 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_36pose_2.npy
+[3/12] profile=source ok=True torso_p05=0.685 horizontal=0.001 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_lotus.npy
+[4/12] profile=source ok=True torso_p05=0.822 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/female_mediation.npy
+[5/12] profile=source ok=True torso_p05=0.671 horizontal=0.006 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_1.npy
+[6/12] profile=source ok=True torso_p05=0.502 horizontal=0.007 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_36pose_2.npy
+[7/12] profile=source ok=True torso_p05=0.358 horizontal=0.049 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_1.npy
+[8/12] profile=source ok=True torso_p05=0.571 horizontal=0.008 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_drum_2.npy
+[9/12] profile=source ok=True torso_p05=0.928 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_mediation.npy
+[10/12] profile=source ok=True torso_p05=0.644 horizontal=0.013 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_1.npy
+[11/12] profile=source ok=True torso_p05=0.637 horizontal=0.017 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_pipa_2.npy
+[12/12] profile=source ok=True torso_p05=0.878 horizontal=0.000 /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache/male_ribbon.npy
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache.gravity.json",
+  "profile": "source",
+  "num_motions": 12,
+  "num_failed": 0,
+  "all_ok": true
+}
+========== 3. SOURCE SPLIT BEFORE EVENT SLICING ==========
+{
+  "manifest": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/source_split_manifest.json",
+  "ok": true,
+  "reasons": [],
+  "target_counts": {
+    "train": 8,
+    "val": 2,
+    "test": 2
+  },
+  "performer_capacities": {
+    "female": {
+      "train": 2,
+      "val": 1,
+      "test": 1
+    },
+    "male": {
+      "train": 6,
+      "val": 1,
+      "test": 1
+    }
+  }
+}
+========== 4. BUILD SPLIT-SPECIFIC HEADING EVENT DATABASES ==========
+========== 5. SPLIT EVENT-DB HARD AUDITS ==========
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/train.event_heading.audit.json",
+  "ok": true,
+  "reasons": [],
+  "num_events": 1570,
+  "num_source_uids": 8,
+  "intent_histogram": {
+    "none": 1549,
+    "uncertain_turn": 21
+  },
+  "entry_heading_abs_deg_p95": 0.7237562090158461
+}
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/val.event_heading.audit.json",
+  "ok": true,
+  "reasons": [],
+  "num_events": 136,
+  "num_source_uids": 2,
+  "intent_histogram": {
+    "explicit_spin": 5,
+    "none": 118,
+    "turn": 13
+  },
+  "entry_heading_abs_deg_p95": 0.6983053684234619
+}
+{
+  "out": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/test.event_heading.audit.json",
+  "ok": true,
+  "reasons": [],
+  "num_events": 412,
+  "num_source_uids": 2,
+  "intent_histogram": {
+    "none": 412
+  },
+  "entry_heading_abs_deg_p95": 0.5675107598304746
+}
+========== 6. AESD ENRICHMENT PER SPLIT ==========
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events_aesd.npz",
+  "num_events": 1570,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 1060,
+    "lyrical_flow": 0,
+    "instrument_phrase": 1,
+    "percussive_accent": 509,
+    "turning_climax": 0,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 900,
+    "medium": 231,
+    "high": 439
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "thirty_six_postures_take2",
+    "source_group": "female_36pose_2",
+    "source_uid": "female_36pose_2",
+    "dance_key": "thirty_six_postures",
+    "dance_category": "Ji Yue Tian Thirty-Six Postures",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.12797074019908905,
+      "pose_hold": 0.6855576038360596,
+      "lyrical_flow": 0.05118829756975174,
+      "instrument_phrase": 0.0840950608253479,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.05118829756975174,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "moderate",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 2.633333444595337,
+    "natural_duration_range_sec": [
+      1.2000000476837158,
+      3.799999952316284
+    ],
+    "event_quality_score": 0.8997308611869812,
+    "semantic_confidence": 0.9232660531997681,
+    "boundary_risk_score": 0.015889092332145083,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.00048037499396337406,
+      "exit_velocity_norm": 0.0005064580796493425,
+      "entry_exit_pose_gap_self": 3.03121250908589e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_36pose_2::thirty_six_postures::pose_motif"
+  }
+}
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events_aesd.npz",
+  "num_events": 136,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 111,
+    "lyrical_flow": 0,
+    "instrument_phrase": 0,
+    "percussive_accent": 0,
+    "turning_climax": 25,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 100,
+    "medium": 16,
+    "high": 20
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "revelation_meditation",
+    "source_group": "female_mediation",
+    "source_uid": "female_mediation",
+    "dance_key": "revelation_meditation",
+    "dance_category": "Revelation Meditation",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.37186896800994873,
+      "pose_hold": 0.5934489965438843,
+      "lyrical_flow": 0.0,
+      "instrument_phrase": 0.034682080149650574,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.0,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "calm",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 3.8333332538604736,
+    "natural_duration_range_sec": [
+      2.0,
+      6.0
+    ],
+    "event_quality_score": 0.9352619647979736,
+    "semantic_confidence": 0.9377018213272095,
+    "boundary_risk_score": 0.005138223192261648,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.0002998073274890582,
+      "exit_velocity_norm": 2.139517164323479e-05,
+      "entry_exit_pose_gap_self": 2.091212991217617e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_mediation::revelation_meditation::pose_motif"
+  }
+}
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events_aesd.npz",
+  "num_events": 412,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 412,
+    "lyrical_flow": 0,
+    "instrument_phrase": 0,
+    "percussive_accent": 0,
+    "turning_climax": 0,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 308,
+    "medium": 45,
+    "high": 59
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "thirty_six_postures_take1",
+    "source_group": "female_36pose_1",
+    "source_uid": "female_36pose_1",
+    "dance_key": "thirty_six_postures",
+    "dance_category": "Ji Yue Tian Thirty-Six Postures",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.12797074019908905,
+      "pose_hold": 0.6855576038360596,
+      "lyrical_flow": 0.05118829756975174,
+      "instrument_phrase": 0.0840950682759285,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.05118829756975174,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "moderate",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 2.4666666984558105,
+    "natural_duration_range_sec": [
+      1.2000000476837158,
+      3.799999952316284
+    ],
+    "event_quality_score": 0.9191914200782776,
+    "semantic_confidence": 0.9376741051673889,
+    "boundary_risk_score": 0.0057320443011121824,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.00014884916082438495,
+      "exit_velocity_norm": 0.00014343502051714394,
+      "entry_exit_pose_gap_self": 5.5750730098225176e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_36pose_1::thirty_six_postures::pose_motif"
+  }
+}
+========== 7. TRAIN V44 ON TRAIN SOURCES + NON-TEST MUSIC ==========
+========== 8. TRAIN V45 ON TRAIN-SOURCE CANONICAL EVENTS ==========
+========== 9. TRAIN V46 ON TRAIN-SOURCE CANONICAL EVENTS ==========
+========== 10. RESOLVE FIXED TRAINED V21/V26/V23 ASSETS ==========
+{
+  "schema": "v46_51_scheduler_asset_resolution",
+  "root": "/home/disk/lsm/storage/DunhuangDanceRAG",
+  "assets": {
+    "index_json": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json",
+    "duration_index_npz": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz",
+    "router_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt",
+    "planner_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt",
+    "v23_ckpt": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt",
+    "hierarchy_index_npz": "",
+    "start_pose": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy"
+  },
+  "resolution_sources": {
+    "index_json": "environment:V46_51_INDEX_JSON",
+    "duration_index_npz": "environment:V46_51_DURATION_INDEX_NPZ",
+    "router_ckpt": "environment:V46_51_ROUTER_CKPT",
+    "planner_ckpt": "environment:V46_51_PLANNER_CKPT",
+    "v23_ckpt": "environment:V46_51_V23_CKPT",
+    "hierarchy_index_npz": "optional_not_found",
+    "start_pose": "environment:V46_51_START_POSE"
+  },
+  "required_assets": [
+    "duration_index_npz",
+    "index_json",
+    "planner_ckpt",
+    "router_ckpt",
+    "v23_ckpt"
+  ],
+  "optional_assets": [
+    "hierarchy_index_npz",
+    "start_pose"
+  ]
+}
+========== 11. REBUILD SCHEDULE FROM CURRENT WAV ==========
+[RUN] /home/disk/lsm/conda_envs/edge/bin/python3.9 /home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/schedule_v26_whole_song.py --index_json /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json --duration_index_npz /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz --music /home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav --out_dir /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_schedule_20260721_085236_36ce6f03d7a8/raw_v26_schedule --router_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt --planner_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt --v23_ckpt /home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt --feature_dir /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_schedule_20260721_085236_36ce6f03d7a8/music_features --deep_music_cache /home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_schedule_20260721_085236_36ce6f03d7a8/deep_music_cache --fps 30.0 --max_seconds 0.0 --min_phrase_seconds 2.5 --max_phrase_seconds 7.5 --boundary_quantile 0.68 --beat_snap_seconds 0.35 --max_phrases 160 --multi_event_phrases 1 --lock_music_boundaries 1 --music_dominant_timing 1 --max_single_event_seconds 3.2 --calm_max_single_event_seconds 2.8 --min_subphrase_seconds 1.6 --max_events_per_phrase 4 --slot_beat_snap_seconds 0.25 --beam_size 24 --candidate_top_k 256 --hierarchical_retrieval 1 --graph_scheduler 1 --graph_node_top_k 96 --graph_edge_weight 0.45 --graph_hard_prune 0 --graph_hard_prune_threshold 1.35 --deep_music_features 1 --deep_music_model clap --deep_music_weight 0.25 --require_deep_music 1 --deep_music_min_success 0.8 --transition_diffusion 0 --transition_diffusion_blend 0.18 --transition_diffusion_steps 32 --start_pose /home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy
+Traceback (most recent call last):
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/schedule_v26_whole_song.py", line 1021, in <module>
+    main()
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/schedule_v26_whole_song.py", line 966, in main
+    motions = [
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/schedule_v26_whole_song.py", line 967, in <listcomp>
+    load_motion(Path(str(item.get("pkl", item.get("path", "")))))
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/v21_common.py", line 96, in load_motion
+    raise FileNotFoundError(p)
+FileNotFoundError: data/dunhuang_dynamic_event_rag_physical/events/src0071_ev0323_zhr_002_Take_003_013870_013916.pkl
+Traceback (most recent call last):
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/scheduling/build_schedule.py", line 442, in <module>
+    raise SystemExit(main())
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/scheduling/build_schedule.py", line 300, in main
+    run_checked(scheduler_cmd, env=env)
+  File "/home/disk/lsm/storage/DunhuangDanceRAG/scheduling/build_schedule.py", line 48, in run_checked
+    subprocess.run(
+  File "/home/disk/lsm/conda_envs/edge/lib/python3.9/subprocess.py", line 528, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/home/disk/lsm/conda_envs/edge/bin/python3.9', '/home/disk/lsm/storage/DunhuangDanceRAG/vendor/edge_scheduler/tools/schedule_v26_whole_song.py', '--index_json', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/event_index.json', '--duration_index_npz', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/duration_index.npz', '--music', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav', '--out_dir', '/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_schedule_20260721_085236_36ce6f03d7a8/raw_v26_schedule', '--router_ckpt', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/router.pt', '--planner_ckpt', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/planner.pt', '--v23_ckpt', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/weights/music/duration.pt', '--feature_dir', '/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_schedule_20260721_085236_36ce6f03d7a8/music_features', '--deep_music_cache', '/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/fresh_schedule/resume_schedule_20260721_085236_36ce6f03d7a8/deep_music_cache', '--fps', '30.0', '--max_seconds', '0.0', '--min_phrase_seconds', '2.5', '--max_phrase_seconds', '7.5', '--boundary_quantile', '0.68', '--beat_snap_seconds', '0.35', '--max_phrases', '160', '--multi_event_phrases', '1', '--lock_music_boundaries', '1', '--music_dominant_timing', '1', '--max_single_event_seconds', '3.2', '--calm_max_single_event_seconds', '2.8', '--min_subphrase_seconds', '1.6', '--max_events_per_phrase', '4', '--slot_beat_snap_seconds', '0.25', '--beam_size', '24', '--candidate_top_k', '256', '--hierarchical_retrieval', '1', '--graph_scheduler', '1', '--graph_node_top_k', '96', '--graph_edge_weight', '0.45', '--graph_hard_prune', '0', '--graph_hard_prune_threshold', '1.35', '--deep_music_features', '1', '--deep_music_model', 'clap', '--deep_music_weight', '0.25', '--require_deep_music', '1', '--deep_music_min_success', '0.8', '--transition_diffusion', '0', '--transition_diffusion_blend', '0.18', '--transition_diffusion_steps', '32', '--start_pose', '/home/disk/lsm/storage/DunhuangDanceRAG/assets/indexes/start_pose.npy']' returned non-zero exit status 1.

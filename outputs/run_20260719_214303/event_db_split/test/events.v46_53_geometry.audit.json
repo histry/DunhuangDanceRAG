@@ -1,0 +1,2913 @@
+{
+  "schema": "v46_53_intrinsic_event_geometry_v1",
+  "db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events.npz",
+  "backup": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events.pre_v46_53_geometry.npz",
+  "num_events": 412,
+  "geometry_dim": 112,
+  "body_parts": [
+    "root_torso",
+    "left_arm",
+    "right_arm",
+    "left_leg",
+    "right_leg",
+    "hands"
+  ],
+  "quality": {
+    "min": 0.7108200788497925,
+    "median": 0.8933207988739014,
+    "max": 0.9715569019317627
+  },
+  "structure_quality": {
+    "min": 0.4403980076313019,
+    "median": 0.8607038259506226,
+    "max": 0.9720481038093567
+  },
+  "w2_barycenter": "quality-weighted diagonal Gaussian Wasserstein-2 barycenter",
+  "events": [
+    {
+      "event_id": 0,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000000.npy",
+      "omega_p95": 0.19516980424523336,
+      "alpha_p95": 6.943324160575861,
+      "structure_quality": 0.938971408945331
+    },
+    {
+      "event_id": 1,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000001.npy",
+      "omega_p95": 0.13875776752829552,
+      "alpha_p95": 6.918296146392803,
+      "structure_quality": 0.9457474615507208
+    },
+    {
+      "event_id": 2,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000002.npy",
+      "omega_p95": 0.15249387919902802,
+      "alpha_p95": 6.783687233924858,
+      "structure_quality": 0.9448312997579145
+    },
+    {
+      "event_id": 3,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000003.npy",
+      "omega_p95": 0.1611159674823281,
+      "alpha_p95": 6.097171640396115,
+      "structure_quality": 0.947420100987973
+    },
+    {
+      "event_id": 4,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000004.npy",
+      "omega_p95": 0.5396609306335449,
+      "alpha_p95": 11.394475984573367,
+      "structure_quality": 0.8774281031878413
+    },
+    {
+      "event_id": 5,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000005.npy",
+      "omega_p95": 1.1548156857490537,
+      "alpha_p95": 6.4246673583984375,
+      "structure_quality": 0.8352329949768168
+    },
+    {
+      "event_id": 6,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000006.npy",
+      "omega_p95": 1.3910762667655934,
+      "alpha_p95": 12.549308156967154,
+      "structure_quality": 0.7837988095819938
+    },
+    {
+      "event_id": 7,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000007.npy",
+      "omega_p95": 1.5664071142673492,
+      "alpha_p95": 13.078184318542478,
+      "structure_quality": 0.7645579396613931
+    },
+    {
+      "event_id": 8,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000008.npy",
+      "omega_p95": 1.0279393613338468,
+      "alpha_p95": 8.965572595596313,
+      "structure_quality": 0.836690410528864
+    },
+    {
+      "event_id": 9,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000009.npy",
+      "omega_p95": 0.3254020810127258,
+      "alpha_p95": 5.687162756919861,
+      "structure_quality": 0.9302791200522261
+    },
+    {
+      "event_id": 10,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000010.npy",
+      "omega_p95": 0.6283838957548137,
+      "alpha_p95": 9.845298528671265,
+      "structure_quality": 0.8752514259943012
+    },
+    {
+      "event_id": 11,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000011.npy",
+      "omega_p95": 1.0340580880641934,
+      "alpha_p95": 10.449100637435912,
+      "structure_quality": 0.8291884562196685
+    },
+    {
+      "event_id": 12,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000012.npy",
+      "omega_p95": 0.7979179501533505,
+      "alpha_p95": 6.315449476242061,
+      "structure_quality": 0.8738683235831477
+    },
+    {
+      "event_id": 13,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000013.npy",
+      "omega_p95": 1.1065031170845019,
+      "alpha_p95": 8.089117622375486,
+      "structure_quality": 0.8325579649514686
+    },
+    {
+      "event_id": 14,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000014.npy",
+      "omega_p95": 1.8625102519989016,
+      "alpha_p95": 10.072261285781854,
+      "structure_quality": 0.7491839071838553
+    },
+    {
+      "event_id": 15,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000015.npy",
+      "omega_p95": 0.7826197177171706,
+      "alpha_p95": 6.953443646430968,
+      "structure_quality": 0.8724432175504035
+    },
+    {
+      "event_id": 16,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000016.npy",
+      "omega_p95": 0.7700415581464766,
+      "alpha_p95": 10.352239274978633,
+      "structure_quality": 0.857471244011458
+    },
+    {
+      "event_id": 17,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000017.npy",
+      "omega_p95": 0.3094842031598091,
+      "alpha_p95": 10.221996307373047,
+      "structure_quality": 0.9089416359249356
+    },
+    {
+      "event_id": 18,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000018.npy",
+      "omega_p95": 1.7553857564926092,
+      "alpha_p95": 11.454066801071145,
+      "structure_quality": 0.7534768957111005
+    },
+    {
+      "event_id": 19,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000019.npy",
+      "omega_p95": 0.4315432414412497,
+      "alpha_p95": 8.574958086013794,
+      "structure_quality": 0.9034074933258006
+    },
+    {
+      "event_id": 20,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000020.npy",
+      "omega_p95": 0.3713360801339143,
+      "alpha_p95": 8.827656459808349,
+      "structure_quality": 0.9089551318675655
+    },
+    {
+      "event_id": 21,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000021.npy",
+      "omega_p95": 0.2940293937921517,
+      "alpha_p95": 12.157912302017206,
+      "structure_quality": 0.9009571043357737
+    },
+    {
+      "event_id": 22,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000022.npy",
+      "omega_p95": 0.24374115914106367,
+      "alpha_p95": 10.473197126388548,
+      "structure_quality": 0.9151639280882803
+    },
+    {
+      "event_id": 23,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000023.npy",
+      "omega_p95": 0.32052273154258687,
+      "alpha_p95": 12.3500923633575,
+      "structure_quality": 0.8970201389880311
+    },
+    {
+      "event_id": 24,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000024.npy",
+      "omega_p95": 1.6442363023757929,
+      "alpha_p95": 10.356234502792358,
+      "structure_quality": 0.7686925657102935
+    },
+    {
+      "event_id": 25,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000025.npy",
+      "omega_p95": 1.675126123428344,
+      "alpha_p95": 9.48416543006897,
+      "structure_quality": 0.7694490241063419
+    },
+    {
+      "event_id": 26,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000026.npy",
+      "omega_p95": 0.7851295471191404,
+      "alpha_p95": 6.392099356651304,
+      "structure_quality": 0.8748937255787387
+    },
+    {
+      "event_id": 27,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000027.npy",
+      "omega_p95": 0.6320904552936553,
+      "alpha_p95": 9.894920825958252,
+      "structure_quality": 0.8746048546777117
+    },
+    {
+      "event_id": 28,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000028.npy",
+      "omega_p95": 0.48327721655368805,
+      "alpha_p95": 24.160195922851518,
+      "structure_quality": 0.8231367244561202
+    },
+    {
+      "event_id": 29,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000029.npy",
+      "omega_p95": 0.21242494732141493,
+      "alpha_p95": 10.130879735946653,
+      "structure_quality": 0.9205022963688055
+    },
+    {
+      "event_id": 30,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000030.npy",
+      "omega_p95": 0.29561738967895507,
+      "alpha_p95": 14.937986850738525,
+      "structure_quality": 0.8869727758378945
+    },
+    {
+      "event_id": 31,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000031.npy",
+      "omega_p95": 0.23130042478442173,
+      "alpha_p95": 11.335261631011962,
+      "structure_quality": 0.9122089267221732
+    },
+    {
+      "event_id": 32,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000032.npy",
+      "omega_p95": 0.2905174568295479,
+      "alpha_p95": 14.6945583820343,
+      "structure_quality": 0.8887394953083694
+    },
+    {
+      "event_id": 33,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000033.npy",
+      "omega_p95": 0.21354162245988845,
+      "alpha_p95": 9.61709475517273,
+      "structure_quality": 0.9230046496024236
+    },
+    {
+      "event_id": 34,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000034.npy",
+      "omega_p95": 0.20881306007504463,
+      "alpha_p95": 10.949171590805053,
+      "structure_quality": 0.9167409319767388
+    },
+    {
+      "event_id": 35,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000035.npy",
+      "omega_p95": 0.2650534495711324,
+      "alpha_p95": 13.862983369827262,
+      "structure_quality": 0.8957013328274722
+    },
+    {
+      "event_id": 36,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000036.npy",
+      "omega_p95": 1.5524141788482666,
+      "alpha_p95": 9.512545680999754,
+      "structure_quality": 0.7812193987008512
+    },
+    {
+      "event_id": 37,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000037.npy",
+      "omega_p95": 1.478297966718673,
+      "alpha_p95": 10.29482626914978,
+      "structure_quality": 0.7850713095668614
+    },
+    {
+      "event_id": 38,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000038.npy",
+      "omega_p95": 2.4676520109176634,
+      "alpha_p95": 13.386660718917835,
+      "structure_quality": 0.6819309731220372
+    },
+    {
+      "event_id": 39,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000039.npy",
+      "omega_p95": 1.6765720546245575,
+      "alpha_p95": 16.190996170043928,
+      "structure_quality": 0.7411727977330957
+    },
+    {
+      "event_id": 40,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000040.npy",
+      "omega_p95": 1.7217503190040582,
+      "alpha_p95": 12.105479955673218,
+      "structure_quality": 0.7539181612690993
+    },
+    {
+      "event_id": 41,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000041.npy",
+      "omega_p95": 0.7747155666351317,
+      "alpha_p95": 6.034019994735718,
+      "structure_quality": 0.8777778117739053
+    },
+    {
+      "event_id": 42,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000042.npy",
+      "omega_p95": 1.3798773467540744,
+      "alpha_p95": 7.6540686845779415,
+      "structure_quality": 0.8065355749103598
+    },
+    {
+      "event_id": 43,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000043.npy",
+      "omega_p95": 0.5216096878051758,
+      "alpha_p95": 5.344475746154776,
+      "structure_quality": 0.9094704764040958
+    },
+    {
+      "event_id": 44,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000044.npy",
+      "omega_p95": 0.17460573092103002,
+      "alpha_p95": 6.9733381271362305,
+      "structure_quality": 0.941231190370238
+    },
+    {
+      "event_id": 45,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000045.npy",
+      "omega_p95": 0.1553650327026843,
+      "alpha_p95": 5.459474802017212,
+      "structure_quality": 0.9514662676311056
+    },
+    {
+      "event_id": 46,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000046.npy",
+      "omega_p95": 0.12684335187077522,
+      "alpha_p95": 4.56567764282224,
+      "structure_quality": 0.9596177078918098
+    },
+    {
+      "event_id": 47,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000047.npy",
+      "omega_p95": 0.14102752730250354,
+      "alpha_p95": 7.595010232925413,
+      "structure_quality": 0.9419312950970157
+    },
+    {
+      "event_id": 48,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000048.npy",
+      "omega_p95": 0.10577304549515247,
+      "alpha_p95": 4.332664752006531,
+      "structure_quality": 0.9633947922260421
+    },
+    {
+      "event_id": 49,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000049.npy",
+      "omega_p95": 0.14001354202628136,
+      "alpha_p95": 6.634016633033738,
+      "structure_quality": 0.9470936109185701
+    },
+    {
+      "event_id": 50,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000050.npy",
+      "omega_p95": 0.13002321049571036,
+      "alpha_p95": 6.510055184364319,
+      "structure_quality": 0.948930351473204
+    },
+    {
+      "event_id": 51,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000051.npy",
+      "omega_p95": 0.10373749956488608,
+      "alpha_p95": 3.855243980884552,
+      "structure_quality": 0.9661992437557441
+    },
+    {
+      "event_id": 52,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000052.npy",
+      "omega_p95": 0.11483422517776487,
+      "alpha_p95": 3.6432481527328466,
+      "structure_quality": 0.9659970045422149
+    },
+    {
+      "event_id": 53,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000053.npy",
+      "omega_p95": 1.208849972486496,
+      "alpha_p95": 6.626103639602661,
+      "structure_quality": 0.8286827115754622
+    },
+    {
+      "event_id": 54,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000054.npy",
+      "omega_p95": 1.7202387809753408,
+      "alpha_p95": 12.555047750473022,
+      "structure_quality": 0.7521796307325799
+    },
+    {
+      "event_id": 55,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000055.npy",
+      "omega_p95": 1.7961779713630615,
+      "alpha_p95": 17.364440536499014,
+      "structure_quality": 0.7254295183026543
+    },
+    {
+      "event_id": 56,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000060.npy",
+      "omega_p95": 1.16784705519676,
+      "alpha_p95": 10.24614930152893,
+      "structure_quality": 0.8163566621250062
+    },
+    {
+      "event_id": 57,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000061.npy",
+      "omega_p95": 0.4045760944485664,
+      "alpha_p95": 6.4455486536026,
+      "structure_quality": 0.917245047147306
+    },
+    {
+      "event_id": 58,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000062.npy",
+      "omega_p95": 1.0517427027225492,
+      "alpha_p95": 7.851536154747009,
+      "structure_quality": 0.8393835856415989
+    },
+    {
+      "event_id": 59,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000063.npy",
+      "omega_p95": 0.8728053152561186,
+      "alpha_p95": 7.402136230468745,
+      "structure_quality": 0.8605155062338592
+    },
+    {
+      "event_id": 60,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000064.npy",
+      "omega_p95": 2.087686264514923,
+      "alpha_p95": 13.73532581329345,
+      "structure_quality": 0.7137174318438843
+    },
+    {
+      "event_id": 61,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000065.npy",
+      "omega_p95": 1.2813726723194119,
+      "alpha_p95": 10.319289636611938,
+      "structure_quality": 0.8045268237963159
+    },
+    {
+      "event_id": 62,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000066.npy",
+      "omega_p95": 0.975973978638649,
+      "alpha_p95": 12.008212041854861,
+      "structure_quality": 0.8280273974378446
+    },
+    {
+      "event_id": 63,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000067.npy",
+      "omega_p95": 1.4728189289569829,
+      "alpha_p95": 18.23068876266478,
+      "structure_quality": 0.7517255585667987
+    },
+    {
+      "event_id": 64,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000068.npy",
+      "omega_p95": 0.5125497609376899,
+      "alpha_p95": 12.301646661758422,
+      "structure_quality": 0.8759807163637563
+    },
+    {
+      "event_id": 65,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000069.npy",
+      "omega_p95": 0.30366015434265137,
+      "alpha_p95": 14.54261326789854,
+      "structure_quality": 0.8880299445436305
+    },
+    {
+      "event_id": 66,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000070.npy",
+      "omega_p95": 0.3296148955821985,
+      "alpha_p95": 13.967535114288324,
+      "structure_quality": 0.8879860200956892
+    },
+    {
+      "event_id": 67,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000071.npy",
+      "omega_p95": 0.5742482483386976,
+      "alpha_p95": 13.143839979171752,
+      "structure_quality": 0.865193269326742
+    },
+    {
+      "event_id": 68,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000072.npy",
+      "omega_p95": 1.0389796197414387,
+      "alpha_p95": 15.762616300582868,
+      "structure_quality": 0.8045738319691454
+    },
+    {
+      "event_id": 69,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000073.npy",
+      "omega_p95": 0.7423729538917537,
+      "alpha_p95": 14.068017578124998,
+      "structure_quality": 0.8428618002418179
+    },
+    {
+      "event_id": 70,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000074.npy",
+      "omega_p95": 0.42126149982213956,
+      "alpha_p95": 17.483106136322004,
+      "structure_quality": 0.860892140377399
+    },
+    {
+      "event_id": 71,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000075.npy",
+      "omega_p95": 0.4558243796229362,
+      "alpha_p95": 14.191982841491694,
+      "structure_quality": 0.8729976660989651
+    },
+    {
+      "event_id": 72,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000076.npy",
+      "omega_p95": 0.3931071013212204,
+      "alpha_p95": 15.177150917053204,
+      "structure_quality": 0.8750660648754645
+    },
+    {
+      "event_id": 73,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000077.npy",
+      "omega_p95": 1.8456762969493865,
+      "alpha_p95": 11.638015508651735,
+      "structure_quality": 0.7442597499270438
+    },
+    {
+      "event_id": 74,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000078.npy",
+      "omega_p95": 1.753705048561096,
+      "alpha_p95": 10.791271448135376,
+      "structure_quality": 0.7564153574075047
+    },
+    {
+      "event_id": 75,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000079.npy",
+      "omega_p95": 1.4356661975383749,
+      "alpha_p95": 7.484917283058164,
+      "structure_quality": 0.8016836915404703
+    },
+    {
+      "event_id": 76,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000080.npy",
+      "omega_p95": 2.94641958475113,
+      "alpha_p95": 27.323525619506835,
+      "structure_quality": 0.5944612102621558
+    },
+    {
+      "event_id": 77,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000081.npy",
+      "omega_p95": 1.712079393863678,
+      "alpha_p95": 9.911837577819824,
+      "structure_quality": 0.7640854209387321
+    },
+    {
+      "event_id": 78,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000082.npy",
+      "omega_p95": 0.285761155188083,
+      "alpha_p95": 5.942541790008544,
+      "structure_quality": 0.9335747301759768
+    },
+    {
+      "event_id": 79,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000083.npy",
+      "omega_p95": 0.19559789448976517,
+      "alpha_p95": 5.44356482028961,
+      "structure_quality": 0.94677693410428
+    },
+    {
+      "event_id": 80,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000084.npy",
+      "omega_p95": 0.11260178387165054,
+      "alpha_p95": 3.574187445640557,
+      "structure_quality": 0.9666374078219253
+    },
+    {
+      "event_id": 81,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000085.npy",
+      "omega_p95": 0.14344925805926323,
+      "alpha_p95": 5.70669667720794,
+      "structure_quality": 0.9515766602664606
+    },
+    {
+      "event_id": 82,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000086.npy",
+      "omega_p95": 0.1365202374756336,
+      "alpha_p95": 4.717333817481994,
+      "structure_quality": 0.9576504524436598
+    },
+    {
+      "event_id": 83,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000087.npy",
+      "omega_p95": 0.11378104984760284,
+      "alpha_p95": 3.7458123207092253,
+      "structure_quality": 0.9655738417863311
+    },
+    {
+      "event_id": 84,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000088.npy",
+      "omega_p95": 0.11538745723664759,
+      "alpha_p95": 3.8440579771995544,
+      "structure_quality": 0.9648532036296582
+    },
+    {
+      "event_id": 85,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000089.npy",
+      "omega_p95": 1.238487476110458,
+      "alpha_p95": 9.092181873321532,
+      "structure_quality": 0.8143841821875208
+    },
+    {
+      "event_id": 86,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000090.npy",
+      "omega_p95": 2.9090529203414865,
+      "alpha_p95": 22.41138267517088,
+      "structure_quality": 0.6137673713974315
+    },
+    {
+      "event_id": 87,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000091.npy",
+      "omega_p95": 1.6218782722949978,
+      "alpha_p95": 7.875347876548767,
+      "structure_quality": 0.7815417429337058
+    },
+    {
+      "event_id": 88,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000092.npy",
+      "omega_p95": 1.9175493717193601,
+      "alpha_p95": 15.82664198875427,
+      "structure_quality": 0.7206371986036252
+    },
+    {
+      "event_id": 89,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000093.npy",
+      "omega_p95": 0.8599865823984145,
+      "alpha_p95": 6.1167826652526855,
+      "structure_quality": 0.8680721473424413
+    },
+    {
+      "event_id": 90,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000094.npy",
+      "omega_p95": 2.6906791448593133,
+      "alpha_p95": 28.212074756622314,
+      "structure_quality": 0.6107493447199408
+    },
+    {
+      "event_id": 91,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000095.npy",
+      "omega_p95": 0.7846513599157336,
+      "alpha_p95": 6.812455010414122,
+      "structure_quality": 0.8729051370065527
+    },
+    {
+      "event_id": 92,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000096.npy",
+      "omega_p95": 0.6472933650016784,
+      "alpha_p95": 6.964125680923462,
+      "structure_quality": 0.8872741598927494
+    },
+    {
+      "event_id": 93,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000097.npy",
+      "omega_p95": 1.748587983846663,
+      "alpha_p95": 10.59513411521911,
+      "structure_quality": 0.7577245467470266
+    },
+    {
+      "event_id": 94,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000098.npy",
+      "omega_p95": 0.567083120346069,
+      "alpha_p95": 5.964205503463745,
+      "structure_quality": 0.9012073947021634
+    },
+    {
+      "event_id": 95,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000099.npy",
+      "omega_p95": 1.0457223892211913,
+      "alpha_p95": 8.6936354637146,
+      "structure_quality": 0.8360948014599502
+    },
+    {
+      "event_id": 96,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000100.npy",
+      "omega_p95": 0.8701949447393413,
+      "alpha_p95": 10.12560420036315,
+      "structure_quality": 0.8478701967633993
+    },
+    {
+      "event_id": 97,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000101.npy",
+      "omega_p95": 0.655229315161705,
+      "alpha_p95": 7.793456435203559,
+      "structure_quality": 0.8823198521174075
+    },
+    {
+      "event_id": 98,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000102.npy",
+      "omega_p95": 0.47992068380117364,
+      "alpha_p95": 9.250431060791012,
+      "structure_quality": 0.8945975119752023
+    },
+    {
+      "event_id": 99,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000103.npy",
+      "omega_p95": 0.31666833311319337,
+      "alpha_p95": 10.869837474822997,
+      "structure_quality": 0.9048631812862302
+    },
+    {
+      "event_id": 100,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000104.npy",
+      "omega_p95": 0.2369212262332439,
+      "alpha_p95": 10.248348712921143,
+      "structure_quality": 0.9170893043934716
+    },
+    {
+      "event_id": 101,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000105.npy",
+      "omega_p95": 1.3990233957767448,
+      "alpha_p95": 10.136103248596179,
+      "structure_quality": 0.7935889800079994
+    },
+    {
+      "event_id": 102,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000106.npy",
+      "omega_p95": 1.1013484895229337,
+      "alpha_p95": 8.177699184417724,
+      "structure_quality": 0.8326846971250386
+    },
+    {
+      "event_id": 103,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000107.npy",
+      "omega_p95": 2.0784019231796265,
+      "alpha_p95": 19.312765693664545,
+      "structure_quality": 0.6927449513249898
+    },
+    {
+      "event_id": 104,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000108.npy",
+      "omega_p95": 0.540106055140495,
+      "alpha_p95": 8.406463527679442,
+      "structure_quality": 0.8920653988026719
+    },
+    {
+      "event_id": 105,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000109.npy",
+      "omega_p95": 0.49076107144355774,
+      "alpha_p95": 10.961940717697109,
+      "structure_quality": 0.8849317066452065
+    },
+    {
+      "event_id": 106,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000110.npy",
+      "omega_p95": 0.1411657564342021,
+      "alpha_p95": 6.543864750862114,
+      "structure_quality": 0.9474316103073552
+    },
+    {
+      "event_id": 107,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000111.npy",
+      "omega_p95": 0.7516884505748749,
+      "alpha_p95": 8.133529949188224,
+      "structure_quality": 0.8700998238855208
+    },
+    {
+      "event_id": 108,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000112.npy",
+      "omega_p95": 1.0972229361534118,
+      "alpha_p95": 5.927531123161316,
+      "structure_quality": 0.8435942929778515
+    },
+    {
+      "event_id": 109,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000113.npy",
+      "omega_p95": 1.6686701834201811,
+      "alpha_p95": 9.959114503860473,
+      "structure_quality": 0.7680409808027312
+    },
+    {
+      "event_id": 110,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000114.npy",
+      "omega_p95": 1.1450616002082825,
+      "alpha_p95": 11.170044994354248,
+      "structure_quality": 0.8144937653438635
+    },
+    {
+      "event_id": 111,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000115.npy",
+      "omega_p95": 0.9365272998809802,
+      "alpha_p95": 9.379192781448358,
+      "structure_quality": 0.84436320519288
+    },
+    {
+      "event_id": 112,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000116.npy",
+      "omega_p95": 2.2849582552909853,
+      "alpha_p95": 29.6886191368103,
+      "structure_quality": 0.6372733752890674
+    },
+    {
+      "event_id": 113,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000117.npy",
+      "omega_p95": 2.649346613883972,
+      "alpha_p95": 22.84368867874131,
+      "structure_quality": 0.6324983239381952
+    },
+    {
+      "event_id": 114,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000118.npy",
+      "omega_p95": 0.8908888846635818,
+      "alpha_p95": 25.280564212799025,
+      "structure_quality": 0.7773934473393975
+    },
+    {
+      "event_id": 115,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000119.npy",
+      "omega_p95": 1.1663286268711086,
+      "alpha_p95": 32.04050397872925,
+      "structure_quality": 0.7233993353573286
+    },
+    {
+      "event_id": 116,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000120.npy",
+      "omega_p95": 0.836197918653488,
+      "alpha_p95": 19.03106117248535,
+      "structure_quality": 0.8103793096103226
+    },
+    {
+      "event_id": 117,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000121.npy",
+      "omega_p95": 0.5466860651969904,
+      "alpha_p95": 19.168473720550537,
+      "structure_quality": 0.8396020252992568
+    },
+    {
+      "event_id": 118,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000122.npy",
+      "omega_p95": 0.25925369560718536,
+      "alpha_p95": 9.32869896888733,
+      "structure_quality": 0.9192172214780983
+    },
+    {
+      "event_id": 119,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000123.npy",
+      "omega_p95": 0.4127974197268485,
+      "alpha_p95": 22.28501882553099,
+      "structure_quality": 0.8391168262201262
+    },
+    {
+      "event_id": 120,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000124.npy",
+      "omega_p95": 0.40981605201959603,
+      "alpha_p95": 14.919022560119629,
+      "structure_quality": 0.8744934581992787
+    },
+    {
+      "event_id": 121,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000125.npy",
+      "omega_p95": 0.3496429696679111,
+      "alpha_p95": 11.425264596939082,
+      "structure_quality": 0.8983647943201692
+    },
+    {
+      "event_id": 122,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000126.npy",
+      "omega_p95": 0.36151866614818545,
+      "alpha_p95": 13.90346736907959,
+      "structure_quality": 0.8847666698240375
+    },
+    {
+      "event_id": 123,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000127.npy",
+      "omega_p95": 2.709559607505795,
+      "alpha_p95": 32.51170101165771,
+      "structure_quality": 0.594927629388454
+    },
+    {
+      "event_id": 124,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000128.npy",
+      "omega_p95": 2.294300723075866,
+      "alpha_p95": 27.256859302520752,
+      "structure_quality": 0.6451873195067122
+    },
+    {
+      "event_id": 125,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000129.npy",
+      "omega_p95": 0.5686340302228926,
+      "alpha_p95": 17.321317195892288,
+      "structure_quality": 0.8459383505216194
+    },
+    {
+      "event_id": 126,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000130.npy",
+      "omega_p95": 2.0312720417976373,
+      "alpha_p95": 17.754825878143315,
+      "structure_quality": 0.7028955844173898
+    },
+    {
+      "event_id": 127,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000131.npy",
+      "omega_p95": 0.4724395081400856,
+      "alpha_p95": 6.464903640747065,
+      "structure_quality": 0.9093992431396447
+    },
+    {
+      "event_id": 128,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000132.npy",
+      "omega_p95": 0.1408341661095619,
+      "alpha_p95": 5.729082822799683,
+      "structure_quality": 0.95176939215272
+    },
+    {
+      "event_id": 129,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000133.npy",
+      "omega_p95": 0.12072367668151855,
+      "alpha_p95": 5.627721786499023,
+      "structure_quality": 0.9547024281458764
+    },
+    {
+      "event_id": 130,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000134.npy",
+      "omega_p95": 0.13977663218975064,
+      "alpha_p95": 6.421193408966062,
+      "structure_quality": 0.9482421510570918
+    },
+    {
+      "event_id": 131,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000135.npy",
+      "omega_p95": 0.13000507429242134,
+      "alpha_p95": 5.008795714378355,
+      "structure_quality": 0.9568800096613471
+    },
+    {
+      "event_id": 132,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000136.npy",
+      "omega_p95": 0.1378774099051951,
+      "alpha_p95": 5.420655012130736,
+      "structure_quality": 0.9537540725955189
+    },
+    {
+      "event_id": 133,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000137.npy",
+      "omega_p95": 0.12573609128594387,
+      "alpha_p95": 4.349399828910822,
+      "structure_quality": 0.9609044104501572
+    },
+    {
+      "event_id": 134,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000138.npy",
+      "omega_p95": 0.16333996951580035,
+      "alpha_p95": 5.29297876358032,
+      "structure_quality": 0.9513978700261738
+    },
+    {
+      "event_id": 135,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000139.npy",
+      "omega_p95": 0.907136082649231,
+      "alpha_p95": 5.310232758522033,
+      "structure_quality": 0.8668465535119676
+    },
+    {
+      "event_id": 136,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000140.npy",
+      "omega_p95": 1.2161896526813507,
+      "alpha_p95": 6.961080813407897,
+      "structure_quality": 0.826383458452222
+    },
+    {
+      "event_id": 137,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000141.npy",
+      "omega_p95": 0.41399203538894636,
+      "alpha_p95": 4.791348147392271,
+      "structure_quality": 0.9246244672604846
+    },
+    {
+      "event_id": 138,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000142.npy",
+      "omega_p95": 0.20644123330712294,
+      "alpha_p95": 5.349058675765991,
+      "structure_quality": 0.9459910727571657
+    },
+    {
+      "event_id": 139,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000143.npy",
+      "omega_p95": 0.1614122167229652,
+      "alpha_p95": 6.937207818031311,
+      "structure_quality": 0.9429739979112827
+    },
+    {
+      "event_id": 140,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000144.npy",
+      "omega_p95": 0.17561708241701124,
+      "alpha_p95": 7.749358296394346,
+      "structure_quality": 0.9370635971971576
+    },
+    {
+      "event_id": 141,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000145.npy",
+      "omega_p95": 0.15326539948582646,
+      "alpha_p95": 7.444477438926696,
+      "structure_quality": 0.9412783479950202
+    },
+    {
+      "event_id": 142,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000146.npy",
+      "omega_p95": 0.15065104141831398,
+      "alpha_p95": 5.474051809310912,
+      "structure_quality": 0.951949988063067
+    },
+    {
+      "event_id": 143,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000147.npy",
+      "omega_p95": 0.149800356477499,
+      "alpha_p95": 6.831641030311579,
+      "structure_quality": 0.9448977051755221
+    },
+    {
+      "event_id": 144,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000148.npy",
+      "omega_p95": 0.1499472804367542,
+      "alpha_p95": 8.238345623016357,
+      "structure_quality": 0.9375248668502003
+    },
+    {
+      "event_id": 145,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000149.npy",
+      "omega_p95": 0.19007627665996552,
+      "alpha_p95": 9.71233935356139,
+      "structure_quality": 0.9252262512470975
+    },
+    {
+      "event_id": 146,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000150.npy",
+      "omega_p95": 0.33973629772663116,
+      "alpha_p95": 5.75718286037445,
+      "structure_quality": 0.928252598625418
+    },
+    {
+      "event_id": 147,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000151.npy",
+      "omega_p95": 1.0514437556266767,
+      "alpha_p95": 7.282229566574096,
+      "structure_quality": 0.8420740692496953
+    },
+    {
+      "event_id": 148,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000152.npy",
+      "omega_p95": 1.1491692841053007,
+      "alpha_p95": 8.631191396713252,
+      "structure_quality": 0.8256393493858999
+    },
+    {
+      "event_id": 149,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000153.npy",
+      "omega_p95": 1.3144712150096893,
+      "alpha_p95": 8.824421215057367,
+      "structure_quality": 0.8078866910190189
+    },
+    {
+      "event_id": 150,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000154.npy",
+      "omega_p95": 0.8428769946098327,
+      "alpha_p95": 7.797924017906191,
+      "structure_quality": 0.8618436334996682
+    },
+    {
+      "event_id": 151,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000155.npy",
+      "omega_p95": 0.2028151720762251,
+      "alpha_p95": 3.873880696296688,
+      "structure_quality": 0.9542081393289695
+    },
+    {
+      "event_id": 152,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000156.npy",
+      "omega_p95": 0.1445971317589283,
+      "alpha_p95": 1.8495651662349712,
+      "structure_quality": 0.9720480870181588
+    },
+    {
+      "event_id": 153,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000157.npy",
+      "omega_p95": 0.908560261130333,
+      "alpha_p95": 6.069125366210939,
+      "structure_quality": 0.8630459060133925
+    },
+    {
+      "event_id": 154,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000158.npy",
+      "omega_p95": 0.5979314953088759,
+      "alpha_p95": 6.431232810020447,
+      "structure_quality": 0.8954127372405515
+    },
+    {
+      "event_id": 155,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000159.npy",
+      "omega_p95": 1.6003846287727352,
+      "alpha_p95": 8.477624893188477,
+      "structure_quality": 0.7810266594780937
+    },
+    {
+      "event_id": 156,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000160.npy",
+      "omega_p95": 0.3721279606223105,
+      "alpha_p95": 8.394166088104246,
+      "structure_quality": 0.9110566027343854
+    },
+    {
+      "event_id": 157,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000161.npy",
+      "omega_p95": 0.27452871948480584,
+      "alpha_p95": 5.5388136148452745,
+      "structure_quality": 0.9369856828046416
+    },
+    {
+      "event_id": 158,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000162.npy",
+      "omega_p95": 0.2426394782960415,
+      "alpha_p95": 6.066877985000615,
+      "structure_quality": 0.9379723458174621
+    },
+    {
+      "event_id": 159,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000163.npy",
+      "omega_p95": 0.36280375421047206,
+      "alpha_p95": 9.588422822952264,
+      "structure_quality": 0.9060874223272153
+    },
+    {
+      "event_id": 160,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000164.npy",
+      "omega_p95": 0.41771087795495987,
+      "alpha_p95": 10.556925058364847,
+      "structure_quality": 0.8950609670647022
+    },
+    {
+      "event_id": 161,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000165.npy",
+      "omega_p95": 0.4155288338661194,
+      "alpha_p95": 6.567080068588256,
+      "structure_quality": 0.9153718686986245
+    },
+    {
+      "event_id": 162,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000166.npy",
+      "omega_p95": 0.25621249377727506,
+      "alpha_p95": 7.927586674690247,
+      "structure_quality": 0.9267525272844412
+    },
+    {
+      "event_id": 163,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000167.npy",
+      "omega_p95": 0.6164336860179899,
+      "alpha_p95": 14.808632802963237,
+      "structure_quality": 0.8527196978048877
+    },
+    {
+      "event_id": 164,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000168.npy",
+      "omega_p95": 2.224469172954558,
+      "alpha_p95": 21.054781913757324,
+      "structure_quality": 0.6736600600469101
+    },
+    {
+      "event_id": 165,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000169.npy",
+      "omega_p95": 2.3327851295471205,
+      "alpha_p95": 12.233407688140868,
+      "structure_quality": 0.6979823121929554
+    },
+    {
+      "event_id": 166,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000171.npy",
+      "omega_p95": 1.1801776289939874,
+      "alpha_p95": 12.926124620437612,
+      "structure_quality": 0.8030534478239633
+    },
+    {
+      "event_id": 167,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000172.npy",
+      "omega_p95": 0.47903521060943594,
+      "alpha_p95": 16.88564682006836,
+      "structure_quality": 0.8575390596848466
+    },
+    {
+      "event_id": 168,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000173.npy",
+      "omega_p95": 0.36376576125621796,
+      "alpha_p95": 11.652965354919413,
+      "structure_quality": 0.8956465524238842
+    },
+    {
+      "event_id": 169,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000176.npy",
+      "omega_p95": 2.7117329835891724,
+      "alpha_p95": 17.053759288787827,
+      "structure_quality": 0.6481003522034869
+    },
+    {
+      "event_id": 170,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000177.npy",
+      "omega_p95": 1.0476184189319586,
+      "alpha_p95": 23.278237438201867,
+      "structure_quality": 0.7708389254209431
+    },
+    {
+      "event_id": 171,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000178.npy",
+      "omega_p95": 0.4077069640159606,
+      "alpha_p95": 19.441083908081055,
+      "structure_quality": 0.8530224676990871
+    },
+    {
+      "event_id": 172,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000179.npy",
+      "omega_p95": 0.8134298682212816,
+      "alpha_p95": 21.52303886413574,
+      "structure_quality": 0.8015153370662705
+    },
+    {
+      "event_id": 173,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000180.npy",
+      "omega_p95": 0.48961500972509386,
+      "alpha_p95": 20.806227684020996,
+      "structure_quality": 0.8379540356904615
+    },
+    {
+      "event_id": 174,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000181.npy",
+      "omega_p95": 0.7476382076740256,
+      "alpha_p95": 18.283581066131585,
+      "structure_quality": 0.8228097871627441
+    },
+    {
+      "event_id": 175,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000182.npy",
+      "omega_p95": 2.4904652833938554,
+      "alpha_p95": 17.76495294570921,
+      "structure_quality": 0.6636486949030145
+    },
+    {
+      "event_id": 176,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000183.npy",
+      "omega_p95": 1.637917017936706,
+      "alpha_p95": 12.112904167175294,
+      "structure_quality": 0.7618287094734632
+    },
+    {
+      "event_id": 177,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000184.npy",
+      "omega_p95": 1.0985196828842163,
+      "alpha_p95": 12.54166545867918,
+      "structure_quality": 0.8130270651057923
+    },
+    {
+      "event_id": 178,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000185.npy",
+      "omega_p95": 0.7107189297676086,
+      "alpha_p95": 15.262588500976566,
+      "structure_quality": 0.8406061631768897
+    },
+    {
+      "event_id": 179,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000186.npy",
+      "omega_p95": 0.7831311762332892,
+      "alpha_p95": 16.42030944824217,
+      "structure_quality": 0.8276910366224411
+    },
+    {
+      "event_id": 180,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000187.npy",
+      "omega_p95": 0.36943777501583036,
+      "alpha_p95": 8.169685935974112,
+      "structure_quality": 0.912500298898336
+    },
+    {
+      "event_id": 181,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000188.npy",
+      "omega_p95": 0.9531923294067379,
+      "alpha_p95": 17.642870330810528,
+      "structure_quality": 0.8047971769102399
+    },
+    {
+      "event_id": 182,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000189.npy",
+      "omega_p95": 1.6128018260002128,
+      "alpha_p95": 17.540702152252198,
+      "structure_quality": 0.7415233901439384
+    },
+    {
+      "event_id": 183,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000190.npy",
+      "omega_p95": 1.7814641892909984,
+      "alpha_p95": 20.367046356201172,
+      "structure_quality": 0.7147422568577778
+    },
+    {
+      "event_id": 184,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000192.npy",
+      "omega_p95": 0.3847231045365331,
+      "alpha_p95": 9.89490990638733,
+      "structure_quality": 0.9020709443233849
+    },
+    {
+      "event_id": 185,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000193.npy",
+      "omega_p95": 0.3512013614177703,
+      "alpha_p95": 10.726938247680664,
+      "structure_quality": 0.9016811879597544
+    },
+    {
+      "event_id": 186,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000194.npy",
+      "omega_p95": 0.3293964415788647,
+      "alpha_p95": 11.474458932876585,
+      "structure_quality": 0.9003951564738985
+    },
+    {
+      "event_id": 187,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000195.npy",
+      "omega_p95": 0.3815920561552047,
+      "alpha_p95": 18.357702350616446,
+      "structure_quality": 0.8609780725497471
+    },
+    {
+      "event_id": 188,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000196.npy",
+      "omega_p95": 0.5145242899656294,
+      "alpha_p95": 17.542935371398926,
+      "structure_quality": 0.8506314794627391
+    },
+    {
+      "event_id": 189,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000197.npy",
+      "omega_p95": 2.138523304462432,
+      "alpha_p95": 15.447848796844482,
+      "structure_quality": 0.7024810907189941
+    },
+    {
+      "event_id": 190,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000198.npy",
+      "omega_p95": 1.7540997564792633,
+      "alpha_p95": 8.778678178787214,
+      "structure_quality": 0.7648826130781141
+    },
+    {
+      "event_id": 191,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000199.npy",
+      "omega_p95": 0.41438755691051443,
+      "alpha_p95": 10.923939323425289,
+      "structure_quality": 0.8936089671570382
+    },
+    {
+      "event_id": 192,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000200.npy",
+      "omega_p95": 0.44191939085721965,
+      "alpha_p95": 7.914222860336302,
+      "structure_quality": 0.9055544883106503
+    },
+    {
+      "event_id": 193,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000201.npy",
+      "omega_p95": 0.6806103229522698,
+      "alpha_p95": 18.45721721649165,
+      "structure_quality": 0.8289326363986876
+    },
+    {
+      "event_id": 194,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000202.npy",
+      "omega_p95": 2.080426383018493,
+      "alpha_p95": 17.280812740325924,
+      "structure_quality": 0.7004321249112611
+    },
+    {
+      "event_id": 195,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000203.npy",
+      "omega_p95": 1.4789758026599884,
+      "alpha_p95": 9.092915248870838,
+      "structure_quality": 0.7902640323779784
+    },
+    {
+      "event_id": 196,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000204.npy",
+      "omega_p95": 1.3917574167251585,
+      "alpha_p95": 9.37644600868225,
+      "structure_quality": 0.7976694074032522
+    },
+    {
+      "event_id": 197,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000205.npy",
+      "omega_p95": 0.35633863508701286,
+      "alpha_p95": 6.107173824310302,
+      "structure_quality": 0.9245288035241771
+    },
+    {
+      "event_id": 198,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000206.npy",
+      "omega_p95": 0.18650875613093376,
+      "alpha_p95": 6.225968551635737,
+      "structure_quality": 0.9437421383373953
+    },
+    {
+      "event_id": 199,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000207.npy",
+      "omega_p95": 0.16976465731859205,
+      "alpha_p95": 6.126266717910767,
+      "structure_quality": 0.9462434491018957
+    },
+    {
+      "event_id": 200,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000208.npy",
+      "omega_p95": 0.15212347134947773,
+      "alpha_p95": 6.115375757217407,
+      "structure_quality": 0.9483897394201172
+    },
+    {
+      "event_id": 201,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000209.npy",
+      "omega_p95": 0.14205932915210723,
+      "alpha_p95": 6.252918171882627,
+      "structure_quality": 0.9488582583992603
+    },
+    {
+      "event_id": 202,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000210.npy",
+      "omega_p95": 0.1971947580575942,
+      "alpha_p95": 7.064370989799499,
+      "structure_quality": 0.9381026975987473
+    },
+    {
+      "event_id": 203,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000211.npy",
+      "omega_p95": 0.13580914139747619,
+      "alpha_p95": 4.943431615829468,
+      "structure_quality": 0.9565333235581931
+    },
+    {
+      "event_id": 204,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000212.npy",
+      "omega_p95": 0.1623711973428726,
+      "alpha_p95": 7.267252707481381,
+      "structure_quality": 0.9411337383780213
+    },
+    {
+      "event_id": 205,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000213.npy",
+      "omega_p95": 0.15896466374397278,
+      "alpha_p95": 7.2024511814117425,
+      "structure_quality": 0.9418735956266835
+    },
+    {
+      "event_id": 206,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000214.npy",
+      "omega_p95": 0.12420044057071207,
+      "alpha_p95": 4.918125629425049,
+      "structure_quality": 0.9580570273911365
+    },
+    {
+      "event_id": 207,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000215.npy",
+      "omega_p95": 0.7417413145303726,
+      "alpha_p95": 6.5878087997436445,
+      "structure_quality": 0.878695724596864
+    },
+    {
+      "event_id": 208,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000216.npy",
+      "omega_p95": 0.8320417106151581,
+      "alpha_p95": 6.941387438774107,
+      "structure_quality": 0.8671281735974898
+    },
+    {
+      "event_id": 209,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000217.npy",
+      "omega_p95": 1.7013205766677841,
+      "alpha_p95": 18.830218982696532,
+      "structure_quality": 0.728128744365464
+    },
+    {
+      "event_id": 210,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000218.npy",
+      "omega_p95": 1.4225797176361077,
+      "alpha_p95": 34.893377113342275,
+      "structure_quality": 0.6895786226306823
+    },
+    {
+      "event_id": 211,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000219.npy",
+      "omega_p95": 0.7023310452699657,
+      "alpha_p95": 22.309651851654053,
+      "structure_quality": 0.8091799990426867
+    },
+    {
+      "event_id": 212,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000220.npy",
+      "omega_p95": 0.7743619531393051,
+      "alpha_p95": 21.739217090606644,
+      "structure_quality": 0.8044723579563693
+    },
+    {
+      "event_id": 213,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000221.npy",
+      "omega_p95": 0.6360427349805805,
+      "alpha_p95": 26.380645275115956,
+      "structure_quality": 0.797666664634204
+    },
+    {
+      "event_id": 214,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000222.npy",
+      "omega_p95": 0.6717345744371407,
+      "alpha_p95": 23.13517265319824,
+      "structure_quality": 0.8085639073343033
+    },
+    {
+      "event_id": 215,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000223.npy",
+      "omega_p95": 0.8673013806343072,
+      "alpha_p95": 34.72263450622557,
+      "structure_quality": 0.7398437989138166
+    },
+    {
+      "event_id": 216,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000224.npy",
+      "omega_p95": 1.1565273106098175,
+      "alpha_p95": 48.44228286743162,
+      "structure_quality": 0.6612060867053344
+    },
+    {
+      "event_id": 217,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000225.npy",
+      "omega_p95": 0.7899641007184984,
+      "alpha_p95": 32.45117416381825,
+      "structure_quality": 0.7565173484489282
+    },
+    {
+      "event_id": 218,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000226.npy",
+      "omega_p95": 3.136048293113708,
+      "alpha_p95": 41.33599033355713,
+      "structure_quality": 0.5370573316186682
+    },
+    {
+      "event_id": 219,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000227.npy",
+      "omega_p95": 1.2179089725017547,
+      "alpha_p95": 7.332773661613463,
+      "structure_quality": 0.8245015533317237
+    },
+    {
+      "event_id": 220,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000228.npy",
+      "omega_p95": 1.5793895423412323,
+      "alpha_p95": 17.422158050537064,
+      "structure_quality": 0.745117421895212
+    },
+    {
+      "event_id": 221,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000229.npy",
+      "omega_p95": 0.5280441850423813,
+      "alpha_p95": 8.180074739456176,
+      "structure_quality": 0.8945357746680289
+    },
+    {
+      "event_id": 222,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000230.npy",
+      "omega_p95": 0.6674495726823775,
+      "alpha_p95": 10.97757897377014,
+      "structure_quality": 0.8655261020788007
+    },
+    {
+      "event_id": 223,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000231.npy",
+      "omega_p95": 0.4122279599308967,
+      "alpha_p95": 19.472329044342025,
+      "structure_quality": 0.852392565369288
+    },
+    {
+      "event_id": 224,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000232.npy",
+      "omega_p95": 0.47916980832815004,
+      "alpha_p95": 7.838810539245605,
+      "structure_quality": 0.9017254598544228
+    },
+    {
+      "event_id": 225,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000233.npy",
+      "omega_p95": 1.6423244893550866,
+      "alpha_p95": 15.355314493179321,
+      "structure_quality": 0.7478163415003748
+    },
+    {
+      "event_id": 226,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000234.npy",
+      "omega_p95": 0.33745539784431405,
+      "alpha_p95": 3.2576786518096905,
+      "structure_quality": 0.9415007451242158
+    },
+    {
+      "event_id": 227,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000235.npy",
+      "omega_p95": 0.3711307272315022,
+      "alpha_p95": 4.775945544242859,
+      "structure_quality": 0.929671136809889
+    },
+    {
+      "event_id": 228,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000236.npy",
+      "omega_p95": 0.44299398213624896,
+      "alpha_p95": 10.841994094848598,
+      "structure_quality": 0.8908247604017653
+    },
+    {
+      "event_id": 229,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000237.npy",
+      "omega_p95": 2.5221681118011468,
+      "alpha_p95": 15.044401025772096,
+      "structure_quality": 0.6710906732136942
+    },
+    {
+      "event_id": 230,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000238.npy",
+      "omega_p95": 1.7041694462299342,
+      "alpha_p95": 11.53401517868042,
+      "structure_quality": 0.757979420925948
+    },
+    {
+      "event_id": 231,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000239.npy",
+      "omega_p95": 0.9385822474956507,
+      "alpha_p95": 9.303280448913554,
+      "structure_quality": 0.8445024240685014
+    },
+    {
+      "event_id": 232,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000240.npy",
+      "omega_p95": 0.7474083602428436,
+      "alpha_p95": 6.31619353294372,
+      "structure_quality": 0.8793994839094543
+    },
+    {
+      "event_id": 233,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000241.npy",
+      "omega_p95": 2.999273264408102,
+      "alpha_p95": 21.012551879882793,
+      "structure_quality": 0.6116191112962149
+    },
+    {
+      "event_id": 234,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000242.npy",
+      "omega_p95": 1.839554488658905,
+      "alpha_p95": 13.78946862220762,
+      "structure_quality": 0.735979900231216
+    },
+    {
+      "event_id": 235,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000243.npy",
+      "omega_p95": 1.1323806285858136,
+      "alpha_p95": 7.978969001770021,
+      "structure_quality": 0.8303772327635599
+    },
+    {
+      "event_id": 236,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000244.npy",
+      "omega_p95": 1.449466586112976,
+      "alpha_p95": 6.478585052490228,
+      "structure_quality": 0.8047887467148295
+    },
+    {
+      "event_id": 237,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000245.npy",
+      "omega_p95": 0.8504034250974611,
+      "alpha_p95": 13.21849908828734,
+      "structure_quality": 0.8354903055521188
+    },
+    {
+      "event_id": 238,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000246.npy",
+      "omega_p95": 0.8117992937564839,
+      "alpha_p95": 10.102779436111442,
+      "structure_quality": 0.8541901395414422
+    },
+    {
+      "event_id": 239,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000247.npy",
+      "omega_p95": 0.9285794436931598,
+      "alpha_p95": 6.800680994987488,
+      "structure_quality": 0.8573971991131465
+    },
+    {
+      "event_id": 240,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000248.npy",
+      "omega_p95": 1.8818158864974945,
+      "alpha_p95": 11.400536203384398,
+      "structure_quality": 0.7418833205939395
+    },
+    {
+      "event_id": 241,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000249.npy",
+      "omega_p95": 0.3483710035681719,
+      "alpha_p95": 8.26624274253845,
+      "structure_quality": 0.914415746344645
+    },
+    {
+      "event_id": 242,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000250.npy",
+      "omega_p95": 0.4001914352178573,
+      "alpha_p95": 7.393685460090637,
+      "structure_quality": 0.9129264504511191
+    },
+    {
+      "event_id": 243,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000251.npy",
+      "omega_p95": 1.0872693061828613,
+      "alpha_p95": 12.129145240783696,
+      "structure_quality": 0.8160392672879482
+    },
+    {
+      "event_id": 244,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000252.npy",
+      "omega_p95": 1.9042422115802753,
+      "alpha_p95": 10.71693587303161,
+      "structure_quality": 0.7426214823650622
+    },
+    {
+      "event_id": 245,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000253.npy",
+      "omega_p95": 1.4204190373420715,
+      "alpha_p95": 12.918341827392588,
+      "structure_quality": 0.7793298109438003
+    },
+    {
+      "event_id": 246,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000254.npy",
+      "omega_p95": 2.4106574416160584,
+      "alpha_p95": 14.474492311477661,
+      "structure_quality": 0.6826684109600286
+    },
+    {
+      "event_id": 247,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000255.npy",
+      "omega_p95": 1.5248183906078328,
+      "alpha_p95": 8.081899118423461,
+      "structure_quality": 0.7901742893901422
+    },
+    {
+      "event_id": 248,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000256.npy",
+      "omega_p95": 0.8017665743827815,
+      "alpha_p95": 8.423133134841919,
+      "structure_quality": 0.863280159746833
+    },
+    {
+      "event_id": 249,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000257.npy",
+      "omega_p95": 0.6231425315141678,
+      "alpha_p95": 6.939540505409235,
+      "structure_quality": 0.8900783207838247
+    },
+    {
+      "event_id": 250,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000258.npy",
+      "omega_p95": 0.2358275696635245,
+      "alpha_p95": 9.505418491363521,
+      "structure_quality": 0.9210082116830284
+    },
+    {
+      "event_id": 251,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000259.npy",
+      "omega_p95": 0.27717403918504724,
+      "alpha_p95": 11.790102958679194,
+      "structure_quality": 0.9047041209718492
+    },
+    {
+      "event_id": 252,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000260.npy",
+      "omega_p95": 0.21038147136569013,
+      "alpha_p95": 8.502429103851318,
+      "structure_quality": 0.929105112080713
+    },
+    {
+      "event_id": 253,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000261.npy",
+      "omega_p95": 0.24272809401154502,
+      "alpha_p95": 6.5220879793167095,
+      "structure_quality": 0.9355928992096809
+    },
+    {
+      "event_id": 254,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000262.npy",
+      "omega_p95": 0.1465730153024196,
+      "alpha_p95": 7.0036702156066895,
+      "structure_quality": 0.9443759822135364
+    },
+    {
+      "event_id": 255,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000263.npy",
+      "omega_p95": 0.22727814018726333,
+      "alpha_p95": 5.944322776794432,
+      "structure_quality": 0.9404152151990405
+    },
+    {
+      "event_id": 256,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000264.npy",
+      "omega_p95": 1.5534674227237681,
+      "alpha_p95": 7.269856071472168,
+      "structure_quality": 0.7909096682819583
+    },
+    {
+      "event_id": 257,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000265.npy",
+      "omega_p95": 1.3932287693023668,
+      "alpha_p95": 7.437934994697571,
+      "structure_quality": 0.8061580553554141
+    },
+    {
+      "event_id": 258,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000266.npy",
+      "omega_p95": 0.5186455547809601,
+      "alpha_p95": 5.009425139427179,
+      "structure_quality": 0.9115025985555891
+    },
+    {
+      "event_id": 259,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000267.npy",
+      "omega_p95": 0.5592588037252426,
+      "alpha_p95": 5.019392871856688,
+      "structure_quality": 0.9068367206377027
+    },
+    {
+      "event_id": 260,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000268.npy",
+      "omega_p95": 0.23571041822433467,
+      "alpha_p95": 6.280193376541133,
+      "structure_quality": 0.9376732244295942
+    },
+    {
+      "event_id": 261,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000269.npy",
+      "omega_p95": 0.1880437038838863,
+      "alpha_p95": 8.586446046829224,
+      "structure_quality": 0.931268223125024
+    },
+    {
+      "event_id": 262,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000270.npy",
+      "omega_p95": 0.23084098249673823,
+      "alpha_p95": 5.039178013801575,
+      "structure_quality": 0.9447352436213747
+    },
+    {
+      "event_id": 263,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000271.npy",
+      "omega_p95": 1.269831538200378,
+      "alpha_p95": 7.4625019073486385,
+      "structure_quality": 0.8185774304605697
+    },
+    {
+      "event_id": 264,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000272.npy",
+      "omega_p95": 0.3752221167087555,
+      "alpha_p95": 4.747377586364744,
+      "structure_quality": 0.9293432877148072
+    },
+    {
+      "event_id": 265,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000273.npy",
+      "omega_p95": 0.3972270265221596,
+      "alpha_p95": 4.945915269851677,
+      "structure_quality": 0.9257688612545335
+    },
+    {
+      "event_id": 266,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000274.npy",
+      "omega_p95": 0.5521835029125208,
+      "alpha_p95": 4.462177109718323,
+      "structure_quality": 0.9104531733866998
+    },
+    {
+      "event_id": 267,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000275.npy",
+      "omega_p95": 0.5531180500984171,
+      "alpha_p95": 9.875103044509887,
+      "structure_quality": 0.8833785689554635
+    },
+    {
+      "event_id": 268,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000276.npy",
+      "omega_p95": 1.5531924605369567,
+      "alpha_p95": 9.058777332305906,
+      "structure_quality": 0.7831150974702049
+    },
+    {
+      "event_id": 269,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000277.npy",
+      "omega_p95": 2.175562000274657,
+      "alpha_p95": 10.516694593429566,
+      "structure_quality": 0.7186568242436564
+    },
+    {
+      "event_id": 270,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000278.npy",
+      "omega_p95": 0.4394087076187133,
+      "alpha_p95": 8.617878532409664,
+      "structure_quality": 0.9023045372914827
+    },
+    {
+      "event_id": 271,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000279.npy",
+      "omega_p95": 0.17591368705034255,
+      "alpha_p95": 7.014832329750059,
+      "structure_quality": 0.9408604015205729
+    },
+    {
+      "event_id": 272,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000280.npy",
+      "omega_p95": 0.21314695924520485,
+      "alpha_p95": 5.92787091732025,
+      "structure_quality": 0.9421639394956288
+    },
+    {
+      "event_id": 273,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000281.npy",
+      "omega_p95": 1.0111312866210938,
+      "alpha_p95": 9.042309284210187,
+      "structure_quality": 0.8380927852226433
+    },
+    {
+      "event_id": 274,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000282.npy",
+      "omega_p95": 0.3578655585646627,
+      "alpha_p95": 6.064136433601373,
+      "structure_quality": 0.9245733957149909
+    },
+    {
+      "event_id": 275,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000283.npy",
+      "omega_p95": 0.5927000343799588,
+      "alpha_p95": 5.6342164993286135,
+      "structure_quality": 0.8999746280852919
+    },
+    {
+      "event_id": 276,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000284.npy",
+      "omega_p95": 0.6634555339813232,
+      "alpha_p95": 5.9389671087265015,
+      "structure_quality": 0.8905409397101951
+    },
+    {
+      "event_id": 277,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000285.npy",
+      "omega_p95": 0.8084654003381729,
+      "alpha_p95": 5.818316769599914,
+      "structure_quality": 0.875130590831957
+    },
+    {
+      "event_id": 278,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000286.npy",
+      "omega_p95": 0.36541405022144313,
+      "alpha_p95": 5.22140884399414,
+      "structure_quality": 0.9280361583750757
+    },
+    {
+      "event_id": 279,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000287.npy",
+      "omega_p95": 0.6949270725250244,
+      "alpha_p95": 6.289517521858215,
+      "structure_quality": 0.8853186448703455
+    },
+    {
+      "event_id": 280,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000288.npy",
+      "omega_p95": 1.4367209494113917,
+      "alpha_p95": 8.93848967552185,
+      "structure_quality": 0.7951310026849652
+    },
+    {
+      "event_id": 281,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000289.npy",
+      "omega_p95": 0.8817298859357834,
+      "alpha_p95": 7.82510762214657,
+      "structure_quality": 0.857538626165989
+    },
+    {
+      "event_id": 282,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000290.npy",
+      "omega_p95": 0.28803032636642456,
+      "alpha_p95": 10.66724481582641,
+      "structure_quality": 0.9091308352489884
+    },
+    {
+      "event_id": 283,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000291.npy",
+      "omega_p95": 0.14935852587223059,
+      "alpha_p95": 5.592659711837765,
+      "structure_quality": 0.9514766359945229
+    },
+    {
+      "event_id": 284,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000292.npy",
+      "omega_p95": 0.15483951121568676,
+      "alpha_p95": 7.290893793106079,
+      "structure_quality": 0.9418964798758725
+    },
+    {
+      "event_id": 285,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000293.npy",
+      "omega_p95": 0.15130163356661797,
+      "alpha_p95": 7.512799453735343,
+      "structure_quality": 0.941152134787695
+    },
+    {
+      "event_id": 286,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000294.npy",
+      "omega_p95": 0.16570531949400902,
+      "alpha_p95": 7.469593024253819,
+      "structure_quality": 0.9396846826697198
+    },
+    {
+      "event_id": 287,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000295.npy",
+      "omega_p95": 0.19726523458957662,
+      "alpha_p95": 10.297316789627075,
+      "structure_quality": 0.9213959059144174
+    },
+    {
+      "event_id": 288,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000296.npy",
+      "omega_p95": 0.13332107961177822,
+      "alpha_p95": 5.373609161376958,
+      "structure_quality": 0.9545468829794561
+    },
+    {
+      "event_id": 289,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000297.npy",
+      "omega_p95": 0.13460091054439535,
+      "alpha_p95": 5.681835889816284,
+      "structure_quality": 0.9527613096542682
+    },
+    {
+      "event_id": 290,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000298.npy",
+      "omega_p95": 0.13114821910858154,
+      "alpha_p95": 6.219921708106994,
+      "structure_quality": 0.9503274705059881
+    },
+    {
+      "event_id": 291,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000299.npy",
+      "omega_p95": 0.2185024969279763,
+      "alpha_p95": 8.730061292648315,
+      "structure_quality": 0.9269893959088766
+    },
+    {
+      "event_id": 292,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000300.npy",
+      "omega_p95": 0.18849142044782644,
+      "alpha_p95": 8.629783391952515,
+      "structure_quality": 0.9309919311349494
+    },
+    {
+      "event_id": 293,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000301.npy",
+      "omega_p95": 0.2500215061008929,
+      "alpha_p95": 4.474104356765749,
+      "structure_quality": 0.9454362445371156
+    },
+    {
+      "event_id": 294,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000302.npy",
+      "omega_p95": 0.3948529213666916,
+      "alpha_p95": 3.7790985703468305,
+      "structure_quality": 0.9320660411273003
+    },
+    {
+      "event_id": 295,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000303.npy",
+      "omega_p95": 0.14358069449663152,
+      "alpha_p95": 5.060798525810242,
+      "structure_quality": 0.9549816683050935
+    },
+    {
+      "event_id": 296,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000304.npy",
+      "omega_p95": 0.08742338381707665,
+      "alpha_p95": 4.106606602668761,
+      "structure_quality": 0.9668205215626807
+    },
+    {
+      "event_id": 297,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000305.npy",
+      "omega_p95": 0.22188620567321765,
+      "alpha_p95": 6.427071070671082,
+      "structure_quality": 0.9385288094394726
+    },
+    {
+      "event_id": 298,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000306.npy",
+      "omega_p95": 0.4446575328707694,
+      "alpha_p95": 5.4830762863159155,
+      "structure_quality": 0.9175541088830926
+    },
+    {
+      "event_id": 299,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000307.npy",
+      "omega_p95": 0.6694558531045913,
+      "alpha_p95": 6.345116329193107,
+      "structure_quality": 0.8878676162427146
+    },
+    {
+      "event_id": 300,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000308.npy",
+      "omega_p95": 0.50661917924881,
+      "alpha_p95": 6.664992022514341,
+      "structure_quality": 0.9045161393928054
+    },
+    {
+      "event_id": 301,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000309.npy",
+      "omega_p95": 0.1886163346469402,
+      "alpha_p95": 5.027774691581726,
+      "structure_quality": 0.9497949845148912
+    },
+    {
+      "event_id": 302,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000310.npy",
+      "omega_p95": 0.2731622070074082,
+      "alpha_p95": 6.104267621040342,
+      "structure_quality": 0.9342064059654536
+    },
+    {
+      "event_id": 303,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000311.npy",
+      "omega_p95": 0.5997818380594252,
+      "alpha_p95": 7.601933741569519,
+      "structure_quality": 0.8894022287655244
+    },
+    {
+      "event_id": 304,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000312.npy",
+      "omega_p95": 0.393929137289524,
+      "alpha_p95": 5.899965810775759,
+      "structure_quality": 0.9212547034352329
+    },
+    {
+      "event_id": 305,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000313.npy",
+      "omega_p95": 0.1535332351922989,
+      "alpha_p95": 3.9109898328781116,
+      "structure_quality": 0.9599065186260892
+    },
+    {
+      "event_id": 306,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000314.npy",
+      "omega_p95": 0.11148589141666888,
+      "alpha_p95": 4.244494295120241,
+      "structure_quality": 0.9631787560286909
+    },
+    {
+      "event_id": 307,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000315.npy",
+      "omega_p95": 0.11415631212294099,
+      "alpha_p95": 4.710792660713196,
+      "structure_quality": 0.9603661995879951
+    },
+    {
+      "event_id": 308,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000316.npy",
+      "omega_p95": 0.13261448368430118,
+      "alpha_p95": 5.402863931655887,
+      "structure_quality": 0.9544760563092859
+    },
+    {
+      "event_id": 309,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000317.npy",
+      "omega_p95": 0.17197453156113623,
+      "alpha_p95": 5.715674042701721,
+      "structure_quality": 0.9481424150852975
+    },
+    {
+      "event_id": 310,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000318.npy",
+      "omega_p95": 0.23820040747523308,
+      "alpha_p95": 6.5219825267791744,
+      "structure_quality": 0.9361231064254125
+    },
+    {
+      "event_id": 311,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000319.npy",
+      "omega_p95": 0.5644875824451446,
+      "alpha_p95": 11.401325178146356,
+      "structure_quality": 0.8746760906791544
+    },
+    {
+      "event_id": 312,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000320.npy",
+      "omega_p95": 0.25075768232345585,
+      "alpha_p95": 5.375794577598572,
+      "structure_quality": 0.9406254659136521
+    },
+    {
+      "event_id": 313,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000321.npy",
+      "omega_p95": 0.33609601855278043,
+      "alpha_p95": 12.45096535682677,
+      "structure_quality": 0.8947740666441439
+    },
+    {
+      "event_id": 314,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000322.npy",
+      "omega_p95": 1.7016644179821014,
+      "alpha_p95": 23.46968946456908,
+      "structure_quality": 0.7095706459076823
+    },
+    {
+      "event_id": 315,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000323.npy",
+      "omega_p95": 1.4565239727497101,
+      "alpha_p95": 26.99248857498167,
+      "structure_quality": 0.717470270927103
+    },
+    {
+      "event_id": 316,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000324.npy",
+      "omega_p95": 1.1964788556098929,
+      "alpha_p95": 21.341520690917964,
+      "structure_quality": 0.7648130448882443
+    },
+    {
+      "event_id": 317,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000325.npy",
+      "omega_p95": 0.5352526605129235,
+      "alpha_p95": 17.547695446014416,
+      "structure_quality": 0.8484078704780312
+    },
+    {
+      "event_id": 318,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000326.npy",
+      "omega_p95": 0.3196479573845861,
+      "alpha_p95": 15.986202049255363,
+      "structure_quality": 0.8791777104636141
+    },
+    {
+      "event_id": 319,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000327.npy",
+      "omega_p95": 0.25465672165155406,
+      "alpha_p95": 13.36409068107605,
+      "structure_quality": 0.8993553604778939
+    },
+    {
+      "event_id": 320,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000328.npy",
+      "omega_p95": 0.42711111158132553,
+      "alpha_p95": 16.111300945281968,
+      "structure_quality": 0.8668441150869641
+    },
+    {
+      "event_id": 321,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000329.npy",
+      "omega_p95": 0.24177894666790956,
+      "alpha_p95": 9.38658857345581,
+      "structure_quality": 0.9209310750279532
+    },
+    {
+      "event_id": 322,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000330.npy",
+      "omega_p95": 0.35572881102561893,
+      "alpha_p95": 11.526182889938354,
+      "structure_quality": 0.8971784903986486
+    },
+    {
+      "event_id": 323,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000331.npy",
+      "omega_p95": 0.36594266891479477,
+      "alpha_p95": 16.962016582489014,
+      "structure_quality": 0.869378875014539
+    },
+    {
+      "event_id": 324,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000332.npy",
+      "omega_p95": 0.37159857302904037,
+      "alpha_p95": 11.773672580718994,
+      "structure_quality": 0.8941702249220621
+    },
+    {
+      "event_id": 325,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000333.npy",
+      "omega_p95": 0.5148862004280086,
+      "alpha_p95": 16.378700733184814,
+      "structure_quality": 0.8561124395051767
+    },
+    {
+      "event_id": 326,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000334.npy",
+      "omega_p95": 0.5233106940984724,
+      "alpha_p95": 12.55823745727534,
+      "structure_quality": 0.8735570647992206
+    },
+    {
+      "event_id": 327,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000335.npy",
+      "omega_p95": 0.47499970346689224,
+      "alpha_p95": 9.612450981140137,
+      "structure_quality": 0.8933494364918113
+    },
+    {
+      "event_id": 328,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000336.npy",
+      "omega_p95": 0.3478319019079208,
+      "alpha_p95": 15.961431312561036,
+      "structure_quality": 0.8762063940584235
+    },
+    {
+      "event_id": 329,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000337.npy",
+      "omega_p95": 0.5519692748785019,
+      "alpha_p95": 12.278094387054436,
+      "structure_quality": 0.8717890540394438
+    },
+    {
+      "event_id": 330,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000338.npy",
+      "omega_p95": 0.9378721296787261,
+      "alpha_p95": 20.42001762390135,
+      "structure_quality": 0.7939946477991408
+    },
+    {
+      "event_id": 331,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000339.npy",
+      "omega_p95": 0.8628999292850494,
+      "alpha_p95": 20.90646772384643,
+      "structure_quality": 0.7993075136785395
+    },
+    {
+      "event_id": 332,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000340.npy",
+      "omega_p95": 0.7857170701026917,
+      "alpha_p95": 16.388112449645977,
+      "structure_quality": 0.8275715560284367
+    },
+    {
+      "event_id": 333,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000341.npy",
+      "omega_p95": 0.8937081694602973,
+      "alpha_p95": 21.859317779540994,
+      "structure_quality": 0.7920314522547839
+    },
+    {
+      "event_id": 334,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000342.npy",
+      "omega_p95": 1.9852763414382935,
+      "alpha_p95": 18.198227214813215,
+      "structure_quality": 0.7052091842137526
+    },
+    {
+      "event_id": 335,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000343.npy",
+      "omega_p95": 0.7469499379396439,
+      "alpha_p95": 21.55767974853513,
+      "structure_quality": 0.8080481507418479
+    },
+    {
+      "event_id": 336,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000344.npy",
+      "omega_p95": 1.9493450224399567,
+      "alpha_p95": 38.78183193206786,
+      "structure_quality": 0.6318376822849604
+    },
+    {
+      "event_id": 337,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000345.npy",
+      "omega_p95": 1.9851083576679232,
+      "alpha_p95": 41.890776252746576,
+      "structure_quality": 0.6182483264827563
+    },
+    {
+      "event_id": 338,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000346.npy",
+      "omega_p95": 0.5718210577964792,
+      "alpha_p95": 20.098796272277816,
+      "structure_quality": 0.8326535651342167
+    },
+    {
+      "event_id": 339,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000347.npy",
+      "omega_p95": 0.6941378563642502,
+      "alpha_p95": 18.37823410034177,
+      "structure_quality": 0.827895340785963
+    },
+    {
+      "event_id": 340,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000348.npy",
+      "omega_p95": 0.9052846461534474,
+      "alpha_p95": 23.41420459747313,
+      "structure_quality": 0.7840837069991431
+    },
+    {
+      "event_id": 341,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000349.npy",
+      "omega_p95": 1.3722697556018824,
+      "alpha_p95": 24.921853065490723,
+      "structure_quality": 0.7334554212023213
+    },
+    {
+      "event_id": 342,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000350.npy",
+      "omega_p95": 1.7838436663150787,
+      "alpha_p95": 26.61995677947992,
+      "structure_quality": 0.6901342693475858
+    },
+    {
+      "event_id": 343,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000351.npy",
+      "omega_p95": 2.008118426799774,
+      "alpha_p95": 27.50841522216797,
+      "structure_quality": 0.6677513986906813
+    },
+    {
+      "event_id": 344,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000352.npy",
+      "omega_p95": 0.41976223886013053,
+      "alpha_p95": 17.31694822311401,
+      "structure_quality": 0.8618486982782834
+    },
+    {
+      "event_id": 345,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000353.npy",
+      "omega_p95": 0.7056937217712395,
+      "alpha_p95": 28.790185928344727,
+      "structure_quality": 0.7802372861094101
+    },
+    {
+      "event_id": 346,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000354.npy",
+      "omega_p95": 0.5525806844234467,
+      "alpha_p95": 22.17729387283321,
+      "structure_quality": 0.8250760016030365
+    },
+    {
+      "event_id": 347,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000355.npy",
+      "omega_p95": 0.3888281896710395,
+      "alpha_p95": 16.852309322357183,
+      "structure_quality": 0.8674239259909157
+    },
+    {
+      "event_id": 348,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000356.npy",
+      "omega_p95": 0.5923877567052808,
+      "alpha_p95": 26.48310136795044,
+      "structure_quality": 0.801574940876963
+    },
+    {
+      "event_id": 349,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000357.npy",
+      "omega_p95": 0.631776875257492,
+      "alpha_p95": 23.986850929260246,
+      "structure_quality": 0.8087767222042344
+    },
+    {
+      "event_id": 350,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000358.npy",
+      "omega_p95": 0.7082997143268582,
+      "alpha_p95": 20.516107082366936,
+      "structure_quality": 0.8166735488606522
+    },
+    {
+      "event_id": 351,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000359.npy",
+      "omega_p95": 0.8865500420331955,
+      "alpha_p95": 18.198486709594714,
+      "structure_quality": 0.8090282367991559
+    },
+    {
+      "event_id": 352,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000360.npy",
+      "omega_p95": 1.2783449649810752,
+      "alpha_p95": 16.266146564483623,
+      "structure_quality": 0.7786757165122785
+    },
+    {
+      "event_id": 353,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000361.npy",
+      "omega_p95": 2.0984558343887327,
+      "alpha_p95": 29.71239185333252,
+      "structure_quality": 0.6522183875372891
+    },
+    {
+      "event_id": 354,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000362.npy",
+      "omega_p95": 1.7668667912483207,
+      "alpha_p95": 26.417122840881348,
+      "structure_quality": 0.6923801375539865
+    },
+    {
+      "event_id": 355,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000363.npy",
+      "omega_p95": 0.3542997315526009,
+      "alpha_p95": 16.454919910430895,
+      "structure_quality": 0.8731013044094791
+    },
+    {
+      "event_id": 356,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000364.npy",
+      "omega_p95": 1.3708523213863348,
+      "alpha_p95": 31.289197254180877,
+      "structure_quality": 0.7080890518083689
+    },
+    {
+      "event_id": 357,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000365.npy",
+      "omega_p95": 1.9200742542743614,
+      "alpha_p95": 38.81541156768799,
+      "structure_quality": 0.634035420911246
+    },
+    {
+      "event_id": 358,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000366.npy",
+      "omega_p95": 0.43610230982303605,
+      "alpha_p95": 21.093363761901855,
+      "structure_quality": 0.8422333688723432
+    },
+    {
+      "event_id": 359,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000367.npy",
+      "omega_p95": 0.6454210579395294,
+      "alpha_p95": 23.56074972152702,
+      "structure_quality": 0.8093120717946125
+    },
+    {
+      "event_id": 360,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000368.npy",
+      "omega_p95": 0.2168901525437832,
+      "alpha_p95": 10.622488737106321,
+      "structure_quality": 0.9174794515956618
+    },
+    {
+      "event_id": 361,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000369.npy",
+      "omega_p95": 0.6290058791637421,
+      "alpha_p95": 26.19585313796996,
+      "structure_quality": 0.7991886508964546
+    },
+    {
+      "event_id": 362,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000370.npy",
+      "omega_p95": 0.9639074325561523,
+      "alpha_p95": 33.89862194061268,
+      "structure_quality": 0.734317262132589
+    },
+    {
+      "event_id": 363,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000371.npy",
+      "omega_p95": 0.6452929854393007,
+      "alpha_p95": 29.958884620666467,
+      "structure_quality": 0.7810626840680461
+    },
+    {
+      "event_id": 364,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000372.npy",
+      "omega_p95": 0.7998056948184966,
+      "alpha_p95": 23.52286739349366,
+      "structure_quality": 0.7940107264186749
+    },
+    {
+      "event_id": 365,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000373.npy",
+      "omega_p95": 0.7922513484954834,
+      "alpha_p95": 16.29423599243162,
+      "structure_quality": 0.8273272524825456
+    },
+    {
+      "event_id": 366,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000374.npy",
+      "omega_p95": 0.8278724700212479,
+      "alpha_p95": 19.41686697006221,
+      "structure_quality": 0.8094862094307673
+    },
+    {
+      "event_id": 367,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000375.npy",
+      "omega_p95": 0.5579990684986109,
+      "alpha_p95": 19.16130828857422,
+      "structure_quality": 0.8384489381141366
+    },
+    {
+      "event_id": 368,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000376.npy",
+      "omega_p95": 0.7407517701387404,
+      "alpha_p95": 24.506095123290972,
+      "structure_quality": 0.7955361857551757
+    },
+    {
+      "event_id": 369,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000377.npy",
+      "omega_p95": 0.9206953167915337,
+      "alpha_p95": 18.888781547546387,
+      "structure_quality": 0.8024990643777349
+    },
+    {
+      "event_id": 370,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000378.npy",
+      "omega_p95": 1.587528187036514,
+      "alpha_p95": 17.775485515594454,
+      "structure_quality": 0.742900083305805
+    },
+    {
+      "event_id": 371,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000379.npy",
+      "omega_p95": 1.2709104716777802,
+      "alpha_p95": 16.02231884002685,
+      "structure_quality": 0.7804561742997019
+    },
+    {
+      "event_id": 372,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000380.npy",
+      "omega_p95": 1.0300520837306972,
+      "alpha_p95": 18.989353179931644,
+      "structure_quality": 0.7911616923305632
+    },
+    {
+      "event_id": 373,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000381.npy",
+      "omega_p95": 1.4686799049377437,
+      "alpha_p95": 27.337149620056152,
+      "structure_quality": 0.715010506806398
+    },
+    {
+      "event_id": 374,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000382.npy",
+      "omega_p95": 0.6765905767679214,
+      "alpha_p95": 17.251820850372305,
+      "structure_quality": 0.8349217498603212
+    },
+    {
+      "event_id": 375,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000383.npy",
+      "omega_p95": 0.3776469618082049,
+      "alpha_p95": 16.278859996795653,
+      "structure_quality": 0.87140887436489
+    },
+    {
+      "event_id": 376,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000384.npy",
+      "omega_p95": 0.5359500825405119,
+      "alpha_p95": 22.56283836364745,
+      "structure_quality": 0.8250239503530848
+    },
+    {
+      "event_id": 377,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000385.npy",
+      "omega_p95": 0.43407290875911725,
+      "alpha_p95": 18.281171035766555,
+      "structure_quality": 0.8557121995052969
+    },
+    {
+      "event_id": 378,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000386.npy",
+      "omega_p95": 0.7461255282163615,
+      "alpha_p95": 29.301055049896203,
+      "structure_quality": 0.7741037811613232
+    },
+    {
+      "event_id": 379,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000387.npy",
+      "omega_p95": 0.8989686995744703,
+      "alpha_p95": 21.205795574188148,
+      "structure_quality": 0.7943897550008339
+    },
+    {
+      "event_id": 380,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000388.npy",
+      "omega_p95": 0.8194022506475447,
+      "alpha_p95": 15.497811079025269,
+      "structure_quality": 0.8281804349177007
+    },
+    {
+      "event_id": 381,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000389.npy",
+      "omega_p95": 0.5939797759056078,
+      "alpha_p95": 29.751646900176965,
+      "structure_quality": 0.7869942008964346
+    },
+    {
+      "event_id": 382,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000390.npy",
+      "omega_p95": 0.4347717389464369,
+      "alpha_p95": 18.186536407470726,
+      "structure_quality": 0.8560874209789794
+    },
+    {
+      "event_id": 383,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000391.npy",
+      "omega_p95": 2.08987762928009,
+      "alpha_p95": 25.093459510803218,
+      "structure_quality": 0.6698892946913476
+    },
+    {
+      "event_id": 384,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000392.npy",
+      "omega_p95": 2.0267611145973206,
+      "alpha_p95": 38.67103252410887,
+      "structure_quality": 0.6261381728075862
+    },
+    {
+      "event_id": 385,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000393.npy",
+      "omega_p95": 3.739687645435336,
+      "alpha_p95": 63.47078056335449,
+      "structure_quality": 0.4403980053800705
+    },
+    {
+      "event_id": 386,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000394.npy",
+      "omega_p95": 2.23208612203598,
+      "alpha_p95": 28.608842849731428,
+      "structure_quality": 0.645358836589331
+    },
+    {
+      "event_id": 387,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000395.npy",
+      "omega_p95": 1.3426428914070136,
+      "alpha_p95": 15.385862731933592,
+      "structure_quality": 0.7762292504403934
+    },
+    {
+      "event_id": 388,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000396.npy",
+      "omega_p95": 0.8038232415914524,
+      "alpha_p95": 11.2416281223297,
+      "structure_quality": 0.8496494768150827
+    },
+    {
+      "event_id": 389,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000397.npy",
+      "omega_p95": 1.2834247052669496,
+      "alpha_p95": 20.101490116119376,
+      "structure_quality": 0.7617757688146016
+    },
+    {
+      "event_id": 390,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000398.npy",
+      "omega_p95": 0.6997054278850565,
+      "alpha_p95": 12.689872503280638,
+      "structure_quality": 0.8538818274065229
+    },
+    {
+      "event_id": 391,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000399.npy",
+      "omega_p95": 1.1523909151554037,
+      "alpha_p95": 20.61128282546997,
+      "structure_quality": 0.7721657953473048
+    },
+    {
+      "event_id": 392,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000400.npy",
+      "omega_p95": 0.7143452137708659,
+      "alpha_p95": 12.347830677032444,
+      "structure_quality": 0.853941822510397
+    },
+    {
+      "event_id": 393,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000401.npy",
+      "omega_p95": 1.0447471141815179,
+      "alpha_p95": 20.658743858337402,
+      "structure_quality": 0.7824195381613785
+    },
+    {
+      "event_id": 394,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000402.npy",
+      "omega_p95": 0.3638549655675887,
+      "alpha_p95": 20.485599803924515,
+      "structure_quality": 0.8527483790839819
+    },
+    {
+      "event_id": 395,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000403.npy",
+      "omega_p95": 1.3896426498889902,
+      "alpha_p95": 31.38992938995361,
+      "structure_quality": 0.7060326275851079
+    },
+    {
+      "event_id": 396,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000404.npy",
+      "omega_p95": 2.593630719184872,
+      "alpha_p95": 32.134003639221135,
+      "structure_quality": 0.604879458870902
+    },
+    {
+      "event_id": 397,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000405.npy",
+      "omega_p95": 1.8761545956134795,
+      "alpha_p95": 27.617343902587773,
+      "structure_quality": 0.6784469344921906
+    },
+    {
+      "event_id": 398,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000406.npy",
+      "omega_p95": 0.645574077963829,
+      "alpha_p95": 6.530202794075005,
+      "structure_quality": 0.8896068422324247
+    },
+    {
+      "event_id": 399,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000407.npy",
+      "omega_p95": 2.2884459137916533,
+      "alpha_p95": 28.655622005462646,
+      "structure_quality": 0.6406617584520957
+    },
+    {
+      "event_id": 400,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000408.npy",
+      "omega_p95": 1.929566353559494,
+      "alpha_p95": 35.91689567565917,
+      "structure_quality": 0.6435638051853393
+    },
+    {
+      "event_id": 401,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000409.npy",
+      "omega_p95": 1.0482304275035856,
+      "alpha_p95": 12.283918142318726,
+      "structure_quality": 0.8193263562536539
+    },
+    {
+      "event_id": 402,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000410.npy",
+      "omega_p95": 0.3958217650651931,
+      "alpha_p95": 12.64818987846374,
+      "structure_quality": 0.8871462379884113
+    },
+    {
+      "event_id": 403,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000411.npy",
+      "omega_p95": 2.6539880037307744,
+      "alpha_p95": 22.666420745849603,
+      "structure_quality": 0.6327543149846163
+    },
+    {
+      "event_id": 404,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000412.npy",
+      "omega_p95": 0.9701164960861206,
+      "alpha_p95": 16.14704761505127,
+      "structure_quality": 0.8097980510483387
+    },
+    {
+      "event_id": 405,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000413.npy",
+      "omega_p95": 1.9171633481979382,
+      "alpha_p95": 15.70670361518859,
+      "structure_quality": 0.7211523335723755
+    },
+    {
+      "event_id": 406,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000414.npy",
+      "omega_p95": 0.3926739901304241,
+      "alpha_p95": 9.534953594207764,
+      "structure_quality": 0.9029787909341609
+    },
+    {
+      "event_id": 407,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000415.npy",
+      "omega_p95": 0.5857804834842671,
+      "alpha_p95": 8.500677061080925,
+      "structure_quality": 0.88652270298805
+    },
+    {
+      "event_id": 408,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000416.npy",
+      "omega_p95": 2.4297035932540894,
+      "alpha_p95": 23.70047073364258,
+      "structure_quality": 0.6470173097272225
+    },
+    {
+      "event_id": 409,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000417.npy",
+      "omega_p95": 1.7947485029697408,
+      "alpha_p95": 26.046394157409658,
+      "structure_quality": 0.6913937766398185
+    },
+    {
+      "event_id": 410,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000418.npy",
+      "omega_p95": 0.4143358841538429,
+      "alpha_p95": 8.87172532081604,
+      "structure_quality": 0.9038613100801431
+    },
+    {
+      "event_id": 411,
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/test/events/event_0000419.npy",
+      "omega_p95": 0.1766637623310089,
+      "alpha_p95": 8.16318039894103,
+      "structure_quality": 0.9347894403809671
+    }
+  ],
+  "ok": true
+}

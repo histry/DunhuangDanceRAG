@@ -1,0 +1,440 @@
+{
+  "schema": "v46_50_event_heading_db",
+  "input_motion_dirs": [
+    "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val"
+  ],
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/val/events.npz",
+  "num_input_files": 2,
+  "num_rejected_sources": 0,
+  "num_events": 147,
+  "num_dropped_events": 3,
+  "num_source_uids": 2,
+  "intent_histogram": {
+    "explicit_spin": 5,
+    "none": 128,
+    "turn": 14
+  },
+  "entry_heading_abs_deg_p95": 0.7320761317289971,
+  "nonturn_budget_violation_count": 0,
+  "source_reports": [
+    {
+      "cache": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.npy",
+      "source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+      "seq_id": 0,
+      "frames": 15202,
+      "segments_proposed": 124,
+      "events_kept": 121,
+      "events_dropped": 3,
+      "segmentation": {
+        "schema": "v46_50_motion_adaptive_segmentation",
+        "frames": 15202,
+        "segments": 124,
+        "min_frames": 60,
+        "max_frames": 180,
+        "preferred_frames": 120,
+        "turn_intervals": [
+          [
+            13071,
+            13099
+          ],
+          [
+            13191,
+            13203
+          ],
+          [
+            13245,
+            13271
+          ],
+          [
+            14058,
+            14088
+          ],
+          [
+            14563,
+            14581
+          ],
+          [
+            14676,
+            14696
+          ]
+        ],
+        "boundary_score_p50": 0.7484463453292847,
+        "boundary_score_p95": 0.9792502254247665
+      },
+      "source_contract": {
+        "version": "v46_24_edge151_contract_guard",
+        "source_hint": "v46_50_source:/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.npy",
+        "input_shape": [
+          15202,
+          151
+        ],
+        "finite_before": true,
+        "rot6d_sanitize": {
+          "bad_joint_count": 0,
+          "bad_joint_ratio": 0.0,
+          "min_a1_norm_before_identity": 0.9999999403953552,
+          "min_a2_norm_before_identity": 0.9999999403953552,
+          "min_cross_norm_before_identity": 0.9999998807907104,
+          "near_collinear_joint_count": 0
+        },
+        "contact_before_min": 0.0,
+        "contact_before_max": 1.0,
+        "contact_before_abs_p95": 1.0,
+        "contact_metadata_pollution_detected": false,
+        "rot6d_abs_p95_before_project": 1.0,
+        "rot6d_project": {
+          "bad_joint_count": 0,
+          "bad_joint_ratio": 0.0,
+          "min_a1_norm_before_identity": 0.9999999403953552,
+          "min_a2_norm_before_identity": 0.9999999403953552,
+          "min_cross_norm_before_identity": 0.9999998807907104,
+          "near_collinear_joint_count": 0,
+          "projected": true
+        },
+        "rot6d_projected": true,
+        "contact_rebuilt_from_fk": true,
+        "contact_ratio": 0.11646493882383897,
+        "contact_conf_mean": 0.394216924905777,
+        "floor_y": 0.006875530444085601,
+        "root_min": [
+          -0.2691788673400879,
+          0.24183577299118042,
+          -0.6069077253341675
+        ],
+        "root_max": [
+          0.181041419506073,
+          1.2312064170837402,
+          0.07540017366409302
+        ],
+        "root_y_range_m": 0.9893706440925598,
+        "root_xz_travel_m": 0.10689567774534225,
+        "contact_after_abs_p95": 1.0,
+        "rot6d_abs_p95_after": 1.0
+      }
+    },
+    {
+      "cache": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/male_ribbon.npy",
+      "source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/male_ribbon.bvh",
+      "seq_id": 0,
+      "frames": 2374,
+      "segments_proposed": 26,
+      "events_kept": 26,
+      "events_dropped": 0,
+      "segmentation": {
+        "schema": "v46_50_motion_adaptive_segmentation",
+        "frames": 2374,
+        "segments": 26,
+        "min_frames": 48,
+        "max_frames": 135,
+        "preferred_frames": 92,
+        "turn_intervals": [
+          [
+            533,
+            558
+          ],
+          [
+            572,
+            585
+          ],
+          [
+            644,
+            678
+          ],
+          [
+            778,
+            841
+          ],
+          [
+            927,
+            941
+          ],
+          [
+            1032,
+            1128
+          ],
+          [
+            1152,
+            1191
+          ],
+          [
+            1208,
+            1249
+          ],
+          [
+            1294,
+            1316
+          ],
+          [
+            1340,
+            1353
+          ],
+          [
+            1362,
+            1378
+          ],
+          [
+            1400,
+            1884
+          ],
+          [
+            1921,
+            1954
+          ],
+          [
+            1980,
+            2123
+          ],
+          [
+            2158,
+            2289
+          ],
+          [
+            2324,
+            2374
+          ]
+        ],
+        "boundary_score_p50": 0.6623576879501343,
+        "boundary_score_p95": 0.9996522754430771
+      },
+      "source_contract": {
+        "version": "v46_24_edge151_contract_guard",
+        "source_hint": "v46_50_source:/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/male_ribbon.npy",
+        "input_shape": [
+          2374,
+          151
+        ],
+        "finite_before": true,
+        "rot6d_sanitize": {
+          "bad_joint_count": 0,
+          "bad_joint_ratio": 0.0,
+          "min_a1_norm_before_identity": 0.9999999403953552,
+          "min_a2_norm_before_identity": 0.9999999403953552,
+          "min_cross_norm_before_identity": 0.9999998807907104,
+          "near_collinear_joint_count": 0
+        },
+        "contact_before_min": 0.0,
+        "contact_before_max": 1.0,
+        "contact_before_abs_p95": 1.0,
+        "contact_metadata_pollution_detected": false,
+        "rot6d_abs_p95_before_project": 1.0,
+        "rot6d_project": {
+          "bad_joint_count": 0,
+          "bad_joint_ratio": 0.0,
+          "min_a1_norm_before_identity": 0.9999999403953552,
+          "min_a2_norm_before_identity": 0.9999999403953552,
+          "min_cross_norm_before_identity": 0.9999998807907104,
+          "near_collinear_joint_count": 0,
+          "projected": true
+        },
+        "rot6d_projected": true,
+        "contact_rebuilt_from_fk": true,
+        "contact_ratio": 0.1667017691659646,
+        "contact_conf_mean": 0.3298676609992981,
+        "floor_y": 0.004547590389847755,
+        "root_min": [
+          -1.6794967651367188,
+          0.3629380762577057,
+          -1.1496506929397583
+        ],
+        "root_max": [
+          1.703031063079834,
+          1.155876636505127,
+          1.1375797986984253
+        ],
+        "root_y_range_m": 0.7929385900497437,
+        "root_xz_travel_m": 1.210635781288147,
+        "contact_after_abs_p95": 1.0,
+        "rot6d_abs_p95_after": 1.0
+      }
+    }
+  ],
+  "rejected_sources": [],
+  "dropped_events": [
+    {
+      "source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+      "cache": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.npy",
+      "seq_id": 0,
+      "segment_index": 106,
+      "start": 12961,
+      "end": 13099,
+      "reason": "drop_reset_or_drift",
+      "intent": "reset_or_drift",
+      "heading": {
+        "schema": "v46_50_event_heading_contract",
+        "valid": false,
+        "reason": "drop_reset_or_drift",
+        "intent": "reset_or_drift",
+        "turn_confidence": 0.7257776571853274,
+        "semantic_turn_strength": 0.0,
+        "yaw_budget_deg": 30.0,
+        "yaw_budget_rad": 0.5235987755982988,
+        "heading_quality": 0.0986169651876939,
+        "entry": {
+          "entry_heading_before_rad": -0.2552644388555177,
+          "entry_heading_before_deg": -14.625575006196426,
+          "entry_heading_after_rad": -0.0006131978589110076,
+          "entry_heading_after_deg": -0.03513364932205926
+        },
+        "before_budget": {
+          "frames": 138,
+          "duration_seconds": 4.6,
+          "entry_heading_rad": -0.0006131978589110076,
+          "exit_heading_rad": -0.6483417749404907,
+          "net_yaw_rad": -0.6477285623550415,
+          "net_yaw_deg": -37.11211289302025,
+          "absolute_yaw_rad": 1.0436474084854126,
+          "absolute_yaw_deg": 59.796591805979965,
+          "monotonicity": 0.6206392667568197,
+          "yaw_speed_deg_s_p50": 7.280782461166382,
+          "yaw_speed_deg_s_p95": 33.7495044708252,
+          "yaw_speed_deg_s_max": 119.81141662597656,
+          "longest_same_sign_turn_seconds": 0.43333333333333335,
+          "mechanical_spin_ratio": 0.09420289855072464
+        },
+        "after_budget": {
+          "frames": 138,
+          "duration_seconds": 4.6,
+          "entry_heading_rad": -0.0006131978589110076,
+          "exit_heading_rad": -0.6483417749404907,
+          "net_yaw_rad": -0.6477285623550415,
+          "net_yaw_deg": -37.11211289302025,
+          "absolute_yaw_rad": 1.0436474084854126,
+          "absolute_yaw_deg": 59.796591805979965,
+          "monotonicity": 0.6206392667568197,
+          "yaw_speed_deg_s_p50": 7.280782461166382,
+          "yaw_speed_deg_s_p95": 33.7495044708252,
+          "yaw_speed_deg_s_max": 119.81141662597656,
+          "longest_same_sign_turn_seconds": 0.43333333333333335,
+          "mechanical_spin_ratio": 0.09420289855072464
+        },
+        "budget_violation_deg": 7.112112893020253,
+        "local_rotation_energy_p95_rad_per_frame": 0.0646340992301703,
+        "root_rotation_dominance": 0.30378184320054735
+      }
+    },
+    {
+      "source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+      "cache": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.npy",
+      "seq_id": 0,
+      "segment_index": 107,
+      "start": 13099,
+      "end": 13203,
+      "reason": "drop_reset_or_drift",
+      "intent": "reset_or_drift",
+      "heading": {
+        "schema": "v46_50_event_heading_contract",
+        "valid": false,
+        "reason": "drop_reset_or_drift",
+        "intent": "reset_or_drift",
+        "turn_confidence": 0.7718922118660325,
+        "semantic_turn_strength": 0.0,
+        "yaw_budget_deg": 30.0,
+        "yaw_budget_rad": 0.5235987755982988,
+        "heading_quality": 0.09658737119985777,
+        "entry": {
+          "entry_heading_before_rad": -0.9325349157028225,
+          "entry_heading_before_deg": -53.430314918359734,
+          "entry_heading_after_rad": 0.016081731766462326,
+          "entry_heading_after_deg": 0.9214153574797573
+        },
+        "before_budget": {
+          "frames": 104,
+          "duration_seconds": 3.466666666666667,
+          "entry_heading_rad": 0.016081731766462326,
+          "exit_heading_rad": 0.6746987104415894,
+          "net_yaw_rad": 0.6586169600486755,
+          "net_yaw_deg": 37.73597212652546,
+          "absolute_yaw_rad": 0.8194697499275208,
+          "absolute_yaw_deg": 46.95215810948794,
+          "monotonicity": 0.8037111316274065,
+          "yaw_speed_deg_s_p50": 6.698468446731567,
+          "yaw_speed_deg_s_p95": 58.29138317108152,
+          "yaw_speed_deg_s_max": 110.20640563964844,
+          "longest_same_sign_turn_seconds": 0.6666666666666666,
+          "mechanical_spin_ratio": 0.5
+        },
+        "after_budget": {
+          "frames": 104,
+          "duration_seconds": 3.466666666666667,
+          "entry_heading_rad": 0.016081731766462326,
+          "exit_heading_rad": 0.6746987104415894,
+          "net_yaw_rad": 0.6586169600486755,
+          "net_yaw_deg": 37.73597212652546,
+          "absolute_yaw_rad": 0.8194697499275208,
+          "absolute_yaw_deg": 46.95215810948794,
+          "monotonicity": 0.8037111316274065,
+          "yaw_speed_deg_s_p50": 6.698468446731567,
+          "yaw_speed_deg_s_p95": 58.29138317108152,
+          "yaw_speed_deg_s_max": 110.20640563964844,
+          "longest_same_sign_turn_seconds": 0.6666666666666666,
+          "mechanical_spin_ratio": 0.5
+        },
+        "budget_violation_deg": 7.735972126525461,
+        "local_rotation_energy_p95_rad_per_frame": 0.051198469474911634,
+        "root_rotation_dominance": 0.6623743328730575
+      }
+    },
+    {
+      "source": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/motion/bvh/female_mediation.bvh",
+      "cache": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/retarget_cache_split/val/female_mediation.npy",
+      "seq_id": 0,
+      "segment_index": 114,
+      "start": 13970,
+      "end": 14088,
+      "reason": "drop_reset_or_drift",
+      "intent": "reset_or_drift",
+      "heading": {
+        "schema": "v46_50_event_heading_contract",
+        "valid": false,
+        "reason": "drop_reset_or_drift",
+        "intent": "reset_or_drift",
+        "turn_confidence": 0.7692220819720643,
+        "semantic_turn_strength": 0.0,
+        "yaw_budget_deg": 30.0,
+        "yaw_budget_rad": 0.5235987755982988,
+        "heading_quality": 0.07378127358768856,
+        "entry": {
+          "entry_heading_before_rad": -0.8843171167150441,
+          "entry_heading_before_deg": -50.66763853894985,
+          "entry_heading_after_rad": 0.0005251647671684623,
+          "entry_heading_after_deg": 0.03008972470772343
+        },
+        "before_budget": {
+          "frames": 118,
+          "duration_seconds": 3.933333333333333,
+          "entry_heading_rad": 0.0005251647671684623,
+          "exit_heading_rad": 0.800169825553894,
+          "net_yaw_rad": 0.7996446490287781,
+          "net_yaw_deg": 45.81626349956897,
+          "absolute_yaw_rad": 1.0317004919052124,
+          "absolute_yaw_deg": 59.112083907739624,
+          "monotonicity": 0.775074409000326,
+          "yaw_speed_deg_s_p50": 4.343560695648193,
+          "yaw_speed_deg_s_p95": 66.50950202941894,
+          "yaw_speed_deg_s_max": 74.34352111816406,
+          "longest_same_sign_turn_seconds": 0.0,
+          "mechanical_spin_ratio": 0.0
+        },
+        "after_budget": {
+          "frames": 118,
+          "duration_seconds": 3.933333333333333,
+          "entry_heading_rad": 0.0005251647671684623,
+          "exit_heading_rad": 0.800169825553894,
+          "net_yaw_rad": 0.7996446490287781,
+          "net_yaw_deg": 45.81626349956897,
+          "absolute_yaw_rad": 1.0317004919052124,
+          "absolute_yaw_deg": 59.112083907739624,
+          "monotonicity": 0.775074409000326,
+          "yaw_speed_deg_s_p50": 4.343560695648193,
+          "yaw_speed_deg_s_p95": 66.50950202941894,
+          "yaw_speed_deg_s_max": 74.34352111816406,
+          "longest_same_sign_turn_seconds": 0.0,
+          "mechanical_spin_ratio": 0.0
+        },
+        "budget_violation_deg": 15.816263499568969,
+        "local_rotation_energy_p95_rad_per_frame": 0.05489604417234657,
+        "root_rotation_dominance": 0.7048533349269146
+      }
+    }
+  ]
+}

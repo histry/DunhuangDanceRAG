@@ -1,0 +1,150 @@
+{
+  "schema": "v46_53_dual_branch_structure_guided_grounding_v1",
+  "db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events.npz",
+  "checkpoint": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/checkpoints/grounder.pt",
+  "device": "cuda",
+  "events": 1570,
+  "geometry_dim": 112,
+  "semantic_dim": 40,
+  "embedding_dim": 96,
+  "steps": 1600,
+  "history": [
+    {
+      "step": 1,
+      "loss": 1.2546952962875366,
+      "contrastive": 1.0985087156295776,
+      "hierarchy": 0.3478950560092926,
+      "jigsaw": 0.6933073997497559,
+      "dynamic_consistency_weight": 0.998126756714382
+    },
+    {
+      "step": 100,
+      "loss": 0.10953263938426971,
+      "contrastive": 0.015034213662147522,
+      "hierarchy": 0.05064547434449196,
+      "jigsaw": 0.6917320489883423,
+      "dynamic_consistency_weight": 0.8290291181804004
+    },
+    {
+      "step": 200,
+      "loss": 0.1019749566912651,
+      "contrastive": 0.015841683372855186,
+      "hierarchy": 0.013830411247909069,
+      "jigsaw": 0.6871074438095093,
+      "dynamic_consistency_weight": 0.6872892787909722
+    },
+    {
+      "step": 300,
+      "loss": 0.11102046817541122,
+      "contrastive": 0.028462395071983337,
+      "hierarchy": 0.008799707517027855,
+      "jigsaw": 0.6675587892532349,
+      "dynamic_consistency_weight": 0.569782824730923
+    },
+    {
+      "step": 400,
+      "loss": 0.09821967035531998,
+      "contrastive": 0.021236201748251915,
+      "hierarchy": 0.00621613347902894,
+      "jigsaw": 0.6267490386962891,
+      "dynamic_consistency_weight": 0.4723665527410147
+    },
+    {
+      "step": 500,
+      "loss": 0.10016787797212601,
+      "contrastive": 0.03026670403778553,
+      "hierarchy": 0.006413642317056656,
+      "jigsaw": 0.5682430863380432,
+      "dynamic_consistency_weight": 0.391605626676799
+    },
+    {
+      "step": 600,
+      "loss": 0.06247202306985855,
+      "contrastive": 0.0020307733211666346,
+      "hierarchy": 0.005332478322088718,
+      "jigsaw": 0.49169838428497314,
+      "dynamic_consistency_weight": 0.32465246735834974
+    },
+    {
+      "step": 700,
+      "loss": 0.06058530509471893,
+      "contrastive": 0.0014716758159920573,
+      "hierarchy": 0.006036019418388605,
+      "jigsaw": 0.4804285168647766,
+      "dynamic_consistency_weight": 0.26914634872918386
+    },
+    {
+      "step": 800,
+      "loss": 0.08968819677829742,
+      "contrastive": 0.028370065614581108,
+      "hierarchy": 0.005476238671690226,
+      "jigsaw": 0.5001234412193298,
+      "dynamic_consistency_weight": 0.22313016014842982
+    },
+    {
+      "step": 900,
+      "loss": 0.05639665201306343,
+      "contrastive": 0.009003465063869953,
+      "hierarchy": 0.005557549651712179,
+      "jigsaw": 0.384342759847641,
+      "dynamic_consistency_weight": 0.18498139990730428
+    },
+    {
+      "step": 1000,
+      "loss": 0.08815468102693558,
+      "contrastive": 0.036864884197711945,
+      "hierarchy": 0.004713109228760004,
+      "jigsaw": 0.41848069429397583,
+      "dynamic_consistency_weight": 0.15335496684492847
+    },
+    {
+      "step": 1100,
+      "loss": 0.04520617797970772,
+      "contrastive": 0.006242278032004833,
+      "hierarchy": 0.005434858147054911,
+      "jigsaw": 0.3148632049560547,
+      "dynamic_consistency_weight": 0.1271357329320356
+    },
+    {
+      "step": 1200,
+      "loss": 0.050223611295223236,
+      "contrastive": 0.002428589155897498,
+      "hierarchy": 0.005167578347027302,
+      "jigsaw": 0.3890281915664673,
+      "dynamic_consistency_weight": 0.10539922456186433
+    },
+    {
+      "step": 1300,
+      "loss": 0.05190948024392128,
+      "contrastive": 0.0015117322327569127,
+      "hierarchy": 0.004556608851999044,
+      "jigsaw": 0.4118521809577942,
+      "dynamic_consistency_weight": 0.08737902619542039
+    },
+    {
+      "step": 1400,
+      "loss": 0.04215613007545471,
+      "contrastive": 0.000639030069578439,
+      "hierarchy": 0.004809712991118431,
+      "jigsaw": 0.33748888969421387,
+      "dynamic_consistency_weight": 0.07243975703425146
+    },
+    {
+      "step": 1500,
+      "loss": 0.04274612292647362,
+      "contrastive": 0.0007113522151485085,
+      "hierarchy": 0.004649848211556673,
+      "jigsaw": 0.34213173389434814,
+      "dynamic_consistency_weight": 0.060054667895307945
+    },
+    {
+      "step": 1600,
+      "loss": 0.036124538630247116,
+      "contrastive": 0.0024281686637550592,
+      "hierarchy": 0.00474372087046504,
+      "jigsaw": 0.272541344165802,
+      "dynamic_consistency_weight": 0.049787068367863944
+    }
+  ],
+  "ok": true
+}

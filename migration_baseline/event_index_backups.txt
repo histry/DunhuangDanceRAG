@@ -1,0 +1,1 @@
+assets/indexes/event_index.json.before_event_store_20260721_103252

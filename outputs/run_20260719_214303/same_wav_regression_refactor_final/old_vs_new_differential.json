@@ -1,0 +1,111 @@
+{
+  "schema": "same_wav_old_new_differential_v1",
+  "audio": "D:\\DunhuangDanceRAG\\assets\\music\\test\\audio\\dunhuangwu2.wav",
+  "baseline": {
+    "report": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\results\\report.json",
+    "route": {
+      "num_slots": 51,
+      "unique_events": 10,
+      "unique_ratio": 0.19607843137254902,
+      "adjacent_repeats": 28,
+      "source_counts": {
+        "male_36pose_1": 38,
+        "male_36pose_2": 3,
+        "male_drum_1": 10
+      },
+      "max_source_share": 0.7450980392156863
+    },
+    "transition_mask": {
+      "nonzero_frame_fraction": 0.47042488197722854,
+      "strong_frame_fraction": 0.3871146903637878
+    },
+    "physical": {
+      "frames": 3601,
+      "floor_y": 0.13698518946766852,
+      "contact_ratio": 0.242154956956401,
+      "foot_skate_mean_mpf": 0.003768101567402482,
+      "foot_skate_p95_mpf": 0.012071173451840857,
+      "foot_skate_max_mpf": 0.04286349192261696,
+      "foot_penetration_min_m": -0.07001391053199768,
+      "mean_joint_jerk_p95": 0.01585858734324574,
+      "mean_joint_jerk_max": 0.03912067040801048,
+      "root_y_range_m": 0.16318607330322266
+    }
+  },
+  "candidate": {
+    "gate": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\same_wav_regression_refactor_final\\regression_gate.json",
+    "ok": true,
+    "route": {
+      "num_slots": 37,
+      "unique_events": 37,
+      "unique_ratio": 1.0,
+      "adjacent_repeats": 0,
+      "source_counts": {
+        "male_pipa_1": 5,
+        "male_36pose_1": 7,
+        "female_lotus": 6,
+        "male_36pose_2": 7,
+        "female_36pose_2": 7,
+        "male_pipa_2": 3,
+        "male_drum_2": 2
+      },
+      "max_source_share": 0.1891891891891892,
+      "transition_fraction": 0.1999444598722577
+    },
+    "physical": {
+      "frames": 3601,
+      "floor_y": 0.045767344534397125,
+      "contact_ratio": 0.11246875867814496,
+      "foot_skate_mean_mpf": 0.0005351718282327056,
+      "foot_skate_p95_mpf": 0.0031546703539788723,
+      "foot_skate_max_mpf": 0.017881590873003006,
+      "foot_penetration_min_m": -0.045703671872615814,
+      "mean_joint_jerk_p95": 0.0053622242994606495,
+      "mean_joint_jerk_max": 0.03592902049422264,
+      "root_y_range_m": 0.3414180278778076
+    }
+  },
+  "differential": {
+    "slot_count_delta": -14,
+    "unique_event_delta": 27,
+    "adjacent_repeat_delta": -28,
+    "max_source_share_delta": -0.555908850026497,
+    "physical": {
+      "foot_skate_mean_mpf": {
+        "baseline": 0.003768101567402482,
+        "candidate": 0.0005351718282327056,
+        "delta": -0.0032329297391697764
+      },
+      "foot_skate_p95_mpf": {
+        "baseline": 0.012071173451840857,
+        "candidate": 0.0031546703539788723,
+        "delta": -0.008916503097861985
+      },
+      "foot_skate_max_mpf": {
+        "baseline": 0.04286349192261696,
+        "candidate": 0.017881590873003006,
+        "delta": -0.024981901049613953
+      },
+      "foot_penetration_min_m": {
+        "baseline": -0.07001391053199768,
+        "candidate": -0.045703671872615814,
+        "delta": 0.024310238659381866
+      },
+      "mean_joint_jerk_p95": {
+        "baseline": 0.01585858734324574,
+        "candidate": 0.0053622242994606495,
+        "delta": -0.010496363043785092
+      },
+      "mean_joint_jerk_max": {
+        "baseline": 0.03912067040801048,
+        "candidate": 0.03592902049422264,
+        "delta": -0.003191649913787842
+      },
+      "root_y_range_m": {
+        "baseline": 0.16318607330322266,
+        "candidate": 0.3414180278778076,
+        "delta": 0.17823195457458496
+      }
+    }
+  }
+}

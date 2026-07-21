@@ -1,0 +1,2 @@
+path,ok,gravity_ok,anatomy_ok,reasons,anatomy_quality,torso_compression_ratio_p05,local_angle_violation_ratio,self_collision_severe_ratio,spine_cumulative_angle_p95_deg,pelvis_height_norm_p05,pelvis_height_norm_p95,foot_penetration_min_m
+/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.npy,True,True,True,,1.0,0.919823408126831,0.0,0.0,127.51694070960508,1.1265125274658203,1.2876626253128052,0.05521823465824127

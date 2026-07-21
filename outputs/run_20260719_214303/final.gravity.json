@@ -1,0 +1,48 @@
+{
+  "version": "v46_53_1_context_aware_gravity_audit",
+  "profile": "final",
+  "thresholds": {
+    "torso_up_cos_p05_min": 0.3,
+    "torso_up_cos_median_min": 0.6,
+    "head_above_pelvis_ratio_min": 0.9,
+    "feet_below_pelvis_ratio_min": 0.88,
+    "horizontal_body_ratio_max": 0.15,
+    "nonfinite_count_max": 0
+  },
+  "num_motions": 1,
+  "num_passed": 1,
+  "num_failed": 0,
+  "all_ok": true,
+  "torso_up_cos_p05_min_observed": 0.9402911067008972,
+  "torso_up_cos_median_min_observed": 0.9882494807243347,
+  "horizontal_body_ratio_max_observed": 0.0,
+  "rows": [
+    {
+      "path": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/results/motion.npy",
+      "shape": [
+        3601,
+        151
+      ],
+      "ok": true,
+      "reasons": [],
+      "frames": 3601,
+      "fps": 30.0,
+      "nonfinite_count": 0,
+      "torso_up_cos_p05": 0.9402911067008972,
+      "torso_up_cos_median": 0.9882494807243347,
+      "torso_up_cos_p95": 0.9970911145210266,
+      "torso_abs_up_cos_p05": 0.9402911067008972,
+      "horizontal_body_ratio": 0.0,
+      "head_above_pelvis_ratio": 1.0,
+      "neck_above_pelvis_ratio": 1.0,
+      "feet_below_pelvis_ratio": 1.0,
+      "root_up_cos_p05": 0.9175046682357788,
+      "root_up_cos_median": 0.9671416282653809,
+      "pelvis_y_p05": 1.0455200672149658,
+      "pelvis_y_p95": 1.1765189170837402,
+      "floor_y": 0.1297783948481083,
+      "foot_height_above_floor_p95": 0.5369494557380676,
+      "foot_speed_xz_p95_mpf": 0.025435571465641234
+    }
+  ]
+}

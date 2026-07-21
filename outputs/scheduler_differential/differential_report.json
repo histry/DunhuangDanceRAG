@@ -1,0 +1,95 @@
+{
+  "schema": "scheduler_end_to_end_differential_v1",
+  "inputs": {
+    "old_motion": "D:\\DunhuangDanceRAG\\outputs\\scheduler_differential\\old_snapshot\\dunhuangwu2_v26.npy",
+    "old_report": "D:\\DunhuangDanceRAG\\outputs\\scheduler_differential\\old_snapshot\\dunhuangwu2_v26.schedule_report.json",
+    "new_motion": "D:\\DunhuangDanceRAG\\outputs\\scheduler_differential\\new_scheduler\\dunhuangwu2_v26.npy",
+    "new_report": "D:\\DunhuangDanceRAG\\outputs\\scheduler_differential\\new_scheduler\\dunhuangwu2_v26.schedule_report.json",
+    "audio": "D:\\DunhuangDanceRAG\\assets\\music\\test\\audio\\dunhuangwu2.wav",
+    "audio_sha256": "36ce6f03d7a8c57507071fcd74429562b256c03f5523c7e0657f0d1037cd598c",
+    "old_rot6d_layout": "column",
+    "new_rot6d_layout": "column"
+  },
+  "hashes": {
+    "old_motion_sha256": "0b1a2960d08b57c8a07d5917f6e67604429e3734b6ea467909008800d8046a2a",
+    "new_motion_sha256": "844102af82aaffe678fecc7ab5a4fe7e26e2c374e950971a2d13abc09cf23501",
+    "old_report_sha256": "d614622a414e1ff8bf85e0452cf8ee6e6e6b084c5a2b52fbc7a0b47fc4a6ab39",
+    "new_report_sha256": "e5ddae028139a72acdb9a1c898b567847bc4b55d9d6cadcbe3a21c64a55e3f1f"
+  },
+  "contracts": {
+    "old_rotation_contract": null,
+    "new_rotation_contract": {
+      "motion_rot6d_layout": "column",
+      "event_index_rot6d_layout": "column",
+      "duration_checkpoint_rot6d_layout": "pytorch3d_row",
+      "transition_checkpoint_rot6d_layout": null,
+      "transition_diffusion_checkpoint_rot6d_layout": null
+    }
+  },
+  "route": {
+    "old_slots": 51,
+    "new_slots": 51,
+    "event_id": {
+      "field": "event_id",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "family_id": {
+      "field": "family_id",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "transition_len": {
+      "field": "transition_len",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "allocated_content_len": {
+      "field": "allocated_content_len",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "old_score": 199.73601905264664,
+    "new_score": 199.73601905264664,
+    "score_abs_delta": 0.0
+  },
+  "motion": {
+    "shape": [
+      3601,
+      151
+    ],
+    "contact_abs_mean": 0.0,
+    "contact_abs_max": 0.0,
+    "root_abs_mean_m": 1.8811284974162845e-08,
+    "root_abs_max_m": 2.8312206268310547e-05,
+    "rot6d_raw_abs_mean": 3.9944579839357175e-06,
+    "rot6d_raw_abs_max": 0.04079705476760864,
+    "rotation_geodesic_rad": {
+      "mean": 1.0904837836278602e-05,
+      "p50": 7.314392869162134e-09,
+      "p95": 7.480615060728722e-08,
+      "p99": 1.1573761909744466e-07,
+      "p100": 0.05205809697508812,
+      "joint_ratio_over_1e-4": 0.004674627418309729,
+      "frame_ratio_over_1e-4": 0.005554012774229381
+    }
+  },
+  "acceptance": {
+    "exact_frame_count": true,
+    "exact_route": true,
+    "exact_transition_lengths": true,
+    "exact_content_lengths": true,
+    "rotation_p95_below_1e-4_rad": true,
+    "rotation_max_below_0_1_rad": true,
+    "root_max_below_1e-4_m": true,
+    "passed": true
+  }
+}

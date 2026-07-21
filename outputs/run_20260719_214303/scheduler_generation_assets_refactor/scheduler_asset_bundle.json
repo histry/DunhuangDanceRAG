@@ -1,0 +1,52 @@
+{
+  "schema": "scheduler_asset_bundle_v1",
+  "ok": true,
+  "event_db_contract": {
+    "schema": "dunhuang_event_db_contract_v1",
+    "num_events": 1570,
+    "ordered_event_uid_sha256": "76817549fcf3f455fde2ec6764a77371552bcac4a77b8b2e0289145385568ba7"
+  },
+  "index_json": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\scheduler_generation_assets_refactor\\event_index.json",
+  "index_npz": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\scheduler_generation_assets_refactor\\duration_index.npz",
+  "index_json_sha256": "23cc44e1fd786d56da5f04462bc8c47d3b3b050d6f97384eb09181ffada02e95",
+  "index_npz_sha256": "10fad8f37bc5152ffa7926090e4e4839514708739182b86855bbbc40a1d1fcf3",
+  "checkpoints": {
+    "router": {
+      "path": "D:\\DunhuangDanceRAG\\assets\\weights\\music\\router.pt",
+      "sha256": "2ba932af9b52a62d16c25028107f5919313de5e56bdfcbcabd7ab8f1d82f2f65",
+      "version": "unknown",
+      "declared_rot6d_layout": null,
+      "effective_rot6d_layout": "not_applicable",
+      "rotation_contract_policy": "descriptor/state model does not decode Rot6D",
+      "num_state_tensors": 17
+    },
+    "planner": {
+      "path": "D:\\DunhuangDanceRAG\\assets\\weights\\music\\planner.pt",
+      "sha256": "2292f25da9e47890fa9ca8a4461275aa7bca6590ce1633a0f241c339a1dfa980",
+      "version": "unknown",
+      "declared_rot6d_layout": null,
+      "effective_rot6d_layout": "not_applicable",
+      "rotation_contract_policy": "descriptor/state model does not decode Rot6D",
+      "num_state_tensors": 60
+    },
+    "duration": {
+      "path": "D:\\DunhuangDanceRAG\\assets\\weights\\music\\duration.pt",
+      "sha256": "4b476088629a88f6b857f61bbcf92b300ac372db559667ea255f769f16be3d08",
+      "version": "unknown",
+      "declared_rot6d_layout": null,
+      "effective_rot6d_layout": "pytorch3d_row",
+      "rotation_contract_policy": "legacy duration checkpoints without metadata are decoded as pytorch3d_row and adapted at the canonical-column boundary",
+      "num_state_tensors": 176
+    }
+  },
+  "asset_bundle_rebuilt": true,
+  "checkpoint_weights_reused": true,
+  "checkpoint_policy": "Router/Planner/Duration model weights are immutable inputs; the Generation-DB-aligned index, hashes and compatibility manifest are rebuilt after the no-training regression passes.",
+  "training_order": [
+    "build_generation_aligned_scheduler_index",
+    "same_wav_no_training_regression",
+    "rebuild_and_validate_router_planner_duration_asset_bundle",
+    "train_v45",
+    "train_v46"
+  ]
+}

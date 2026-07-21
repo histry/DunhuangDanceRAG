@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "generation_db": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\event_db_split\\train\\events_aesd.npz",
+  "index_json": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\scheduler_generation_assets_refactor\\event_index.json",
+  "index_npz": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\scheduler_generation_assets_refactor\\duration_index.npz",
+  "num_events": 1570,
+  "event_db_contract": {
+    "schema": "dunhuang_event_db_contract_v1",
+    "num_events": 1570,
+    "ordered_event_uid_sha256": "76817549fcf3f455fde2ec6764a77371552bcac4a77b8b2e0289145385568ba7"
+  }
+}

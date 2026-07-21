@@ -1,0 +1,101 @@
+{
+  "schema": "v46_38_action_event_semantic_descriptor",
+  "input_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events.npz",
+  "output_db": "/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_20260719_214303/event_db_split/train/events_aesd.npz",
+  "num_events": 1570,
+  "label_names": [
+    "calm_meditative",
+    "pose_hold",
+    "lyrical_flow",
+    "instrument_phrase",
+    "percussive_accent",
+    "turning_climax",
+    "footwork_flow",
+    "aerial_curve"
+  ],
+  "event_semantic_histogram": {
+    "calm_meditative": 0,
+    "pose_hold": 1060,
+    "lyrical_flow": 0,
+    "instrument_phrase": 1,
+    "percussive_accent": 509,
+    "turning_climax": 0,
+    "footwork_flow": 0,
+    "aerial_curve": 0
+  },
+  "boundary_risk_histogram": {
+    "low": 900,
+    "medium": 231,
+    "high": 439
+  },
+  "arrays_added": [
+    "aesd_schema_version",
+    "aesd_label_names",
+    "aesd_semantics",
+    "aesd_music_alignment_probs",
+    "aesd_event_semantics",
+    "aesd_route_affordance",
+    "aesd_energy_profile",
+    "aesd_rhythm_profile",
+    "aesd_locomotion_profile",
+    "aesd_support_profile",
+    "aesd_boundary_risk",
+    "aesd_boundary_risk_profile",
+    "aesd_entry_exit_state_json"
+  ],
+  "first_event": {
+    "schema": "v46_38_action_event_semantic_descriptor",
+    "event_index": 0,
+    "event_id": "thirty_six_postures_take2",
+    "source_group": "female_36pose_2",
+    "source_uid": "female_36pose_2",
+    "dance_key": "thirty_six_postures",
+    "dance_category": "Ji Yue Tian Thirty-Six Postures",
+    "event_family": "pose_motif",
+    "event_semantic": "pose_hold",
+    "music_alignment_label": "pose_hold",
+    "music_alignment_probs": {
+      "calm_meditative": 0.12797074019908905,
+      "pose_hold": 0.6855576038360596,
+      "lyrical_flow": 0.05118829756975174,
+      "instrument_phrase": 0.0840950608253479,
+      "percussive_accent": 0.0,
+      "turning_climax": 0.0,
+      "footwork_flow": 0.05118829756975174,
+      "aerial_curve": 0.0
+    },
+    "route_affordance": [
+      "anchor_or_resolution",
+      "intro",
+      "release",
+      "resolution",
+      "motif_recall",
+      "calm",
+      "normal",
+      "development",
+      "accent",
+      "motif"
+    ],
+    "motion_stage_role": "anchor_or_resolution",
+    "energy_profile": "moderate",
+    "rhythm_profile": "sustained",
+    "locomotion_profile": "in_place_pose",
+    "support_profile": "stable_support",
+    "natural_duration_sec": 2.633333444595337,
+    "natural_duration_range_sec": [
+      1.2000000476837158,
+      3.799999952316284
+    ],
+    "event_quality_score": 0.8997308611869812,
+    "semantic_confidence": 0.9232660531997681,
+    "boundary_risk_score": 0.015889092332145083,
+    "boundary_risk_profile": "low",
+    "entry_exit_state": {
+      "entry_velocity_norm": 0.00048037499396337406,
+      "exit_velocity_norm": 0.0005064580796493425,
+      "entry_exit_pose_gap_self": 3.03121250908589e-05,
+      "contact_jump_self": 0.0
+    },
+    "reuse_penalty_key": "female_36pose_2::thirty_six_postures::pose_motif"
+  }
+}

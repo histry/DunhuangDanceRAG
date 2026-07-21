@@ -1,0 +1,89 @@
+{
+  "schema": "scheduler_end_to_end_differential_v1",
+  "inputs": {
+    "old_motion": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\fresh_schedule\\resume_local_index_20260721_110312_36ce6f03d7a8\\raw_v26_schedule\\dunhuangwu2_v26.npy",
+    "old_report": "D:\\DunhuangDanceRAG\\outputs\\run_20260719_214303\\fresh_schedule\\resume_local_index_20260721_110312_36ce6f03d7a8\\raw_v26_schedule\\dunhuangwu2_v26.schedule_report.json",
+    "new_motion": "D:\\DunhuangDanceRAG\\outputs\\scheduler_differential\\old_snapshot\\dunhuangwu2_v26.npy",
+    "new_report": "D:\\DunhuangDanceRAG\\outputs\\scheduler_differential\\old_snapshot\\dunhuangwu2_v26.schedule_report.json",
+    "audio": "D:\\DunhuangDanceRAG\\assets\\music\\test\\audio\\dunhuangwu2.wav",
+    "audio_sha256": "36ce6f03d7a8c57507071fcd74429562b256c03f5523c7e0657f0d1037cd598c",
+    "old_rot6d_layout": "column",
+    "new_rot6d_layout": "column"
+  },
+  "hashes": {
+    "old_motion_sha256": "420c5f44d42bea9eec57b57fd1fc06579cfabc958335e1fac6acf8a1e54f558a",
+    "new_motion_sha256": "0b1a2960d08b57c8a07d5917f6e67604429e3734b6ea467909008800d8046a2a",
+    "old_report_sha256": "778e6a18f64d9f5978e2ba1821c9bc6e3903e05fed50931d2b82b6129c3a2abf",
+    "new_report_sha256": "d614622a414e1ff8bf85e0452cf8ee6e6e6b084c5a2b52fbc7a0b47fc4a6ab39"
+  },
+  "contracts": {
+    "old_rotation_contract": null,
+    "new_rotation_contract": null
+  },
+  "route": {
+    "old_slots": 51,
+    "new_slots": 51,
+    "event_id": {
+      "field": "event_id",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "family_id": {
+      "field": "family_id",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "transition_len": {
+      "field": "transition_len",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "allocated_content_len": {
+      "field": "allocated_content_len",
+      "compared": 51,
+      "exact": 51,
+      "exact_ratio": 1.0,
+      "lengths_equal": true
+    },
+    "old_score": 198.63499158106723,
+    "new_score": 199.73601905264664,
+    "score_abs_delta": 1.101027471579414
+  },
+  "motion": {
+    "shape": [
+      3601,
+      151
+    ],
+    "contact_abs_mean": 0.0,
+    "contact_abs_max": 0.0,
+    "root_abs_mean_m": 8.647903226854936e-11,
+    "root_abs_max_m": 5.960464477539063e-08,
+    "rot6d_raw_abs_mean": 1.0447479326103348e-08,
+    "rot6d_raw_abs_max": 5.9664249420166016e-05,
+    "rotation_geodesic_rad": {
+      "mean": 2.578638635952757e-08,
+      "p50": 0.0,
+      "p95": 4.803475803782923e-08,
+      "p99": 9.553881284318787e-08,
+      "p100": 7.783479668432847e-05,
+      "joint_ratio_over_1e-4": 0.0,
+      "frame_ratio_over_1e-4": 0.0
+    }
+  },
+  "acceptance": {
+    "exact_frame_count": true,
+    "exact_route": true,
+    "exact_transition_lengths": true,
+    "exact_content_lengths": true,
+    "rotation_p95_below_1e-4_rad": true,
+    "rotation_max_below_0_1_rad": true,
+    "root_max_below_1e-4_m": true,
+    "passed": true
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "audio": "/home/disk/lsm/storage/DunhuangDanceRAG/assets/music/test/audio/dunhuangwu2.wav",
+  "duration_sec": 120.0326875,
+  "fps": 30.0,
+  "num_frames": 3601,
+  "feature_dim": 12,
+  "extractor": {
+    "backend": "librosa",
+    "tempo_bpm": 0.0,
+    "sample_rate": 16000,
+    "duration_sec": 120.0326875
+  }
+}
