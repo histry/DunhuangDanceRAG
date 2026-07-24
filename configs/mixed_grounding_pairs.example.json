@@ -1,0 +1,20 @@
+{
+  "pairs": [
+    {
+      "pair_id": "aist_song001_phrase000",
+      "supervision": "dataset_paired",
+      "event_uid": "evt_replace_with_stable_event_uid",
+      "audio_path": "D:/datasets/AIST++/music/song001.wav",
+      "start_sec": 0.0,
+      "end_sec": 2.4
+    },
+    {
+      "pair_id": "aist_song001_phrase000",
+      "supervision": "dataset_paired",
+      "event_uid": "evt_second_valid_positive_for_same_phrase",
+      "audio_path": "D:/datasets/AIST++/music/song001.wav",
+      "start_sec": 0.0,
+      "end_sec": 2.4
+    }
+  ]
+}

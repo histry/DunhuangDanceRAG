@@ -96,6 +96,14 @@ from motion_geometry.rotations import (
     rot6d_to_matrix_torch as _contract_rot6d_to_matrix_torch,
     tangent_blend_np,
 )
+from motion_geometry.product_manifold import (
+    PRODUCT_STATE_DIM,
+    masked_retract_np,
+    masked_retract_torch,
+    product_log_np,
+    product_log_torch,
+)
+from contracts.boundary import build_frame_joint_risk_mask
 from support.event_identity import (
     assert_same_event_db_contract,
     event_uids_from_generation_db,
@@ -824,6 +832,19 @@ class V46Config:
     lower_body_only: bool = True
     refiner_enable: bool = True
     diffusion_enable: bool = True
+    # Geometry-safe V45/V46 path.  Existing 151D checkpoints remain loadable;
+    # newly trained checkpoints use a 79D contact/root/joint-tangent state.
+    product_manifold_enable: bool = True
+    product_refiner_rotation_cap_rad: float = 0.35
+    product_refiner_root_cap_m: float = 0.08
+    product_refiner_outside_weight: float = 0.25
+    tangent_diffusion_enable: bool = True
+    tangent_diffusion_rotation_cap_rad: float = 0.45
+    tangent_diffusion_root_cap_m: float = 0.10
+    riemannian_trust_region_enable: bool = True
+    riemannian_trust_region_steps: int = 5
+    riemannian_trust_region_initial_radius: float = 1.0
+    riemannian_trust_region_min_radius: float = 0.0625
     diffusion_steps: int = 50
     diffusion_train_steps: int = 15000
     refiner_train_steps: int = 8000
@@ -867,6 +888,17 @@ class V46Config:
             "V46_ENABLE_TRUE_IK": ("ik_enable", lambda x: bool(int(x))),
             "V46_ENABLE_REFINER": ("refiner_enable", lambda x: bool(int(x))),
             "V46_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
+            "V46_PRODUCT_MANIFOLD_ENABLE": ("product_manifold_enable", lambda x: bool(int(x))),
+            "V46_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
+            "V46_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
+            "V46_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
+            "V46_TANGENT_DIFFUSION_ENABLE": ("tangent_diffusion_enable", lambda x: bool(int(x))),
+            "V46_TANGENT_DIFFUSION_ROTATION_CAP_RAD": ("tangent_diffusion_rotation_cap_rad", float),
+            "V46_TANGENT_DIFFUSION_ROOT_CAP_M": ("tangent_diffusion_root_cap_m", float),
+            "V46_RIEMANNIAN_TRUST_REGION_ENABLE": ("riemannian_trust_region_enable", lambda x: bool(int(x))),
+            "V46_RIEMANNIAN_TRUST_REGION_STEPS": ("riemannian_trust_region_steps", int),
+            "V46_RIEMANNIAN_TRUST_REGION_INITIAL_RADIUS": ("riemannian_trust_region_initial_radius", float),
+            "V46_RIEMANNIAN_TRUST_REGION_MIN_RADIUS": ("riemannian_trust_region_min_radius", float),
             "V46_TOP_K": ("top_k", int),
             "V46_BEAM_SIZE": ("beam_size", int),
             "V46_CHANG_E_EVENT_SEMANTIC_ENABLE": ("chang_e_event_semantic_enable", lambda x: bool(int(x))),
@@ -1631,6 +1663,7 @@ def finalize_motion_window_accum_np(
     rot_quat_weight: np.ndarray,
     cfg: V46Config,
     source_hint: str,
+    derive_contact: bool = True,
 ) -> Tuple[np.ndarray, dict]:
     out = accum / np.maximum(weight_sum, 1e-8)
     valid = rot_quat_weight[:, 0, 0] > 1e-8
@@ -1640,7 +1673,13 @@ def finalize_motion_window_accum_np(
         q[valid] = normalize_quat_np(rot_quat_accum[valid])
     R = quat_to_matrix_np(q)
     out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(R).reshape(accum.shape[0], -1)
-    out, report = enforce_edge151_contract_np(out, cfg, source_hint=source_hint, derive_contact=True, project_rot=True)
+    out, report = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint=source_hint,
+        derive_contact=derive_contact,
+        project_rot=True,
+    )
     report["rotation_overlap_mode"] = "quaternion_sign_aligned_weighted_average"
     report["scalar_overlap_mode"] = "hann_weighted_overlap_add"
     report["weight_sum_min"] = float(np.min(weight_sum)) if weight_sum.size else 0.0
@@ -4209,6 +4248,8 @@ def train_contrastive(args: argparse.Namespace) -> int:
     return 0
 
 class TemporalRefiner(nn.Module):
+    """Legacy 151D Euclidean refiner kept for old V45 checkpoints."""
+
     def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256):
         super().__init__()
         self.in_proj = nn.Conv1d(motion_dim + cond_dim + 1, hidden, 1)
@@ -4230,6 +4271,175 @@ class TemporalRefiner(nn.Module):
         h = h + self.net(h)
         delta = self.out(h).transpose(1, 2)
         return delta
+
+
+class ProductManifoldTemporalRefiner(nn.Module):
+    """V45 refiner with a joint-risk-conditioned 79D geometric output.
+
+    Output layout:
+      - 4 contact logits;
+      - 3 root-translation tangent residuals;
+      - 24 x 3 local SO(3) tangent residuals.
+    """
+
+    def __init__(
+        self,
+        motion_dim: int = EDGE_DIM,
+        cond_dim: int = 32,
+        hidden: int = 256,
+    ):
+        super().__init__()
+        self.in_proj = nn.Conv1d(
+            motion_dim + cond_dim + 1 + NUM_JOINTS, hidden, 1
+        )
+        self.net = nn.Sequential(
+            nn.Conv1d(hidden, hidden, 5, padding=2),
+            nn.GroupNorm(8, hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, 5, padding=2),
+            nn.GroupNorm(8, hidden),
+            nn.SiLU(),
+            nn.Conv1d(hidden, hidden, 5, padding=2),
+            nn.GroupNorm(8, hidden),
+            nn.SiLU(),
+        )
+        self.out = nn.Conv1d(hidden, PRODUCT_STATE_DIM, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, x, cond, seam_mask, joint_mask):
+        # x: B,T,151; cond: B,32; seam: B,T,1; joint_mask: B,T,24.
+        batch, frames, _ = x.shape
+        c = cond[:, None, :].expand(batch, frames, cond.shape[-1])
+        y = torch.cat([x, c, seam_mask, joint_mask], dim=-1).transpose(1, 2)
+        h = self.in_proj(y)
+        h = h + self.net(h)
+        return self.out(h).transpose(1, 2)
+
+
+def _risk_masks_for_batch_np(
+    motion_batch: np.ndarray,
+    seam_batch: np.ndarray,
+    cfg: V46Config,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the same frame x joint risk masks for training and inference."""
+    joint_masks: List[np.ndarray] = []
+    root_masks: List[np.ndarray] = []
+    contact_masks: List[np.ndarray] = []
+    for motion, seam in zip(
+        np.asarray(motion_batch, dtype=np.float32),
+        np.asarray(seam_batch, dtype=np.float32),
+    ):
+        masks = build_frame_joint_risk_mask(
+            motion,
+            seam,
+            fps=float(cfg.fps),
+        )
+        joint_masks.append(np.asarray(masks["joint"], dtype=np.float32))
+        root_masks.append(np.asarray(masks["root"], dtype=np.float32)[:, None])
+        contact_masks.append(
+            np.asarray(masks["contact"], dtype=np.float32)[:, None]
+        )
+    return (
+        np.stack(joint_masks),
+        np.stack(root_masks),
+        np.stack(contact_masks),
+    )
+
+
+def _decode_product_refiner_output(
+    reference,
+    output,
+    joint_mask,
+    root_mask,
+    contact_mask,
+    cfg: V46Config,
+):
+    if output.shape[-1] != PRODUCT_STATE_DIM:
+        raise ValueError(
+            f"product refiner output must be {PRODUCT_STATE_DIM}D, "
+            f"got {output.shape[-1]}"
+        )
+    geometry = masked_retract_torch(
+        reference,
+        output[..., 4:],
+        joint_mask=joint_mask,
+        root_mask=root_mask,
+        max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
+        max_root_m=float(cfg.product_refiner_root_cap_m),
+    )
+    contact_weight = contact_mask.clamp(0.0, 1.0)
+    contact_probability = torch.sigmoid(output[..., :4])
+    contacts = (
+        reference[..., :4] * (1.0 - contact_weight)
+        + contact_probability * contact_weight
+    )
+    return torch.cat([contacts, geometry[..., 4:]], dim=-1)
+
+
+def _product_motion_losses(
+    prediction,
+    clean,
+    reference,
+    joint_mask,
+    root_mask,
+    contact_mask,
+    cfg: V46Config,
+):
+    contact_target = clean[..., :4].clamp(0.0, 1.0)
+    contact_weight = 0.25 + 0.75 * contact_mask
+    contact_loss = (
+        F.binary_cross_entropy(
+            prediction[..., :4].clamp(1.0e-5, 1.0 - 1.0e-5),
+            contact_target,
+            reduction="none",
+        )
+        * contact_weight
+    ).mean()
+
+    reconstruction_tangent = product_log_torch(prediction, clean)
+    reconstruction_loss = F.smooth_l1_loss(
+        reconstruction_tangent, torch.zeros_like(reconstruction_tangent)
+    )
+    if prediction.shape[1] > 1:
+        predicted_velocity = product_log_torch(
+            prediction[:, :-1], prediction[:, 1:]
+        )
+        clean_velocity = product_log_torch(clean[:, :-1], clean[:, 1:])
+        velocity_loss = F.smooth_l1_loss(predicted_velocity, clean_velocity)
+    else:
+        velocity_loss = reconstruction_loss.new_zeros(())
+
+    reference_delta = product_log_torch(reference, prediction)
+    product_mask = torch.cat(
+        [
+            root_mask.expand(reference_delta.shape[:-1] + (3,)),
+            joint_mask[..., None]
+            .expand(joint_mask.shape + (3,))
+            .reshape(reference_delta.shape[:-1] + (NUM_JOINTS * 3,)),
+        ],
+        dim=-1,
+    ).clamp(0.0, 1.0)
+    outside_loss = (
+        F.smooth_l1_loss(
+            reference_delta,
+            torch.zeros_like(reference_delta),
+            reduction="none",
+        )
+        * (1.0 - product_mask)
+    ).mean()
+    total = (
+        reconstruction_loss
+        + 0.25 * velocity_loss
+        + 0.20 * contact_loss
+        + float(cfg.product_refiner_outside_weight) * outside_loss
+    )
+    return total, {
+        "reconstruction": reconstruction_loss,
+        "velocity": velocity_loss,
+        "contact": contact_loss,
+        "outside": outside_loss,
+    }
 
 
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[V46Config] = None) -> np.ndarray:
@@ -4349,12 +4559,48 @@ def _evaluate_refiner_validation(
                 bad_t = torch.from_numpy(bad[None]).float().to(device)
                 seam_t = torch.from_numpy(seam[None]).float().to(device)
                 cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
-                pred = bad_t + model(bad_t, cond_t, seam_t) * (0.35 + 0.65 * seam_t)
-                rec_values.append(float(F.smooth_l1_loss(pred, clean_t).cpu()))
-                velocity_values.append(float(F.smooth_l1_loss(
-                    pred[:, 1:] - pred[:, :-1],
-                    clean_t[:, 1:] - clean_t[:, :-1],
-                ).cpu()))
+                if isinstance(model, ProductManifoldTemporalRefiner):
+                    joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                        bad[None], seam[None], cfg
+                    )
+                    joint_t = torch.from_numpy(joint_np).float().to(device)
+                    root_t = torch.from_numpy(root_np).float().to(device)
+                    contact_t = torch.from_numpy(contact_np).float().to(device)
+                    output = model(bad_t, cond_t, seam_t, joint_t)
+                    pred = _decode_product_refiner_output(
+                        bad_t,
+                        output,
+                        joint_t,
+                        root_t,
+                        contact_t,
+                        cfg,
+                    )
+                    rec_values.append(
+                        float(
+                            product_log_torch(pred, clean_t).abs().mean().cpu()
+                        )
+                    )
+                    velocity_values.append(
+                        float(
+                            F.smooth_l1_loss(
+                                product_log_torch(pred[:, :-1], pred[:, 1:]),
+                                product_log_torch(
+                                    clean_t[:, :-1], clean_t[:, 1:]
+                                ),
+                            ).cpu()
+                        )
+                    )
+                else:
+                    pred = bad_t + model(bad_t, cond_t, seam_t) * (
+                        0.35 + 0.65 * seam_t
+                    )
+                    rec_values.append(
+                        float(F.smooth_l1_loss(pred, clean_t).cpu())
+                    )
+                    velocity_values.append(float(F.smooth_l1_loss(
+                        pred[:, 1:] - pred[:, :-1],
+                        clean_t[:, 1:] - clean_t[:, :-1],
+                    ).cpu()))
     finally:
         random.setstate(python_state)
         np.random.set_state(numpy_state)
@@ -4363,6 +4609,11 @@ def _evaluate_refiner_validation(
         "num_windows": len(indices),
         "reconstruction_smooth_l1": float(np.mean(rec_values)) if rec_values else None,
         "velocity_smooth_l1_per_frame": float(np.mean(velocity_values)) if velocity_values else None,
+        "representation": (
+            "product_manifold_79d"
+            if isinstance(model, ProductManifoldTemporalRefiner)
+            else "legacy_edge151_euclidean"
+        ),
         "descriptor_coordinates": "training_event_db",
     }
 
@@ -4400,16 +4651,63 @@ def _evaluate_diffusion_validation(
                 cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
                 timestep = int(round(sample_index * max(diffusion_steps - 1, 0) / max(len(indices) - 1, 1)))
                 t = torch.full((1,), timestep, dtype=torch.long, device=device)
-                noise = torch.randn_like(x0)
                 a = abar[t].view(1, 1, 1)
-                x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
-                pred_noise = model(x_t, retr, cond_t, seam_t, t)
-                noise_values.append(float(F.mse_loss(pred_noise, noise).cpu()))
-                x0_hat = (x_t - torch.sqrt(1.0 - a) * pred_noise) / torch.sqrt(a).clamp_min(1.0e-6)
-                velocity_values.append(float(F.smooth_l1_loss(
-                    x0_hat[:, 1:] - x0_hat[:, :-1],
-                    x0[:, 1:] - x0[:, :-1],
-                ).cpu()))
+                if isinstance(model, TangentDiffusionDenoiser):
+                    joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                        retrieval[None], seam[None], cfg
+                    )
+                    joint_t = torch.from_numpy(joint_np).float().to(device)
+                    root_t = torch.from_numpy(root_np).float().to(device)
+                    contact_t = torch.from_numpy(contact_np).float().to(device)
+                    state0 = _encode_reference_tangent_state(retr, x0)
+                    state_mask = _tangent_state_mask(
+                        joint_t, root_t, contact_t
+                    )
+                    active_mask = (state_mask > 0.0).to(state0.dtype)
+                    noise = torch.randn_like(state0) * active_mask
+                    x_t = (
+                        torch.sqrt(a) * state0
+                        + torch.sqrt(1.0 - a) * noise
+                    ) * active_mask
+                    pred_noise = model(
+                        x_t, retr, cond_t, seam_t, joint_t, t
+                    ) * active_mask
+                    denominator = state_mask.sum().clamp_min(1.0)
+                    noise_error = ((pred_noise - noise) ** 2 * state_mask).sum()
+                    noise_values.append(float((noise_error / denominator).cpu()))
+                    state0_hat = (
+                        x_t - torch.sqrt(1.0 - a) * pred_noise
+                    ) / torch.sqrt(a).clamp_min(1.0e-6)
+                    decoded = _decode_reference_tangent_state(
+                        retr,
+                        state0_hat,
+                        joint_t,
+                        root_t,
+                        contact_t,
+                        cfg,
+                    )
+                    velocity_values.append(
+                        float(
+                            F.smooth_l1_loss(
+                                product_log_torch(
+                                    decoded[:, :-1], decoded[:, 1:]
+                                ),
+                                product_log_torch(
+                                    x0[:, :-1], x0[:, 1:]
+                                ),
+                            ).cpu()
+                        )
+                    )
+                else:
+                    noise = torch.randn_like(x0)
+                    x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
+                    pred_noise = model(x_t, retr, cond_t, seam_t, t)
+                    noise_values.append(float(F.mse_loss(pred_noise, noise).cpu()))
+                    x0_hat = (x_t - torch.sqrt(1.0 - a) * pred_noise) / torch.sqrt(a).clamp_min(1.0e-6)
+                    velocity_values.append(float(F.smooth_l1_loss(
+                        x0_hat[:, 1:] - x0_hat[:, :-1],
+                        x0[:, 1:] - x0[:, :-1],
+                    ).cpu()))
     finally:
         random.setstate(python_state)
         np.random.set_state(numpy_state)
@@ -4421,6 +4719,11 @@ def _evaluate_diffusion_validation(
         "num_windows": len(indices),
         "noise_mse": float(np.mean(noise_values)) if noise_values else None,
         "velocity_smooth_l1_per_frame": float(np.mean(velocity_values)) if velocity_values else None,
+        "representation": (
+            "reference_tangent_product_manifold_79d"
+            if isinstance(model, TangentDiffusionDenoiser)
+            else "legacy_edge151_euclidean"
+        ),
         "descriptor_coordinates": "training_event_db",
     }
 
@@ -4447,7 +4750,12 @@ def train_refiner(args: argparse.Namespace) -> int:
             "source_disjoint": _validate_source_disjoint(db, validation_db),
         }
     device = torch.device(cfg.device)
-    model = TemporalRefiner(EDGE_DIM, 32).to(device)
+    product_mode = bool(cfg.product_manifold_enable)
+    model = (
+        ProductManifoldTemporalRefiner(EDGE_DIM, 32)
+        if product_mode
+        else TemporalRefiner(EDGE_DIM, 32)
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
     bs = min(cfg.batch_size, max(2, len(paths)))
@@ -4455,6 +4763,9 @@ def train_refiner(args: argparse.Namespace) -> int:
         clean_batch = []
         bad_batch = []
         seam_batch = []
+        joint_mask_batch = []
+        root_mask_batch = []
+        contact_mask_batch = []
         cond_batch = []
         for _ in range(bs):
             idx = random.randrange(len(paths))
@@ -4463,16 +4774,46 @@ def train_refiner(args: argparse.Namespace) -> int:
             clean_batch.append(clean)
             bad_batch.append(bad)
             seam_batch.append(seam)
+            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                bad[None], seam[None], cfg
+            )
+            joint_mask_batch.append(joint_np[0])
+            root_mask_batch.append(root_np[0])
+            contact_mask_batch.append(contact_np[0])
             cond_batch.append(desc_z[idx])
         clean_t = torch.from_numpy(np.stack(clean_batch)).float().to(device)
         bad_t = torch.from_numpy(np.stack(bad_batch)).float().to(device)
         seam_t = torch.from_numpy(np.stack(seam_batch)).float().to(device)
         cond_t = torch.from_numpy(np.stack(cond_batch)).float().to(device)
-        delta = model(bad_t, cond_t, seam_t)
-        pred = bad_t + delta * (0.35 + 0.65 * seam_t)
-        rec = F.smooth_l1_loss(pred, clean_t)
-        smooth = F.smooth_l1_loss(pred[:, 1:] - pred[:, :-1], clean_t[:, 1:] - clean_t[:, :-1])
-        loss = rec + 0.25 * smooth
+        if product_mode:
+            joint_t = torch.from_numpy(np.stack(joint_mask_batch)).float().to(device)
+            root_t = torch.from_numpy(np.stack(root_mask_batch)).float().to(device)
+            contact_t = torch.from_numpy(
+                np.stack(contact_mask_batch)
+            ).float().to(device)
+            output = model(bad_t, cond_t, seam_t, joint_t)
+            pred = _decode_product_refiner_output(
+                bad_t, output, joint_t, root_t, contact_t, cfg
+            )
+            loss, loss_terms = _product_motion_losses(
+                pred,
+                clean_t,
+                bad_t,
+                joint_t,
+                root_t,
+                contact_t,
+                cfg,
+            )
+            rec = loss_terms["reconstruction"]
+        else:
+            delta = model(bad_t, cond_t, seam_t)
+            pred = bad_t + delta * (0.35 + 0.65 * seam_t)
+            rec = F.smooth_l1_loss(pred, clean_t)
+            smooth = F.smooth_l1_loss(
+                pred[:, 1:] - pred[:, :-1],
+                clean_t[:, 1:] - clean_t[:, :-1],
+            )
+            loss = rec + 0.25 * smooth
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -4486,7 +4827,18 @@ def train_refiner(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "version": "v45_refiner",
+        "version": (
+            "v45_product_manifold_79d_v1"
+            if product_mode
+            else "v45_refiner"
+        ),
+        "output_mode": (
+            "contact_logits_root_joint_tangent"
+            if product_mode
+            else "legacy_edge151_residual"
+        ),
+        "output_dim": PRODUCT_STATE_DIM if product_mode else EDGE_DIM,
+        "joint_mask_conditioned": bool(product_mode),
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "motion_contract": motion_checkpoint_contract(cfg, "v45_refiner"),
@@ -4520,6 +4872,8 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 class DiffusionDenoiser(nn.Module):
+    """Legacy raw EDGE-151 denoiser kept for old V46 checkpoints."""
+
     def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256, time_dim: int = 128):
         super().__init__()
         self.time = SinusoidalTimeEmbedding(time_dim)
@@ -4543,6 +4897,120 @@ class DiffusionDenoiser(nn.Module):
         for blk in self.blocks:
             h = h + blk(h)
         return self.out(h).transpose(1, 2)
+
+
+class TangentDiffusionDenoiser(nn.Module):
+    """Reference-point diffusion denoiser in the local 79D product tangent."""
+
+    def __init__(
+        self,
+        tangent_dim: int = PRODUCT_STATE_DIM,
+        cond_dim: int = 32,
+        hidden: int = 256,
+        time_dim: int = 128,
+    ):
+        super().__init__()
+        self.time = SinusoidalTimeEmbedding(time_dim)
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim + time_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.in_proj = nn.Conv1d(
+            tangent_dim + EDGE_DIM + 1 + NUM_JOINTS, hidden, 1
+        )
+        self.blocks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv1d(hidden, hidden, 5, padding=2),
+                    nn.GroupNorm(8, hidden),
+                    nn.SiLU(),
+                ),
+                nn.Sequential(
+                    nn.Conv1d(hidden, hidden, 5, padding=4, dilation=2),
+                    nn.GroupNorm(8, hidden),
+                    nn.SiLU(),
+                ),
+                nn.Sequential(
+                    nn.Conv1d(hidden, hidden, 5, padding=8, dilation=4),
+                    nn.GroupNorm(8, hidden),
+                    nn.SiLU(),
+                ),
+                nn.Sequential(
+                    nn.Conv1d(hidden, hidden, 5, padding=2),
+                    nn.GroupNorm(8, hidden),
+                    nn.SiLU(),
+                ),
+            ]
+        )
+        self.out = nn.Conv1d(hidden, tangent_dim, 1)
+
+    def forward(self, x_tangent, retrieval, cond, seam_mask, joint_mask, t):
+        inp = torch.cat(
+            [x_tangent, retrieval, seam_mask, joint_mask], dim=-1
+        ).transpose(1, 2)
+        h = self.in_proj(inp)
+        te = self.time(t)
+        ce = self.cond_proj(torch.cat([cond, te], dim=-1))[:, :, None]
+        h = h + ce
+        for block in self.blocks:
+            h = h + block(h)
+        return self.out(h).transpose(1, 2)
+
+
+def _contact_logit_torch(contact):
+    value = contact.clamp(1.0e-4, 1.0 - 1.0e-4)
+    return torch.log(value) - torch.log1p(-value)
+
+
+def _encode_reference_tangent_state(reference, target):
+    contact_delta = (
+        _contact_logit_torch(target[..., :4])
+        - _contact_logit_torch(reference[..., :4])
+    ).clamp(-8.0, 8.0)
+    return torch.cat(
+        [contact_delta, product_log_torch(reference, target)], dim=-1
+    )
+
+
+def _tangent_state_mask(joint_mask, root_mask, contact_mask):
+    return torch.cat(
+        [
+            contact_mask.expand(contact_mask.shape[:-1] + (4,)),
+            root_mask.expand(root_mask.shape[:-1] + (3,)),
+            joint_mask[..., None]
+            .expand(joint_mask.shape + (3,))
+            .reshape(joint_mask.shape[:-1] + (NUM_JOINTS * 3,)),
+        ],
+        dim=-1,
+    ).clamp(0.0, 1.0)
+
+
+def _decode_reference_tangent_state(
+    reference,
+    state,
+    joint_mask,
+    root_mask,
+    contact_mask,
+    cfg: V46Config,
+):
+    if state.shape[-1] != PRODUCT_STATE_DIM:
+        raise ValueError(
+            f"tangent diffusion state must be {PRODUCT_STATE_DIM}D"
+        )
+    geometry = masked_retract_torch(
+        reference,
+        state[..., 4:],
+        joint_mask=joint_mask,
+        root_mask=root_mask,
+        max_rotation_rad=float(cfg.tangent_diffusion_rotation_cap_rad),
+        max_root_m=float(cfg.tangent_diffusion_root_cap_m),
+    )
+    contact_delta = state[..., :4] * contact_mask
+    contacts = torch.sigmoid(
+        _contact_logit_torch(reference[..., :4]) + contact_delta
+    )
+    return torch.cat([contacts, geometry[..., 4:]], dim=-1)
 
 
 def make_beta_schedule(n: int, device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -4574,7 +5042,14 @@ def train_diffusion(args: argparse.Namespace) -> int:
             "source_disjoint": _validate_source_disjoint(db, validation_db),
         }
     device = torch.device(cfg.device)
-    model = DiffusionDenoiser(EDGE_DIM, 32).to(device)
+    tangent_mode = bool(
+        cfg.product_manifold_enable and cfg.tangent_diffusion_enable
+    )
+    model = (
+        TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32)
+        if tangent_mode
+        else DiffusionDenoiser(EDGE_DIM, 32)
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.diffusion_train_steps)
     Tdiff = int(args.diffusion_steps or cfg.diffusion_steps)
@@ -4584,6 +5059,9 @@ def train_diffusion(args: argparse.Namespace) -> int:
         clean_batch = []
         retr_batch = []
         seam_batch = []
+        joint_mask_batch = []
+        root_mask_batch = []
+        contact_mask_batch = []
         cond_batch = []
         for _ in range(bs):
             idx = random.randrange(len(paths))
@@ -4596,20 +5074,74 @@ def train_diffusion(args: argparse.Namespace) -> int:
             clean_batch.append(clean)
             retr_batch.append(retr)
             seam_batch.append(seam)
+            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                retr[None], seam[None], cfg
+            )
+            joint_mask_batch.append(joint_np[0])
+            root_mask_batch.append(root_np[0])
+            contact_mask_batch.append(contact_np[0])
             cond_batch.append(desc_z[idx])
         x0 = torch.from_numpy(np.stack(clean_batch)).float().to(device)
         retr = torch.from_numpy(np.stack(retr_batch)).float().to(device)
         seam = torch.from_numpy(np.stack(seam_batch)).float().to(device)
         cond = torch.from_numpy(np.stack(cond_batch)).float().to(device)
         t = torch.randint(0, Tdiff, (bs,), device=device)
-        noise = torch.randn_like(x0)
         a = abar[t].view(bs, 1, 1)
-        x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
-        pred_noise = model(x_t, retr, cond, seam, t)
-        loss_noise = F.mse_loss(pred_noise, noise)
-        # Encourage denoised sample to stay close to motion manifold.
-        x0_hat = (x_t - torch.sqrt(1.0 - a) * pred_noise) / torch.sqrt(a).clamp_min(1e-6)
-        loss_vel = F.smooth_l1_loss(x0_hat[:, 1:] - x0_hat[:, :-1], x0[:, 1:] - x0[:, :-1])
+        if tangent_mode:
+            joint_mask = torch.from_numpy(
+                np.stack(joint_mask_batch)
+            ).float().to(device)
+            root_mask = torch.from_numpy(
+                np.stack(root_mask_batch)
+            ).float().to(device)
+            contact_mask = torch.from_numpy(
+                np.stack(contact_mask_batch)
+            ).float().to(device)
+            state0 = _encode_reference_tangent_state(retr, x0)
+            state_mask = _tangent_state_mask(
+                joint_mask, root_mask, contact_mask
+            )
+            active_mask = (state_mask > 0.0).to(state0.dtype)
+            noise = torch.randn_like(state0) * active_mask
+            x_t = (
+                torch.sqrt(a) * state0
+                + torch.sqrt(1.0 - a) * noise
+            ) * active_mask
+            pred_noise = model(
+                x_t, retr, cond, seam, joint_mask, t
+            ) * active_mask
+            loss_noise = (
+                ((pred_noise - noise) ** 2 * state_mask).sum()
+                / state_mask.sum().clamp_min(1.0)
+            )
+            state0_hat = (
+                x_t - torch.sqrt(1.0 - a) * pred_noise
+            ) / torch.sqrt(a).clamp_min(1.0e-6)
+            decoded = _decode_reference_tangent_state(
+                retr,
+                state0_hat,
+                joint_mask,
+                root_mask,
+                contact_mask,
+                cfg,
+            )
+            loss_vel = F.smooth_l1_loss(
+                product_log_torch(decoded[:, :-1], decoded[:, 1:]),
+                product_log_torch(x0[:, :-1], x0[:, 1:]),
+            )
+        else:
+            noise = torch.randn_like(x0)
+            x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
+            pred_noise = model(x_t, retr, cond, seam, t)
+            loss_noise = F.mse_loss(pred_noise, noise)
+            # Legacy raw-channel denoising retained for checkpoint parity.
+            x0_hat = (
+                x_t - torch.sqrt(1.0 - a) * pred_noise
+            ) / torch.sqrt(a).clamp_min(1e-6)
+            loss_vel = F.smooth_l1_loss(
+                x0_hat[:, 1:] - x0_hat[:, :-1],
+                x0[:, 1:] - x0[:, :-1],
+            )
         loss = loss_noise + 0.10 * loss_vel
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -4624,7 +5156,18 @@ def train_diffusion(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "version": "v46_conditional_residual_diffusion",
+        "version": (
+            "v46_reference_tangent_diffusion_79d_v1"
+            if tangent_mode
+            else "v46_conditional_residual_diffusion"
+        ),
+        "diffusion_space": (
+            "reference_point_product_tangent"
+            if tangent_mode
+            else "legacy_edge151_channels"
+        ),
+        "state_dim": PRODUCT_STATE_DIM if tangent_mode else EDGE_DIM,
+        "joint_mask_conditioned": bool(tangent_mode),
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "diffusion_steps": Tdiff,
@@ -5999,7 +6542,14 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
 
     ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
     assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v45_refiner")
-    model = TemporalRefiner(EDGE_DIM, 32).to(cfg.device)
+    product_mode = str(ckpt.get("version", "")).startswith(
+        "v45_product_manifold_79d"
+    )
+    model = (
+        ProductManifoldTemporalRefiner(EDGE_DIM, 32)
+        if product_mode
+        else TemporalRefiner(EDGE_DIM, 32)
+    ).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
 
@@ -6025,25 +6575,80 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             x = torch.from_numpy(chunk_in[None]).float().to(cfg.device)
             c = torch.from_numpy(cond[None].astype(np.float32)).float().to(cfg.device)
             sm = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
-            delta = model(x, c, sm)
             strength = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * sm, 0.0, 1.0)
-            y = x + delta * strength
+            if product_mode:
+                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                    chunk_in[None], mask_in[None], cfg
+                )
+                joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
+                root_t = torch.from_numpy(root_np).float().to(cfg.device)
+                contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
+                output = model(x, c, sm, joint_t)
+                y = _decode_product_refiner_output(
+                    x,
+                    output,
+                    joint_t * strength,
+                    root_t * strength,
+                    contact_t * strength,
+                    cfg,
+                )
+            else:
+                delta = model(x, c, sm)
+                y = x + delta * strength
             y_np = y[0].detach().cpu().numpy()
             if orig_len < win:
                 y_np = resample_motion_np(y_np, orig_len)
             y_np, _ = enforce_edge151_contract_np(
-                y_np, cfg, source_hint="apply_refiner_model:v46_33_output_chunk", derive_contact=True, project_rot=True
+                y_np,
+                cfg,
+                source_hint="apply_refiner_model:v46_33_output_chunk",
+                derive_contact=not product_mode,
+                project_rot=True,
             )
             w = overlap_add_weight_np(orig_len, st, T, hop, win)
             accumulate_motion_window_np(accum, weight_sum, rot_quat_accum, rot_quat_weight, y_np, w, st, ed)
 
     out, _ = finalize_motion_window_accum_np(
-        accum, weight_sum, rot_quat_accum, rot_quat_weight, cfg, source_hint="apply_refiner_model:v46_33_final"
+        accum,
+        weight_sum,
+        rot_quat_accum,
+        rot_quat_weight,
+        cfg,
+        source_hint="apply_refiner_model:v46_33_final",
+        derive_contact=not product_mode,
     )
     # Hard blend with original reference according to the exact transition mask.
     w = np.clip(core_strength + (trans_strength - core_strength) * seam_mask.astype(np.float32), 0.0, 1.0)
-    out = motion.astype(np.float32) * (1.0 - w) + out.astype(np.float32) * w
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="apply_refiner_model:v46_33_reference_blend", derive_contact=True, project_rot=True)
+    if product_mode:
+        full_joint, full_root, full_contact = _risk_masks_for_batch_np(
+            motion[None], seam_mask[None], cfg
+        )
+        tangent = product_log_np(motion, out)
+        joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
+        root_support = (full_root[0] * w > 0.0).astype(np.float32)
+        out_geometry = masked_retract_np(
+            motion,
+            tangent,
+            joint_mask=joint_support,
+            root_mask=root_support,
+            max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
+            max_root_m=float(cfg.product_refiner_root_cap_m),
+        )
+        contact_weight = (full_contact[0] * w > 0.0).astype(np.float32)
+        out_geometry[:, :4] = (
+            motion[:, :4] * (1.0 - contact_weight)
+            + out[:, :4] * contact_weight
+        )
+        out = out_geometry
+    else:
+        out = motion.astype(np.float32) * (1.0 - w) + out.astype(np.float32) * w
+    out, _ = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint="apply_refiner_model:v46_33_reference_blend",
+        derive_contact=not product_mode,
+        project_rot=True,
+    )
     return out.astype(np.float32)
 
 
@@ -6068,7 +6673,14 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
     ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
     assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
-    model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
+    tangent_mode = str(ckpt.get("version", "")).startswith(
+        "v46_reference_tangent_diffusion_79d"
+    )
+    model = (
+        TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32)
+        if tangent_mode
+        else DiffusionDenoiser(EDGE_DIM, 32)
+    ).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
     betas, alphas, abar = make_beta_schedule(Tdiff, torch.device(cfg.device))
@@ -6096,36 +6708,134 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
             raw_mask = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
             mask = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * raw_mask, 0.0, 1.0)
             c = torch.from_numpy(cond[None].astype(np.float32)).float().to(cfg.device)
-            x = retr + float(noise_scale) * torch.randn_like(retr) * (0.15 + 0.85 * mask)
-            for ti in reversed(range(Tdiff)):
-                t = torch.full((1,), ti, device=cfg.device, dtype=torch.long)
-                eps = model(x, retr, c, raw_mask, t)
-                beta = betas[ti]
-                alpha = alphas[ti]
-                ab = abar[ti]
-                mean = (1 / torch.sqrt(alpha)) * (x - beta / torch.sqrt(1 - ab).clamp_min(1e-6) * eps)
-                if ti > 0:
-                    x = mean + torch.sqrt(beta) * torch.randn_like(x) * 0.35
-                else:
-                    x = mean
-                # Strong reference lock: core mask=0 returns exactly retr.
-                x = retr * (1.0 - mask) + x * mask
-            y = x[0].detach().cpu().numpy()
+            if tangent_mode:
+                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                    retr_in[None], mask_in[None], cfg
+                )
+                joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
+                root_t = torch.from_numpy(root_np).float().to(cfg.device)
+                contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
+                effective_joint = joint_t * mask
+                effective_root = root_t * mask
+                effective_contact = contact_t * mask
+                state_mask = _tangent_state_mask(
+                    effective_joint, effective_root, effective_contact
+                )
+                active_mask = (state_mask > 0.0).to(retr.dtype)
+                x = (
+                    float(noise_scale)
+                    * torch.randn(
+                        retr.shape[:-1] + (PRODUCT_STATE_DIM,),
+                        dtype=retr.dtype,
+                        device=retr.device,
+                    )
+                    * active_mask
+                )
+                for ti in reversed(range(Tdiff)):
+                    t = torch.full(
+                        (1,), ti, device=cfg.device, dtype=torch.long
+                    )
+                    eps = model(
+                        x, retr, c, raw_mask, joint_t, t
+                    ) * active_mask
+                    beta = betas[ti]
+                    alpha = alphas[ti]
+                    ab = abar[ti]
+                    mean = (1 / torch.sqrt(alpha)) * (
+                        x
+                        - beta
+                        / torch.sqrt(1 - ab).clamp_min(1e-6)
+                        * eps
+                    )
+                    if ti > 0:
+                        x = (
+                            mean
+                            + torch.sqrt(beta)
+                            * torch.randn_like(x)
+                            * 0.35
+                            * active_mask
+                        )
+                    else:
+                        x = mean
+                    x = x * active_mask
+                y_t = _decode_reference_tangent_state(
+                    retr,
+                    x,
+                    effective_joint,
+                    effective_root,
+                    effective_contact,
+                    cfg,
+                )
+                y = y_t[0].detach().cpu().numpy()
+            else:
+                x = retr + float(noise_scale) * torch.randn_like(retr) * (0.15 + 0.85 * mask)
+                for ti in reversed(range(Tdiff)):
+                    t = torch.full((1,), ti, device=cfg.device, dtype=torch.long)
+                    eps = model(x, retr, c, raw_mask, t)
+                    beta = betas[ti]
+                    alpha = alphas[ti]
+                    ab = abar[ti]
+                    mean = (1 / torch.sqrt(alpha)) * (x - beta / torch.sqrt(1 - ab).clamp_min(1e-6) * eps)
+                    if ti > 0:
+                        x = mean + torch.sqrt(beta) * torch.randn_like(x) * 0.35
+                    else:
+                        x = mean
+                    # Strong reference lock: core mask=0 returns exactly retr.
+                    x = retr * (1.0 - mask) + x * mask
+                y = x[0].detach().cpu().numpy()
             if orig_len < win:
                 y = resample_motion_np(y, orig_len)
             y, _ = enforce_edge151_contract_np(
-                y, cfg, source_hint="apply_diffusion_model:v46_33_output_chunk", derive_contact=True, project_rot=True
+                y,
+                cfg,
+                source_hint="apply_diffusion_model:v46_33_output_chunk",
+                derive_contact=not tangent_mode,
+                project_rot=True,
             )
             w = overlap_add_weight_np(orig_len, st, T, hop, win)
             accumulate_motion_window_np(accum, weight_sum, rot_quat_accum, rot_quat_weight, y, w, st, ed)
 
     out, _ = finalize_motion_window_accum_np(
-        accum, weight_sum, rot_quat_accum, rot_quat_weight, cfg, source_hint="apply_diffusion_model:v46_33_final"
+        accum,
+        weight_sum,
+        rot_quat_accum,
+        rot_quat_weight,
+        cfg,
+        source_hint="apply_diffusion_model:v46_33_final",
+        derive_contact=not tangent_mode,
     )
     # Final exact reference blend in the original-length mask coordinates.
     w = np.clip(core_strength + (trans_strength - core_strength) * seam_mask.astype(np.float32), 0.0, 1.0)
-    out = motion.astype(np.float32) * (1.0 - w) + out.astype(np.float32) * w
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="apply_diffusion_model:v46_33_reference_blend", derive_contact=True, project_rot=True)
+    if tangent_mode:
+        full_joint, full_root, full_contact = _risk_masks_for_batch_np(
+            motion[None], seam_mask[None], cfg
+        )
+        tangent = product_log_np(motion, out)
+        joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
+        root_support = (full_root[0] * w > 0.0).astype(np.float32)
+        out_geometry = masked_retract_np(
+            motion,
+            tangent,
+            joint_mask=joint_support,
+            root_mask=root_support,
+            max_rotation_rad=float(cfg.tangent_diffusion_rotation_cap_rad),
+            max_root_m=float(cfg.tangent_diffusion_root_cap_m),
+        )
+        contact_weight = (full_contact[0] * w > 0.0).astype(np.float32)
+        out_geometry[:, :4] = (
+            motion[:, :4] * (1.0 - contact_weight)
+            + out[:, :4] * contact_weight
+        )
+        out = out_geometry
+    else:
+        out = motion.astype(np.float32) * (1.0 - w) + out.astype(np.float32) * w
+    out, _ = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint="apply_diffusion_model:v46_33_reference_blend",
+        derive_contact=not tangent_mode,
+        project_rot=True,
+    )
     return out.astype(np.float32)
 
 
@@ -8149,6 +8859,12 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
     ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
     assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
+    if str(ckpt.get("version", "")).startswith(
+        "v46_reference_tangent_diffusion_79d"
+    ):
+        return _v46_41_orig_apply_diffusion_model(
+            snapshot, cond, sm_win, ckpt_path, cfg
+        )
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -8194,9 +8910,43 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
 
 
 def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cfg):
+    preserve_neural_contacts = False
+    if torch is not None and ckpt_path and Path(ckpt_path).exists():
+        try:
+            checkpoint_meta = _v46_41_trusted_torch_load(
+                ckpt_path, map_location="cpu"
+            )
+            checkpoint_version = str(checkpoint_meta.get("version", ""))
+            preserve_neural_contacts = bool(
+                (
+                    stage == "refiner"
+                    and checkpoint_version.startswith(
+                        "v45_product_manifold_79d"
+                    )
+                )
+                or (
+                    stage == "diffusion"
+                    and checkpoint_version.startswith(
+                        "v46_reference_tangent_diffusion_79d"
+                    )
+                )
+            )
+            del checkpoint_meta
+        except Exception:
+            # The actual model loader below remains the authority and will
+            # surface invalid checkpoints; this metadata probe is optional.
+            preserve_neural_contacts = False
     if not _v46_41_env_bool("V46_41_TGT_ENABLE", True):
         cand = orig_func(motion, cond, seam_mask, ckpt_path, cfg)
-        return _v46_41_safe_residual(cand, motion, seam_mask, cfg, stage=stage, global_start=0)
+        return _v46_41_safe_residual(
+            cand,
+            motion,
+            seam_mask,
+            cfg,
+            stage=stage,
+            global_start=0,
+            preserve_contacts=preserve_neural_contacts,
+        )
     ref_all = np.asarray(motion, dtype=np.float32)
     out = ref_all.copy().astype(np.float32)
     regions = _v46_41_regions(seam_mask, ref_all.shape[0])
@@ -8214,7 +8964,15 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
             else:
                 cand = orig_func(snapshot.copy(), cond, sm_win, ckpt_path, cfg)
             rejected_candidate = np.asarray(cand, dtype=np.float32)
-            cand = _v46_41_safe_residual(cand, snapshot, sm_win, cfg, stage=stage, global_start=a)
+            cand = _v46_41_safe_residual(
+                cand,
+                snapshot,
+                sm_win,
+                cfg,
+                stage=stage,
+                global_start=a,
+                preserve_contacts=preserve_neural_contacts,
+            )
             ok, reasons, detail = _v46_41_kbo(cand, snapshot, cfg, stage=f"{stage}_neural_commit", global_start=a)
             if ok:
                 out[a:b] = cand.astype(np.float32)
@@ -8236,8 +8994,21 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
                 if rejected_candidate is not None:
                     token["hn_dpo_pair"] = _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected_candidate, snapshot, token.get("barrier_violations", [str(exc)]), [a, b])
         _v46_41_add_token(token)
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_41_tgt_final:{stage}", derive_contact=True, project_rot=True)
-    out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_STAGE_FINAL_STRENGTH", 0.08))
+    out, _ = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint=f"v46_41_tgt_final:{stage}",
+        derive_contact=not preserve_neural_contacts,
+        project_rot=True,
+    )
+    out, _ = _v46_41_apply_stage_prior(
+        out,
+        cfg,
+        strength=_v46_41_env_float(
+            "V46_41_MSA_STAGE_FINAL_STRENGTH", 0.08
+        ),
+        preserve_contacts=preserve_neural_contacts,
+    )
     ok, reasons, detail = _v46_41_kbo(out, ref_all, cfg, stage=f"{stage}_whole_stage_guard", global_start=0)
     if not ok:
         _v46_41_add_token({"mechanism": "KBO", "stage": stage, "event": "whole_stage_rollback", "commit_state": "rolled_back", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
@@ -8629,7 +9400,15 @@ def _v46_42_kbo_early_abort(candidate, reference, cfg, stage="diffusion_early_ab
     return len(reasons) == 0, reasons, detail
 
 
-def _v46_41_safe_residual(candidate, reference, seam_mask, cfg, stage="stage", global_start=0):
+def _v46_41_safe_residual(
+    candidate,
+    reference,
+    seam_mask,
+    cfg,
+    stage="stage",
+    global_start=0,
+    preserve_contacts=False,
+):
     cand = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
     if cand.shape != ref.shape:
@@ -8659,8 +9438,27 @@ def _v46_41_safe_residual(candidate, reference, seam_mask, cfg, stage="stage", g
         w,
         max_rotation_rad=max_rotation_rad,
     )
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_42_safe_residual:{stage}", derive_contact=True, project_rot=True)
-    out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_TRANSACTION_STRENGTH", 0.08), global_start=global_start)
+    if preserve_contacts:
+        out[:, :4] = (
+            ref[:, :4] * (1.0 - w)
+            + np.clip(bounded[:, :4], 0.0, 1.0) * w
+        )
+    out, _ = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint=f"v46_42_safe_residual:{stage}",
+        derive_contact=not preserve_contacts,
+        project_rot=True,
+    )
+    out, _ = _v46_41_apply_stage_prior(
+        out,
+        cfg,
+        strength=_v46_41_env_float(
+            "V46_41_MSA_TRANSACTION_STRENGTH", 0.08
+        ),
+        global_start=global_start,
+        preserve_contacts=preserve_contacts,
+    )
     ok, reasons, detail = _v46_41_kbo(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
     if not ok:
         _v46_41_add_token({"mechanism": "KBO", "version": "v46_42", "stage": stage, "event": "bounded_residual_rejected", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
@@ -8720,6 +9518,12 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
     ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
     assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
+    if str(ckpt.get("version", "")).startswith(
+        "v46_reference_tangent_diffusion_79d"
+    ):
+        return _v46_41_orig_apply_diffusion_model(
+            snapshot, cond, sm_win, ckpt_path, cfg
+        )
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
@@ -9009,7 +9813,13 @@ def _v46_43_anchor_weight_for_motion(motion, global_start=0):
     return np.clip(w, _v46_42_env_float("V46_42_MSA_MIN_WEIGHT", 0.05), 1.0).astype(np.float32)
 
 
-def _v46_41_apply_stage_prior(motion, cfg, strength=None, global_start=0):
+def _v46_41_apply_stage_prior(
+    motion,
+    cfg,
+    strength=None,
+    global_start=0,
+    preserve_contacts=False,
+):
     """Velocity-preserving MSA.
 
     Instead of dragging root to the low-frequency prior frame-by-frame, correct
@@ -9049,7 +9859,13 @@ def _v46_41_apply_stage_prior(motion, cfg, strength=None, global_start=0):
     alpha = float(base_alpha) * w[:, 0]
     m[:, ROOT_X_IDX] = m[:, ROOT_X_IDX] + alpha * corr[:, 0]
     m[:, ROOT_Z_IDX] = m[:, ROOT_Z_IDX] + alpha * corr[:, 1]
-    m, _ = enforce_edge151_contract_np(m, cfg, source_hint="v46_43_velocity_preserving_msa", derive_contact=True, project_rot=True)
+    m, _ = enforce_edge151_contract_np(
+        m,
+        cfg,
+        source_hint="v46_43_velocity_preserving_msa",
+        derive_contact=not preserve_contacts,
+        project_rot=True,
+    )
     meta.update({
         "applied": True,
         "version": "v46_43_velocity_preserving_dynamic_msa",
@@ -9093,6 +9909,12 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
     ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
     assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
+    if str(ckpt.get("version", "")).startswith(
+        "v46_reference_tangent_diffusion_79d"
+    ):
+        return _v46_41_orig_apply_diffusion_model(
+            snapshot, cond, sm_win, ckpt_path, cfg
+        )
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
     model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)

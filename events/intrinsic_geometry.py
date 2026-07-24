@@ -47,6 +47,13 @@ BODY_PARTS: Dict[str, Tuple[int, ...]] = {
     "right_leg": (2, 5, 8, 11),
     "hands": (20, 21, 22, 23),
 }
+# The Gaussian-Wasserstein retrieval factor uses disjoint anatomical blocks.
+# Hands remain represented by their parent arm blocks; keeping the overlapping
+# ``hands`` summary above preserves the historical 112D descriptor contract.
+GAUSSIAN_BODY_PARTS: Dict[str, Tuple[int, ...]] = {
+    name: ids for name, ids in BODY_PARTS.items() if name != "hands"
+}
+GAUSSIAN_FEATURE_DIM = 8
 POSTURE_ORDER = ("floor_pose", "kneeling", "deep_squat", "half_squat", "standing", "aerial")
 
 
@@ -130,6 +137,92 @@ def _stats(x: np.ndarray) -> List[float]:
     ]
 
 
+def _bodypart_gaussian_statistics(
+    omega: np.ndarray,
+    alpha: np.ndarray,
+    *,
+    shrinkage: Optional[float] = None,
+    minimum_eigenvalue: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate stable body-part Gaussian dynamics in local SO(3) tangents.
+
+    Each aligned frame contributes eight physical features per anatomical block:
+    mean angular velocity (3), RMS angular speed (1), mean angular acceleration
+    (3), and RMS angular acceleration (1).  Covariances are shrunk toward their
+    diagonal and eigenvalue-floored, which is essential for short event clips.
+    """
+
+    w = np.asarray(omega, dtype=np.float64)
+    a = np.asarray(alpha, dtype=np.float64)
+    if w.ndim != 3 or a.ndim != 3 or w.shape[1:] != (NUM_JOINTS, 3) or a.shape[1:] != (NUM_JOINTS, 3):
+        raise ValueError(
+            "body-part Gaussian statistics require omega/alpha shaped "
+            f"[T,{NUM_JOINTS},3], got {w.shape} and {a.shape}"
+        )
+    aligned = min(max(len(w) - 1, 0), len(a))
+    shrink = (
+        _env_float("V46_53_GAUSSIAN_COV_SHRINKAGE", 0.20)
+        if shrinkage is None
+        else float(shrinkage)
+    )
+    floor = (
+        _env_float("V46_53_GAUSSIAN_COV_EPS", 1.0e-4)
+        if minimum_eigenvalue is None
+        else float(minimum_eigenvalue)
+    )
+    if not np.isfinite(shrink) or not 0.0 <= shrink <= 1.0:
+        raise ValueError("Gaussian covariance shrinkage must be in [0,1]")
+    if not np.isfinite(floor) or floor <= 0.0:
+        raise ValueError("Gaussian covariance eigenvalue floor must be positive")
+
+    means: List[np.ndarray] = []
+    covariances: List[np.ndarray] = []
+    sample_counts: List[int] = []
+    for ids in GAUSSIAN_BODY_PARTS.values():
+        joint_ids = np.asarray(ids, dtype=np.int64)
+        if aligned > 0:
+            part_w = w[1 : aligned + 1, joint_ids]
+            part_a = a[:aligned, joint_ids]
+            features = np.concatenate(
+                [
+                    np.mean(part_w, axis=1),
+                    np.sqrt(np.mean(np.sum(part_w * part_w, axis=-1), axis=1))[
+                        :, None
+                    ],
+                    np.mean(part_a, axis=1),
+                    np.sqrt(np.mean(np.sum(part_a * part_a, axis=-1), axis=1))[
+                        :, None
+                    ],
+                ],
+                axis=-1,
+            )
+        else:
+            # Degenerate clips remain representable but carry an explicit sample
+            # count of zero and an isotropic floor covariance.
+            features = np.zeros((1, GAUSSIAN_FEATURE_DIM), dtype=np.float64)
+
+        mean = np.mean(features, axis=0)
+        centered = features - mean[None]
+        denominator = max(len(features) - 1, 1)
+        covariance = centered.T @ centered / float(denominator)
+        diagonal = np.diag(np.diag(covariance))
+        covariance = (1.0 - shrink) * covariance + shrink * diagonal
+        covariance = 0.5 * (covariance + covariance.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        eigenvalues = np.maximum(eigenvalues, floor)
+        covariance = (eigenvectors * eigenvalues[None]) @ eigenvectors.T
+
+        means.append(mean.astype(np.float32))
+        covariances.append(covariance.astype(np.float32))
+        sample_counts.append(int(aligned))
+
+    return (
+        np.stack(means).astype(np.float32),
+        np.stack(covariances).astype(np.float32),
+        np.asarray(sample_counts, dtype=np.int32),
+    )
+
+
 def _hash_onehot(value: Any, width: int) -> np.ndarray:
     out = np.zeros(int(width), dtype=np.float32)
     token = str(value or "unknown").strip().lower()
@@ -158,6 +251,9 @@ def _geometry_descriptor(
     local = rot6d_to_matrix_np(x[:, ROT6D_START:ROT6D_END].reshape(t, NUM_JOINTS, 6))
     omega = angular_velocity_np(local, fps=fps)
     alpha = angular_acceleration_np(local, fps=fps)
+    gaussian_mean, gaussian_covariance, gaussian_samples = (
+        _bodypart_gaussian_statistics(omega, alpha)
+    )
     joints = fk24_np(x)
 
     root = x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
@@ -223,6 +319,10 @@ def _geometry_descriptor(
 
     return {
         "descriptor": np.asarray(desc, dtype=np.float32),
+        # Dedicated paper-two routing endpoints.  They are projected SO(3)
+        # matrices, so the graph never compares unconstrained Rot6D channels.
+        "entry_rotation_matrix": local[0].astype(np.float32),
+        "exit_rotation_matrix": local[-1].astype(np.float32),
         "entry_omega": entry_omega.astype(np.float32),
         "exit_omega": exit_omega.astype(np.float32),
         "entry_alpha": entry_alpha.astype(np.float32),
@@ -230,6 +330,9 @@ def _geometry_descriptor(
         "entry_root_velocity_mps": entry_root_velocity.astype(np.float32),
         "exit_root_velocity_mps": exit_root_velocity.astype(np.float32),
         "part_flow": np.asarray(part_flow, dtype=np.float32),
+        "bodypart_gaussian_mean": gaussian_mean,
+        "bodypart_gaussian_covariance": gaussian_covariance,
+        "bodypart_gaussian_samples": gaussian_samples,
         "structure_quality": structure_quality,
         "omega_p95": omega_p95,
         "alpha_p95": alpha_p95,
@@ -331,7 +434,27 @@ def augment_database(
 
     edge_frames_30fps = _env_int("V46_53_EVENT_EDGE_FRAMES", 6)
     edge_frames = max(1, int(round(edge_frames_30fps * fps / 30.0)))
-    rows, w0, w1, a0, a1, rv0, rv1, parts, structure_q = (
+    (
+        rows,
+        w0,
+        w1,
+        a0,
+        a1,
+        rv0,
+        rv1,
+        r0,
+        r1,
+        parts,
+        gaussian_means,
+        gaussian_covariances,
+        gaussian_sample_counts,
+        structure_q,
+    ) = (
+        [],
+        [],
+        [],
+        [],
+        [],
         [],
         [],
         [],
@@ -361,7 +484,12 @@ def augment_database(
         a1.append(item["exit_alpha"])
         rv0.append(item["entry_root_velocity_mps"])
         rv1.append(item["exit_root_velocity_mps"])
+        r0.append(item["entry_rotation_matrix"])
+        r1.append(item["exit_rotation_matrix"])
         parts.append(item["part_flow"])
+        gaussian_means.append(item["bodypart_gaussian_mean"])
+        gaussian_covariances.append(item["bodypart_gaussian_covariance"])
+        gaussian_sample_counts.append(item["bodypart_gaussian_samples"])
         structure_q.append(float(item["structure_quality"]))
         diagnostics.append({
             "event_id": int(i),
@@ -398,7 +526,24 @@ def augment_database(
         "v46_53_exit_alpha": np.stack(a1).astype(np.float32),
         "v46_53_entry_root_velocity_mps": np.stack(rv0).astype(np.float32),
         "v46_53_exit_root_velocity_mps": np.stack(rv1).astype(np.float32),
+        "v46_55_route_geometry_schema_version": np.asarray(
+            "v46_55_so3_product_event_edge_state_v1", dtype=object
+        ),
+        "v46_55_entry_rotation_matrix": np.stack(r0).astype(np.float32),
+        "v46_55_exit_rotation_matrix": np.stack(r1).astype(np.float32),
         "v46_53_bodypart_flow": np.stack(parts).astype(np.float32),
+        "v46_53_bodypart_gaussian_schema_version": np.asarray(
+            "v46_53_bodypart_so3_gaussian_bw_v1", dtype=object
+        ),
+        "v46_53_bodypart_gaussian_mean": np.stack(gaussian_means).astype(
+            np.float32
+        ),
+        "v46_53_bodypart_gaussian_covariance": np.stack(
+            gaussian_covariances
+        ).astype(np.float32),
+        "v46_53_bodypart_gaussian_samples": np.stack(
+            gaussian_sample_counts
+        ).astype(np.int32),
         "v46_53_structure_quality": structure_q_arr,
         "v46_53_combined_quality": combined_q,
         "v46_53_w2_barycenter_mean": bary_mean,
@@ -424,7 +569,23 @@ def augment_database(
         "fps": fps,
         "edge_frames": int(edge_frames),
         "edge_window_seconds": float(edge_frames / fps),
+        "route_edge_geometry": {
+            "schema": "v46_55_so3_product_event_edge_state_v1",
+            "rotation_shape": [24, 3, 3],
+            "distance": "RMS product SO(3) geodesic",
+        },
         "body_parts": list(BODY_PARTS),
+        "gaussian_body_parts": list(GAUSSIAN_BODY_PARTS),
+        "gaussian_feature_dim": int(GAUSSIAN_FEATURE_DIM),
+        "gaussian_covariance": {
+            "geometry": "Bures-Wasserstein SPD",
+            "shrinkage": _env_float(
+                "V46_53_GAUSSIAN_COV_SHRINKAGE", 0.20
+            ),
+            "minimum_eigenvalue": _env_float(
+                "V46_53_GAUSSIAN_COV_EPS", 1.0e-4
+            ),
+        },
         "quality": {
             "min": float(combined_q.min()),
             "median": float(np.median(combined_q)),

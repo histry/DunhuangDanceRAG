@@ -211,6 +211,19 @@ class SchedulerArchitectureTests(unittest.TestCase):
         block = source[start : start + 700]
         self.assertIn('--fps "$V46_51_FPS"', block)
 
+    def test_pipeline_enriches_mixed_schedule_before_generation(self):
+        source = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        enrich = source.index("-m grounding.audio_query")
+        generate = source.index("routing/closed_loop.py", enrich)
+        self.assertLess(enrich, generate)
+        block = source[enrich:generate]
+        self.assertIn('--checkpoint "$MIXED_GROUNDER_CKPT"', block)
+        self.assertIn('ROUTING_MSSD="$MIXED_MSSD"', block)
+        generation_block = source[generate : generate + 500]
+        self.assertIn('--slots_json "$ROUTING_MSSD"', generation_block)
+
     def test_pipeline_trains_scheduler_models_before_regression_and_v45(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
         markers = [

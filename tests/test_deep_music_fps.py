@@ -84,6 +84,28 @@ class DeepMusicFpsTests(unittest.TestCase):
         self.assertGreater(float(np.std(semantic[0])), 0.01)
         self.assertEqual(meta["deep_success_count"], 1)
 
+    def test_raw_deep_embedding_has_no_projection_or_rule_mix(self):
+        phrase = phrase_at_rate(30.0)
+        embedding = np.linspace(-1.0, 1.0, 24, dtype=np.float32)
+        with patch.object(
+            features,
+            "_try_clap_phrase_embedding",
+            return_value=(embedding, "laion_clap"),
+        ):
+            matrix, meta = features.phrase_deep_embedding_matrix(
+                "not_read.wav",
+                [phrase],
+                model_name="clap",
+                require_deep=True,
+                fps=30.0,
+            )
+        self.assertEqual(matrix.shape, (1, 24))
+        np.testing.assert_allclose(
+            np.linalg.norm(matrix, axis=-1), 1.0, atol=1.0e-6
+        )
+        self.assertEqual(meta["projection"], "none")
+        self.assertFalse(meta["rule_semantic_mixing"])
+
     def test_invalid_rate_fails(self):
         with self.assertRaisesRegex(ValueError, "finite and positive"):
             features.phrase_rule_semantic(phrase_at_rate(30.0), fps=0.0)

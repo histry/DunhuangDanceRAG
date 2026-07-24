@@ -62,12 +62,20 @@ def _checkpoint_for(out_dir: Path) -> Path:
     if explicit:
         return Path(explicit)
     out_root = str(os.environ.get("OUT_ROOT", "")).strip()
+    architecture = str(
+        os.environ.get("V46_53_GROUNDER_ARCHITECTURE", "legacy")
+    ).strip().lower()
+    checkpoint_name = (
+        "v46_53_mixed_curvature_grounder.pt"
+        if architecture == "mixed"
+        else "v46_53_dual_branch_grounder.pt"
+    )
     if out_root:
-        return Path(out_root) / "v46_53_dual_branch_grounder.pt"
+        return Path(out_root) / checkpoint_name
     # split DB layout is usually .../event_db_split/train.  Put the shared model
     # two levels above so val/test wrappers can resolve the same checkpoint.
     parent = out_dir.parent.parent if out_dir.parent.name.lower() in {"train", "val", "test"} else out_dir.parent
-    return parent / "v46_53_dual_branch_grounder.pt"
+    return parent / checkpoint_name
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -94,6 +102,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     split = _split_name(out_dir)
+    architecture = str(
+        os.environ.get("V46_53_GROUNDER_ARCHITECTURE", "legacy")
+    ).strip().lower()
+    if architecture not in {"legacy", "mixed"}:
+        raise RuntimeError(
+            "V46_53_GROUNDER_ARCHITECTURE must be 'legacy' or 'mixed', "
+            f"got {architecture!r}"
+        )
     ckpt = _checkpoint_for(out_dir)
     grounding_report = {
         "enabled": False,
@@ -103,15 +119,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     if _env_bool("V46_53_GROUNDER_ENABLE", True):
         if split == "train" and _env_bool("V46_53_TRAIN_GROUNDER_ON_BUILD", True):
-            grounding_report = train_grounder(
-                db_path=db_path,
-                out_path=ckpt,
-                steps=_env_int("V46_53_GROUNDER_STEPS", 1400),
-                batch_size=_env_int("V46_53_GROUNDER_BATCH", 128),
-                seed=_env_int("V46_53_SEED", 20260717),
-            )
+            if architecture == "mixed":
+                paired_path = str(
+                    os.environ.get("V46_53_GROUNDER_PAIRED_DATASET", "")
+                ).strip()
+                if not paired_path:
+                    raise RuntimeError(
+                        "Mixed grounding requires "
+                        "V46_53_GROUNDER_PAIRED_DATASET; the builder will not "
+                        "replace real audio with semantic noise"
+                    )
+                from grounding.mixed_curvature import (
+                    embed_database_mixed,
+                    train_mixed_grounder,
+                )
+
+                training_report = train_mixed_grounder(
+                    paired_dataset_path=Path(paired_path),
+                    out_path=ckpt,
+                    epochs=_env_int("V46_53_MIXED_EPOCHS", 120),
+                    batch_size=_env_int("V46_53_GROUNDER_BATCH", 96),
+                    seed=_env_int("V46_53_SEED", 20260724),
+                )
+                embedding_report = embed_database_mixed(db_path, ckpt)
+                grounding_report = {
+                    "schema": "v46_53_mixed_train_and_embed_v1",
+                    "ok": bool(
+                        training_report.get("ok", False)
+                        and embedding_report.get("ok", False)
+                    ),
+                    "checkpoint": str(ckpt),
+                    "split": split,
+                    "training": training_report,
+                    "embedding": embedding_report,
+                    "train_db_embedded": True,
+                }
+            else:
+                grounding_report = train_grounder(
+                    db_path=db_path,
+                    out_path=ckpt,
+                    steps=_env_int("V46_53_GROUNDER_STEPS", 1400),
+                    batch_size=_env_int("V46_53_GROUNDER_BATCH", 128),
+                    seed=_env_int("V46_53_SEED", 20260717),
+                )
         elif ckpt.is_file():
-            grounding_report = embed_database(db_path, ckpt)
+            if architecture == "mixed":
+                from grounding.mixed_curvature import embed_database_mixed
+
+                grounding_report = embed_database_mixed(db_path, ckpt)
+            else:
+                grounding_report = embed_database(db_path, ckpt)
         else:
             grounding_report = {
                 "enabled": False,
@@ -123,6 +180,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = {
         "schema": "v46_53_hierarchical_intrinsic_event_db",
         "split": split,
+        "grounder_architecture": architecture,
         "out_dir": str(out_dir),
         "geometry": geometry_report,
         "grounding": grounding_report,

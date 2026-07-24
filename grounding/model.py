@@ -551,6 +551,11 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
     raw = np.load(db_path, allow_pickle=True)
     db = {k: raw[k] for k in raw.files}
     ckpt = _load_grounder_checkpoint(checkpoint)
+    if ckpt.get("schema") == "v46_53_mixed_curvature_gaussian_grounder_v1":
+        raw.close()
+        from grounding.mixed_curvature import embed_database_mixed
+
+        return embed_database_mixed(db_path, checkpoint)
     geom = _geometry_for_checkpoint(db, ckpt)
     model = DualBranchGrounder(
         geometry_dim=int(ckpt["geometry_dim"]),
@@ -604,10 +609,48 @@ class GroundingRuntime:
             dtype=np.float32,
         )
         self.model = None
+        self.mixed_runtime = None
         self.event_embedding = np.asarray(db.get("v46_53_grounding_embedding", np.zeros((len(self.event_probs), 1), np.float32)), dtype=np.float32)
         self.device = None
-        if torch is not None and self.checkpoint and Path(self.checkpoint).is_file() and "v46_53_geometry_desc" in db:
-            ckpt = _load_grounder_checkpoint(Path(self.checkpoint))
+        architecture = str(
+            os.environ.get("V46_53_GROUNDER_ARCHITECTURE", "legacy")
+        ).strip().lower()
+        strict_mixed = (
+            architecture == "mixed"
+            and _env_bool("V46_53_MIXED_REQUIRE_RUNTIME_AUDIO", False)
+        )
+        checkpoint_path = Path(self.checkpoint) if self.checkpoint else None
+        if strict_mixed and torch is None:
+            raise RuntimeError(
+                "Mixed-curvature Grounder strict mode requires PyTorch"
+            )
+        if strict_mixed and (
+            checkpoint_path is None or not checkpoint_path.is_file()
+        ):
+            raise RuntimeError(
+                "Mixed-curvature Grounder strict mode requires an existing "
+                "V46_53_GROUNDER_CKPT"
+            )
+        if (
+            torch is not None
+            and checkpoint_path is not None
+            and checkpoint_path.is_file()
+        ):
+            ckpt = _load_grounder_checkpoint(checkpoint_path)
+            if ckpt.get("schema") == "v46_53_mixed_curvature_gaussian_grounder_v1":
+                from grounding.mixed_curvature import MixedGroundingRuntime
+
+                self.mixed_runtime = MixedGroundingRuntime(
+                    db, checkpoint_path
+                )
+                return
+            if strict_mixed:
+                raise RuntimeError(
+                    "V46_53_GROUNDER_ARCHITECTURE=mixed but the configured "
+                    f"checkpoint has incompatible schema {ckpt.get('schema')!r}"
+                )
+            if "v46_53_geometry_desc" not in db:
+                return
             aligned_geometry = _geometry_for_checkpoint(db, ckpt)
             self.model = DualBranchGrounder(
                 geometry_dim=int(ckpt["geometry_dim"]),
@@ -639,6 +682,23 @@ class GroundingRuntime:
     def score(self, slot: Mapping[str, Any], event_id: int) -> float:
         i = int(event_id)
         deterministic = probabilistic_association(slot, self.event_probs[i] if i < len(self.event_probs) else None)
+        if self.mixed_runtime is not None:
+            learned = self.mixed_runtime.score(slot, i)
+            # Missing real-audio fields are an explicit runtime condition. The
+            # stable semantic scorer remains available, but no synthetic CLAP
+            # vector is manufactured to force the mixed model to run.
+            if learned is None:
+                if _env_bool(
+                    "V46_53_MIXED_REQUIRE_RUNTIME_AUDIO", False
+                ):
+                    raise RuntimeError(
+                        "Mixed-curvature Grounder is active but the music slot "
+                        "has no checkpoint-compatible clap_embedding and "
+                        "temporal_features; run grounding.audio_query on the "
+                        "current schedule before closed-loop generation"
+                    )
+                return deterministic
+            return float(0.15 * deterministic + 0.85 * learned)
         if self.model is None or i >= len(self.event_embedding):
             return deterministic
         sem = slot_semantic_vector(slot)[None]

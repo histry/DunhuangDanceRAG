@@ -459,3 +459,121 @@ def phrase_semantic_matrix(
     if cache_path is not None:
         np.savez_compressed(cache_path, semantic=semantic, meta=np.asarray(json.dumps(meta, ensure_ascii=False), dtype=object))
     return semantic, meta
+
+
+def phrase_deep_embedding_matrix(
+    audio_path: str | Path,
+    phrases: Sequence[Any],
+    *,
+    model_name: str = "clap",
+    cache_dir: str | Path | None = None,
+    require_deep: bool = True,
+    min_deep_success: float = 1.0,
+    fps: float = 30.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Return normalized, unprojected CLAP/MSCLAP phrase embeddings.
+
+    Unlike :func:`phrase_semantic_matrix`, this research-grade path never mixes
+    rule semantics with a fixed random projection. Failed rows are rejected in
+    strict mode. Non-strict mode returns an explicit validity mask and uses zero
+    rows only after another successful phrase establishes the feature dimension.
+    """
+
+    fps = _validated_fps(fps)
+    audio = Path(audio_path)
+    cache_path = None
+    audio_hash = _audio_fingerprint(audio)
+    phrase_hash = _phrase_fingerprint(phrases)
+    backend_hash = _backend_fingerprint(True, model_name)
+    cache_key = (
+        f"{audio.stem}_v46_53_raw_{model_name}_{len(phrases)}"
+        f"_fps{fps:g}_audio{audio_hash}_phrases{phrase_hash}"
+        f"_backend{backend_hash}.npz"
+    )
+    if cache_dir:
+        cache = Path(cache_dir)
+        cache.mkdir(parents=True, exist_ok=True)
+        cache_path = cache / cache_key
+        if cache_path.is_file():
+            with np.load(cache_path, allow_pickle=True) as data:
+                embedding = np.asarray(data["embedding"], dtype=np.float32)
+                valid = np.asarray(data["valid"], dtype=bool)
+                meta = json.loads(str(data["meta"].item()))
+            if embedding.ndim != 2 or len(embedding) != len(phrases):
+                raise RuntimeError(
+                    f"Invalid cached raw deep embedding shape: {embedding.shape}"
+                )
+            if require_deep:
+                _assert_deep_success(meta, min_deep_success)
+            meta["valid_mask"] = valid.tolist()
+            return embedding, meta
+
+    raw_rows: list[np.ndarray | None] = []
+    modes: list[str] = []
+    embedding_dim: int | None = None
+    for phrase in phrases:
+        embedding, mode = _try_clap_phrase_embedding(
+            audio, phrase, model_name, fps=fps
+        )
+        modes.append(str(mode))
+        if (
+            embedding is not None
+            and embedding.size > 0
+            and np.isfinite(embedding).all()
+        ):
+            normalized = _normalize(embedding)
+            if embedding_dim is None:
+                embedding_dim = int(normalized.size)
+            elif int(normalized.size) != embedding_dim:
+                raise RuntimeError(
+                    "CLAP embedding dimension changed within one audio file: "
+                    f"expected={embedding_dim}, got={normalized.size}"
+                )
+            raw_rows.append(normalized)
+        else:
+            raw_rows.append(None)
+
+    valid = np.asarray([row is not None for row in raw_rows], dtype=bool)
+    if embedding_dim is None:
+        embedding = np.zeros((len(raw_rows), 0), dtype=np.float32)
+    else:
+        embedding = np.stack(
+            [
+                row
+                if row is not None
+                else np.zeros(embedding_dim, dtype=np.float32)
+                for row in raw_rows
+            ]
+        ).astype(np.float32)
+    meta = _meta_from_modes(
+        audio,
+        True,
+        model_name,
+        phrases,
+        modes,
+        embedding,
+        fps=fps,
+    )
+    meta.update(
+        {
+            "schema": "v46_53_unprojected_deep_audio_embedding_v1",
+            "projection": "none",
+            "rule_semantic_mixing": False,
+            "valid_mask": valid.tolist(),
+        }
+    )
+    if require_deep:
+        _assert_deep_success(meta, min_deep_success)
+        if not valid.all():
+            raise RuntimeError(
+                "Strict raw CLAP extraction produced invalid phrase rows: "
+                f"{np.where(~valid)[0].tolist()}"
+            )
+    if cache_path is not None:
+        np.savez_compressed(
+            cache_path,
+            embedding=embedding,
+            valid=valid,
+            meta=np.asarray(json.dumps(meta, ensure_ascii=False), dtype=object),
+        )
+    return embedding, meta

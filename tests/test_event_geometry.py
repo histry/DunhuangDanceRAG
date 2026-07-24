@@ -48,7 +48,13 @@ class EventGeometryTest(unittest.TestCase):
             with np.load(db, allow_pickle=True) as obj:
                 self.assertIn("v46_53_geometry_desc_z", obj.files)
                 self.assertIn("v46_53_shared_embedding", obj.files)
+                self.assertIn("v46_55_entry_rotation_matrix", obj.files)
+                self.assertIn("v46_55_exit_rotation_matrix", obj.files)
                 self.assertEqual(obj["v46_53_geometry_desc_z"].shape[0], 4)
+                self.assertEqual(
+                    obj["v46_55_entry_rotation_matrix"].shape,
+                    (4, 24, 3, 3),
+                )
             self.assertTrue(rep["ok"])
 
 

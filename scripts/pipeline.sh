@@ -438,12 +438,42 @@ echo "========== 12. FRESH-WAV CONTRACT RECHECK =========="
   --out "$OUT_ROOT/fresh_schedule.contract.json" \
   --csv "$OUT_ROOT/fresh_schedule.contract.csv"
 
+ROUTING_MSSD="$FRESH_MSSD"
+if [[ "${V46_53_GROUNDER_ARCHITECTURE:-legacy}" == "mixed" ]]; then
+  echo "========== 12B. MIXED-GROUNDER REAL-AUDIO SLOT FEATURES =========="
+  MIXED_GROUNDER_CKPT="${V46_53_GROUNDER_CKPT:-}"
+  require_file "$MIXED_GROUNDER_CKPT" \
+    "mixed-curvature Grounder checkpoint"
+  MIXED_MSSD="$SCHEDULE_ROOT/current_wav.final.mixed_grounding.json"
+  "$PY" -m grounding.audio_query \
+    --audio "$AUDIO" \
+    --schedule "$FRESH_MSSD" \
+    --out "$MIXED_MSSD" \
+    --checkpoint "$MIXED_GROUNDER_CKPT" \
+    --model_name "$V46_51_DEEP_MUSIC_MODEL" \
+    --cache_dir "$OUT_ROOT/mixed_audio_cache" \
+    --temporal_frames "${V46_53_MIXED_TEMPORAL_FRAMES:-64}" \
+    --temporal_source_frames "${V46_53_MIXED_TEMPORAL_SOURCE_FRAMES:-2048}" \
+    --phrase_fps "$V46_51_FPS"
+  require_file "$MIXED_MSSD" "mixed-grounding enriched schedule"
+  "$PY" scheduling/validate_schedule.py \
+    --audio "$AUDIO" \
+    --schedule "$MIXED_MSSD" \
+    --required_run_id "$V46_51_SCHEDULE_RUN_ID" \
+    --fps "$V46_51_FPS" \
+    --max_frame_error "$V46_51_MAX_FRAME_ERROR" \
+    --max_seconds_error "$V46_51_MAX_SECONDS_ERROR" \
+    --out "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.json" \
+    --csv "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.csv"
+  ROUTING_MSSD="$MIXED_MSSD"
+fi
+
 echo "========== 13. V46.51 HEADING/BOUNDARY CLOSED-LOOP GENERATION =========="
 "$PY" routing/closed_loop.py \
   generate \
   --config "$CONFIG" \
   --audio "$AUDIO" \
-  --slots_json "$FRESH_MSSD" \
+  --slots_json "$ROUTING_MSSD" \
   --db "$GENERATION_DB" \
   --contrastive "$V44_CKPT" \
   --refiner "$V45_CKPT" \
@@ -506,8 +536,8 @@ echo "========== 17. SCIENTIFIC FIXED-CAMERA RENDER =========="
   --gravity_audit_json "$OUT_ROOT/final.render_gravity.json"
 
 echo "========== V46.51 COMPLETE =========="
-printf "FRESH_MSSD=%s\nGENERATION_DB=%s\nFINAL_NPY=%s\nFINAL_REPORT=%s\nFINAL_MP4=%s\n" \
-  "$FRESH_MSSD" "$GENERATION_DB" "$FINAL_NPY" "$FINAL_REPORT" "$FINAL_MP4"
+printf "FRESH_MSSD=%s\nROUTING_MSSD=%s\nGENERATION_DB=%s\nFINAL_NPY=%s\nFINAL_REPORT=%s\nFINAL_MP4=%s\n" \
+  "$FRESH_MSSD" "$ROUTING_MSSD" "$GENERATION_DB" "$FINAL_NPY" "$FINAL_REPORT" "$FINAL_MP4"
 ls -lh \
   "$TRAIN_AESD" \
   "$VAL_AESD" \
@@ -516,6 +546,7 @@ ls -lh \
   "$V45_CKPT" \
   "$V46_CKPT" \
   "$FRESH_MSSD" \
+  "$ROUTING_MSSD" \
   "$FINAL_NPY" \
   "$FINAL_REPORT" \
   "$FINAL_MP4"
