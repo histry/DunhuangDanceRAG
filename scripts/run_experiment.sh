@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-
-[[ -f "$ROOT_DIR/configs/performer_policy.env" ]] && source "$ROOT_DIR/configs/performer_policy.env"
 # One-command V46.53.1 full rebuild, retraining and current-WAV whole-song generation.
 set -Eeuo pipefail
 
@@ -8,6 +6,8 @@ set -Eeuo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+[[ -f "$ROOT_DIR/configs/performer_policy.env" ]] && \
+  source "$ROOT_DIR/configs/performer_policy.env"
 [[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
 
 cd "$ROOT_DIR"

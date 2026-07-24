@@ -27,7 +27,6 @@ from scheduling.validate_schedule import audit_contract, save_json
 import routing.heading_closed_loop as v4650
 from contracts.anatomy import (
     AnatomyThresholds,
-    align_core_floor_np,
     anatomy_metrics_np,
     env_bool,
     env_float,
@@ -35,8 +34,13 @@ from contracts.anatomy import (
     evaluate_anatomy_contract,
     event_anatomy_features,
     frame_anomaly_score_np,
-    geodesic_c2_bridge_np,
     transition_anatomy_risk,
+)
+from support.motion_geometry import (
+    canonicalize_event_root_np,
+    make_so3_transition,
+    project_transition_floor_np,
+    recompute_transition_contacts_np,
 )
 
 base = v4650.base
@@ -109,13 +113,36 @@ def _align_core_v52(
     cfg: Any,
     event_id: int,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    out, report = _ORIG_ALIGN(v46, prev, core, stage_heading_rad, cfg, event_id)
-    out, floor_report = align_core_floor_np(prev, out, fps=float(getattr(cfg, "fps", 30.0)))
+    # Normalize every event independently before applying planner-owned stage
+    # heading and cumulative XZ placement.  Only a constant Root-Y/XZ
+    # translation is changed, so kneels, crouches and jumps remain intact.
+    localized, floor_report = canonicalize_event_root_np(
+        core,
+        target_floor_y=env_float("V46_54_STAGE_FLOOR_Y", 0.0),
+        floor_quantile=env_float("V46_54_EVENT_FLOOR_QUANTILE", 5.0),
+        max_floor_penetration_m=env_float(
+            "V46_54_EVENT_MAX_FLOOR_PENETRATION_M",
+            0.005,
+        ),
+    )
+    out, report = _ORIG_ALIGN(
+        v46,
+        prev,
+        localized,
+        stage_heading_rad,
+        cfg,
+        event_id,
+    )
     out = base.enforce_contract(v46, out, cfg, source_hint=f"v46_52_floor_align:{event_id}")
     report = dict(report or {})
     report["v46_52_support_floor_alignment"] = floor_report
     report["root_y_ramp_applied"] = False
-    report["root_y_policy"] = "support-floor alignment; posture mismatch is rejected, not hidden by whole-core Y shift"
+    report["root_trajectory_policy"] = (
+        "event-local first-frame XZ + cumulative stage endpoint"
+    )
+    report["root_y_policy"] = (
+        "one event-wide FK floor offset; internal posture height is preserved"
+    )
     return out.astype(np.float32), report
 
 
@@ -125,8 +152,69 @@ def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: i
         return np.zeros((0, 151), dtype=np.float32)
     if not env_bool("V46_52_RIEMANNIAN_BRIDGE_ENABLE", True):
         return base._V46_52_ORIG_BUILD_BRIDGE(v46, prev, core, trans_len, cfg)
-    bridge = geodesic_c2_bridge_np(prev, core, trans_len, fps=float(getattr(cfg, "fps", 30.0)))
-    return base.enforce_contract(v46, bridge, cfg, source_hint="v46_52_c2_so3_bridge")
+    fps = float(getattr(cfg, "fps", 30.0))
+    bridge = make_so3_transition(
+        prev,
+        core,
+        trans_len,
+        fps=fps,
+        angular_speed_cap_radps=env_float(
+            "V46_54_TRANSITION_ANGULAR_SPEED_CAP_RADPS",
+            8.0,
+        ),
+        root_horizontal_speed_cap_mps=env_float(
+            "V46_54_TRANSITION_ROOT_XZ_SPEED_CAP_MPS",
+            1.5,
+        ),
+        root_vertical_speed_cap_mps=env_float(
+            "V46_54_TRANSITION_ROOT_Y_SPEED_CAP_MPS",
+            0.9,
+        ),
+    )
+    # Project rotations/contact once before the transition-specific physical
+    # post-processing.  Calling the generic contract afterwards would derive
+    # binary contacts again and silently destroy the endpoint contact ramps.
+    bridge = base.enforce_contract(
+        v46,
+        bridge,
+        cfg,
+        source_hint="v46_52_c2_so3_bridge_pre_physics",
+    )
+    bridge, floor_report = project_transition_floor_np(
+        bridge,
+        target_floor_y=env_float("V46_54_STAGE_FLOOR_Y", 0.0),
+        clearance_m=env_float(
+            "V46_54_TRANSITION_FLOOR_CLEARANCE_M",
+            0.002,
+        ),
+        smoothing_frames=max(
+            1,
+            int(
+                round(
+                    env_float(
+                        "V46_54_TRANSITION_FLOOR_SMOOTH_SECONDS",
+                        5.0 / 30.0,
+                    )
+                    * fps
+                )
+            ),
+        ),
+    )
+    bridge, contact_report = recompute_transition_contacts_np(
+        bridge,
+        fps=fps,
+        floor_y=env_float("V46_54_STAGE_FLOOR_Y", 0.0),
+        left_contact=prev[-1, :4],
+        right_contact=core[0, :4],
+        ramp_seconds=env_float(
+            "V46_54_TRANSITION_CONTACT_RAMP_SECONDS",
+            4.0 / 30.0,
+        ),
+    )
+    # Reports are attached to the candidate risk by the subsequent physical
+    # audit; keep the bridge itself free of side-channel mutable state.
+    _ = floor_report, contact_report
+    return np.asarray(bridge, dtype=np.float32)
 
 
 def _transition_risk_v52(v46: Any, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, Any]:
@@ -139,6 +227,8 @@ def _transition_risk_v52(v46: Any, previous: np.ndarray, transition: np.ndarray,
         "anatomy_hard_reject": bool(anatomy["anatomy_hard_reject"]),
         "pelvis_height_gap_norm": float(anatomy["pelvis_height_gap_norm"]),
         "body_height_gap_norm": float(anatomy["body_height_gap_norm"]),
+        "floor_offset_gap_m": float(anatomy["floor_offset_gap_m"]),
+        "root_velocity_gap_mps": float(anatomy["root_velocity_gap_mps"]),
         "posture_gap": int(anatomy["posture_gap"]),
         "posture_exit": anatomy["posture_exit"],
         "posture_entry": anatomy["posture_entry"],
@@ -164,6 +254,10 @@ def _risk_safe_v52(risk: Dict[str, Any]) -> bool:
         and not bool(risk.get("anatomy_hard_reject", False))
         and float(risk.get("pelvis_height_gap_norm", 0.0))
         <= env_float("V46_52_PELVIS_GAP_SAFE", 0.22)
+        and float(risk.get("floor_offset_gap_m", 0.0))
+        <= env_float("V46_52_FLOOR_GAP_SAFE_M", 0.15)
+        and float(risk.get("root_velocity_gap_mps", 0.0))
+        <= env_float("V46_52_ROOT_VELOCITY_GAP_SAFE_MPS", 1.25)
     )
 
 

@@ -635,11 +635,27 @@ def transition_anatomy_risk(
     pelvis_gap = abs(float(pfeat["pelvis_height_exit_norm"]) - float(ffeat["pelvis_height_entry_norm"]))
     body_gap = abs(float(pfeat["body_height_exit_norm"]) - float(ffeat["body_height_entry_norm"]))
     floor_gap = abs(float(pfeat["exit_floor_offset_m"]) - float(ffeat["entry_floor_offset_m"]))
+    p_root = p[-context_n:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+    f_root = f[:context_n, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+    p_velocity = (
+        np.median(np.diff(p_root, axis=0) * float(fps), axis=0)
+        if len(p_root) > 1
+        else np.zeros(3, dtype=np.float32)
+    )
+    f_velocity = (
+        np.median(np.diff(f_root, axis=0) * float(fps), axis=0)
+        if len(f_root) > 1
+        else np.zeros(3, dtype=np.float32)
+    )
+    root_velocity_gap = float(np.linalg.norm(p_velocity - f_velocity))
     transition_seconds = len(b) / max(float(fps), 1e-8)
     required = 0.20 + 0.30 * posture_gap + 0.90 * max(0.0, pelvis_gap - 0.08)
     hard = (
         not bool(ffeat["anatomy_hard_valid"])
         or pelvis_gap > env_float("V46_52_PELVIS_GAP_HARD", 0.34)
+        or floor_gap > env_float("V46_52_FLOOR_GAP_HARD_M", 0.20)
+        or root_velocity_gap
+        > env_float("V46_52_ROOT_VELOCITY_GAP_HARD_MPS", 2.0)
         or (posture_gap >= 3 and transition_seconds + 1e-6 < required)
     )
     score = (
@@ -647,6 +663,8 @@ def transition_anatomy_risk(
         + env_float("V46_52_RISK_BODY_W", 1.0) * body_gap
         + env_float("V46_52_RISK_POSTURE_W", 0.45) * posture_gap
         + env_float("V46_52_RISK_FLOOR_W", 4.0) * floor_gap
+        + env_float("V46_52_RISK_ROOT_VELOCITY_W", 0.35)
+        * root_velocity_gap
         + env_float("V46_52_RISK_ANATOMY_W", 2.0) * (1.0 - float(m["anatomy_quality"]))
     )
     return {
@@ -658,6 +676,7 @@ def transition_anatomy_risk(
         "pelvis_height_gap_norm": float(pelvis_gap),
         "body_height_gap_norm": float(body_gap),
         "floor_offset_gap_m": float(floor_gap),
+        "root_velocity_gap_mps": float(root_velocity_gap),
         "required_transition_seconds": float(required),
         "available_transition_seconds": float(transition_seconds),
         "anatomy_risk_score": float(score),

@@ -35,7 +35,11 @@ from support.motion_geometry import (
     ROOT_X,
     ROOT_Z,
     ROT,
-    project_motion_rotations_np,
+)
+from motion_geometry.rotations import (
+    ROT6D_LAYOUT_COLUMN,
+    ROT6D_LAYOUT_PYTORCH3D_ROW,
+    convert_motion_rot6d_layout_np,
 )
 from support.contact_inr import (
     V32ContactINRSystem,
@@ -137,7 +141,7 @@ def _geodesic_blend(
     if value <= 0.0:
         return a.copy()
     if value >= 1.0:
-        return project_motion_rotations_np(b)
+        return _project_native_motion_np(b)
     with torch.no_grad():
         ra = rotation_6d_to_matrix(
             torch.from_numpy(a[:, ROT]).reshape(
@@ -168,9 +172,53 @@ def _geodesic_blend(
         + value * b[:, ROOT]
     )
     out[:, ROT] = rot6d
-    out[:, ROOT_X] = 0.0
-    out[:, ROOT_Z] = 0.0
-    return project_motion_rotations_np(out)
+    # Root XZ is a physical trajectory, not a local pose channel.  The
+    # scheduler supplies a velocity-aware canonical bridge and restores it
+    # after this optional learned proposal.  Keeping the blended trajectory
+    # here is still important because candidate risk is evaluated before that
+    # restoration; zeroing XZ would make that audit measure a different path.
+    return _project_native_motion_np(out)
+
+
+def _project_native_motion_np(motion: np.ndarray) -> np.ndarray:
+    """Project the checkpoint-native PyTorch3D-row Rot6D representation."""
+
+    x = np.asarray(motion, dtype=np.float32)
+    with torch.no_grad():
+        rotations = torch.from_numpy(x[:, ROT]).reshape(
+            len(x),
+            NUM_JOINTS,
+            6,
+        )
+        matrices = rotation_6d_to_matrix(rotations)
+        rot6d = matrix_to_rotation_6d(matrices).reshape(len(x), -1)
+    out = x.copy()
+    out[:, ROT] = rot6d.cpu().numpy().astype(np.float32)
+    return out
+
+
+def _native_transition_risk(
+    previous: np.ndarray,
+    transition: np.ndarray,
+    following: np.ndarray,
+    *,
+    fps: float,
+) -> Dict[str, float]:
+    """Audit row-native model values under the canonical geometry contract."""
+
+    def canonical(value: np.ndarray) -> np.ndarray:
+        return convert_motion_rot6d_layout_np(
+            value,
+            ROT6D_LAYOUT_PYTORCH3D_ROW,
+            ROT6D_LAYOUT_COLUMN,
+        )
+
+    return transition_risk(
+        canonical(previous),
+        canonical(transition),
+        canonical(following),
+        fps=fps,
+    )
 
 
 def _seed(
@@ -334,7 +382,7 @@ def sample_transition_diffusion(
         device=device,
     ).reshape(1, k, 1)
 
-    baseline_risk = transition_risk(
+    baseline_risk = _native_transition_risk(
         previous, baseline, following, fps=fps
     )
     baseline_absolute_safe, baseline_gate = accept_candidate(
@@ -408,7 +456,7 @@ def sample_transition_diffusion(
         candidate = _geodesic_blend(
             baseline, generated, trust
         )
-        risk = transition_risk(
+        risk = _native_transition_risk(
             previous, candidate, following, fps=fps
         )
         safe, gate = accept_candidate(
@@ -521,7 +569,7 @@ def sample_transition_diffusion(
             blended_candidate = _geodesic_blend(
                 baseline, generated, trust
             )
-            blended_risk = transition_risk(
+            blended_risk = _native_transition_risk(
                 previous, blended_candidate, following, fps=fps
             )
             blended_safe, blended_gate = accept_candidate(

@@ -27,6 +27,29 @@ REQUIRED_EVENT_ARRAYS = (
     "exit_vel",
     "length",
 )
+OPTIONAL_ENDPOINT_GEOMETRY_ARRAYS = (
+    "event_floor_y_m",
+    "entry_floor_relative_m",
+    "exit_floor_relative_m",
+    "entry_root_height_m",
+    "exit_root_height_m",
+)
+PHYSICAL_ENDPOINT_ARRAYS = (
+    "entry_angular_velocity_radps",
+    "exit_angular_velocity_radps",
+    "entry_root_velocity_mps",
+    "exit_root_velocity_mps",
+)
+MOTION_DIM = 151
+NUM_JOINTS = 24
+VALID_POSTURES = {
+    "floor_pose",
+    "kneeling",
+    "deep_squat",
+    "half_squat",
+    "standing",
+    "aerial",
+}
 
 
 def event_motion_reference(item: Dict[str, Any]) -> str:
@@ -47,8 +70,8 @@ def resolve_event_motion_path(
 
     Project-local paths such as ``assets/events/...`` are rooted at the project
     package.  Optional index metadata roots are also supported for portable
-    external asset stores.  The current directory is retained only as the last
-    backwards-compatible fallback.
+    external asset stores.  Resolution never depends on the process working
+    directory, preventing an old EDGE checkout from shadowing project assets.
     """
 
     raw_value = (
@@ -76,9 +99,6 @@ def resolve_event_motion_path(
             if not declared_root.is_absolute():
                 declared_root = index.parent / declared_root
             candidates.append(declared_root / raw)
-
-        # Compatibility only; correctness does not depend on this candidate.
-        candidates.append(Path.cwd() / raw)
 
     checked: List[str] = []
     seen = set()
@@ -129,9 +149,133 @@ def load_shared_index(
     if missing:
         raise RuntimeError(f"Scheduler index is missing arrays {missing}: {arrays_path}")
     for name in REQUIRED_EVENT_ARRAYS:
-        if len(arrays[name]) != count:
+        values = np.asarray(arrays[name])
+        if len(values) != count:
             raise RuntimeError(
                 f"Index mismatch: {name} has {len(arrays[name])}, metadata has {count}"
+            )
+        if not np.issubdtype(values.dtype, np.number) or not np.isfinite(
+            values
+        ).all():
+            raise RuntimeError(
+                f"Scheduler index array {name} must be finite numeric data: "
+                f"dtype={values.dtype}, shape={values.shape}"
+            )
+    expected_motion_shapes = {
+        "entry_pose": (count, MOTION_DIM),
+        "exit_pose": (count, MOTION_DIM),
+        # Retained only for checkpoint compatibility; routing uses the
+        # intrinsic physical endpoint arrays below.
+        "entry_vel": (count, MOTION_DIM),
+        "exit_vel": (count, MOTION_DIM),
+    }
+    for name, expected in expected_motion_shapes.items():
+        if tuple(np.asarray(arrays[name]).shape) != expected:
+            raise RuntimeError(
+                f"Scheduler index {name} must have shape {expected}, "
+                f"got {np.asarray(arrays[name]).shape}: {arrays_path}"
+            )
+    for name in ("motion_desc", "mmr_embed"):
+        values = np.asarray(arrays[name])
+        if values.ndim != 2 or values.shape[1] < 1:
+            raise RuntimeError(
+                f"Scheduler index {name} must be a non-empty feature matrix, "
+                f"got {values.shape}: {arrays_path}"
+            )
+    lengths = np.asarray(arrays["length"])
+    if lengths.shape != (count,) or np.any(lengths <= 0):
+        raise RuntimeError(
+            "Scheduler event lengths must be a positive vector with one value "
+            f"per event, got {lengths.shape}: {arrays_path}"
+        )
+    present_endpoint_geometry = [
+        name for name in OPTIONAL_ENDPOINT_GEOMETRY_ARRAYS if name in arrays.files
+    ]
+    schema = str(metadata.get("schema", "")).strip()
+    if schema == "generation_aligned_scheduler_index_v4_physical_endpoints":
+        raise RuntimeError(
+            "Scheduler index schema v4 lacks discrete posture endpoints. "
+            "Rebuild the Generation-aligned Scheduler Index with the current "
+            f"code to obtain schema v5: {metadata_path}"
+        )
+    if schema == "generation_aligned_scheduler_index_v5_product_state_endpoints":
+        invalid_postures = []
+        for position, item in enumerate(items):
+            for key in ("posture_entry", "posture_exit"):
+                value = str(item.get(key, "unknown"))
+                if value not in VALID_POSTURES:
+                    invalid_postures.append(
+                        {
+                            "event": position,
+                            "field": key,
+                            "value": value,
+                        }
+                    )
+        if invalid_postures:
+            raise RuntimeError(
+                "Scheduler index schema v4 requires explicit valid posture "
+                f"endpoints; examples={invalid_postures[:8]}: {metadata_path}"
+            )
+    if schema in {
+        "generation_aligned_scheduler_index_v3_endpoint_geometry",
+        "generation_aligned_scheduler_index_v4_physical_endpoints",
+        "generation_aligned_scheduler_index_v5_product_state_endpoints",
+    } and not present_endpoint_geometry:
+        raise RuntimeError(
+            "Scheduler index schema requires endpoint geometry arrays: "
+            f"{arrays_path}"
+        )
+    if present_endpoint_geometry and len(present_endpoint_geometry) != len(
+        OPTIONAL_ENDPOINT_GEOMETRY_ARRAYS
+    ):
+        missing_endpoint_geometry = sorted(
+            set(OPTIONAL_ENDPOINT_GEOMETRY_ARRAYS)
+            - set(present_endpoint_geometry)
+        )
+        raise RuntimeError(
+            "Scheduler endpoint geometry contract must be complete; "
+            f"missing={missing_endpoint_geometry}: {arrays_path}"
+        )
+    for name in present_endpoint_geometry:
+        values = np.asarray(arrays[name])
+        if values.shape != (count,) or not np.isfinite(values).all():
+            raise RuntimeError(
+                f"Invalid endpoint geometry array {name}: "
+                f"shape={values.shape}, events={count}"
+            )
+    present_physical_endpoints = [
+        name for name in PHYSICAL_ENDPOINT_ARRAYS if name in arrays.files
+    ]
+    if schema in {
+        "generation_aligned_scheduler_index_v4_physical_endpoints",
+        "generation_aligned_scheduler_index_v5_product_state_endpoints",
+    }:
+        missing_physical_endpoints = sorted(
+            set(PHYSICAL_ENDPOINT_ARRAYS) - set(present_physical_endpoints)
+        )
+        if missing_physical_endpoints:
+            raise RuntimeError(
+                "Scheduler index schema v4 requires physical endpoint arrays; "
+                f"missing={missing_physical_endpoints}: {arrays_path}"
+            )
+    if present_physical_endpoints and len(present_physical_endpoints) != len(
+        PHYSICAL_ENDPOINT_ARRAYS
+    ):
+        raise RuntimeError(
+            "Scheduler physical endpoint contract must be complete; "
+            f"present={sorted(present_physical_endpoints)}: {arrays_path}"
+        )
+    for name in present_physical_endpoints:
+        values = np.asarray(arrays[name])
+        expected = (
+            (count, NUM_JOINTS, 3)
+            if "angular_velocity" in name
+            else (count, 3)
+        )
+        if values.shape != expected or not np.isfinite(values).all():
+            raise RuntimeError(
+                f"Invalid physical endpoint array {name}: "
+                f"shape={values.shape}, expected={expected}"
             )
     event_uids = [event_uid_from_item(item, position=i) for i, item in enumerate(items)]
     if len(set(event_uids)) != count:

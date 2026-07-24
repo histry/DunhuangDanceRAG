@@ -72,6 +72,10 @@ def diversity_assessment(
         hard_reasons.append("event_uid_cooldown")
     if source_run_after > max_source_run:
         hard_reasons.append("source_run")
+    if share_active and source_share > max_source_share + 1.0e-9:
+        hard_reasons.append("source_share")
+    if share_active and family_share > max_family_share + 1.0e-9:
+        hard_reasons.append("family_share")
 
     penalty = 0.0
     if share_active:

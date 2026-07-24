@@ -45,6 +45,25 @@ class RoutingDiversityTests(unittest.TestCase):
         self.assertEqual(selected.event_id, 2)
         self.assertEqual(decision, "reselected_heading_physics_diverse")
 
+    def test_global_source_and_family_shares_are_hard_after_warmup(self):
+        with patch.dict(
+            os.environ,
+            {
+                "V46_54_MIN_SHARE_HISTORY": "3",
+                "V46_54_MAX_SOURCE_SHARE": "0.40",
+                "V46_54_MAX_FAMILY_SHARE": "0.50",
+                "V46_54_EVENT_COOLDOWN_SLOTS": "1",
+                "V46_54_MAX_SOURCE_RUN": "3",
+            },
+            clear=False,
+        ):
+            source = diversity_assessment(self.db, 1, [0, 2, 3])
+            family = diversity_assessment(self.db, 2, [1, 2, 3])
+        self.assertFalse(source["hard_valid"])
+        self.assertIn("source_share", source["hard_reasons"])
+        self.assertFalse(family["hard_valid"])
+        self.assertIn("family_share", family["hard_reasons"])
+
     def test_cooldown_is_not_silently_relaxed_when_pool_is_exhausted(self):
         rows = [
             (SimpleNamespace(event_id=0, safe=True, risk_score=0.01), {"heading_detail": {}}),

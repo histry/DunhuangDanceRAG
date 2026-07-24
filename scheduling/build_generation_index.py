@@ -32,6 +32,7 @@ from support.common import (
     motion_mmr_embedding,
     robust_scale,
 )
+from support.motion_geometry import event_endpoint_geometry_np
 from support.event_identity import (
     event_uids_from_generation_db,
     make_event_db_contract,
@@ -71,7 +72,7 @@ def resolve_generation_motion(raw_value: Any, db_path: Path) -> Path:
     """Resolve legacy Linux paths after a project is moved to another host."""
     text = str(raw_value).strip().replace("\\", "/")
     raw = Path(text)
-    candidates = [raw]
+    candidates = [raw] if raw.is_absolute() else []
     marker = "/DunhuangDanceRAG/"
     if marker in text:
         candidates.append(PROJECT_ROOT / text.split(marker, 1)[1])
@@ -143,6 +144,9 @@ def build_generation_index(
     families = _array(db, "event_families", count, "unknown")
     dance_keys = _array(db, "dance_keys", count, "unknown")
     performers = _array(db, "performer_groups", count, "unknown")
+    posture_entry = _array(db, "posture_entry", count, "unknown")
+    posture_exit = _array(db, "posture_exit", count, "unknown")
+    posture_mode = _array(db, "posture_mode", count, "unknown")
     semantics = _array(db, "aesd_event_semantics", count, "neutral_flow")
     quality = _array(db, "v46_53_combined_quality", count, 0.5).astype(np.float32)
     anatomy_quality = _array(db, "anatomy_quality", count, 0.5).astype(np.float32)
@@ -196,6 +200,13 @@ def build_generation_index(
     exit_vel: list[np.ndarray] = []
     entry_angular_velocity: list[np.ndarray] = []
     exit_angular_velocity: list[np.ndarray] = []
+    entry_root_velocity: list[np.ndarray] = []
+    exit_root_velocity: list[np.ndarray] = []
+    event_floor_y: list[float] = []
+    entry_floor_relative: list[float] = []
+    exit_floor_relative: list[float] = []
+    entry_root_height: list[float] = []
+    exit_root_height: list[float] = []
     resolved_motions: list[Path] = []
     items: list[dict[str, Any]] = []
 
@@ -209,12 +220,16 @@ def build_generation_index(
                 f"Generation event {index} frame mismatch: DB={frames[index]}, file={len(motion)}"
             )
         fps = float(canonical_fps[index])
+        edge_frames = max(2, int(round(5.0 * fps / 30.0)))
         raw_descriptors.append(motion_descriptor_raw(motion, fps=fps))
         embeddings.append(motion_mmr_embedding(motion, out_dim=64, fps=fps))
         entry_pose.append(motion[0].astype(np.float32))
         exit_pose.append(motion[-1].astype(np.float32))
-        first = np.diff(motion[: min(5, len(motion))], axis=0)
-        last = np.diff(motion[max(0, len(motion) - 5) :], axis=0)
+        first = np.diff(motion[: min(edge_frames, len(motion))], axis=0)
+        last = np.diff(
+            motion[max(0, len(motion) - edge_frames) :],
+            axis=0,
+        )
         entry_vel.append(((first.mean(axis=0) * fps) if len(first) else np.zeros(151)).astype(np.float32))
         exit_vel.append(((last.mean(axis=0) * fps) if len(last) else np.zeros(151)).astype(np.float32))
         rotation_matrices = rot6d_to_matrix_np(
@@ -222,11 +237,51 @@ def build_generation_index(
         )
         omega = angular_velocity_np(rotation_matrices, fps=fps)
         entry_angular_velocity.append(
-            (omega[: min(4, len(omega))].mean(axis=0) if len(omega) else np.zeros((24, 3))).astype(np.float32)
+            (
+                omega[: max(1, edge_frames - 1)].mean(axis=0)
+                if len(omega)
+                else np.zeros((24, 3))
+            ).astype(np.float32)
         )
         exit_angular_velocity.append(
-            (omega[max(0, len(omega) - 4):].mean(axis=0) if len(omega) else np.zeros((24, 3))).astype(np.float32)
+            (
+                omega[max(0, len(omega) - max(1, edge_frames - 1)) :].mean(
+                    axis=0
+                )
+                if len(omega)
+                else np.zeros((24, 3))
+            ).astype(np.float32)
         )
+        root_velocity = np.diff(motion[:, 4:7], axis=0) * fps
+        entry_root_velocity.append(
+            (
+                root_velocity[: max(1, edge_frames - 1)].mean(axis=0)
+                if len(root_velocity)
+                else np.zeros((3,))
+            ).astype(np.float32)
+        )
+        exit_root_velocity.append(
+            (
+                root_velocity[
+                    max(0, len(root_velocity) - max(1, edge_frames - 1)) :
+                ].mean(axis=0)
+                if len(root_velocity)
+                else np.zeros((3,))
+            ).astype(np.float32)
+        )
+        endpoint_geometry = event_endpoint_geometry_np(
+            motion,
+            window_frames=edge_frames,
+        )
+        event_floor_y.append(float(endpoint_geometry["floor_y_m"]))
+        entry_floor_relative.append(
+            float(endpoint_geometry["entry_floor_relative_m"])
+        )
+        exit_floor_relative.append(
+            float(endpoint_geometry["exit_floor_relative_m"])
+        )
+        entry_root_height.append(float(endpoint_geometry["entry_root_height_m"]))
+        exit_root_height.append(float(endpoint_geometry["exit_root_height_m"]))
         resolved_motions.append(path)
         uid = str(event_uids[index])
         items.append(
@@ -248,6 +303,9 @@ def build_generation_index(
                 "dance_key": str(dance_keys[index]),
                 "performer_group": str(performers[index]),
                 "event_type": _semantic_event_type(semantics[index]),
+                "posture_entry": str(posture_entry[index]),
+                "posture_exit": str(posture_exit[index]),
+                "posture_mode": str(posture_mode[index]),
             }
         )
 
@@ -264,12 +322,23 @@ def build_generation_index(
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_npz.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "schema": "generation_aligned_scheduler_index_v2_multirate",
+        "schema": "generation_aligned_scheduler_index_v5_product_state_endpoints",
         "rot6d_layout": CANONICAL_ROT6D_LAYOUT,
         "skeleton_contract": skeleton_contract(),
         "canonical_fps_values": fps_values,
         "natural_duration_units": "frames_at_canonical_fps",
-        "velocity_units": {"entry_vel": "channel_units/s", "angular_velocity": "rad/s"},
+        "velocity_units": {
+            "entry_vel": "legacy_mixed_channel_units/s_not_for_routing",
+            "angular_velocity": "rad/s",
+            "root_velocity": "m/s",
+        },
+        "endpoint_geometry_units": {
+            "event_floor_y_m": "m",
+            "entry_floor_relative_m": "m_above_event_floor",
+            "exit_floor_relative_m": "m_above_event_floor",
+            "entry_root_height_m": "m_above_event_floor",
+            "exit_root_height_m": "m_above_event_floor",
+        },
         "generation_db": str(db_path),
         "event_db_contract": contract,
         "items": items,
@@ -289,6 +358,15 @@ def build_generation_index(
         exit_vel=np.stack(exit_vel).astype(np.float32),
         entry_angular_velocity_radps=np.stack(entry_angular_velocity).astype(np.float32),
         exit_angular_velocity_radps=np.stack(exit_angular_velocity).astype(np.float32),
+        entry_root_velocity_mps=np.stack(entry_root_velocity).astype(np.float32),
+        exit_root_velocity_mps=np.stack(exit_root_velocity).astype(np.float32),
+        event_floor_y_m=np.asarray(event_floor_y, dtype=np.float32),
+        entry_floor_relative_m=np.asarray(
+            entry_floor_relative, dtype=np.float32
+        ),
+        exit_floor_relative_m=np.asarray(exit_floor_relative, dtype=np.float32),
+        entry_root_height_m=np.asarray(entry_root_height, dtype=np.float32),
+        exit_root_height_m=np.asarray(exit_root_height, dtype=np.float32),
         canonical_fps=canonical_fps.astype(np.float32),
         source_start_seconds=source_start_seconds.astype(np.float64),
         source_end_seconds=source_end_seconds.astype(np.float64),

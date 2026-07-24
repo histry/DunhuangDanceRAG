@@ -223,15 +223,13 @@ def _build_heading_proposal(
 
     piece = np.concatenate([bridge, core], axis=0).astype(np.float32)
     if piece.shape[0] != int(target_len):
-        piece = base.resample_motion(v46, piece, int(target_len))
-        piece = base.enforce_contract(
-            v46,
-            piece,
-            cfg,
-            source_hint=f"v46_50_slot_exact_len:{event_id}",
+        raise RuntimeError(
+            "Closed-loop slot frame contract mismatch: "
+            f"event_id={event_id}, bridge={len(bridge)}, core={len(core)}, "
+            f"assembled={len(piece)}, target={int(target_len)}. "
+            "Do not resample a floor/contact-audited composite; repair the "
+            "upstream transition budget instead."
         )
-        length_info["slot_exact_repair_applied"] = True
-        length_info["slot_exact_frames_after"] = int(piece.shape[0])
 
     physical_risk = float(base.risk_score(risk))
     combined = (

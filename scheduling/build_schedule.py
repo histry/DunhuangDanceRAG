@@ -104,6 +104,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--graph_edge_weight", type=float, default=0.45)
     ap.add_argument("--graph_hard_prune", action="store_true")
     ap.add_argument("--graph_hard_prune_threshold", type=float, default=1.35)
+    ap.add_argument("--physical_edge_weight", type=float, default=0.55)
+    ap.add_argument(
+        "--physical_edge_hard_prune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--physical_edge_reset_accent", type=float, default=0.82)
+    ap.add_argument("--root_height_gap_reference_m", type=float, default=0.18)
+    ap.add_argument("--root_height_gap_hard_m", type=float, default=0.55)
+    ap.add_argument("--posture_state_gap_hard", type=int, default=2)
+    ap.add_argument("--floor_gap_reference_m", type=float, default=0.08)
+    ap.add_argument("--floor_gap_hard_m", type=float, default=0.20)
+    ap.add_argument("--root_velocity_jump_reference_mps", type=float, default=0.80)
+    ap.add_argument("--root_velocity_jump_hard_mps", type=float, default=2.0)
+    ap.add_argument("--contact_gap_hard", type=float, default=0.75)
 
     ap.add_argument("--deep_music_features", action="store_true")
     ap.add_argument("--deep_music_model", default="clap")
@@ -115,6 +130,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--transition_diffusion", action="store_true")
     ap.add_argument("--transition_diffusion_blend", type=float, default=0.18)
     ap.add_argument("--transition_diffusion_steps", type=int, default=32)
+    ap.add_argument("--stage_floor_y", type=float, default=0.0)
+    ap.add_argument("--event_floor_quantile", type=float, default=5.0)
+    ap.add_argument("--event_max_floor_penetration_m", type=float, default=0.005)
+    ap.add_argument("--transition_angular_speed_cap_radps", type=float, default=8.0)
+    ap.add_argument(
+        "--transition_root_horizontal_speed_cap_mps", type=float, default=1.5
+    )
+    ap.add_argument(
+        "--transition_root_vertical_speed_cap_mps", type=float, default=0.9
+    )
+    ap.add_argument("--transition_root_tangent_margin_m", type=float, default=0.12)
+    ap.add_argument("--transition_floor_clearance_m", type=float, default=0.002)
+    ap.add_argument("--transition_floor_smoothing_frames", type=int, default=5)
+    ap.add_argument("--transition_floor_smoothing_seconds", type=float, default=None)
+    ap.add_argument(
+        "--transition_contact_ramp_seconds", type=float, default=4.0 / 30.0
+    )
 
     ap.add_argument("--overwrite_run_dir", action="store_true")
     ap.add_argument("--hash_assets", action="store_true")
@@ -264,6 +296,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bool_text(args.graph_hard_prune),
         "--graph_hard_prune_threshold",
         str(args.graph_hard_prune_threshold),
+        "--physical_edge_weight",
+        str(args.physical_edge_weight),
+        "--physical_edge_hard_prune",
+        bool_text(args.physical_edge_hard_prune),
+        "--physical_edge_reset_accent",
+        str(args.physical_edge_reset_accent),
+        "--root_height_gap_reference_m",
+        str(args.root_height_gap_reference_m),
+        "--root_height_gap_hard_m",
+        str(args.root_height_gap_hard_m),
+        "--posture_state_gap_hard",
+        str(args.posture_state_gap_hard),
+        "--floor_gap_reference_m",
+        str(args.floor_gap_reference_m),
+        "--floor_gap_hard_m",
+        str(args.floor_gap_hard_m),
+        "--root_velocity_jump_reference_mps",
+        str(args.root_velocity_jump_reference_mps),
+        "--root_velocity_jump_hard_mps",
+        str(args.root_velocity_jump_hard_mps),
+        "--contact_gap_hard",
+        str(args.contact_gap_hard),
         "--deep_music_features",
         bool_text(args.deep_music_features),
         "--deep_music_model",
@@ -280,6 +334,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(args.transition_diffusion_blend),
         "--transition_diffusion_steps",
         str(args.transition_diffusion_steps),
+        "--stage_floor_y",
+        str(args.stage_floor_y),
+        "--event_floor_quantile",
+        str(args.event_floor_quantile),
+        "--event_max_floor_penetration_m",
+        str(args.event_max_floor_penetration_m),
+        "--transition_angular_speed_cap_radps",
+        str(args.transition_angular_speed_cap_radps),
+        "--transition_root_horizontal_speed_cap_mps",
+        str(args.transition_root_horizontal_speed_cap_mps),
+        "--transition_root_vertical_speed_cap_mps",
+        str(args.transition_root_vertical_speed_cap_mps),
+        "--transition_root_tangent_margin_m",
+        str(args.transition_root_tangent_margin_m),
+        "--transition_floor_clearance_m",
+        str(args.transition_floor_clearance_m),
+        "--transition_floor_smoothing_frames",
+        str(
+            max(
+                1,
+                int(round(args.transition_floor_smoothing_seconds * args.fps)),
+            )
+            if args.transition_floor_smoothing_seconds is not None
+            else args.transition_floor_smoothing_frames
+        ),
+        "--transition_contact_ramp_seconds",
+        str(args.transition_contact_ramp_seconds),
     ]
     if hierarchy is not None:
         scheduler_cmd += ["--hierarchy_index_npz", str(hierarchy)]

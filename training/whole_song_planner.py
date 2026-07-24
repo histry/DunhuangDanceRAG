@@ -32,7 +32,8 @@ from support.common import (
     EVENT_TO_ID,
     event_compatibility,
     family_id,
-    transition_cost_from_arrays,
+    intrinsic_transition_cost_from_arrays,
+    posture_state_distance,
 )
 from training.music_corpus import audio_sha256, discover_training_audio
 from support.scheduler_checkpoint_contracts import (
@@ -66,10 +67,14 @@ def _select_event_path(
     quality: np.ndarray,
     entry_pose: np.ndarray,
     exit_pose: np.ndarray,
-    entry_velocity: np.ndarray,
-    exit_velocity: np.ndarray,
     entry_angular_velocity: np.ndarray,
     exit_angular_velocity: np.ndarray,
+    entry_floor_relative: np.ndarray,
+    exit_floor_relative: np.ndarray,
+    entry_root_height: np.ndarray,
+    exit_root_height: np.ndarray,
+    entry_root_velocity: np.ndarray,
+    exit_root_velocity: np.ndarray,
     fps: float,
     cooldown_slots: int,
     candidate_pool: int,
@@ -113,11 +118,9 @@ def _select_event_path(
             previous = selected[-1]
             boundary_cost = np.asarray(
                 [
-                    transition_cost_from_arrays(
+                    intrinsic_transition_cost_from_arrays(
                         exit_pose[previous],
-                        exit_velocity[previous],
                         entry_pose[int(candidate)],
-                        entry_velocity[int(candidate)],
                     )
                     for candidate in shortlist
                 ],
@@ -128,11 +131,62 @@ def _select_event_path(
                 - entry_angular_velocity[shortlist],
                 axis=-1,
             ).mean(axis=-1)
+            floor_cost = np.abs(
+                float(exit_floor_relative[previous])
+                - entry_floor_relative[shortlist]
+            )
+            posture_cost = np.abs(
+                float(exit_root_height[previous])
+                - entry_root_height[shortlist]
+            )
+            posture_state_cost = np.asarray(
+                [
+                    posture_state_distance(
+                        str(items[previous].get("posture_exit", "unknown")),
+                        str(items[int(candidate)].get(
+                            "posture_entry",
+                            "unknown",
+                        )),
+                    )
+                    for candidate in shortlist
+                ],
+                dtype=np.float32,
+            )
+            root_velocity_cost = np.linalg.norm(
+                exit_root_velocity[previous][None]
+                - entry_root_velocity[shortlist],
+                axis=-1,
+            )
+            contact_cost = np.mean(
+                np.abs(
+                    exit_pose[previous, :4][None]
+                    - entry_pose[shortlist, :4]
+                ),
+                axis=-1,
+            )
             # Match the formal runtime's preference for intrinsically smooth
             # boundaries without allowing a single noisy endpoint to dominate
             # the weak semantic label.
             shortlist_score -= 0.35 * np.minimum(boundary_cost, 3.0)
             shortlist_score -= 0.15 * np.minimum(angular_cost / 4.0, 2.0)
+            shortlist_score -= 0.18 * np.minimum(floor_cost / 0.08, 2.0)
+            shortlist_score -= 0.26 * np.minimum(posture_cost / 0.18, 2.0)
+            shortlist_score -= 0.20 * np.minimum(
+                posture_state_cost / 2.0,
+                2.0,
+            )
+            shortlist_score -= 0.18 * np.minimum(contact_cost, 1.0)
+            shortlist_score -= 0.18 * np.minimum(
+                root_velocity_cost / 0.80, 2.0
+            )
+            hard = (
+                (posture_cost > 0.55)
+                | (posture_state_cost > 2.0)
+                | (floor_cost > 0.20)
+                | (root_velocity_cost > 2.0)
+                | (contact_cost > 0.75)
+            )
+            shortlist_score[hard] = -1.0e6
         chosen = int(shortlist[int(np.argmax(shortlist_score))])
         selected.append(chosen)
         source_counts[sources[chosen]] += 1
@@ -157,13 +211,29 @@ def build_dataset(args: argparse.Namespace) -> int:
         )
         entry_pose = np.asarray(arrays["entry_pose"], dtype=np.float32)
         exit_pose = np.asarray(arrays["exit_pose"], dtype=np.float32)
-        entry_velocity = np.asarray(arrays["entry_vel"], dtype=np.float32)
-        exit_velocity = np.asarray(arrays["exit_vel"], dtype=np.float32)
         entry_angular_velocity = np.asarray(
             arrays["entry_angular_velocity_radps"], dtype=np.float32
         )
         exit_angular_velocity = np.asarray(
             arrays["exit_angular_velocity_radps"], dtype=np.float32
+        )
+        entry_floor_relative = np.asarray(
+            arrays["entry_floor_relative_m"], dtype=np.float32
+        )
+        exit_floor_relative = np.asarray(
+            arrays["exit_floor_relative_m"], dtype=np.float32
+        )
+        entry_root_height = np.asarray(
+            arrays["entry_root_height_m"], dtype=np.float32
+        )
+        exit_root_height = np.asarray(
+            arrays["exit_root_height_m"], dtype=np.float32
+        )
+        entry_root_velocity = np.asarray(
+            arrays["entry_root_velocity_mps"], dtype=np.float32
+        )
+        exit_root_velocity = np.asarray(
+            arrays["exit_root_velocity_mps"], dtype=np.float32
         )
     finally:
         arrays.close()
@@ -252,10 +322,14 @@ def build_dataset(args: argparse.Namespace) -> int:
             quality=quality,
             entry_pose=entry_pose,
             exit_pose=exit_pose,
-            entry_velocity=entry_velocity,
-            exit_velocity=exit_velocity,
             entry_angular_velocity=entry_angular_velocity,
             exit_angular_velocity=exit_angular_velocity,
+            entry_floor_relative=entry_floor_relative,
+            exit_floor_relative=exit_floor_relative,
+            entry_root_height=entry_root_height,
+            exit_root_height=exit_root_height,
+            entry_root_velocity=entry_root_velocity,
+            exit_root_velocity=exit_root_velocity,
             fps=args.fps,
             cooldown_slots=args.cooldown_slots,
             candidate_pool=args.weak_candidate_pool,

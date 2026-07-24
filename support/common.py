@@ -328,6 +328,34 @@ def transition_cost_from_arrays(
     return pose_jump + 0.35 * vel_jump + 0.50 * root_y_jump + 0.15 * contact_jump
 
 
+def intrinsic_transition_cost_from_arrays(
+    prev_exit: np.ndarray,
+    next_entry: np.ndarray,
+) -> float:
+    """Endpoint cost that is independent of source floor and FPS contracts.
+
+    Historical Scheduler assets stored finite differences of all 151 channels.
+    Those arrays mix contact, metres, and Rot6D coordinate derivatives and
+    therefore cannot be compared across frame rates or Rot6D layouts.  The
+    formal runtime uses this intrinsic pose term; angular velocity, Root-Y,
+    floor, contact and root-velocity compatibility are scored separately in
+    physical units.
+    """
+
+    previous = np.asarray(prev_exit, dtype=np.float32).reshape(-1)
+    following = np.asarray(next_entry, dtype=np.float32).reshape(-1)
+    if previous.shape[0] < ROT.stop or following.shape[0] < ROT.stop:
+        raise ValueError(
+            "Intrinsic transition endpoints must contain a complete EDGE151 frame"
+        )
+    previous_rotation = rot6d_to_matrix_np(previous[ROT].reshape(24, 6))
+    following_rotation = rot6d_to_matrix_np(following[ROT].reshape(24, 6))
+    relative = np.swapaxes(previous_rotation, -1, -2) @ following_rotation
+    trace = np.trace(relative, axis1=-2, axis2=-1)
+    angles = np.arccos(np.clip((trace - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.sqrt(np.mean(np.square(angles))))
+
+
 def motion_boundary_metrics(
     prev: np.ndarray,
     nxt: np.ndarray,
@@ -368,6 +396,18 @@ def motion_boundary_metrics(
     following_velocity_after *= float(fps)
     previous_acceleration = (previous_velocity - previous_velocity_before) * float(fps)
     following_acceleration = (following_velocity_after - following_velocity) * float(fps)
+    previous_root_velocity = (
+        (previous[-1, ROOT_X:ROOT_Z + 1] - previous[-2, ROOT_X:ROOT_Z + 1])
+        * float(fps)
+        if len(previous) > 1
+        else np.zeros((3,), dtype=np.float32)
+    )
+    following_root_velocity = (
+        (following[1, ROOT_X:ROOT_Z + 1] - following[0, ROOT_X:ROOT_Z + 1])
+        * float(fps)
+        if len(following) > 1
+        else np.zeros((3,), dtype=np.float32)
+    )
     yaw = root_yaw_np(
         np.stack([previous[-1], following[0]], axis=0).astype(np.float32)
     )
@@ -399,6 +439,12 @@ def motion_boundary_metrics(
         "contact_jump": float(
             np.abs(previous[-1, CONTACT] - following[0, CONTACT]).mean()
         ),
+        "root_y_gap_m": float(
+            abs(previous[-1, ROOT_Y] - following[0, ROOT_Y])
+        ),
+        "root_velocity_jump_mps": float(
+            np.linalg.norm(previous_root_velocity - following_root_velocity)
+        ),
         "yaw_gap_deg": float(abs(yaw_delta) * 180.0 / np.pi),
     }
 
@@ -408,34 +454,32 @@ def smoothstep(x: float) -> float:
     return v * v * (3.0 - 2.0 * v)
 
 
-def make_geodesic_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np.ndarray:
-    """Build a geometry-aware EDGE151 transition.
+POSTURE_ORDER = {
+    "floor_pose": 0,
+    "kneeling": 1,
+    "deep_squat": 2,
+    "half_squat": 3,
+    "standing": 4,
+    "aerial": 5,
+}
 
-    Root translation is eased in Euclidean space, rotations follow the SO(3)
-    shortest path, and contact channels switch discretely.
-    """
-    k = max(0, int(length))
-    if k == 0:
-        return np.zeros((0, 151), dtype=np.float32)
-    out = np.zeros((k, 151), dtype=np.float32)
-    a0 = np.asarray(prev[-1], dtype=np.float32)
-    a1 = np.asarray(nxt[0], dtype=np.float32)
-    r0 = rot6d_to_matrix_np(a0[ROT].reshape(24, 6))
-    r1 = rot6d_to_matrix_np(a1[ROT].reshape(24, 6))
-    for i in range(k):
-        alpha = smoothstep((i + 1) / (k + 1))
-        out[i] = (1.0 - alpha) * a0 + alpha * a1
-        # Contacts are categorical support observations.  Switch once at the
-        # temporal midpoint instead of activating the target support pattern
-        # on the first bridge frame.
-        out[i, CONTACT] = a0[CONTACT] if alpha < 0.5 else a1[CONTACT]
-        blended = tangent_blend_np(
-            r0,
-            r1,
-            np.full((24,), alpha, dtype=np.float32),
-        )
-        out[i, ROT] = matrix_to_rot6d_np(blended).reshape(-1)
-    return out
+
+def posture_state_distance(first: str, second: str) -> int:
+    """Ordered posture-graph distance used by training and runtime routing."""
+
+    a = str(first)
+    b = str(second)
+    if a not in POSTURE_ORDER or b not in POSTURE_ORDER:
+        return 0
+    return abs(int(POSTURE_ORDER[a]) - int(POSTURE_ORDER[b]))
+
+
+def make_geodesic_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np.ndarray:
+    """Compatibility entry point for the endpoint-velocity-aware SO(3) bridge."""
+
+    from support.motion_geometry import make_so3_transition
+
+    return make_so3_transition(prev, nxt, length)
 
 
 def make_linear_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np.ndarray:
@@ -444,27 +488,21 @@ def make_linear_transition(prev: np.ndarray, nxt: np.ndarray, length: int) -> np
 
 
 def apply_start_anchor(motion: np.ndarray, start_pose: np.ndarray, blend_frames: int = 8) -> np.ndarray:
+    """Translate the complete stage XZ path to the requested start anchor.
+
+    A start anchor is a trajectory placement contract, not a hidden pose
+    editor.  Root-Y, contacts and rotations remain owned by the selected first
+    event; changing them here would create a synthetic boundary before frame
+    zero and invalidate the event/floor contracts.
+    """
     x = np.asarray(motion, dtype=np.float32).copy()
     s = np.asarray(start_pose, dtype=np.float32).reshape(-1)
     if s.shape[0] != 151 or len(x) == 0:
         return x
-    bf = max(1, min(int(blend_frames), len(x)))
-    x[0, CONTACT] = s[CONTACT]
-    x[0, ROOT_Y] = s[ROOT_Y]
-    x[0, ROT] = s[ROT]
-    x[:, ROOT_X] = 0.0
-    x[:, ROOT_Z] = 0.0
-    anchor_rotation = rot6d_to_matrix_np(s[ROT].reshape(24, 6))
-    target_rotations = rot6d_to_matrix_np(x[:bf, ROT].reshape(bf, 24, 6))
-    for t in range(1, bf):
-        alpha = smoothstep(t / max(bf - 1, 1))
-        x[t, ROOT_Y] = (1.0 - alpha) * s[ROOT_Y] + alpha * x[t, ROOT_Y]
-        blended = tangent_blend_np(
-            anchor_rotation,
-            target_rotations[t],
-            np.full((24,), alpha, dtype=np.float32),
-        )
-        x[t, ROT] = matrix_to_rot6d_np(blended).reshape(-1)
+    _ = blend_frames  # retained for CLI/checkpoint compatibility
+    stage_offset = s[[ROOT_X, ROOT_Z]] - x[0, [ROOT_X, ROOT_Z]]
+    x[:, ROOT_X] += float(stage_offset[0])
+    x[:, ROOT_Z] += float(stage_offset[1])
     return x
 
 

@@ -8,6 +8,121 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SchedulerArchitectureTests(unittest.TestCase):
+    def test_scheduler_preserves_composed_root_trajectory(self):
+        source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("canonicalize_event_root_np", source)
+        self.assertIn("compose_event_root_xz_np", source)
+        self.assertIn("make_so3_transition", source)
+        self.assertNotIn("content[:, ROOT_X] = 0.0", source)
+        self.assertNotIn("motion[:, ROOT_X] = 0.0", source)
+
+    def test_all_transition_backends_preserve_root_xz(self):
+        paths = (
+            "support/contact_inr.py",
+            "training/boundary_dynamics.py",
+            "training/transition_diffusion.py",
+        )
+        forbidden = (
+            "root[..., ROOT_X - ROOT.start] = 0.0",
+            "root[..., ROOT_Z - ROOT.start] = 0.0",
+            "result[:, ROOT_X] = 0.0",
+            "result[:, ROOT_Z] = 0.0",
+            "out[:, ROOT_X] = 0.0",
+            "out[:, ROOT_Z] = 0.0",
+        )
+        failures = []
+        for relative in paths:
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            for statement in forbidden:
+                if statement in source:
+                    failures.append(f"{relative}: {statement}")
+        self.assertEqual([], failures)
+
+    def test_all_start_anchor_entrypoints_are_xz_translation_only(self):
+        source = (ROOT / "support" / "motion_geometry.py").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("def apply_start_anchor_so3(")
+        end = source.index("\ndef temporal_so3_filter_np(", start)
+        block = source[start:end]
+        self.assertIn("stage_offset", block)
+        self.assertNotIn("ROOT_Y] =", block)
+        self.assertNotIn("CONTACT] =", block)
+        self.assertNotIn("ROT] =", block)
+
+    def test_scheduler_routes_with_physical_endpoint_state(self):
+        source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        for name in (
+            "posture_root_height_gap_m",
+            "posture_state_gap",
+            "floor_gap_m",
+            "contact_gap",
+            "root_velocity_jump_mps",
+            "physical_edge_hard_prune",
+        ):
+            self.assertIn(name, source)
+
+    def test_ik_uses_contact_ramps_and_local_transactions(self):
+        source = (ROOT / "training" / "motion_models.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("contact_ramp_weights_np", source)
+        self.assertIn("local_ownership_window_transactions", source)
+        self.assertIn("ik_local_transaction", source)
+        self.assertIn(
+            "trial[own_start:own_end] = blend_edge151_geodesic_np(",
+            source,
+        )
+
+    def test_final_closed_loop_uses_same_geometry_contract_as_scheduler(self):
+        source = (
+            ROOT / "routing" / "heading_closed_loop_impl2.py"
+        ).read_text(encoding="utf-8")
+        for name in (
+            "canonicalize_event_root_np",
+            "make_so3_transition",
+            "project_transition_floor_np",
+            "recompute_transition_contacts_np",
+            "root_velocity_gap_mps",
+            "floor_offset_gap_m",
+        ):
+            self.assertIn(name, source)
+        contact_position = source.index("recompute_transition_contacts_np(")
+        return_position = source.index(
+            "return np.asarray(bridge, dtype=np.float32)",
+            contact_position,
+        )
+        block = source[contact_position:return_position]
+        self.assertNotIn("base.enforce_contract", block)
+        heading = (
+            ROOT / "routing" / "heading_closed_loop.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Closed-loop slot frame contract mismatch", heading)
+        self.assertNotIn(
+            "source_hint=f\"v46_50_slot_exact_len:",
+            heading,
+        )
+
+    def test_generation_db_and_global_route_expose_physical_endpoints(self):
+        geometry = (
+            ROOT / "events" / "intrinsic_geometry.py"
+        ).read_text(encoding="utf-8")
+        route = (ROOT / "routing" / "global_path.py").read_text(
+            encoding="utf-8"
+        )
+        for name in (
+            "v46_53_entry_root_velocity_mps",
+            "v46_53_exit_root_velocity_mps",
+        ):
+            self.assertIn(name, geometry)
+            self.assertIn(name, route)
+        self.assertIn("entry_floor_offset_m", route)
+        self.assertIn("exit_floor_offset_m", route)
+
     def test_runtime_layout_is_project_owned(self):
         required = [
             "scheduling/whole_song_scheduler.py",
@@ -123,9 +238,25 @@ class SchedulerArchitectureTests(unittest.TestCase):
         source = (ROOT / "training" / "whole_song_planner.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("transition_cost_from_arrays", source)
+        self.assertIn("intrinsic_transition_cost_from_arrays", source)
+        self.assertNotIn(
+            "\n    transition_cost_from_arrays,",
+            source,
+        )
         self.assertIn("entry_angular_velocity_radps", source)
         self.assertIn("exit_angular_velocity_radps", source)
+        self.assertIn("posture_state_distance", source)
+
+    def test_generation_index_carries_discrete_posture_endpoints(self):
+        source = (
+            ROOT / "scheduling" / "build_generation_index.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "generation_aligned_scheduler_index_v5_product_state_endpoints",
+            source,
+        )
+        self.assertIn('"posture_entry": str(posture_entry[index])', source)
+        self.assertIn('"posture_exit": str(posture_exit[index])', source)
 
     def test_runtime_scheduler_validates_full_checkpoint_contract(self):
         source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
@@ -197,6 +328,18 @@ class SchedulerArchitectureTests(unittest.TestCase):
                 failures.append(str(path.relative_to(ROOT)))
         self.assertEqual([], failures)
 
+    def test_event_asset_resolution_never_depends_on_process_cwd(self):
+        for relative in (
+            "scheduling/index_io.py",
+            "scheduling/build_generation_index.py",
+            "events/intrinsic_geometry.py",
+            "training/motion_models.py",
+            "evaluation/audit_heading.py",
+        ):
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertNotIn("Path.cwd() / raw", source)
+            self.assertNotIn("candidates = [raw]\n", source)
+
     def test_aist_dataset_exposes_rate_and_physical_contact_contracts(self):
         source = (ROOT / "dataset" / "dance_dataset.py").read_text(
             encoding="utf-8"
@@ -263,6 +406,23 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertIn("previous_context=contents[slot - 1]", sample_block)
         self.assertIn("next_context=content", sample_block)
         self.assertIn("fps=float(args.fps)", sample_block)
+
+    def test_legacy_row_transition_model_has_explicit_layout_boundary(self):
+        diffusion = (
+            ROOT / "training" / "transition_diffusion.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("def _native_transition_risk(", diffusion)
+        self.assertIn("ROT6D_LAYOUT_PYTORCH3D_ROW", diffusion)
+        self.assertIn("ROT6D_LAYOUT_COLUMN", diffusion)
+        self.assertNotIn("project_motion_rotations_np", diffusion)
+
+        for relative in (
+            "support/contact_inr.py",
+            "training/boundary_dynamics.py",
+        ):
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn("_project_native_motion", source)
+            self.assertNotIn("project_motion_rotations_torch", source)
 
     def test_refiner_training_passes_multirate_config_to_corruption(self):
         source = (ROOT / "training" / "motion_models.py").read_text(

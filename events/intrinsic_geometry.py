@@ -36,7 +36,7 @@ from contracts.gravity import (
     fk24_np,
 )
 
-SCHEMA = "v46_53_intrinsic_event_geometry_v2_physical_time"
+SCHEMA = "v46_53_intrinsic_event_geometry_v3_physical_endpoints"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 BODY_PARTS: Dict[str, Tuple[int, ...]] = {
@@ -92,7 +92,6 @@ def _resolve_event_motion_path(raw_value: Any, db_path: Path) -> Path:
     candidates = [raw] if raw.is_absolute() else [
         PROJECT_ROOT / raw,
         db_path.parent / raw,
-        Path.cwd() / raw,  # compatibility only
     ]
     checked: List[str] = []
     seen = set()
@@ -211,6 +210,8 @@ def _geometry_descriptor(
     exit_omega = _pad_edge(omega, edge_frames, True)
     entry_alpha = _pad_edge(alpha, edge_frames, False)
     exit_alpha = _pad_edge(alpha, edge_frames, True)
+    entry_root_velocity = _pad_edge(root_v, edge_frames, False)
+    exit_root_velocity = _pad_edge(root_v, edge_frames, True)
 
     # Intrinsic structure quality.  This is not a hard anatomy gate; it is a
     # continuous ranking prior that penalizes excessive high-order dynamics.
@@ -226,6 +227,8 @@ def _geometry_descriptor(
         "exit_omega": exit_omega.astype(np.float32),
         "entry_alpha": entry_alpha.astype(np.float32),
         "exit_alpha": exit_alpha.astype(np.float32),
+        "entry_root_velocity_mps": entry_root_velocity.astype(np.float32),
+        "exit_root_velocity_mps": exit_root_velocity.astype(np.float32),
         "part_flow": np.asarray(part_flow, dtype=np.float32),
         "structure_quality": structure_quality,
         "omega_p95": omega_p95,
@@ -328,7 +331,17 @@ def augment_database(
 
     edge_frames_30fps = _env_int("V46_53_EVENT_EDGE_FRAMES", 6)
     edge_frames = max(1, int(round(edge_frames_30fps * fps / 30.0)))
-    rows, w0, w1, a0, a1, parts, structure_q = [], [], [], [], [], [], []
+    rows, w0, w1, a0, a1, rv0, rv1, parts, structure_q = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     diagnostics: List[dict] = []
     for i, path in enumerate(paths.tolist()):
         resolved_path = _resolve_event_motion_path(path, db_path)
@@ -346,6 +359,8 @@ def augment_database(
         w1.append(item["exit_omega"])
         a0.append(item["entry_alpha"])
         a1.append(item["exit_alpha"])
+        rv0.append(item["entry_root_velocity_mps"])
+        rv1.append(item["exit_root_velocity_mps"])
         parts.append(item["part_flow"])
         structure_q.append(float(item["structure_quality"]))
         diagnostics.append({
@@ -381,6 +396,8 @@ def augment_database(
         "v46_53_exit_omega": np.stack(w1).astype(np.float32),
         "v46_53_entry_alpha": np.stack(a0).astype(np.float32),
         "v46_53_exit_alpha": np.stack(a1).astype(np.float32),
+        "v46_53_entry_root_velocity_mps": np.stack(rv0).astype(np.float32),
+        "v46_53_exit_root_velocity_mps": np.stack(rv1).astype(np.float32),
         "v46_53_bodypart_flow": np.stack(parts).astype(np.float32),
         "v46_53_structure_quality": structure_q_arr,
         "v46_53_combined_quality": combined_q,

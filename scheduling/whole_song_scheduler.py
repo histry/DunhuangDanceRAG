@@ -48,11 +48,20 @@ from support.scheduler_common import (
     ROT,
     apply_start_anchor,
     event_compatibility,
+    intrinsic_transition_cost_from_arrays,
+    posture_state_distance,
     json_safe,
     load_motion,
-    make_geodesic_transition,
     motion_boundary_metrics,
-    transition_cost_from_arrays,
+)
+from support.motion_geometry import (
+    canonicalize_event_root_np,
+    compose_event_root_xz_np,
+    event_endpoint_geometry_np,
+    make_so3_transition,
+    project_motion_rotations_np,
+    project_transition_floor_np,
+    recompute_transition_contacts_np,
 )
 from scheduling.event_resampling import resample_event
 from scheduling.duration_alignment import allocate_whole_song_durations
@@ -212,8 +221,6 @@ def dampen_event_edges(motion: np.ndarray, edge_frames: int, strength: float) ->
         ).reshape(-1)
         x[idx, 5] = (1.0 - weight) * x[idx, 5] + weight * target[5]
 
-    x[:, ROOT_X] = 0.0
-    x[:, ROOT_Z] = 0.0
     return x.astype(np.float32)
 
 
@@ -241,15 +248,31 @@ def root_geodesic6d(start_frame: np.ndarray, end_frame: np.ndarray, length: int)
     return matrix_to_rot6d_np(interpolation).astype(np.float32)
 
 
-def enforce_yaw_safe_transition(transition: np.ndarray, prev: np.ndarray, nxt: np.ndarray) -> np.ndarray:
+def enforce_yaw_safe_transition(
+    transition: np.ndarray,
+    prev: np.ndarray,
+    nxt: np.ndarray,
+    *,
+    canonical_root: np.ndarray | None = None,
+) -> np.ndarray:
     x = np.asarray(transition, dtype=np.float32).copy()
     if len(x) == 0:
         return x
-    # Preserve full root orientation while still avoiding the 6D linear
-    # interpolation long-path artifact that produced transition yaw spikes.
-    x[:, ROOT_ROT6D] = root_geodesic6d(prev[-1], nxt[0], len(x))
-    x[:, ROOT_X] = 0.0
-    x[:, ROOT_Z] = 0.0
+    # Learned refiners may edit limbs, but the canonical Hermite root path is a
+    # hard contract.  Restoring it prevents checkpoint-era zero-XZ behavior and
+    # preserves C1 root translation/orientation.
+    if canonical_root is not None:
+        reference = np.asarray(canonical_root, dtype=np.float32)
+        if reference.shape != x.shape:
+            raise ValueError(
+                "canonical_root and transition shapes differ: "
+                f"{reference.shape} != {x.shape}"
+            )
+        x[:, ROOT_X:ROOT_Z + 1] = reference[:, ROOT_X:ROOT_Z + 1]
+        x[:, ROOT_ROT6D] = reference[:, ROOT_ROT6D]
+    else:
+        root_matrix = rot6d_to_matrix_np(x[:, ROOT_ROT6D])
+        x[:, ROOT_ROT6D] = matrix_to_rot6d_np(root_matrix)
     return x.astype(np.float32)
 
 
@@ -418,8 +441,43 @@ def choose_events(
     )
     entry_pose = np.asarray(arrays["entry_pose"], dtype=np.float32)
     exit_pose = np.asarray(arrays["exit_pose"], dtype=np.float32)
-    entry_vel = np.asarray(arrays["entry_vel"], dtype=np.float32)
-    exit_vel = np.asarray(arrays["exit_vel"], dtype=np.float32)
+    endpoint_geometry_keys = {
+        "event_floor_y_m",
+        "entry_floor_relative_m",
+        "exit_floor_relative_m",
+        "entry_root_height_m",
+        "exit_root_height_m",
+    }
+    if endpoint_geometry_keys.issubset(array_names):
+        endpoint_geometry = [
+            {
+                "floor_y_m": float(arrays["event_floor_y_m"][index]),
+                "entry_floor_relative_m": float(
+                    arrays["entry_floor_relative_m"][index]
+                ),
+                "exit_floor_relative_m": float(
+                    arrays["exit_floor_relative_m"][index]
+                ),
+                "entry_root_height_m": float(
+                    arrays["entry_root_height_m"][index]
+                ),
+                "exit_root_height_m": float(
+                    arrays["exit_root_height_m"][index]
+                ),
+            }
+            for index in range(len(motions))
+        ]
+    else:
+        endpoint_geometry = [
+            event_endpoint_geometry_np(
+                motion,
+                floor_quantile=float(args.event_floor_quantile),
+                window_frames=max(
+                    2, int(round(5.0 * float(args.fps) / 30.0))
+                ),
+            )
+            for motion in motions
+        ]
     event_types = [str(item.get("event_type", "neutral_flow")) for item in items]
     families = [str(item.get("family_id", "")) for item in items]
     queries = [np.asarray(p.query, dtype=np.float32) for p in phrases]
@@ -557,16 +615,16 @@ def choose_events(
                 transition_cost = 0.0
                 boundary_velocity_penalty = 0.0
                 boundary_acceleration_penalty = 0.0
+                physical_edge_cost = 0.0
+                physical_edge_meta: Dict[str, Any] = {}
                 graph_edge_cost = 0.0
                 graph_edge_meta: Dict[str, Any] = {}
                 transition_meta: Dict[str, Any] = {}
                 if state.selected:
                     previous = state.selected[-1]
-                    transition_cost = transition_cost_from_arrays(
+                    transition_cost = intrinsic_transition_cost_from_arrays(
                         exit_pose[previous],
-                        exit_vel[previous],
                         entry_pose[idx],
-                        entry_vel[idx],
                     )
                     candidate_boundary = boundary_metrics(
                         motions[previous], motions[idx], fps=float(args.fps)
@@ -581,6 +639,85 @@ def choose_events(
                         / max(args.acceleration_jump_reference_radps2, 1e-6),
                         args.boundary_penalty_cap,
                     )
+                    previous_geometry = endpoint_geometry[previous]
+                    candidate_geometry = endpoint_geometry[idx]
+                    floor_gap = abs(
+                        float(previous_geometry["exit_floor_relative_m"])
+                        - float(candidate_geometry["entry_floor_relative_m"])
+                    )
+                    root_height_gap = abs(
+                        float(previous_geometry["exit_root_height_m"])
+                        - float(candidate_geometry["entry_root_height_m"])
+                    )
+                    posture_gap = posture_state_distance(
+                        str(items[previous].get("posture_exit", "unknown")),
+                        str(items[idx].get("posture_entry", "unknown")),
+                    )
+                    contact_gap = float(candidate_boundary["contact_jump"])
+                    root_velocity_gap = float(
+                        candidate_boundary["root_velocity_jump_mps"]
+                    )
+                    physical_edge_cost = (
+                        0.34
+                        * min(
+                            root_height_gap
+                            / max(float(args.root_height_gap_reference_m), 1e-6),
+                            float(args.boundary_penalty_cap),
+                        )
+                        + 0.20 * min(float(posture_gap) / 2.0, 2.0)
+                        + 0.24
+                        * min(
+                            floor_gap
+                            / max(float(args.floor_gap_reference_m), 1e-6),
+                            float(args.boundary_penalty_cap),
+                        )
+                        + 0.18 * min(contact_gap, 1.0)
+                        + 0.24
+                        * min(
+                            root_velocity_gap
+                            / max(
+                                float(args.root_velocity_jump_reference_mps),
+                                1e-6,
+                            ),
+                            float(args.boundary_penalty_cap),
+                        )
+                    )
+                    physical_edge_meta = {
+                        "posture_root_height_gap_m": float(root_height_gap),
+                        "posture_state_gap": int(posture_gap),
+                        "posture_exit": str(
+                            items[previous].get("posture_exit", "unknown")
+                        ),
+                        "posture_entry": str(
+                            items[idx].get("posture_entry", "unknown")
+                        ),
+                        "floor_gap_m": float(floor_gap),
+                        "contact_gap": float(contact_gap),
+                        "root_velocity_jump_mps": float(root_velocity_gap),
+                        "physical_edge_cost": float(physical_edge_cost),
+                    }
+                    strong_reset = float(phrase.boundary_accent_strength) >= float(
+                        args.physical_edge_reset_accent
+                    )
+                    if bool(args.physical_edge_hard_prune):
+                        reset_multiplier = 1.35 if strong_reset else 1.0
+                        if (
+                            root_height_gap
+                            > float(args.root_height_gap_hard_m)
+                            * reset_multiplier
+                            or posture_gap
+                            > int(args.posture_state_gap_hard)
+                            or floor_gap
+                            > float(args.floor_gap_hard_m)
+                            * reset_multiplier
+                            or root_velocity_gap
+                            > float(args.root_velocity_jump_hard_mps)
+                            * reset_multiplier
+                            or contact_gap
+                            > float(args.contact_gap_hard)
+                            * reset_multiplier
+                        ):
+                            continue
                     if args.music_dominant_timing:
                         transition_len, transition_meta = dynamic_transition_len(
                             motions[previous],
@@ -613,6 +750,7 @@ def choose_events(
                     - args.transition_weight * transition_cost
                     - args.boundary_velocity_penalty_weight * boundary_velocity_penalty
                     - args.boundary_acceleration_penalty_weight * boundary_acceleration_penalty
+                    - args.physical_edge_weight * physical_edge_cost
                     - args.graph_edge_weight * graph_edge_cost
                     - args.mmr_weight * mmr
                     - args.family_repeat_weight * same_family
@@ -666,6 +804,8 @@ def choose_events(
                     "transition_cost": float(transition_cost),
                     "boundary_velocity_penalty": float(boundary_velocity_penalty),
                     "boundary_acceleration_penalty": float(boundary_acceleration_penalty),
+                    "physical_edge_cost": float(physical_edge_cost),
+                    "physical_edge_meta": physical_edge_meta,
                     "graph_scheduler_enabled": bool(args.graph_scheduler),
                     "graph_edge_cost": float(graph_edge_cost),
                     "graph_edge_meta": graph_edge_meta,
@@ -845,6 +985,7 @@ def generate_one(
 
     contents: List[np.ndarray] = []
     resampling_reports: List[Dict[str, Any]] = []
+    stage_cursor_xz = np.zeros((2,), dtype=np.float32)
     for idx, target_len in zip(selected_state.selected, allocation["content_lengths"]):
         content, report = resample_event(
             motions[idx],
@@ -855,18 +996,62 @@ def generate_one(
             min_turn_angle=args.v23_min_turn_angle,
             min_peak_dps=args.v23_min_peak_dps,
         )
-        content[:, ROOT_X] = 0.0
-        content[:, ROOT_Z] = 0.0
-        content = dampen_event_edges(content, args.edge_damping_frames, args.edge_damping_strength)
+        # Edge damping changes Root-Y and joint rotations, so floor
+        # canonicalization must be the final event-local geometry operation
+        # before stage composition and transition construction.
+        content = dampen_event_edges(
+            content,
+            args.edge_damping_frames,
+            args.edge_damping_strength,
+        )
+        content, root_contract = canonicalize_event_root_np(
+            content,
+            target_floor_y=float(args.stage_floor_y),
+            floor_quantile=float(args.event_floor_quantile),
+            max_floor_penetration_m=float(
+                args.event_max_floor_penetration_m
+            ),
+        )
+        content, stage_contract = compose_event_root_xz_np(
+            content,
+            stage_cursor_xz,
+        )
+        stage_cursor_xz = content[-1, [ROOT_X, ROOT_Z]].astype(np.float32)
         contents.append(content)
-        resampling_reports.append(report)
+        resampling_reports.append(
+            {
+                **report,
+                "root_trajectory_contract": {
+                    **root_contract,
+                    **stage_contract,
+                    "policy": (
+                        "event_first_xz_localization_then_previous_endpoint_composition"
+                    ),
+                },
+            }
+        )
 
     pieces: List[np.ndarray] = []
     boundary_reports: List[Dict[str, Any]] = []
     for slot, content in enumerate(contents):
         if slot > 0:
             k = int(transition_lengths[slot])
-            rough = make_geodesic_transition(contents[slot - 1], content, k)
+            rough = make_so3_transition(
+                contents[slot - 1],
+                content,
+                k,
+                fps=float(args.fps),
+                angular_speed_cap_radps=float(
+                    args.transition_angular_speed_cap_radps
+                ),
+                root_horizontal_speed_cap_mps=float(
+                    args.transition_root_horizontal_speed_cap_mps
+                ),
+                root_vertical_speed_cap_mps=float(
+                    args.transition_root_vertical_speed_cap_mps
+                ),
+                root_tangent_margin_m=float(args.transition_root_tangent_margin_m),
+            )
             transition = refine_transition(
                 transition_bundle,
                 rough,
@@ -875,7 +1060,12 @@ def generate_one(
                 np.asarray(phrases[slot].query, dtype=np.float32),
                 device,
             )
-            transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
+            transition = enforce_yaw_safe_transition(
+                transition,
+                contents[slot - 1],
+                content,
+                canonical_root=rough,
+            )
             if args.transition_diffusion and args.transition_diffusion_ckpt:
                 transition, diffusion_meta = sample_transition_diffusion(
                     args.transition_diffusion_bundle,
@@ -891,15 +1081,45 @@ def generate_one(
                     next_context=content,
                     fps=float(args.fps),
                 )
-                transition = enforce_yaw_safe_transition(transition, contents[slot - 1], content)
+                transition = enforce_yaw_safe_transition(
+                    transition,
+                    contents[slot - 1],
+                    content,
+                    canonical_root=rough,
+                )
             else:
                 diffusion_meta = {"enabled": False}
+            # Learned transition heads operate in Euclidean 6D coordinates.
+            # Canonicalize every joint once before FK floor/contact audits so
+            # the saved bridge and the audited bridge are the same rotations.
+            transition = project_motion_rotations_np(transition)
+            transition, floor_projection = project_transition_floor_np(
+                transition,
+                target_floor_y=float(args.stage_floor_y),
+                clearance_m=float(args.transition_floor_clearance_m),
+                smoothing_frames=int(args.transition_floor_smoothing_frames),
+            )
+            transition, contact_rebuild = recompute_transition_contacts_np(
+                transition,
+                fps=float(args.fps),
+                floor_y=float(args.stage_floor_y),
+                left_contact=contents[slot - 1][-1, CONTACT],
+                right_contact=content[0, CONTACT],
+                ramp_seconds=float(args.transition_contact_ramp_seconds),
+            )
             metrics = boundary_metrics(
                 contents[slot - 1], content, fps=float(args.fps)
             )
             metrics["transition_len"] = k
             metrics["transition_meta"] = selected_state.parts[slot].get("transition_meta", {})
             metrics["transition_diffusion"] = diffusion_meta
+            metrics["transition_root_contract"] = {
+                "mode": "endpoint_velocity_aware_so3_root_hermite",
+                "preserves_root_xz": True,
+                "stage_floor_y_m": float(args.stage_floor_y),
+                "floor_projection": floor_projection,
+                "contact_rebuild": contact_rebuild,
+            }
             boundary_reports.append(metrics)
             pieces.append(transition)
         pieces.append(content)
@@ -910,8 +1130,6 @@ def generate_one(
             f"V26 output length mismatch: generated={len(motion)} music_frames={len(features)}. "
             "No pad/trim fallback is permitted."
         )
-    motion[:, ROOT_X] = 0.0
-    motion[:, ROOT_Z] = 0.0
     if args.start_pose:
         start_path = Path(args.start_pose)
         if start_path.is_file():
@@ -979,8 +1197,33 @@ def generate_one(
             "turn_peak_penalty_weight": float(args.turn_peak_penalty_weight),
             "boundary_velocity_penalty_weight": float(args.boundary_velocity_penalty_weight),
             "boundary_acceleration_penalty_weight": float(args.boundary_acceleration_penalty_weight),
+            "physical_edge_weight": float(args.physical_edge_weight),
+            "physical_edge_hard_prune": bool(args.physical_edge_hard_prune),
+            "root_height_gap_reference_m": float(args.root_height_gap_reference_m),
+            "root_height_gap_hard_m": float(args.root_height_gap_hard_m),
+            "posture_state_gap_hard": int(args.posture_state_gap_hard),
+            "floor_gap_reference_m": float(args.floor_gap_reference_m),
+            "floor_gap_hard_m": float(args.floor_gap_hard_m),
+            "root_velocity_jump_reference_mps": float(
+                args.root_velocity_jump_reference_mps
+            ),
             "edge_damping_frames": int(args.edge_damping_frames),
             "edge_damping_strength": float(args.edge_damping_strength),
+            "root_trajectory_contract": {
+                "policy": (
+                    "event_first_xz_localization_then_previous_endpoint_composition"
+                ),
+                "start_anchor_policy": "single_global_xz_translation",
+                "stage_floor_y_m": float(args.stage_floor_y),
+                "event_floor_quantile": float(args.event_floor_quantile),
+                "transition_mode": "endpoint_velocity_aware_so3_root_hermite",
+                "transition_floor_clearance_m": float(
+                    args.transition_floor_clearance_m
+                ),
+                "transition_contact_ramp_seconds": float(
+                    args.transition_contact_ramp_seconds
+                ),
+            },
             "multi_event_phrases": bool(args.multi_event_phrases),
             "lock_music_boundaries": bool(args.lock_music_boundaries),
             "max_single_event_seconds": float(args.max_single_event_seconds),
@@ -1071,6 +1314,19 @@ def main() -> None:
     parser.add_argument("--boundary_velocity_penalty_weight", type=float, default=0.35)
     parser.add_argument("--boundary_acceleration_penalty_weight", type=float, default=0.35)
     parser.add_argument("--boundary_penalty_cap", type=float, default=4.0)
+    parser.add_argument("--physical_edge_weight", type=float, default=0.55)
+    parser.add_argument("--physical_edge_hard_prune", type=_bool_arg, default=True)
+    parser.add_argument("--physical_edge_reset_accent", type=float, default=0.82)
+    parser.add_argument("--root_height_gap_reference_m", type=float, default=0.18)
+    parser.add_argument("--root_height_gap_hard_m", type=float, default=0.55)
+    parser.add_argument("--posture_state_gap_hard", type=int, default=2)
+    parser.add_argument("--floor_gap_reference_m", type=float, default=0.08)
+    parser.add_argument("--floor_gap_hard_m", type=float, default=0.20)
+    parser.add_argument(
+        "--root_velocity_jump_reference_mps", type=float, default=0.80
+    )
+    parser.add_argument("--root_velocity_jump_hard_mps", type=float, default=2.0)
+    parser.add_argument("--contact_gap_hard", type=float, default=0.75)
     parser.add_argument("--turn_peak_soft_dps", type=float, default=360.0)
     parser.add_argument("--turn_peak_hard_dps", type=float, default=720.0)
     parser.add_argument("--turn_angle_soft_deg", type=float, default=220.0)
@@ -1100,6 +1356,30 @@ def main() -> None:
     parser.add_argument("--transition_diffusion", type=_bool_arg, default=False)
     parser.add_argument("--transition_diffusion_blend", type=float, default=0.45)
     parser.add_argument("--transition_diffusion_steps", type=int, default=12)
+    parser.add_argument("--stage_floor_y", type=float, default=0.0)
+    parser.add_argument("--event_floor_quantile", type=float, default=5.0)
+    parser.add_argument("--event_max_floor_penetration_m", type=float, default=0.005)
+    parser.add_argument(
+        "--transition_angular_speed_cap_radps", type=float, default=8.0
+    )
+    parser.add_argument(
+        "--transition_root_horizontal_speed_cap_mps", type=float, default=1.5
+    )
+    parser.add_argument(
+        "--transition_root_vertical_speed_cap_mps", type=float, default=0.9
+    )
+    parser.add_argument(
+        "--transition_root_tangent_margin_m", type=float, default=0.12
+    )
+    parser.add_argument(
+        "--transition_floor_clearance_m", type=float, default=0.002
+    )
+    parser.add_argument(
+        "--transition_floor_smoothing_frames", type=int, default=5
+    )
+    parser.add_argument(
+        "--transition_contact_ramp_seconds", type=float, default=4.0 / 30.0
+    )
     parser.add_argument("--transition_yaw_limit_dps", type=float, default=220.0)
     parser.add_argument("--yaw_transition_safety_factor", type=float, default=1.90)
     parser.add_argument("--pose_jump_reference", type=float, default=0.120)
@@ -1123,6 +1403,7 @@ def main() -> None:
         "transition_min_frames",
         "transition_max_frames",
         "transition_budget_min_frames",
+        "transition_floor_smoothing_frames",
     ):
         setattr(args, name, max(1, int(round(float(getattr(args, name)) * frame_scale))))
     for name in (

@@ -373,9 +373,35 @@ FRESH_ARGS=(
   --beam_size "$V46_51_BEAM_SIZE"
   --candidate_top_k "$V46_51_CANDIDATE_TOP_K"
   --graph_node_top_k "$V46_51_GRAPH_NODE_TOP_K"
+  --physical_edge_weight "$V46_54_PHYSICAL_EDGE_WEIGHT"
+  --physical_edge_reset_accent "$V46_54_PHYSICAL_EDGE_RESET_ACCENT"
+  --root_height_gap_reference_m "$V46_54_ROOT_HEIGHT_GAP_REFERENCE_M"
+  --root_height_gap_hard_m "$V46_54_ROOT_HEIGHT_GAP_HARD_M"
+  --posture_state_gap_hard "$V46_54_POSTURE_STATE_GAP_HARD"
+  --floor_gap_reference_m "$V46_54_FLOOR_GAP_REFERENCE_M"
+  --floor_gap_hard_m "$V46_54_FLOOR_GAP_HARD_M"
+  --root_velocity_jump_reference_mps "$V46_54_ROOT_VELOCITY_JUMP_REFERENCE_MPS"
+  --root_velocity_jump_hard_mps "$V46_54_ROOT_VELOCITY_JUMP_HARD_MPS"
+  --contact_gap_hard "$V46_54_CONTACT_GAP_HARD"
+  --stage_floor_y "$V46_54_STAGE_FLOOR_Y"
+  --event_floor_quantile "$V46_54_EVENT_FLOOR_QUANTILE"
+  --event_max_floor_penetration_m "$V46_54_EVENT_MAX_FLOOR_PENETRATION_M"
+  --transition_angular_speed_cap_radps "$V46_54_TRANSITION_ANGULAR_SPEED_CAP_RADPS"
+  --transition_root_horizontal_speed_cap_mps "$V46_54_TRANSITION_ROOT_XZ_SPEED_CAP_MPS"
+  --transition_root_vertical_speed_cap_mps "$V46_54_TRANSITION_ROOT_Y_SPEED_CAP_MPS"
+  --transition_root_tangent_margin_m "$V46_54_TRANSITION_ROOT_TANGENT_MARGIN_M"
+  --transition_floor_clearance_m "$V46_54_TRANSITION_FLOOR_CLEARANCE_M"
+  --transition_floor_smoothing_seconds "$V46_54_TRANSITION_FLOOR_SMOOTH_SECONDS"
+  --transition_contact_ramp_seconds "$V46_54_TRANSITION_CONTACT_RAMP_SECONDS"
   --max_frame_error "$V46_51_MAX_FRAME_ERROR"
   --max_seconds_error "$V46_51_MAX_SECONDS_ERROR"
 )
+
+if [[ "$V46_54_PHYSICAL_EDGE_HARD_PRUNE" == "1" ]]; then
+  FRESH_ARGS+=(--physical_edge_hard_prune)
+else
+  FRESH_ARGS+=(--no-physical_edge_hard_prune)
+fi
 
 [[ -n "$V46_51_RESOLVED_HIERARCHY_INDEX_NPZ" ]] && \
   FRESH_ARGS+=(--hierarchy_index_npz "$V46_51_RESOLVED_HIERARCHY_INDEX_NPZ")

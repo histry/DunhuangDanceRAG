@@ -737,7 +737,18 @@ def physical_quality_gate(audit: Dict[str, Any]) -> Dict[str, Any]:
         "foot_penetration_min_m": env_float("V46_54_MIN_FOOT_PENETRATION_M", -0.050),
         "joint_jerk_mps3_p95": env_float("V46_54_MAX_JOINT_JERK_P95_MPS3", 810.0),
         "joint_jerk_mps3_max": env_float("V46_54_MAX_JOINT_JERK_MAX_MPS3", 1620.0),
-        "root_y_range_m": env_float("V46_54_MAX_ROOT_Y_RANGE_M", 0.45),
+        "root_y_robust_range_m": env_float(
+            "V46_54_MAX_ROOT_Y_ROBUST_RANGE_M",
+            0.90,
+        ),
+        "root_vertical_speed_mps_p95": env_float(
+            "V46_54_MAX_ROOT_VERTICAL_SPEED_P95_MPS",
+            1.25,
+        ),
+        "root_vertical_speed_mps_max": env_float(
+            "V46_54_MAX_ROOT_VERTICAL_SPEED_MAX_MPS",
+            4.0,
+        ),
     }
     reasons: List[str] = []
     for key in (
@@ -745,9 +756,25 @@ def physical_quality_gate(audit: Dict[str, Any]) -> Dict[str, Any]:
         "foot_skate_mps_max",
         "joint_jerk_mps3_p95",
         "joint_jerk_mps3_max",
-        "root_y_range_m",
     ):
         if float(audit.get(key, float("inf"))) > float(limits[key]):
+            reasons.append(f"{key}_too_high")
+    robust_root_range = float(
+        audit.get(
+            "root_y_robust_range_m",
+            audit.get("root_y_range_m", float("inf")),
+        )
+    )
+    if robust_root_range > float(limits["root_y_robust_range_m"]):
+        reasons.append("root_y_robust_range_m_too_high")
+    # Older cached audits do not contain vertical-speed metrics.  Preserve
+    # compatibility for report inspection while enforcing the new SI gates on
+    # every newly generated audit.
+    for key in (
+        "root_vertical_speed_mps_p95",
+        "root_vertical_speed_mps_max",
+    ):
+        if key in audit and float(audit[key]) > float(limits[key]):
             reasons.append(f"{key}_too_high")
     if float(audit.get("foot_penetration_min_m", float("-inf"))) < float(
         limits["foot_penetration_min_m"]

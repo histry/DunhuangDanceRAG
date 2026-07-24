@@ -42,7 +42,7 @@ def _resolve_motion_ref_path(
         if raw.is_absolute():
             candidates.append(raw)
         else:
-            candidates.extend((report_path.parent / raw, Path.cwd() / raw))
+            candidates.extend((report_path.parent / raw, ROOT / raw))
     if motion_path.suffix.lower() == ".npy":
         candidates.append(
             motion_path.with_name(motion_path.stem + ".motion_ref.npy")

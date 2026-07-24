@@ -117,10 +117,21 @@ def _vector_gap(db: Mapping[str, Any], key_a: str, key_b: str, a: int, b: int) -
 def _global_transition_energy(db: Mapping[str, Any], a: int, b: int) -> float:
     omega = _vector_gap(db, "v46_53_exit_omega", "v46_53_entry_omega", a, b)
     alpha = _vector_gap(db, "v46_53_exit_alpha", "v46_53_entry_alpha", a, b)
+    root_velocity = _vector_gap(
+        db,
+        "v46_53_exit_root_velocity_mps",
+        "v46_53_entry_root_velocity_mps",
+        a,
+        b,
+    )
     posture = _posture_gap(db, a, b)
     pelvis = abs(
         float(_db_value(db, "pelvis_height_exit_norm", a, 0.8))
         - float(_db_value(db, "pelvis_height_entry_norm", b, 0.8))
+    )
+    floor = abs(
+        float(_db_value(db, "exit_floor_offset_m", a, 0.0))
+        - float(_db_value(db, "entry_floor_offset_m", b, 0.0))
     )
     contact = 0.0
     try:
@@ -135,7 +146,9 @@ def _global_transition_energy(db: Mapping[str, Any], a: int, b: int) -> float:
         + _env_float("V46_53_GLOBAL_ALPHA_W", 0.002) * alpha
         + _env_float("V46_53_GLOBAL_POSTURE_W", 0.35) * posture
         + _env_float("V46_53_GLOBAL_PELVIS_W", 1.8) * pelvis
+        + _env_float("V46_53_GLOBAL_FLOOR_W", 2.0) * floor
         + _env_float("V46_53_GLOBAL_CONTACT_W", 0.45) * contact
+        + _env_float("V46_53_GLOBAL_ROOT_VEL_W", 0.30) * root_velocity
     )
 
 

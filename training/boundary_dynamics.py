@@ -36,10 +36,6 @@ from support.motion_geometry import (
     ROOT_Y,
     ROOT_Z,
     ROT,
-    motion_rotation_matrices_np,
-    motion_rotation_matrices_torch,
-    project_motion_rotations_np,
-    project_motion_rotations_torch,
 )
 
 
@@ -47,6 +43,32 @@ def _limit_norm(vector: torch.Tensor, maximum: torch.Tensor | float) -> torch.Te
     norm = torch.linalg.norm(vector, dim=-1, keepdim=True).clamp_min(1e-8)
     limit = torch.as_tensor(maximum, dtype=vector.dtype, device=vector.device)
     return vector * torch.minimum(torch.ones_like(norm), limit / norm)
+
+
+def _native_rotation_matrices_torch(motion: torch.Tensor) -> torch.Tensor:
+    """Decode the historical transition model's PyTorch3D-row layout."""
+
+    return rotation_6d_to_matrix(
+        motion[..., ROT].reshape(*motion.shape[:-1], NUM_JOINTS, 6)
+    )
+
+
+def _project_native_motion_torch(motion: torch.Tensor) -> torch.Tensor:
+    matrices = _native_rotation_matrices_torch(motion)
+    out = motion.clone()
+    out[..., ROT] = matrix_to_rotation_6d(matrices).reshape(
+        *motion.shape[:-1],
+        NUM_JOINTS * 6,
+    )
+    return out
+
+
+def _project_native_motion_np(motion: np.ndarray) -> np.ndarray:
+    with torch.no_grad():
+        projected = _project_native_motion_torch(
+            torch.from_numpy(np.asarray(motion, dtype=np.float32))
+        )
+    return projected.cpu().numpy().astype(np.float32)
 
 
 def _difference(values: torch.Tensor, order: int) -> torch.Tensor:
@@ -59,7 +81,7 @@ def _difference(values: torch.Tensor, order: int) -> torch.Tensor:
 
 
 def _angular_increments(motion: torch.Tensor) -> torch.Tensor:
-    matrices = motion_rotation_matrices_torch(motion)
+    matrices = _native_rotation_matrices_torch(motion)
     if len(matrices) < 2:
         return matrices.new_zeros((0, NUM_JOINTS, 3))
     relative = torch.matmul(
@@ -374,8 +396,10 @@ def septic_so3_root_base(
     root = root0[:, None] + _evaluate_polynomial(
         tuple(coefficient[:, None] for coefficient in root_coefficients), t
     )
-    root[..., ROOT_X - ROOT.start] = 0.0
-    root[..., ROOT_Z - ROOT.start] = 0.0
+    # Preserve the endpoint-velocity-aware Root trajectory.  Older snapshots
+    # zeroed XZ here because boundary clips were treated as root-local poses;
+    # doing so breaks cumulative event composition and introduces a pair of
+    # artificial velocity impulses at every transition.
 
     smooth = t.clamp(0.0, 1.0) ** 3 * (
         10.0 - 15.0 * t.clamp(0.0, 1.0) + 6.0 * t.clamp(0.0, 1.0) ** 2
@@ -412,7 +436,7 @@ def make_v34_transition_np(
         motion = torch.cat([
             torch.sigmoid(logits)[0], root[0], rot6d
         ], dim=-1)
-        motion = project_motion_rotations_torch(motion)
+        motion = _project_native_motion_torch(motion)
     return motion.cpu().numpy().astype(np.float32)
 
 
@@ -464,10 +488,10 @@ def apply_exit_handshake_np(
         raise ValueError(f"Unknown V34_HANDSHAKE_MODE={mode!r}")
 
     with torch.no_grad():
-        orig_m = motion_rotation_matrices_torch(
+        orig_m = _native_rotation_matrices_torch(
             torch.from_numpy(original[:h])
         )
-        bridge_m = motion_rotation_matrices_torch(
+        bridge_m = _native_rotation_matrices_torch(
             torch.from_numpy(bridge)
         )
         relative = torch.matmul(orig_m.transpose(-1, -2), bridge_m)
@@ -503,9 +527,10 @@ def apply_exit_handshake_np(
         "1", "true", "yes", "on"
     }:
         result[:h, CONTACT] = (result[:h, CONTACT] >= 0.5).astype(np.float32)
-    result[:, ROOT_X] = 0.0
-    result[:, ROOT_Z] = 0.0
-    result = project_motion_rotations_np(result)
+    # The handshake owns only its local prefix.  Preserve the original event's
+    # global Root trajectory outside that window and the geodesic bridge Root
+    # inside it; never reset a whole event to the origin.
+    result = _project_native_motion_np(result)
     return result, {
         "enabled": True,
         "frames": int(h),

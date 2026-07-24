@@ -43,12 +43,19 @@ from support.common import (
     ROT,
     apply_start_anchor,
     event_compatibility,
+    intrinsic_transition_cost_from_arrays,
     json_safe,
     load_motion,
-    make_geodesic_transition,
     pad_or_trim_motion,
     resample_motion,
-    transition_cost_from_arrays,
+)
+from support.motion_geometry import (
+    canonicalize_event_root_np,
+    compose_event_root_xz_np,
+    make_so3_transition,
+    project_motion_rotations_np,
+    project_transition_floor_np,
+    recompute_transition_contacts_np,
 )
 
 
@@ -230,8 +237,6 @@ def schedule_one(
     mmr_embed = np.asarray(arrays["mmr_embed"], dtype=np.float32)
     entry_pose = np.asarray(arrays["entry_pose"], dtype=np.float32)
     exit_pose = np.asarray(arrays["exit_pose"], dtype=np.float32)
-    entry_vel = np.asarray(arrays["entry_vel"], dtype=np.float32)
-    exit_vel = np.asarray(arrays["exit_vel"], dtype=np.float32)
     lengths = np.asarray(arrays["length"], dtype=np.int32)
     style = np.asarray(arrays["style_score"], dtype=np.float32)
     quality = np.asarray(arrays["quality_score"], dtype=np.float32)
@@ -280,8 +285,8 @@ def schedule_one(
                 trans_cost = 0.0
                 if selected:
                     prev = selected[-1]
-                    trans_cost = transition_cost_from_arrays(
-                        exit_pose[prev], exit_vel[prev], entry_pose[idx], entry_vel[idx]
+                    trans_cost = intrinsic_transition_cost_from_arrays(
+                        exit_pose[prev], entry_pose[idx]
                     )
                     transition_len = predict_transition_len(
                         transition_bundle,
@@ -363,15 +368,22 @@ def schedule_one(
     best_score, selected, trans_lengths, _, parts = beam[0]
     pieces: List[np.ndarray] = []
     previous_content: Optional[np.ndarray] = None
+    stage_cursor_xz = np.zeros((2,), dtype=np.float32)
     for slot, idx in enumerate(selected):
         slot_len = task.boundaries[slot + 1] - task.boundaries[slot]
         k = int(trans_lengths[slot]) if slot > 0 else 0
         content_len = max(8, slot_len - k)
         content = resample_motion(motions[idx], content_len)
-        content[:, ROOT_X] = 0.0
-        content[:, ROOT_Z] = 0.0
+        content, _ = canonicalize_event_root_np(content)
+        content, _ = compose_event_root_xz_np(content, stage_cursor_xz)
+        stage_cursor_xz = content[-1, [ROOT_X, ROOT_Z]].astype(np.float32)
         if previous_content is not None and k > 0:
-            rough = make_geodesic_transition(previous_content, content, k)
+            rough = make_so3_transition(
+                previous_content,
+                content,
+                k,
+                fps=float(args.fps),
+            )
             transition = refine_transition(
                 transition_bundle,
                 rough,
@@ -380,14 +392,24 @@ def schedule_one(
                 task.queries[slot],
                 device,
             )
+            transition[:, ROOT_X:ROOT_Z + 1] = rough[:, ROOT_X:ROOT_Z + 1]
+            transition[:, ROT.start:ROT.start + 6] = rough[
+                :, ROT.start:ROT.start + 6
+            ]
+            transition = project_motion_rotations_np(transition)
+            transition, _ = project_transition_floor_np(transition)
+            transition, _ = recompute_transition_contacts_np(
+                transition,
+                fps=float(args.fps),
+                left_contact=previous_content[-1, CONTACT],
+                right_contact=content[0, CONTACT],
+            )
             pieces.append(transition)
         pieces.append(content)
         previous_content = content
 
     motion = np.concatenate(pieces, axis=0).astype(np.float32)
     motion = pad_or_trim_motion(motion, args.num_frames)
-    motion[:, ROOT_X] = 0.0
-    motion[:, ROOT_Z] = 0.0
     if args.start_pose:
         start_path = Path(args.start_pose)
         if start_path.is_file():
@@ -427,6 +449,7 @@ def main() -> None:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--feature_dir", default="")
     ap.add_argument("--num_frames", type=int, default=150)
+    ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--phrase_count", type=int, default=3)
     ap.add_argument("--beam_size", type=int, default=48)
     ap.add_argument("--candidate_top_k", type=int, default=1800)
@@ -455,6 +478,8 @@ def main() -> None:
     ap.add_argument("--max_time_warp", type=float, default=1.45)
     ap.add_argument("--hard_family_unique", action="store_true")
     args = ap.parse_args()
+    if not np.isfinite(args.fps) or float(args.fps) <= 0.0:
+        raise ValueError("--fps must be finite and positive")
 
     paths = [Path(x) for x in args.music]
     if args.music_glob:
@@ -476,6 +501,17 @@ def main() -> None:
     feature_dir = Path(args.feature_dir) if args.feature_dir else out_dir / "music_features"
     index_json = Path(args.index_json).resolve()
     meta, arrays, items = load_shared_index(index_json, Path(args.index_npz))
+    index_rates = sorted(
+        {
+            float(item.get("canonical_fps", meta.get("canonical_fps", -1.0)))
+            for item in items
+        }
+    )
+    if index_rates != [float(args.fps)]:
+        raise RuntimeError(
+            "Multi-music Scheduler FPS mismatch: "
+            f"index={index_rates!r}, runtime={float(args.fps)!r}"
+        )
     motions: List[np.ndarray] = []
     for item in items:
         p = resolve_event_motion_path(item, index_json, metadata=meta)
@@ -529,6 +565,7 @@ def main() -> None:
         "router_ckpt": str(args.router_ckpt),
         "transition_ckpt": str(args.transition_ckpt),
         "num_music": len(tasks),
+        "fps": float(args.fps),
         "weights": {k: v for k, v in vars(args).items() if k.endswith("_weight")},
         "results": {},
     }

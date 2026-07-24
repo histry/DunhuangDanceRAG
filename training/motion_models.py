@@ -50,7 +50,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -749,6 +749,7 @@ class V46Config:
     ik_contact_break_speed_mps: float = 0.54
     ik_hard_contact_lock: bool = True
     ik_hard_contact_min_confidence: float = 0.85
+    ik_contact_ramp_seconds: float = 4.0 / 30.0
     ik_max_delta_rot: float = 0.30
     # V46.4: cloud-step is not a release / continue any more.  Large XZ travel
     # in contact is classified by speed and then mapped to a sliding anchor.
@@ -918,6 +919,7 @@ class V46Config:
             "V46_IK_CLOUD_DIRECTION_COS_MIN": ("ik_cloud_direction_cos_min", float),
             "V46_IK_CLOUD_ROOT_FOOT_REL_MAX_M": ("ik_cloud_root_foot_rel_max_m", float),
             "V46_IK_CHUNK_OVERLAP": ("ik_chunk_overlap", int),
+            "V46_IK_CONTACT_RAMP_SECONDS": ("ik_contact_ramp_seconds", float),
             "V46_IK_POST_STABILIZE_ENABLE": ("ik_post_stabilize_enable", lambda x: bool(int(x))),
             "V46_IK_POST_STABILIZE_PASSES": ("ik_post_stabilize_passes", int),
             "V46_IK_COMMIT_JERK_P95_MAX_MPS3": ("ik_commit_jerk_p95_max_mps3", float),
@@ -3054,7 +3056,7 @@ def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[st
     mp = Path(manifest_path)
     if not mp.exists():
         return []
-    roots: List[Path] = [mp.parent, Path.cwd()]
+    roots: List[Path] = [mp.parent, Path(__file__).resolve().parents[1]]
     for d in motion_dirs or []:
         roots.append(Path(d))
     rows: List[dict] = []
@@ -3973,7 +3975,6 @@ def _resolve_training_motion_path(raw_value: Any, db_path: Path) -> Path:
     candidates = [raw] if raw.is_absolute() else [
         PROJECT_ROOT / raw,
         db_path.parent / raw,
-        Path.cwd() / raw,  # compatibility only
     ]
     checked: List[str] = []
     seen = set()
@@ -6357,6 +6358,38 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
     }
 
 
+def contact_ramp_weights_np(
+    contacts: np.ndarray,
+    *,
+    fps: float,
+    ramp_seconds: float,
+) -> np.ndarray:
+    """Return smooth support weights without changing the binary contact state."""
+
+    state = np.asarray(contacts, dtype=bool)
+    if state.ndim != 2:
+        raise ValueError(f"Expected [T,F] contacts, got {state.shape}")
+    ramp = max(1, int(round(max(float(ramp_seconds), 0.0) * float(fps))))
+    weights = state.astype(np.float32)
+    for foot in range(state.shape[1]):
+        index = 0
+        while index < len(state):
+            if not state[index, foot]:
+                index += 1
+                continue
+            end = index + 1
+            while end < len(state) and state[end, foot]:
+                end += 1
+            for frame in range(index, end):
+                phase_in = min(1.0, (frame - index + 1) / float(ramp))
+                phase_out = min(1.0, (end - frame) / float(ramp))
+                weights[frame, foot] = float(
+                    min(smoothstep01(phase_in), smoothstep01(phase_out))
+                )
+            index = end
+    return weights.astype(np.float32)
+
+
 def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V46Config, root_xz: Optional[np.ndarray] = None) -> Tuple[np.ndarray, dict]:
     """
     Generate V43 lower-body IK targets with a V46.4 sliding-anchor cloud-step guard.
@@ -6560,6 +6593,11 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     contacts0, _, _, _ = derive_contacts_np(motion, cfg)
     motion_base, root_y_report = apply_root_y_c1_physics_np(motion, contacts0, cfg)
     contacts, conf, floor_y, native_foot = derive_contacts_np(motion_base, cfg)
+    contact_ramps = contact_ramp_weights_np(
+        contacts,
+        fps=float(cfg.fps),
+        ramp_seconds=float(cfg.ik_contact_ramp_seconds),
+    )
     targets, target_meta = generate_ik_targets_np(native_foot, contacts, cfg, root_xz=motion_base[:, [ROOT_X_IDX, ROOT_Z_IDX]])
     device = torch.device(cfg.device)
     out_all = motion_base.copy().astype(np.float32)
@@ -6588,6 +6626,7 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
         opt = torch.optim.Adam([lower_rot, root], lr=cfg.ik_lr)
         target = torch.from_numpy(targets[st:ed]).float().to(device)
         contact = torch.from_numpy(contacts[st:ed].astype(np.float32)).float().to(device)
+        contact_ramp = torch.from_numpy(contact_ramps[st:ed]).float().to(device)
         confidence = torch.from_numpy(conf[st:ed]).float().to(device)
         floor = torch.tensor(floor_y, device=device, dtype=torch.float32)
         base_rot = rot_full[:, lower_idx].detach().clone()
@@ -6612,7 +6651,7 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
                 torch.clamp(confidence, min=minimum_confidence),
                 confidence,
             )
-            w = (contact * effective_confidence).unsqueeze(-1)
+            w = (contact * contact_ramp * effective_confidence).unsqueeze(-1)
             foot_loss = ((foot - target) ** 2 * w).sum() / w.sum().clamp_min(1.0)
             pose_loss = F.smooth_l1_loss(rr, base_rot)
             if L > 1:
@@ -6705,10 +6744,15 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
             and audit_stabilized["joint_jerk_mps3_p95"] <= audit_before_stabilize["joint_jerk_mps3_p95"]
             and audit_stabilized["joint_jerk_mps3_max"] <= audit_before_stabilize["joint_jerk_mps3_max"]
         )
-        if passes > 0 and stabilization_safe:
+        if passes > 0:
+            # Local transaction gates below decide which ownership windows may
+            # commit.  Keep the lower-jerk stabilized proposal available even
+            # when a different global window prevents a whole-song commit.
             out_all = stabilized
         post_stabilize_report.update({
-            "applied": bool(passes > 0 and stabilization_safe),
+            "applied": bool(passes > 0),
+            "globally_safe": bool(stabilization_safe),
+            "commit_scope": "local_transaction_candidate",
             "passes": int(passes),
             "safe": bool(stabilization_safe),
             "audit_before": audit_before_stabilize,
@@ -6717,45 +6761,183 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     audit_before = audit_motion_np(motion, cfg)
     audit_after = audit_motion_np(out_all, cfg)
     root_delta = np.linalg.norm(out_all[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]], axis=1)
-    rollback_reasons: List[str] = []
-    if audit_after["foot_skate_mps_p95"] > max(
-        audit_before["foot_skate_mps_p95"] * float(cfg.rollback_skate_ratio),
-        audit_before["foot_skate_mps_p95"] + 0.06,
-    ):
-        rollback_reasons.append("foot_skate_p95_worse")
-    if audit_after["joint_jerk_mps3_p95"] > max(
-        audit_before["joint_jerk_mps3_p95"] * float(cfg.rollback_jerk_ratio),
-        audit_before["joint_jerk_mps3_p95"] + 2.7,
-    ):
-        rollback_reasons.append("joint_jerk_p95_worse")
-    if audit_after["foot_penetration_min_m"] < audit_before["foot_penetration_min_m"] - float(cfg.rollback_penetration_margin_m):
-        rollback_reasons.append("floor_penetration_worse")
-    if root_delta.size and float(root_delta.max()) > float(cfg.rollback_root_delta_max_m):
-        rollback_reasons.append("root_delta_too_large")
-    absolute_commit_reasons: List[str] = []
-    if audit_after["foot_skate_mps_p95"] > float(cfg.ik_commit_skate_p95_max_mps):
-        absolute_commit_reasons.append("absolute_foot_skate_p95")
-    if audit_after["foot_skate_mps_max"] > float(cfg.ik_commit_skate_max_mps):
-        absolute_commit_reasons.append("absolute_foot_skate_max")
-    if audit_after["foot_penetration_min_m"] < float(cfg.ik_commit_penetration_min_m):
-        absolute_commit_reasons.append("absolute_foot_penetration")
-    if audit_after["joint_jerk_mps3_p95"] > float(cfg.ik_commit_jerk_p95_max_mps3):
-        absolute_commit_reasons.append("absolute_joint_jerk_p95")
-    if audit_after["joint_jerk_mps3_max"] > float(cfg.ik_commit_jerk_max_mps3):
-        absolute_commit_reasons.append("absolute_joint_jerk_max")
-    if root_delta.size and float(root_delta.max()) > float(cfg.ik_commit_root_delta_max_m):
-        absolute_commit_reasons.append("absolute_root_delta")
-    # Both relative and absolute gates are mandatory.  An absolute threshold
-    # must never hide a large regression against an already smoother input.
-    rollback = bool(rollback_reasons or absolute_commit_reasons)
-    final = motion.copy() if rollback else out_all
+    def transaction_reasons(
+        before: Mapping[str, Any],
+        after: Mapping[str, Any],
+        maximum_root_delta: float,
+    ) -> Tuple[List[str], List[str]]:
+        relative: List[str] = []
+        if after["foot_skate_mps_p95"] > max(
+            before["foot_skate_mps_p95"] * float(cfg.rollback_skate_ratio),
+            before["foot_skate_mps_p95"] + 0.06,
+        ):
+            relative.append("foot_skate_p95_worse")
+        if after["joint_jerk_mps3_p95"] > max(
+            before["joint_jerk_mps3_p95"] * float(cfg.rollback_jerk_ratio),
+            before["joint_jerk_mps3_p95"] + 2.7,
+        ):
+            relative.append("joint_jerk_p95_worse")
+        if after["foot_penetration_min_m"] < (
+            before["foot_penetration_min_m"]
+            - float(cfg.rollback_penetration_margin_m)
+        ):
+            relative.append("floor_penetration_worse")
+        if maximum_root_delta > float(cfg.rollback_root_delta_max_m):
+            relative.append("root_delta_too_large")
+
+        absolute: List[str] = []
+        if after["foot_skate_mps_p95"] > float(
+            cfg.ik_commit_skate_p95_max_mps
+        ):
+            absolute.append("absolute_foot_skate_p95")
+        if after["foot_skate_mps_max"] > float(cfg.ik_commit_skate_max_mps):
+            absolute.append("absolute_foot_skate_max")
+        if after["foot_penetration_min_m"] < float(
+            cfg.ik_commit_penetration_min_m
+        ):
+            absolute.append("absolute_foot_penetration")
+        if after["joint_jerk_mps3_p95"] > float(
+            cfg.ik_commit_jerk_p95_max_mps3
+        ):
+            absolute.append("absolute_joint_jerk_p95")
+        if after["joint_jerk_mps3_max"] > float(
+            cfg.ik_commit_jerk_max_mps3
+        ):
+            absolute.append("absolute_joint_jerk_max")
+        if maximum_root_delta > float(cfg.ik_commit_root_delta_max_m):
+            absolute.append("absolute_root_delta")
+        return relative, absolute
+
+    rollback_reasons, absolute_commit_reasons = transaction_reasons(
+        audit_before,
+        audit_after,
+        float(root_delta.max()) if root_delta.size else 0.0,
+    )
+
+    # Commit IK by non-overlapping ownership windows.  A bad solve in one
+    # support interval must not discard improvements in unrelated intervals.
+    final = np.asarray(motion, dtype=np.float32).copy()
+    transaction_reports: List[Dict[str, Any]] = []
+    accepted_transactions = 0
+    solved_ranges = [
+        (int(report["start"]), int(report["end"]))
+        for report in reports
+        if int(report["end"]) - int(report["start"]) >= 4
+    ]
+    for transaction_index, (start, end) in enumerate(solved_ranges):
+        own_start = start
+        own_end = end
+        if transaction_index > 0:
+            own_start = min(own_end, own_start + overlap // 2)
+        if transaction_index + 1 < len(solved_ranges) and own_end < T:
+            own_end = max(
+                own_start,
+                own_end - (overlap - overlap // 2),
+            )
+        if own_end - own_start < 4:
+            continue
+        has_contact = bool(np.any(contacts[own_start:own_end]))
+        if not has_contact:
+            transaction_reports.append(
+                {
+                    "start": int(own_start),
+                    "end": int(own_end),
+                    "committed": False,
+                    "reason": "no_contact_in_ownership_window",
+                }
+            )
+            continue
+
+        fade = min(
+            max(2, int(round(3.0 * float(cfg.fps) / 30.0))),
+            max(2, (own_end - own_start) // 4),
+        )
+        weight = np.ones((own_end - own_start, 1), dtype=np.float32)
+        if own_start > 0:
+            weight[:fade, 0] = smoothstep01(
+                np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            )
+        if own_end < T:
+            weight[-fade:, 0] = np.minimum(
+                weight[-fade:, 0],
+                smoothstep01(
+                    np.linspace(1.0, 0.0, fade, dtype=np.float32)
+                ),
+            )
+
+        trial = final.copy()
+        trial[own_start:own_end] = blend_edge151_geodesic_np(
+            final[own_start:own_end],
+            out_all[own_start:own_end],
+            weight,
+        )
+        halo = max(4, int(round(6.0 * float(cfg.fps) / 30.0)))
+        audit_start = max(0, own_start - halo)
+        audit_end = min(T, own_end + halo)
+        before_local = audit_motion_np(final[audit_start:audit_end], cfg)
+        after_local = audit_motion_np(trial[audit_start:audit_end], cfg)
+        local_root_delta = np.linalg.norm(
+            trial[own_start:own_end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+            - final[own_start:own_end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]],
+            axis=1,
+        )
+        relative_reasons, absolute_reasons = transaction_reasons(
+            before_local,
+            after_local,
+            float(local_root_delta.max()) if local_root_delta.size else 0.0,
+        )
+        kbo_reasons: List[str] = []
+        kbo_detail: Dict[str, Any] = {}
+        if (
+            not relative_reasons
+            and not absolute_reasons
+            and callable(globals().get("_v46_41_kbo"))
+        ):
+            kbo_ok, kbo_reasons, kbo_detail = globals()["_v46_41_kbo"](
+                trial[audit_start:audit_end],
+                final[audit_start:audit_end],
+                cfg,
+                stage="ik_local_transaction",
+                global_start=int(audit_start),
+            )
+            if not kbo_ok and not kbo_reasons:
+                kbo_reasons = ["local_kbo_rejected"]
+        committed = (
+            not relative_reasons
+            and not absolute_reasons
+            and not kbo_reasons
+        )
+        if committed:
+            final = trial
+            accepted_transactions += 1
+        transaction_reports.append(
+            {
+                "start": int(own_start),
+                "end": int(own_end),
+                "audit_start": int(audit_start),
+                "audit_end": int(audit_end),
+                "committed": bool(committed),
+                "relative_reasons": relative_reasons,
+                "absolute_reasons": absolute_reasons,
+                "kbo_reasons": kbo_reasons,
+                "kbo_detail": kbo_detail,
+                "root_delta_max_m": float(
+                    local_root_delta.max()
+                    if local_root_delta.size
+                    else 0.0
+                ),
+                "audit_before": before_local,
+                "audit_after": after_local,
+            }
+        )
+    rollback = bool(solved_ranges and accepted_transactions == 0)
     # Contacts are an observation of the final FK state.  Never retain stale
     # logits from the pre-IK/refiner motion after geometry has changed.
     final_contacts, final_confidence, final_floor_y, _ = derive_contacts_np(final, cfg)
     final = final.copy().astype(np.float32)
     final[:, :4] = final_contacts.astype(np.float32)
     report = {
-        "version": "v46_8_true_lower_body_ik_root_aware_sliding_anchor_weighted_chunks_strict_rollback",
+        "version": "v46_9_true_lower_body_ik_contact_ramps_local_transactions",
         "enabled": True,
         "writes_lower_body_rot6d": True,
         "root_y_physics": root_y_report,
@@ -6765,6 +6947,18 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
         "foot_joint_ids": list(map(int, DEFAULT_FOOT_JOINTS)),
         "floor_y": float(floor_y),
         "contact_ratio": float(contacts.mean()),
+        "contact_ramp": {
+            "seconds": float(cfg.ik_contact_ramp_seconds),
+            "frames": int(
+                max(
+                    1,
+                    round(
+                        float(cfg.ik_contact_ramp_seconds) * float(cfg.fps)
+                    ),
+                )
+            ),
+            "mean_weight": float(contact_ramps.mean()),
+        },
         "chunks": reports,
         "chunk_stitching": {
             "mode": "weighted_accumulation",
@@ -6775,11 +6969,24 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
             "coverage_p95": float(np.percentile(weight_sum[:, 0], 95)) if weight_sum.size else 0.0,
         },
         "rollback_policy": {
-            "mode": "or_gated_safety_rollback",
+            "mode": "local_ownership_window_transactions",
             "skate_ratio": float(cfg.rollback_skate_ratio),
             "jerk_ratio": float(cfg.rollback_jerk_ratio),
             "penetration_margin_m": float(cfg.rollback_penetration_margin_m),
             "root_delta_max_m": float(cfg.rollback_root_delta_max_m),
+        },
+        "local_transactions": {
+            "attempted": int(len(transaction_reports)),
+            "accepted": int(accepted_transactions),
+            "rejected": int(
+                sum(
+                    1
+                    for transaction in transaction_reports
+                    if not transaction.get("committed", False)
+                )
+            ),
+            "ownership_overlap_frames": int(overlap),
+            "transactions": transaction_reports,
         },
         "root_delta_max_m": float(root_delta.max()) if root_delta.size else 0.0,
         "root_delta_p95_m": float(np.percentile(root_delta, 95)) if root_delta.size else 0.0,
@@ -8052,10 +8259,48 @@ def true_lower_body_ik(motion, cfg):
     snapshot = np.asarray(motion, dtype=np.float32).copy()
     try:
         out, report = _v46_41_orig_true_lower_body_ik(snapshot.copy(), cfg)
-        out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_IK_STRENGTH", 0.04))
+        local_transactions = dict(report.get("local_transactions", {}))
+        local_mode = str(
+            report.get("rollback_policy", {}).get("mode", "")
+        ) == "local_ownership_window_transactions"
+        # Local transactions have already passed physical and KBO checks with
+        # derivative halos.  A second whole-song stage prior would modify
+        # frames outside those audited ownership windows.
+        if not local_mode:
+            out, _ = _v46_41_apply_stage_prior(
+                out,
+                cfg,
+                strength=_v46_41_env_float(
+                    "V46_41_MSA_IK_STRENGTH", 0.04
+                ),
+            )
         ok, reasons, detail = _v46_41_kbo(out, snapshot, cfg, stage="ik_final", global_start=0)
         if ok:
             _v46_41_add_token({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "committed", "fallback_level": "ik_commit", "kbo_status": "pass", "frames": int(snapshot.shape[0])})
+            return out.astype(np.float32), report
+        if local_mode and int(local_transactions.get("accepted", 0)) > 0:
+            _v46_41_add_token(
+                {
+                    "mechanism": "IK_TGT",
+                    "stage": "ik",
+                    "commit_state": "partially_committed",
+                    "fallback_level": "local_transaction_commit",
+                    "kbo_status": "global_baseline_still_invalid",
+                    "barrier_violations": reasons,
+                    "detail": detail,
+                    "frames": int(snapshot.shape[0]),
+                }
+            )
+            report = dict(report)
+            report["v46_41_global_kbo_after_local_transactions"] = {
+                "ok": False,
+                "reasons": reasons,
+                "detail": detail,
+                "policy": (
+                    "retain_individually_audited_local_commits; "
+                    "do_not_rollback_unrelated_windows"
+                ),
+            }
             return out.astype(np.float32), report
         _v46_41_add_token({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "fk_snapshot_rollback", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
         try:

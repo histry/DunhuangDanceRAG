@@ -6,9 +6,14 @@ from typing import Any
 import numpy as np
 
 from contracts.gravity import fk24_np
-from motion_geometry.smpl24 import CONTACT, FOOT_JOINTS, MOTION_DIM
+from motion_geometry.smpl24 import (
+    CONTACT,
+    FOOT_JOINTS,
+    MOTION_DIM,
+    ROOT_Y_IDX,
+)
 
-PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v1"
+PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v2_root_vertical"
 
 
 def _odd_window(seconds: float, fps: float) -> int:
@@ -104,6 +109,12 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
     contacts = x[:, CONTACT] > 0.5
     skate = foot_speed_mps[contacts]
     floor_y = float(np.percentile(feet[..., 1], 5))
+    root_y = np.asarray(x[:, ROOT_Y_IDX], dtype=np.float32)
+    root_vertical_speed = (
+        np.abs(np.diff(root_y)) * float(fps)
+        if len(root_y) > 1
+        else np.zeros(0, dtype=np.float32)
+    )
 
     def distribution(values: np.ndarray, prefix: str) -> dict[str, float]:
         v = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -123,9 +134,16 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
         "floor_y_m": floor_y,
         "foot_penetration_min_m": float(np.min(feet[..., 1] - floor_y)),
         "contact_ratio": float(np.mean(contacts)),
+        "root_y_range_m": float(np.ptp(root_y)) if root_y.size else 0.0,
+        "root_y_robust_range_m": (
+            float(np.percentile(root_y, 99) - np.percentile(root_y, 1))
+            if root_y.size
+            else 0.0
+        ),
     }
     result.update(distribution(skate, "foot_skate_mps"))
     result.update(distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
     result.update(distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
     result.update(distribution(np.linalg.norm(jerk, axis=-1), "joint_jerk_mps3"))
+    result.update(distribution(root_vertical_speed, "root_vertical_speed_mps"))
     return result

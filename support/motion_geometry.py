@@ -14,7 +14,7 @@ there, and projected back to valid 6D rotations.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Any, Dict, Iterable, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from motion_geometry.rotations import (
 )
 from motion_geometry.smpl24 import (
     CONTACT,
+    FOOT_JOINTS,
     JOINT_NAMES as SMPL_JOINT_NAMES,
     MOTION_DIM,
     NUM_JOINTS,
@@ -178,7 +179,50 @@ def _so3_hermite_rotations(
     # Limit endpoint tangents to avoid large Hermite overshoot.
     max_tangent = torch.linalg.vector_norm(delta, dim=-1, keepdim=True) + 0.35
     m0 = start_velocity * scale
-    m1 = end_velocity * scale
+
+    # ``end_velocity`` is a body tangent at R1, whereas the Hermite polynomial
+    # lives in log coordinates at R0.  Map the requested endpoint derivative
+    # through the inverse SO(3) right Jacobian so the generated curve has the
+    # intended physical angular velocity at u=1.
+    theta = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+    x, y, z = delta.unbind(dim=-1)
+    zero = torch.zeros_like(x)
+    hat = torch.stack(
+        (
+            zero,
+            -z,
+            y,
+            z,
+            zero,
+            -x,
+            -y,
+            x,
+            zero,
+        ),
+        dim=-1,
+    ).reshape(*delta.shape[:-1], 3, 3)
+    theta2 = theta * theta
+    small = theta < 1e-4
+    coefficient = torch.where(
+        small,
+        1.0 / 12.0 + theta2 / 720.0,
+        1.0 / theta2.clamp_min(1e-8)
+        - 1.0
+        / (
+            2.0
+            * theta.clamp_min(1e-8)
+            * torch.tan(0.5 * theta).clamp_min(1e-8)
+        ),
+    )
+    identity = torch.eye(3, dtype=delta.dtype, device=delta.device)
+    identity = identity.expand(*delta.shape[:-1], 3, 3)
+    right_jacobian_inverse = (
+        identity + 0.5 * hat + coefficient[..., None] * torch.matmul(hat, hat)
+    )
+    m1 = torch.matmul(
+        right_jacobian_inverse,
+        (end_velocity * scale).unsqueeze(-1),
+    )[..., 0]
     m0_norm = torch.linalg.vector_norm(m0, dim=-1, keepdim=True).clamp_min(1e-8)
     m1_norm = torch.linalg.vector_norm(m1, dim=-1, keepdim=True).clamp_min(1e-8)
     m0 = m0 * torch.minimum(torch.ones_like(m0_norm), max_tangent / m0_norm)
@@ -201,10 +245,50 @@ def _so3_hermite_rotations(
     return torch.matmul(r0.unsqueeze(0), axis_angle_to_matrix(tangent))
 
 
+def _clip_vector_norm_torch(value: torch.Tensor, maximum: float) -> torch.Tensor:
+    limit = max(float(maximum), 0.0)
+    if limit <= 0.0:
+        return torch.zeros_like(value)
+    norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True).clamp_min(1e-8)
+    return value * torch.minimum(torch.ones_like(norm), value.new_tensor(limit) / norm)
+
+
+def _clip_root_velocity_np(
+    velocity: np.ndarray,
+    *,
+    fps: float,
+    horizontal_speed_cap_mps: float,
+    vertical_speed_cap_mps: float,
+) -> np.ndarray:
+    value = np.asarray(velocity, dtype=np.float32).copy()
+    rate = max(float(fps), 1e-6)
+    horizontal = value[[0, 2]]
+    horizontal_norm = float(np.linalg.norm(horizontal))
+    horizontal_limit = max(float(horizontal_speed_cap_mps), 0.0) / rate
+    if horizontal_norm > horizontal_limit > 0.0:
+        value[[0, 2]] *= horizontal_limit / max(horizontal_norm, 1e-8)
+    elif horizontal_limit <= 0.0:
+        value[[0, 2]] = 0.0
+    value[1] = float(
+        np.clip(
+            value[1],
+            -max(float(vertical_speed_cap_mps), 0.0) / rate,
+            max(float(vertical_speed_cap_mps), 0.0) / rate,
+        )
+    )
+    return value
+
+
 def make_so3_transition(
     prev: np.ndarray,
     nxt: np.ndarray,
     length: int,
+    *,
+    fps: float = 30.0,
+    angular_speed_cap_radps: float = 8.0,
+    root_horizontal_speed_cap_mps: float = 1.5,
+    root_vertical_speed_cap_mps: float = 0.9,
+    root_tangent_margin_m: float = 0.12,
 ) -> np.ndarray:
     """Generate an endpoint-velocity-aware SO(3) transition.
 
@@ -238,6 +322,11 @@ def make_so3_transition(
             )
         else:
             end_v = torch.zeros((NUM_JOINTS, 3), dtype=b_t.dtype)
+        per_frame_angular_cap = max(float(angular_speed_cap_radps), 0.0) / max(
+            float(fps), 1e-6
+        )
+        start_v = _clip_vector_norm_torch(start_v, per_frame_angular_cap)
+        end_v = _clip_vector_norm_torch(end_v, per_frame_angular_cap)
 
         rotations = _so3_hermite_rotations(r0, r1, start_v, end_v, k)
         rot6d = matrix_to_rotation_6d(rotations).reshape(k, NUM_JOINTS * 6)
@@ -251,6 +340,29 @@ def make_so3_transition(
     root1 = b[0, ROOT]
     root_v0 = a[-1, ROOT] - a[-2, ROOT] if len(a) >= 2 else np.zeros((3,), np.float32)
     root_v1 = b[1, ROOT] - b[0, ROOT] if len(b) >= 2 else np.zeros((3,), np.float32)
+    root_v0 = _clip_root_velocity_np(
+        root_v0,
+        fps=fps,
+        horizontal_speed_cap_mps=root_horizontal_speed_cap_mps,
+        vertical_speed_cap_mps=root_vertical_speed_cap_mps,
+    )
+    root_v1 = _clip_root_velocity_np(
+        root_v1,
+        fps=fps,
+        horizontal_speed_cap_mps=root_horizontal_speed_cap_mps,
+        vertical_speed_cap_mps=root_vertical_speed_cap_mps,
+    )
+    root_delta = root1 - root0
+    tangent_limit = float(np.linalg.norm(root_delta)) + max(
+        float(root_tangent_margin_m), 0.0
+    )
+    for velocity in (root_v0, root_v1):
+        tangent = velocity * float(k + 1)
+        tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm > tangent_limit > 0.0:
+            velocity *= tangent_limit / max(tangent_norm, 1e-8)
+        elif tangent_limit <= 0.0:
+            velocity[:] = 0.0
     roots = (
         h00[:, None] * root0[None]
         + h10[:, None] * float(k + 1) * root_v0[None]
@@ -259,15 +371,261 @@ def make_so3_transition(
     )
 
     contact_alpha = smootherstep01(u)[:, None]
-    contacts = (1.0 - contact_alpha) * a[-1, CONTACT][None] + contact_alpha * b[0, CONTACT][None]
+    contacts = np.where(
+        contact_alpha < 0.5,
+        a[-1, CONTACT][None],
+        b[0, CONTACT][None],
+    )
 
     out = np.zeros((k, MOTION_DIM), dtype=np.float32)
     out[:, CONTACT] = contacts
     out[:, ROOT] = roots
     out[:, ROT] = rot6d.cpu().numpy().astype(np.float32)
-    out[:, ROOT_X] = 0.0
-    out[:, ROOT_Z] = 0.0
     return project_motion_rotations_np(out)
+
+
+def canonicalize_event_root_np(
+    motion: np.ndarray,
+    *,
+    target_floor_y: float = 0.0,
+    floor_quantile: float = 5.0,
+    max_floor_penetration_m: float = 0.005,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Localize one event in XZ and align its robust foot floor in Y.
+
+    Only a constant root translation is applied.  Relative stage travel,
+    crouches, kneels, jumps, and every joint rotation remain unchanged.
+    """
+
+    from contracts.gravity import fk24_np
+
+    x = _validate_motion_np(motion).copy()
+    if len(x) == 0:
+        return x, {
+            "source_floor_y_m": float(target_floor_y),
+            "target_floor_y_m": float(target_floor_y),
+            "root_y_offset_m": 0.0,
+            "root_xz_origin_m": [0.0, 0.0],
+        }
+    origin = x[0, [ROOT_X, ROOT_Z]].astype(np.float32).copy()
+    x[:, ROOT_X] -= float(origin[0])
+    x[:, ROOT_Z] -= float(origin[1])
+    joints = fk24_np(x)
+    foot_y = joints[:, list(FOOT_JOINTS), 1]
+    robust_floor = float(
+        np.percentile(foot_y, np.clip(float(floor_quantile), 0.0, 25.0))
+    )
+    # A robust percentile is less sensitive to a single corrupt foot sample,
+    # but using it without a lower-envelope guard can leave an event already
+    # below the stage floor.  Limit that residual with one constant Root-Y
+    # translation; the event's internal crouch/jump profile is untouched.
+    minimum_floor = float(np.min(foot_y))
+    source_floor = min(
+        robust_floor,
+        minimum_floor + max(float(max_floor_penetration_m), 0.0),
+    )
+    offset = float(target_floor_y) - source_floor
+    x[:, ROOT_Y] += offset
+    return x.astype(np.float32), {
+        "source_floor_y_m": source_floor,
+        "robust_floor_y_m": robust_floor,
+        "minimum_foot_y_m": minimum_floor,
+        "target_floor_y_m": float(target_floor_y),
+        "max_floor_penetration_m": float(max_floor_penetration_m),
+        "root_y_offset_m": offset,
+        "root_xz_origin_m": [float(origin[0]), float(origin[1])],
+        "relative_root_xz_travel_m": float(
+            np.linalg.norm(x[-1, [ROOT_X, ROOT_Z]] - x[0, [ROOT_X, ROOT_Z]])
+        ),
+    }
+
+
+def compose_event_root_xz_np(
+    motion: np.ndarray,
+    start_xz: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Translate a localized event so its first XZ equals ``start_xz``."""
+
+    x = _validate_motion_np(motion).copy()
+    start = np.asarray(start_xz, dtype=np.float32).reshape(2)
+    if len(x):
+        delta = start - x[0, [ROOT_X, ROOT_Z]]
+        x[:, ROOT_X] += float(delta[0])
+        x[:, ROOT_Z] += float(delta[1])
+    return x.astype(np.float32), {
+        "stage_start_xz_m": start.tolist(),
+        "stage_end_xz_m": (
+            x[-1, [ROOT_X, ROOT_Z]].astype(float).tolist()
+            if len(x)
+            else start.astype(float).tolist()
+        ),
+    }
+
+
+def event_endpoint_geometry_np(
+    motion: np.ndarray,
+    *,
+    floor_quantile: float = 5.0,
+    window_frames: int = 5,
+) -> Dict[str, float]:
+    """Return floor-relative endpoint state for routing edge decisions."""
+
+    from contracts.gravity import fk24_np
+
+    x = _validate_motion_np(motion)
+    if len(x) == 0:
+        return {
+            "floor_y_m": 0.0,
+            "entry_floor_relative_m": 0.0,
+            "exit_floor_relative_m": 0.0,
+            "entry_root_height_m": 0.0,
+            "exit_root_height_m": 0.0,
+        }
+    joints = fk24_np(x)
+    foot_y = joints[:, list(FOOT_JOINTS), 1]
+    quantile = np.clip(float(floor_quantile), 0.0, 25.0)
+    floor = float(np.percentile(foot_y, quantile))
+    count = max(1, min(int(window_frames), len(x)))
+    entry_floor = float(np.percentile(foot_y[:count], quantile)) - floor
+    exit_floor = float(np.percentile(foot_y[-count:], quantile)) - floor
+    return {
+        "floor_y_m": floor,
+        "entry_floor_relative_m": entry_floor,
+        "exit_floor_relative_m": exit_floor,
+        "entry_root_height_m": float(np.median(x[:count, ROOT_Y]) - floor),
+        "exit_root_height_m": float(np.median(x[-count:, ROOT_Y]) - floor),
+    }
+
+
+def project_transition_floor_np(
+    transition: np.ndarray,
+    *,
+    target_floor_y: float = 0.0,
+    clearance_m: float = 0.002,
+    smoothing_frames: int = 5,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Raise only penetrating bridge frames using a conservative smooth lift."""
+
+    from contracts.gravity import fk24_np
+
+    x = _validate_motion_np(transition).copy()
+    if len(x) == 0:
+        return x, {
+            "applied": False,
+            "max_root_y_correction_m": 0.0,
+            "penetration_before_m": 0.0,
+            "penetration_after_m": 0.0,
+        }
+    feet = fk24_np(x)[:, list(FOOT_JOINTS)]
+    minimum = feet[..., 1].min(axis=1)
+    floor = float(target_floor_y) + max(float(clearance_m), 0.0)
+    required = np.maximum(floor - minimum, 0.0).astype(np.float32)
+    correction = required.copy()
+    window = max(1, int(smoothing_frames))
+    if window % 2 == 0:
+        window += 1
+    if window > 1 and len(x) > 1:
+        radius = window // 2
+        grid = np.arange(-radius, radius + 1, dtype=np.float32)
+        sigma = max(float(radius) / 1.5, 0.8)
+        kernel = np.exp(-0.5 * np.square(grid / sigma))
+        kernel /= np.sum(kernel)
+        padded = np.pad(required, (radius, radius), mode="constant")
+        smoothed = np.convolve(padded, kernel, mode="valid").astype(np.float32)
+        # Never smooth below the exact correction needed to satisfy the floor.
+        correction = np.maximum(required, smoothed)
+    x[:, ROOT_Y] += correction
+    feet_after = fk24_np(x)[:, list(FOOT_JOINTS)]
+    residual = np.maximum(floor - feet_after[..., 1].min(axis=1), 0.0)
+    if np.any(residual > 1e-6):
+        x[:, ROOT_Y] += residual.astype(np.float32)
+        correction += residual.astype(np.float32)
+        feet_after = fk24_np(x)[:, list(FOOT_JOINTS)]
+    return x.astype(np.float32), {
+        "applied": bool(np.any(correction > 1e-7)),
+        "target_floor_y_m": float(target_floor_y),
+        "clearance_m": float(clearance_m),
+        "smoothing_frames": int(window),
+        "max_root_y_correction_m": float(np.max(correction)),
+        "correction_p95_m": float(np.percentile(correction, 95)),
+        "penetration_before_m": float(
+            min(0.0, float(np.min(minimum - float(target_floor_y))))
+        ),
+        "penetration_after_m": float(
+            min(
+                0.0,
+                float(
+                    np.min(
+                        feet_after[..., 1].min(axis=1) - float(target_floor_y)
+                    )
+                ),
+            )
+        ),
+    }
+
+
+def recompute_transition_contacts_np(
+    transition: np.ndarray,
+    *,
+    fps: float,
+    floor_y: float = 0.0,
+    left_contact: np.ndarray | None = None,
+    right_contact: np.ndarray | None = None,
+    ramp_seconds: float = 4.0 / 30.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Rebuild bridge contacts from FK and soften only support on/off edges."""
+
+    from contracts.gravity import fk24_np
+    from motion_geometry.physical import contact_from_joints_np
+
+    x = _validate_motion_np(transition).copy()
+    if len(x) == 0:
+        return x, {"contact_ratio": 0.0, "ramp_frames": 0}
+    binary = contact_from_joints_np(
+        fk24_np(x),
+        fps=float(fps),
+        floor_y=float(floor_y),
+    )
+    left = (
+        np.asarray(left_contact, dtype=np.float32).reshape(4) > 0.5
+        if left_contact is not None
+        else np.zeros((4,), dtype=bool)
+    )
+    right = (
+        np.asarray(right_contact, dtype=np.float32).reshape(4) > 0.5
+        if right_contact is not None
+        else np.zeros((4,), dtype=bool)
+    )
+    ramp = max(1, int(round(max(float(ramp_seconds), 0.0) * float(fps))))
+    weights = binary.astype(np.float32)
+    for foot in range(binary.shape[1]):
+        index = 0
+        while index < len(binary):
+            if not binary[index, foot]:
+                index += 1
+                continue
+            end = index + 1
+            while end < len(binary) and binary[end, foot]:
+                end += 1
+            for frame in range(index, end):
+                in_phase = 1.0 if index == 0 and left[foot] else min(
+                    1.0, (frame - index + 1) / float(ramp)
+                )
+                out_phase = 1.0 if end == len(binary) and right[foot] else min(
+                    1.0, (end - frame) / float(ramp)
+                )
+                weights[frame, foot] = float(
+                    min(smootherstep01(in_phase), smootherstep01(out_phase))
+                )
+            index = end
+    x[:, CONTACT] = weights
+    return x.astype(np.float32), {
+        "contact_ratio": float(np.mean(weights > 0.5)),
+        "contact_confidence_mean": float(np.mean(weights)),
+        "ramp_frames": int(ramp),
+        "left_contact": left.astype(int).tolist(),
+        "right_contact": right.astype(int).tolist(),
+    }
 
 
 def resample_motion_so3_np(motion: np.ndarray, positions: np.ndarray) -> np.ndarray:
@@ -311,8 +669,6 @@ def dampen_event_edges_so3(
     positions[start:] = right_map
 
     result = resample_motion_so3_np(x, positions)
-    result[:, ROOT_X] = 0.0
-    result[:, ROOT_Z] = 0.0
     return result.astype(np.float32)
 
 
@@ -321,31 +677,21 @@ def apply_start_anchor_so3(
     start_pose: np.ndarray,
     blend_frames: int = 8,
 ) -> np.ndarray:
+    """Apply one constant stage-XZ translation and nothing else.
+
+    ``blend_frames`` is retained for API compatibility with old checkpoints
+    and launchers.  A start anchor must not overwrite pose, Root-Y, contacts or
+    any frame-relative trajectory; those are event content contracts.
+    """
     x = _validate_motion_np(motion).copy()
     s = np.asarray(start_pose, dtype=np.float32).reshape(-1)
     if s.shape[0] != MOTION_DIM or len(x) == 0:
         return x
-    count = max(1, min(int(blend_frames), len(x)))
-    original = x[:count].copy()
-    anchor_sequence = np.repeat(s[None], count, axis=0)
-
-    with torch.no_grad():
-        anchor_m = motion_rotation_matrices_torch(torch.from_numpy(anchor_sequence))
-        orig_m = motion_rotation_matrices_torch(torch.from_numpy(original))
-        relative = torch.matmul(anchor_m.transpose(-1, -2), orig_m)
-        tangent = matrix_to_axis_angle(relative)
-        alpha = torch.from_numpy(
-            smootherstep01(np.linspace(0.0, 1.0, count, dtype=np.float32))
-        )[:, None, None]
-        interp = torch.matmul(anchor_m, axis_angle_to_matrix(alpha * tangent))
-        x[:count, ROT] = matrix_to_rotation_6d(interp).reshape(count, -1).cpu().numpy()
-
-    weights = smootherstep01(np.linspace(0.0, 1.0, count, dtype=np.float32))
-    x[:count, ROOT_Y] = (1.0 - weights) * s[ROOT_Y] + weights * original[:, ROOT_Y]
-    x[0, CONTACT] = s[CONTACT]
-    x[:, ROOT_X] = 0.0
-    x[:, ROOT_Z] = 0.0
-    return project_motion_rotations_np(x)
+    del blend_frames
+    stage_offset = s[[ROOT_X, ROOT_Z]] - x[0, [ROOT_X, ROOT_Z]]
+    x[:, ROOT_X] += float(stage_offset[0])
+    x[:, ROOT_Z] += float(stage_offset[1])
+    return x.astype(np.float32)
 
 
 def temporal_so3_filter_np(
@@ -400,8 +746,6 @@ def temporal_so3_filter_np(
     ).astype(np.float32)
     if preserve_contacts:
         out[:, CONTACT] = x[:, CONTACT]
-    out[:, ROOT_X] = 0.0
-    out[:, ROOT_Z] = 0.0
     return project_motion_rotations_np(out)
 
 

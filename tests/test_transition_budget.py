@@ -49,6 +49,9 @@ class TransitionBudgetTests(unittest.TestCase):
                 "joint_jerk_mps3_p95": 270.0,
                 "joint_jerk_mps3_max": 540.0,
                 "root_y_range_m": 0.20,
+                "root_y_robust_range_m": 0.20,
+                "root_vertical_speed_mps_p95": 0.30,
+                "root_vertical_speed_mps_max": 0.80,
             }
         )
         self.assertFalse(result["ok"])
@@ -63,6 +66,9 @@ class TransitionBudgetTests(unittest.TestCase):
                 "joint_jerk_mps3_p95": 270.0,
                 "joint_jerk_mps3_max": 3240.0,
                 "root_y_range_m": 0.20,
+                "root_y_robust_range_m": 0.20,
+                "root_vertical_speed_mps_p95": 0.30,
+                "root_vertical_speed_mps_max": 0.80,
             }
         )
         self.assertFalse(result["ok"])
@@ -77,9 +83,37 @@ class TransitionBudgetTests(unittest.TestCase):
                 "joint_jerk_mps3_p95": 145.8,
                 "joint_jerk_mps3_max": 972.0,
                 "root_y_range_m": 0.35,
+                "root_y_robust_range_m": 0.34,
+                "root_vertical_speed_mps_p95": 0.45,
+                "root_vertical_speed_mps_max": 1.20,
             }
         )
         self.assertTrue(result["ok"], result["reasons"])
+
+    def test_physical_gate_preserves_legitimate_posture_range_but_rejects_root_spike(self):
+        stable_posture_change = {
+            "foot_skate_mps_p95": 0.06,
+            "foot_skate_mps_max": 0.30,
+            "foot_penetration_min_m": -0.01,
+            "joint_jerk_mps3_p95": 270.0,
+            "joint_jerk_mps3_max": 540.0,
+            "root_y_range_m": 0.78,
+            "root_y_robust_range_m": 0.72,
+            "root_vertical_speed_mps_p95": 0.55,
+            "root_vertical_speed_mps_max": 1.40,
+        }
+        self.assertTrue(
+            physical_quality_gate(stable_posture_change)["ok"],
+            physical_quality_gate(stable_posture_change)["reasons"],
+        )
+        spiking = dict(stable_posture_change)
+        spiking["root_vertical_speed_mps_max"] = 8.0
+        result = physical_quality_gate(spiking)
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "root_vertical_speed_mps_max_too_high",
+            result["reasons"],
+        )
 
 
 if __name__ == "__main__":

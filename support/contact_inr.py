@@ -46,7 +46,6 @@ from support.motion_geometry import (
     ROOT_Y,
     ROOT_Z,
     ROT,
-    project_motion_rotations_torch,
 )
 
 
@@ -68,6 +67,19 @@ class V32INRConfig:
     contact_logit_scale: float = 3.0
     max_len: int = 120
     dropout: float = 0.08
+
+
+def _project_native_motion_torch(motion: torch.Tensor) -> torch.Tensor:
+    """Project the historical model's PyTorch3D-row Rot6D channels."""
+
+    rotations = motion[..., ROT].reshape(*motion.shape[:-1], NUM_JOINTS, 6)
+    matrices = rotation_6d_to_matrix(rotations)
+    out = motion.clone()
+    out[..., ROT] = matrix_to_rotation_6d(matrices).reshape(
+        *motion.shape[:-1],
+        NUM_JOINTS * 6,
+    )
+    return out
 
 
 def config_from_dict(values: Dict[str, object]) -> V32INRConfig:
@@ -136,8 +148,8 @@ def c2_quintic_so3_base(
 
     r0 = _rotation(start)
     r1 = _rotation(end)
-    start_next = project_motion_rotations_torch(start + start_velocity)
-    end_prev = project_motion_rotations_torch(end - end_velocity)
+    start_next = _project_native_motion_torch(start + start_velocity)
+    end_prev = _project_native_motion_torch(end - end_velocity)
     rs = _rotation(start_next)
     re = _rotation(end_prev)
 
@@ -198,8 +210,9 @@ def c2_quintic_so3_base(
         + root_a4[:, None] * ur**4
         + root_a5[:, None] * ur**5
     )
-    root[..., ROOT_X - ROOT.start] = 0.0
-    root[..., ROOT_Z - ROOT.start] = 0.0
+    # Root XZ belongs to the cumulative world trajectory.  Retain the
+    # endpoint-velocity-aware Hermite path so transition proposals and their
+    # physical audits operate in the same coordinate contract.
 
     smooth = quintic_smootherstep(t)
     start_logits = _safe_contact_logit(start[..., CONTACT])[:, None]
@@ -538,8 +551,8 @@ class V32ContactINRSystem(torch.nn.Module):
             batch = start.shape[0]
             r0 = _rotation(start)
             r1 = _rotation(end)
-            rs = _rotation(project_motion_rotations_torch(start + start_velocity))
-            re = _rotation(project_motion_rotations_torch(end - end_velocity))
+            rs = _rotation(_project_native_motion_torch(start + start_velocity))
+            re = _rotation(_project_native_motion_torch(end - end_velocity))
             zeros_w = start.new_zeros((batch, NUM_JOINTS, 3))
             zeros_r = start.new_zeros((batch, 3))
             boundary_state = {
@@ -579,7 +592,7 @@ class V32ContactINRSystem(torch.nn.Module):
         root[..., 1:2] += residual_root_y
         root[..., 0] = 0.0
         root[..., 2] = 0.0
-        motion = project_motion_rotations_torch(
+        motion = _project_native_motion_torch(
             torch.cat([contacts, root, rot6d], dim=-1)
         )
         if return_aux:
