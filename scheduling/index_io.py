@@ -213,7 +213,7 @@ def load_shared_index(
                     )
         if invalid_postures:
             raise RuntimeError(
-                "Scheduler index schema v4 requires explicit valid posture "
+                "Scheduler index schema v5 requires explicit valid posture "
                 f"endpoints; examples={invalid_postures[:8]}: {metadata_path}"
             )
     if schema in {

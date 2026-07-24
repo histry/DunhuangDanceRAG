@@ -53,6 +53,15 @@ EVENT_TYPE_MAP = {
     "release": "release",
 }
 
+VALID_POSTURE_STATES = {
+    "floor_pose",
+    "kneeling",
+    "deep_squat",
+    "half_squat",
+    "standing",
+    "aerial",
+}
+
 
 def _db_dict(path: Path) -> dict[str, Any]:
     source = np.load(path, allow_pickle=True)
@@ -170,6 +179,23 @@ def build_generation_index(
         raise RuntimeError(
             f"One Scheduler index cannot mix canonical frame rates: {fps_values}"
         )
+    for field, values in (
+        ("posture_entry", posture_entry),
+        ("posture_exit", posture_exit),
+        ("posture_mode", posture_mode),
+    ):
+        invalid = [
+            {"event": index, "value": str(value)}
+            for index, value in enumerate(values)
+            if str(value) not in VALID_POSTURE_STATES
+        ]
+        if invalid:
+            raise RuntimeError(
+                "Generation DB must provide explicit valid posture state fields "
+                "before building the v5 product-state Scheduler Index; "
+                f"field={field!r}, examples={invalid[:8]}. Rebuild the Event-DB "
+                "and Anatomy/AESD enrichment with the current code."
+            )
     source_start_seconds = np.asarray(
         db.get("source_start_seconds", starts / canonical_fps), dtype=np.float64
     )

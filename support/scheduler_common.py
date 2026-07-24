@@ -15,6 +15,7 @@ from support.common import (
     make_geodesic_transition,
     make_linear_transition,
     motion_boundary_metrics,
+    posture_state_distance,
     transition_cost_from_arrays,
 )
 
@@ -34,5 +35,6 @@ __all__ = [
     "make_geodesic_transition",
     "make_linear_transition",
     "motion_boundary_metrics",
+    "posture_state_distance",
     "transition_cost_from_arrays",
 ]
