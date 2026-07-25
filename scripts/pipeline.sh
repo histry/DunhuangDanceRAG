@@ -157,6 +157,19 @@ else
   GENERATION_DB="$TRAIN_AESD"
 fi
 
+if [[ "${SEMANTIC_OT_ENABLE:-0}" == "1" ]]; then
+  SEMANTIC_OT_GENERATION_DB="${SEMANTIC_OT_GENERATION_DB:-}"
+  SEMANTIC_OT_GROUNDER_CKPT="${SEMANTIC_OT_GROUNDER_CKPT:-}"
+  require_file "$SEMANTIC_OT_GENERATION_DB"     "semantic-OT embedded generation Event-DB"
+  require_file "$SEMANTIC_OT_GROUNDER_CKPT"     "semantic-OT mixed-curvature Grounder checkpoint"
+  GENERATION_DB="$SEMANTIC_OT_GENERATION_DB"
+  export V46_53_GROUNDER_ARCHITECTURE="mixed"
+  export V46_53_GROUNDER_CKPT="$SEMANTIC_OT_GROUNDER_CKPT"
+  export V46_53_MIXED_REQUIRE_RUNTIME_AUDIO="1"
+  echo "[SEMANTIC OT] Generation DB: $GENERATION_DB"
+  echo "[SEMANTIC OT] Grounder: $V46_53_GROUNDER_CKPT"
+fi
+
 echo "========== 6C. BUILD GENERATION-ALIGNED SCHEDULER INDEX =========="
 ALIGNED_SCHEDULER_DIR="$OUT_ROOT/scheduler_generation_assets"
 ALIGNED_INDEX_JSON="$ALIGNED_SCHEDULER_DIR/event_index.json"

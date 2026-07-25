@@ -625,7 +625,7 @@ DANCE_KEY_TO_MUSIC_LABEL = {
 EVENT_FAMILY_TO_MUSIC_LABEL = {
     "calm_flow": "calm_meditative",
     "pose_motif": "pose_hold",
-    "aerial_curve": "lyrical_flow",
+    "aerial_curve": "aerial_curve",
     "instrument_motif": "instrument_phrase",
     "percussive_accent": "percussive_accent",
     "turning_flow": "turning_climax",
@@ -716,6 +716,102 @@ def normalize_vector(vec: np.ndarray, default: str = "lyrical_flow") -> np.ndarr
     return v.astype(np.float32)
 
 
+
+
+AESD_EVIDENCE_WEIGHTS: Dict[str, float] = {
+    "explicit_alignment": 0.25,
+    "dance_key": 0.20,
+    "event_family": 0.25,
+    "dynamic_attributes": 0.20,
+    "low_level_descriptor": 0.10,
+}
+
+
+def _normalized_hint_vector(labels: Any, weight: float) -> np.ndarray:
+    if labels is None:
+        labels = []
+    if not isinstance(labels, (list, tuple, set)):
+        labels = [labels]
+    canonical = []
+    for label in labels:
+        text = str(label or "").strip()
+        if not text or text == "unknown":
+            continue
+        value = canonical_music_label(text)
+        if value in MUSIC_SEMANTIC_LABELS and value not in canonical:
+            canonical.append(value)
+    vector = np.zeros((len(MUSIC_SEMANTIC_LABELS),), dtype=np.float32)
+    if not canonical:
+        return vector
+    share = float(weight) / len(canonical)
+    for label in canonical:
+        vector[MUSIC_SEMANTIC_LABELS.index(label)] += share
+    return vector
+
+
+def _descriptor_semantic_hint(desc: Optional[np.ndarray]) -> np.ndarray:
+    vector = np.zeros((len(MUSIC_SEMANTIC_LABELS),), dtype=np.float32)
+    if desc is None:
+        return vector
+    value = np.asarray(desc, dtype=np.float32).reshape(-1)
+    if value.size > 30:
+        calm = max(0.0, float(value[28]))
+        percussive = max(0.0, float(value[29]))
+        turning = max(0.0, float(value[30]))
+        vector += _normalized_hint_vector(
+            ["calm_meditative", "pose_hold"], calm
+        )
+        vector += _normalized_hint_vector(
+            ["percussive_accent", "instrument_phrase"], percussive
+        )
+        vector += _normalized_hint_vector(
+            ["turning_climax", "footwork_flow"], turning
+        )
+    if value.size > 18 and (float(value[16]) > 0.08 or float(value[17]) > 0.08):
+        vector += _normalized_hint_vector(
+            ["percussive_accent", "turning_climax"], 0.25
+        )
+    if float(vector.sum()) > 1.0e-8:
+        vector /= float(vector.sum())
+    return vector
+
+
+def semantic_distribution_diagnostics(
+    probabilities: np.ndarray,
+    ambiguity_margin: float = 0.08,
+) -> Dict[str, Any]:
+    vector = normalize_vector(probabilities)
+    order = np.argsort(-vector, kind="stable")
+    top = int(order[0])
+    second = int(order[1]) if len(order) > 1 else top
+    entropy = float(
+        -(vector * np.log(vector + 1.0e-8)).sum()
+        / max(math.log(len(vector)), 1.0e-8)
+    )
+    margin = float(vector[top] - vector[second])
+    return {
+        "top_label": MUSIC_SEMANTIC_LABELS[top],
+        "secondary_label": MUSIC_SEMANTIC_LABELS[second],
+        "normalized_entropy": entropy,
+        "top2_margin": margin,
+        "ambiguous": bool(margin < float(ambiguity_margin)),
+    }
+
+
+def class_prior_adjustment(
+    probabilities: np.ndarray,
+    class_prior: np.ndarray,
+    alpha: float = 0.35,
+) -> np.ndarray:
+    vector = normalize_vector(probabilities).astype(np.float64)
+    prior = normalize_vector(class_prior).astype(np.float64)
+    strength = float(np.clip(alpha, 0.0, 1.0))
+    logits = np.log(vector + 1.0e-8) - strength * np.log(prior + 1.0e-8)
+    logits -= float(np.max(logits))
+    adjusted = np.exp(logits)
+    return normalize_vector(adjusted)
+
+
 def event_probs_from_fields(
     *,
     dance_key: Any = "unknown",
@@ -729,48 +825,69 @@ def event_probs_from_fields(
     semantic_confidence: float = 0.5,
     desc: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Soft action-to-music response distribution for AESD.
+    """Grouped-evidence action-to-music response distribution for AESD.
 
-    The vector is not a single hard label.  It fuses cultural class, event family,
-    existing music_alignment label, energy/rhythm/locomotion/support, and low-level
-    motion descriptor hints.  This keeps the action side symmetric with MSSD.
+    Correlated dynamic fields are normalized inside one evidence group instead
+    of being added as independent votes.  This prevents turning/high-energy
+    metadata from receiving the same physical evidence four or five times.
     """
-    vec = np.zeros((len(MUSIC_SEMANTIC_LABELS),), dtype=np.float32)
-    dk = str(dance_key or "unknown")
-    fam = str(event_family or "unknown")
-    align = str(music_alignment_label or "unknown")
-    if align and align != "unknown":
-        add_hint(vec, align, 1.20)
-    if dk in DANCE_KEY_TO_MUSIC_LABEL:
-        add_hint(vec, DANCE_KEY_TO_MUSIC_LABEL[dk], 0.95)
+    groups: List[np.ndarray] = []
+
+    alignment = str(music_alignment_label or "unknown")
+    if alignment != "unknown":
+        groups.append(
+            _normalized_hint_vector(
+                [alignment], AESD_EVIDENCE_WEIGHTS["explicit_alignment"]
+            )
+        )
+
+    dance = str(dance_key or "unknown")
+    dance_label = DANCE_KEY_TO_MUSIC_LABEL.get(dance, dance)
+    if dance != "unknown":
+        groups.append(
+            _normalized_hint_vector(
+                [dance_label], AESD_EVIDENCE_WEIGHTS["dance_key"]
+            )
+        )
+
+    family = str(event_family or "unknown")
+    family_label = EVENT_FAMILY_TO_MUSIC_LABEL.get(family, family)
+    if family != "unknown":
+        groups.append(
+            _normalized_hint_vector(
+                [family_label], AESD_EVIDENCE_WEIGHTS["event_family"]
+            )
+        )
+
+    dynamic_hints: List[str] = []
+    dynamic_hints.extend(ENERGY_TO_MUSIC_HINT.get(str(energy_label or ""), []))
+    dynamic_hints.extend(RHYTHM_TO_MUSIC_HINT.get(str(rhythm_label or ""), []))
+    dynamic_hints.extend(LOCO_TO_MUSIC_HINT.get(str(locomotion_label or ""), []))
+    dynamic_hints.extend(SUPPORT_TO_MUSIC_HINT.get(str(support_label or ""), []))
+    if dynamic_hints:
+        groups.append(
+            _normalized_hint_vector(
+                dynamic_hints, AESD_EVIDENCE_WEIGHTS["dynamic_attributes"]
+            )
+        )
+
+    descriptor = _descriptor_semantic_hint(desc)
+    if float(descriptor.sum()) > 1.0e-8:
+        groups.append(
+            descriptor * AESD_EVIDENCE_WEIGHTS["low_level_descriptor"]
+        )
+
+    if groups:
+        vector = np.sum(groups, axis=0)
     else:
-        add_hint(vec, dk, 0.45)
-    if fam in EVENT_FAMILY_TO_MUSIC_LABEL:
-        add_hint(vec, EVENT_FAMILY_TO_MUSIC_LABEL[fam], 0.90)
-    else:
-        add_hint(vec, fam, 0.35)
-    add_hint(vec, ENERGY_TO_MUSIC_HINT.get(str(energy_label or ""), []), 0.28)
-    add_hint(vec, RHYTHM_TO_MUSIC_HINT.get(str(rhythm_label or ""), []), 0.24)
-    add_hint(vec, LOCO_TO_MUSIC_HINT.get(str(locomotion_label or ""), []), 0.28)
-    add_hint(vec, SUPPORT_TO_MUSIC_HINT.get(str(support_label or ""), []), 0.18)
-    if desc is not None:
-        d = np.asarray(desc, dtype=np.float32).reshape(-1)
-        # Descriptor channels are coarse but stable: duration/root energy/onset/turn bits.
-        if d.size > 30:
-            if float(d[28]) > 0.35:
-                add_hint(vec, ["calm_meditative", "pose_hold"], 0.20 * float(d[28]))
-            if float(d[29]) > 0.25:
-                add_hint(vec, ["percussive_accent", "instrument_phrase"], 0.22 * float(d[29]))
-            if float(d[30]) > 0.25:
-                add_hint(vec, ["turning_climax", "footwork_flow"], 0.22 * float(d[30]))
-        if d.size > 18:
-            if float(d[16]) > 0.08 or float(d[17]) > 0.08:
-                add_hint(vec, ["percussive_accent", "turning_climax"], 0.18)
+        vector = one_hot_music("lyrical_flow")
+    vector = normalize_vector(vector)
+
     q = float(np.clip(float(quality), 0.0, 1.0))
-    c = float(np.clip(float(semantic_confidence), 0.0, 1.0))
-    # Low confidence pushes distribution softer rather than zeroing it.
-    vec = vec * (0.55 + 0.30 * q + 0.15 * c)
-    return normalize_vector(vec)
+    confidence = float(np.clip(float(semantic_confidence), 0.0, 1.0))
+    reliability = float(np.clip(0.55 + 0.30 * q + 0.15 * confidence, 0.55, 1.0))
+    uniform = np.full_like(vector, 1.0 / len(vector))
+    return normalize_vector(reliability * vector + (1.0 - reliability) * uniform)
 
 
 def vector_to_prob_dict(vec: np.ndarray) -> Dict[str, float]:
@@ -790,6 +907,59 @@ def stage_affordance_from_probs(vec: np.ndarray, explicit_stage: Any = None) -> 
     return list(dict.fromkeys([x for x in out if x]))
 
 
+def intrinsic_transition_prior_from_arrays(
+    entry: Optional[np.ndarray],
+    exit_: Optional[np.ndarray],
+    contact_entry: Optional[np.ndarray],
+    contact_exit: Optional[np.ndarray],
+    duration: float,
+    quality: float,
+    locomotion_label: Any = "unknown",
+    support_label: Any = "unknown",
+    low_threshold: float = 0.35,
+    high_threshold: float = 0.65,
+) -> Tuple[float, str]:
+    """Event-local transition prior, not an event-to-event boundary score."""
+    risk = 0.0
+    try:
+        entry_value = np.asarray(entry, dtype=np.float32).reshape(-1)
+        exit_value = np.asarray(exit_, dtype=np.float32).reshape(-1)
+        if entry_value.size >= 144 and exit_value.size >= 144:
+            pose_gap = float(np.mean((exit_value[:72] - entry_value[:72]) ** 2))
+            velocity = float(
+                np.mean(np.abs(exit_value[72:144]))
+                + np.mean(np.abs(entry_value[72:144]))
+            )
+            risk += float(np.clip(pose_gap * 4.0 + velocity * 2.5, 0.0, 0.55))
+    except Exception:
+        pass
+    try:
+        contact0 = np.asarray(contact_entry, dtype=np.float32).reshape(-1)
+        contact1 = np.asarray(contact_exit, dtype=np.float32).reshape(-1)
+        count = min(len(contact0), len(contact1))
+        if count:
+            risk += 0.20 * float(np.mean(np.abs(contact1[:count] - contact0[:count])))
+    except Exception:
+        pass
+    if str(locomotion_label) in {"turning_travel", "accented_travel", "traveling_steps"}:
+        risk += 0.04
+    if str(support_label) in {"low_contact_flight_like", "alternating_or_pivot_support"}:
+        risk += 0.04
+    if float(duration) < 1.2:
+        risk += 0.05
+    risk += max(0.0, 0.45 - float(quality)) * 0.12
+    risk = float(np.clip(risk, 0.0, 1.0))
+    if not 0.0 < float(low_threshold) < float(high_threshold) < 1.0:
+        raise ValueError("Intrinsic-risk thresholds must satisfy 0 < low < high < 1")
+    if risk < float(low_threshold):
+        profile = "low"
+    elif risk < float(high_threshold):
+        profile = "medium"
+    else:
+        profile = "high"
+    return risk, profile
+
+
 def boundary_risk_from_arrays(
     entry: Optional[np.ndarray],
     exit_: Optional[np.ndarray],
@@ -800,38 +970,17 @@ def boundary_risk_from_arrays(
     locomotion_label: Any = "unknown",
     support_label: Any = "unknown",
 ) -> Tuple[float, str]:
-    risk = 0.0
-    try:
-        e = np.asarray(entry, dtype=np.float32).reshape(-1)
-        x = np.asarray(exit_, dtype=np.float32).reshape(-1)
-        if e.size >= 144 and x.size >= 144:
-            pose_gap = float(np.mean((x[:72] - e[:72]) ** 2))
-            vel_mag = float(np.mean(np.abs(x[72:144])) + np.mean(np.abs(e[72:144])))
-            risk += np.clip(pose_gap * 5.0 + vel_mag * 3.0, 0.0, 0.55)
-    except Exception:
-        pass
-    try:
-        c0 = np.asarray(contact_entry, dtype=np.float32).reshape(-1)
-        c1 = np.asarray(contact_exit, dtype=np.float32).reshape(-1)
-        if c0.size and c1.size:
-            risk += 0.25 * float(np.mean(np.abs(c1[: min(len(c0), len(c1))] - c0[: min(len(c0), len(c1))])))
-    except Exception:
-        pass
-    if str(locomotion_label) in {"turning_travel", "accented_travel", "traveling_steps"}:
-        risk += 0.12
-    if str(support_label) in {"low_contact_flight_like", "alternating_or_pivot_support"}:
-        risk += 0.10
-    if float(duration) < 1.2:
-        risk += 0.08
-    risk += max(0.0, 0.45 - float(quality)) * 0.20
-    risk = float(np.clip(risk, 0.0, 1.0))
-    if risk < 0.28:
-        prof = "low"
-    elif risk < 0.58:
-        prof = "medium"
-    else:
-        prof = "high"
-    return risk, prof
+    """Backward-compatible alias for the intrinsic event-local prior."""
+    return intrinsic_transition_prior_from_arrays(
+        entry,
+        exit_,
+        contact_entry,
+        contact_exit,
+        duration,
+        quality,
+        locomotion_label=locomotion_label,
+        support_label=support_label,
+    )
 
 
 def get_db_array(db: Dict[str, Any], key: str, n: int, default: Any, dtype: Any = object) -> np.ndarray:
