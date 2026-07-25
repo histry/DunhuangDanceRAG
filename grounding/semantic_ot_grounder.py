@@ -242,6 +242,35 @@ def _expected_calibration_loss(
     return (expected * confidence).sum() / confidence.sum().clamp_min(EPS)
 
 
+
+def _weighted_gaussian_anchor(
+    gaussian_per_part: "torch.Tensor",
+    candidate_weight: "torch.Tensor",
+) -> "torch.Tensor":
+    """Reduce body-part Gaussian distances before OT candidate weighting."""
+    if gaussian_per_part.ndim < 1:
+        raise RuntimeError(
+            "Gaussian anchor distance must contain a candidate dimension"
+        )
+
+    weights = candidate_weight.reshape(-1).clamp_min(1.0e-6)
+
+    if gaussian_per_part.shape[0] != weights.shape[0]:
+        raise RuntimeError(
+            "Gaussian candidate count does not match OT candidate weights: "
+            f"{tuple(gaussian_per_part.shape)} vs {tuple(weights.shape)}"
+        )
+
+    # gaussian_per_part is normally [num_candidates, num_body_parts].
+    # Aggregate body-part geometry first, producing one loss per candidate.
+    gaussian_per_row = gaussian_per_part.reshape(
+        weights.shape[0], -1
+    ).mean(dim=-1)
+
+    return (
+        gaussian_per_row * weights
+    ).sum() / weights.sum().clamp_min(EPS)
+
 def _batch_loss(
     model: "MixedCurvatureGrounder",
     batch: Sequence["torch.Tensor"],
@@ -324,7 +353,7 @@ def _batch_loss(
     hierarchy = _hierarchy_loss(
         motion, family_ids, model.curvature, hierarchy_margin
     )
-    gaussian_per_row = gaussian_wasserstein_distance_sq_torch(
+    gaussian_per_part = gaussian_wasserstein_distance_sq_torch(
         motion["gaussian_mean"],
         motion["gaussian_covariance"],
         gaussian_mean,
@@ -332,9 +361,10 @@ def _batch_loss(
         model.config.minimum_covariance,
     )
     candidate_weight = pair_weights.reshape(-1).clamp_min(1.0e-6)
-    gaussian_anchor = (
-        gaussian_per_row * candidate_weight
-    ).sum() / candidate_weight.sum().clamp_min(EPS)
+    gaussian_anchor = _weighted_gaussian_anchor(
+        gaussian_per_part,
+        candidate_weight,
+    )
     phrase_controls = (pair_weights[..., None] * controls_group).sum(dim=1)
     motion_control_rows = F.smooth_l1_loss(
         motion["euclidean"], controls, reduction="none"

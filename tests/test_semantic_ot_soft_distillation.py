@@ -51,5 +51,45 @@ class SemanticOTSoftDistillationTests(unittest.TestCase):
         self.assertGreater(float(target[1, 1]), float(target[1, 0]))
 
 
+    def test_gaussian_body_parts_reduce_before_candidate_weighting(self):
+        from grounding.semantic_ot_grounder import (
+            _weighted_gaussian_anchor,
+        )
+
+        gaussian_per_part = torch.tensor(
+            [
+                [1.0, 2.0, 3.0, 4.0, 5.0],
+                [2.0, 4.0, 6.0, 8.0, 10.0],
+            ],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        candidate_weight = torch.tensor(
+            [0.25, 0.75],
+            dtype=torch.float32,
+        )
+
+        loss = _weighted_gaussian_anchor(
+            gaussian_per_part,
+            candidate_weight,
+        )
+
+        expected = (
+            gaussian_per_part.mean(dim=-1)
+            * candidate_weight
+        ).sum() / candidate_weight.sum()
+
+        self.assertEqual(tuple(loss.shape), ())
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.allclose(loss, expected))
+
+        loss.backward()
+
+        self.assertIsNotNone(gaussian_per_part.grad)
+        self.assertTrue(
+            torch.isfinite(gaussian_per_part.grad).all()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
