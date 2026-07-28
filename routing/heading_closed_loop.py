@@ -27,7 +27,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from routing.diversity import select_safe_diverse_proposal
+from routing.diversity import (
+    diversity_assessment,
+    event_identity,
+    proposal_selection_score,
+)
+from routing.dynamic_route import (
+    DynamicBeamState,
+    DynamicRouteDeadEnd,
+    DynamicSearchConfig,
+    adaptive_beam_width,
+    candidate_subset,
+    observability_from_extra,
+    prune_states,
+    route_prior_cost,
+    route_prior_summary,
+    source_calibration_penalty,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -276,225 +292,391 @@ def assemble_event_heading_reference(
     cfg: Any,
     banned: Optional[Dict[int, set]] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[List[int]]]:
-    """Planner-owned stage heading + boundary-safe candidate assembly."""
+    """Assemble an exact-simulation route with posterior-guided dynamic beam.
+
+    Graph-SB probabilities remain soft priors.  Every retained branch is built
+    by the authoritative heading/bridge/physics simulator, and anatomy,
+    heading, cooldown, source, family, and severe physical gates remain hard.
+    """
+
     global _LAST_HEADING_PLAN
     _heading_schema_guard(db)
 
     paths = np.asarray(db["paths"], dtype=object)
-    banned = banned or {}
-    pieces: List[np.ndarray] = []
-    report: List[Dict[str, Any]] = []
-    selected: List[List[int]] = []
-    cursor = 0
-
-    stage_heading = float(
+    blocked = banned or {}
+    search = DynamicSearchConfig.from_environment()
+    initial_heading = float(
         np.radians(env_float("V46_50_STAGE_INITIAL_HEADING_DEG", 0.0))
     )
-    initial_heading = stage_heading
-    recent_turn_count = 0
-    cumulative_abs_yaw = 0.0
-    state_trace: List[Dict[str, Any]] = []
+    beam: List[DynamicBeamState] = [
+        DynamicBeamState(
+            motion=np.zeros((0, EDGE_DIM), dtype=np.float32),
+            stage_heading=initial_heading,
+        )
+    ]
+    layer_trace: List[Dict[str, Any]] = []
 
     for slot_idx, slot in enumerate(slots):
         target_len = base.slot_target_frames(slot, cfg)
-        prev = (
-            np.concatenate(pieces, axis=0).astype(np.float32)
-            if pieces
-            else None
-        )
         candidates = [
-            int(x)
-            for x in candidate_lists[slot_idx]
-            if int(x) not in banned.get(slot_idx, set())
-            and 0 <= int(x) < len(paths)
+            int(value)
+            for value in candidate_lists[slot_idx]
+            if int(value) not in blocked.get(slot_idx, set())
+            and 0 <= int(value) < len(paths)
         ]
         if not candidates:
             raise RuntimeError(f"No candidates remain for slot {slot_idx}")
 
-        # Heading-aware pre-ordering before expensive simulated stitching.
-        preordered: List[Tuple[float, int, Dict[str, Any]]] = []
-        for original_rank, event_id in enumerate(candidates):
-            meta = event_meta_from_db(db, event_id)
-            pen, detail = candidate_heading_penalty(
-                meta,
-                slot,
-                stage_heading,
-                recent_turn_count=recent_turn_count,
-            )
-            if not _heading_valid(db, event_id):
-                detail["hard_reject"] = True
-                pen += 1e6
-            preordered.append((float(pen), int(event_id), detail))
         primary_event_id = int(candidates[0])
-        preordered.sort(
-            key=lambda row: (0 if int(row[1]) == primary_event_id else 1, row[0])
-        )
+        expanded: List[DynamicBeamState] = []
+        state_diagnostics: List[Dict[str, Any]] = []
 
-        max_trials = max(
-            1,
-            min(
-                len(preordered),
-                base.env_int("V46_50_HEADING_TRIAL_TOPK", 32),
-            ),
-        )
-        proposals: List[Tuple[base.CandidateProposal, Dict[str, Any]]] = []
-        for rank, (_, event_id, _) in enumerate(preordered[:max_trials]):
-            proposal, extra = _build_heading_proposal(
-                v46=v46,
-                prev_motion=prev,
-                event_id=event_id,
-                event_path=str(paths[event_id]),
-                slot=dict(slot),
-                slot_idx=slot_idx,
-                candidate_rank=rank,
-                target_len=target_len,
-                cfg=cfg,
-                db=db,
-                stage_heading_rad=stage_heading,
-                recent_turn_count=recent_turn_count,
+        for state_index, state in enumerate(beam):
+            previous_event_id = (
+                int(state.selected_event_ids[-1])
+                if state.selected_event_ids
+                else None
             )
-            proposals.append((proposal, extra))
-
-        selected_prop, selected_extra, decision = select_safe_diverse_proposal(
-            proposals,
-            db=db,
-            selected_event_ids=[int(pair[0]) for pair in selected],
-            primary_event_id=primary_event_id,
-        )
-        selected_prop.decision = decision
-
-        piece = selected_prop.motion_piece.astype(np.float32)
-        transition_span = None
-        if selected_prop.transition_span_local is not None:
-            transition_span = [
-                int(cursor + selected_prop.transition_span_local[0]),
-                int(cursor + selected_prop.transition_span_local[1]),
-            ]
-        core_span = [
-            int(cursor + selected_prop.core_span_local[0]),
-            int(cursor + selected_prop.core_span_local[1]),
-        ]
-
-        event_meta = selected_extra["event_meta"]
-        event_delta = float(
-            event_meta.get(
-                "event_stage_delta_yaw_rad",
-                _event_delta(db, selected_prop.event_id),
+            subset = candidate_subset(
+                candidates,
+                db,
+                limit=search.branch_topk,
+                minimum_per_source=search.candidates_per_source,
+                primary_event_id=primary_event_id,
             )
-        )
-        stage_before = float(stage_heading)
-        stage_after = float(wrap_angle(stage_before + event_delta))
-        cumulative_abs_yaw += abs(event_delta)
-        intent = str(event_meta.get("event_turn_intent", "none"))
-        if intent in {"turn", "explicit_spin", "uncertain_turn"}:
-            recent_turn_count += 1
-        else:
-            recent_turn_count = 0
 
-        pieces.append(piece)
-        selected.append([int(selected_prop.event_id), int(selected_prop.rank)])
-        row = {
-            "slot": int(slot_idx),
-            "event_id": int(selected_prop.event_id),
-            "candidate_rank": int(selected_prop.rank),
-            "event_path": selected_prop.event_path,
-            "target_frames": int(target_len),
-            "piece_frames": int(piece.shape[0]),
-            "transition_span": transition_span,
-            "transition_spans": [transition_span] if transition_span else [],
-            "core_span": core_span,
-            "transition_in_frames": int(len(selected_prop.bridge)),
-            "core_frames": int(len(selected_prop.core)),
-            "core_warp": float(
-                len(selected_prop.core)
-                / max(
-                    1,
-                    base.load_event_motion(
-                        v46,
-                        selected_prop.event_path,
-                        cfg,
-                        "v46_50_warp_probe",
-                    ).shape[0],
+            preordered: List[
+                Tuple[float, int, int, Dict[str, Any], Dict[str, Any]]
+            ] = []
+            rank_lookup = {int(event_id): rank for rank, event_id in enumerate(candidates)}
+            for event_id in subset:
+                original_rank = int(rank_lookup[int(event_id)])
+                meta = event_meta_from_db(db, int(event_id))
+                heading_penalty, heading_detail = candidate_heading_penalty(
+                    meta,
+                    slot,
+                    state.stage_heading,
+                    recent_turn_count=state.recent_turn_count,
                 )
-            ),
-            "risk_predicted": selected_prop.risk,
-            "risk_score_predicted": float(selected_extra["physical_risk_score"]),
-            "heading_penalty": float(selected_extra["heading_penalty"]),
-            "combined_candidate_score": float(selected_prop.risk_score),
-            "safe_predicted": bool(selected_prop.safe),
-            "decision": selected_prop.decision,
-            "primary_event_id": primary_event_id,
-            "diversity": dict(selected_extra.get("diversity", {})),
-            "length_policy": selected_prop.length_info,
-            "contract_after_align": selected_prop.align_report,
-            "event_turn_intent": intent,
-            "event_turn_confidence": float(
-                event_meta.get("event_turn_confidence", 0.0)
-            ),
-            "event_heading_quality": float(
-                event_meta.get("event_heading_quality", 0.0)
-            ),
-            "event_stage_delta_yaw_rad": event_delta,
-            "event_stage_delta_yaw_deg": float(np.degrees(event_delta)),
-            "stage_heading_before_rad": stage_before,
-            "stage_heading_before_deg": float(np.degrees(stage_before)),
-            "stage_heading_after_rad": stage_after,
-            "stage_heading_after_deg": float(np.degrees(stage_after)),
-            "slot_turn_policy": slot_turn_policy(slot),
-            "candidate_trials": [
-                {
-                    "event_id": int(pp.event_id),
-                    "rank": int(pp.rank),
-                    "safe": bool(pp.safe),
-                    "combined_score": float(pp.risk_score),
-                    "physical_risk_score": float(ex["physical_risk_score"]),
-                    "heading_penalty": float(ex["heading_penalty"]),
-                    "hard_reject": bool(
-                        ex["heading_detail"].get("hard_reject", False)
-                    ),
-                    "event_intent": str(
-                        ex["event_meta"].get("event_turn_intent", "none")
-                    ),
-                    "decision": pp.decision,
-                    "diversity": dict(ex.get("diversity", {})),
-                }
-                for pp, ex in proposals
-            ],
-            "version": "v46_50_event_heading_closed_loop_reference",
-        }
-        report.append(row)
-        state_trace.append({
-            "slot": int(slot_idx),
-            "event_id": int(selected_prop.event_id),
-            "intent": intent,
-            "stage_heading_before_rad": stage_before,
-            "event_delta_rad": event_delta,
-            "stage_heading_after_rad": stage_after,
-            "cumulative_abs_yaw_rad": float(cumulative_abs_yaw),
-        })
-        stage_heading = stage_after
-        cursor += int(piece.shape[0])
+                if not _heading_valid(db, int(event_id)):
+                    heading_detail = dict(heading_detail)
+                    heading_detail["hard_reject"] = True
+                    heading_penalty += 1.0e6
+                prior_cost, prior_detail = route_prior_cost(
+                    slot_idx,
+                    int(event_id),
+                    previous_event_id=previous_event_id,
+                    fallback_rank=original_rank,
+                    candidate_count=len(candidates),
+                )
+                order_score = float(heading_penalty) + search.posterior_weight * float(
+                    prior_cost
+                )
+                preordered.append(
+                    (
+                        order_score,
+                        original_rank,
+                        int(event_id),
+                        heading_detail,
+                        prior_detail,
+                    )
+                )
+            preordered.sort(key=lambda row: (row[0], row[1], row[2]))
 
-    final = (
-        np.concatenate(pieces, axis=0).astype(np.float32)
-        if pieces
-        else np.zeros((0, EDGE_DIM), dtype=np.float32)
-    )
+            proposals: List[Tuple[base.CandidateProposal, Dict[str, Any]]] = []
+            for _, original_rank, event_id, _heading_detail, prior_detail in preordered:
+                proposal, extra0 = _build_heading_proposal(
+                    v46=v46,
+                    prev_motion=(state.motion if len(state.motion) else None),
+                    event_id=event_id,
+                    event_path=str(paths[event_id]),
+                    slot=dict(slot),
+                    slot_idx=slot_idx,
+                    candidate_rank=original_rank,
+                    target_len=target_len,
+                    cfg=cfg,
+                    db=db,
+                    stage_heading_rad=state.stage_heading,
+                    recent_turn_count=state.recent_turn_count,
+                )
+                extra = dict(extra0)
+                diversity = diversity_assessment(
+                    db,
+                    int(event_id),
+                    state.selected_event_ids,
+                )
+                calibration_penalty, calibration_detail = source_calibration_penalty(
+                    db,
+                    previous_event_id,
+                    int(event_id),
+                )
+                extra["diversity"] = diversity
+                extra["route_prior"] = prior_detail
+                extra["route_prior_cost"] = float(prior_detail["negative_log_cost"])
+                extra["source_calibration"] = calibration_detail
+                extra["source_calibration_penalty"] = float(calibration_penalty)
+                proposals.append((proposal, extra))
+
+            safe_count = sum(bool(proposal.safe) for proposal, _extra in proposals)
+            safe_ratio = safe_count / max(1, len(proposals))
+            eligible_count = 0
+            trials: List[Dict[str, Any]] = []
+
+            for proposal, extra in proposals:
+                observability = observability_from_extra(
+                    extra,
+                    safe_ratio=safe_ratio,
+                )
+                extra["observability"] = observability
+                extra["route_uncertainty"] = 1.0 - observability
+                extra["selection_score"] = proposal_selection_score(
+                    proposal,
+                    extra,
+                    primary_event_id=primary_event_id,
+                )
+                diversity = extra["diversity"]
+                eligible = bool(
+                    proposal.safe
+                    and diversity["hard_valid"]
+                    and observability >= search.minimum_observability
+                )
+                eligible_count += int(eligible)
+                trials.append(
+                    {
+                        "event_id": int(proposal.event_id),
+                        "rank": int(proposal.rank),
+                        "safe": bool(proposal.safe),
+                        "eligible": eligible,
+                        "combined_score": float(proposal.risk_score),
+                        "selection_score": float(extra["selection_score"]),
+                        "physical_risk_score": float(
+                            extra.get("physical_risk_score", proposal.risk_score)
+                        ),
+                        "heading_penalty": float(extra.get("heading_penalty", 0.0)),
+                        "hard_reject": bool(
+                            extra.get("heading_detail", {}).get("hard_reject", False)
+                        ),
+                        "observability": float(observability),
+                        "route_prior": dict(extra.get("route_prior", {})),
+                        "source_calibration": dict(
+                            extra.get("source_calibration", {})
+                        ),
+                        "diversity": dict(diversity),
+                    }
+                )
+                if not eligible:
+                    continue
+
+                event_meta = extra["event_meta"]
+                event_delta = float(
+                    event_meta.get(
+                        "event_stage_delta_yaw_rad",
+                        _event_delta(db, int(proposal.event_id)),
+                    )
+                )
+                stage_before = float(state.stage_heading)
+                stage_after = float(wrap_angle(stage_before + event_delta))
+                intent = str(event_meta.get("event_turn_intent", "none"))
+                recent_turn_count = (
+                    state.recent_turn_count + 1
+                    if intent in {"turn", "explicit_spin", "uncertain_turn"}
+                    else 0
+                )
+
+                cursor = int(len(state.motion))
+                piece = np.asarray(proposal.motion_piece, dtype=np.float32)
+                motion = (
+                    np.concatenate([state.motion, piece], axis=0).astype(np.float32)
+                    if len(state.motion)
+                    else piece.copy()
+                )
+                transition_span = None
+                if proposal.transition_span_local is not None:
+                    transition_span = [
+                        cursor + int(proposal.transition_span_local[0]),
+                        cursor + int(proposal.transition_span_local[1]),
+                    ]
+                core_span = [
+                    cursor + int(proposal.core_span_local[0]),
+                    cursor + int(proposal.core_span_local[1]),
+                ]
+                decision = (
+                    "selected_primary_soft_prior"
+                    if int(proposal.event_id) == primary_event_id
+                    else "selected_dynamic_beam"
+                )
+                proposal.decision = decision
+                source_frames = base.load_event_motion(
+                    v46,
+                    proposal.event_path,
+                    cfg,
+                    "v46_50_warp_probe",
+                ).shape[0]
+                row = {
+                    "slot": int(slot_idx),
+                    "event_id": int(proposal.event_id),
+                    "candidate_rank": int(proposal.rank),
+                    "event_path": proposal.event_path,
+                    "target_frames": int(target_len),
+                    "piece_frames": int(piece.shape[0]),
+                    "transition_span": transition_span,
+                    "transition_spans": [transition_span] if transition_span else [],
+                    "core_span": core_span,
+                    "transition_in_frames": int(len(proposal.bridge)),
+                    "core_frames": int(len(proposal.core)),
+                    "core_warp": float(len(proposal.core) / max(1, source_frames)),
+                    "risk_predicted": proposal.risk,
+                    "risk_score_predicted": float(
+                        extra.get("physical_risk_score", proposal.risk_score)
+                    ),
+                    "heading_penalty": float(extra.get("heading_penalty", 0.0)),
+                    "combined_candidate_score": float(proposal.risk_score),
+                    "dynamic_selection_score": float(extra["selection_score"]),
+                    "safe_predicted": bool(proposal.safe),
+                    "decision": decision,
+                    "primary_event_id": primary_event_id,
+                    "planned_event_diverged": bool(
+                        int(proposal.event_id) != primary_event_id
+                    ),
+                    "observability": float(observability),
+                    "route_prior": dict(extra.get("route_prior", {})),
+                    "source_calibration": dict(
+                        extra.get("source_calibration", {})
+                    ),
+                    "dynamic_hard_mask": {
+                        "physical_safe": bool(proposal.safe),
+                        "history_safe": bool(diversity["hard_valid"]),
+                        "hard_reasons": list(diversity["hard_reasons"]),
+                    },
+                    "diversity": dict(diversity),
+                    "length_policy": proposal.length_info,
+                    "contract_after_align": proposal.align_report,
+                    "event_turn_intent": intent,
+                    "event_turn_confidence": float(
+                        event_meta.get("event_turn_confidence", 0.0)
+                    ),
+                    "event_heading_quality": float(
+                        event_meta.get("event_heading_quality", 0.0)
+                    ),
+                    "event_stage_delta_yaw_rad": event_delta,
+                    "event_stage_delta_yaw_deg": float(np.degrees(event_delta)),
+                    "stage_heading_before_rad": stage_before,
+                    "stage_heading_before_deg": float(np.degrees(stage_before)),
+                    "stage_heading_after_rad": stage_after,
+                    "stage_heading_after_deg": float(np.degrees(stage_after)),
+                    "slot_turn_policy": slot_turn_policy(slot),
+                    "candidate_trials": trials,
+                    "version": "mode_sb_dynamic_heading_reference",
+                }
+                state_row = {
+                    "slot": int(slot_idx),
+                    "event_id": int(proposal.event_id),
+                    "intent": intent,
+                    "stage_heading_before_rad": stage_before,
+                    "event_delta_rad": event_delta,
+                    "stage_heading_after_rad": stage_after,
+                    "cumulative_abs_yaw_rad": float(
+                        state.cumulative_abs_yaw + abs(event_delta)
+                    ),
+                    "observability": float(observability),
+                    "prefix_score": float(
+                        state.score + float(extra["selection_score"])
+                    ),
+                }
+                expanded.append(
+                    DynamicBeamState(
+                        motion=motion,
+                        selected_event_ids=state.selected_event_ids
+                        + (int(proposal.event_id),),
+                        selected_ranks=state.selected_ranks + (int(proposal.rank),),
+                        report=state.report + (row,),
+                        state_trace=state.state_trace + (state_row,),
+                        stage_heading=stage_after,
+                        recent_turn_count=recent_turn_count,
+                        cumulative_abs_yaw=state.cumulative_abs_yaw
+                        + abs(event_delta),
+                        score=state.score + float(extra["selection_score"]),
+                        observability=float(observability),
+                    )
+                )
+
+            state_diagnostics.append(
+                {
+                    "state_index": int(state_index),
+                    "prefix_event_ids": list(map(int, state.selected_event_ids)),
+                    "candidate_subset": list(map(int, subset)),
+                    "proposals": int(len(proposals)),
+                    "physically_safe": int(safe_count),
+                    "eligible": int(eligible_count),
+                }
+            )
+
+        if not expanded:
+            raise DynamicRouteDeadEnd(
+                slot_idx,
+                {
+                    "retained_prefixes": int(len(beam)),
+                    "candidate_count": int(len(candidates)),
+                    "state_diagnostics": state_diagnostics,
+                    "hard_contracts_relaxed": False,
+                },
+            )
+
+        width = adaptive_beam_width(
+            search,
+            [state.observability for state in expanded],
+        )
+        beam = prune_states(expanded, db, width=width)
+        layer_trace.append(
+            {
+                "slot": int(slot_idx),
+                "input_states": int(len(state_diagnostics)),
+                "expanded_states": int(len(expanded)),
+                "retained_states": int(len(beam)),
+                "adaptive_beam_width": int(width),
+                "best_prefix_score": float(min(state.score for state in beam)),
+                "retained_sources": [
+                    event_identity(db, state.selected_event_ids[-1])["source_uid"]
+                    for state in beam
+                ],
+                "state_diagnostics": state_diagnostics,
+            }
+        )
+
+    best = min(beam, key=lambda state: float(state.score))
     final = base.enforce_contract(
         v46,
-        final,
+        np.asarray(best.motion, dtype=np.float32),
         cfg,
-        source_hint="v46_50_event_heading_reference_final",
+        source_hint="mode_sb_dynamic_heading_reference_final",
     )
     _LAST_HEADING_PLAN = {
-        "schema": "v46_50_stage_heading_state",
+        "schema": "mode_sb_manifold_observable_dynamic_route",
+        "search": {
+            "beam_width": int(search.beam_width),
+            "maximum_beam_width": int(search.maximum_beam_width),
+            "branch_topk": int(search.branch_topk),
+            "candidates_per_source": int(search.candidates_per_source),
+            "primary_is_soft_prior": True,
+            "exact_simulation_authoritative": True,
+            "implicit_bounded_backtracking": True,
+        },
+        "graph_route_prior": route_prior_summary(),
         "initial_stage_heading_rad": float(initial_heading),
-        "final_stage_heading_rad": float(stage_heading),
-        "cumulative_abs_event_yaw_rad": float(cumulative_abs_yaw),
-        "cumulative_abs_event_yaw_deg": float(np.degrees(cumulative_abs_yaw)),
-        "state_trace": state_trace,
+        "final_stage_heading_rad": float(best.stage_heading),
+        "cumulative_abs_event_yaw_rad": float(best.cumulative_abs_yaw),
+        "cumulative_abs_event_yaw_deg": float(
+            np.degrees(best.cumulative_abs_yaw)
+        ),
+        "final_route_score": float(best.score),
+        "state_trace": list(best.state_trace),
+        "layer_trace": layer_trace,
     }
-    return final, report, selected
+    selected = [
+        [int(event_id), int(rank)]
+        for event_id, rank in zip(best.selected_event_ids, best.selected_ranks)
+    ]
+    return final, list(best.report), selected
 
 
 def apply_generators_with_heading_guard(

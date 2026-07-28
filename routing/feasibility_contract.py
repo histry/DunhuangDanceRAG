@@ -485,11 +485,22 @@ def _tier_env(policy: FeasibilityPolicy, tier: int) -> Dict[str, str]:
         observability = policy.observability_relaxed_min
     elif tier >= 2:
         observability = policy.observability_rescue_min
+
+    base_beam = max(1, env_int("RESEARCH_DYNAMIC_BEAM_BASE", 6))
+    maximum_beam = max(base_beam, env_int("RESEARCH_DYNAMIC_BEAM_MAX", 16))
+    base_branch = max(1, env_int("RESEARCH_DYNAMIC_BRANCH_BASE", 16))
+    maximum_branch = max(base_branch, env_int("RESEARCH_DYNAMIC_BRANCH_MAX", 48))
+    ratio = float(np.clip(tier / max(1, policy.max_rescue_tier), 0.0, 1.0))
+    beam = int(round(base_beam + ratio * (maximum_beam - base_beam)))
+    branch = int(round(base_branch + ratio * (maximum_branch - base_branch)))
     return {
         "V46_52_CORE_WARP_MIN": str(warp_min),
         "V46_52_CORE_WARP_MAX": str(warp_max),
         "V46_53_OBSERVABILITY_HARD_MIN": str(observability),
         "V46_50_HEADING_TRIAL_TOPK": str(policy.candidate_pool),
+        "V46_50_DYNAMIC_BEAM_WIDTH": str(beam),
+        "V46_50_DYNAMIC_BEAM_MAX": str(maximum_beam),
+        "V46_50_DYNAMIC_BRANCH_TOPK": str(branch),
     }
 
 
@@ -804,6 +815,7 @@ def install(v53: Any) -> Dict[str, Any]:
                                 "no candidates remain",
                                 "no candidates for slot",
                                 "has no candidates",
+                                "dynamic route dead-end",
                             )
                         ):
                             raise
@@ -813,9 +825,10 @@ def install(v53: Any) -> Dict[str, Any]:
                             "warp_range": list(policy.warp_range(tier)),
                         })
             raise RuntimeError(
-                "Feasibility-aware generation exhausted all bounded tiers. "
-                "Source safety, event anatomy, heading validity, performer group, "
-                "and severe physical gates were intentionally not relaxed. "
+                "Feasibility-aware generation exhausted bounded search and "
+                "duration tiers. Source safety, event anatomy, heading validity, "
+                "history diversity, performer group, and severe physical gates "
+                "were intentionally not relaxed. "
                 "Diagnostics=" + json.dumps(failures, ensure_ascii=False)
             )
         finally:

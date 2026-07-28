@@ -34,6 +34,7 @@ from routing.performer_policy import (
     resolve_candidate_policy,
 )
 from routing.diversity import diversity_assessment, event_identity
+from routing.dynamic_route import clear_route_prior, register_route_prior
 from routing.event_graph_geometry import (
     EventGraphGeometryConfig,
     event_node_feasibility,
@@ -234,6 +235,11 @@ def _legacy_global_route_preorder(
     for i, candidates in enumerate(candidate_lists):
         ordered = [chosen[i]] + [int(x) for x in candidates if int(x) != chosen[i]]
         reordered.append(ordered)
+    register_route_prior(
+        [list(map(int, layer[:topk])) for layer in candidate_lists],
+        chosen_path=chosen,
+        source="legacy_beam",
+    )
     _GLOBAL_ROUTE_REPORT = {
         "schema": "v46_53_entropy_regularised_global_event_path",
         "solver": "legacy_beam",
@@ -678,6 +684,14 @@ def _graph_sb_global_route_preorder(
             result.node_marginals[slot].tolist()
         )
 
+    register_route_prior(
+        layers,
+        node_marginals=result.node_marginals,
+        transition_marginals=result.posterior_transitions,
+        chosen_path=chosen,
+        source="fisher_rao_graph_sb",
+        path_entropy=float(result.path_entropy),
+    )
     _GLOBAL_ROUTE_REPORT = {
         "schema": "v46_55_fisher_rao_discrete_graph_schrodinger_route_v1",
         "solver": "fisher_rao_graph_sb",
@@ -745,6 +759,7 @@ def _global_route_preorder(
     # One process may generate more than one song.  Never allow a disabled or
     # failed current route to inherit the previous song's audit payload.
     _GLOBAL_ROUTE_REPORT = {}
+    clear_route_prior()
     if not _env_bool("V46_53_GLOBAL_ROUTE_ENABLE", True):
         return [list(map(int, values)) for values in candidate_lists]
     solver = str(

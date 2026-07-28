@@ -1,4 +1,4 @@
-"""Global diversity and cooldown policy for closed-loop event reselection."""
+"""Global diversity and cooldown policy for closed-loop Event reselection."""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,7 @@ import numpy as np
 
 def _env_int(name: str, default: int) -> int:
     try:
-        return int(os.environ.get(name, default))
+        return int(float(os.environ.get(name, default)))
     except Exception:
         return int(default)
 
@@ -103,6 +103,38 @@ def diversity_assessment(
     }
 
 
+def proposal_selection_score(
+    proposal: Any,
+    extra: Mapping[str, Any],
+    *,
+    primary_event_id: int,
+) -> float:
+    """Score one already-safe proposal using only soft preferences.
+
+    The primary Event is a finite prior, not an unconditional commit.  Hard
+    anatomy, heading, physical, cooldown, and source constraints are evaluated
+    before this function is used.
+    """
+
+    diversity = extra.get("diversity", {})
+    score = float(proposal.risk_score) + float(diversity.get("penalty", 0.0))
+    score += _env_float("V46_54_CANDIDATE_RANK_WEIGHT", 0.01) * float(
+        getattr(proposal, "rank", 0)
+    )
+    score += _env_float("V46_50_POSTERIOR_WEIGHT", 0.35) * float(
+        extra.get("route_prior_cost", 0.0)
+    )
+    score += _env_float("V46_50_UNCERTAINTY_WEIGHT", 0.20) * float(
+        extra.get("route_uncertainty", 0.0)
+    )
+    score += _env_float("V46_50_SOURCE_CALIBRATION_WEIGHT", 0.15) * float(
+        extra.get("source_calibration_penalty", 0.0)
+    )
+    if int(proposal.event_id) == int(primary_event_id):
+        score -= max(0.0, _env_float("V46_54_PRIMARY_EVENT_BONUS", 0.18))
+    return float(score)
+
+
 def select_safe_diverse_proposal(
     rows: Sequence[tuple[Any, dict[str, Any]]],
     *,
@@ -110,24 +142,19 @@ def select_safe_diverse_proposal(
     selected_event_ids: Sequence[int],
     primary_event_id: int,
 ) -> tuple[Any, dict[str, Any], str]:
-    """Preserve a safe primary; otherwise choose a globally diverse safe row."""
+    """Choose the minimum-score safe row; the primary is only a soft prior."""
+
     enriched: list[tuple[Any, dict[str, Any]]] = []
     for proposal, extra0 in rows:
         extra = dict(extra0)
         assessment = diversity_assessment(db, int(proposal.event_id), selected_event_ids)
         extra["diversity"] = assessment
-        extra["selection_score"] = float(proposal.risk_score) + float(assessment["penalty"])
+        extra["selection_score"] = proposal_selection_score(
+            proposal,
+            extra,
+            primary_event_id=primary_event_id,
+        )
         enriched.append((proposal, extra))
-
-    primary = [
-        row
-        for row in enriched
-        if int(row[0].event_id) == int(primary_event_id)
-        and bool(row[0].safe)
-        and bool(row[1]["diversity"]["hard_valid"])
-    ]
-    if primary:
-        return primary[0][0], primary[0][1], "preserved_primary_safe"
 
     safe_valid = [
         row
@@ -136,22 +163,24 @@ def select_safe_diverse_proposal(
     ]
     if safe_valid:
         proposal, extra = min(safe_valid, key=lambda row: float(row[1]["selection_score"]))
-        return proposal, extra, "reselected_heading_physics_diverse"
+        decision = (
+            "selected_primary_soft_prior"
+            if int(proposal.event_id) == int(primary_event_id)
+            else "reselected_heading_physics_diverse"
+        )
+        return proposal, extra, decision
 
-    safe_count = sum(bool(row[0].safe) for row in enriched)
-    hard_reasons = sorted(
-        {
-            str(reason)
-            for _proposal, extra in enriched
-            for reason in extra["diversity"].get("hard_reasons", [])
-        }
+    physically_safe = [row for row in enriched if bool(row[0].safe)]
+    reason_counts = Counter(
+        str(reason)
+        for _proposal, extra in physically_safe
+        for reason in extra["diversity"].get("hard_reasons", [])
     )
-    # Physical/anatomy safety and exact-event/source-run cooldown are immutable
-    # contracts.  The outer feasibility controller may widen duration or
-    # observability tiers and retry, but this selector must never silently
-    # commit an unsafe or diversity-invalid proposal.
+    # Physical/anatomy safety and exact-event/source history are immutable.  The
+    # outer feasibility controller may expand search width or bounded duration
+    # tiers, but this selector never commits an unsafe or history-invalid row.
     raise RuntimeError(
         "Heading/diversity exhausted candidates: "
-        f"proposals={len(enriched)}, physically_safe={safe_count}, "
-        f"diversity_hard_reasons={hard_reasons}"
+        f"proposals={len(enriched)}, physically_safe={len(physically_safe)}, "
+        f"safe_diversity_reason_counts={dict(reason_counts)}"
     )
