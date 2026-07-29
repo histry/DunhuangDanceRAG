@@ -69,6 +69,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from motion_geometry.resampling import resample_edge151_np
+from contracts.physical_quality import (
+    PhysicalQualityLimits,
+    StageAcceptancePolicy,
+    build_repair_mask,
+    evaluate_physical_audit,
+    run_stage_transaction,
+)
 from support.common import make_geodesic_transition
 from support.event_identity import (
     assert_same_event_db_contract,
@@ -712,75 +719,95 @@ def compute_condition(slot_feat: np.ndarray, db: Dict[str, Any]) -> np.ndarray:
 
 
 def apply_generators(v46, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: argparse.Namespace, cfg: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Apply repair stages with Peak-Jerk support and transactional rollback."""
+    if not hasattr(v46, "audit_motion_np"):
+        raise RuntimeError(
+            "The generation runtime must provide audit_motion_np for audited stages"
+        )
+
+    limits = PhysicalQualityLimits.from_environment()
+    policy = StageAcceptancePolicy.from_environment()
+    motion = np.asarray(motion_ref, dtype=np.float32).copy()
     stage: Dict[str, Any] = {}
-    motion = motion_ref.astype(np.float32)
-    stage["pre_refine_audit"] = v46.audit_motion_np(motion, cfg) if hasattr(v46, "audit_motion_np") else {}
-    if bool(getattr(cfg, "refiner_enable", False)) and env_bool("V46_46_USE_REFINER", True):
-        motion = v46.apply_refiner_model(motion, cond, seam_mask, getattr(args, "refiner", None), cfg)
-        stage["v45_refiner_audit"] = v46.audit_motion_np(motion, cfg) if hasattr(v46, "audit_motion_np") else {}
-    if bool(getattr(cfg, "diffusion_enable", False)) and env_bool("V46_46_USE_DIFFUSION", True):
-        motion = v46.apply_diffusion_model(motion, cond, seam_mask, getattr(args, "diffusion", None), cfg)
-        stage["v46_diffusion_audit"] = v46.audit_motion_np(motion, cfg) if hasattr(v46, "audit_motion_np") else {}
+
+    def audit_fn(value: np.ndarray) -> Dict[str, Any]:
+        return dict(v46.audit_motion_np(value, cfg))
+
+    stage["pre_refine_audit"] = audit_fn(motion)
+
+    if bool(getattr(cfg, "refiner_enable", False)) and env_bool(
+        "V46_46_USE_REFINER", True
+    ):
+        refiner_mask, mask_report = build_repair_mask(
+            motion,
+            seam_mask,
+            fps=float(getattr(cfg, "fps", 30.0)),
+        )
+        stage["v45_refiner_repair_mask"] = mask_report
+        motion, transaction = run_stage_transaction(
+            stage_name="refiner",
+            motion=motion,
+            apply_fn=lambda value: v46.apply_refiner_model(
+                value,
+                cond,
+                refiner_mask,
+                getattr(args, "refiner", None),
+                cfg,
+            ),
+            audit_fn=audit_fn,
+            limits=limits,
+            policy=policy,
+            require_repair_gain=True,
+        )
+        stage["v45_refiner_transaction"] = transaction
+        stage["v45_refiner_audit"] = audit_fn(motion)
+
+    if bool(getattr(cfg, "diffusion_enable", False)) and env_bool(
+        "V46_46_USE_DIFFUSION", True
+    ):
+        diffusion_mask, mask_report = build_repair_mask(
+            motion,
+            seam_mask,
+            fps=float(getattr(cfg, "fps", 30.0)),
+        )
+        stage["v46_diffusion_repair_mask"] = mask_report
+        motion, transaction = run_stage_transaction(
+            stage_name="diffusion",
+            motion=motion,
+            apply_fn=lambda value: v46.apply_diffusion_model(
+                value,
+                cond,
+                diffusion_mask,
+                getattr(args, "diffusion", None),
+                cfg,
+            ),
+            audit_fn=audit_fn,
+            limits=limits,
+            policy=policy,
+            require_repair_gain=True,
+        )
+        stage["v46_diffusion_transaction"] = transaction
+        stage["v46_diffusion_audit"] = audit_fn(motion)
+
     ik_report = {"enabled": False}
-    if bool(getattr(cfg, "ik_enable", False)) and env_bool("V46_46_USE_IK", True):
+    if bool(getattr(cfg, "ik_enable", False)) and env_bool(
+        "V46_46_USE_IK", True
+    ):
         motion, ik_report = v46.true_lower_body_ik(motion, cfg)
     stage["v43_true_ik"] = ik_report
-    stage["final_audit"] = v46.audit_motion_np(motion, cfg) if hasattr(v46, "audit_motion_np") else {}
-    stage["final_physical_gate"] = physical_quality_gate(stage["final_audit"])
+    stage["final_audit"] = audit_fn(motion)
+    stage["final_physical_gate"] = physical_quality_gate(
+        stage["final_audit"]
+    )
     return motion.astype(np.float32), stage
 
 
 def physical_quality_gate(audit: Dict[str, Any]) -> Dict[str, Any]:
-    limits = {
-        "foot_skate_mps_p95": env_float("V46_54_MAX_FOOT_SKATE_P95_MPS", 0.18),
-        "foot_skate_mps_max": env_float("V46_54_MAX_FOOT_SKATE_MAX_MPS", 0.60),
-        "foot_penetration_min_m": env_float("V46_54_MIN_FOOT_PENETRATION_M", -0.050),
-        "joint_jerk_mps3_p95": env_float("V46_54_MAX_JOINT_JERK_P95_MPS3", 810.0),
-        "joint_jerk_mps3_max": env_float("V46_54_MAX_JOINT_JERK_MAX_MPS3", 1620.0),
-        "root_y_robust_range_m": env_float(
-            "V46_54_MAX_ROOT_Y_ROBUST_RANGE_M",
-            0.90,
-        ),
-        "root_vertical_speed_mps_p95": env_float(
-            "V46_54_MAX_ROOT_VERTICAL_SPEED_P95_MPS",
-            1.25,
-        ),
-        "root_vertical_speed_mps_max": env_float(
-            "V46_54_MAX_ROOT_VERTICAL_SPEED_MAX_MPS",
-            4.0,
-        ),
-    }
-    reasons: List[str] = []
-    for key in (
-        "foot_skate_mps_p95",
-        "foot_skate_mps_max",
-        "joint_jerk_mps3_p95",
-        "joint_jerk_mps3_max",
-    ):
-        if float(audit.get(key, float("inf"))) > float(limits[key]):
-            reasons.append(f"{key}_too_high")
-    robust_root_range = float(
-        audit.get(
-            "root_y_robust_range_m",
-            audit.get("root_y_range_m", float("inf")),
-        )
+    """Delegate to the single authoritative SI physical-quality contract."""
+    return evaluate_physical_audit(
+        audit,
+        limits=PhysicalQualityLimits.from_environment(),
     )
-    if robust_root_range > float(limits["root_y_robust_range_m"]):
-        reasons.append("root_y_robust_range_m_too_high")
-    # Older cached audits do not contain vertical-speed metrics.  Preserve
-    # compatibility for report inspection while enforcing the new SI gates on
-    # every newly generated audit.
-    for key in (
-        "root_vertical_speed_mps_p95",
-        "root_vertical_speed_mps_max",
-    ):
-        if key in audit and float(audit[key]) > float(limits[key]):
-            reasons.append(f"{key}_too_high")
-    if float(audit.get("foot_penetration_min_m", float("-inf"))) < float(
-        limits["foot_penetration_min_m"]
-    ):
-        reasons.append("foot_penetration_too_low")
-    return {"ok": not reasons, "reasons": reasons, "limits": limits, "audit": dict(audit)}
 
 
 def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str, Any]], cfg: Any) -> List[Dict[str, Any]]:

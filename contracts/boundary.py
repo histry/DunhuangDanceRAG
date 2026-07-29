@@ -30,6 +30,7 @@ from contracts.gravity import (
     ROT6D_START,
     ROT6D_END,
 )
+from contracts.physical_quality import build_peak_jerk_risk_mask
 
 SCHEMA = "v46_53_bidirectional_tangent_boundary_v2_physical_time"
 BODY_PARTS: Dict[str, Tuple[int, ...]] = {
@@ -215,6 +216,12 @@ def build_frame_joint_risk_mask(
     seam_mask: np.ndarray,
     fps: float = 30.0,
 ) -> Dict[str, np.ndarray | Dict[str, Any]]:
+    """Build frame-joint repair support from seams and true Peak Jerk.
+
+    Seam regions retain the original angular-velocity/acceleration risk logic.
+    Core Peak-Jerk regions are added from world-space FK jerk and propagated to
+    the corresponding parent chain. Unrelated body parts remain low-weight.
+    """
     x = _motion(motion_ref)
     t = len(x)
     seam = np.asarray(seam_mask)
@@ -225,41 +232,70 @@ def build_frame_joint_risk_mask(
     dilation = _frames_at_rate(_env_int("V46_53_MASK_DILATE", 3), fps, 0)
     seam_f = _dilate(seam_f, dilation)
 
-    r = rot6d_to_matrix_np(x[:, ROT6D_START:ROT6D_END].reshape(t, NUM_JOINTS, 6))
+    r = rot6d_to_matrix_np(
+        x[:, ROT6D_START:ROT6D_END].reshape(t, NUM_JOINTS, 6)
+    )
     omega = angular_velocity_np(r, fps=fps)
     alpha = angular_acceleration_np(r, fps=fps)
-    w = np.zeros((t, NUM_JOINTS), np.float32)
-    a = np.zeros((t, NUM_JOINTS), np.float32)
+    angular_speed = np.zeros((t, NUM_JOINTS), np.float32)
+    angular_acceleration = np.zeros((t, NUM_JOINTS), np.float32)
     if len(omega):
-        w[1:] = np.linalg.norm(omega, axis=-1)
+        angular_speed[1:] = np.linalg.norm(omega, axis=-1)
     if len(alpha):
-        a[2:] = np.linalg.norm(alpha, axis=-1)
+        angular_acceleration[2:] = np.linalg.norm(alpha, axis=-1)
 
-    def robust_z(v: np.ndarray) -> np.ndarray:
-        med = np.median(v, axis=0, keepdims=True)
-        mad = np.median(np.abs(v - med), axis=0, keepdims=True) + 1e-5
-        return np.maximum(0.0, (v - med) / (1.4826 * mad))
+    def robust_z(values: np.ndarray) -> np.ndarray:
+        median = np.median(values, axis=0, keepdims=True)
+        mad = np.median(
+            np.abs(values - median), axis=0, keepdims=True
+        ) + 1.0e-5
+        return np.maximum(0.0, (values - median) / (1.4826 * mad))
 
-    risk = 0.55 * np.clip(robust_z(w) / 5.0, 0.0, 1.0) + 0.45 * np.clip(robust_z(a) / 5.0, 0.0, 1.0)
+    risk = (
+        0.55 * np.clip(robust_z(angular_speed) / 5.0, 0.0, 1.0)
+        + 0.45
+        * np.clip(robust_z(angular_acceleration) / 5.0, 0.0, 1.0)
+    )
     risk *= seam_f[:, None].astype(np.float32)
     minimum = _env_float("V46_53_MASK_MIN_ON_SEAM", 0.18)
     risk[seam_f] = np.maximum(risk[seam_f], minimum)
 
+    peak = build_peak_jerk_risk_mask(x, fps=float(fps))
+    peak_joint = np.asarray(peak["joint"], dtype=np.float32)
+    peak_frame = np.asarray(peak["frame"], dtype=np.float32) > 0.0
+    risk = np.maximum(risk, peak_joint)
+    editable_frame = np.logical_or(seam_f, peak_frame)
+
     # Promote coherent body-part masks so a dangerous wrist does not leave its
-    # elbow/shoulder frozen while still preserving unrelated limbs.
+    # elbow/shoulder frozen while preserving unrelated limbs.
     for ids in BODY_PARTS.values():
         ids_a = np.asarray(ids, dtype=np.int64)
         part = np.max(risk[:, ids_a], axis=1, keepdims=True)
-        risk[:, ids_a] = np.maximum(risk[:, ids_a], part * _env_float("V46_53_PART_PROPAGATION", 0.65))
+        risk[:, ids_a] = np.maximum(
+            risk[:, ids_a],
+            part * _env_float("V46_53_PART_PROPAGATION", 0.65),
+        )
 
     root_v = np.zeros((t, 3), np.float32)
     root_a = np.zeros((t, 3), np.float32)
     if t > 1:
-        root_v[1:] = np.diff(x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]], axis=0) * fps
+        root_v[1:] = np.diff(
+            x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]], axis=0
+        ) * float(fps)
     if t > 2:
-        root_a[2:] = np.diff(root_v[1:], axis=0) * fps
-    root_score = np.clip(np.linalg.norm(root_a, axis=-1) / _env_float("V46_53_ROOT_ACC_MASK_SCALE", 8.0), 0.0, 1.0)
+        root_a[2:] = np.diff(root_v[1:], axis=0) * float(fps)
+    root_score = np.clip(
+        np.linalg.norm(root_a, axis=-1)
+        / _env_float("V46_53_ROOT_ACC_MASK_SCALE", 8.0),
+        0.0,
+        1.0,
+    )
     root_score *= seam_f.astype(np.float32)
+    root_score = np.maximum(
+        root_score,
+        np.asarray(peak["root"], dtype=np.float32),
+    )
+
     contact_score = np.zeros(t, np.float32)
     if t > 1:
         contact_score[1:] = (
@@ -270,22 +306,27 @@ def build_frame_joint_risk_mask(
             * float(fps)
             / 30.0
         )
-    contact_score = np.maximum(contact_score * seam_f, seam_f.astype(np.float32) * 0.25)
+    contact_score = np.maximum(
+        contact_score * seam_f,
+        seam_f.astype(np.float32) * 0.25,
+    )
 
     return {
         "joint": np.clip(risk, 0.0, 1.0).astype(np.float32),
         "root": np.clip(root_score, 0.0, 1.0).astype(np.float32),
         "contact": np.clip(contact_score, 0.0, 1.0).astype(np.float32),
-        "frame": seam_f.astype(np.float32),
+        "frame": editable_frame.astype(np.float32),
         "report": {
             "schema": SCHEMA,
-            "editable_frame_ratio": float(seam_f.mean()),
+            "editable_frame_ratio": float(editable_frame.mean()),
             "editable_joint_ratio": float((risk > 0.25).mean()),
             "mean_joint_weight": float(risk.mean()),
             "max_joint_weight": float(risk.max()),
             "fps": float(fps),
             "mask_dilation_frames": int(dilation),
             "mask_dilation_seconds": float(dilation / float(fps)),
+            "seam_active_frames": int(np.count_nonzero(seam_f)),
+            "peak_jerk": peak["report"],
         },
     }
 

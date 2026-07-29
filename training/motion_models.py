@@ -104,6 +104,13 @@ from motion_geometry.product_manifold import (
     product_log_torch,
 )
 from contracts.boundary import build_frame_joint_risk_mask
+from contracts.physical_quality import (
+    PhysicalQualityLimits,
+    StageAcceptancePolicy,
+    compute_joint_kinematic_metrics,
+    evaluate_physical_audit,
+    evaluate_stage_candidate,
+)
 from support.event_identity import (
     assert_same_event_db_contract,
     event_uids_from_generation_db,
@@ -8622,6 +8629,7 @@ def concat_events(event_paths, target_durations, cfg):
 
 
 def _v46_41_kinematic_stats(motion, cfg):
+    """Return KBO statistics using the same true frame-joint SI metrics as final audit."""
     m = np.asarray(motion, dtype=np.float32)
     stats = {"finite": bool(np.isfinite(m).all()), "shape": list(m.shape)}
     if m.ndim != 2 or m.shape[0] < 2 or m.shape[1] < EDGE_DIM:
@@ -8633,24 +8641,26 @@ def _v46_41_kinematic_stats(motion, cfg):
         foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
         foot_y = foot[..., 1]
         stats["floor_y"] = float(np.percentile(foot_y.reshape(-1), 5))
-        stats["foot_penetration_min_m"] = float(np.min(foot_y - stats["floor_y"]))
-        if joints.shape[0] >= 4:
-            fps = float(cfg.fps)
-            vel = np.diff(joints, axis=0) * fps
-            acc = np.diff(joints, n=2, axis=0) * fps ** 2
-            jerk = np.diff(joints, n=3, axis=0) * fps ** 3
-            stats["joint_velocity_p95_mps"] = float(np.percentile(np.linalg.norm(vel, axis=-1).mean(axis=-1), 95))
-            stats["joint_acceleration_max_mps2"] = float(np.max(np.linalg.norm(acc, axis=-1).mean(axis=-1)))
-            stats["joint_jerk_max_mps3"] = float(np.max(np.linalg.norm(jerk, axis=-1).mean(axis=-1)))
-            stats["joint_jerk_p95_mps3"] = float(np.percentile(np.linalg.norm(jerk, axis=-1).mean(axis=-1), 95))
+        stats["foot_penetration_min_m"] = float(
+            np.min(foot_y - stats["floor_y"])
+        )
+        stats.update(
+            compute_joint_kinematic_metrics(joints, fps=float(cfg.fps))
+        )
         bone_vars = []
-        for j in range(1, min(NUM_JOINTS, len(PARENTS))):
-            pa = int(PARENTS[j])
-            if pa < 0 or pa >= NUM_JOINTS:
+        for joint_id in range(1, min(NUM_JOINTS, len(PARENTS))):
+            parent_id = int(PARENTS[joint_id])
+            if parent_id < 0 or parent_id >= NUM_JOINTS:
                 continue
-            L = np.linalg.norm(joints[:, j] - joints[:, pa], axis=-1)
-            bone_vars.append(float(np.max(np.abs(L - np.median(L)))))
-        stats["bone_length_violation_max_m"] = float(max(bone_vars) if bone_vars else 0.0)
+            lengths = np.linalg.norm(
+                joints[:, joint_id] - joints[:, parent_id], axis=-1
+            )
+            bone_vars.append(
+                float(np.max(np.abs(lengths - np.median(lengths))))
+            )
+        stats["bone_length_violation_max_m"] = float(
+            max(bone_vars) if bone_vars else 0.0
+        )
     except Exception as exc:
         stats["fk_finite"] = False
         stats["fk_error"] = str(exc)
@@ -8658,9 +8668,18 @@ def _v46_41_kinematic_stats(motion, cfg):
         stats.update(audit_motion_np(m, cfg))
     except Exception as exc:
         stats["audit_error"] = str(exc)
-    stats["root_y_range_m"] = float(np.max(m[:, ROOT_Y_IDX]) - np.min(m[:, ROOT_Y_IDX]))
+    stats["root_y_range_m"] = float(
+        np.max(m[:, ROOT_Y_IDX]) - np.min(m[:, ROOT_Y_IDX])
+    )
     xz = m[:, [ROOT_X_IDX, ROOT_Z_IDX]]
-    stats["root_xz_radius_p95_m"] = float(np.percentile(np.linalg.norm(xz - np.median(xz, axis=0, keepdims=True), axis=-1), 95))
+    stats["root_xz_radius_p95_m"] = float(
+        np.percentile(
+            np.linalg.norm(
+                xz - np.median(xz, axis=0, keepdims=True), axis=-1
+            ),
+            95,
+        )
+    )
     stats["valid"] = True
     return stats
 
@@ -8678,43 +8697,82 @@ def _v46_41_anchor_error(candidate, a0=0):
 
 
 def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
+    """Kinematic barrier oracle aligned with the final SI physical gate."""
     cand = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
-    reasons = []
     if cand.shape != ref.shape:
-        return False, ["shape_changed"], {"candidate_shape": list(cand.shape), "reference_shape": list(ref.shape)}
-    c = _v46_41_kinematic_stats(cand, cfg)
-    r = _v46_41_kinematic_stats(ref, cfg)
-    if not c.get("finite", False) or not c.get("fk_finite", False):
+        return False, ["shape_changed"], {
+            "candidate_shape": list(cand.shape),
+            "reference_shape": list(ref.shape),
+        }
+
+    candidate_stats = _v46_41_kinematic_stats(cand, cfg)
+    reference_stats = _v46_41_kinematic_stats(ref, cfg)
+    reasons = []
+
+    if not candidate_stats.get("finite", False) or not candidate_stats.get(
+        "fk_finite", False
+    ):
         reasons.append("nan_or_inf_or_fk_invalid")
-    if float(c.get("root_y_range_m", 0.0)) > _v46_41_env_float("V46_41_KBO_ROOT_RANGE_ABS_MAX_M", 2.50):
-        reasons.append("root_y_range_abs_exceeded")
-    if abs(float(c.get("floor_y", 0.0)) - float(r.get("floor_y", 0.0))) > _v46_41_env_float("V46_41_KBO_FLOOR_SHIFT_MAX_M", 1.50):
-        reasons.append("floor_shift_exceeded")
-    if float(c.get("bone_length_violation_max_m", 0.0)) > _v46_41_env_float("V46_41_KBO_BONE_LENGTH_EPS_M", 0.02):
+
+    if float(candidate_stats.get("bone_length_violation_max_m", 0.0)) > _v46_41_env_float(
+        "PHYSICAL_STAGE_BONE_LENGTH_EPS_M", 0.02
+    ):
         reasons.append("bone_length_violation")
-    if float(c.get("joint_acceleration_max_mps2", 0.0)) > _v46_41_env_float("V46_41_KBO_ACC_MAX_MPS2", 2700.0):
+
+    if abs(
+        float(candidate_stats.get("floor_y", 0.0))
+        - float(reference_stats.get("floor_y", 0.0))
+    ) > _v46_41_env_float("PHYSICAL_STAGE_FLOOR_SHIFT_MAX_M", 1.50):
+        reasons.append("floor_shift_exceeded")
+
+    if float(candidate_stats.get("joint_acceleration_mps2_max", 0.0)) > _v46_41_env_float(
+        "PHYSICAL_STAGE_ACCELERATION_MAX_MPS2", 2700.0
+    ):
         reasons.append("acceleration_spike")
-    if float(c.get("joint_jerk_max_mps3", 0.0)) > _v46_41_env_float("V46_41_KBO_JERK_MAX_MPS3", 81000.0):
-        reasons.append("jerk_spike")
-    if float(c.get("joint_jerk_mps3_p95", c.get("joint_jerk_p95_mps3", 0.0))) > max(
-        float(r.get("joint_jerk_mps3_p95", r.get("joint_jerk_p95_mps3", 0.0))) * _v46_41_env_float("V46_41_KBO_JERK_RATIO", 2.5),
-        float(r.get("joint_jerk_mps3_p95", r.get("joint_jerk_p95_mps3", 0.0))) + _v46_41_env_float("V46_41_KBO_JERK_MARGIN_MPS3", 4050.0),
-    ):
-        reasons.append("jerk_p95_worse")
-    if float(c.get("foot_skate_mps_p95", 0.0)) > max(
-        float(r.get("foot_skate_mps_p95", 0.0)) * _v46_41_env_float("V46_41_KBO_SKATE_RATIO", 2.5),
-        float(r.get("foot_skate_mps_p95", 0.0)) + _v46_41_env_float("V46_41_KBO_SKATE_MARGIN_MPS", 1.8),
-    ):
-        reasons.append("skate_p95_worse")
-    if float(c.get("foot_penetration_min_m", 0.0)) < float(r.get("foot_penetration_min_m", 0.0)) - _v46_41_env_float("V46_41_KBO_PENETRATION_MARGIN_M", 0.20):
-        reasons.append("penetration_worse")
+
+    limits = PhysicalQualityLimits.from_environment()
+    stage_key = str(stage).strip().lower()
+
+    if stage_key.startswith("ik_"):
+        # IK has its own local ownership-window transaction checks, including
+        # relative skate/jerk constraints, penetration control and root-delta
+        # limits.  KBO must therefore apply only the authoritative absolute SI
+        # gate to IK candidates; reapplying the neural-stage relative policy
+        # would reject physically valid IK trade-offs twice.
+        decision = evaluate_physical_audit(
+            candidate_stats,
+            limits=limits,
+        )
+    else:
+        # Neural repair stages must not regress relative to their input.
+        decision = evaluate_stage_candidate(
+            reference_stats,
+            candidate_stats,
+            limits=limits,
+            policy=StageAcceptancePolicy.from_environment(),
+            require_repair_gain=False,
+        )
+
+    reasons.extend(decision["reasons"])
+
     if _v46_41_env_bool("V46_41_KBO_STAGE_ANCHOR_ENABLE", True):
-        ae = _v46_41_anchor_error(cand, global_start)
-        if ae > _v46_41_env_float("V46_41_KBO_ANCHOR_P95_MAX_M", 0.85):
+        anchor_error = _v46_41_anchor_error(cand, global_start)
+        if anchor_error > _v46_41_env_float(
+            "V46_41_KBO_ANCHOR_P95_MAX_M", 0.85
+        ):
             reasons.append("stage_anchor_deviation")
-        c["stage_anchor_error_p95_m"] = ae
-    return len(reasons) == 0, reasons, {"candidate": c, "reference": r, "stage": stage, "global_start": int(global_start)}
+        candidate_stats["stage_anchor_error_p95_m"] = anchor_error
+
+    reasons = list(dict.fromkeys(reasons))
+    detail = {
+        "candidate": candidate_stats,
+        "reference": reference_stats,
+        "stage": stage,
+        "global_start": int(global_start),
+        "stage_decision": decision,
+    }
+    return len(reasons) == 0, reasons, detail
 
 
 def _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected, accepted, reasons, global_span):
