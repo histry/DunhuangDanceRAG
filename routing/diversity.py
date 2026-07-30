@@ -54,45 +54,75 @@ def diversity_assessment(
     costs.  The legacy binary behavior remains available by setting
     ``BR_HPR_ENABLE=0``.
     """
+    probabilistic = _env_bool("BR_HPR_ENABLE", False)
+
     identity = event_identity(db, event_id)
     history = [event_identity(db, int(value)) for value in selected_event_ids]
-    cooldown = max(
-        1,
-        _env_int(
-            "BR_HPR_EVENT_COOLDOWN_SLOTS",
+
+    # Keep the legacy baseline isolated from BR-HPR environment variables.
+    # This is essential for reproducible ablations: sourcing br_hpr.env must not
+    # alter the V46.54 hard-diversity baseline when BR_HPR_ENABLE=0.
+    if probabilistic:
+        cooldown = max(
+            1,
+            _env_int(
+                "BR_HPR_EVENT_COOLDOWN_SLOTS",
+                _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8),
+            ),
+        )
+        max_source_run = max(
+            1,
+            _env_int(
+                "BR_HPR_MAX_SOURCE_RUN",
+                _env_int("V46_54_MAX_SOURCE_RUN", 2),
+            ),
+        )
+        max_source_share = _env_float(
+            "BR_HPR_MAX_SOURCE_SHARE",
+            _env_float("V46_54_MAX_SOURCE_SHARE", 0.40),
+        )
+        max_family_share = _env_float(
+            "BR_HPR_MAX_FAMILY_SHARE",
+            _env_float("V46_54_MAX_FAMILY_SHARE", 0.50),
+        )
+        minimum_share_history = max(
+            1,
+            _env_int(
+                "BR_HPR_MIN_SHARE_HISTORY",
+                _env_int("V46_54_MIN_SHARE_HISTORY", 6),
+            ),
+        )
+    else:
+        cooldown = max(
+            1,
             _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8),
-        ),
-    )
-    max_source_run = max(
-        1,
-        _env_int(
-            "BR_HPR_MAX_SOURCE_RUN",
+        )
+        max_source_run = max(
+            1,
             _env_int("V46_54_MAX_SOURCE_RUN", 2),
-        ),
-    )
-    max_source_share = _env_float(
-        "BR_HPR_MAX_SOURCE_SHARE",
-        _env_float("V46_54_MAX_SOURCE_SHARE", 0.40),
-    )
-    max_family_share = _env_float(
-        "BR_HPR_MAX_FAMILY_SHARE",
-        _env_float("V46_54_MAX_FAMILY_SHARE", 0.50),
-    )
-    minimum_share_history = max(
-        1,
-        _env_int(
-            "BR_HPR_MIN_SHARE_HISTORY",
+        )
+        max_source_share = _env_float(
+            "V46_54_MAX_SOURCE_SHARE",
+            0.40,
+        )
+        max_family_share = _env_float(
+            "V46_54_MAX_FAMILY_SHARE",
+            0.50,
+        )
+        minimum_share_history = max(
+            1,
             _env_int("V46_54_MIN_SHARE_HISTORY", 6),
-        ),
-    )
+        )
 
     recent_uids = [row["event_uid"] for row in history[-cooldown:]]
     exact_cooldown_violation = identity["event_uid"] in recent_uids
+
     repeat_gap = None
     for gap, row in enumerate(reversed(history), start=1):
         if row["event_uid"] == identity["event_uid"]:
             repeat_gap = gap
             break
+
     source_run = 0
     for row in reversed(history):
         if row["source_uid"] != identity["source_uid"]:
@@ -102,9 +132,15 @@ def diversity_assessment(
 
     source_counts = Counter(row["source_uid"] for row in history)
     family_counts = Counter(row["family_id"] for row in history)
+
     total_after = len(history) + 1
-    source_share = (source_counts[identity["source_uid"]] + 1) / max(1, total_after)
-    family_share = (family_counts[identity["family_id"]] + 1) / max(1, total_after)
+    source_share = (
+        source_counts[identity["source_uid"]] + 1
+    ) / max(1, total_after)
+    family_share = (
+        family_counts[identity["family_id"]] + 1
+    ) / max(1, total_after)
+
     share_active = len(history) >= minimum_share_history
 
     legacy_reasons: list[str] = []
@@ -112,24 +148,36 @@ def diversity_assessment(
         legacy_reasons.append("event_uid_cooldown")
     if source_run_after > max_source_run:
         legacy_reasons.append("source_run")
-    if share_active and source_share > max_source_share + 1.0e-9:
+    if (
+        share_active
+        and source_share > max_source_share + 1.0e-9
+    ):
         legacy_reasons.append("source_share")
-    if share_active and family_share > max_family_share + 1.0e-9:
+    if (
+        share_active
+        and family_share > max_family_share + 1.0e-9
+    ):
         legacy_reasons.append("family_share")
 
     repeat_violation = 0.0
     if repeat_gap is not None and repeat_gap <= cooldown:
-        repeat_violation = (cooldown - repeat_gap + 1) / max(1.0, float(cooldown))
+        repeat_violation = (
+            cooldown - repeat_gap + 1
+        ) / max(1.0, float(cooldown))
+
     source_run_violation = max(
         0.0,
-        (source_run_after - max_source_run) / max(1.0, float(max_source_run)),
+        (source_run_after - max_source_run)
+        / max(1.0, float(max_source_run)),
     )
+
     source_share_violation = (
         max(0.0, source_share - max_source_share)
         / max(1.0 - max_source_share, 1.0e-9)
         if share_active
         else 0.0
     )
+
     family_share_violation = (
         max(0.0, family_share - max_family_share)
         / max(1.0 - max_family_share, 1.0e-9)
@@ -137,19 +185,46 @@ def diversity_assessment(
         else 0.0
     )
 
-    penalty = 0.0
-    penalty += _env_float("BR_HPR_EVENT_REPEAT_WEIGHT", 1.20) * repeat_violation
-    penalty += _env_float("BR_HPR_SOURCE_RUN_WEIGHT", 1.00) * source_run_violation
-    penalty += _env_float("BR_HPR_SOURCE_SHARE_WEIGHT", 0.80) * source_share_violation
-    penalty += _env_float("BR_HPR_FAMILY_SHARE_WEIGHT", 0.65) * family_share_violation
-    penalty += _env_float("V46_54_SOURCE_REUSE_WEIGHT", 0.08) * source_counts[
-        identity["source_uid"]
-    ]
-    penalty += _env_float("V46_54_FAMILY_REUSE_WEIGHT", 0.05) * family_counts[
-        identity["family_id"]
-    ]
+    if probabilistic:
+        penalty = 0.0
+        penalty += (
+            _env_float("BR_HPR_EVENT_REPEAT_WEIGHT", 1.20)
+            * repeat_violation
+        )
+        penalty += (
+            _env_float("BR_HPR_SOURCE_RUN_WEIGHT", 1.00)
+            * source_run_violation
+        )
+        penalty += (
+            _env_float("BR_HPR_SOURCE_SHARE_WEIGHT", 0.80)
+            * source_share_violation
+        )
+        penalty += (
+            _env_float("BR_HPR_FAMILY_SHARE_WEIGHT", 0.65)
+            * family_share_violation
+        )
+    else:
+        # Preserve the original V46.54 baseline scoring semantics.
+        penalty = 0.0
+        if share_active:
+            penalty += (
+                _env_float("V46_54_SOURCE_SHARE_WEIGHT", 2.0)
+                * max(0.0, source_share - max_source_share)
+            )
+            penalty += (
+                _env_float("V46_54_FAMILY_SHARE_WEIGHT", 1.2)
+                * max(0.0, family_share - max_family_share)
+            )
 
-    probabilistic = _env_bool("BR_HPR_ENABLE", False)
+    penalty += (
+        _env_float("V46_54_SOURCE_REUSE_WEIGHT", 0.08)
+        * source_counts[identity["source_uid"]]
+    )
+    penalty += (
+        _env_float("V46_54_FAMILY_REUSE_WEIGHT", 0.05)
+        * family_counts[identity["family_id"]]
+    )
+
     return {
         **identity,
         "hard_valid": True if probabilistic else not legacy_reasons,
