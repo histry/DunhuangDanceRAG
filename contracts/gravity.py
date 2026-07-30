@@ -63,17 +63,23 @@ def identity6d_np(shape_prefix: Tuple[int, ...] = ()) -> np.ndarray:
     return np.broadcast_to(base, tuple(shape_prefix) + (6,)).copy()
 
 
-def fk24_np(motion: np.ndarray) -> np.ndarray:
+def fk24_from_local_np(
+    motion: np.ndarray,
+    local_matrices: np.ndarray,
+) -> np.ndarray:
+    """Run FK from preprojected local SO(3) matrices."""
     x = np.asarray(motion, dtype=np.float32)
     if x.ndim == 3 and x.shape[0] == 1:
         x = x[0]
     if x.ndim != 2 or x.shape[-1] < EDGE_DIM:
         raise ValueError(f"Expected [T,151], got {x.shape}")
-    T = x.shape[0]
-    local = rot6d_to_matrix_np(x[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6))
+    local = np.asarray(local_matrices, dtype=np.float32)
+    expected = (len(x), NUM_JOINTS, 3, 3)
+    if local.shape != expected:
+        raise ValueError(f"Expected local matrices {expected}, got {local.shape}")
     root = x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
-    gp = np.zeros((T, NUM_JOINTS, 3), dtype=np.float32)
-    gr = np.zeros((T, NUM_JOINTS, 3, 3), dtype=np.float32)
+    gp = np.zeros((len(x), NUM_JOINTS, 3), dtype=np.float32)
+    gr = np.zeros((len(x), NUM_JOINTS, 3, 3), dtype=np.float32)
     for j in range(NUM_JOINTS):
         p = int(PARENTS[j])
         if p < 0:
@@ -81,8 +87,22 @@ def fk24_np(motion: np.ndarray) -> np.ndarray:
             gp[:, j] = root
         else:
             gr[:, j] = gr[:, p] @ local[:, j]
-            gp[:, j] = gp[:, p] + (gr[:, p] @ OFFSETS[j].reshape(1, 3, 1))[..., 0]
+            gp[:, j] = gp[:, p] + (
+                gr[:, p] @ OFFSETS[j].reshape(1, 3, 1)
+            )[..., 0]
     return gp
+
+
+def fk24_np(motion: np.ndarray) -> np.ndarray:
+    x = np.asarray(motion, dtype=np.float32)
+    if x.ndim == 3 and x.shape[0] == 1:
+        x = x[0]
+    if x.ndim != 2 or x.shape[-1] < EDGE_DIM:
+        raise ValueError(f"Expected [T,151], got {x.shape}")
+    local = rot6d_to_matrix_np(
+        x[:, ROT6D_START:ROT6D_END].reshape(len(x), NUM_JOINTS, 6)
+    )
+    return fk24_from_local_np(x, local)
 
 
 def gravity_metrics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, float]:

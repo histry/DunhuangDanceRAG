@@ -826,9 +826,10 @@ def install(v53: Any) -> Dict[str, Any]:
                         })
             raise RuntimeError(
                 "Feasibility-aware generation exhausted bounded search and "
-                "duration tiers. Source safety, event anatomy, heading validity, "
-                "history diversity, performer group, and severe physical gates "
-                "were intentionally not relaxed. "
+                "duration tiers. Physical safety, event anatomy, severe heading "
+                "validity and performer-group contracts were not relaxed. BR-HPR "
+                "history, source, family and observability preferences were handled "
+                "through probabilistic budgets and auditable safe-set recovery. "
                 "Diagnostics=" + json.dumps(failures, ensure_ascii=False)
             )
         finally:

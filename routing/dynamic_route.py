@@ -170,7 +170,13 @@ class DynamicBeamState:
     cumulative_abs_yaw: float = 0.0
     score: float = 0.0
     observability: float = 1.0
-
+    constraint_usage: tuple[float, ...] = ()
+    constraint_duals: tuple[float, ...] = ()
+    recovery_count: int = 0
+    recovery_budget_used: float = 0.0
+    minimum_future_reachability: float = 1.0
+    source_scarcity_exemption_count: int = 0
+    source_expansion_count: int = 0
 
 class DynamicRouteDeadEnd(RuntimeError):
     """Raised when every retained exact-simulation state is blocked."""

@@ -22,6 +22,11 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 def _db_value(db: Mapping[str, Any], key: str, index: int, default: str) -> str:
     values = db.get(key)
     if values is None or index < 0 or index >= len(values):
@@ -43,16 +48,51 @@ def diversity_assessment(
     event_id: int,
     selected_event_ids: Sequence[int],
 ) -> dict[str, Any]:
+    """Evaluate history diversity without turning preferences into safety gates.
+
+    Under BR-HPR, exact repetition and source/family concentration are continuous
+    costs.  The legacy binary behavior remains available by setting
+    ``BR_HPR_ENABLE=0``.
+    """
     identity = event_identity(db, event_id)
     history = [event_identity(db, int(value)) for value in selected_event_ids]
-    cooldown = max(1, _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8))
-    max_source_run = max(1, _env_int("V46_54_MAX_SOURCE_RUN", 2))
-    max_source_share = _env_float("V46_54_MAX_SOURCE_SHARE", 0.40)
-    max_family_share = _env_float("V46_54_MAX_FAMILY_SHARE", 0.50)
-    minimum_share_history = max(1, _env_int("V46_54_MIN_SHARE_HISTORY", 6))
+    cooldown = max(
+        1,
+        _env_int(
+            "BR_HPR_EVENT_COOLDOWN_SLOTS",
+            _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8),
+        ),
+    )
+    max_source_run = max(
+        1,
+        _env_int(
+            "BR_HPR_MAX_SOURCE_RUN",
+            _env_int("V46_54_MAX_SOURCE_RUN", 2),
+        ),
+    )
+    max_source_share = _env_float(
+        "BR_HPR_MAX_SOURCE_SHARE",
+        _env_float("V46_54_MAX_SOURCE_SHARE", 0.40),
+    )
+    max_family_share = _env_float(
+        "BR_HPR_MAX_FAMILY_SHARE",
+        _env_float("V46_54_MAX_FAMILY_SHARE", 0.50),
+    )
+    minimum_share_history = max(
+        1,
+        _env_int(
+            "BR_HPR_MIN_SHARE_HISTORY",
+            _env_int("V46_54_MIN_SHARE_HISTORY", 6),
+        ),
+    )
 
     recent_uids = [row["event_uid"] for row in history[-cooldown:]]
     exact_cooldown_violation = identity["event_uid"] in recent_uids
+    repeat_gap = None
+    for gap, row in enumerate(reversed(history), start=1):
+        if row["event_uid"] == identity["event_uid"]:
+            repeat_gap = gap
+            break
     source_run = 0
     for row in reversed(history):
         if row["source_uid"] != identity["source_uid"]:
@@ -67,41 +107,69 @@ def diversity_assessment(
     family_share = (family_counts[identity["family_id"]] + 1) / max(1, total_after)
     share_active = len(history) >= minimum_share_history
 
-    hard_reasons: list[str] = []
+    legacy_reasons: list[str] = []
     if exact_cooldown_violation:
-        hard_reasons.append("event_uid_cooldown")
+        legacy_reasons.append("event_uid_cooldown")
     if source_run_after > max_source_run:
-        hard_reasons.append("source_run")
+        legacy_reasons.append("source_run")
     if share_active and source_share > max_source_share + 1.0e-9:
-        hard_reasons.append("source_share")
+        legacy_reasons.append("source_share")
     if share_active and family_share > max_family_share + 1.0e-9:
-        hard_reasons.append("family_share")
+        legacy_reasons.append("family_share")
+
+    repeat_violation = 0.0
+    if repeat_gap is not None and repeat_gap <= cooldown:
+        repeat_violation = (cooldown - repeat_gap + 1) / max(1.0, float(cooldown))
+    source_run_violation = max(
+        0.0,
+        (source_run_after - max_source_run) / max(1.0, float(max_source_run)),
+    )
+    source_share_violation = (
+        max(0.0, source_share - max_source_share)
+        / max(1.0 - max_source_share, 1.0e-9)
+        if share_active
+        else 0.0
+    )
+    family_share_violation = (
+        max(0.0, family_share - max_family_share)
+        / max(1.0 - max_family_share, 1.0e-9)
+        if share_active
+        else 0.0
+    )
 
     penalty = 0.0
-    if share_active:
-        penalty += _env_float("V46_54_SOURCE_SHARE_WEIGHT", 2.0) * max(
-            0.0, source_share - max_source_share
-        )
-        penalty += _env_float("V46_54_FAMILY_SHARE_WEIGHT", 1.2) * max(
-            0.0, family_share - max_family_share
-        )
+    penalty += _env_float("BR_HPR_EVENT_REPEAT_WEIGHT", 1.20) * repeat_violation
+    penalty += _env_float("BR_HPR_SOURCE_RUN_WEIGHT", 1.00) * source_run_violation
+    penalty += _env_float("BR_HPR_SOURCE_SHARE_WEIGHT", 0.80) * source_share_violation
+    penalty += _env_float("BR_HPR_FAMILY_SHARE_WEIGHT", 0.65) * family_share_violation
     penalty += _env_float("V46_54_SOURCE_REUSE_WEIGHT", 0.08) * source_counts[
         identity["source_uid"]
     ]
     penalty += _env_float("V46_54_FAMILY_REUSE_WEIGHT", 0.05) * family_counts[
         identity["family_id"]
     ]
+
+    probabilistic = _env_bool("BR_HPR_ENABLE", False)
     return {
         **identity,
-        "hard_valid": not hard_reasons,
-        "hard_reasons": hard_reasons,
+        "hard_valid": True if probabilistic else not legacy_reasons,
+        "hard_reasons": [] if probabilistic else list(legacy_reasons),
+        "soft_reasons": list(legacy_reasons),
+        "legacy_hard_reasons": list(legacy_reasons),
         "penalty": float(penalty),
-        "cooldown_slots": cooldown,
-        "source_run_after": source_run_after,
+        "cooldown_slots": int(cooldown),
+        "event_repeat_gap": repeat_gap,
+        "source_run_after": int(source_run_after),
         "source_share_after": float(source_share),
         "family_share_after": float(family_share),
+        "probabilistic_preference_mode": bool(probabilistic),
+        "preference_violations": {
+            "event_repeat": float(repeat_violation),
+            "source_run": float(source_run_violation),
+            "source_share": float(source_share_violation),
+            "family_share": float(family_share_violation),
+        },
     }
-
 
 def proposal_selection_score(
     proposal: Any,
