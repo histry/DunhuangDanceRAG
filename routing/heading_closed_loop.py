@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from routing.anatomy_feature_cache import ROUTE_PROGRESS
 from routing.diversity import (
     diversity_assessment,
     event_identity,
@@ -43,6 +44,24 @@ from routing.dynamic_route import (
     route_prior_cost,
     route_prior_summary,
     source_calibration_penalty,
+)
+
+from routing.bidirectional_reachability import BackwardReachabilityModel
+from routing.constraint_audit import (
+    controlled_recovery_metadata,
+    summarize_constraint_trials,
+)
+from routing.hierarchical_constraint_model import (
+    CONSTRAINT_NAMES,
+    ConstraintBudgetConfig,
+    assess_candidate_constraints,
+    build_source_scarcity_context,
+    select_controlled_recovery_indices,
+)
+from routing.safe_source_coverage import (
+    SafeSourceCoverageConfig,
+    build_source_reservoir_layers,
+    select_state_source_expansion_candidates,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -281,6 +300,8 @@ def _build_heading_proposal(
         "combined_score": float(combined),
         "heading_detail": heading_detail,
         "event_meta": event_meta,
+        "source_frames": int(raw.shape[0]),
+        "core_frames": int(len(core)),
     }
 
 
@@ -292,32 +313,86 @@ def assemble_event_heading_reference(
     cfg: Any,
     banned: Optional[Dict[int, set]] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[List[int]]]:
-    """Assemble an exact-simulation route with posterior-guided dynamic beam.
+    """Assemble a hard-safe route with state-aware probabilistic constraints.
 
-    Graph-SB probabilities remain soft priors.  Every retained branch is built
-    by the authoritative heading/bridge/physics simulator, and anatomy,
-    heading, cooldown, source, family, and severe physical gates remain hard.
+    Immutable physical, anatomical and severe-heading gates are evaluated by the
+    existing exact simulator.  The route planner adds four bounded mechanisms:
+    state-conditioned suffix reachability, source-targeted candidate expansion,
+    scarcity-aware source budgets and continuous safe-set recovery resources.
     """
-
     global _LAST_HEADING_PLAN
     _heading_schema_guard(db)
 
     paths = np.asarray(db["paths"], dtype=object)
     blocked = banned or {}
     search = DynamicSearchConfig.from_environment()
+    constraint_config = ConstraintBudgetConfig.from_environment(len(slots))
+    source_coverage_config = SafeSourceCoverageConfig.from_environment()
+    target_lengths = [base.slot_target_frames(slot, cfg) for slot in slots]
+    reservoir_layers, reservoir_report = build_source_reservoir_layers(
+        slots=slots,
+        target_lengths=target_lengths,
+        candidate_lists=candidate_lists,
+        db=db,
+        fps=float(getattr(cfg, "fps", 30.0)),
+        blocked=blocked,
+        config=source_coverage_config,
+    )
+    reachability_model = BackwardReachabilityModel.build(
+        candidate_lists,
+        db,
+        constraint_config=constraint_config,
+        additional_candidate_layers=reservoir_layers,
+    )
+
+    route_progress = globals().get("ROUTE_PROGRESS")
+
+    def progress_call(name: str, *args: Any, **kwargs: Any) -> Any:
+        if route_progress is None or not hasattr(route_progress, name):
+            return None
+        try:
+            return getattr(route_progress, name)(*args, **kwargs)
+        except Exception:
+            return None
+
+    progress_call(
+        "start",
+        len(slots),
+        {
+            "beam_width": int(search.beam_width),
+            "maximum_beam_width": int(search.maximum_beam_width),
+            "branch_topk": int(search.branch_topk),
+            "candidates_per_source": int(search.candidates_per_source),
+            "method": "state-aware BR-HPR",
+            "source_targeted_expansion": bool(source_coverage_config.enabled),
+            "continuous_recovery_budget": float(
+                constraint_config.recovery_budget_total
+            ),
+        },
+    )
+
     initial_heading = float(
         np.radians(env_float("V46_50_STAGE_INITIAL_HEADING_DEG", 0.0))
     )
+    initial_usage, initial_duals = constraint_config.initial_state()
     beam: List[DynamicBeamState] = [
         DynamicBeamState(
             motion=np.zeros((0, EDGE_DIM), dtype=np.float32),
             stage_heading=initial_heading,
+            constraint_usage=initial_usage,
+            constraint_duals=initial_duals,
+            recovery_count=0,
+            recovery_budget_used=0.0,
+            minimum_future_reachability=1.0,
+            source_scarcity_exemption_count=0,
+            source_expansion_count=0,
         )
     ]
     layer_trace: List[Dict[str, Any]] = []
+    collapse_events: List[Dict[str, Any]] = []
 
     for slot_idx, slot in enumerate(slots):
-        target_len = base.slot_target_frames(slot, cfg)
+        target_len = int(target_lengths[slot_idx])
         candidates = [
             int(value)
             for value in candidate_lists[slot_idx]
@@ -326,6 +401,9 @@ def assemble_event_heading_reference(
         ]
         if not candidates:
             raise RuntimeError(f"No candidates remain for slot {slot_idx}")
+        progress_call(
+            "slot_start", slot_idx, target_len, len(beam), len(candidates)
+        )
 
         primary_event_id = int(candidates[0])
         expanded: List[DynamicBeamState] = []
@@ -344,11 +422,13 @@ def assemble_event_heading_reference(
                 minimum_per_source=search.candidates_per_source,
                 primary_event_id=primary_event_id,
             )
+            rank_lookup = {
+                int(event_id): rank for rank, event_id in enumerate(candidates)
+            }
 
             preordered: List[
-                Tuple[float, int, int, Dict[str, Any], Dict[str, Any]]
+                Tuple[float, int, int, Dict[str, Any], Dict[str, Any], str]
             ] = []
-            rank_lookup = {int(event_id): rank for rank, event_id in enumerate(candidates)}
             for event_id in subset:
                 original_rank = int(rank_lookup[int(event_id)])
                 meta = event_meta_from_db(db, int(event_id))
@@ -369,8 +449,19 @@ def assemble_event_heading_reference(
                     fallback_rank=original_rank,
                     candidate_count=len(candidates),
                 )
-                order_score = float(heading_penalty) + search.posterior_weight * float(
-                    prior_cost
+                static_reachability = reachability_model.get(
+                    slot_idx, int(event_id)
+                )
+                future_probability = float(
+                    static_reachability.get(
+                        "future_reachability_probability", 0.0
+                    )
+                )
+                order_score = (
+                    float(heading_penalty)
+                    + search.posterior_weight * float(prior_cost)
+                    - constraint_config.future_reachability_weight
+                    * math.log(max(future_probability, 1.0e-9))
                 )
                 preordered.append(
                     (
@@ -379,12 +470,28 @@ def assemble_event_heading_reference(
                         int(event_id),
                         heading_detail,
                         prior_detail,
+                        "retrieval",
                     )
                 )
             preordered.sort(key=lambda row: (row[0], row[1], row[2]))
 
             proposals: List[Tuple[base.CandidateProposal, Dict[str, Any]]] = []
-            for _, original_rank, event_id, _heading_detail, prior_detail in preordered:
+
+            def simulate_candidate(
+                *,
+                event_id: int,
+                original_rank: int,
+                prior_detail: Mapping[str, Any],
+                origin: str,
+            ) -> None:
+                progress_token = progress_call(
+                    "candidate_start",
+                    slot=slot_idx,
+                    state_index=state_index,
+                    event_id=event_id,
+                    candidate_rank=original_rank,
+                    target_frames=target_len,
+                )
                 proposal, extra0 = _build_heading_proposal(
                     v46=v46,
                     prev_motion=(state.motion if len(state.motion) else None),
@@ -399,74 +506,291 @@ def assemble_event_heading_reference(
                     stage_heading_rad=state.stage_heading,
                     recent_turn_count=state.recent_turn_count,
                 )
-                extra = dict(extra0)
-                diversity = diversity_assessment(
-                    db,
-                    int(event_id),
-                    state.selected_event_ids,
+                progress_call(
+                    "candidate_finish", progress_token, safe=bool(proposal.safe)
                 )
                 calibration_penalty, calibration_detail = source_calibration_penalty(
                     db,
                     previous_event_id,
                     int(event_id),
                 )
-                extra["diversity"] = diversity
-                extra["route_prior"] = prior_detail
-                extra["route_prior_cost"] = float(prior_detail["negative_log_cost"])
+                extra = dict(extra0)
+                extra["candidate_origin"] = str(origin)
+                extra["route_prior"] = dict(prior_detail)
+                extra["route_prior_cost"] = float(
+                    prior_detail.get("negative_log_cost", 0.0)
+                )
                 extra["source_calibration"] = calibration_detail
                 extra["source_calibration_penalty"] = float(calibration_penalty)
                 proposals.append((proposal, extra))
 
-            safe_count = sum(bool(proposal.safe) for proposal, _extra in proposals)
-            safe_ratio = safe_count / max(1, len(proposals))
-            eligible_count = 0
-            trials: List[Dict[str, Any]] = []
+            for (
+                _order_score,
+                original_rank,
+                event_id,
+                _heading_detail,
+                prior_detail,
+                origin,
+            ) in preordered:
+                simulate_candidate(
+                    event_id=event_id,
+                    original_rank=original_rank,
+                    prior_detail=prior_detail,
+                    origin=origin,
+                )
 
+            initial_safe_event_ids = [
+                int(proposal.event_id)
+                for proposal, _extra in proposals
+                if bool(proposal.safe)
+            ]
+            expansion_ids: List[int] = []
+            expansion_report: Dict[str, Any] = {
+                "schema": "safe_source_targeted_expansion",
+                "triggered": False,
+                "safe_source_count_before": int(
+                    len(
+                        {
+                            event_identity(db, value)["source_uid"]
+                            for value in initial_safe_event_ids
+                        }
+                    )
+                ),
+                "selected_event_ids": [],
+                "additional_exact_simulations": 0,
+                "physical_constraints_relaxed": False,
+            }
+            if source_coverage_config.enabled:
+                expansion_ids, expansion_report = (
+                    select_state_source_expansion_candidates(
+                        reservoir_event_ids=reservoir_layers[slot_idx],
+                        attempted_event_ids=[
+                            int(proposal.event_id) for proposal, _extra in proposals
+                        ],
+                        hard_safe_event_ids=initial_safe_event_ids,
+                        selected_event_ids=state.selected_event_ids,
+                        previous_event_id=previous_event_id,
+                        db=db,
+                        config=source_coverage_config,
+                    )
+                )
+            reservoir_rank_lookup = {
+                int(event_id): index
+                for index, event_id in enumerate(reservoir_layers[slot_idx])
+            }
+            for event_id in expansion_ids:
+                original_rank = int(
+                    len(candidates) + reservoir_rank_lookup.get(int(event_id), 0)
+                )
+                _prior_cost, prior_detail = route_prior_cost(
+                    slot_idx,
+                    int(event_id),
+                    previous_event_id=previous_event_id,
+                    fallback_rank=original_rank,
+                    candidate_count=len(candidates) + len(reservoir_layers[slot_idx]),
+                )
+                simulate_candidate(
+                    event_id=int(event_id),
+                    original_rank=original_rank,
+                    prior_detail=prior_detail,
+                    origin="safe_source_expansion",
+                )
+
+            hard_safe_event_ids = [
+                int(proposal.event_id)
+                for proposal, _extra in proposals
+                if bool(proposal.safe)
+            ]
+            safe_count = len(hard_safe_event_ids)
+            safe_ratio = safe_count / max(1, len(proposals))
+            scarcity_context = build_source_scarcity_context(
+                db=db,
+                hard_safe_event_ids=hard_safe_event_ids,
+                all_event_ids=[
+                    int(proposal.event_id) for proposal, _extra in proposals
+                ],
+                config=constraint_config,
+            )
+            expansion_report = dict(expansion_report)
+            expansion_report["safe_source_count_after"] = int(
+                scarcity_context.safe_source_count
+            )
+            expansion_report["safe_sources_after"] = sorted(
+                dict(scarcity_context.safe_source_counts)
+            )
+
+            evaluated: List[Dict[str, Any]] = []
             for proposal, extra in proposals:
                 observability = observability_from_extra(
                     extra,
                     safe_ratio=safe_ratio,
                 )
-                extra["observability"] = observability
-                extra["route_uncertainty"] = 1.0 - observability
-                extra["selection_score"] = proposal_selection_score(
+                if bool(proposal.safe):
+                    reachability = reachability_model.query(
+                        slot=slot_idx,
+                        event_id=int(proposal.event_id),
+                        selected_event_ids=state.selected_event_ids,
+                        constraint_usage=state.constraint_usage,
+                        dual_variables=state.constraint_duals,
+                        recovery_budget_used=state.recovery_budget_used,
+                        observability=observability,
+                        scarcity_context=scarcity_context,
+                    )
+                else:
+                    reachability = reachability_model.get(
+                        slot_idx, int(proposal.event_id)
+                    )
+                    reachability["future_reachable"] = False
+                    reachability["future_reachability_probability"] = 0.0
+                assessment = assess_candidate_constraints(
+                    db=db,
+                    event_id=int(proposal.event_id),
+                    selected_event_ids=state.selected_event_ids,
+                    observability=observability,
+                    future_reachability_probability=float(
+                        reachability.get("future_reachability_probability", 0.0)
+                    ),
+                    slot_index=slot_idx,
+                    constraint_usage=state.constraint_usage,
+                    dual_variables=state.constraint_duals,
+                    config=constraint_config,
+                    scarcity_context=scarcity_context,
+                )
+                extra["observability"] = float(observability)
+                extra["route_uncertainty"] = 1.0 - float(observability)
+                extra["future_reachability"] = reachability
+                extra["constraint_assessment"] = assessment
+                extra["diversity"] = dict(assessment["diversity"])
+                base_selection_score = proposal_selection_score(
                     proposal,
                     extra,
                     primary_event_id=primary_event_id,
                 )
-                diversity = extra["diversity"]
-                eligible = bool(
-                    proposal.safe
-                    and diversity["hard_valid"]
-                    and observability >= search.minimum_observability
+                hard_safe = bool(proposal.safe)
+                future_reachable = bool(
+                    reachability.get("future_reachable", False)
                 )
-                eligible_count += int(eligible)
-                trials.append(
+                preferred = bool(
+                    hard_safe and assessment["within_budget"] and future_reachable
+                )
+                evaluated.append(
                     {
-                        "event_id": int(proposal.event_id),
-                        "rank": int(proposal.rank),
-                        "safe": bool(proposal.safe),
-                        "eligible": eligible,
-                        "combined_score": float(proposal.risk_score),
-                        "selection_score": float(extra["selection_score"]),
-                        "physical_risk_score": float(
-                            extra.get("physical_risk_score", proposal.risk_score)
-                        ),
-                        "heading_penalty": float(extra.get("heading_penalty", 0.0)),
-                        "hard_reject": bool(
-                            extra.get("heading_detail", {}).get("hard_reject", False)
-                        ),
+                        "proposal": proposal,
+                        "extra": extra,
+                        "hard_safe": hard_safe,
+                        "future_reachable": future_reachable,
+                        "preferred": preferred,
+                        "base_selection_score": float(base_selection_score),
+                        "constraint_assessment": assessment,
+                        "future_reachability": reachability,
                         "observability": float(observability),
-                        "route_prior": dict(extra.get("route_prior", {})),
-                        "source_calibration": dict(
-                            extra.get("source_calibration", {})
-                        ),
-                        "diversity": dict(diversity),
                     }
                 )
-                if not eligible:
-                    continue
 
+            recovery_indices = select_controlled_recovery_indices(
+                evaluated,
+                current_recovery_budget_used=state.recovery_budget_used,
+                config=constraint_config,
+            )
+            trials: List[Dict[str, Any]] = []
+            eligible_rows: List[Dict[str, Any]] = []
+            for evaluation_index, evaluation in enumerate(evaluated):
+                proposal = evaluation["proposal"]
+                extra = evaluation["extra"]
+                assessment = evaluation["constraint_assessment"]
+                preferred = bool(evaluation["preferred"])
+                recovery_triggered = bool(evaluation_index in recovery_indices)
+                eligible = bool(preferred or recovery_triggered)
+                recovery_charge = (
+                    float(assessment.get("recovery_charge", 0.0))
+                    if recovery_triggered
+                    else 0.0
+                )
+                final_selection_score = float(
+                    evaluation["base_selection_score"]
+                    + assessment["probabilistic_auxiliary_cost"]
+                    + (
+                        constraint_config.recovery_penalty * recovery_charge
+                        if recovery_triggered
+                        else 0.0
+                    )
+                )
+                audit_assessment = dict(assessment)
+                audit_assessment.pop("usage_after_tuple", None)
+                audit_assessment.pop("duals_after_tuple", None)
+                comparisons = audit_assessment.pop("hierarchy_comparisons", [])
+                audit_assessment["hierarchy_comparison_count"] = len(comparisons)
+                trial = {
+                    "event_id": int(proposal.event_id),
+                    "rank": int(proposal.rank),
+                    "candidate_origin": str(
+                        extra.get("candidate_origin", "retrieval")
+                    ),
+                    "safe": bool(proposal.safe),
+                    "future_reachable": bool(evaluation["future_reachable"]),
+                    "preferred": preferred,
+                    "recovery_candidate": bool(
+                        evaluation["hard_safe"]
+                        and evaluation["future_reachable"]
+                        and not preferred
+                    ),
+                    "recovery_triggered": recovery_triggered,
+                    "eligible": eligible,
+                    "combined_score": float(proposal.risk_score),
+                    "base_selection_score": float(
+                        evaluation["base_selection_score"]
+                    ),
+                    "selection_score": final_selection_score,
+                    "physical_risk_score": float(
+                        extra.get("physical_risk_score", proposal.risk_score)
+                    ),
+                    "heading_penalty": float(extra.get("heading_penalty", 0.0)),
+                    "hard_reject": bool(
+                        extra.get("heading_detail", {}).get("hard_reject", False)
+                    ),
+                    "observability": float(evaluation["observability"]),
+                    "route_prior": dict(extra.get("route_prior", {})),
+                    "source_calibration": dict(
+                        extra.get("source_calibration", {})
+                    ),
+                    "future_reachability": dict(
+                        evaluation["future_reachability"]
+                    ),
+                    "constraint_assessment": audit_assessment,
+                    "diversity": dict(assessment["diversity"]),
+                }
+                trials.append(trial)
+                if eligible:
+                    eligible_row = dict(evaluation)
+                    eligible_row["recovery_triggered"] = recovery_triggered
+                    eligible_row["selection_score"] = final_selection_score
+                    eligible_row["recovery_charge"] = recovery_charge
+                    eligible_rows.append(eligible_row)
+
+            diagnostic_summary = summarize_constraint_trials(
+                trials,
+                source_expansion=expansion_report,
+                scarcity_context=scarcity_context.to_dict(),
+            )
+            if diagnostic_summary["constraint_collapse_detected"]:
+                collapse_events.append(
+                    {
+                        "slot": int(slot_idx),
+                        "state_index": int(state_index),
+                        "prefix_event_ids": list(map(int, state.selected_event_ids)),
+                        **dict(diagnostic_summary),
+                    }
+                )
+
+            for evaluation in eligible_rows:
+                proposal = evaluation["proposal"]
+                extra = evaluation["extra"]
+                assessment = evaluation["constraint_assessment"]
+                observability = float(evaluation["observability"])
+                recovery_triggered = bool(evaluation["recovery_triggered"])
+                recovery_charge = float(evaluation["recovery_charge"])
+                selection_score = float(evaluation["selection_score"])
+                future_reachability = dict(evaluation["future_reachability"])
                 event_meta = extra["event_meta"]
                 event_delta = float(
                     event_meta.get(
@@ -482,7 +806,6 @@ def assemble_event_heading_reference(
                     if intent in {"turn", "explicit_spin", "uncertain_turn"}
                     else 0
                 )
-
                 cursor = int(len(state.motion))
                 piece = np.asarray(proposal.motion_piece, dtype=np.float32)
                 motion = (
@@ -500,22 +823,50 @@ def assemble_event_heading_reference(
                     cursor + int(proposal.core_span_local[0]),
                     cursor + int(proposal.core_span_local[1]),
                 ]
-                decision = (
-                    "selected_primary_soft_prior"
-                    if int(proposal.event_id) == primary_event_id
-                    else "selected_dynamic_beam"
+                candidate_origin = str(
+                    extra.get("candidate_origin", "retrieval")
                 )
+                if recovery_triggered:
+                    decision = "selected_continuous_safe_set_recovery"
+                elif candidate_origin == "safe_source_expansion":
+                    decision = "selected_safe_source_expansion"
+                elif int(proposal.event_id) == primary_event_id:
+                    decision = "selected_primary_soft_prior"
+                else:
+                    decision = "selected_state_aware_dynamic_beam"
                 proposal.decision = decision
-                source_frames = base.load_event_motion(
-                    v46,
-                    proposal.event_path,
-                    cfg,
-                    "v46_50_warp_probe",
-                ).shape[0]
+                source_frames = int(extra.get("source_frames", 0) or 0)
+                if source_frames <= 0:
+                    source_frames = base.load_event_motion(
+                        v46,
+                        proposal.event_path,
+                        cfg,
+                        "state_aware_br_hpr_warp_probe",
+                    ).shape[0]
+                recovery_budget_after = float(
+                    state.recovery_budget_used + recovery_charge
+                )
+                recovery_count_after = int(
+                    state.recovery_count + int(recovery_triggered)
+                )
+                recovery_metadata = controlled_recovery_metadata(
+                    assessment,
+                    triggered=recovery_triggered,
+                    recovery_count_after=recovery_count_after,
+                    recovery_budget_used_before=state.recovery_budget_used,
+                    recovery_budget_used_after=recovery_budget_after,
+                    recovery_budget_total=constraint_config.recovery_budget_total,
+                )
+                row_assessment = dict(assessment)
+                row_assessment.pop("usage_after_tuple", None)
+                row_assessment.pop("duals_after_tuple", None)
+                comparisons = row_assessment.pop("hierarchy_comparisons", [])
+                row_assessment["hierarchy_comparison_count"] = len(comparisons)
                 row = {
                     "slot": int(slot_idx),
                     "event_id": int(proposal.event_id),
                     "candidate_rank": int(proposal.rank),
+                    "candidate_origin": candidate_origin,
                     "event_path": proposal.event_path,
                     "target_frames": int(target_len),
                     "piece_frames": int(piece.shape[0]),
@@ -531,24 +882,35 @@ def assemble_event_heading_reference(
                     ),
                     "heading_penalty": float(extra.get("heading_penalty", 0.0)),
                     "combined_candidate_score": float(proposal.risk_score),
-                    "dynamic_selection_score": float(extra["selection_score"]),
+                    "dynamic_selection_score": selection_score,
                     "safe_predicted": bool(proposal.safe),
                     "decision": decision,
                     "primary_event_id": primary_event_id,
                     "planned_event_diverged": bool(
                         int(proposal.event_id) != primary_event_id
                     ),
-                    "observability": float(observability),
+                    "observability": observability,
                     "route_prior": dict(extra.get("route_prior", {})),
                     "source_calibration": dict(
                         extra.get("source_calibration", {})
                     ),
+                    "future_reachability": future_reachability,
+                    "probabilistic_constraint_routing": row_assessment,
+                    "controlled_recovery": recovery_metadata,
+                    "safe_source_expansion": dict(expansion_report),
+                    "source_scarcity": scarcity_context.to_dict(),
                     "dynamic_hard_mask": {
-                        "physical_safe": bool(proposal.safe),
-                        "history_safe": bool(diversity["hard_valid"]),
-                        "hard_reasons": list(diversity["hard_reasons"]),
+                        "physical_anatomy_heading_safe": bool(proposal.safe),
+                        "preference_budget_valid": bool(assessment["within_budget"]),
+                        "future_state_reachable": bool(
+                            future_reachability.get("future_reachable", False)
+                        ),
+                        "immutable_safety_relaxed": False,
+                        "soft_reasons": list(
+                            assessment["diversity"].get("soft_reasons", [])
+                        ),
                     },
-                    "diversity": dict(diversity),
+                    "diversity": dict(assessment["diversity"]),
                     "length_policy": proposal.length_info,
                     "contract_after_align": proposal.align_report,
                     "event_turn_intent": intent,
@@ -566,22 +928,47 @@ def assemble_event_heading_reference(
                     "stage_heading_after_deg": float(np.degrees(stage_after)),
                     "slot_turn_policy": slot_turn_policy(slot),
                     "candidate_trials": trials,
-                    "version": "mode_sb_dynamic_heading_reference",
+                    "method": "state-aware BR-HPR",
                 }
+                source_exemption_used = bool(
+                    scarcity_context.source_scarcity_exemption
+                    and (
+                        float(assessment["raw_violations"].get("source_run", 0.0))
+                        > 0.0
+                        or float(
+                            assessment["raw_violations"].get("source_share", 0.0)
+                        )
+                        > 0.0
+                    )
+                )
                 state_row = {
                     "slot": int(slot_idx),
                     "event_id": int(proposal.event_id),
                     "intent": intent,
+                    "candidate_origin": candidate_origin,
                     "stage_heading_before_rad": stage_before,
                     "event_delta_rad": event_delta,
                     "stage_heading_after_rad": stage_after,
                     "cumulative_abs_yaw_rad": float(
                         state.cumulative_abs_yaw + abs(event_delta)
                     ),
-                    "observability": float(observability),
-                    "prefix_score": float(
-                        state.score + float(extra["selection_score"])
+                    "observability": observability,
+                    "future_reachability_probability": float(
+                        assessment["future_reachability_probability"]
                     ),
+                    "future_first_dead_end_slot": future_reachability.get(
+                        "future_first_dead_end_slot"
+                    ),
+                    "constraint_usage": dict(
+                        assessment["constraint_usage_after"]
+                    ),
+                    "constraint_dual_variables": dict(
+                        assessment["dual_variables_after"]
+                    ),
+                    "source_scarcity": scarcity_context.to_dict(),
+                    "safe_source_expansion": dict(expansion_report),
+                    "controlled_recovery": recovery_metadata,
+                    "prefix_score": float(state.score + selection_score),
                 }
                 expanded.append(
                     DynamicBeamState(
@@ -595,8 +982,24 @@ def assemble_event_heading_reference(
                         recent_turn_count=recent_turn_count,
                         cumulative_abs_yaw=state.cumulative_abs_yaw
                         + abs(event_delta),
-                        score=state.score + float(extra["selection_score"]),
-                        observability=float(observability),
+                        score=state.score + selection_score,
+                        observability=observability,
+                        constraint_usage=tuple(assessment["usage_after_tuple"]),
+                        constraint_duals=tuple(assessment["duals_after_tuple"]),
+                        recovery_count=recovery_count_after,
+                        recovery_budget_used=recovery_budget_after,
+                        minimum_future_reachability=min(
+                            float(state.minimum_future_reachability),
+                            float(assessment["future_reachability_probability"]),
+                        ),
+                        source_scarcity_exemption_count=(
+                            state.source_scarcity_exemption_count
+                            + int(source_exemption_used)
+                        ),
+                        source_expansion_count=(
+                            state.source_expansion_count
+                            + int(candidate_origin == "safe_source_expansion")
+                        ),
                     )
                 )
 
@@ -605,9 +1008,16 @@ def assemble_event_heading_reference(
                     "state_index": int(state_index),
                     "prefix_event_ids": list(map(int, state.selected_event_ids)),
                     "candidate_subset": list(map(int, subset)),
-                    "proposals": int(len(proposals)),
-                    "physically_safe": int(safe_count),
-                    "eligible": int(eligible_count),
+                    "source_expansion_candidates": list(map(int, expansion_ids)),
+                    **dict(diagnostic_summary),
+                    "hard_contracts_relaxed": False,
+                    "current_recovery_count": int(state.recovery_count),
+                    "current_recovery_budget_used": float(
+                        state.recovery_budget_used
+                    ),
+                    "recovery_budget_total": float(
+                        constraint_config.recovery_budget_total
+                    ),
                 }
             )
 
@@ -617,8 +1027,19 @@ def assemble_event_heading_reference(
                 {
                     "retained_prefixes": int(len(beam)),
                     "candidate_count": int(len(candidates)),
+                    "reservoir_candidate_count": int(
+                        len(reservoir_layers[slot_idx])
+                    ),
                     "state_diagnostics": state_diagnostics,
                     "hard_contracts_relaxed": False,
+                    "preference_constraints_are_probabilistic": True,
+                    "source_scarcity_budgeting_enabled": bool(
+                        constraint_config.source_scarcity_enabled
+                    ),
+                    "continuous_recovery_enabled": bool(
+                        constraint_config.controlled_recovery_enabled
+                    ),
+                    "backward_reachability": reachability_model.runtime_summary(),
                 },
             )
 
@@ -627,31 +1048,53 @@ def assemble_event_heading_reference(
             [state.observability for state in expanded],
         )
         beam = prune_states(expanded, db, width=width)
-        layer_trace.append(
-            {
-                "slot": int(slot_idx),
-                "input_states": int(len(state_diagnostics)),
-                "expanded_states": int(len(expanded)),
-                "retained_states": int(len(beam)),
-                "adaptive_beam_width": int(width),
-                "best_prefix_score": float(min(state.score for state in beam)),
-                "retained_sources": [
-                    event_identity(db, state.selected_event_ids[-1])["source_uid"]
-                    for state in beam
-                ],
-                "state_diagnostics": state_diagnostics,
-            }
-        )
+        layer_summary = {
+            "slot": int(slot_idx),
+            "input_states": int(len(state_diagnostics)),
+            "expanded_states": int(len(expanded)),
+            "retained_states": int(len(beam)),
+            "adaptive_beam_width": int(width),
+            "best_prefix_score": float(min(state.score for state in beam)),
+            "retained_sources": [
+                event_identity(db, state.selected_event_ids[-1])["source_uid"]
+                for state in beam
+            ],
+            "retained_recovery_counts": [
+                int(state.recovery_count) for state in beam
+            ],
+            "retained_recovery_budget_used": [
+                float(state.recovery_budget_used) for state in beam
+            ],
+            "retained_source_scarcity_exemptions": [
+                int(state.source_scarcity_exemption_count) for state in beam
+            ],
+            "retained_source_expansion_counts": [
+                int(state.source_expansion_count) for state in beam
+            ],
+            "retained_minimum_future_reachability": [
+                float(state.minimum_future_reachability) for state in beam
+            ],
+            "constraint_collapse_states": int(
+                sum(
+                    bool(row.get("constraint_collapse_detected", False))
+                    for row in state_diagnostics
+                )
+            ),
+            "state_diagnostics": state_diagnostics,
+        }
+        layer_trace.append(layer_summary)
+        progress_call("slot_finish", slot_idx, len(expanded), len(beam))
 
     best = min(beam, key=lambda state: float(state.score))
     final = base.enforce_contract(
         v46,
         np.asarray(best.motion, dtype=np.float32),
         cfg,
-        source_hint="mode_sb_dynamic_heading_reference_final",
+        source_hint="state_aware_br_hpr_dynamic_heading_reference_final",
     )
     _LAST_HEADING_PLAN = {
-        "schema": "mode_sb_manifold_observable_dynamic_route",
+        "schema": "state_aware_bidirectional_hierarchical_probabilistic_route",
+        "method": "state-aware BR-HPR",
         "search": {
             "beam_width": int(search.beam_width),
             "maximum_beam_width": int(search.maximum_beam_width),
@@ -659,8 +1102,13 @@ def assemble_event_heading_reference(
             "candidates_per_source": int(search.candidates_per_source),
             "primary_is_soft_prior": True,
             "exact_simulation_authoritative": True,
-            "implicit_bounded_backtracking": True,
+            "physical_anatomy_heading_gates_immutable": True,
         },
+        "constraint_configuration": constraint_config.to_dict(),
+        "source_coverage_configuration": source_coverage_config.to_dict(),
+        "source_candidate_reservoir": reservoir_report,
+        "backward_reachability": reachability_model.runtime_summary(),
+        "constraint_collapse_events": collapse_events,
         "graph_route_prior": route_prior_summary(),
         "initial_stage_heading_rad": float(initial_heading),
         "final_stage_heading_rad": float(best.stage_heading),
@@ -669,6 +1117,26 @@ def assemble_event_heading_reference(
             np.degrees(best.cumulative_abs_yaw)
         ),
         "final_route_score": float(best.score),
+        "final_constraint_usage": dict(
+            zip(CONSTRAINT_NAMES, map(float, best.constraint_usage))
+        ),
+        "final_constraint_dual_variables": dict(
+            zip(CONSTRAINT_NAMES, map(float, best.constraint_duals))
+        ),
+        "controlled_recovery_count": int(best.recovery_count),
+        "continuous_recovery_budget_used": float(best.recovery_budget_used),
+        "continuous_recovery_budget_total": float(
+            constraint_config.recovery_budget_total
+        ),
+        "source_scarcity_exemption_count": int(
+            best.source_scarcity_exemption_count
+        ),
+        "safe_source_expansion_selection_count": int(
+            best.source_expansion_count
+        ),
+        "minimum_future_reachability": float(
+            best.minimum_future_reachability
+        ),
         "state_trace": list(best.state_trace),
         "layer_trace": layer_trace,
     }
@@ -676,8 +1144,8 @@ def assemble_event_heading_reference(
         [int(event_id), int(rank)]
         for event_id, rank in zip(best.selected_event_ids, best.selected_ranks)
     ]
+    progress_call("finish")
     return final, list(best.report), selected
-
 
 def apply_generators_with_heading_guard(
     v46: Any,

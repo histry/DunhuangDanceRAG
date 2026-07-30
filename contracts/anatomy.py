@@ -46,6 +46,7 @@ from contracts.gravity import (
     ROOT_Z_IDX,
     ROT6D_END,
     ROT6D_START,
+    fk24_from_local_np,
     fk24_np,
     matrix_to_rot6d_np,
     rot6d_to_matrix_np,
@@ -360,12 +361,39 @@ def _posture_limit_slack(labels: np.ndarray) -> np.ndarray:
     return slack
 
 
-def anatomy_metrics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, Any]:
+def anatomy_metrics_np(
+    motion: np.ndarray,
+    fps: float = 30.0,
+    *,
+    local_matrices: Optional[np.ndarray] = None,
+    joints: Optional[np.ndarray] = None,
+    labels: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Compute anatomy metrics while accepting shared geometry."""
     x = _as_motion(motion)
     T = len(x)
-    local = rot6d_to_matrix_np(x[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6))
-    joints = fk24_np(x)
-    labels = posture_labels_np(x, joints)
+    if local_matrices is None:
+        local = rot6d_to_matrix_np(
+            x[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)
+        )
+    else:
+        local = np.asarray(local_matrices, dtype=np.float32)
+        expected = (T, NUM_JOINTS, 3, 3)
+        if local.shape != expected:
+            raise ValueError(f"Expected local matrices {expected}, got {local.shape}")
+    if joints is None:
+        joints = fk24_from_local_np(x, local)
+    else:
+        joints = np.asarray(joints, dtype=np.float32)
+        expected_joints = (T, NUM_JOINTS, 3)
+        if joints.shape != expected_joints:
+            raise ValueError(f"Expected joints {expected_joints}, got {joints.shape}")
+    if labels is None:
+        labels = posture_labels_np(x, joints)
+    else:
+        labels = np.asarray(labels, dtype=object)
+        if labels.shape != (T,):
+            raise ValueError(f"Expected posture labels {(T,)}, got {labels.shape}")
 
     ident = np.eye(3, dtype=np.float32)
     ortho = local.transpose(0, 1, 3, 2) @ local
@@ -564,18 +592,51 @@ def evaluate_source_anatomy_contract(
     return not reasons, reasons
 
 
-def event_anatomy_features(motion: np.ndarray, fps: float = 30.0) -> Dict[str, Any]:
+def event_anatomy_features(
+    motion: np.ndarray,
+    fps: float = 30.0,
+    *,
+    local_matrices: Optional[np.ndarray] = None,
+    joints: Optional[np.ndarray] = None,
+    labels: Optional[np.ndarray] = None,
+    metrics: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build Event features with one SO(3) projection and one FK pass."""
     x = _as_motion(motion)
-    joints = fk24_np(x)
-    labels = posture_labels_np(x, joints)
+    T = len(x)
+    if local_matrices is None:
+        local = rot6d_to_matrix_np(
+            x[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)
+        )
+    else:
+        local = np.asarray(local_matrices, dtype=np.float32)
+    if joints is None:
+        joints = fk24_from_local_np(x, local)
+    else:
+        joints = np.asarray(joints, dtype=np.float32)
+    if labels is None:
+        labels = posture_labels_np(x, joints)
+    else:
+        labels = np.asarray(labels, dtype=object)
+
     feet = joints[:, list(FOOT_JOINTS), 1]
     floor = float(np.percentile(feet, 5))
     pelvis_norm = (joints[:, PELVIS, 1] - floor) / max(REST_LEG_LENGTH, 1e-6)
     body_norm = (
         joints[:, :, 1].max(axis=1) - joints[:, :, 1].min(axis=1)
     ) / max(REST_BODY_HEIGHT, 1e-6)
-    metrics = anatomy_metrics_np(x, fps=fps)
-    detail = evaluate_anatomy_contract_detailed(metrics)
+    metric_values = (
+        dict(metrics)
+        if metrics is not None
+        else anatomy_metrics_np(
+            x,
+            fps=fps,
+            local_matrices=local,
+            joints=joints,
+            labels=labels,
+        )
+    )
+    detail = evaluate_anatomy_contract_detailed(metric_values)
     edge_n = min(
         len(x),
         _frames_at_rate(env_int("V46_52_EVENT_EDGE_FRAMES", 6), fps),
@@ -586,11 +647,11 @@ def event_anatomy_features(motion: np.ndarray, fps: float = 30.0) -> Dict[str, A
         "anatomy_soft_valid": bool(detail["soft_ok"]),
         "anatomy_reasons": list(detail["hard_reasons"]),
         "anatomy_soft_reasons": list(detail["soft_reasons"]),
-        "anatomy_quality": float(metrics["anatomy_quality"]),
+        "anatomy_quality": float(metric_values["anatomy_quality"]),
         "posture_entry": str(_mode_object(labels[:edge_n])),
         "posture_exit": str(_mode_object(labels[-edge_n:])),
         "posture_mode": str(_mode_object(labels)),
-        "posture_distribution": dict(metrics["posture_distribution"]),
+        "posture_distribution": dict(metric_values["posture_distribution"]),
         "pelvis_height_entry_norm": float(np.median(pelvis_norm[:edge_n])),
         "pelvis_height_exit_norm": float(np.median(pelvis_norm[-edge_n:])),
         "pelvis_height_median_norm": float(np.median(pelvis_norm)),
@@ -599,14 +660,13 @@ def event_anatomy_features(motion: np.ndarray, fps: float = 30.0) -> Dict[str, A
         "body_height_median_norm": float(np.median(body_norm)),
         "entry_floor_offset_m": float(np.median(feet[:edge_n]) - floor),
         "exit_floor_offset_m": float(np.median(feet[-edge_n:]) - floor),
-        "torso_compression_ratio_p05": float(metrics["torso_compression_ratio_p05"]),
-        "local_angle_violation_ratio": float(metrics["local_angle_violation_ratio"]),
-        "raw_local_angle_violation_ratio": float(metrics["raw_local_angle_violation_ratio"]),
-        "local_angle_severe_ratio": float(metrics["local_angle_severe_ratio"]),
-        "self_collision_severe_ratio": float(metrics["self_collision_severe_ratio"]),
-        "spine_cumulative_angle_p95_deg": float(metrics["spine_cumulative_angle_p95_deg"]),
+        "torso_compression_ratio_p05": float(metric_values["torso_compression_ratio_p05"]),
+        "local_angle_violation_ratio": float(metric_values["local_angle_violation_ratio"]),
+        "raw_local_angle_violation_ratio": float(metric_values["raw_local_angle_violation_ratio"]),
+        "local_angle_severe_ratio": float(metric_values["local_angle_severe_ratio"]),
+        "self_collision_severe_ratio": float(metric_values["self_collision_severe_ratio"]),
+        "spine_cumulative_angle_p95_deg": float(metric_values["spine_cumulative_angle_p95_deg"]),
     }
-
 
 def posture_distance(a: str, b: str) -> int:
     return abs(int(POSTURE_ORDER.get(str(a), 3)) - int(POSTURE_ORDER.get(str(b), 3)))

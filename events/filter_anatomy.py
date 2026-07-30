@@ -77,6 +77,10 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
     paths = np.asarray(payload["paths"], dtype=object)
     n = len(paths)
     source_ids = _source_ids(payload, paths, n)
+    try:
+        anatomy_fps = float(np.asarray(payload.get("canonical_fps", 30.0)).reshape(-1)[0])
+    except Exception:
+        anatomy_fps = 30.0
 
     meta: List[Dict[str, Any]] = []
     if meta_path.is_file():
@@ -94,7 +98,7 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
     for i, path in enumerate(paths.tolist()):
         try:
             motion = _load_event(str(path))
-            feat = event_anatomy_features(motion)
+            feat = event_anatomy_features(motion, fps=anatomy_fps)
             posture = str(feat.get("posture_mode", "standing"))
             threshold = _quality_threshold(posture)
             hard = bool(feat.get("anatomy_hard_valid", feat.get("anatomy_valid", False))) and len(motion) >= min_frames
@@ -167,6 +171,11 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
     kept_features = [features[i] for i in kept]
     out.update({
         "anatomy_contract_schema_version": np.asarray(SCHEMA, dtype=object),
+        "anatomy_static_feature_schema_version": np.asarray("event_anatomy_static_features", dtype=object),
+        "anatomy_feature_fps": np.asarray(anatomy_fps, dtype=np.float32),
+        "event_frames": np.asarray([int(f.get("frames", 0)) for f in kept_features], dtype=np.int32),
+        "anatomy_static_complete": np.ones(len(kept), dtype=np.bool_),
+        "posture_distribution_json": np.asarray([json.dumps(f.get("posture_distribution", {}), ensure_ascii=False, sort_keys=True) for f in kept_features], dtype=object),
         "anatomy_valid": np.ones(len(kept), dtype=np.bool_),
         "anatomy_hard_valid": np.ones(len(kept), dtype=np.bool_),
         "anatomy_soft_valid": np.asarray([bool(f.get("anatomy_soft_valid", True)) for f in kept_features], dtype=np.bool_),

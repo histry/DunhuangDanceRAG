@@ -36,6 +36,7 @@ from contracts.anatomy import (
     frame_anomaly_score_np,
     transition_anatomy_risk,
 )
+from routing.anatomy_feature_cache import evaluate_candidate_anatomy
 from support.motion_geometry import (
     canonicalize_event_root_np,
     make_so3_transition,
@@ -266,17 +267,31 @@ def _build_proposal_v52(*args, **kwargs):
     db = kwargs.get("db")
     event_id = int(kwargs.get("event_id", proposal.event_id))
     cfg = kwargs.get("cfg")
-    event_valid = bool(_db_value(db, "anatomy_valid", event_id, False)) if db is not None else False
-    db_quality = float(_db_value(db, "anatomy_quality", event_id, 0.0)) if db is not None else 0.0
-    core_feat = event_anatomy_features(proposal.core, fps=float(getattr(cfg, "fps", 30.0)))
-
-    raw = base.load_event_motion(
-        kwargs.get("v46"),
-        proposal.event_path,
-        cfg,
-        source_hint=f"v46_52_warp_probe:{event_id}",
+    event_valid = bool(
+        _db_value(db, "anatomy_valid", event_id, False)
+    ) if db is not None else False
+    db_quality = float(
+        _db_value(db, "anatomy_quality", event_id, 0.0)
+    ) if db is not None else 0.0
+    extra = dict(extra)
+    source_frames = int(extra.get("source_frames", 0) or 0)
+    if source_frames <= 0:
+        raw = base.load_event_motion(
+            kwargs.get("v46"),
+            proposal.event_path,
+            cfg,
+            source_hint=f"v46_52_warp_probe:{event_id}",
+        )
+        source_frames = int(len(raw))
+    fps = float(getattr(cfg, "fps", 30.0))
+    core_feat, core_anatomy_evaluation = evaluate_candidate_anatomy(
+        db=db,
+        event_id=event_id,
+        core_motion=proposal.core,
+        fps=fps,
+        source_frames=source_frames,
     )
-    warp = float(len(proposal.core) / max(1, len(raw)))
+    warp = float(len(proposal.core) / max(1, source_frames))
     warp_min = env_float("V46_52_CORE_WARP_MIN", 0.72)
     warp_max = env_float("V46_52_CORE_WARP_MAX", 1.32)
     warp_hard = not (warp_min <= warp <= warp_max)
@@ -299,6 +314,7 @@ def _build_proposal_v52(*args, **kwargs):
         "db_anatomy_valid": event_valid,
         "db_anatomy_quality": db_quality,
         "runtime_core_anatomy": core_feat,
+        "runtime_core_anatomy_evaluation": core_anatomy_evaluation,
         "core_warp": warp,
         "core_warp_range": [warp_min, warp_max],
         "core_warp_hard_reject": warp_hard,
