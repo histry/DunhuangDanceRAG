@@ -3,8 +3,8 @@
 The module keeps physical, anatomical and severe-heading decisions outside the
 preference model.  It represents repetition, source/family concentration,
 observability and hierarchy novelty as continuous song-level resources.  The
-implementation additionally models source scarcity and allocates controlled
-recovery as a continuous budget rather than a fixed number of fallback slots.
+implementation additionally models joint source--family scarcity and allocates
+controlled recovery as a continuous resource guided by future viability depth.
 """
 from __future__ import annotations
 
@@ -202,48 +202,68 @@ def _normalized_entropy(counts: Counter) -> float:
 
 
 @dataclass(frozen=True)
-class SourceScarcityContext:
-    """Observed source diversity of the exact hard-safe candidate set."""
+class FeasibleSetScarcityContext:
+    """Observed Source--Family diversity of the exact hard-safe candidate set."""
 
     enabled: bool = False
     hard_safe_event_ids: tuple[int, ...] = ()
     all_event_ids: tuple[int, ...] = ()
     safe_source_count: int = 0
     all_source_count: int = 0
+    safe_family_count: int = 0
+    all_family_count: int = 0
     safe_source_entropy: float = 0.0
     all_source_entropy: float = 0.0
+    safe_family_entropy: float = 0.0
+    all_family_entropy: float = 0.0
     safe_source_entropy_normalized: float = 0.0
     all_source_entropy_normalized: float = 0.0
+    safe_family_entropy_normalized: float = 0.0
+    all_family_entropy_normalized: float = 0.0
     source_penalty_scale: float = 1.0
+    family_penalty_scale: float = 1.0
     alternative_safe_source_exists: bool = True
+    alternative_safe_family_exists: bool = True
     source_scarcity_exemption: bool = False
+    family_scarcity_exemption: bool = False
     safe_source_counts: tuple[tuple[str, int], ...] = ()
     all_source_counts: tuple[tuple[str, int], ...] = ()
+    safe_family_counts: tuple[tuple[str, int], ...] = ()
+    all_family_counts: tuple[tuple[str, int], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": "hard_safe_source_scarcity_context",
+            "schema": "hard_safe_feasible_set_scarcity_context",
             "enabled": bool(self.enabled),
             "hard_safe_event_ids": list(map(int, self.hard_safe_event_ids)),
             "all_event_ids": list(map(int, self.all_event_ids)),
             "safe_source_count": int(self.safe_source_count),
             "all_source_count": int(self.all_source_count),
+            "safe_family_count": int(self.safe_family_count),
+            "all_family_count": int(self.all_family_count),
             "safe_source_entropy": float(self.safe_source_entropy),
             "all_source_entropy": float(self.all_source_entropy),
-            "safe_source_entropy_normalized": float(
-                self.safe_source_entropy_normalized
-            ),
-            "all_source_entropy_normalized": float(
-                self.all_source_entropy_normalized
-            ),
+            "safe_family_entropy": float(self.safe_family_entropy),
+            "all_family_entropy": float(self.all_family_entropy),
+            "safe_source_entropy_normalized": float(self.safe_source_entropy_normalized),
+            "all_source_entropy_normalized": float(self.all_source_entropy_normalized),
+            "safe_family_entropy_normalized": float(self.safe_family_entropy_normalized),
+            "all_family_entropy_normalized": float(self.all_family_entropy_normalized),
             "source_penalty_scale": float(self.source_penalty_scale),
-            "alternative_safe_source_exists": bool(
-                self.alternative_safe_source_exists
-            ),
+            "family_penalty_scale": float(self.family_penalty_scale),
+            "alternative_safe_source_exists": bool(self.alternative_safe_source_exists),
+            "alternative_safe_family_exists": bool(self.alternative_safe_family_exists),
             "source_scarcity_exemption": bool(self.source_scarcity_exemption),
+            "family_scarcity_exemption": bool(self.family_scarcity_exemption),
             "safe_source_counts": dict(self.safe_source_counts),
             "all_source_counts": dict(self.all_source_counts),
+            "safe_family_counts": dict(self.safe_family_counts),
+            "all_family_counts": dict(self.all_family_counts),
         }
+
+
+# Compatibility alias retained for existing callers and historical reports.
+SourceScarcityContext = FeasibleSetScarcityContext
 
 
 @dataclass(frozen=True)
@@ -294,6 +314,12 @@ class ConstraintBudgetConfig:
     minimum_safe_source_count: int
     source_scarcity_minimum_scale: float
     source_scarcity_budget_credit: float
+    family_scarcity_enabled: bool
+    minimum_safe_family_count: int
+    family_scarcity_minimum_scale: float
+    family_scarcity_budget_credit: float
+    recovery_minimum_viability_depth: int
+    recovery_require_safe_successor: bool
 
     @classmethod
     def from_environment(cls, total_slots: int) -> "ConstraintBudgetConfig":
@@ -437,6 +463,28 @@ class ConstraintBudgetConfig:
             source_scarcity_budget_credit=max(
                 0.0, _env_float("BR_HPR_SOURCE_SCARCITY_BUDGET_CREDIT", 0.25)
             ),
+            family_scarcity_enabled=_env_bool(
+                "BR_HPR_FAMILY_SCARCITY_ENABLE", True
+            ),
+            minimum_safe_family_count=max(
+                1, _env_int("BR_HPR_MINIMUM_SAFE_FAMILY_COUNT", 2)
+            ),
+            family_scarcity_minimum_scale=float(
+                np.clip(
+                    _env_float("BR_HPR_FAMILY_SCARCITY_MINIMUM_SCALE", 0.12),
+                    0.0,
+                    1.0,
+                )
+            ),
+            family_scarcity_budget_credit=max(
+                0.0, _env_float("BR_HPR_FAMILY_SCARCITY_BUDGET_CREDIT", 0.25)
+            ),
+            recovery_minimum_viability_depth=max(
+                1, _env_int("BR_HPR_RECOVERY_MINIMUM_VIABILITY_DEPTH", 2)
+            ),
+            recovery_require_safe_successor=_env_bool(
+                "BR_HPR_RECOVERY_REQUIRE_SAFE_SUCCESSOR", True
+            ),
         )
 
     @property
@@ -487,47 +535,98 @@ class ConstraintBudgetConfig:
         return result
 
 
+def _scarcity_scale(
+    safe_counts: Counter,
+    all_counts: Counter,
+    minimum_count: int,
+    minimum_scale: float,
+    enabled: bool,
+) -> tuple[bool, bool, float, float, float]:
+    safe_count = len(safe_counts)
+    all_count = len(all_counts)
+    safe_norm = _normalized_entropy(safe_counts)
+    all_norm = _normalized_entropy(all_counts)
+    alternative = safe_count >= int(minimum_count)
+    scarcity = bool(enabled and bool(safe_counts) and not alternative)
+    if scarcity:
+        ratio = safe_norm / max(all_norm, _EPS) if all_norm > 0.0 else 0.0
+        scale = max(float(minimum_scale), min(1.0, ratio))
+    else:
+        scale = 1.0
+    return alternative, scarcity, float(scale), float(safe_norm), float(all_norm)
+
+
+def build_feasible_set_scarcity_context(
+    *,
+    db: Mapping[str, Any],
+    hard_safe_event_ids: Sequence[int],
+    all_event_ids: Sequence[int],
+    config: ConstraintBudgetConfig,
+) -> FeasibleSetScarcityContext:
+    """Build a joint Source--Family scarcity context from exact-safe candidates."""
+    safe_ids = tuple(dict.fromkeys(map(int, hard_safe_event_ids)))
+    all_ids = tuple(dict.fromkeys(map(int, all_event_ids)))
+    safe_sources = Counter(event_identity(db, value)["source_uid"] for value in safe_ids)
+    all_sources = Counter(event_identity(db, value)["source_uid"] for value in all_ids)
+    safe_families = Counter(event_identity(db, value)["family_id"] for value in safe_ids)
+    all_families = Counter(event_identity(db, value)["family_id"] for value in all_ids)
+
+    source_alt, source_scarcity, source_scale, safe_source_norm, all_source_norm = _scarcity_scale(
+        safe_sources,
+        all_sources,
+        config.minimum_safe_source_count,
+        config.source_scarcity_minimum_scale,
+        config.source_scarcity_enabled,
+    )
+    family_alt, family_scarcity, family_scale, safe_family_norm, all_family_norm = _scarcity_scale(
+        safe_families,
+        all_families,
+        config.minimum_safe_family_count,
+        config.family_scarcity_minimum_scale,
+        config.family_scarcity_enabled,
+    )
+    return FeasibleSetScarcityContext(
+        enabled=bool(config.source_scarcity_enabled or config.family_scarcity_enabled),
+        hard_safe_event_ids=safe_ids,
+        all_event_ids=all_ids,
+        safe_source_count=len(safe_sources),
+        all_source_count=len(all_sources),
+        safe_family_count=len(safe_families),
+        all_family_count=len(all_families),
+        safe_source_entropy=_entropy_from_counts(safe_sources),
+        all_source_entropy=_entropy_from_counts(all_sources),
+        safe_family_entropy=_entropy_from_counts(safe_families),
+        all_family_entropy=_entropy_from_counts(all_families),
+        safe_source_entropy_normalized=safe_source_norm,
+        all_source_entropy_normalized=all_source_norm,
+        safe_family_entropy_normalized=safe_family_norm,
+        all_family_entropy_normalized=all_family_norm,
+        source_penalty_scale=source_scale,
+        family_penalty_scale=family_scale,
+        alternative_safe_source_exists=source_alt,
+        alternative_safe_family_exists=family_alt,
+        source_scarcity_exemption=source_scarcity,
+        family_scarcity_exemption=family_scarcity,
+        safe_source_counts=tuple(sorted(safe_sources.items())),
+        all_source_counts=tuple(sorted(all_sources.items())),
+        safe_family_counts=tuple(sorted(safe_families.items())),
+        all_family_counts=tuple(sorted(all_families.items())),
+    )
+
+
 def build_source_scarcity_context(
     *,
     db: Mapping[str, Any],
     hard_safe_event_ids: Sequence[int],
     all_event_ids: Sequence[int],
     config: ConstraintBudgetConfig,
-) -> SourceScarcityContext:
-    safe_ids = tuple(dict.fromkeys(map(int, hard_safe_event_ids)))
-    all_ids = tuple(dict.fromkeys(map(int, all_event_ids)))
-    safe_counts = Counter(event_identity(db, value)["source_uid"] for value in safe_ids)
-    all_counts = Counter(event_identity(db, value)["source_uid"] for value in all_ids)
-    safe_count = len(safe_counts)
-    all_count = len(all_counts)
-    safe_norm = _normalized_entropy(safe_counts)
-    all_norm = _normalized_entropy(all_counts)
-    alternative = safe_count >= int(config.minimum_safe_source_count)
-    scarcity = bool(
-        config.source_scarcity_enabled
-        and bool(safe_ids)
-        and not alternative
-    )
-    if scarcity:
-        ratio = safe_norm / max(all_norm, _EPS) if all_norm > 0.0 else 0.0
-        scale = max(config.source_scarcity_minimum_scale, min(1.0, ratio))
-    else:
-        scale = 1.0
-    return SourceScarcityContext(
-        enabled=bool(config.source_scarcity_enabled),
-        hard_safe_event_ids=safe_ids,
-        all_event_ids=all_ids,
-        safe_source_count=safe_count,
-        all_source_count=all_count,
-        safe_source_entropy=_entropy_from_counts(safe_counts),
-        all_source_entropy=_entropy_from_counts(all_counts),
-        safe_source_entropy_normalized=safe_norm,
-        all_source_entropy_normalized=all_norm,
-        source_penalty_scale=float(scale),
-        alternative_safe_source_exists=alternative,
-        source_scarcity_exemption=scarcity,
-        safe_source_counts=tuple(sorted(safe_counts.items())),
-        all_source_counts=tuple(sorted(all_counts.items())),
+) -> FeasibleSetScarcityContext:
+    """Compatibility wrapper for the former source-only API."""
+    return build_feasible_set_scarcity_context(
+        db=db,
+        hard_safe_event_ids=hard_safe_event_ids,
+        all_event_ids=all_event_ids,
+        config=config,
     )
 
 
@@ -589,7 +688,7 @@ def assess_candidate_constraints(
     constraint_usage: Sequence[float],
     dual_variables: Sequence[float],
     config: ConstraintBudgetConfig,
-    scarcity_context: Optional[SourceScarcityContext] = None,
+    scarcity_context: Optional[FeasibleSetScarcityContext] = None,
 ) -> dict[str, Any]:
     """Evaluate one hard-safe candidate under stateful probabilistic budgets."""
     count = len(CONSTRAINT_NAMES)
@@ -665,20 +764,28 @@ def assess_candidate_constraints(
         ),
         dtype=np.float64,
     )
-    context = scarcity_context or SourceScarcityContext()
+    context = scarcity_context or FeasibleSetScarcityContext()
     effective_violations = raw_violations.copy()
-    scarcity_scale = float(np.clip(context.source_penalty_scale, 0.0, 1.0))
+    source_scale = float(np.clip(context.source_penalty_scale, 0.0, 1.0))
+    family_scale = float(np.clip(context.family_penalty_scale, 0.0, 1.0))
     if context.source_scarcity_exemption:
-        effective_violations[1] *= scarcity_scale
-        effective_violations[2] *= scarcity_scale
+        effective_violations[1] *= source_scale
+        effective_violations[2] *= source_scale
+    if context.family_scarcity_exemption:
+        effective_violations[3] *= family_scale
+        effective_violations[5] *= family_scale
 
     usage_after = usage + effective_violations
     budgets = np.asarray(config.budgets, dtype=np.float64)
     effective_budgets = budgets.copy()
     if context.source_scarcity_exemption:
-        credit = float(config.source_scarcity_budget_credit) * (1.0 - scarcity_scale)
+        credit = float(config.source_scarcity_budget_credit) * (1.0 - source_scale)
         effective_budgets[1] += credit
         effective_budgets[2] += credit
+    if context.family_scarcity_exemption:
+        credit = float(config.family_scarcity_budget_credit) * (1.0 - family_scale)
+        effective_budgets[3] += credit
+        effective_budgets[5] += credit
     weights = np.asarray(config.weights, dtype=np.float64)
     overrun = np.maximum(0.0, usage_after - effective_budgets)
     normalized_overrun = overrun / np.maximum(effective_budgets, 1.0)
@@ -754,6 +861,7 @@ def assess_candidate_constraints(
             zip(CONSTRAINT_NAMES, map(float, preference_probabilities))
         ),
         "source_scarcity": context.to_dict(),
+        "feasible_set_scarcity": context.to_dict(),
         "future_reachability_probability": future_probability,
         "within_budget": within_budget,
         "constraint_usage_before": dict(zip(CONSTRAINT_NAMES, map(float, usage))),
@@ -787,10 +895,11 @@ def select_controlled_recovery_indices(
     config: ConstraintBudgetConfig,
     current_recoveries: Optional[int] = None,
 ) -> set[int]:
-    """Select minimum-cost hard-safe branches within the remaining recovery budget.
+    """Select hard-safe recovery branches using graded future viability.
 
-    ``current_recoveries`` is accepted only for compatibility with older callers;
-    recovery eligibility is determined by the continuous resource budget.
+    Terminal reachability is preferred, but a candidate with safe successors and
+    sufficient viability depth may consume bounded recovery resource.  Immediate
+    dead ends remain ineligible, and immutable safety gates are never relaxed.
     """
     del current_recoveries
     if not config.enabled or not config.controlled_recovery_enabled:
@@ -805,13 +914,31 @@ def select_controlled_recovery_indices(
     if remaining <= config.budget_tolerance:
         return set()
 
-    candidates: list[tuple[float, float, float, int]] = []
+    candidates: list[tuple[int, int, int, float, float, int]] = []
     for index, row in enumerate(evaluated_rows):
         if not bool(row.get("hard_safe", False)) or bool(row.get("preferred", False)):
             continue
         reachability = row.get("future_reachability", {})
-        if not bool(reachability.get("future_reachable", True)):
-            continue
+        terminal = bool(
+            reachability.get(
+                "terminal_reachable",
+                reachability.get("future_reachable", False),
+            )
+        )
+        viability_depth = int(reachability.get("future_viability_depth", 0) or 0)
+        reachable_until = int(
+            reachability.get("reachable_until_slot", -1)
+            if reachability.get("reachable_until_slot") is not None
+            else -1
+        )
+        successor_count = int(
+            reachability.get("future_safe_successor_count", 0) or 0
+        )
+        if not terminal:
+            if viability_depth < int(config.recovery_minimum_viability_depth):
+                continue
+            if config.recovery_require_safe_successor and successor_count <= 0:
+                continue
         assessment = row.get("constraint_assessment", {})
         charge = float(assessment.get("recovery_charge", float("inf")))
         if not np.isfinite(charge) or charge > remaining + config.budget_tolerance:
@@ -819,9 +946,15 @@ def select_controlled_recovery_indices(
         if charge > config.recovery_maximum_charge_per_slot + config.budget_tolerance:
             continue
         score = float(assessment.get("recovery_score", float("inf")))
-        future_probability = float(
-            assessment.get("future_reachability_probability", 0.0)
+        candidates.append(
+            (
+                0 if terminal else 1,
+                -viability_depth,
+                -reachable_until,
+                charge,
+                score,
+                int(index),
+            )
         )
-        candidates.append((score, charge, -future_probability, int(index)))
     candidates.sort()
-    return {row[3] for row in candidates[: config.recovery_topk]}
+    return {row[5] for row in candidates[: config.recovery_topk]}

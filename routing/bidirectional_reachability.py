@@ -8,6 +8,7 @@ bounded surrogate; exact transition simulation remains authoritative.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 import os
 from dataclasses import dataclass
@@ -17,9 +18,9 @@ import numpy as np
 
 from routing.hierarchical_constraint_model import (
     ConstraintBudgetConfig,
-    SourceScarcityContext,
+    FeasibleSetScarcityContext,
     assess_candidate_constraints,
-    build_source_scarcity_context,
+    build_feasible_set_scarcity_context,
     event_hyperbolic_distance,
     event_identity,
 )
@@ -87,6 +88,11 @@ class ReachabilityConfig:
     state_recovery_quantization: float
     state_surrogate_observability: float
     state_cache_maximum_entries: int
+    viability_depth_weight: float
+    viability_successor_weight: float
+    viability_terminal_weight: float
+    viability_probability_floor: float
+    bottleneck_activation_maximum: int
 
     @classmethod
     def from_environment(cls) -> "ReachabilityConfig":
@@ -155,6 +161,25 @@ class ReachabilityConfig:
                 128,
                 _env_int("BR_HPR_STATE_REACHABILITY_CACHE_MAXIMUM_ENTRIES", 20000),
             ),
+            viability_depth_weight=max(
+                0.0, _env_float("BR_HPR_VIABILITY_DEPTH_WEIGHT", 1.0)
+            ),
+            viability_successor_weight=max(
+                0.0, _env_float("BR_HPR_VIABILITY_SUCCESSOR_WEIGHT", 0.35)
+            ),
+            viability_terminal_weight=max(
+                0.0, _env_float("BR_HPR_VIABILITY_TERMINAL_WEIGHT", 2.0)
+            ),
+            viability_probability_floor=float(
+                np.clip(
+                    _env_float("BR_HPR_VIABILITY_PROBABILITY_FLOOR", 0.02),
+                    1.0e-6,
+                    1.0,
+                )
+            ),
+            bottleneck_activation_maximum=max(
+                0, _env_int("BR_HPR_BOTTLENECK_ACTIVATION_MAXIMUM", 12)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -185,6 +210,8 @@ class BackwardReachabilityModel:
         self._state_queries = 0
         self._state_cache_lookups = 0
         self._state_cache_hits = 0
+        self._candidate_activations = 0
+        self._activation_events: list[dict[str, Any]] = []
 
     @staticmethod
     def _static_valid(
@@ -378,6 +405,9 @@ class BackwardReachabilityModel:
                     "static_valid": bool(valid),
                     "static_validity": validity_detail,
                     "future_reachable": reachable,
+                    "terminal_reachable": reachable,
+                    "future_viability_depth": int(max(0, len(layers) - slot - 1)) if reachable else 0,
+                    "reachable_until_slot": int(len(layers) - 1) if reachable else int(slot),
                     "future_log_mass": None if not reachable else float(value),
                     "future_reachability_probability": float(
                         np.clip(probability, 0.0, 1.0)
@@ -428,9 +458,12 @@ class BackwardReachabilityModel:
             "event_id": int(event_id),
             "static_valid": bool(valid),
             "static_validity": detail,
-            "future_reachable": bool(valid and int(slot) >= len(self.layers) - 1),
+            "future_reachable": bool(valid),
+            "terminal_reachable": bool(valid),
+            "future_viability_depth": int(max(0, len(self.layers) - int(slot) - 1)) if valid else 0,
+            "reachable_until_slot": int(len(self.layers) - 1) if valid else int(slot),
             "future_log_mass": 0.0 if valid else None,
-            "future_reachability_probability": 1.0 if valid else 0.0,
+            "future_reachability_probability": 0.5 if valid else 0.0,
             "future_safe_successor_count": 0,
             "best_future_successor_event_id": None,
             "minimum_surrogate_edge_cost": None,
@@ -474,25 +507,51 @@ class BackwardReachabilityModel:
         recovery_budget_used: float,
         depth: int,
     ) -> tuple[Any, ...]:
+        """Return a compressed routing-state key with stable semantic bins."""
+        del duals
         history = tuple(map(int, selected_event_ids))[-self.config.state_history_window :]
+        identities = [event_identity(self.db, value) for value in history]
+        uid_token = "|".join(row["event_uid"] for row in identities)
+        uid_hash = hashlib.sha1(uid_token.encode("utf-8")).hexdigest()[:16]
+        previous = event_identity(self.db, int(previous_event_id))
+        source_run = 0
+        for row in reversed(identities):
+            if row["source_uid"] != previous["source_uid"]:
+                break
+            source_run += 1
+        total = max(1, len(identities))
+        source_share = sum(
+            row["source_uid"] == previous["source_uid"] for row in identities
+        ) / total
+        family_share = sum(
+            row["family_id"] == previous["family_id"] for row in identities
+        ) / total
+        usage_array = np.asarray(tuple(usage), dtype=np.float64)
+        selected_usage = tuple(
+            float(usage_array[index]) if index < len(usage_array) else 0.0
+            for index in (0, 1, 2, 3, 5)
+        )
         return (
             int(slot),
             int(previous_event_id),
-            history,
-            _quantized(usage, self.config.state_usage_quantization),
-            _quantized(duals, self.config.state_usage_quantization),
+            uid_hash,
+            int(source_run),
+            int(round(source_share / self.config.state_usage_quantization)),
+            int(round(family_share / self.config.state_usage_quantization)),
+            _quantized(selected_usage, self.config.state_usage_quantization),
             int(round(float(recovery_budget_used) / self.config.state_recovery_quantization)),
             int(depth),
         )
 
-    def _layer_scarcity(self, slot: int) -> SourceScarcityContext:
+
+    def _layer_scarcity(self, slot: int) -> FeasibleSetScarcityContext:
         layer = self.layers[int(slot)] if 0 <= int(slot) < len(self.layers) else ()
         valid = [
             event_id
             for event_id in layer
             if bool(self.get(slot, event_id).get("static_valid", False))
         ]
-        return build_source_scarcity_context(
+        return build_feasible_set_scarcity_context(
             db=self.db,
             hard_safe_event_ids=valid,
             all_event_ids=layer,
@@ -511,29 +570,43 @@ class BackwardReachabilityModel:
         depth: int,
     ) -> dict[str, Any]:
         if slot >= len(self.layers):
+            terminal_slot = max(-1, len(self.layers) - 1)
             return {
                 "reachable": True,
+                "terminal_reachable": True,
                 "best_cost": 0.0,
                 "path_count": 1,
                 "immediate_successor_count": 0,
                 "first_dead_end_slot": None,
                 "best_successor": None,
                 "explored_steps": 0,
+                "viability_depth": 0,
+                "reachable_until_slot": terminal_slot,
             }
         if depth >= self.config.state_horizon:
             static_candidates = [
                 event_id
                 for event_id in self.layers[slot]
-                if bool(self.get(slot, event_id).get("future_reachable", False))
+                if bool(self.get(slot, event_id).get("static_valid", False))
             ]
+            terminal_candidates = [
+                event_id
+                for event_id in static_candidates
+                if bool(self.get(slot, event_id).get("terminal_reachable", False))
+            ]
+            terminal = bool(terminal_candidates)
+            viability = (len(self.layers) - slot) if terminal else int(bool(static_candidates))
             return {
-                "reachable": bool(static_candidates),
+                "reachable": terminal,
+                "terminal_reachable": terminal,
                 "best_cost": 0.0 if static_candidates else float("inf"),
-                "path_count": max(1, len(static_candidates)) if static_candidates else 0,
+                "path_count": len(terminal_candidates) if terminal else len(static_candidates),
                 "immediate_successor_count": len(static_candidates),
-                "first_dead_end_slot": None if static_candidates else int(slot),
-                "best_successor": int(static_candidates[0]) if static_candidates else None,
+                "first_dead_end_slot": None if terminal else int(slot + viability),
+                "best_successor": int((terminal_candidates or static_candidates)[0]) if static_candidates else None,
                 "explored_steps": 0,
+                "viability_depth": int(viability),
+                "reachable_until_slot": int(min(len(self.layers) - 1, slot + max(0, viability - 1))),
             }
 
         key = self._cache_key(
@@ -556,11 +629,7 @@ class BackwardReachabilityModel:
         indexed_layer = list(enumerate(self.layers[slot]))
         indexed_layer.sort(
             key=lambda row: (
-                -float(
-                    self.get(slot, row[1]).get(
-                        "future_reachability_probability", 0.0
-                    )
-                ),
+                -float(self.get(slot, row[1]).get("future_reachability_probability", 0.0)),
                 int(row[0]),
             )
         )
@@ -569,9 +638,9 @@ class BackwardReachabilityModel:
             for _rank, event_id in indexed_layer[: self.config.state_branch_topk]
         ]
         scarcity = self._layer_scarcity(slot)
-        rows: list[tuple[float, int, dict[str, Any], dict[str, Any], float]] = []
+        rows: list[dict[str, Any]] = []
         immediate = 0
-        first_dead_end: Optional[int] = None
+        earliest_dead_end: Optional[int] = None
         for rank, event_id in enumerate(layer):
             static = self.get(slot, event_id)
             if not bool(static.get("static_valid", False)):
@@ -604,10 +673,10 @@ class BackwardReachabilityModel:
                 )
             if not allowed:
                 continue
-            immediate += 1
             edge = self._edge_cost(previous_event_id, event_id, rank)
             if edge > self.config.maximum_edge_cost:
                 continue
+            immediate += 1
             child = self._suffix(
                 slot=slot + 1,
                 previous_event_id=int(event_id),
@@ -617,44 +686,71 @@ class BackwardReachabilityModel:
                 recovery_budget_used=float(recovery_budget_used + charge),
                 depth=depth + 1,
             )
-            if not child["reachable"]:
-                dead = child.get("first_dead_end_slot")
-                if dead is not None:
-                    first_dead_end = dead if first_dead_end is None else min(first_dead_end, dead)
-                continue
             local_cost = float(
                 edge
                 + assessment["probabilistic_auxiliary_cost"]
                 + assessment["diversity_penalty"]
                 + self.constraint_config.recovery_penalty * charge
             )
-            total_cost = local_cost + float(child["best_cost"])
-            rows.append((total_cost, int(event_id), assessment, child, charge))
+            child_cost = float(child["best_cost"])
+            total_cost = local_cost + (child_cost if np.isfinite(child_cost) else 0.0)
+            terminal = bool(child.get("terminal_reachable", child.get("reachable", False)))
+            viability = 1 + int(child.get("viability_depth", 0))
+            reachable_until = max(int(slot), int(child.get("reachable_until_slot", slot)))
+            dead = child.get("first_dead_end_slot")
+            if dead is not None:
+                earliest_dead_end = int(dead) if earliest_dead_end is None else min(earliest_dead_end, int(dead))
+            rows.append(
+                {
+                    "total_cost": total_cost,
+                    "event_id": int(event_id),
+                    "terminal_reachable": terminal,
+                    "viability_depth": int(viability),
+                    "reachable_until_slot": int(reachable_until),
+                    "child": child,
+                }
+            )
 
         if rows:
-            rows.sort(key=lambda row: (row[0], row[1]))
+            rows.sort(
+                key=lambda row: (
+                    0 if row["terminal_reachable"] else 1,
+                    -int(row["viability_depth"]),
+                    -int(row["reachable_until_slot"]),
+                    float(row["total_cost"]),
+                    int(row["event_id"]),
+                )
+            )
             best = rows[0]
+            terminal = bool(best["terminal_reachable"])
             result = {
-                "reachable": True,
-                "best_cost": float(best[0]),
-                "path_count": int(min(1000000, sum(int(row[3]["path_count"]) for row in rows))),
+                "reachable": terminal,
+                "terminal_reachable": terminal,
+                "best_cost": float(best["total_cost"]),
+                "path_count": int(min(1000000, sum(max(1, int(row["child"].get("path_count", 0))) for row in rows))),
                 "immediate_successor_count": int(immediate),
-                "first_dead_end_slot": None,
-                "best_successor": int(best[1]),
-                "explored_steps": int(1 + best[3].get("explored_steps", 0)),
+                "first_dead_end_slot": None if terminal else int(best["child"].get("first_dead_end_slot", earliest_dead_end if earliest_dead_end is not None else slot + best["viability_depth"])),
+                "best_successor": int(best["event_id"]),
+                "explored_steps": int(1 + best["child"].get("explored_steps", 0)),
+                "viability_depth": int(best["viability_depth"]),
+                "reachable_until_slot": int(best["reachable_until_slot"]),
             }
         else:
             result = {
                 "reachable": False,
+                "terminal_reachable": False,
                 "best_cost": float("inf"),
                 "path_count": 0,
                 "immediate_successor_count": int(immediate),
-                "first_dead_end_slot": int(first_dead_end if first_dead_end is not None else slot),
+                "first_dead_end_slot": int(earliest_dead_end if earliest_dead_end is not None else slot),
                 "best_successor": None,
                 "explored_steps": 0,
+                "viability_depth": 0,
+                "reachable_until_slot": int(slot - 1),
             }
         self._state_cache[key] = dict(result)
         return result
+
 
     def query(
         self,
@@ -666,16 +762,20 @@ class BackwardReachabilityModel:
         dual_variables: Sequence[float],
         recovery_budget_used: float,
         observability: float,
-        scarcity_context: Optional[SourceScarcityContext] = None,
+        scarcity_context: Optional[FeasibleSetScarcityContext] = None,
     ) -> dict[str, Any]:
-        """Evaluate future capacity conditioned on the retained Beam state."""
+        """Evaluate terminal reachability and graded future viability."""
         self._state_queries += 1
         static = self.get(slot, event_id)
         if not bool(static.get("static_valid", False)):
             return {
                 **static,
-                "schema": "state_aware_backward_reachability",
+                "schema": "viability_aware_backward_reachability",
                 "future_reachable": False,
+                "terminal_reachable": False,
+                "future_viability_depth": 0,
+                "reachable_until_slot": int(slot),
+                "future_viability_score": 0.0,
                 "state_budget_feasible": False,
                 "predicted_recovery_charge": None,
                 "future_first_dead_end_slot": int(slot),
@@ -710,8 +810,12 @@ class BackwardReachabilityModel:
         if not state_budget_feasible:
             return {
                 **static,
-                "schema": "state_aware_backward_reachability",
+                "schema": "viability_aware_backward_reachability",
                 "future_reachable": False,
+                "terminal_reachable": False,
+                "future_viability_depth": 0,
+                "reachable_until_slot": int(slot),
+                "future_viability_score": 0.0,
                 "future_reachability_probability": 0.0,
                 "future_safe_successor_count": 0,
                 "state_budget_feasible": False,
@@ -724,12 +828,15 @@ class BackwardReachabilityModel:
         if int(slot) >= len(self.layers) - 1:
             suffix = {
                 "reachable": True,
+                "terminal_reachable": True,
                 "best_cost": 0.0,
                 "path_count": 1,
                 "immediate_successor_count": 0,
                 "first_dead_end_slot": None,
                 "best_successor": None,
                 "explored_steps": 0,
+                "viability_depth": 0,
+                "reachable_until_slot": int(slot),
             }
         else:
             suffix = self._suffix(
@@ -741,31 +848,112 @@ class BackwardReachabilityModel:
                 recovery_budget_used=float(recovery_budget_used + charge),
                 depth=0,
             )
-        reachable = bool(suffix["reachable"])
-        if reachable:
-            steps = max(1, int(suffix.get("explored_steps", 0)))
-            probability = math.exp(-float(suffix["best_cost"]) / steps)
-            probability = max(self.config.successor_probability_floor, probability)
+        terminal = bool(suffix.get("terminal_reachable", suffix.get("reachable", False)))
+        viability_depth = int(suffix.get("viability_depth", 0))
+        reachable_until = int(suffix.get("reachable_until_slot", slot))
+        successor_count = int(suffix.get("immediate_successor_count", 0))
+        steps = max(1, int(suffix.get("explored_steps", 0)))
+        best_cost = float(suffix.get("best_cost", float("inf")))
+        remaining_slots = max(1, len(self.layers) - int(slot) - 1)
+        survival_fraction = float(np.clip(viability_depth / remaining_slots, 0.0, 1.0))
+        if np.isfinite(best_cost):
+            cost_probability = math.exp(-best_cost / steps)
+        else:
+            cost_probability = self.config.viability_probability_floor
+        if terminal:
+            probability = max(self.config.successor_probability_floor, cost_probability)
+        elif viability_depth > 0:
+            probability = max(
+                self.config.viability_probability_floor,
+                cost_probability * (0.25 + 0.75 * survival_fraction),
+            )
         else:
             probability = 0.0
+        viability_score = float(
+            self.config.viability_depth_weight * viability_depth
+            + self.config.viability_successor_weight * math.log1p(successor_count)
+            + self.config.viability_terminal_weight * float(terminal)
+        )
         return {
             **static,
-            "schema": "state_aware_backward_reachability",
-            "future_reachable": reachable,
+            "schema": "viability_aware_backward_reachability",
+            "future_reachable": terminal,
+            "terminal_reachable": terminal,
+            "future_viability_depth": viability_depth,
+            "reachable_until_slot": reachable_until,
+            "future_viability_score": viability_score,
             "future_reachability_probability": float(np.clip(probability, 0.0, 1.0)),
-            "future_safe_successor_count": int(suffix["immediate_successor_count"]),
-            "future_state_path_count": int(suffix["path_count"]),
-            "best_future_successor_event_id": suffix["best_successor"],
-            "minimum_state_conditioned_cost": (
-                None if not reachable else float(suffix["best_cost"])
-            ),
+            "future_safe_successor_count": successor_count,
+            "future_state_path_count": int(suffix.get("path_count", 0)),
+            "best_future_successor_event_id": suffix.get("best_successor"),
+            "minimum_state_conditioned_cost": None if not np.isfinite(best_cost) else best_cost,
             "state_budget_feasible": True,
             "predicted_recovery_charge": float(charge),
             "recovery_budget_used_after_prediction": float(recovery_budget_used + charge),
-            "future_first_dead_end_slot": suffix["first_dead_end_slot"],
+            "future_first_dead_end_slot": suffix.get("first_dead_end_slot"),
             "state_history_length": int(len(selected_event_ids)),
             "state_cache_hit_rate": self.state_cache_hit_rate,
         }
+
+    def activate_candidates(
+        self,
+        *,
+        slot: int,
+        event_ids: Sequence[int],
+        reason: str,
+    ) -> dict[str, Any]:
+        """Activate additional future-layer candidates and invalidate state cache."""
+        slot = int(slot)
+        if not 0 <= slot < len(self.layers):
+            return {"triggered": False, "slot": slot, "activated_event_ids": []}
+        existing = list(self.layers[slot])
+        activated: list[int] = []
+        total_events = len(np.asarray(self.db["paths"], dtype=object))
+        for value in event_ids:
+            event_id = int(value)
+            if event_id in existing or not 0 <= event_id < total_events:
+                continue
+            valid, detail = self._static_valid(self.db, event_id, self.config)
+            if not valid:
+                continue
+            existing.insert(0, event_id)
+            activated.append(event_id)
+            self.records[(slot, event_id)] = {
+                "schema": "activated_backward_candidate",
+                "slot": slot,
+                "event_id": event_id,
+                "static_valid": True,
+                "static_validity": detail,
+                "future_reachable": True,
+                "terminal_reachable": True,
+                "future_viability_depth": max(0, len(self.layers) - slot - 1),
+                "reachable_until_slot": len(self.layers) - 1,
+                "future_log_mass": 0.0,
+                "future_reachability_probability": 1.0,
+                "future_safe_successor_count": 0,
+                "best_future_successor_event_id": None,
+                "minimum_surrogate_edge_cost": None,
+            }
+            if len(activated) >= self.config.bottleneck_activation_maximum:
+                break
+        if activated:
+            layers = list(self.layers)
+            layers[slot] = tuple(existing)
+            self.layers = tuple(layers)
+            self._state_cache.clear()
+            self._candidate_activations += len(activated)
+        report = {
+            "schema": "predicted_bottleneck_layer_activation",
+            "triggered": bool(activated),
+            "slot": slot,
+            "reason": str(reason),
+            "activated_event_ids": activated,
+            "layer_size_after": len(existing),
+        }
+        if activated:
+            self._activation_events.append(report)
+        return report
+
 
     @property
     def state_cache_hit_rate(self) -> float:
@@ -779,4 +967,7 @@ class BackwardReachabilityModel:
             "state_cache_hits": int(self._state_cache_hits),
             "state_cache_entries": int(len(self._state_cache)),
             "state_cache_hit_rate": self.state_cache_hit_rate,
+            "state_cache_key_schema": "slot-event-uidhash-source_run-source_share-family_share-usage-recovery-depth",
+            "candidate_activations": int(self._candidate_activations),
+            "activation_events": list(self._activation_events),
         }

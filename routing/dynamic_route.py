@@ -37,6 +37,14 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(
+        os.environ.get(name, "1" if default else "0")
+    ).strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 def _db_value(
     db: Mapping[str, Any],
     key: str,
@@ -175,8 +183,12 @@ class DynamicBeamState:
     recovery_count: int = 0
     recovery_budget_used: float = 0.0
     minimum_future_reachability: float = 1.0
+    minimum_future_viability_depth: int = 1000000
+    latest_future_viability_depth: int = 0
     source_scarcity_exemption_count: int = 0
+    family_scarcity_exemption_count: int = 0
     source_expansion_count: int = 0
+    bottleneck_expansion_count: int = 0
 
 class DynamicRouteDeadEnd(RuntimeError):
     """Raised when every retained exact-simulation state is blocked."""
@@ -449,37 +461,131 @@ def adaptive_beam_width(
     return max(config.beam_width, min(config.maximum_beam_width, width))
 
 
+def _constraint_state_signature(
+    state: DynamicBeamState,
+    db: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    """Compress one Beam prefix into a constraint-relevant diversity signature."""
+    if not state.selected_event_ids:
+        return ("initial", "initial", 0, 0, 0, 0, 0)
+    identities = [
+        {
+            "source": str(_db_value(db, "source_uids", event_id, "unknown")),
+            "family": str(_db_value(db, "event_families", event_id, "unknown")),
+        }
+        for event_id in state.selected_event_ids
+    ]
+    current = identities[-1]
+    source_run = 0
+    for row in reversed(identities):
+        if row["source"] != current["source"]:
+            break
+        source_run += 1
+    total = max(1, len(identities))
+    source_share = sum(row["source"] == current["source"] for row in identities) / total
+    family_share = sum(row["family"] == current["family"] for row in identities) / total
+    share_step = max(0.01, _env_float("BR_HPR_BEAM_SHARE_BIN", 0.10))
+    recovery_step = max(0.01, _env_float("BR_HPR_BEAM_RECOVERY_BIN", 0.25))
+    viability_step = max(1, _env_int("BR_HPR_BEAM_VIABILITY_BIN", 1))
+    return (
+        current["source"],
+        current["family"],
+        int(source_run),
+        int(round(source_share / share_step)),
+        int(round(family_share / share_step)),
+        int(round(float(state.recovery_budget_used) / recovery_step)),
+        int(max(0, state.latest_future_viability_depth) // viability_step),
+    )
+
+
 def prune_states(
     states: Sequence[DynamicBeamState],
     db: Mapping[str, Any],
     *,
     width: int,
 ) -> list[DynamicBeamState]:
-    """Score-prune while preserving at least one current-source branch."""
+    """Prune exact-simulation prefixes with mode-isolated semantics.
 
+    Legacy routing preserves at least one branch per current source. This
+    reproduces the original diversity contract when ``BR_HPR_ENABLE=0``.
+
+    Viability-aware BR-HPR preserves constraint-state signatures involving
+    source, family, concentration, recovery resource and future viability.
+    Physical, anatomical and severe-heading safety decisions are not changed
+    by either pruning policy.
+    """
     ordered = sorted(states, key=lambda state: float(state.score))
     cap = max(1, min(int(width), len(ordered)))
-    selected: list[DynamicBeamState] = []
-    selected_ids: set[int] = set()
-    best_by_source: dict[str, DynamicBeamState] = {}
-    for state in ordered:
-        if not state.selected_event_ids:
-            source = "initial"
-        else:
-            source = str(
-                _db_value(db, "source_uids", state.selected_event_ids[-1], "unknown")
-            )
-        best_by_source.setdefault(source, state)
 
-    for state in sorted(best_by_source.values(), key=lambda item: float(item.score)):
+    if not _env_bool("BR_HPR_ENABLE", False):
+        # Legacy behavior: preserve the lowest-score branch from every
+        # represented current source before filling the remaining capacity.
+        selected: list[DynamicBeamState] = []
+        selected_ids: set[int] = set()
+        best_by_source: dict[str, DynamicBeamState] = {}
+
+        for state in ordered:
+            if not state.selected_event_ids:
+                source = "initial"
+            else:
+                source = str(
+                    _db_value(
+                        db,
+                        "source_uids",
+                        int(state.selected_event_ids[-1]),
+                        "unknown",
+                    )
+                )
+            best_by_source.setdefault(source, state)
+
+        for state in sorted(
+            best_by_source.values(),
+            key=lambda item: float(item.score),
+        ):
+            if len(selected) >= cap:
+                break
+            selected.append(state)
+            selected_ids.add(id(state))
+
+        for state in ordered:
+            if len(selected) >= cap:
+                break
+            if id(state) not in selected_ids:
+                selected.append(state)
+                selected_ids.add(id(state))
+
+        return selected
+
+    # Viability-aware BR-HPR behavior: retain one representative for each
+    # constraint-relevant state signature before filling by global score.
+    selected = []
+    selected_ids: set[int] = set()
+    best_by_signature: dict[tuple[Any, ...], DynamicBeamState] = {}
+
+    for state in ordered:
+        signature = _constraint_state_signature(state, db)
+        best_by_signature.setdefault(signature, state)
+
+    signature_rows = sorted(
+        best_by_signature.values(),
+        key=lambda item: (
+            -int(item.latest_future_viability_depth),
+            float(item.recovery_budget_used),
+            float(item.score),
+        ),
+    )
+
+    for state in signature_rows:
         if len(selected) >= cap:
             break
         selected.append(state)
         selected_ids.add(id(state))
+
     for state in ordered:
         if len(selected) >= cap:
             break
         if id(state) not in selected_ids:
             selected.append(state)
             selected_ids.add(id(state))
+
     return selected
