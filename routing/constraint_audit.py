@@ -26,10 +26,20 @@ def summarize_constraint_trials(
     preferred = [row for row in safe if bool(row.get("preferred", False))]
     recovered = [row for row in safe if bool(row.get("recovery_triggered", False))]
     eligible = [row for row in trials if bool(row.get("eligible", False))]
-    state_reachable = [
+    terminal_reachable = [
         row
         for row in safe
-        if bool(row.get("future_reachability", {}).get("future_reachable", False))
+        if bool(
+            row.get("future_reachability", {}).get(
+                "terminal_reachable",
+                row.get("future_reachability", {}).get("future_reachable", False),
+            )
+        )
+    ]
+    viability_reachable = [
+        row
+        for row in safe
+        if int(row.get("future_reachability", {}).get("future_viability_depth", 0) or 0) > 0
     ]
     soft_reason_counts = Counter(
         str(reason)
@@ -71,6 +81,15 @@ def summarize_constraint_trials(
         int(row.get("future_reachability", {}).get("future_safe_successor_count", 0))
         for row in safe
     ]
+    viability_depths = [
+        int(row.get("future_reachability", {}).get("future_viability_depth", 0) or 0)
+        for row in safe
+    ]
+    reachable_until_slots = [
+        int(row.get("future_reachability", {}).get("reachable_until_slot", -1))
+        for row in safe
+        if row.get("future_reachability", {}).get("reachable_until_slot") is not None
+    ]
     recovery_charges = [
         float(row.get("constraint_assessment", {}).get("recovery_charge", np.nan))
         for row in safe
@@ -87,7 +106,9 @@ def summarize_constraint_trials(
         "schema": "state_aware_constraint_collapse_diagnostics",
         "proposals": int(len(trials)),
         "physically_safe": int(len(safe)),
-        "state_future_reachable": int(len(state_reachable)),
+        "state_future_reachable": int(len(terminal_reachable)),
+        "terminal_reachable": int(len(terminal_reachable)),
+        "viability_reachable": int(len(viability_reachable)),
         "preference_budget_valid": int(len(preferred)),
         "controlled_recovery": int(len(recovered)),
         "eligible": int(len(eligible)),
@@ -98,6 +119,7 @@ def summarize_constraint_trials(
         "safe_candidate_source_uids": safe_sources,
         "safe_candidate_family_ids": safe_families,
         "safe_source_count": int(len(safe_sources)),
+        "safe_family_count": int(len(safe_families)),
         "safe_observability_range": _finite_range(observabilities),
         "safe_future_reachability_range": _finite_range(reachabilities),
         "safe_future_successor_count_range": (
@@ -106,6 +128,16 @@ def summarize_constraint_trials(
             else [None, None]
         ),
         "safe_recovery_charge_range": _finite_range(recovery_charges),
+        "safe_future_viability_depth_range": (
+            [int(min(viability_depths)), int(max(viability_depths))]
+            if viability_depths
+            else [None, None]
+        ),
+        "safe_reachable_until_slot_range": (
+            [int(min(reachable_until_slots)), int(max(reachable_until_slots))]
+            if reachable_until_slots
+            else [None, None]
+        ),
         "future_first_dead_end_slot_counts": dict(first_dead_end_counts),
         "source_scarcity": scarcity,
         "safe_source_expansion": expansion,
@@ -157,5 +189,14 @@ def controlled_recovery_metadata(
         ),
         "source_penalty_scale": float(
             source_scarcity.get("source_penalty_scale", 1.0)
+        ),
+        "family_scarcity_exemption": bool(
+            source_scarcity.get("family_scarcity_exemption", False)
+        ),
+        "alternative_safe_family_exists": bool(
+            source_scarcity.get("alternative_safe_family_exists", True)
+        ),
+        "family_penalty_scale": float(
+            source_scarcity.get("family_penalty_scale", 1.0)
         ),
     }

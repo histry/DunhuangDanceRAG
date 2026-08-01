@@ -55,13 +55,14 @@ from routing.hierarchical_constraint_model import (
     CONSTRAINT_NAMES,
     ConstraintBudgetConfig,
     assess_candidate_constraints,
-    build_source_scarcity_context,
+    build_feasible_set_scarcity_context,
     select_controlled_recovery_indices,
 )
 from routing.safe_source_coverage import (
     SafeSourceCoverageConfig,
     build_source_reservoir_layers,
-    select_state_source_expansion_candidates,
+    build_state_source_expansion_batches,
+    select_bottleneck_layer_expansion_candidates,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -313,7 +314,7 @@ def assemble_event_heading_reference(
     cfg: Any,
     banned: Optional[Dict[int, set]] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[List[int]]]:
-    """Assemble a hard-safe route with state-aware probabilistic constraints.
+    """Assemble a hard-safe route with viability-aware probabilistic constraints.
 
     Immutable physical, anatomical and severe-heading gates are evaluated by the
     existing exact simulator.  The route planner adds four bounded mechanisms:
@@ -338,11 +339,15 @@ def assemble_event_heading_reference(
         blocked=blocked,
         config=source_coverage_config,
     )
+    initial_reachability_reservoir_layers = [
+        list(layer[: source_coverage_config.bottleneck_initial_reservoir_per_slot])
+        for layer in reservoir_layers
+    ]
     reachability_model = BackwardReachabilityModel.build(
         candidate_lists,
         db,
         constraint_config=constraint_config,
-        additional_candidate_layers=reservoir_layers,
+        additional_candidate_layers=initial_reachability_reservoir_layers,
     )
 
     route_progress = globals().get("ROUTE_PROGRESS")
@@ -363,7 +368,7 @@ def assemble_event_heading_reference(
             "maximum_beam_width": int(search.maximum_beam_width),
             "branch_topk": int(search.branch_topk),
             "candidates_per_source": int(search.candidates_per_source),
-            "method": "state-aware BR-HPR",
+            "method": "viability-aware BR-HPR",
             "source_targeted_expansion": bool(source_coverage_config.enabled),
             "continuous_recovery_budget": float(
                 constraint_config.recovery_budget_total
@@ -384,12 +389,17 @@ def assemble_event_heading_reference(
             recovery_count=0,
             recovery_budget_used=0.0,
             minimum_future_reachability=1.0,
+            minimum_future_viability_depth=len(slots),
+            latest_future_viability_depth=len(slots),
             source_scarcity_exemption_count=0,
+            family_scarcity_exemption_count=0,
             source_expansion_count=0,
+            bottleneck_expansion_count=0,
         )
     ]
     layer_trace: List[Dict[str, Any]] = []
     collapse_events: List[Dict[str, Any]] = []
+    bottleneck_expansion_events: List[Dict[str, Any]] = []
 
     for slot_idx, slot in enumerate(slots):
         target_len = int(target_lengths[slot_idx])
@@ -545,56 +555,81 @@ def assemble_event_heading_reference(
                 if bool(proposal.safe)
             ]
             expansion_ids: List[int] = []
-            expansion_report: Dict[str, Any] = {
-                "schema": "safe_source_targeted_expansion",
-                "triggered": False,
-                "safe_source_count_before": int(
-                    len(
-                        {
-                            event_identity(db, value)["source_uid"]
-                            for value in initial_safe_event_ids
-                        }
-                    )
-                ),
-                "selected_event_ids": [],
-                "additional_exact_simulations": 0,
-                "physical_constraints_relaxed": False,
-            }
-            if source_coverage_config.enabled:
-                expansion_ids, expansion_report = (
-                    select_state_source_expansion_candidates(
-                        reservoir_event_ids=reservoir_layers[slot_idx],
-                        attempted_event_ids=[
-                            int(proposal.event_id) for proposal, _extra in proposals
-                        ],
-                        hard_safe_event_ids=initial_safe_event_ids,
-                        selected_event_ids=state.selected_event_ids,
-                        previous_event_id=previous_event_id,
-                        db=db,
-                        config=source_coverage_config,
-                    )
-                )
+            expansion_batches, expansion_report = build_state_source_expansion_batches(
+                reservoir_event_ids=reservoir_layers[slot_idx],
+                attempted_event_ids=[
+                    int(proposal.event_id) for proposal, _extra in proposals
+                ],
+                hard_safe_event_ids=initial_safe_event_ids,
+                selected_event_ids=state.selected_event_ids,
+                previous_event_id=previous_event_id,
+                db=db,
+                config=source_coverage_config,
+            )
             reservoir_rank_lookup = {
                 int(event_id): index
                 for index, event_id in enumerate(reservoir_layers[slot_idx])
             }
-            for event_id in expansion_ids:
-                original_rank = int(
-                    len(candidates) + reservoir_rank_lookup.get(int(event_id), 0)
-                )
-                _prior_cost, prior_detail = route_prior_cost(
-                    slot_idx,
-                    int(event_id),
-                    previous_event_id=previous_event_id,
-                    fallback_rank=original_rank,
-                    candidate_count=len(candidates) + len(reservoir_layers[slot_idx]),
-                )
-                simulate_candidate(
-                    event_id=int(event_id),
-                    original_rank=original_rank,
-                    prior_detail=prior_detail,
-                    origin="safe_source_expansion",
-                )
+            executed_batches: List[Dict[str, Any]] = []
+            exact_budget_used = 0
+            if source_coverage_config.enabled:
+                for batch_index, batch in enumerate(expansion_batches):
+                    batch_attempted: List[int] = []
+                    batch_safe: List[int] = []
+                    for event_id in batch:
+                        if exact_budget_used >= source_coverage_config.expansion_maximum_exact:
+                            break
+                        original_rank = int(
+                            len(candidates)
+                            + reservoir_rank_lookup.get(int(event_id), 0)
+                        )
+                        _prior_cost, prior_detail = route_prior_cost(
+                            slot_idx,
+                            int(event_id),
+                            previous_event_id=previous_event_id,
+                            fallback_rank=original_rank,
+                            candidate_count=len(candidates)
+                            + len(reservoir_layers[slot_idx]),
+                        )
+                        before = len(proposals)
+                        simulate_candidate(
+                            event_id=int(event_id),
+                            original_rank=original_rank,
+                            prior_detail=prior_detail,
+                            origin="safe_source_expansion",
+                        )
+                        exact_budget_used += 1
+                        expansion_ids.append(int(event_id))
+                        batch_attempted.append(int(event_id))
+                        if len(proposals) > before and bool(proposals[-1][0].safe):
+                            batch_safe.append(int(event_id))
+                    current_safe = [
+                        int(proposal.event_id)
+                        for proposal, _extra in proposals
+                        if bool(proposal.safe)
+                    ]
+                    current_sources = {
+                        event_identity(db, value)["source_uid"] for value in current_safe
+                    }
+                    current_families = {
+                        event_identity(db, value)["family_id"] for value in current_safe
+                    }
+                    executed_batches.append(
+                        {
+                            "batch_index": int(batch_index),
+                            "attempted_event_ids": batch_attempted,
+                            "hard_safe_event_ids": batch_safe,
+                            "safe_source_count_after_batch": len(current_sources),
+                            "safe_family_count_after_batch": len(current_families),
+                        }
+                    )
+                    if (
+                        len(current_sources) >= source_coverage_config.target_safe_sources
+                        and len(current_families) >= source_coverage_config.target_safe_families
+                    ):
+                        break
+                    if exact_budget_used >= source_coverage_config.expansion_maximum_exact:
+                        break
 
             hard_safe_event_ids = [
                 int(proposal.event_id)
@@ -603,7 +638,7 @@ def assemble_event_heading_reference(
             ]
             safe_count = len(hard_safe_event_ids)
             safe_ratio = safe_count / max(1, len(proposals))
-            scarcity_context = build_source_scarcity_context(
+            scarcity_context = build_feasible_set_scarcity_context(
                 db=db,
                 hard_safe_event_ids=hard_safe_event_ids,
                 all_event_ids=[
@@ -612,80 +647,140 @@ def assemble_event_heading_reference(
                 config=constraint_config,
             )
             expansion_report = dict(expansion_report)
+            expansion_report["executed_batches"] = executed_batches
+            expansion_report["additional_exact_simulations"] = int(exact_budget_used)
             expansion_report["safe_source_count_after"] = int(
                 scarcity_context.safe_source_count
+            )
+            expansion_report["safe_family_count_after"] = int(
+                scarcity_context.safe_family_count
             )
             expansion_report["safe_sources_after"] = sorted(
                 dict(scarcity_context.safe_source_counts)
             )
+            expansion_report["safe_families_after"] = sorted(
+                dict(scarcity_context.safe_family_counts)
+            )
 
-            evaluated: List[Dict[str, Any]] = []
-            for proposal, extra in proposals:
-                observability = observability_from_extra(
-                    extra,
-                    safe_ratio=safe_ratio,
-                )
-                if bool(proposal.safe):
-                    reachability = reachability_model.query(
-                        slot=slot_idx,
+            def evaluate_current_proposals() -> List[Dict[str, Any]]:
+                rows: List[Dict[str, Any]] = []
+                for proposal, extra in proposals:
+                    observability = observability_from_extra(
+                        extra,
+                        safe_ratio=safe_ratio,
+                    )
+                    if bool(proposal.safe):
+                        reachability = reachability_model.query(
+                            slot=slot_idx,
+                            event_id=int(proposal.event_id),
+                            selected_event_ids=state.selected_event_ids,
+                            constraint_usage=state.constraint_usage,
+                            dual_variables=state.constraint_duals,
+                            recovery_budget_used=state.recovery_budget_used,
+                            observability=observability,
+                            scarcity_context=scarcity_context,
+                        )
+                    else:
+                        reachability = reachability_model.get(
+                            slot_idx, int(proposal.event_id)
+                        )
+                        reachability["future_reachable"] = False
+                        reachability["terminal_reachable"] = False
+                        reachability["future_viability_depth"] = 0
+                        reachability["reachable_until_slot"] = int(slot_idx)
+                        reachability["future_reachability_probability"] = 0.0
+                    assessment = assess_candidate_constraints(
+                        db=db,
                         event_id=int(proposal.event_id),
                         selected_event_ids=state.selected_event_ids,
+                        observability=observability,
+                        future_reachability_probability=float(
+                            reachability.get("future_reachability_probability", 0.0)
+                        ),
+                        slot_index=slot_idx,
                         constraint_usage=state.constraint_usage,
                         dual_variables=state.constraint_duals,
-                        recovery_budget_used=state.recovery_budget_used,
-                        observability=observability,
+                        config=constraint_config,
                         scarcity_context=scarcity_context,
                     )
-                else:
-                    reachability = reachability_model.get(
-                        slot_idx, int(proposal.event_id)
+                    extra["observability"] = float(observability)
+                    extra["route_uncertainty"] = 1.0 - float(observability)
+                    extra["future_reachability"] = reachability
+                    extra["constraint_assessment"] = assessment
+                    extra["diversity"] = dict(assessment["diversity"])
+                    base_selection_score = proposal_selection_score(
+                        proposal,
+                        extra,
+                        primary_event_id=primary_event_id,
                     )
-                    reachability["future_reachable"] = False
-                    reachability["future_reachability_probability"] = 0.0
-                assessment = assess_candidate_constraints(
-                    db=db,
-                    event_id=int(proposal.event_id),
-                    selected_event_ids=state.selected_event_ids,
-                    observability=observability,
-                    future_reachability_probability=float(
-                        reachability.get("future_reachability_probability", 0.0)
-                    ),
-                    slot_index=slot_idx,
-                    constraint_usage=state.constraint_usage,
-                    dual_variables=state.constraint_duals,
-                    config=constraint_config,
-                    scarcity_context=scarcity_context,
+                    hard_safe = bool(proposal.safe)
+                    terminal_reachable = bool(
+                        reachability.get(
+                            "terminal_reachable",
+                            reachability.get("future_reachable", False),
+                        )
+                    )
+                    preferred = bool(
+                        hard_safe and assessment["within_budget"] and terminal_reachable
+                    )
+                    rows.append(
+                        {
+                            "proposal": proposal,
+                            "extra": extra,
+                            "hard_safe": hard_safe,
+                            "future_reachable": terminal_reachable,
+                            "terminal_reachable": terminal_reachable,
+                            "future_viability_depth": int(
+                                reachability.get("future_viability_depth", 0) or 0
+                            ),
+                            "preferred": preferred,
+                            "base_selection_score": float(base_selection_score),
+                            "constraint_assessment": assessment,
+                            "future_reachability": reachability,
+                            "observability": float(observability),
+                        }
+                    )
+                return rows
+
+            evaluated = evaluate_current_proposals()
+            predicted_dead_ends = [
+                int(row["future_reachability"].get("future_first_dead_end_slot"))
+                for row in evaluated
+                if row["hard_safe"]
+                and row["future_reachability"].get("future_first_dead_end_slot")
+                is not None
+                and int(row["future_reachability"].get("future_first_dead_end_slot"))
+                > slot_idx
+            ]
+            bottleneck_report: Dict[str, Any] = {
+                "schema": "predicted_bottleneck_source_family_expansion",
+                "triggered": False,
+            }
+            if predicted_dead_ends:
+                bottleneck_slot = min(predicted_dead_ends)
+                bottleneck_candidates, selection_report = (
+                    select_bottleneck_layer_expansion_candidates(
+                        reservoir_event_ids=reservoir_layers[bottleneck_slot],
+                        active_event_ids=reachability_model.layers[bottleneck_slot],
+                        selected_event_ids=state.selected_event_ids,
+                        db=db,
+                        config=source_coverage_config,
+                    )
                 )
-                extra["observability"] = float(observability)
-                extra["route_uncertainty"] = 1.0 - float(observability)
-                extra["future_reachability"] = reachability
-                extra["constraint_assessment"] = assessment
-                extra["diversity"] = dict(assessment["diversity"])
-                base_selection_score = proposal_selection_score(
-                    proposal,
-                    extra,
-                    primary_event_id=primary_event_id,
+                activation_report = reachability_model.activate_candidates(
+                    slot=bottleneck_slot,
+                    event_ids=bottleneck_candidates,
+                    reason=f"predicted_from_slot_{slot_idx}",
                 )
-                hard_safe = bool(proposal.safe)
-                future_reachable = bool(
-                    reachability.get("future_reachable", False)
-                )
-                preferred = bool(
-                    hard_safe and assessment["within_budget"] and future_reachable
-                )
-                evaluated.append(
-                    {
-                        "proposal": proposal,
-                        "extra": extra,
-                        "hard_safe": hard_safe,
-                        "future_reachable": future_reachable,
-                        "preferred": preferred,
-                        "base_selection_score": float(base_selection_score),
-                        "constraint_assessment": assessment,
-                        "future_reachability": reachability,
-                        "observability": float(observability),
-                    }
-                )
+                bottleneck_report = {
+                    **dict(selection_report),
+                    **dict(activation_report),
+                    "predicted_from_slot": int(slot_idx),
+                    "predicted_first_dead_end_slot": int(bottleneck_slot),
+                }
+                if bool(activation_report.get("triggered", False)):
+                    bottleneck_expansion_events.append(dict(bottleneck_report))
+                    evaluated = evaluate_current_proposals()
 
             recovery_indices = select_controlled_recovery_indices(
                 evaluated,
@@ -728,11 +823,28 @@ def assemble_event_heading_reference(
                     ),
                     "safe": bool(proposal.safe),
                     "future_reachable": bool(evaluation["future_reachable"]),
+                    "terminal_reachable": bool(evaluation["terminal_reachable"]),
+                    "future_viability_depth": int(evaluation["future_viability_depth"]),
+                    "reachable_until_slot": evaluation["future_reachability"].get(
+                        "reachable_until_slot"
+                    ),
                     "preferred": preferred,
                     "recovery_candidate": bool(
                         evaluation["hard_safe"]
-                        and evaluation["future_reachable"]
                         and not preferred
+                        and (
+                            evaluation["terminal_reachable"]
+                            or (
+                                evaluation["future_viability_depth"]
+                                >= constraint_config.recovery_minimum_viability_depth
+                                and int(
+                                    evaluation["future_reachability"].get(
+                                        "future_safe_successor_count", 0
+                                    )
+                                )
+                                > 0
+                            )
+                        )
                     ),
                     "recovery_triggered": recovery_triggered,
                     "eligible": eligible,
@@ -771,6 +883,9 @@ def assemble_event_heading_reference(
                 trials,
                 source_expansion=expansion_report,
                 scarcity_context=scarcity_context.to_dict(),
+            )
+            diagnostic_summary["predicted_bottleneck_expansion"] = dict(
+                bottleneck_report
             )
             if diagnostic_summary["constraint_collapse_detected"]:
                 collapse_events.append(
@@ -898,12 +1013,17 @@ def assemble_event_heading_reference(
                     "probabilistic_constraint_routing": row_assessment,
                     "controlled_recovery": recovery_metadata,
                     "safe_source_expansion": dict(expansion_report),
+                    "predicted_bottleneck_expansion": dict(bottleneck_report),
                     "source_scarcity": scarcity_context.to_dict(),
+                    "feasible_set_scarcity": scarcity_context.to_dict(),
                     "dynamic_hard_mask": {
                         "physical_anatomy_heading_safe": bool(proposal.safe),
                         "preference_budget_valid": bool(assessment["within_budget"]),
                         "future_state_reachable": bool(
-                            future_reachability.get("future_reachable", False)
+                            future_reachability.get("terminal_reachable", False)
+                        ),
+                        "future_viability_depth": int(
+                            future_reachability.get("future_viability_depth", 0) or 0
                         ),
                         "immutable_safety_relaxed": False,
                         "soft_reasons": list(
@@ -928,17 +1048,20 @@ def assemble_event_heading_reference(
                     "stage_heading_after_deg": float(np.degrees(stage_after)),
                     "slot_turn_policy": slot_turn_policy(slot),
                     "candidate_trials": trials,
-                    "method": "state-aware BR-HPR",
+                    "method": "viability-aware BR-HPR",
                 }
                 source_exemption_used = bool(
                     scarcity_context.source_scarcity_exemption
                     and (
-                        float(assessment["raw_violations"].get("source_run", 0.0))
-                        > 0.0
-                        or float(
-                            assessment["raw_violations"].get("source_share", 0.0)
-                        )
-                        > 0.0
+                        float(assessment["raw_violations"].get("source_run", 0.0)) > 0.0
+                        or float(assessment["raw_violations"].get("source_share", 0.0)) > 0.0
+                    )
+                )
+                family_exemption_used = bool(
+                    scarcity_context.family_scarcity_exemption
+                    and (
+                        float(assessment["raw_violations"].get("family_share", 0.0)) > 0.0
+                        or float(assessment["raw_violations"].get("hierarchy_repetition", 0.0)) > 0.0
                     )
                 )
                 state_row = {
@@ -956,6 +1079,15 @@ def assemble_event_heading_reference(
                     "future_reachability_probability": float(
                         assessment["future_reachability_probability"]
                     ),
+                    "terminal_reachable": bool(
+                        future_reachability.get("terminal_reachable", False)
+                    ),
+                    "future_viability_depth": int(
+                        future_reachability.get("future_viability_depth", 0) or 0
+                    ),
+                    "reachable_until_slot": future_reachability.get(
+                        "reachable_until_slot"
+                    ),
                     "future_first_dead_end_slot": future_reachability.get(
                         "future_first_dead_end_slot"
                     ),
@@ -967,6 +1099,7 @@ def assemble_event_heading_reference(
                     ),
                     "source_scarcity": scarcity_context.to_dict(),
                     "safe_source_expansion": dict(expansion_report),
+                    "predicted_bottleneck_expansion": dict(bottleneck_report),
                     "controlled_recovery": recovery_metadata,
                     "prefix_score": float(state.score + selection_score),
                 }
@@ -992,13 +1125,28 @@ def assemble_event_heading_reference(
                             float(state.minimum_future_reachability),
                             float(assessment["future_reachability_probability"]),
                         ),
+                        minimum_future_viability_depth=min(
+                            int(state.minimum_future_viability_depth),
+                            int(future_reachability.get("future_viability_depth", 0) or 0),
+                        ),
+                        latest_future_viability_depth=int(
+                            future_reachability.get("future_viability_depth", 0) or 0
+                        ),
                         source_scarcity_exemption_count=(
                             state.source_scarcity_exemption_count
                             + int(source_exemption_used)
                         ),
+                        family_scarcity_exemption_count=(
+                            state.family_scarcity_exemption_count
+                            + int(family_exemption_used)
+                        ),
                         source_expansion_count=(
                             state.source_expansion_count
                             + int(candidate_origin == "safe_source_expansion")
+                        ),
+                        bottleneck_expansion_count=(
+                            state.bottleneck_expansion_count
+                            + int(bool(bottleneck_report.get("triggered", False)))
                         ),
                     )
                 )
@@ -1009,6 +1157,7 @@ def assemble_event_heading_reference(
                     "prefix_event_ids": list(map(int, state.selected_event_ids)),
                     "candidate_subset": list(map(int, subset)),
                     "source_expansion_candidates": list(map(int, expansion_ids)),
+                    "predicted_bottleneck_expansion": dict(bottleneck_report),
                     **dict(diagnostic_summary),
                     "hard_contracts_relaxed": False,
                     "current_recovery_count": int(state.recovery_count),
@@ -1035,6 +1184,9 @@ def assemble_event_heading_reference(
                     "preference_constraints_are_probabilistic": True,
                     "source_scarcity_budgeting_enabled": bool(
                         constraint_config.source_scarcity_enabled
+                    ),
+                    "family_scarcity_budgeting_enabled": bool(
+                        constraint_config.family_scarcity_enabled
                     ),
                     "continuous_recovery_enabled": bool(
                         constraint_config.controlled_recovery_enabled
@@ -1068,11 +1220,23 @@ def assemble_event_heading_reference(
             "retained_source_scarcity_exemptions": [
                 int(state.source_scarcity_exemption_count) for state in beam
             ],
+            "retained_family_scarcity_exemptions": [
+                int(state.family_scarcity_exemption_count) for state in beam
+            ],
             "retained_source_expansion_counts": [
                 int(state.source_expansion_count) for state in beam
             ],
             "retained_minimum_future_reachability": [
                 float(state.minimum_future_reachability) for state in beam
+            ],
+            "retained_latest_future_viability_depth": [
+                int(state.latest_future_viability_depth) for state in beam
+            ],
+            "retained_minimum_future_viability_depth": [
+                int(state.minimum_future_viability_depth) for state in beam
+            ],
+            "retained_bottleneck_expansion_counts": [
+                int(state.bottleneck_expansion_count) for state in beam
             ],
             "constraint_collapse_states": int(
                 sum(
@@ -1090,11 +1254,11 @@ def assemble_event_heading_reference(
         v46,
         np.asarray(best.motion, dtype=np.float32),
         cfg,
-        source_hint="state_aware_br_hpr_dynamic_heading_reference_final",
+        source_hint="viability_aware_br_hpr_dynamic_heading_reference_final",
     )
     _LAST_HEADING_PLAN = {
-        "schema": "state_aware_bidirectional_hierarchical_probabilistic_route",
-        "method": "state-aware BR-HPR",
+        "schema": "viability_aware_bidirectional_hierarchical_probabilistic_route",
+        "method": "viability-aware BR-HPR",
         "search": {
             "beam_width": int(search.beam_width),
             "maximum_beam_width": int(search.maximum_beam_width),
@@ -1109,6 +1273,7 @@ def assemble_event_heading_reference(
         "source_candidate_reservoir": reservoir_report,
         "backward_reachability": reachability_model.runtime_summary(),
         "constraint_collapse_events": collapse_events,
+        "predicted_bottleneck_expansion_events": bottleneck_expansion_events,
         "graph_route_prior": route_prior_summary(),
         "initial_stage_heading_rad": float(initial_heading),
         "final_stage_heading_rad": float(best.stage_heading),
@@ -1131,12 +1296,19 @@ def assemble_event_heading_reference(
         "source_scarcity_exemption_count": int(
             best.source_scarcity_exemption_count
         ),
+        "family_scarcity_exemption_count": int(
+            best.family_scarcity_exemption_count
+        ),
         "safe_source_expansion_selection_count": int(
             best.source_expansion_count
         ),
         "minimum_future_reachability": float(
             best.minimum_future_reachability
         ),
+        "minimum_future_viability_depth": int(
+            best.minimum_future_viability_depth
+        ),
+        "bottleneck_expansion_count": int(best.bottleneck_expansion_count),
         "state_trace": list(best.state_trace),
         "layer_trace": layer_trace,
     }

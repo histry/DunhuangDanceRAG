@@ -1,7 +1,7 @@
-"""Source-targeted candidate expansion for low-resource whole-song routing.
+"""Source--Family-targeted candidate expansion for low-resource whole-song routing.
 
 The module is deliberately a *candidate proposal* mechanism.  It never labels an
-Event physically safe.  It adds statically plausible Events from uncovered sources
+Event physically safe.  It adds statically plausible Events from uncovered sources and families
 and delegates every final decision to the authoritative exact simulator.
 """
 from __future__ import annotations
@@ -121,6 +121,7 @@ class SafeSourceCoverageConfig:
 
     enabled: bool
     target_safe_sources: int
+    target_safe_families: int
     reservoir_maximum_per_slot: int
     reservoir_per_source: int
     expansion_maximum_exact: int
@@ -133,6 +134,8 @@ class SafeSourceCoverageConfig:
     family_affinity_weight: float
     hierarchy_affinity_weight: float
     history_novelty_weight: float
+    bottleneck_initial_reservoir_per_slot: int
+    bottleneck_expansion_maximum: int
 
     @classmethod
     def from_environment(cls) -> "SafeSourceCoverageConfig":
@@ -140,6 +143,9 @@ class SafeSourceCoverageConfig:
             enabled=_env_bool("BR_HPR_SOURCE_COVERAGE_ENABLE", True),
             target_safe_sources=max(
                 1, _env_int("BR_HPR_MINIMUM_SAFE_SOURCE_COUNT", 2)
+            ),
+            target_safe_families=max(
+                1, _env_int("BR_HPR_MINIMUM_SAFE_FAMILY_COUNT", 2)
             ),
             reservoir_maximum_per_slot=max(
                 1, _env_int("BR_HPR_SOURCE_RESERVOIR_MAXIMUM_PER_SLOT", 24)
@@ -183,6 +189,12 @@ class SafeSourceCoverageConfig:
             history_novelty_weight=max(
                 0.0,
                 _env_float("BR_HPR_SOURCE_EXPANSION_HISTORY_NOVELTY_WEIGHT", 0.20),
+            ),
+            bottleneck_initial_reservoir_per_slot=max(
+                0, _env_int("BR_HPR_BOTTLENECK_INITIAL_RESERVOIR_PER_SLOT", 8)
+            ),
+            bottleneck_expansion_maximum=max(
+                0, _env_int("BR_HPR_BOTTLENECK_EXPANSION_MAXIMUM", 12)
             ),
         )
 
@@ -372,6 +384,93 @@ def build_source_reservoir_layers(
     }
 
 
+def build_state_source_expansion_batches(
+    *,
+    reservoir_event_ids: Sequence[int],
+    attempted_event_ids: Sequence[int],
+    hard_safe_event_ids: Sequence[int],
+    selected_event_ids: Sequence[int],
+    previous_event_id: Optional[int],
+    db: Mapping[str, Any],
+    config: SafeSourceCoverageConfig,
+) -> tuple[list[list[int]], dict[str, Any]]:
+    """Return source-grouped batches for exact-safety feedback expansion.
+
+    The planner must simulate one batch, update the *actual* hard-safe set, then
+    decide whether another batch is needed.  No source is counted as covered merely
+    because its candidates were selected for simulation.
+    """
+    attempted = set(map(int, attempted_event_ids))
+    safe_sources = {event_identity(db, int(v))["source_uid"] for v in hard_safe_event_ids}
+    safe_families = {event_identity(db, int(v))["family_id"] for v in hard_safe_event_ids}
+    previous_source = (
+        event_identity(db, int(previous_event_id))["source_uid"]
+        if previous_event_id is not None
+        else None
+    )
+    history_sources = Counter(
+        event_identity(db, int(value))["source_uid"] for value in selected_event_ids
+    )
+    history_families = Counter(
+        event_identity(db, int(value))["family_id"] for value in selected_event_ids
+    )
+    rows_by_source: dict[str, list[tuple[tuple[Any, ...], int]]] = {}
+    for value in reservoir_event_ids:
+        event_id = int(value)
+        if event_id in attempted:
+            continue
+        identity = event_identity(db, event_id)
+        source = identity["source_uid"]
+        family = identity["family_id"]
+        if source in safe_sources and family in safe_families:
+            continue
+        key = (
+            source in safe_sources,
+            family in safe_families,
+            source == previous_source,
+            history_sources[source],
+            history_families[family],
+            event_id,
+        )
+        rows_by_source.setdefault(source, []).append((key, event_id))
+
+    source_order = sorted(
+        rows_by_source,
+        key=lambda source: min(row[0] for row in rows_by_source[source]),
+    )
+    batches: list[list[int]] = []
+    selected_event_ids: list[int] = []
+    selected_sources: list[str] = []
+    for source in source_order:
+        rows = sorted(rows_by_source[source], key=lambda row: row[0])
+        batch = [int(event_id) for _key, event_id in rows[: config.expansion_per_source]]
+        if not batch:
+            continue
+        remaining = config.expansion_maximum_exact - len(selected_event_ids)
+        if remaining <= 0:
+            break
+        batch = batch[:remaining]
+        batches.append(batch)
+        selected_event_ids.extend(batch)
+        selected_sources.append(source)
+    return batches, {
+        "schema": "iterative_safe_source_family_expansion_plan",
+        "triggered": bool(batches),
+        "safe_source_count_before": int(len(safe_sources)),
+        "safe_family_count_before": int(len(safe_families)),
+        "safe_sources_before": sorted(safe_sources),
+        "safe_families_before": sorted(safe_families),
+        "reservoir_candidates_available": int(sum(len(v) for v in rows_by_source.values())),
+        "selected_event_ids": selected_event_ids,
+        "selected_source_uids": selected_sources,
+        "planned_batches": [list(map(int, batch)) for batch in batches],
+        "additional_exact_simulation_budget": int(config.expansion_maximum_exact),
+        "physical_constraints_relaxed": False,
+        "anatomy_constraints_relaxed": False,
+        "severe_heading_constraints_relaxed": False,
+    }
+
+
 def select_state_source_expansion_candidates(
     *,
     reservoir_event_ids: Sequence[int],
@@ -382,61 +481,67 @@ def select_state_source_expansion_candidates(
     db: Mapping[str, Any],
     config: SafeSourceCoverageConfig,
 ) -> tuple[list[int], dict[str, Any]]:
-    """Select bounded candidates from sources missing in the hard-safe set."""
-    attempted = set(map(int, attempted_event_ids))
-    safe_sources = {
-        event_identity(db, int(value))["source_uid"] for value in hard_safe_event_ids
-    }
-    previous_source = (
-        event_identity(db, int(previous_event_id))["source_uid"]
-        if previous_event_id is not None
-        else None
+    """Compatibility wrapper returning the flattened iterative expansion plan."""
+    batches, report = build_state_source_expansion_batches(
+        reservoir_event_ids=reservoir_event_ids,
+        attempted_event_ids=attempted_event_ids,
+        hard_safe_event_ids=hard_safe_event_ids,
+        selected_event_ids=selected_event_ids,
+        previous_event_id=previous_event_id,
+        db=db,
+        config=config,
     )
-    rows_by_source: dict[str, list[int]] = {}
+    return [event for batch in batches for event in batch], report
+
+
+def select_bottleneck_layer_expansion_candidates(
+    *,
+    reservoir_event_ids: Sequence[int],
+    active_event_ids: Sequence[int],
+    selected_event_ids: Sequence[int],
+    db: Mapping[str, Any],
+    config: SafeSourceCoverageConfig,
+) -> tuple[list[int], dict[str, Any]]:
+    """Select Source--Family novel candidates for a predicted future bottleneck."""
+    active = set(map(int, active_event_ids))
+    history_sources = Counter(
+        event_identity(db, int(value))["source_uid"] for value in selected_event_ids
+    )
+    history_families = Counter(
+        event_identity(db, int(value))["family_id"] for value in selected_event_ids
+    )
+    active_sources = {event_identity(db, value)["source_uid"] for value in active}
+    active_families = {event_identity(db, value)["family_id"] for value in active}
+    rows: list[tuple[tuple[Any, ...], int]] = []
     for value in reservoir_event_ids:
         event_id = int(value)
-        if event_id in attempted:
+        if event_id in active:
             continue
-        source = event_identity(db, event_id)["source_uid"]
-        if source in safe_sources:
-            continue
-        rows_by_source.setdefault(source, []).append(event_id)
-
-    source_order = sorted(
-        rows_by_source,
-        key=lambda source: (
-            source == previous_source,
-            sum(
-                event_identity(db, int(value))["source_uid"] == source
-                for value in selected_event_ids
-            ),
-            source,
-        ),
-    )
-    selected: list[int] = []
-    selected_sources: list[str] = []
-    for source in source_order:
-        for event_id in rows_by_source[source][: config.expansion_per_source]:
-            if len(selected) >= config.expansion_maximum_exact:
-                break
-            selected.append(int(event_id))
-            selected_sources.append(source)
-        if len(selected) >= config.expansion_maximum_exact:
-            break
-        if len(safe_sources.union(selected_sources)) >= config.target_safe_sources:
-            break
+        identity = event_identity(db, event_id)
+        source = identity["source_uid"]
+        family = identity["family_id"]
+        rows.append(
+            (
+                (
+                    source in active_sources,
+                    family in active_families,
+                    history_sources[source],
+                    history_families[family],
+                    event_id,
+                ),
+                event_id,
+            )
+        )
+    rows.sort(key=lambda row: row[0])
+    selected = [
+        int(event_id)
+        for _key, event_id in rows[: config.bottleneck_expansion_maximum]
+    ]
     return selected, {
-        "schema": "safe_source_targeted_expansion",
+        "schema": "predicted_bottleneck_source_family_expansion",
         "triggered": bool(selected),
-        "safe_source_count_before": int(len(safe_sources)),
-        "safe_sources_before": sorted(safe_sources),
-        "reservoir_candidates_available": int(
-            sum(len(values) for values in rows_by_source.values())
-        ),
-        "selected_event_ids": list(map(int, selected)),
-        "selected_source_uids": selected_sources,
-        "additional_exact_simulations": int(len(selected)),
-        "physical_constraints_relaxed": False,
-        "anatomy_constraints_relaxed": False,
-        "severe_heading_constraints_relaxed": False,
+        "selected_event_ids": selected,
+        "active_source_count": len(active_sources),
+        "active_family_count": len(active_families),
+        "reservoir_candidates_available": len(rows),
     }
