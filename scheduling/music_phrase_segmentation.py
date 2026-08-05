@@ -47,6 +47,8 @@ class MusicPhrase:
     novelty: float
     section_change: float
     accent: float
+    target_motion_density: float
+    target_motion_density_source: str
 
     @property
     def length(self) -> int:
@@ -421,9 +423,38 @@ def phrase_rhythm_profile(
     tension = float(np.mean(x[:, 6]))
     calm = float(np.mean(x[:, 7]))
     novelty = float(np.mean(x[:, 8]))
-    section = float(np.max(x[:, 10]))
+    section_peak = float(np.percentile(x[:, 10], 90))
+    section_mean = float(np.mean(x[:, 10]))
+    section_density = float(np.mean(x[:, 10] > 0.75))
     accent = float(np.mean(x[:, 11]))
     boundary_accent = float(np.percentile(x[:, 11], 90))
+
+    # Continuous time-local motion target.
+    # This is dimensionless and intentionally distinct from content-frame
+    # allocation fields such as slot_content_target.
+    acoustic_drive = float(
+        np.clip(
+            0.20 * energy
+            + 0.16 * onset
+            + 0.10 * beat
+            + 0.18 * arousal
+            + 0.14 * tension
+            + 0.10 * novelty
+            + 0.08 * accent
+            + 0.04 * section_mean,
+            0.0,
+            1.0,
+        )
+    )
+    target_motion_density = float(
+        np.clip(
+            0.12
+            + 0.72 * acoustic_drive
+            - 0.08 * calm,
+            0.12,
+            0.78,
+        )
+    )
 
     fast_drive = np.clip(
         0.25 * tempo
@@ -456,7 +487,11 @@ def phrase_rhythm_profile(
     transition_frames = int(
         np.clip(transition_frames, round(12.0 * rate_scale), round(48.0 * rate_scale))
     )
-    if section > 0.70 and calm > 0.55:
+    if (
+        section_density >= 0.16
+        and section_mean >= 0.45
+        and calm > 0.55
+    ):
         profile = "section_sustain"
     elif transition_fast > 0.62 and accent > 0.50:
         profile = "accent_cut"
@@ -480,8 +515,11 @@ def phrase_rhythm_profile(
         "tension": tension,
         "calmness": calm,
         "novelty": novelty,
-        "section_change": section,
+        "section_change": section_peak,
         "accent": accent,
+        "target_motion_density": target_motion_density,
+        "target_motion_density_source":
+            "v26_local_acoustic_drive_v1",
     }
 
 

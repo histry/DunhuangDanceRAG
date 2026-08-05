@@ -705,6 +705,19 @@ def install(v53: Any) -> Dict[str, Any]:
             if isinstance(proposal.risk, dict)
             else {}
         )
+        activity = (
+            proposal.risk.get("motion_activity", {})
+            if isinstance(proposal.risk, dict)
+            else {}
+        )
+        activity_assessment = (
+            activity.get("assessment", {})
+            if isinstance(activity, Mapping)
+            else {}
+        )
+        activity_hard_reject = bool(
+            activity_assessment.get("hard_reject", False)
+        )
 
         warp_min, warp_max = policy.warp_range(_ACTIVE_TIER)
         warp = float(gate.get("core_warp", 1.0))
@@ -735,6 +748,7 @@ def install(v53: Any) -> Dict[str, Any]:
             and heading_penalty < 1e5
             and warp_min <= warp <= warp_max
             and physical_ok
+            and not activity_hard_reject
         )
         allow = False
         reason = ""
@@ -754,7 +768,11 @@ def install(v53: Any) -> Dict[str, Any]:
             )
             reason = "base_physics_safe_tangent_gate_softening"
 
-        if allow and bool(extra.get("heading_detail", {}).get("hard_reject", False)):
+        if (
+            allow
+            and not activity_hard_reject
+            and bool(extra.get("heading_detail", {}).get("hard_reject", False))
+        ):
             # Immutable gates above prove that the hard flag came only from the
             # bounded V46.53 observability/tangent layer.  V46.52 anatomy and
             # base physical safety remain mandatory.

@@ -135,6 +135,10 @@ def canonical_music_label(label: Any) -> str:
     aliases = {
         "calm": "calm_meditative",
         "calm_flow": "calm_meditative",
+        "build_up": "turning_climax",
+        "release": "lyrical_flow",
+        "section_change": "lyrical_flow",
+        "neutral_flow": "lyrical_flow",
         "meditation": "calm_meditative",
         "meditative": "calm_meditative",
         "revelation_meditation": "calm_meditative",

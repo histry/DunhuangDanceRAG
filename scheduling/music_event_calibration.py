@@ -54,24 +54,84 @@ def phrase_statistics(w: np.ndarray) -> Dict[str, float]:
     }
 
 
-def classify_phrase_event(w: np.ndarray) -> Tuple[str, Dict[str, float]]:
+def classify_phrase_event(
+    w: np.ndarray,
+) -> Tuple[str, Dict[str, float]]:
+    """Classify a local phrase without letting calm mask temporal events.
+
+    Event priority:
+    climax -> section change -> accent -> release/build-up
+    -> stable calm -> neutral flow.
+
+    Calm describes a sustained state. Structural, transient, and trend-based
+    events therefore take precedence when their evidence is sufficiently
+    strong.
+    """
     s = phrase_statistics(w)
-    if s["calm"] >= 0.62 and s["tension"] <= 0.56 and s["arousal"] <= 0.58:
-        return "calm_flow", s
-    if s["arousal"] >= 0.67 and s["tension"] >= 0.62 and (
-        s["accent_density"] >= 0.06 or s["energy"] >= 0.55
+
+    if (
+        s["arousal"] >= 0.67
+        and s["tension"] >= 0.62
+        and (
+            s["accent_density"] >= 0.06
+            or s["energy"] >= 0.55
+        )
     ):
         return "climax", s
-    if s["arousal_trend"] <= -0.055 or s["tension_trend"] <= -0.055 or s["delta_mean"] <= -0.012:
-        return "release", s
-    if s["arousal_trend"] >= 0.055 or s["tension_trend"] >= 0.055 or s["delta_mean"] >= 0.012:
-        return "build_up", s
-    if s["section_density"] >= 0.16 and s["section_mean"] >= 0.45 and s["novelty"] >= 0.42:
-        return "section_change", s
-    if s["accent_density"] >= 0.16 or (s["accent_mean"] >= 0.52 and s["beat_density"] >= 0.08):
-        return "accent", s
-    return "neutral_flow", s
 
+    if (
+        s["section_density"] >= 0.16
+        and s["section_mean"] >= 0.45
+        and s["novelty"] >= 0.42
+    ):
+        return "section_change", s
+
+    if (
+        s["accent_density"] >= 0.16
+        or (
+            s["accent_mean"] >= 0.52
+            and s["beat_density"] >= 0.08
+        )
+    ):
+        return "accent", s
+
+    # Resolve contradictory temporal cues by comparing their dominance
+    # instead of allowing source-code order to decide the label.
+    positive_trend = max(
+        float(s["arousal_trend"]),
+        float(s["tension_trend"]),
+        6.0 * float(s["delta_mean"]),
+        0.0,
+    )
+    negative_trend = max(
+        -float(s["arousal_trend"]),
+        -float(s["tension_trend"]),
+        -6.0 * float(s["delta_mean"]),
+        0.0,
+    )
+    trend_threshold = 0.055
+    trend_margin = 0.020
+
+    if (
+        positive_trend >= trend_threshold
+        and positive_trend >= negative_trend + trend_margin
+    ):
+        return "build_up", s
+
+    if (
+        negative_trend >= trend_threshold
+        and negative_trend >= positive_trend + trend_margin
+    ):
+        return "release", s
+
+    if (
+        s["calm"] >= 0.62
+        and s["tension"] <= 0.56
+        and s["arousal"] <= 0.58
+    ):
+        return "calm_flow", s
+
+    return "neutral_flow", s
 
 def build_phrase_query(
     w: np.ndarray,
