@@ -765,6 +765,12 @@ def choose_events(
                     "music_speed_factor": float(phrase.speed_factor),
                     "music_transition_profile": phrase.transition_profile,
                     "boundary_accent_strength": float(phrase.boundary_accent_strength),
+                    "target_motion_density": float(
+                        phrase.target_motion_density
+                    ),
+                    "target_motion_density_source": str(
+                        phrase.target_motion_density_source
+                    ),
                     "predicted_motion_event": predicted_event,
                     "predicted_duration": predicted_duration,
                     "event_index": idx,

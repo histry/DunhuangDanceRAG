@@ -69,6 +69,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# MOTION_ACTIVITY_INTEGRATION_BEGIN
+from evaluation.motion_activity_analysis import (  # noqa: E402
+    candidate_activity_assessment,
+    motion_activity_metrics,
+    save_stage_snapshot,
+    slot_activity_target,
+)
+# MOTION_ACTIVITY_INTEGRATION_END
+
 import routing.boundary_closed_loop as base  # noqa: E402
 from contracts.heading import (  # noqa: E402
     EDGE_DIM,
@@ -236,6 +245,17 @@ def _build_heading_proposal(
         cfg,
         event_id,
     )
+
+    # Candidate activity is measured after duration resampling and heading
+    # alignment, because this is the exact core that enters the route.
+    activity_fps = float(getattr(cfg, "fps", 30.0))
+    core_activity_metrics = motion_activity_metrics(core, fps=activity_fps)
+    core_activity_target = slot_activity_target(slot)
+    core_activity_assessment = candidate_activity_assessment(
+        core_activity_metrics,
+        core_activity_target,
+    )
+
     bridge = np.zeros((0, EDGE_DIM), dtype=np.float32)
     if has_prev:
         bridge = base.build_bridge(v46, prev_motion, core, trans_len, cfg)
@@ -267,14 +287,24 @@ def _build_heading_proposal(
             "upstream transition budget instead."
         )
 
+    risk = dict(risk)
+    risk["motion_activity"] = {
+        "metrics": core_activity_metrics,
+        "assessment": core_activity_assessment,
+    }
     physical_risk = float(base.risk_score(risk))
     combined = (
         physical_risk
         + env_float("V46_50_HEADING_PLANNER_WEIGHT", 0.85)
         * float(heading_penalty)
+        + float(core_activity_assessment["penalty"])
     )
-    hard_reject = bool(heading_detail.get("hard_reject", False))
+    heading_hard_reject = bool(heading_detail.get("hard_reject", False))
+    activity_hard_reject = bool(core_activity_assessment["hard_reject"])
+    hard_reject = bool(heading_hard_reject or activity_hard_reject)
     safe = bool((not hard_reject) and (base.risk_safe(risk) if has_prev else True))
+    heading_detail = dict(heading_detail)
+    heading_detail["motion_activity_hard_reject"] = activity_hard_reject
 
     length_info = dict(length_info)
     length_info["v46_50_heading"] = heading_detail
@@ -301,6 +331,10 @@ def _build_heading_proposal(
         "combined_score": float(combined),
         "heading_detail": heading_detail,
         "event_meta": event_meta,
+        "motion_activity": {
+            "metrics": core_activity_metrics,
+            "assessment": core_activity_assessment,
+        },
         "source_frames": int(raw.shape[0]),
         "core_frames": int(len(core)),
     }
@@ -494,6 +528,61 @@ def assemble_event_heading_reference(
                 prior_detail: Mapping[str, Any],
                 origin: str,
             ) -> None:
+                skip_pairs_raw = str(
+                    os.environ.get(
+                        "V46_50_EXACT_SKIP_PAIRS",
+                        "",
+                    )
+                ).strip()
+
+                skip_pairs = set()
+                if skip_pairs_raw:
+                    for item in skip_pairs_raw.split(","):
+                        item = item.strip()
+                        if not item:
+                            continue
+                        try:
+                            slot_text, event_text = item.split(":", 1)
+                            skip_pairs.add(
+                                (
+                                    int(slot_text),
+                                    int(event_text),
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "Invalid V46_50_EXACT_SKIP_PAIRS "
+                                f"item: {item!r}; expected slot:event"
+                            ) from exc
+
+                if (
+                    int(slot_idx),
+                    int(event_id),
+                ) in skip_pairs:
+                    print(
+                        "[BR-HPR-CANDIDATE-SKIP] "
+                        + json.dumps(
+                            {
+                                "slot": int(slot_idx),
+                                "state_index": int(state_index),
+                                "event_id": int(event_id),
+                                "candidate_rank": int(original_rank),
+                                "target_frames": int(target_len),
+                                "candidate_origin": str(origin),
+                                "decision": (
+                                    "skip_known_nonreturning_"
+                                    "exact_candidate"
+                                ),
+                                "safety_gates_relaxed": False,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return
+
                 progress_token = progress_call(
                     "candidate_start",
                     slot=slot_idx,
@@ -1009,6 +1098,7 @@ def assemble_event_heading_reference(
                     "source_calibration": dict(
                         extra.get("source_calibration", {})
                     ),
+                    "motion_activity": dict(extra.get("motion_activity", {})),
                     "future_reachability": future_reachability,
                     "probabilistic_constraint_routing": row_assessment,
                     "controlled_recovery": recovery_metadata,
@@ -1335,6 +1425,12 @@ def apply_generators_with_heading_guard(
         if hasattr(v46, "audit_motion_np")
         else {}
     )
+    stage["motion_activity_retrieval"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "retrieval",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
 
     if bool(getattr(cfg, "refiner_enable", False)) and base.env_bool(
         "V46_46_USE_REFINER", True
@@ -1351,6 +1447,12 @@ def apply_generators_with_heading_guard(
             if hasattr(v46, "audit_motion_np")
             else {}
         )
+    stage["motion_activity_refiner"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "refiner",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
 
     if bool(getattr(cfg, "diffusion_enable", False)) and base.env_bool(
         "V46_46_USE_DIFFUSION", True
@@ -1367,6 +1469,12 @@ def apply_generators_with_heading_guard(
             if hasattr(v46, "audit_motion_np")
             else {}
         )
+    stage["motion_activity_diffusion"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "diffusion",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
 
     if env_bool("V46_50_PROTECT_PLANNED_ROOT_HEADING", True):
         motion, heading_guard_pre_ik = restore_planned_root_heading_np(
@@ -1414,6 +1522,12 @@ def apply_generators_with_heading_guard(
         else {}
     )
     stage["final_physical_gate"] = base.physical_quality_gate(stage["final_audit"])
+    stage["motion_activity_full_ik"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "full_ik",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
     return motion.astype(np.float32), stage
 
 

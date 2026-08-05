@@ -68,6 +68,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+# MOTION_ACTIVITY_INTEGRATION_BEGIN
+from evaluation.motion_activity_analysis import (
+    evaluate_final_motion_activity,
+    write_activity_report,
+)
+# MOTION_ACTIVITY_INTEGRATION_END
 from motion_geometry.resampling import resample_edge151_np
 from contracts.physical_quality import (
     PhysicalQualityLimits,
@@ -1163,6 +1169,16 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             + ",".join(final_gate["reasons"])
         )
 
+    # The activity gate is additive and is evaluated only after immutable
+    # physical/anatomy/heading processing has completed.
+    final_motion_activity = evaluate_final_motion_activity(
+        best_payload["motion"],
+        slots=slots,
+        assembly_report=best_payload["assembly_report"],
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
+    best_payload["stage_reports"]["final_motion_activity"] = final_motion_activity
+
     out = Path(args.out)
     if out.suffix.lower() != ".npy":
         raise ValueError(f"--out must end in .npy, got {out}")
@@ -1172,6 +1188,10 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     mask_path = str(out.with_name(out.stem + ".transition_mask.npy"))
     audit_csv_path = str(out.with_name(out.stem + ".boundary_audit.csv"))
     audit_json_path = str(out.with_name(out.stem + ".boundary_audit.json"))
+    motion_activity_path = str(
+        out.with_name(out.stem + ".motion_activity.json")
+    )
+    write_activity_report(final_motion_activity, motion_activity_path)
     np.save(motion_ref_path, best_payload["motion_ref"].astype(np.float32))
     np.save(mask_path, best_payload["seam_mask"].astype(np.float32))
     write_audit_csv(best_payload["boundary_rows"], audit_csv_path)
@@ -1196,6 +1216,8 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "transition_mask_path": mask_path,
         "boundary_audit_csv": audit_csv_path,
         "boundary_audit_json": audit_json_path,
+        "motion_activity_json": motion_activity_path,
+        "motion_activity": final_motion_activity,
         "closed_loop": {
             "enabled": True,
             "rounds": rounds,
@@ -1257,10 +1279,26 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "transition_mask": mask_path,
         "json": json_path,
         "boundary_audit_csv": audit_csv_path,
+        "motion_activity_json": motion_activity_path,
         "frames": int(best_payload["motion"].shape[0]),
         "boundary_audit_summary": report["boundary_audit_summary"],
         "final_audit": report["final_audit"],
+        "final_motion_activity": final_motion_activity,
     }), ensure_ascii=False, indent=2))
+
+    # Preserve NPY and JSON evidence, then fail the run so static collapse is
+    # never silently accepted as a successful generation.
+    if (
+        env_bool("MOTION_ACTIVITY_FINAL_GATE", True)
+        and not bool(final_motion_activity["ok"])
+    ):
+        raise RuntimeError(
+            "Final motion activity gate rejected a physically safe but "
+            "nearly static sequence; diagnostics were preserved at "
+            + motion_activity_path
+            + "; reasons="
+            + ",".join(final_motion_activity["reasons"])
+        )
     return 0
 
 

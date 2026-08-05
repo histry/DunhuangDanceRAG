@@ -24,3 +24,4 @@ assets/indexes/scheduler_event_store_manifest.json
 
 # Project-local scheduler assets are reproducibility inputs, not source code.
 assets/events/scheduler_event_store/
+*.bak_*
