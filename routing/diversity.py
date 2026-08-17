@@ -38,6 +38,12 @@ def event_identity(db: Mapping[str, Any], event_id: int) -> dict[str, str]:
     return {
         "event_uid": _db_value(db, "event_uids", event_id, f"legacy_index_{event_id}"),
         "source_uid": _db_value(db, "source_uids", event_id, "unknown"),
+        "recording_uid": _db_value(
+            db,
+            "recording_uids",
+            event_id,
+            _db_value(db, "source_uids", event_id, "unknown"),
+        ),
         "family_id": _db_value(db, "event_families", event_id, "unknown"),
         "dance_key": _db_value(db, "dance_keys", event_id, "unknown"),
     }
@@ -81,6 +87,10 @@ def diversity_assessment(
             "BR_HPR_MAX_SOURCE_SHARE",
             _env_float("V46_54_MAX_SOURCE_SHARE", 0.40),
         )
+        max_recording_share = _env_float(
+            "BR_HPR_MAX_RECORDING_SHARE",
+            _env_float("V46_54_MAX_RECORDING_SHARE", max_source_share),
+        )
         max_family_share = _env_float(
             "BR_HPR_MAX_FAMILY_SHARE",
             _env_float("V46_54_MAX_FAMILY_SHARE", 0.50),
@@ -104,6 +114,10 @@ def diversity_assessment(
         max_source_share = _env_float(
             "V46_54_MAX_SOURCE_SHARE",
             0.40,
+        )
+        max_recording_share = _env_float(
+            "V46_54_MAX_RECORDING_SHARE",
+            max_source_share,
         )
         max_family_share = _env_float(
             "V46_54_MAX_FAMILY_SHARE",
@@ -131,11 +145,15 @@ def diversity_assessment(
     source_run_after = source_run + 1
 
     source_counts = Counter(row["source_uid"] for row in history)
+    recording_counts = Counter(row["recording_uid"] for row in history)
     family_counts = Counter(row["family_id"] for row in history)
 
     total_after = len(history) + 1
     source_share = (
         source_counts[identity["source_uid"]] + 1
+    ) / max(1, total_after)
+    recording_share = (
+        recording_counts[identity["recording_uid"]] + 1
     ) / max(1, total_after)
     family_share = (
         family_counts[identity["family_id"]] + 1
@@ -153,6 +171,11 @@ def diversity_assessment(
         and source_share > max_source_share + 1.0e-9
     ):
         legacy_reasons.append("source_share")
+    if (
+        share_active
+        and recording_share > max_recording_share + 1.0e-9
+    ):
+        legacy_reasons.append("recording_share")
     if (
         share_active
         and family_share > max_family_share + 1.0e-9
@@ -174,6 +197,12 @@ def diversity_assessment(
     source_share_violation = (
         max(0.0, source_share - max_source_share)
         / max(1.0 - max_source_share, 1.0e-9)
+        if share_active
+        else 0.0
+    )
+    recording_share_violation = (
+        max(0.0, recording_share - max_recording_share)
+        / max(1.0 - max_recording_share, 1.0e-9)
         if share_active
         else 0.0
     )
@@ -200,6 +229,10 @@ def diversity_assessment(
             * source_share_violation
         )
         penalty += (
+            _env_float("BR_HPR_RECORDING_SHARE_WEIGHT", 0.80)
+            * recording_share_violation
+        )
+        penalty += (
             _env_float("BR_HPR_FAMILY_SHARE_WEIGHT", 0.65)
             * family_share_violation
         )
@@ -212,6 +245,10 @@ def diversity_assessment(
                 * max(0.0, source_share - max_source_share)
             )
             penalty += (
+                _env_float("V46_54_RECORDING_SHARE_WEIGHT", 2.0)
+                * max(0.0, recording_share - max_recording_share)
+            )
+            penalty += (
                 _env_float("V46_54_FAMILY_SHARE_WEIGHT", 1.2)
                 * max(0.0, family_share - max_family_share)
             )
@@ -219,6 +256,10 @@ def diversity_assessment(
     penalty += (
         _env_float("V46_54_SOURCE_REUSE_WEIGHT", 0.08)
         * source_counts[identity["source_uid"]]
+    )
+    penalty += (
+        _env_float("V46_54_RECORDING_REUSE_WEIGHT", 0.08)
+        * recording_counts[identity["recording_uid"]]
     )
     penalty += (
         _env_float("V46_54_FAMILY_REUSE_WEIGHT", 0.05)
@@ -236,12 +277,14 @@ def diversity_assessment(
         "event_repeat_gap": repeat_gap,
         "source_run_after": int(source_run_after),
         "source_share_after": float(source_share),
+        "recording_share_after": float(recording_share),
         "family_share_after": float(family_share),
         "probabilistic_preference_mode": bool(probabilistic),
         "preference_violations": {
             "event_repeat": float(repeat_violation),
             "source_run": float(source_run_violation),
             "source_share": float(source_share_violation),
+            "recording_share": float(recording_share_violation),
             "family_share": float(family_share_violation),
         },
     }

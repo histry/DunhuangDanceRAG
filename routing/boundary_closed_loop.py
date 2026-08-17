@@ -62,10 +62,9 @@ import os
 import random
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 # MOTION_ACTIVITY_INTEGRATION_BEGIN
@@ -78,9 +77,7 @@ from contracts.boundary_continuity import (
     boundary_risk_reasons,
     evaluate_boundary_continuity,
 )
-from contracts.gravity import fk24_np
 from motion_geometry.resampling import resample_edge151_np
-from motion_geometry.rotations import rot6d_to_matrix_np, so3_geodesic_np
 from contracts.physical_quality import (
     PhysicalQualityLimits,
     StageAcceptancePolicy,
@@ -89,6 +86,7 @@ from contracts.physical_quality import (
     run_stage_transaction,
 )
 from support.common import make_geodesic_transition
+from support.transition_quality import transition_risk as canonical_transition_risk
 from support.event_identity import (
     assert_same_event_db_contract,
     event_uids_from_generation_db,
@@ -112,8 +110,6 @@ ROOT_Y_IDX = 5
 ROOT_Z_IDX = 6
 ROT6D_START = 7
 ROT6D_END = 151
-NUM_JOINTS = 24
-DEFAULT_FOOT_JOINTS = (7, 8, 10, 11)
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -163,14 +159,6 @@ def save_json(obj: Any, path: str | Path) -> None:
 
 def import_v46():
     return importlib.import_module("training.motion_models")
-
-
-def import_v32_transition_risk():
-    try:
-        mod = importlib.import_module("support.transition_quality")
-        return mod.transition_risk
-    except Exception:
-        return None
 
 
 def _as_motion_array(x: Any) -> np.ndarray:
@@ -242,125 +230,33 @@ def fk_positions(v46, motion: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-def simple_boundary_risk(previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, float]:
-    ctx = np.concatenate([previous[-4:], transition, following[:4]], axis=0).astype(np.float32)
-    if len(ctx) < 4:
-        return {
-            "total": 1e9,
-            "boundary_joint_jerk_max": 1e9,
-            "entry_fk_jump": 1e9,
-            "exit_fk_jump": 1e9,
-            "entry_rotation_step_rad": 1e9,
-            "exit_rotation_step_rad": 1e9,
-            "foot_slip": 1e9,
-            "foot_penetration": 1e9,
-            "contact_switch": 1e9,
-        }
-    positions = fk24_np(ctx)
-    vel = np.diff(positions, axis=0) * fps
-    acc = np.diff(vel, axis=0) * fps
-    jerk = (
-        np.diff(acc, axis=0) * fps
-        if len(acc) > 1
-        else np.zeros((0, NUM_JOINTS, 3), dtype=np.float32)
-    )
-    boundary_jerk = float(np.max(np.linalg.norm(jerk, axis=-1))) if jerk.size else 0.0
-    left = min(4, len(previous[-4:]))
-    right = left + len(transition)
-    entry_step = left if 0 < left < len(ctx) else None
-    exit_step = right if 0 < right < len(ctx) else None
-
-    def fk_jump(step: Optional[int]) -> float:
-        if step is None:
-            return 1e9
-        delta = positions[step] - positions[step - 1]
-        return float(np.sqrt(np.mean(np.square(delta))))
-
-    rotations = rot6d_to_matrix_np(
-        ctx[:, ROT6D_START:ROT6D_END].reshape(len(ctx), NUM_JOINTS, 6)
-    )
-    rotation_step = so3_geodesic_np(rotations[:-1], rotations[1:])
-
-    def rotation_jump(step: Optional[int]) -> float:
-        if step is None or step - 1 >= len(rotation_step):
-            return 1e9
-        return float(np.max(rotation_step[step - 1]))
-
-    feet = positions[:, list(DEFAULT_FOOT_JOINTS)]
-    floor_y = float(np.percentile(feet[..., 1], 5))
-    foot_speed = np.zeros(feet.shape[:2], dtype=np.float32)
-    foot_speed[1:] = (
-        np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
-        * float(fps)
-    )
-    declared_contact = ctx[:, CONTACT] > 0.5
-    support = declared_contact | (feet[..., 1] <= floor_y + 0.055)
-    foot_slip = float(np.mean(foot_speed[support])) if np.any(support) else 0.0
-    penetration = np.maximum(floor_y - feet[..., 1] - 0.008, 0.0)
-    foot_penetration = float(np.mean(np.square(penetration)))
-    contact = transition[:, CONTACT] if len(transition) else np.zeros((0, 4), dtype=np.float32)
-    contact_switch = float(np.abs(np.diff(contact, axis=0)).mean()) if len(contact) > 1 else 0.0
-    entry_jump = fk_jump(entry_step)
-    exit_jump = fk_jump(exit_step)
-    entry_rotation = rotation_jump(entry_step)
-    exit_rotation = rotation_jump(exit_step)
-    total = (
-        0.002 * boundary_jerk
-        + 3.0 * (entry_jump + exit_jump)
-        + 2.0 * (entry_rotation + exit_rotation)
-        + 2.0 * foot_slip
-        + 0.25 * contact_switch
-    )
-    return {
-        "total": float(total),
-        "boundary_joint_jerk_max": float(boundary_jerk),
-        "entry_fk_jump": float(entry_jump),
-        "exit_fk_jump": float(exit_jump),
-        "entry_rotation_step_rad": float(entry_rotation),
-        "exit_rotation_step_rad": float(exit_rotation),
-        "foot_slip": float(foot_slip),
-        "foot_penetration": float(foot_penetration),
-        "contact_switch": float(contact_switch),
-    }
-
-
-def transition_risk(v46, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, float]:
+def transition_risk(v46, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, Any]:
+    """Evaluate one seam through the canonical transition-quality contract."""
+    del v46
     previous = np.asarray(previous, dtype=np.float32)
     transition = np.asarray(transition, dtype=np.float32)
     following = np.asarray(following, dtype=np.float32)
-
-    # V46.48: v32 transition_risk may return 1e9 sentinel values when the
-    # explicit bridge is empty, especially for a tiny terminal residual slot.
-    # An empty bridge is a direct join and should be evaluated as such.
-    if transition.shape[0] == 0:
-        return simple_boundary_risk(previous, transition, following, fps)
-
-    fn = import_v32_transition_risk()
-    if fn is not None:
-        try:
-            risk = dict(fn(previous, transition, following, fps=fps))
-            probe_keys = (
-                "total",
-                "boundary_joint_jerk_max",
-                "exit_fk_jump",
-                "exit_rotation_step_rad",
-                "foot_slip",
-                "foot_penetration",
-            )
-            values = [
-                float(risk.get(k, 0.0))
-                for k in probe_keys
-            ]
-            sentinel = any(
-                (not np.isfinite(v)) or abs(v) >= 1.0e8
-                for v in values
-            )
-            if not sentinel:
-                return risk
-        except Exception:
-            pass
-
-    return simple_boundary_risk(previous, transition, following, fps)
+    risk = dict(
+        canonical_transition_risk(
+            previous,
+            transition,
+            following,
+            fps=float(fps),
+        )
+    )
+    violations = boundary_risk_reasons(risk)
+    contract_failures = [
+        reason
+        for reason in violations
+        if reason.startswith("missing_or_nonfinite")
+        or reason.startswith("missing_or_invalid")
+    ]
+    if contract_failures:
+        # Search-time ranking must not treat missing/non-finite safety metrics
+        # as zeros.  The detailed reasons remain available to the final gate.
+        risk["total"] = max(float(risk.get("total", 0.0)), 1.0e9)
+        risk["contract_violations"] = contract_failures
+    return risk
 
 
 def risk_score(risk: Dict[str, Any]) -> float:
@@ -371,12 +267,18 @@ def risk_score(risk: Dict[str, Any]) -> float:
     fk = max(
         float(risk.get("entry_fk_jump", 0.0)),
         float(risk.get("exit_fk_jump", 0.0)),
+        float(risk.get("entry_fk_jump_max_m", 0.0)),
+        float(risk.get("exit_fk_jump_max_m", 0.0)),
     ) / max(env_float("V46_46_NORM_EXIT_FK_JUMP_M", 0.040), 1e-6)
     rot = max(
         float(risk.get("entry_rotation_step_rad", 0.0)),
         float(risk.get("exit_rotation_step_rad", 0.0)),
     ) / max(env_float("V46_46_NORM_EXIT_ROT_RAD", 0.12), 1e-6)
-    slip = float(risk.get("foot_slip", 0.0)) / max(env_float("V46_46_NORM_FOOT_SLIP_MPS", 0.22), 1e-6)
+    slip = max(
+        float(risk.get("foot_slip", 0.0)),
+        float(risk.get("foot_slip_p95", 0.0)),
+        float(risk.get("foot_slip_max", 0.0)),
+    ) / max(env_float("V46_46_NORM_FOOT_SLIP_MPS", 0.22), 1e-6)
     cs = float(risk.get("contact_switch", 0.0)) / max(env_float("V46_46_NORM_CONTACT_SWITCH", 0.45), 1e-6)
     total = float(risk.get("total", 0.0)) / max(env_float("V46_46_NORM_TOTAL", 1.0), 1e-6)
     return float(0.30 * total + 0.24 * bj + 0.22 * fk + 0.14 * rot + 0.07 * slip + 0.03 * cs)
@@ -920,10 +822,25 @@ def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str
             "actual_boundary_jerk": float(risk.get("boundary_joint_jerk_max", 0.0)),
             "actual_entry_fk_jump": float(risk.get("entry_fk_jump", 0.0)),
             "actual_exit_fk_jump": float(risk.get("exit_fk_jump", 0.0)),
+            "actual_entry_fk_jump_max_m": float(
+                risk.get("entry_fk_jump_max_m", 0.0)
+            ),
+            "actual_exit_fk_jump_max_m": float(
+                risk.get("exit_fk_jump_max_m", 0.0)
+            ),
             "actual_entry_rotation_step_rad": float(risk.get("entry_rotation_step_rad", 0.0)),
             "actual_exit_rotation_step_rad": float(risk.get("exit_rotation_step_rad", 0.0)),
             "actual_foot_slip": float(risk.get("foot_slip", 0.0)),
+            "actual_foot_slip_p95_mps": float(
+                risk.get("foot_slip_p95", 0.0)
+            ),
+            "actual_foot_slip_peak_mps": float(
+                risk.get("foot_slip_max", 0.0)
+            ),
             "actual_foot_penetration": float(risk.get("foot_penetration", 0.0)),
+            "actual_foot_penetration_depth_max_m": float(
+                risk.get("foot_penetration_max_m", 0.0)
+            ),
             "actual_contact_switch": float(risk.get("contact_switch", 0.0)),
             "safe": bool(safe),
             "risk": risk,
@@ -959,7 +876,9 @@ def write_audit_csv(rows: Sequence[Dict[str, Any]], path: str | Path) -> None:
         "transition_start", "transition_end", "transition_len", "content_start",
         "predicted_risk_score", "predicted_boundary_jerk", "predicted_entry_fk_jump", "predicted_exit_fk_jump",
         "actual_risk_score", "actual_boundary_jerk", "actual_entry_fk_jump", "actual_exit_fk_jump",
+        "actual_entry_fk_jump_max_m", "actual_exit_fk_jump_max_m",
         "actual_entry_rotation_step_rad", "actual_exit_rotation_step_rad", "actual_foot_slip", "actual_foot_penetration",
+        "actual_foot_slip_p95_mps", "actual_foot_slip_peak_mps", "actual_foot_penetration_depth_max_m",
         "actual_contact_switch", "core_warp", "safe", "decision",
         "predicted_boundary_jerk_mps3", "predicted_entry_fk_jump_m", "predicted_exit_fk_jump_m",
         "actual_boundary_jerk_mps3", "actual_entry_fk_jump_m", "actual_exit_fk_jump_m",
@@ -1242,6 +1161,9 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         max_single_source_ratio=env_float(
             "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
         ),
+        max_single_recording_ratio=env_float(
+            "V46_54_MAX_RECORDING_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+        ),
         min_unique_events=env_int(
             "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
         ),
@@ -1319,10 +1241,19 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     out = Path(args.out)
     if out.suffix.lower() != ".npy":
         raise ValueError(f"--out must end in .npy, got {out}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out, best_payload["motion"].astype(np.float32))
-    motion_ref_path = str(out.with_name(out.stem + ".motion_ref.npy"))
-    mask_path = str(out.with_name(out.stem + ".transition_mask.npy"))
+    artifact_out = (
+        out
+        if not required_failures
+        else out.with_name(out.stem + ".rejected.npy")
+    )
+    artifact_out.parent.mkdir(parents=True, exist_ok=True)
+    np.save(artifact_out, best_payload["motion"].astype(np.float32))
+    motion_ref_path = str(
+        artifact_out.with_name(artifact_out.stem + ".motion_ref.npy")
+    )
+    mask_path = str(
+        artifact_out.with_name(artifact_out.stem + ".transition_mask.npy")
+    )
     audit_csv_path = str(out.with_name(out.stem + ".boundary_audit.csv"))
     audit_json_path = str(out.with_name(out.stem + ".boundary_audit.json"))
     motion_activity_path = str(
@@ -1342,6 +1273,8 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "version": "v46_46_boundary_simulated_closed_loop_scheduler",
         "audio": args.audio,
         "db": args.db,
+        "motion_path": str(artifact_out),
+        "requested_motion_path": str(out),
         "fps": float(getattr(cfg, "fps", 30.0)),
         "event_db_contract": make_event_db_contract(db["event_uids"]),
         "config": dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else jsonable(cfg),
@@ -1388,13 +1321,21 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "actual_entry_fk_jump_p95_m": float(np.percentile([r.get("actual_entry_fk_jump_m", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_exit_fk_jump_p95_m": float(np.percentile([r.get("actual_exit_fk_jump_m", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_foot_slip_p95_mps": float(np.percentile([r.get("actual_foot_slip_mps", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "actual_entry_fk_joint_jump_max_m": float(max([r.get("actual_entry_fk_jump_max_m", 0.0) for r in best_payload["boundary_rows"]], default=0.0)),
+            "actual_exit_fk_joint_jump_max_m": float(max([r.get("actual_exit_fk_jump_max_m", 0.0) for r in best_payload["boundary_rows"]], default=0.0)),
+            "actual_supported_foot_slip_p95_max_mps": float(max([r.get("actual_foot_slip_p95_mps", 0.0) for r in best_payload["boundary_rows"]], default=0.0)),
+            "actual_supported_foot_slip_peak_max_mps": float(max([r.get("actual_foot_slip_peak_mps", 0.0) for r in best_payload["boundary_rows"]], default=0.0)),
+            "actual_foot_penetration_depth_max_m": float(max([r.get("actual_foot_penetration_depth_max_m", 0.0) for r in best_payload["boundary_rows"]], default=0.0)),
             "physical_units": {
                 "boundary_jerk": "m/s^3",
                 "entry_fk_jump": "m",
                 "exit_fk_jump": "m",
+                "entry_fk_joint_jump_max": "m",
+                "exit_fk_joint_jump_max": "m",
                 "exit_rotation_step": "rad/frame",
                 "foot_slip": "m/s",
                 "foot_penetration": "m^2_mean_squared_depth",
+                "foot_penetration_depth_max": "m",
             },
         },
         "final_audit": best_payload["stage_reports"].get("final_audit", {}),
@@ -1407,7 +1348,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     if args.render_output and not required_failures:
         render_if_possible(
             v46,
-            str(out),
+            str(artifact_out),
             args.audio,
             args.render_output,
             args.render_script,
@@ -1415,7 +1356,8 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         )
 
     print(json.dumps(jsonable({
-        "motion": str(out),
+        "motion": str(artifact_out),
+        "requested_motion": str(out),
         "motion_ref": motion_ref_path,
         "transition_mask": mask_path,
         "json": json_path,

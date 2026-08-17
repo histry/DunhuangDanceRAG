@@ -40,7 +40,6 @@ from grounding.manifold_ops import (
     sphere_project_torch,
 )
 from grounding.paired_data import _resample_sequence, validate_paired_payload
-from support.event_identity import event_uids_from_generation_db
 
 
 SCHEMA = "v46_53_mixed_curvature_gaussian_grounder_v1"

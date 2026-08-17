@@ -14,18 +14,16 @@ import json
 import math
 import pickle
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
 from motion_geometry.rotations import (
     angular_acceleration_np,
     angular_velocity_np,
-    matrix_to_rot6d_np,
     relative_rotvec_np,
     rot6d_to_matrix_np,
     so3_geodesic_np,
-    tangent_blend_np,
 )
 from motion_geometry.resampling import resample_edge151_np
 from motion_geometry.heading import root_yaw_np

@@ -21,13 +21,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import math
 import os
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -55,6 +53,7 @@ from contracts.gravity import (
     matrix_to_rot6d_np,
     rot6d_to_matrix_np,
 )
+from data_pipeline.chang_e_manifest import validate_source as validate_chang_e_source
 
 CONTACT = slice(0, 4)
 ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX = 4, 5, 6
@@ -113,6 +112,8 @@ class RetargetConfig:
     hard_gravity_gate: bool = True
     gravity_torso_p05_min: float = 0.45
     fit_rmse_p95_max_m: float = 0.18
+    source_manifest_path: str = ""
+    require_source_manifest: bool = False
     seed: int = 1234
 
     @classmethod
@@ -164,6 +165,10 @@ class RetargetConfig:
             fit_rmse_p95_max_m=f(
                 "V46_49_FIT_RMSE_P95_MAX_M", 0.18
             ),
+            source_manifest_path=str(
+                os.environ.get("CHANG_E_SOURCE_MANIFEST", "")
+            ).strip(),
+            require_source_manifest=b("CHANG_E_REQUIRE_SOURCE_MANIFEST", False),
             seed=i("V46_49_SEED", 1234),
         )
 
@@ -544,6 +549,108 @@ def build_joint_mapping(joints: Sequence[BVHJoint]) -> Dict[int, int]:
             f"names={[j.name for j in joints]}; mapping={mapping}"
         )
     return mapping
+
+
+def load_bvh_as_edge151(
+    path: str | Path,
+    *,
+    source_manifest_path: str | Path | None = None,
+    require_source_manifest: bool = False,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Load a BVH through the canonical parser into a direct EDGE151 adapter.
+
+    Formal experiments should use optimisation retargeting.  This lightweight
+    adapter remains useful for diagnostics and raw Event-DB tooling, but it now
+    shares parsing, Euler order, joint mapping and manifest timebase resolution
+    with the formal retargeter instead of maintaining a second BVH parser.
+    """
+
+    bvh = parse_bvh(path)
+    timebase = validate_chang_e_source(
+        path,
+        path=source_manifest_path,
+        required=bool(require_source_manifest),
+        verify_hash=bool(require_source_manifest),
+    )
+    global_pos, global_rot = source_fk(bvh, use_motion=True)
+    local_rot = np.empty_like(global_rot)
+    for joint_index, joint in enumerate(bvh.joints):
+        if joint.parent < 0:
+            local_rot[:, joint_index] = global_rot[:, joint_index]
+        else:
+            local_rot[:, joint_index] = (
+                np.swapaxes(global_rot[:, joint.parent], -1, -2)
+                @ global_rot[:, joint_index]
+            )
+
+    root_xyz = np.asarray(global_pos[:, 0], dtype=np.float32).copy()
+    root_abs_p95 = float(
+        np.nanpercentile(np.linalg.norm(root_xyz, axis=1), 95)
+    ) if root_xyz.size else 0.0
+    root_xz_travel_p95 = float(
+        np.nanpercentile(
+            np.linalg.norm(root_xyz[:, [0, 2]] - root_xyz[:1, [0, 2]], axis=1),
+            95,
+        )
+    ) if root_xyz.size else 0.0
+    scale_mode = str(os.environ.get("V46_BVH_ROOT_SCALE_MODE", "auto")).strip().lower()
+    if scale_mode in {"none", "meter", "meters", "1", "1.0"}:
+        root_scale = 1.0
+    elif scale_mode in {"cm", "centimeter", "centimeters", "0.01"}:
+        root_scale = 0.01
+    else:
+        root_scale = 0.01 if (
+            root_abs_p95 > 20.0 or root_xz_travel_p95 > 20.0
+        ) else 1.0
+    root_xyz *= float(root_scale)
+
+    root_mode = str(
+        os.environ.get(
+            "V46_47_BVH_ROOT_ROT_MODE",
+            os.environ.get("V46_45_BVH_ROOT_ROT_MODE", "raw"),
+        )
+    ).strip().lower()
+    if root_mode in {"identity", "upright", "zero", "none"}:
+        local_rot[:, 0] = np.eye(3, dtype=np.float32)
+    elif root_mode in {"yaw", "yaw_only", "yaw-only"}:
+        forward = local_rot[:, 0, :, 2]
+        yaw = np.arctan2(forward[:, 0], forward[:, 2]).astype(np.float32)
+        c, s = np.cos(yaw), np.sin(yaw)
+        yaw_matrix = np.zeros_like(local_rot[:, 0])
+        yaw_matrix[:, 0, 0] = c
+        yaw_matrix[:, 0, 2] = s
+        yaw_matrix[:, 1, 1] = 1.0
+        yaw_matrix[:, 2, 0] = -s
+        yaw_matrix[:, 2, 2] = c
+        local_rot[:, 0] = yaw_matrix
+    elif root_mode not in {"raw", "full", "original"}:
+        raise ValueError(f"Unsupported V46_47_BVH_ROOT_ROT_MODE={root_mode!r}")
+
+    mapping = build_joint_mapping(bvh.joints)
+    target_local = np.tile(
+        np.eye(3, dtype=np.float32),
+        (len(bvh.values), NUM_JOINTS, 1, 1),
+    )
+    for target_index, source_index in mapping.items():
+        target_local[:, target_index] = local_rot[:, source_index]
+
+    motion = np.zeros((len(bvh.values), EDGE_DIM), dtype=np.float32)
+    motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root_xyz
+    motion[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(target_local).reshape(
+        len(bvh.values), -1
+    )
+    # Raw-loader-only metadata.  The Event-DB contract reconstructs contacts
+    # from FK and clears these channels before persistence.
+    motion[:, 0] = float(timebase["effective_fps"])
+    motion[:, 1] = float(root_scale)
+    return motion, {
+        "schema": "chang_e_direct_edge151_adapter_v2",
+        "source": str(Path(path).resolve()),
+        "timebase": timebase,
+        "root_scale": float(root_scale),
+        "root_rotation_mode": root_mode,
+        "mapping": {str(key): int(value) for key, value in mapping.items()},
+    }
 
 
 def similarity_umeyama(X: np.ndarray, Y: np.ndarray, weights: Optional[np.ndarray] = None):
@@ -1156,6 +1263,13 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
     torch.manual_seed(cfg.seed)
 
     bvh = parse_bvh(path)
+    source_timebase = validate_chang_e_source(
+        path,
+        path=cfg.source_manifest_path or None,
+        required=bool(cfg.require_source_manifest),
+        verify_hash=bool(cfg.require_source_manifest),
+    )
+    source_fps = float(source_timebase["effective_fps"])
     native_pos, _ = source_fk(bvh, use_motion=True)
     rest_pos, _ = source_fk(
         BVHMotion(bvh.path, bvh.joints, np.zeros_like(bvh.values), bvh.frame_time),
@@ -1178,7 +1292,7 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
     scale, basis_R, trans = similarity_umeyama(X, Y, W)
 
     aligned = apply_similarity(native_pos, scale, basis_R, trans)
-    aligned = resample_global_positions(aligned, bvh.fps, cfg.target_fps)
+    aligned = resample_global_positions(aligned, source_fps, cfg.target_fps)
     aligned, heading_report = stabilize_source_heading_positions(
         aligned,
         mapping,
@@ -1201,7 +1315,9 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
     report = {
         "version": "v46_49_optimization_keypoint_retarget",
         "source": str(path),
-        "source_fps": float(bvh.fps),
+        "source_fps": float(source_fps),
+        "declared_source_fps": float(bvh.fps),
+        "source_timebase": source_timebase,
         "target_fps": float(cfg.target_fps),
         "source_frames": int(len(bvh.values)),
         "target_frames": int(len(motion)),

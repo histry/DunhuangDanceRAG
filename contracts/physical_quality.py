@@ -22,6 +22,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from contracts.gravity import fk24_np
+from motion_geometry.physical import PHYSICAL_METRICS_SCHEMA
 from motion_geometry.smpl24 import NUM_JOINTS, PARENTS
 
 
@@ -54,14 +55,6 @@ def _env_bool(primary: str, fallback: Optional[str], default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _metric(audit: Mapping[str, Any], key: str, default: float) -> float:
-    try:
-        value = float(audit.get(key, default))
-    except (TypeError, ValueError):
-        return float(default)
-    return value if np.isfinite(value) else float(default)
-
-
 @dataclass(frozen=True)
 class PhysicalQualityLimits:
     """Absolute whole-motion limits in SI units."""
@@ -85,6 +78,18 @@ class PhysicalQualityLimits:
     root_horizontal_net_displacement_m: float = 3.00
     root_horizontal_drift_speed_mps: float = 0.12
     root_horizontal_window_displacement_max_m: float = 1.50
+    rot6d_nonfinite_ratio: float = 0.0
+    rot6d_degenerate_ratio: float = 0.0
+    rot6d_collinearity_abs_p99: float = 0.995
+    rotation_near_pi_step_ratio: float = 0.0
+    joint_rotation_step_rad_p95: float = 0.35
+    joint_rotation_step_rad_max: float = 1.20
+    joint_rotation_step_window_p95_max_rad: float = 0.50
+    extremity_rotation_step_rad_p95: float = 0.45
+    extremity_rotation_step_rad_max: float = 1.40
+    joint_angular_acceleration_rps2_p95: float = 900.0
+    joint_angular_acceleration_rps2_max: float = 3000.0
+    joint_angular_acceleration_window_p95_max_rps2: float = 1600.0
 
     @classmethod
     def from_environment(cls) -> "PhysicalQualityLimits":
@@ -184,6 +189,44 @@ class PhysicalQualityLimits:
                 "V46_54_MAX_ROOT_XZ_WINDOW_DISPLACEMENT_M",
                 1.50,
             ),
+            rot6d_nonfinite_ratio=_env_float(
+                "PHYSICAL_MAX_ROT6D_NONFINITE_RATIO", None, 0.0
+            ),
+            rot6d_degenerate_ratio=_env_float(
+                "PHYSICAL_MAX_ROT6D_DEGENERATE_RATIO", None, 0.0
+            ),
+            rot6d_collinearity_abs_p99=_env_float(
+                "PHYSICAL_MAX_ROT6D_COLLINEARITY_P99", None, 0.995
+            ),
+            rotation_near_pi_step_ratio=_env_float(
+                "PHYSICAL_MAX_ROTATION_NEAR_PI_STEP_RATIO", None, 0.0
+            ),
+            joint_rotation_step_rad_p95=_env_float(
+                "PHYSICAL_MAX_JOINT_ROTATION_STEP_P95_RAD", None, 0.35
+            ),
+            joint_rotation_step_rad_max=_env_float(
+                "PHYSICAL_MAX_JOINT_ROTATION_STEP_MAX_RAD", None, 1.20
+            ),
+            joint_rotation_step_window_p95_max_rad=_env_float(
+                "PHYSICAL_MAX_JOINT_ROTATION_STEP_WINDOW_P95_RAD", None, 0.50
+            ),
+            extremity_rotation_step_rad_p95=_env_float(
+                "PHYSICAL_MAX_EXTREMITY_ROTATION_STEP_P95_RAD", None, 0.45
+            ),
+            extremity_rotation_step_rad_max=_env_float(
+                "PHYSICAL_MAX_EXTREMITY_ROTATION_STEP_MAX_RAD", None, 1.40
+            ),
+            joint_angular_acceleration_rps2_p95=_env_float(
+                "PHYSICAL_MAX_JOINT_ANGULAR_ACCEL_P95_RPS2", None, 900.0
+            ),
+            joint_angular_acceleration_rps2_max=_env_float(
+                "PHYSICAL_MAX_JOINT_ANGULAR_ACCEL_MAX_RPS2", None, 3000.0
+            ),
+            joint_angular_acceleration_window_p95_max_rps2=_env_float(
+                "PHYSICAL_MAX_JOINT_ANGULAR_ACCEL_WINDOW_P95_RPS2",
+                None,
+                1600.0,
+            ),
         )
 
     def as_audit_limits(self) -> Dict[str, float]:
@@ -217,6 +260,38 @@ class PhysicalQualityLimits:
             "root_horizontal_window_displacement_max_m": float(
                 self.root_horizontal_window_displacement_max_m
             ),
+            "rot6d_nonfinite_ratio": float(self.rot6d_nonfinite_ratio),
+            "rot6d_degenerate_ratio": float(self.rot6d_degenerate_ratio),
+            "rot6d_collinearity_abs_p99": float(
+                self.rot6d_collinearity_abs_p99
+            ),
+            "rotation_near_pi_step_ratio": float(
+                self.rotation_near_pi_step_ratio
+            ),
+            "joint_rotation_step_rad_p95": float(
+                self.joint_rotation_step_rad_p95
+            ),
+            "joint_rotation_step_rad_max": float(
+                self.joint_rotation_step_rad_max
+            ),
+            "joint_rotation_step_window_p95_max_rad": float(
+                self.joint_rotation_step_window_p95_max_rad
+            ),
+            "extremity_rotation_step_rad_p95": float(
+                self.extremity_rotation_step_rad_p95
+            ),
+            "extremity_rotation_step_rad_max": float(
+                self.extremity_rotation_step_rad_max
+            ),
+            "joint_angular_acceleration_rps2_p95": float(
+                self.joint_angular_acceleration_rps2_p95
+            ),
+            "joint_angular_acceleration_rps2_max": float(
+                self.joint_angular_acceleration_rps2_max
+            ),
+            "joint_angular_acceleration_window_p95_max_rps2": float(
+                self.joint_angular_acceleration_window_p95_max_rps2
+            ),
         }
 
     def to_dict(self) -> Dict[str, float]:
@@ -241,6 +316,13 @@ class StageAcceptancePolicy:
     root_vertical_speed_ratio: float = 1.10
     root_vertical_speed_p95_margin_mps: float = 0.05
     root_vertical_speed_max_margin_mps: float = 0.10
+    secondary_metric_ratio: float = 1.10
+    root_drift_ratio: float = 1.10
+    root_drift_margin_m: float = 0.02
+    rotation_step_ratio: float = 1.10
+    rotation_step_margin_rad: float = 0.02
+    angular_acceleration_ratio: float = 1.10
+    angular_acceleration_margin_rps2: float = 25.0
     minimum_repair_gain: float = 0.03
 
     @classmethod
@@ -288,10 +370,117 @@ class StageAcceptancePolicy:
             root_vertical_speed_max_margin_mps=_env_float(
                 "PHYSICAL_STAGE_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.10
             ),
+            secondary_metric_ratio=_env_float(
+                "PHYSICAL_STAGE_SECONDARY_RATIO", None, 1.10
+            ),
+            root_drift_ratio=_env_float(
+                "PHYSICAL_STAGE_ROOT_DRIFT_RATIO", None, 1.10
+            ),
+            root_drift_margin_m=_env_float(
+                "PHYSICAL_STAGE_ROOT_DRIFT_MARGIN_M", None, 0.02
+            ),
+            rotation_step_ratio=_env_float(
+                "PHYSICAL_STAGE_ROTATION_STEP_RATIO", None, 1.10
+            ),
+            rotation_step_margin_rad=_env_float(
+                "PHYSICAL_STAGE_ROTATION_STEP_MARGIN_RAD", None, 0.02
+            ),
+            angular_acceleration_ratio=_env_float(
+                "PHYSICAL_STAGE_ANGULAR_ACCEL_RATIO", None, 1.10
+            ),
+            angular_acceleration_margin_rps2=_env_float(
+                "PHYSICAL_STAGE_ANGULAR_ACCEL_MARGIN_RPS2", None, 25.0
+            ),
             minimum_repair_gain=_env_float(
                 "PHYSICAL_STAGE_MINIMUM_REPAIR_GAIN", None, 0.03
             ),
         )
+
+
+@dataclass(frozen=True)
+class PhysicalMetricSpec:
+    """One required metric shared by final and stage acceptance."""
+
+    key: str
+    layer: str
+    direction: str
+    absolute_limit: float
+    stage_ratio: float
+    stage_margin: float
+    regression_reason: str
+
+
+def physical_metric_specs(
+    limits: PhysicalQualityLimits,
+    policy: Optional[StageAcceptancePolicy] = None,
+) -> Tuple[PhysicalMetricSpec, ...]:
+    """Return the single metric registry used by every physical gate."""
+
+    pol = policy or StageAcceptancePolicy.from_environment()
+
+    def high(
+        key: str,
+        layer: str,
+        limit: float,
+        ratio: float,
+        margin: float,
+        reason: Optional[str] = None,
+    ) -> PhysicalMetricSpec:
+        return PhysicalMetricSpec(
+            key,
+            layer,
+            "high",
+            float(limit),
+            float(ratio),
+            float(margin),
+            reason or f"{key}_regressed",
+        )
+
+    return (
+        high("joint_jerk_mps3_p95", "anti_jitter", limits.joint_jerk_mps3_p95, pol.jerk_p95_ratio, pol.jerk_p95_margin_mps3, "joint_jerk_p95_regressed"),
+        high("joint_jerk_mps3_max", "anti_jitter", limits.joint_jerk_mps3_max, pol.jerk_max_ratio, pol.jerk_max_margin_mps3, "joint_jerk_max_regressed"),
+        high("joint_jerk_window_p95_max_mps3", "anti_jitter", limits.joint_jerk_window_p95_max_mps3, pol.jerk_p95_ratio, pol.jerk_p95_margin_mps3),
+        high("extremity_jerk_mps3_p95", "anti_jitter", limits.extremity_jerk_mps3_p95, pol.jerk_p95_ratio, pol.jerk_p95_margin_mps3),
+        high("extremity_jerk_window_p95_max_mps3", "anti_jitter", limits.extremity_jerk_window_p95_max_mps3, pol.jerk_p95_ratio, pol.jerk_p95_margin_mps3),
+        high("foot_skate_mps_p95", "foot_contact", limits.foot_skate_mps_p95, pol.skate_p95_ratio, pol.skate_p95_margin_mps, "foot_skate_p95_regressed"),
+        high("foot_skate_mps_max", "foot_contact", limits.foot_skate_mps_max, pol.skate_max_ratio, pol.skate_max_margin_mps, "foot_skate_max_regressed"),
+        high("foot_support_drift_m_p95", "foot_contact", limits.foot_support_drift_m_p95, pol.skate_p95_ratio, pol.skate_p95_margin_mps),
+        high("foot_support_drift_m_max", "foot_contact", limits.foot_support_drift_m_max, pol.skate_max_ratio, pol.skate_max_margin_mps),
+        high("foot_contact_height_m_max", "foot_contact", limits.foot_contact_height_m_max, pol.secondary_metric_ratio, 0.01),
+        PhysicalMetricSpec("foot_penetration_min_m", "foot_contact", "low", limits.foot_penetration_min_m, 1.0, pol.penetration_margin_m, "foot_penetration_regressed"),
+        high("root_y_robust_range_m", "root_vertical", limits.root_y_robust_range_m, pol.root_range_ratio, pol.root_range_margin_m),
+        high("root_vertical_speed_mps_p95", "root_vertical", limits.root_vertical_speed_mps_p95, pol.root_vertical_speed_ratio, pol.root_vertical_speed_p95_margin_mps),
+        high("root_vertical_speed_mps_max", "root_vertical", limits.root_vertical_speed_mps_max, pol.root_vertical_speed_ratio, pol.root_vertical_speed_max_margin_mps),
+        high("root_horizontal_radius_p95_m", "long_horizon_root_drift", limits.root_horizontal_radius_p95_m, pol.root_drift_ratio, pol.root_drift_margin_m),
+        high("root_horizontal_radius_max_m", "long_horizon_root_drift", limits.root_horizontal_radius_max_m, pol.root_drift_ratio, pol.root_drift_margin_m),
+        high("root_horizontal_net_displacement_m", "long_horizon_root_drift", limits.root_horizontal_net_displacement_m, pol.root_drift_ratio, pol.root_drift_margin_m),
+        high("root_horizontal_drift_speed_mps", "long_horizon_root_drift", limits.root_horizontal_drift_speed_mps, pol.root_drift_ratio, 0.01),
+        high("root_horizontal_window_displacement_max_m", "long_horizon_root_drift", limits.root_horizontal_window_displacement_max_m, pol.root_drift_ratio, pol.root_drift_margin_m),
+        high("rot6d_nonfinite_ratio", "rotation_quality", limits.rot6d_nonfinite_ratio, 1.0, 0.0),
+        high("rot6d_degenerate_ratio", "rotation_quality", limits.rot6d_degenerate_ratio, 1.0, 0.0),
+        high("rot6d_collinearity_abs_p99", "rotation_quality", limits.rot6d_collinearity_abs_p99, pol.secondary_metric_ratio, 0.01),
+        high("rotation_near_pi_step_ratio", "rotation_quality", limits.rotation_near_pi_step_ratio, 1.0, 0.0),
+        high("joint_rotation_step_rad_p95", "rotation_quality", limits.joint_rotation_step_rad_p95, pol.rotation_step_ratio, pol.rotation_step_margin_rad),
+        high("joint_rotation_step_rad_max", "rotation_quality", limits.joint_rotation_step_rad_max, pol.rotation_step_ratio, pol.rotation_step_margin_rad),
+        high("joint_rotation_step_window_p95_max_rad", "rotation_quality", limits.joint_rotation_step_window_p95_max_rad, pol.rotation_step_ratio, pol.rotation_step_margin_rad),
+        high("extremity_rotation_step_rad_p95", "rotation_quality", limits.extremity_rotation_step_rad_p95, pol.rotation_step_ratio, pol.rotation_step_margin_rad),
+        high("extremity_rotation_step_rad_max", "rotation_quality", limits.extremity_rotation_step_rad_max, pol.rotation_step_ratio, pol.rotation_step_margin_rad),
+        high("joint_angular_acceleration_rps2_p95", "rotation_quality", limits.joint_angular_acceleration_rps2_p95, pol.angular_acceleration_ratio, pol.angular_acceleration_margin_rps2),
+        high("joint_angular_acceleration_rps2_max", "rotation_quality", limits.joint_angular_acceleration_rps2_max, pol.angular_acceleration_ratio, pol.angular_acceleration_margin_rps2),
+        high("joint_angular_acceleration_window_p95_max_rps2", "rotation_quality", limits.joint_angular_acceleration_window_p95_max_rps2, pol.angular_acceleration_ratio, pol.angular_acceleration_margin_rps2),
+    )
+
+
+def _required_metric(
+    audit: Mapping[str, Any], key: str
+) -> Tuple[bool, float]:
+    if key not in audit:
+        return False, float("nan")
+    try:
+        value = float(audit[key])
+    except (TypeError, ValueError):
+        return False, float("nan")
+    return bool(np.isfinite(value)), value
 
 
 @dataclass(frozen=True)
@@ -393,75 +582,41 @@ def evaluate_physical_audit(
     lim = limits or PhysicalQualityLimits.from_environment()
     limit_map = lim.as_audit_limits()
     layer_reasons: Dict[str, list[str]] = {
+        "contract": [],
         "anti_jitter": [],
         "foot_contact": [],
         "root_vertical": [],
         "long_horizon_root_drift": [],
+        "rotation_quality": [],
     }
 
-    def reject_high(layer: str, keys: Sequence[str]) -> None:
-        for key in keys:
-            if _metric(audit, key, float("inf")) > limit_map[key]:
-                layer_reasons[layer].append(f"{key}_too_high")
+    schema = str(audit.get("schema", ""))
+    if schema != PHYSICAL_METRICS_SCHEMA:
+        layer_reasons["contract"].append(
+            f"missing_or_invalid_schema:{schema or 'missing'}"
+        )
 
-    reject_high(
-        "anti_jitter",
-        (
-            "joint_jerk_mps3_p95",
-            "joint_jerk_mps3_max",
-            "joint_jerk_window_p95_max_mps3",
-            "extremity_jerk_mps3_p95",
-            "extremity_jerk_window_p95_max_mps3",
-        ),
-    )
-    reject_high(
-        "foot_contact",
-        (
-            "foot_skate_mps_p95",
-            "foot_skate_mps_max",
-            "foot_support_drift_m_p95",
-            "foot_support_drift_m_max",
-            "foot_contact_height_m_max",
-        ),
-    )
-    reject_high(
-        "long_horizon_root_drift",
-        (
-            "root_horizontal_radius_p95_m",
-            "root_horizontal_radius_max_m",
-            "root_horizontal_net_displacement_m",
-            "root_horizontal_drift_speed_mps",
-            "root_horizontal_window_displacement_max_m",
-        ),
-    )
-
-    robust_root_range = _metric(
-        audit,
-        "root_y_robust_range_m",
-        _metric(audit, "root_y_range_m", float("inf")),
-    )
-    if robust_root_range > limit_map["root_y_robust_range_m"]:
-        layer_reasons["root_vertical"].append("root_y_robust_range_m_too_high")
-
-    for key in (
-        "root_vertical_speed_mps_p95",
-        "root_vertical_speed_mps_max",
-    ):
-        if key in audit and _metric(audit, key, float("inf")) > limit_map[key]:
-            layer_reasons["root_vertical"].append(f"{key}_too_high")
-
-    if _metric(audit, "foot_penetration_min_m", float("-inf")) < limit_map[
-        "foot_penetration_min_m"
-    ]:
-        layer_reasons["foot_contact"].append("foot_penetration_too_low")
+    for spec in physical_metric_specs(lim):
+        finite, value = _required_metric(audit, spec.key)
+        if not finite:
+            layer_reasons[spec.layer].append(
+                f"missing_or_nonfinite:{spec.key}"
+            )
+            continue
+        if spec.direction == "high" and value > spec.absolute_limit:
+            layer_reasons[spec.layer].append(f"{spec.key}_too_high")
+        elif spec.direction == "low" and value < spec.absolute_limit:
+            layer_reasons[spec.layer].append(f"{spec.key}_too_low")
 
     reasons = [
         reason
         for layer in (
+            "contract",
             "anti_jitter",
             "foot_contact",
             "root_vertical",
             "long_horizon_root_drift",
+            "rotation_quality",
         )
         for reason in layer_reasons[layer]
     ]
@@ -486,7 +641,22 @@ def _allowed_after_stage(
 ) -> float:
     if before <= absolute_limit:
         return min(absolute_limit, before * ratio + margin)
-    return before * ratio
+    # A stage may incrementally repair an already-invalid input, but it must
+    # never make that metric worse.  The previous `before * ratio` branch
+    # silently allowed up to 10% additional degradation on a failing baseline.
+    return before
+
+
+def _minimum_after_stage(
+    before: float,
+    absolute_limit: float,
+    margin: float,
+) -> float:
+    if before >= absolute_limit:
+        return max(absolute_limit, before - margin)
+    # Symmetric fail-safe rule for lower-bounded metrics such as penetration:
+    # incremental improvement is valid, further degradation is not.
+    return before
 
 
 def evaluate_stage_candidate(
@@ -504,93 +674,58 @@ def evaluate_stage_candidate(
     reasons = []
     detail: Dict[str, float] = {}
 
-    metric_specs = (
-        (
-            "joint_jerk_mps3_max",
-            lim.joint_jerk_mps3_max,
-            pol.jerk_max_ratio,
-            pol.jerk_max_margin_mps3,
-            "joint_jerk_max_regressed",
-        ),
-        (
-            "joint_jerk_mps3_p95",
-            lim.joint_jerk_mps3_p95,
-            pol.jerk_p95_ratio,
-            pol.jerk_p95_margin_mps3,
-            "joint_jerk_p95_regressed",
-        ),
-        (
-            "foot_skate_mps_p95",
-            lim.foot_skate_mps_p95,
-            pol.skate_p95_ratio,
-            pol.skate_p95_margin_mps,
-            "foot_skate_p95_regressed",
-        ),
-        (
-            "foot_skate_mps_max",
-            lim.foot_skate_mps_max,
-            pol.skate_max_ratio,
-            pol.skate_max_margin_mps,
-            "foot_skate_max_regressed",
-        ),
-        (
-            "root_y_robust_range_m",
-            lim.root_y_robust_range_m,
-            pol.root_range_ratio,
-            pol.root_range_margin_m,
-            "root_y_robust_range_regressed",
-        ),
-        (
-            "root_vertical_speed_mps_p95",
-            lim.root_vertical_speed_mps_p95,
-            pol.root_vertical_speed_ratio,
-            pol.root_vertical_speed_p95_margin_mps,
-            "root_vertical_speed_p95_regressed",
-        ),
-        (
-            "root_vertical_speed_mps_max",
-            lim.root_vertical_speed_mps_max,
-            pol.root_vertical_speed_ratio,
-            pol.root_vertical_speed_max_margin_mps,
-            "root_vertical_speed_max_regressed",
-        ),
-    )
-
-    for key, absolute_limit, ratio, margin, regression_reason in metric_specs:
-        before = _metric(before_audit, key, float("inf"))
-        after = _metric(candidate_audit, key, float("inf"))
-        allowed = _allowed_after_stage(before, absolute_limit, ratio, margin)
-        detail[f"before_{key}"] = before
-        detail[f"candidate_{key}"] = after
-        detail[f"allowed_{key}"] = allowed
-
-        if after > allowed:
-            reasons.append(regression_reason)
-        if before <= absolute_limit and after > absolute_limit:
-            reasons.append(f"absolute_{key}")
-
-    before_penetration = _metric(
-        before_audit, "foot_penetration_min_m", float("-inf")
-    )
-    after_penetration = _metric(
-        candidate_audit, "foot_penetration_min_m", float("-inf")
-    )
-    detail["before_foot_penetration_min_m"] = before_penetration
-    detail["candidate_foot_penetration_min_m"] = after_penetration
-    detail["allowed_foot_penetration_min_m"] = max(
-        lim.foot_penetration_min_m,
-        before_penetration - pol.penetration_margin_m,
-    )
-    if after_penetration < detail["allowed_foot_penetration_min_m"]:
-        reasons.append("foot_penetration_regressed")
-    if before_penetration >= lim.foot_penetration_min_m and (
-        after_penetration < lim.foot_penetration_min_m
+    for label, audit in (
+        ("before", before_audit),
+        ("candidate", candidate_audit),
     ):
-        reasons.append("absolute_foot_penetration")
+        schema = str(audit.get("schema", ""))
+        if schema != PHYSICAL_METRICS_SCHEMA:
+            reasons.append(f"{label}_missing_or_invalid_schema")
 
-    before_jerk_max = detail["before_joint_jerk_mps3_max"]
-    after_jerk_max = detail["candidate_joint_jerk_mps3_max"]
-    if require_repair_gain and before_jerk_max > lim.joint_jerk_mps3_max:
+    for spec in physical_metric_specs(lim, pol):
+        before_finite, before = _required_metric(before_audit, spec.key)
+        after_finite, after = _required_metric(candidate_audit, spec.key)
+        detail[f"before_{spec.key}"] = before
+        detail[f"candidate_{spec.key}"] = after
+        if not before_finite:
+            reasons.append(f"before_missing_or_nonfinite:{spec.key}")
+        if not after_finite:
+            reasons.append(f"candidate_missing_or_nonfinite:{spec.key}")
+        if not before_finite or not after_finite:
+            continue
+
+        if spec.direction == "high":
+            allowed = _allowed_after_stage(
+                before,
+                spec.absolute_limit,
+                spec.stage_ratio,
+                spec.stage_margin,
+            )
+            detail[f"allowed_{spec.key}"] = allowed
+            if after > allowed:
+                reasons.append(spec.regression_reason)
+            if before <= spec.absolute_limit and after > spec.absolute_limit:
+                reasons.append(f"absolute_{spec.key}")
+        else:
+            allowed = _minimum_after_stage(
+                before,
+                spec.absolute_limit,
+                spec.stage_margin,
+            )
+            detail[f"allowed_{spec.key}"] = allowed
+            if after < allowed:
+                reasons.append(spec.regression_reason)
+            if before >= spec.absolute_limit and after < spec.absolute_limit:
+                reasons.append(f"absolute_{spec.key}")
+
+    before_jerk_max = detail.get("before_joint_jerk_mps3_max", float("nan"))
+    after_jerk_max = detail.get("candidate_joint_jerk_mps3_max", float("nan"))
+    if (
+        require_repair_gain
+        and np.isfinite(before_jerk_max)
+        and np.isfinite(after_jerk_max)
+        and before_jerk_max > lim.joint_jerk_mps3_max
+    ):
         repair_gain = (before_jerk_max - after_jerk_max) / max(
             abs(before_jerk_max), 1.0e-8
         )
@@ -608,6 +743,58 @@ def evaluate_stage_candidate(
         "limits": lim.as_audit_limits(),
         "policy": asdict(pol),
         "require_repair_gain": bool(require_repair_gain),
+    }
+
+
+def select_physical_candidate(
+    *,
+    stage_name: str,
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    audit_fn: Any,
+    limits: Optional[PhysicalQualityLimits] = None,
+    rollback_enabled: bool = True,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Audit an already-built candidate and apply one shared fallback policy."""
+
+    baseline = np.asarray(reference, dtype=np.float32)
+    proposal = np.asarray(candidate, dtype=np.float32)
+    if proposal.shape != baseline.shape:
+        raise ValueError(
+            f"{stage_name} candidate shape {proposal.shape} != {baseline.shape}"
+        )
+    if not np.isfinite(proposal).all():
+        raise ValueError(f"{stage_name} candidate contains NaN or Inf")
+
+    candidate_audit = dict(audit_fn(proposal))
+    candidate_gate = evaluate_physical_audit(candidate_audit, limits=limits)
+    selected = proposal
+    selected_audit = candidate_audit
+    selected_gate = candidate_gate
+    reference_audit: Optional[Dict[str, Any]] = None
+    reference_gate: Optional[Dict[str, Any]] = None
+    rolled_back = False
+
+    if rollback_enabled and not bool(candidate_gate["ok"]):
+        reference_audit = dict(audit_fn(baseline))
+        reference_gate = evaluate_physical_audit(reference_audit, limits=limits)
+        if bool(reference_gate["ok"]):
+            selected = baseline.copy()
+            selected_audit = reference_audit
+            selected_gate = reference_gate
+            rolled_back = True
+
+    return selected.astype(np.float32), {
+        "stage": str(stage_name),
+        "enabled": bool(rollback_enabled),
+        "accepted": bool(candidate_gate["ok"]),
+        "rolled_back": bool(rolled_back),
+        "candidate_audit": candidate_audit,
+        "candidate_gate": candidate_gate,
+        "reference_audit": reference_audit,
+        "reference_gate": reference_gate,
+        "selected_audit": selected_audit,
+        "selected_gate": selected_gate,
     }
 
 

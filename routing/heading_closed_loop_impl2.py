@@ -38,9 +38,12 @@ from contracts.anatomy import (
     env_float,
     env_int,
     evaluate_anatomy_contract,
-    event_anatomy_features,
     frame_anomaly_score_np,
     transition_anatomy_risk,
+)
+from contracts.physical_quality import (
+    PhysicalQualityLimits,
+    select_physical_candidate,
 )
 from routing.anatomy_feature_cache import evaluate_candidate_anatomy
 from support.motion_geometry import (
@@ -396,22 +399,16 @@ def _apply_generators_v52(v46: Any, motion_ref: np.ndarray, cond: np.ndarray, se
         )
     # The anatomy rollback can replace frames after V46.50's audit.  Always
     # audit the exact array returned downstream, including full rollbacks.
-    selected_audit = dict(v46.audit_motion_np(motion, cfg))
-    selected_gate = base.physical_quality_gate(selected_audit)
-    physical_rollback = {
-        "enabled": env_bool("V46_54_FINAL_PHYSICAL_ROLLBACK", True),
-        "rolled_back": False,
-        "candidate_gate": selected_gate,
-    }
-    if physical_rollback["enabled"] and not bool(selected_gate["ok"]):
-        reference_audit = dict(v46.audit_motion_np(motion_ref, cfg))
-        reference_gate = base.physical_quality_gate(reference_audit)
-        physical_rollback["reference_gate"] = reference_gate
-        if bool(reference_gate["ok"]):
-            motion = np.asarray(motion_ref, dtype=np.float32).copy()
-            selected_audit = reference_audit
-            selected_gate = reference_gate
-            physical_rollback["rolled_back"] = True
+    motion, physical_rollback = select_physical_candidate(
+        stage_name="v46_54_final_physical_rollback",
+        reference=motion_ref,
+        candidate=motion,
+        audit_fn=lambda value: v46.audit_motion_np(value, cfg),
+        limits=PhysicalQualityLimits.from_environment(),
+        rollback_enabled=env_bool("V46_54_FINAL_PHYSICAL_ROLLBACK", True),
+    )
+    selected_audit = physical_rollback["selected_audit"]
+    selected_gate = physical_rollback["selected_gate"]
     stage["v46_54_final_physical_rollback"] = physical_rollback
     stage["final_audit"] = selected_audit
     stage["final_physical_gate"] = selected_gate

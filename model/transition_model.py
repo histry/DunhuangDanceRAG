@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, Sequence
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn

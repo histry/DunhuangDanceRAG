@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 
 from scheduling.index_io import (
-    REQUIRED_EVENT_ARRAYS,
     load_shared_index,
     resolve_event_motion_path,
 )

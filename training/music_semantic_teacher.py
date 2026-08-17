@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from events.semantic_descriptor import MUSIC_SEMANTIC_LABELS, canonical_music_label
 from model.music_motion_router import MusicMotionRouter
 from scheduling.audio_features import extract_audio_features
-from scheduling.music_event_calibration import build_phrase_query, phrase_statistics
+from scheduling.music_event_calibration import phrase_statistics
 from scheduling.music_phrase_segmentation import (
     audio_duration_seconds,
     segment_music_phrases,

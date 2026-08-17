@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -250,7 +249,6 @@ def heading_metrics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, float
 
     sm = moving_average(speed_deg, max(3, int(round(0.6 * fps))))
     active = np.abs(sm) >= env_float("V46_50_MECHANICAL_MIN_SPEED_DEG_S", 7.0)
-    same_sign = np.sign(sm)
     longest = 0
     mechanical = np.zeros(len(sm), dtype=bool)
     for a, b in contiguous_regions(active):

@@ -31,10 +31,15 @@ class BoundaryContinuityLimits:
     boundary_joint_jerk_max_mps3: float = 650.0
     entry_fk_jump_max_m: float = 0.015
     exit_fk_jump_max_m: float = 0.015
+    entry_fk_joint_jump_max_m: float = 0.050
+    exit_fk_joint_jump_max_m: float = 0.050
     entry_rotation_step_max_rad: float = 0.08
     exit_rotation_step_max_rad: float = 0.08
     foot_slip_max_mps: float = 0.06
+    foot_slip_p95_max_mps: float = 0.12
+    foot_slip_peak_max_mps: float = 0.25
     foot_penetration_max_m2: float = 0.001
+    foot_penetration_depth_max_m: float = 0.040
 
     @classmethod
     def from_environment(cls) -> "BoundaryContinuityLimits":
@@ -47,6 +52,12 @@ class BoundaryContinuityLimits:
                 _env_float("V46_46_MAX_EXIT_FK_JUMP_M", 0.015),
             ),
             exit_fk_jump_max_m=_env_float("V46_46_MAX_EXIT_FK_JUMP_M", 0.015),
+            entry_fk_joint_jump_max_m=_env_float(
+                "V46_46_MAX_ENTRY_FK_JOINT_JUMP_M", 0.050
+            ),
+            exit_fk_joint_jump_max_m=_env_float(
+                "V46_46_MAX_EXIT_FK_JOINT_JUMP_M", 0.050
+            ),
             entry_rotation_step_max_rad=_env_float(
                 "V46_46_MAX_ENTRY_ROT_RAD",
                 _env_float("V46_46_MAX_EXIT_ROT_RAD", 0.08),
@@ -55,8 +66,17 @@ class BoundaryContinuityLimits:
                 "V46_46_MAX_EXIT_ROT_RAD", 0.08
             ),
             foot_slip_max_mps=_env_float("V46_46_MAX_FOOT_SLIP_MPS", 0.06),
+            foot_slip_p95_max_mps=_env_float(
+                "V46_46_MAX_FOOT_SLIP_P95_MPS", 0.12
+            ),
+            foot_slip_peak_max_mps=_env_float(
+                "V46_46_MAX_FOOT_SLIP_PEAK_MPS", 0.25
+            ),
             foot_penetration_max_m2=_env_float(
                 "V46_46_MAX_FOOT_PENETRATION_M2", 0.001
+            ),
+            foot_penetration_depth_max_m=_env_float(
+                "V46_46_MAX_FOOT_PENETRATION_DEPTH_M", 0.040
             ),
         )
 
@@ -78,6 +98,16 @@ def boundary_risk_reasons(
         ("entry_fk_jump", lim.entry_fk_jump_max_m, "entry_fk_jump_m"),
         ("exit_fk_jump", lim.exit_fk_jump_max_m, "exit_fk_jump_m"),
         (
+            "entry_fk_jump_max_m",
+            lim.entry_fk_joint_jump_max_m,
+            "entry_fk_joint_jump_max_m",
+        ),
+        (
+            "exit_fk_jump_max_m",
+            lim.exit_fk_joint_jump_max_m,
+            "exit_fk_joint_jump_max_m",
+        ),
+        (
             "entry_rotation_step_rad",
             lim.entry_rotation_step_max_rad,
             "entry_rotation_step_rad",
@@ -89,9 +119,24 @@ def boundary_risk_reasons(
         ),
         ("foot_slip", lim.foot_slip_max_mps, "foot_slip_mps"),
         (
+            "foot_slip_p95",
+            lim.foot_slip_p95_max_mps,
+            "foot_slip_p95_mps",
+        ),
+        (
+            "foot_slip_max",
+            lim.foot_slip_peak_max_mps,
+            "foot_slip_peak_mps",
+        ),
+        (
             "foot_penetration",
             lim.foot_penetration_max_m2,
             "foot_penetration_m2",
+        ),
+        (
+            "foot_penetration_max_m",
+            lim.foot_penetration_depth_max_m,
+            "foot_penetration_depth_max_m",
         ),
     )
     reasons: list[str] = []
@@ -145,7 +190,7 @@ def evaluate_boundary_continuity(
         reasons.extend(f"slot_{slot}:{reason}" for reason in violations)
 
     return {
-        "schema": "strict_boundary_continuity_v1",
+        "schema": "strict_boundary_continuity_v2_peak_extremity",
         "ok": not reasons,
         "reasons": reasons,
         "expected_boundaries": (

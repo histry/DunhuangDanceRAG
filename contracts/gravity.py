@@ -12,7 +12,6 @@ circular imports when it is used as a training loss.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple
 
@@ -27,7 +26,7 @@ except Exception:  # pragma: no cover
 
 from motion_geometry.rotations import matrix_to_rot6d_np, rot6d_to_matrix_np
 from motion_geometry.smpl24 import (
-    CONTACT,
+    CONTACT as CONTACT,
     FOOT_JOINTS,
     MOTION_DIM as EDGE_DIM,
     NUM_JOINTS,

@@ -13,7 +13,7 @@ import json
 import os
 import shlex
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]

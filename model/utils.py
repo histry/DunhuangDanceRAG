@@ -2,8 +2,6 @@ import math
 
 import numpy as np
 import torch
-from einops import rearrange, reduce, repeat
-from einops.layers.torch import Rearrange
 from torch import nn
 
 

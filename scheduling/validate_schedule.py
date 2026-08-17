@@ -21,13 +21,11 @@ import csv
 import hashlib
 import json
 import math
-import os
 import subprocess
-import sys
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -422,6 +420,7 @@ def audit_contract(
     require_raw_report: bool = True,
     max_pose_hold_ratio: float = DEFAULT_MAX_POSE_HOLD_RATIO,
     max_single_source_ratio: float = DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    max_single_recording_ratio: float | None = None,
     min_unique_events: int = DEFAULT_MIN_UNIQUE_EVENTS,
     min_core_frame_ratio: float = DEFAULT_MIN_CORE_FRAME_RATIO,
 ) -> Dict[str, Any]:
@@ -446,6 +445,7 @@ def audit_contract(
         slots,
         max_pose_hold_ratio=max_pose_hold_ratio,
         max_single_source_ratio=max_single_source_ratio,
+        max_single_recording_ratio=max_single_recording_ratio,
         min_unique_events=min_unique_events,
         min_core_frame_ratio=min_core_frame_ratio,
     )
@@ -623,6 +623,7 @@ def audit_contract(
                         raw_schedule if isinstance(raw_schedule, list) else [],
                         max_pose_hold_ratio=max_pose_hold_ratio,
                         max_single_source_ratio=max_single_source_ratio,
+                        max_single_recording_ratio=max_single_recording_ratio,
                         min_unique_events=min_unique_events,
                         min_core_frame_ratio=min_core_frame_ratio,
                     )
@@ -747,6 +748,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
     )
     ap.add_argument(
+        "--max_single_recording_ratio",
+        type=float,
+        default=None,
+    )
+    ap.add_argument(
         "--min_unique_events",
         type=int,
         default=DEFAULT_MIN_UNIQUE_EVENTS,
@@ -771,6 +777,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         require_raw_report=True,
         max_pose_hold_ratio=args.max_pose_hold_ratio,
         max_single_source_ratio=args.max_single_source_ratio,
+        max_single_recording_ratio=args.max_single_recording_ratio,
         min_unique_events=args.min_unique_events,
         min_core_frame_ratio=args.min_core_frame_ratio,
     )

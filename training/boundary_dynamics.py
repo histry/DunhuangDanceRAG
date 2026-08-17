@@ -33,9 +33,6 @@ from support.motion_geometry import (
     MOTION_DIM,
     NUM_JOINTS,
     ROOT,
-    ROOT_X,
-    ROOT_Y,
-    ROOT_Z,
     ROT,
 )
 

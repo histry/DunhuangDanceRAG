@@ -17,19 +17,15 @@ Run with the same CLI as V46.46:
 """
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 import os
-import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from routing.anatomy_feature_cache import ROUTE_PROGRESS
 from routing.diversity import (
-    diversity_assessment,
     event_identity,
     proposal_selection_score,
 )

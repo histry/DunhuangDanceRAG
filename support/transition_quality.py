@@ -28,6 +28,22 @@ from motion_geometry.smpl24 import (
 FOOT_JOINTS = (7, 8, 10, 11)
 
 
+def _invalid_transition_metrics() -> Dict[str, float]:
+    keys = (
+        "total", "entry_velocity", "exit_velocity",
+        "entry_acceleration", "exit_acceleration",
+        "joint_jerk", "angular_jerk", "boundary_joint_jerk_max",
+        "entry_boundary_jerk", "exit_boundary_jerk",
+        "boundary_angular_jerk_max", "foot_slip", "foot_slip_p95",
+        "foot_slip_max", "foot_penetration", "foot_penetration_max_m",
+        "contact_switch", "max_rotation_step_rad",
+        "entry_rotation_step_rad", "exit_rotation_step_rad",
+        "entry_fk_jump", "exit_fk_jump", "entry_fk_jump_max_m",
+        "exit_fk_jump_max_m", "high_frequency",
+    )
+    return {key: 1e9 for key in keys}
+
+
 def _rms(values: np.ndarray) -> float:
     x = np.asarray(values, np.float64)
     return float(np.sqrt(np.mean(x * x))) if x.size else 0.0
@@ -115,20 +131,8 @@ def transition_risk(
     prev = np.asarray(previous, np.float32)
     trans = np.asarray(transition, np.float32)
     nxt = np.asarray(following, np.float32)
-    if len(trans) == 0:
-        return {
-            key: 1e9 for key in (
-                "total", "entry_velocity", "exit_velocity",
-                "entry_acceleration", "exit_acceleration",
-                "joint_jerk", "angular_jerk", "boundary_joint_jerk_max",
-                "entry_boundary_jerk", "exit_boundary_jerk",
-                "boundary_angular_jerk_max", "foot_slip",
-                "foot_penetration", "contact_switch",
-                "max_rotation_step_rad", "entry_rotation_step_rad",
-                "exit_rotation_step_rad", "entry_fk_jump", "exit_fk_jump",
-                "high_frequency",
-            )
-        }
+    if len(prev) == 0 or len(nxt) == 0:
+        return _invalid_transition_metrics()
 
     prev_context = prev[-4:] if len(prev) >= 4 else prev
     next_context = nxt[:4] if len(nxt) >= 4 else nxt
@@ -170,7 +174,20 @@ def transition_risk(
         _boundary_jerk_regions(jerk, left, len(trans))
     )
 
-    transition_positions = fk24_np(trans)
+    if len(trans):
+        quality_motion = trans
+        transition_positions = fk24_np(trans)
+    else:
+        # A zero-length bridge is a direct join, not an unauditable seam.
+        # Evaluate the last source frame and first destination frame as the
+        # boundary motion instead of returning a blanket sentinel.
+        quality_motion = context[left - 1 : left + 1]
+        transition_positions = positions[left - 1 : left + 1]
+    # Foot contact quality must include both actual seam steps as well as the
+    # bridge interior.  Otherwise a static bridge translated at entry/exit can
+    # report zero internal slip even though the supporting foot visibly jumps.
+    foot_motion = context[left - 1 : right + 1]
+    foot_positions = positions[left - 1 : right + 1]
     tv = np.diff(transition_positions, axis=0) * fps
     ta = np.diff(tv, axis=0) * fps
     tj = np.diff(ta, axis=0) * fps
@@ -186,18 +203,18 @@ def transition_risk(
     _, _, boundary_angular_jerk_max = _boundary_jerk_regions(
         context_angular_jerk, left, len(trans)
     )
-    angular = _angular_velocity_motion(trans, fps)
+    angular = _angular_velocity_motion(quality_motion, fps)
     angular_acc = np.diff(angular, axis=0) * fps
     angular_jerk_values = np.diff(angular_acc, axis=0) * fps
     angular_jerk = _rms(angular_jerk_values)
 
-    feet = transition_positions[:, FOOT_JOINTS]
+    feet = foot_positions[:, FOOT_JOINTS]
     foot_velocity = np.diff(feet, axis=0, prepend=feet[:1]) * fps
     horizontal_speed = np.linalg.norm(
         foot_velocity[..., (0, 2)], axis=-1
     )
     predicted_contact = np.asarray(
-        trans[:, CONTACT], np.float32
+        foot_motion[:, CONTACT], np.float32
     ).clip(0.0, 1.0)
     kinematic_contact = _kinematic_contact_proxy(feet, fps)
     gate_contact = np.maximum(predicted_contact, kinematic_contact)
@@ -205,11 +222,23 @@ def transition_risk(
         np.sum(horizontal_speed * gate_contact)
         / max(float(gate_contact.sum()), 1e-6)
     )
+    supported_speed = horizontal_speed[gate_contact >= 0.5]
+    foot_slip_p95 = (
+        float(np.percentile(supported_speed, 95))
+        if supported_speed.size
+        else 0.0
+    )
+    foot_slip_max = (
+        float(np.max(supported_speed)) if supported_speed.size else 0.0
+    )
 
     context_feet_y = positions[..., FOOT_JOINTS, 1]
     ground = float(np.percentile(context_feet_y, 5))
     penetration = np.maximum(ground - feet[..., 1] - 0.008, 0.0)
     foot_penetration = float(np.mean(penetration**2))
+    foot_penetration_max_m = (
+        float(np.max(penetration)) if penetration.size else 0.0
+    )
     contact_switch = (
         float(np.abs(np.diff(predicted_contact, axis=0)).mean()) * float(fps)
         if len(predicted_contact) > 1 else 0.0
@@ -225,14 +254,20 @@ def transition_risk(
         float(np.max(rotation_step[exit_step_index]))
         if len(rotation_step) > exit_step_index else 0.0
     )
-    entry_fk_jump = (
-        _rms(positions[left] - positions[left - 1])
-        if left > 0 and left < len(positions) else 0.0
+    entry_delta = (
+        positions[left] - positions[left - 1]
+        if left > 0 and left < len(positions)
+        else np.full((NUM_JOINTS, 3), np.inf, dtype=np.float32)
     )
-    exit_fk_jump = (
-        _rms(positions[right] - positions[right - 1])
-        if right > 0 and right < len(positions) else 0.0
+    exit_delta = (
+        positions[right] - positions[right - 1]
+        if right > 0 and right < len(positions)
+        else np.full((NUM_JOINTS, 3), np.inf, dtype=np.float32)
     )
+    entry_fk_jump = _rms(entry_delta)
+    exit_fk_jump = _rms(exit_delta)
+    entry_fk_jump_max = float(np.max(np.linalg.norm(entry_delta, axis=-1)))
+    exit_fk_jump_max = float(np.max(np.linalg.norm(exit_delta, axis=-1)))
 
     total = (
         1.20 * entry_velocity
@@ -244,6 +279,7 @@ def transition_risk(
         + 0.002 * boundary_jerk_max
         + 0.001 * boundary_angular_jerk_max
         + 2.00 * foot_slip
+        + 1.00 * foot_slip_p95
         + 6.00 * foot_penetration
         # Contact change is a physical probability-change rate (1/s).  The
         # coefficient preserves the historical 30 FPS score scale.
@@ -266,13 +302,18 @@ def transition_risk(
         "boundary_joint_jerk_max": float(boundary_jerk_max),
         "boundary_angular_jerk_max": float(boundary_angular_jerk_max),
         "foot_slip": float(foot_slip),
+        "foot_slip_p95": float(foot_slip_p95),
+        "foot_slip_max": float(foot_slip_max),
         "foot_penetration": float(foot_penetration),
+        "foot_penetration_max_m": float(foot_penetration_max_m),
         "contact_switch": float(contact_switch),
         "max_rotation_step_rad": float(max_rotation_step),
         "entry_rotation_step_rad": float(entry_rotation_step),
         "exit_rotation_step_rad": float(exit_rotation_step),
         "entry_fk_jump": float(entry_fk_jump),
         "exit_fk_jump": float(exit_fk_jump),
+        "entry_fk_jump_max_m": float(entry_fk_jump_max),
+        "exit_fk_jump_max_m": float(exit_fk_jump_max),
         "high_frequency": float(high_frequency),
         "predicted_contact_rate": float(predicted_contact.mean()),
         "kinematic_contact_rate": float(kinematic_contact.mean()),

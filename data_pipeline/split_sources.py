@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Performer-aware, exact-cardinality, source-disjoint cache split.
+"""Performer-aware, exact-cardinality, recording-disjoint cache split.
 
-Priority order for the 12-source low-resource setting:
-1. no source leakage;
+Priority order for the local Chang-E subset:
+1. no source or synchronized-recording leakage;
 2. non-empty train/validation/test;
 3. female and male coverage in validation and test when feasible;
 4. dance-category balance within each performer group.
 
-For 4 female + 8 male sources and an 8/2/2 split, the optimal allocation is
-train=2F+6M, validation=1F+1M, test=1F+1M.
+The 12 BVH files form 9 recording groups because three two-person recordings
+are exported as separate performer tracks.  Exact split counts therefore apply
+to recording groups rather than files.
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ except Exception:  # package self-test fallback; real projects provide this modu
     motion_api = _MotionApiFallback()
 
 SPLITS = ("train", "val", "test")
-SCHEMA = "performer_aware_source_disjoint_cache_split"
+SCHEMA = "performer_aware_recording_disjoint_cache_split_v2"
 
 
 def save_json(obj: Any, path: Path) -> None:
@@ -258,6 +259,40 @@ def assign_sources(
     return assign_records(records, target, seed)
 
 
+def recording_group_records(
+    records: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Collapse synchronized performer tracks into indivisible split units."""
+
+    grouped: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in records:
+        recording_uid = str(row.get("recording_uid") or row["source_uid"])
+        grouped.setdefault(recording_uid, []).append(row)
+
+    units: List[Dict[str, Any]] = []
+    for recording_uid, rows in sorted(grouped.items()):
+        performers = {str(row["performer_group"]) for row in rows}
+        categories = {str(row["dance_key"]) for row in rows}
+        if len(performers) != 1:
+            raise RuntimeError(
+                f"recording_uid {recording_uid!r} mixes performer groups: {performers}"
+            )
+        if len(categories) != 1:
+            raise RuntimeError(
+                f"recording_uid {recording_uid!r} mixes dance categories: {categories}"
+            )
+        units.append({
+            # assign_records uses source_uid as its generic assignment key.
+            "source_uid": recording_uid,
+            "recording_uid": recording_uid,
+            "performer_group": next(iter(performers)),
+            "dance_key": next(iter(categories)),
+            "source_uids": sorted(str(row["source_uid"]) for row in rows),
+            "num_performer_tracks": len(rows),
+        })
+    return units
+
+
 def report_path_for_motion(path: Path) -> Path:
     return path.with_suffix(".retarget.json")
 
@@ -285,6 +320,29 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
         or relative_motion.with_suffix(".bvh")
     )
     semantic = motion_api.parse_change_bvh_semantics(original)
+    report_metadata = report.get("source_metadata")
+    if isinstance(report_metadata, Mapping):
+        semantic = dict(semantic)
+        semantic.update({
+            "source_uid": report_metadata.get(
+                "source_id", semantic.get("source_uid")
+            ),
+            "recording_uid": report_metadata.get(
+                "recording_uid", semantic.get("recording_uid")
+            ),
+            "performer_track_id": report_metadata.get(
+                "performer_track_id", semantic.get("performer_track_id", -1)
+            ),
+            "sequence_index": report_metadata.get(
+                "sequence_index", semantic.get("sequence_index", -1)
+            ),
+            "performer_group": report_metadata.get(
+                "performer_group", semantic.get("performer_group")
+            ),
+            "dance_key": report_metadata.get(
+                "dance_category", semantic.get("dance_key")
+            ),
+        })
     source_uid = str(
         semantic.get("source_uid") or Path(original).stem
     )
@@ -301,6 +359,11 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
         "relative_report": str(report_path.relative_to(cache_root)),
         "original_source": original,
         "source_uid": source_uid,
+        "recording_uid": str(
+            semantic.get("recording_uid") or source_uid
+        ),
+        "performer_track_id": semantic.get("performer_track_id", -1),
+        "sequence_index": semantic.get("sequence_index", -1),
         "dance_key": dance_key,
         "performer_group": performer,
         "source_anatomy_quality": float(
@@ -403,21 +466,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "whose released motion metadata does not declare gender." % unknown
         )
 
+    recording_units = recording_group_records(records)
     target = exact_split_counts(
-        len(records),
+        len(recording_units),
         args.train_ratio,
         args.val_ratio,
         args.test_ratio,
     )
-    capacities = performer_capacities(records, target)
-    assignment = assign_records(records, target, args.seed)
+    capacities = performer_capacities(recording_units, target)
+    assignment = assign_records(recording_units, target, args.seed)
 
     split_records: Dict[str, List[Dict[str, Any]]] = {
         split: [] for split in SPLITS
     }
     materialization = Counter()
     for record in records:
-        split = assignment[record["source_uid"]]
+        split = assignment[record["recording_uid"]]
         motion_target = out_root / split / record["relative_motion"]
         report_target = out_root / split / record["relative_report"]
         materialization[
@@ -442,26 +506,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         split: {row["source_uid"] for row in rows}
         for split, rows in split_records.items()
     }
+    recording_sets = {
+        split: {row["recording_uid"] for row in rows}
+        for split, rows in split_records.items()
+    }
     overlap = {
         "train_val": sorted(source_sets["train"] & source_sets["val"]),
         "train_test": sorted(source_sets["train"] & source_sets["test"]),
         "val_test": sorted(source_sets["val"] & source_sets["test"]),
+        "recording_train_val": sorted(
+            recording_sets["train"] & recording_sets["val"]
+        ),
+        "recording_train_test": sorted(
+            recording_sets["train"] & recording_sets["test"]
+        ),
+        "recording_val_test": sorted(
+            recording_sets["val"] & recording_sets["test"]
+        ),
     }
     reasons: List[str] = []
-    if any(overlap.values()):
+    if any(overlap[key] for key in ("train_val", "train_test", "val_test")):
         reasons.append("source_overlap")
+    if any(
+        overlap[key]
+        for key in (
+            "recording_train_val",
+            "recording_train_test",
+            "recording_val_test",
+        )
+    ):
+        reasons.append("recording_overlap")
     for split in SPLITS:
-        if len(split_records[split]) != target[split]:
+        if len(recording_sets[split]) != target[split]:
             reasons.append("count_mismatch_%s" % split)
         if not split_records[split]:
             reasons.append("empty_%s" % split)
     for group in ("female", "male"):
         count = sum(
-            row["performer_group"] == group for row in records
+            row["performer_group"] == group for row in recording_units
         )
         if count >= 3:
             for split in ("val", "test"):
-                if not any(
+                # Exact cardinality can make both performer groups impossible
+                # in a one-recording split.  Require coverage only when the
+                # optimized capacity allocated this performer to that split.
+                if capacities[group][split] > 0 and not any(
                     row["performer_group"] == group
                     for row in split_records[split]
                 ):
@@ -483,7 +572,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         "target_counts": target,
         "performer_capacities": capacities,
-        "assignment_unit": "source_uid_before_event_slicing",
+        "assignment_unit": "recording_uid_before_event_slicing",
         "assignment_algorithm": (
             "exact_global_capacity_performer_stratified_"
             "dance_category_aware_deterministic"
@@ -491,6 +580,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "materialization_requested": args.mode,
         "materialization_actual": dict(materialization),
         "num_sources": len(records),
+        "num_recording_groups": len(recording_units),
+        "recording_groups": recording_units,
         "unknown_performer_group_allowed": bool(
             args.allow_unknown_performer_group
         ),
@@ -500,6 +591,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "sources": len(rows),
                 "source_uids": sorted(
                     row["source_uid"] for row in rows
+                ),
+                "recording_uids": sorted(
+                    {row["recording_uid"] for row in rows}
                 ),
                 "performer_group_histogram": dict(
                     Counter(
@@ -516,6 +610,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "overlap": overlap,
         "policy": {
             "split_before_event_slicing": True,
+            "synchronized_performer_tracks_are_indivisible": True,
             "validation_and_test_cover_both_known_performer_groups": True,
             "training_retrieval_uses_train_motion_only": True,
         },

@@ -1,6 +1,5 @@
 import os
 import copy
-from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +11,7 @@ from tqdm import tqdm
 from pytorch3d.transforms import rotation_6d_to_matrix
 
 from dataset.quaternion import ax_from_6v
-from vis import audio_output_stem, skeleton_render
+from vis import skeleton_render
 
 from .utils import extract, make_beta_schedule
 
@@ -850,14 +849,8 @@ class GaussianDiffusion(nn.Module):
         # Use physical space when possible.
         if self.normalizer is not None:
             pred = maybe_unnormalize(self.normalizer, model_motion_x0)
-            target = (
-                maybe_unnormalize(self.normalizer, target_motion_x0)
-                if target_motion_x0 is not None
-                else None
-            )
         else:
             pred = model_motion_x0
-            target = target_motion_x0
 
         b, t, _ = pred.shape
         device = pred.device

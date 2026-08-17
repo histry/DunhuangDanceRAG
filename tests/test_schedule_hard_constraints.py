@@ -72,6 +72,45 @@ class ScheduleHardConstraintTests(unittest.TestCase):
             )
         )
 
+    def test_distinct_performer_tracks_cannot_hide_one_recording_share(self):
+        rows = schedule_rows()
+        rows[0]["recording_uid"] = "shared_recording"
+        rows[1]["recording_uid"] = "shared_recording"
+        rows[2]["recording_uid"] = "recording_c"
+        rows[3]["recording_uid"] = "recording_d"
+
+        report = audit_schedule_hard_constraints(rows)
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["metrics"]["single_source_ratio"], 0.25)
+        self.assertEqual(report["metrics"]["single_recording_ratio"], 0.50)
+        self.assertTrue(
+            any(
+                "single_recording_ratio_exceeded" in reason
+                for reason in report["reasons"]
+            )
+        )
+
+    def test_recording_share_has_its_own_limit(self):
+        rows = schedule_rows()
+        rows[0]["recording_uid"] = "shared_recording"
+        rows[1]["recording_uid"] = "shared_recording"
+
+        report = audit_schedule_hard_constraints(
+            rows,
+            max_single_source_ratio=0.60,
+            max_single_recording_ratio=0.40,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["limits"]["max_single_recording_ratio"], 0.40)
+        self.assertTrue(
+            any(
+                "single_recording_ratio_exceeded" in reason
+                for reason in report["reasons"]
+            )
+        )
+
     def test_unique_event_count_is_a_hard_failure(self):
         rows = schedule_rows()
         rows[3]["event_uid"] = "event_1"
@@ -159,6 +198,7 @@ class ScheduleHardConstraintTests(unittest.TestCase):
         db = {
             "event_uids": ["event_1", "event_2"],
             "source_uids": ["source_a", "source_b"],
+            "recording_uids": ["recording_a", "recording_b"],
             "aesd_event_semantics": ["pose_hold", "turning_climax"],
         }
         rows = final_selection_constraint_rows(
@@ -170,8 +210,23 @@ class ScheduleHardConstraintTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["event_uid"], "event_2")
         self.assertEqual(rows[0]["source_uid"], "source_b")
+        self.assertEqual(rows[0]["recording_uid"], "recording_b")
         self.assertEqual(rows[0]["motion_event"], "turning_climax")
         self.assertEqual(rows[0]["allocated_content_len"], 20)
+
+    def test_unknown_recording_identity_falls_back_to_source(self):
+        db = {
+            "event_uids": ["event_1"],
+            "source_uids": ["source_a"],
+            "recording_uids": ["unknown"],
+            "aesd_event_semantics": ["footwork_flow"],
+        }
+        rows = final_selection_constraint_rows(
+            db,
+            [{"event_id": 0, "target_frames": 25, "core_frames": 20}],
+        )
+
+        self.assertEqual(rows[0]["recording_uid"], "source_a")
 
 
 if __name__ == "__main__":

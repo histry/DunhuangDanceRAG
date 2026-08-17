@@ -9,10 +9,9 @@ observed/corrupted motion only; no target-motion dynamics are leaked.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
-import torch
 from motion_geometry.rotations import (
     CANONICAL_ROT6D_LAYOUT,
     matrix_to_rot6d_np,
@@ -24,7 +23,6 @@ from motion_geometry.rotations import (
 from motion_geometry.heading import (
     CONTACT,
     ROT,
-    ROOT_ROT6D,
     motion_query_from_dynamics,
     root_yaw_np,
     yaw_speed_dps_np,

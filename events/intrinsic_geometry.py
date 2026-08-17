@@ -15,7 +15,7 @@ import math
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -23,7 +23,6 @@ from motion_geometry.rotations import (
     angular_acceleration_np,
     angular_velocity_np,
     rot6d_to_matrix_np,
-    so3_geodesic_np,
 )
 from contracts.gravity import (
     EDGE_DIM,

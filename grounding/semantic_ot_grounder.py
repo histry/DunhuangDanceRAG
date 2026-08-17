@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -317,7 +316,6 @@ def _batch_loss(
         batch_size * candidate_count, *gaussian_covariance_group.shape[2:]
     )
     controls = controls_group.reshape(batch_size * candidate_count, -1)
-    quality = quality_group.reshape(batch_size * candidate_count)
     family_ids = family_group.reshape(batch_size * candidate_count)
     source_ids = source_group.reshape(batch_size * candidate_count)
     pair_weights = pair_weight_group.float()

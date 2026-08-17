@@ -76,6 +76,12 @@ def final_selection_constraint_rows(
             event_index = int(row.get("event_id", -1))
         except (TypeError, ValueError):
             event_index = -1
+        source_uid = _db_text(
+            db, ("source_uids", "source_groups"), event_index
+        )
+        recording_uid = _db_text(db, ("recording_uids",), event_index)
+        if not recording_uid or recording_uid.lower() == "unknown":
+            recording_uid = source_uid
         resolved = {
             **row,
             "slot": int(row.get("slot", position)),
@@ -84,9 +90,8 @@ def final_selection_constraint_rows(
                 "target_frames", row.get("piece_frames")
             ),
             "event_uid": _db_text(db, ("event_uids",), event_index),
-            "source_uid": _db_text(
-                db, ("source_uids", "source_groups"), event_index
-            ),
+            "source_uid": source_uid,
+            "recording_uid": recording_uid,
             "motion_event": _db_text(
                 db, ("aesd_event_semantics", "event_types"), event_index
             ),
@@ -107,6 +112,7 @@ def audit_schedule_hard_constraints(
     *,
     max_pose_hold_ratio: float = DEFAULT_MAX_POSE_HOLD_RATIO,
     max_single_source_ratio: float = DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    max_single_recording_ratio: float | None = None,
     min_unique_events: int = DEFAULT_MIN_UNIQUE_EVENTS,
     min_core_frame_ratio: float = DEFAULT_MIN_CORE_FRAME_RATIO,
 ) -> Dict[str, Any]:
@@ -116,6 +122,12 @@ def audit_schedule_hard_constraints(
     )
     max_single_source_ratio = _ratio_limit(
         "max_single_source_ratio", max_single_source_ratio
+    )
+    max_single_recording_ratio = _ratio_limit(
+        "max_single_recording_ratio",
+        max_single_source_ratio
+        if max_single_recording_ratio is None
+        else max_single_recording_ratio,
     )
     min_core_frame_ratio = _ratio_limit(
         "min_core_frame_ratio", min_core_frame_ratio
@@ -129,6 +141,7 @@ def audit_schedule_hard_constraints(
     rows = [dict(row) for row in schedule if isinstance(row, Mapping)]
     reasons: list[str] = []
     source_core_frames: Counter[str] = Counter()
+    recording_core_frames: Counter[str] = Counter()
     event_uids: list[str] = []
     total_frames = 0
     core_frames = 0
@@ -162,6 +175,10 @@ def audit_schedule_hard_constraints(
             reasons.append(f"slot_{index}_invalid_core_frames:{core}/{target}")
 
         source_uid = _text(row, ("source_uid", "v26_source_uid"))
+        recording_uid = _text(
+            row,
+            ("recording_uid", "v26_recording_uid"),
+        ) or source_uid
         event_uid = _text(row, ("event_uid", "v26_event_uid"))
         motion_event = _text(row, ("motion_event", "event_type"))
         if not source_uid or source_uid.lower() == "unknown":
@@ -177,6 +194,8 @@ def audit_schedule_hard_constraints(
         core_frames += max(0, core)
         if source_uid and source_uid.lower() != "unknown":
             source_core_frames[source_uid] += max(0, core)
+        if recording_uid and recording_uid.lower() != "unknown":
+            recording_core_frames[recording_uid] += max(0, core)
         if motion_event.strip().lower() == "pose_hold":
             pose_hold_core_frames += max(0, core)
 
@@ -203,6 +222,17 @@ def audit_schedule_hard_constraints(
     single_source_ratio = (
         float(dominant_source_frames / core_frames) if core_frames > 0 else 0.0
     )
+    dominant_recording = ""
+    dominant_recording_frames = 0
+    if recording_core_frames:
+        dominant_recording, dominant_recording_frames = (
+            recording_core_frames.most_common(1)[0]
+        )
+    single_recording_ratio = (
+        float(dominant_recording_frames / core_frames)
+        if core_frames > 0
+        else 0.0
+    )
     unique_event_count = len(set(event_uids))
     core_frame_ratio = float(core_frames / total_frames) if total_frames > 0 else 0.0
 
@@ -219,6 +249,12 @@ def audit_schedule_hard_constraints(
             f"{single_source_ratio:.6f}>{max_single_source_ratio:.6f}"
             f":source={dominant_source}"
         )
+    if single_recording_ratio > max_single_recording_ratio + _EPS:
+        reasons.append(
+            "single_recording_ratio_exceeded:"
+            f"{single_recording_ratio:.6f}>{max_single_recording_ratio:.6f}"
+            f":recording={dominant_recording}"
+        )
     if unique_event_count < min_unique_events:
         reasons.append(
             "unique_event_count_below_minimum:"
@@ -231,7 +267,7 @@ def audit_schedule_hard_constraints(
         )
 
     return {
-        "schema": "music_independent_schedule_hard_constraints_v1",
+        "schema": "music_independent_schedule_hard_constraints_v2_recording",
         "ok": not reasons,
         "reasons": reasons,
         "music_label_independent": True,
@@ -239,6 +275,7 @@ def audit_schedule_hard_constraints(
         "limits": {
             "max_pose_hold_ratio": float(max_pose_hold_ratio),
             "max_single_source_ratio": float(max_single_source_ratio),
+            "max_single_recording_ratio": float(max_single_recording_ratio),
             "min_unique_events": int(min_unique_events),
             "min_core_frame_ratio": float(min_core_frame_ratio),
         },
@@ -251,9 +288,15 @@ def audit_schedule_hard_constraints(
             "dominant_source_uid": dominant_source or None,
             "dominant_source_core_frames": int(dominant_source_frames),
             "single_source_ratio": float(single_source_ratio),
+            "dominant_recording_uid": dominant_recording or None,
+            "dominant_recording_core_frames": int(dominant_recording_frames),
+            "single_recording_ratio": float(single_recording_ratio),
             "unique_event_count": int(unique_event_count),
             "core_frame_ratio": float(core_frame_ratio),
             "source_core_frames": dict(sorted(source_core_frames.items())),
+            "recording_core_frames": dict(
+                sorted(recording_core_frames.items())
+            ),
         },
     }
 

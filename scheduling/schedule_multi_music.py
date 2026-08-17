@@ -17,16 +17,15 @@ import argparse
 import glob
 import json
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 from model.music_motion_router import load_router_checkpoint
-from model.transition_model import TRANSITION_LENGTHS
 from scheduling.audio_features import extract_audio_features
 from scheduling.index_io import load_shared_index, resolve_event_motion_path
 from scheduling.music_event_calibration import build_phrase_query as calibrated_phrase_query

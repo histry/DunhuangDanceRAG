@@ -15,19 +15,24 @@ import glob
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from motion_geometry.rotations import (
     CANONICAL_ROT6D_LAYOUT,
     matrix_to_rot6d_np,
     relative_rotvec_np,
     rot6d_to_matrix_np,
     so3_exp_np,
-    so3_geodesic_np,
     tangent_blend_np,
 )
 
@@ -87,7 +92,7 @@ from scheduling.schedule_hard_constraints import (
 )
 from scheduling.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
 from support.scheduler_checkpoint_contracts import assert_scheduler_checkpoint_contract
-from motion_geometry.heading import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
+from motion_geometry.heading import ROOT_ROT6D
 
 
 @dataclass
@@ -596,6 +601,22 @@ def choose_events(
                     if str(items[previous].get("source_uid", items[previous].get("source_id", "unknown")))
                     == candidate_source
                 )
+                candidate_recording = str(
+                    items[idx].get("recording_uid", candidate_source)
+                )
+                same_recording = sum(
+                    1
+                    for previous in state.selected
+                    if str(
+                        items[previous].get(
+                            "recording_uid",
+                            items[previous].get(
+                                "source_uid",
+                                items[previous].get("source_id", "unknown"),
+                            ),
+                        )
+                    ) == candidate_recording
+                )
                 source_run = 0
                 for previous in reversed(state.selected):
                     previous_source = str(
@@ -610,9 +631,17 @@ def choose_events(
                     continue
                 projected_slots = len(state.selected) + 1
                 projected_source_share = (same_source + 1) / max(1, projected_slots)
+                projected_recording_share = (same_recording + 1) / max(
+                    1, projected_slots
+                )
                 if (
                     projected_slots >= int(args.min_source_share_slots)
                     and projected_source_share > float(args.max_source_share)
+                ):
+                    continue
+                if (
+                    projected_slots >= int(args.min_source_share_slots)
+                    and projected_recording_share > float(args.max_recording_share)
                 ):
                     continue
                 if args.hard_family_unique and same_family > 0:
@@ -1012,6 +1041,7 @@ def generate_one(
         schedule_rows,
         max_pose_hold_ratio=float(args.max_pose_hold_ratio),
         max_single_source_ratio=float(args.max_source_share),
+        max_single_recording_ratio=float(args.max_recording_share),
         min_unique_events=int(args.min_unique_events),
         min_core_frame_ratio=float(args.min_core_frame_ratio),
     )
@@ -1266,6 +1296,7 @@ def generate_one(
             "anti_static_weight": float(args.anti_static_weight),
             "max_pose_hold_ratio": float(args.max_pose_hold_ratio),
             "max_single_source_ratio": float(args.max_source_share),
+            "max_single_recording_ratio": float(args.max_recording_share),
             "min_unique_events": int(args.min_unique_events),
             "min_core_frame_ratio": float(args.min_core_frame_ratio),
             "transition_diffusion": bool(args.transition_diffusion),
@@ -1373,6 +1404,11 @@ def main() -> None:
     parser.add_argument("--max_source_run", type=int, default=2)
     parser.add_argument(
         "--max_source_share",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    )
+    parser.add_argument(
+        "--max_recording_share",
         type=float,
         default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
     )

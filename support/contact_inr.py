@@ -17,7 +17,6 @@ Native EDGE motion layout:
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import asdict, dataclass
 from typing import Dict, Tuple
 
@@ -33,7 +32,6 @@ from motion_geometry.rotations import (
 )
 
 from training.boundary_dynamics import (
-    boundary_state_from_training_batch,
     make_v34_transition_np,
     septic_so3_root_base,
 )
@@ -43,9 +41,6 @@ from support.motion_geometry import (
     MOTION_DIM,
     NUM_JOINTS,
     ROOT,
-    ROOT_X,
-    ROOT_Y,
-    ROOT_Z,
     ROT,
 )
 

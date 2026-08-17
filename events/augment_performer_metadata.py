@@ -8,7 +8,7 @@ import json
 import os
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 

@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from data_pipeline.chang_e_manifest import (  # noqa: E402
+    load_manifest,
+    manifest_sha256,
+    validate_source,
+)
+
 AUDIO_EXT = {".wav", ".mp3", ".flac", ".ogg"}
 
 
@@ -32,6 +38,10 @@ def main() -> int:
     ap.add_argument("--audio", required=True)
     ap.add_argument("--music_dir", required=True)
     ap.add_argument("--change_dir", default="change")
+    ap.add_argument(
+        "--source_manifest",
+        default=os.environ.get("CHANG_E_SOURCE_MANIFEST", ""),
+    )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -66,8 +76,36 @@ def main() -> int:
     min_sources = int(float(os.environ.get("V46_52_MIN_OK_SOURCES", "8")))
     if len(sources) < min_sources:
         errors.append(f"change BVH count={len(sources)} < minimum source requirement={min_sources}")
-    if len(sources) < 12:
-        warnings.append(f"expected project inventory is 12 BVH sources; discovered {len(sources)}")
+    source_manifest = (
+        Path(args.source_manifest).expanduser().resolve()
+        if str(args.source_manifest).strip()
+        else (change_dir / "sources.json").resolve()
+    )
+    source_provenance: List[Dict[str, Any]] = []
+    recording_uids: set[str] = set()
+    try:
+        manifest = load_manifest(source_manifest, required=True)
+        expected_names = {
+            Path(str(row["file"])).name for row in manifest["sources"]
+        }
+        discovered_names = {path.name for path in sources}
+        missing_sources = sorted(expected_names - discovered_names)
+        unmanifested_sources = sorted(discovered_names - expected_names)
+        if missing_sources:
+            errors.append(f"manifest sources missing on disk: {missing_sources}")
+        if unmanifested_sources:
+            errors.append(f"unmanifested BVH sources: {unmanifested_sources}")
+        for source in sources:
+            row = validate_source(
+                source,
+                path=source_manifest,
+                required=True,
+                verify_hash=True,
+            )
+            source_provenance.append(row)
+            recording_uids.add(str(row["recording_uid"]))
+    except Exception as exc:
+        errors.append(f"Chang-E source manifest validation failed: {exc}")
 
     music_count = _count_audio(music_dir) if music_dir.is_dir() else 0
     expected_music = int(float(os.environ.get("V46_53_1_EXPECTED_TRAIN_MUSIC", "788")))
@@ -88,8 +126,8 @@ def main() -> int:
 
     try:
         from data_pipeline.split_sources import exact_split_counts
-        runtime["split_counts_at_discovered_sources"] = exact_split_counts(
-            max(3, len(sources)),
+        runtime["split_counts_at_recording_groups"] = exact_split_counts(
+            max(3, len(recording_uids)),
             float(os.environ.get("V46_51_TRAIN_RATIO", "0.67")),
             float(os.environ.get("V46_51_VAL_RATIO", "0.165")),
             float(os.environ.get("V46_51_TEST_RATIO", "0.165")),
@@ -101,6 +139,13 @@ def main() -> int:
         "schema": "real_data_preflight",
         "root": str(root), "audio": str(audio), "music_dir": str(music_dir), "change_dir": str(change_dir),
         "bvh_sources": [str(p) for p in sources], "num_bvh_sources": len(sources),
+        "source_manifest": str(source_manifest),
+        "source_manifest_sha256": (
+            manifest_sha256(source_manifest) if source_manifest.is_file() else None
+        ),
+        "source_provenance": source_provenance,
+        "num_recording_groups": len(recording_uids),
+        "recording_uids": sorted(recording_uids),
         "training_music_count": music_count, "expected_training_music_count": expected_music,
         "runtime": runtime, "warnings": warnings, "errors": errors, "ok": not errors,
     }

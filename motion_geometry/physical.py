@@ -13,9 +13,16 @@ from motion_geometry.smpl24 import (
     ROOT_X_IDX,
     ROOT_Y_IDX,
     ROOT_Z_IDX,
+    ROT6D_END,
+    ROT6D_START,
+)
+from motion_geometry.rotations import (
+    angular_acceleration_np,
+    rot6d_to_matrix_np,
+    so3_geodesic_np,
 )
 
-PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v3_final_quality_layers"
+PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v4_so3_quality"
 EXTREMITY_JOINTS = (7, 8, 10, 11, 20, 21, 22, 23)
 
 
@@ -159,7 +166,7 @@ def recompute_contacts_np(
 
 
 def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, Any]:
-    """Report final anti-jitter, contact and long-horizon metrics in SI units."""
+    """Report FK physical metrics plus raw/temporal SO(3) rotation quality."""
     if fps <= 0.0:
         raise ValueError("fps must be positive")
     x = np.asarray(motion, dtype=np.float32)
@@ -167,7 +174,55 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
         x = x[0]
     if x.ndim != 2 or x.shape[1] != MOTION_DIM:
         raise ValueError(f"Expected [T,{MOTION_DIM}], got {x.shape}")
-    joints = fk24_np(x)
+    raw_rot6d = np.asarray(
+        x[:, ROT6D_START:ROT6D_END].reshape(len(x), 24, 6),
+        dtype=np.float64,
+    )
+    finite_rot6d = np.isfinite(raw_rot6d).all(axis=-1)
+    safe_rot6d = np.nan_to_num(
+        raw_rot6d,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    first = safe_rot6d[..., :3]
+    second = safe_rot6d[..., 3:]
+    first_norm = np.linalg.norm(first, axis=-1)
+    second_norm = np.linalg.norm(second, axis=-1)
+    first_unit = first / np.maximum(first_norm[..., None], 1.0e-12)
+    second_orthogonal = second - (
+        np.sum(first_unit * second, axis=-1, keepdims=True) * first_unit
+    )
+    second_orthogonal_norm = np.linalg.norm(second_orthogonal, axis=-1)
+    collinearity = np.abs(np.sum(first * second, axis=-1)) / np.maximum(
+        first_norm * second_norm,
+        1.0e-12,
+    )
+    degenerate = (
+        ~finite_rot6d
+        | (first_norm < 1.0e-5)
+        | (second_norm < 1.0e-5)
+        | (second_orthogonal_norm < 1.0e-5)
+    )
+    rotation_matrices = rot6d_to_matrix_np(safe_rot6d.astype(np.float32))
+    rotation_steps = (
+        so3_geodesic_np(rotation_matrices[:-1], rotation_matrices[1:])
+        if len(rotation_matrices) > 1
+        else np.zeros((0, 24), dtype=np.float32)
+    )
+    extremity_rotation_steps = (
+        rotation_steps[:, list(EXTREMITY_JOINTS)]
+        if rotation_steps.size
+        else np.zeros((0, len(EXTREMITY_JOINTS)), dtype=np.float32)
+    )
+    angular_acceleration = angular_acceleration_np(
+        rotation_matrices,
+        fps=float(fps),
+    )
+    angular_acceleration_norm = np.linalg.norm(angular_acceleration, axis=-1)
+
+    safe_motion = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    joints = fk24_np(safe_motion)
     velocity = np.diff(joints, axis=0) * float(fps)
     acceleration = np.diff(joints, n=2, axis=0) * float(fps) ** 2
     jerk = np.diff(joints, n=3, axis=0) * float(fps) ** 3
@@ -179,7 +234,7 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
             np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
             * float(fps)
         )
-    declared_contacts = x[:, CONTACT] > 0.5
+    declared_contacts = safe_motion[:, CONTACT] > 0.5
     floor_y = float(np.percentile(feet[..., 1], 5))
     # Contact auditing must not use a speed veto: doing so removes the fastest
     # sliding samples from the very metric intended to reject them.  A low-foot
@@ -198,8 +253,10 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
     contact_height = np.maximum(feet[..., 1] - floor_y, 0.0)[declared_contacts]
     contact_mismatch = np.logical_xor(declared_contacts, height_support)
 
-    root_y = np.asarray(x[:, ROOT_Y_IDX], dtype=np.float32)
-    root_xz = np.asarray(x[:, [ROOT_X_IDX, ROOT_Z_IDX]], dtype=np.float64)
+    root_y = np.asarray(safe_motion[:, ROOT_Y_IDX], dtype=np.float32)
+    root_xz = np.asarray(
+        safe_motion[:, [ROOT_X_IDX, ROOT_Z_IDX]], dtype=np.float64
+    )
     root_vertical_speed = (
         np.abs(np.diff(root_y)) * float(fps)
         if len(root_y) > 1
@@ -254,6 +311,29 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
         "foot_support_ratio": float(np.mean(support)),
         "foot_contact_mismatch_ratio": float(np.mean(contact_mismatch)),
         "foot_support_segment_count": int(support_segment_count),
+        "rot6d_nonfinite_ratio": float(np.mean(~finite_rot6d)),
+        "rot6d_degenerate_ratio": float(np.mean(degenerate)),
+        "rot6d_first_vector_norm_min": float(np.min(first_norm)),
+        "rot6d_second_vector_norm_min": float(np.min(second_norm)),
+        "rot6d_second_orthogonal_norm_min": float(
+            np.min(second_orthogonal_norm)
+        ),
+        "rot6d_collinearity_abs_p99": float(
+            np.percentile(collinearity, 99)
+        ),
+        "rotation_near_pi_step_ratio": float(
+            np.mean(rotation_steps >= (np.pi - 0.05))
+        ) if rotation_steps.size else 0.0,
+        "joint_rotation_step_window_p95_max_rad": _window_percentile_max(
+            rotation_steps,
+            fps=fps,
+            seconds=1.0,
+        ),
+        "joint_angular_acceleration_window_p95_max_rps2": _window_percentile_max(
+            angular_acceleration_norm,
+            fps=fps,
+            seconds=1.0,
+        ),
         "root_y_range_m": float(np.ptp(root_y)) if root_y.size else 0.0,
         "root_y_robust_range_m": (
             float(np.percentile(root_y, 99) - np.percentile(root_y, 1))
@@ -297,4 +377,14 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
     result.update(distribution(jerk_norm, "joint_jerk_mps3"))
     result.update(distribution(extremity_jerk, "extremity_jerk_mps3"))
     result.update(distribution(root_vertical_speed, "root_vertical_speed_mps"))
+    result.update(distribution(rotation_steps, "joint_rotation_step_rad"))
+    result.update(
+        distribution(extremity_rotation_steps, "extremity_rotation_step_rad")
+    )
+    result.update(
+        distribution(
+            angular_acceleration_norm,
+            "joint_angular_acceleration_rps2",
+        )
+    )
     return result

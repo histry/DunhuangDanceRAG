@@ -9,16 +9,10 @@ import re
 import sys
 from functools import cmp_to_key
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from pytorch3d.transforms import (
-    RotateAxisAngle,
-    axis_angle_to_quaternion,
-    quaternion_multiply,
-    quaternion_to_axis_angle,
-)
 from torch.utils.data import Dataset
 
 from dataset.quaternion import ax_to_6v

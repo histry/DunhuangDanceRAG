@@ -57,6 +57,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "event_heading_quality",
         "event_heading_valid",
         "source_uids",
+        "recording_uids",
         "starts",
         "ends",
     ]
@@ -82,6 +83,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     quality = np.asarray(db["event_heading_quality"], dtype=np.float32)
     valid = np.asarray(db["event_heading_valid"], dtype=bool)
     source_uids = np.asarray(db["source_uids"], dtype=object)
+    recording_uids = np.asarray(db["recording_uids"], dtype=object)
 
     rows: List[Dict[str, Any]] = []
     missing_motion = 0
@@ -96,6 +98,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "event_id": int(i),
             "path": str(p),
             "source_uid": str(source_uids[i]),
+            "recording_uid": str(recording_uids[i]),
             "intent": str(intents[i]),
             "entry_heading_deg": float(np.degrees(entry[i])),
             "net_yaw_deg_db": float(np.degrees(delta[i])),
@@ -164,6 +167,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     if len(set(map(str, source_uids.tolist()))) < 2:
         reasons.append("fewer_than_two_source_uids")
+    if len(set(map(str, recording_uids.tolist()))) < 2:
+        reasons.append("fewer_than_two_recording_uids")
 
     intent_hist = {
         k: int(np.sum(intents == k))
@@ -176,6 +181,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "reasons": reasons,
         "num_events": int(n),
         "num_source_uids": int(len(set(map(str, source_uids.tolist())))),
+        "num_recording_uids": int(
+            len(set(map(str, recording_uids.tolist())))
+        ),
         "intent_histogram": intent_hist,
         "entry_heading_abs_deg_p95": entry_p95,
         "entry_heading_abs_deg_max": float(

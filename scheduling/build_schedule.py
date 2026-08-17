@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -102,6 +102,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--max_source_run", type=int, default=2)
     ap.add_argument(
         "--max_source_share",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    )
+    ap.add_argument(
+        "--max_recording_share",
         type=float,
         default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
     )
@@ -300,6 +305,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(args.max_source_run),
         "--max_source_share",
         str(args.max_source_share),
+        "--max_recording_share",
+        str(args.max_recording_share),
         "--min_source_share_slots",
         str(args.min_source_share_slots),
         "--max_pose_hold_ratio",
@@ -509,6 +516,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "music_independent_hard_constraints": {
             "max_pose_hold_ratio": float(args.max_pose_hold_ratio),
             "max_single_source_ratio": float(args.max_source_share),
+            "max_single_recording_ratio": float(args.max_recording_share),
             "min_unique_events": int(args.min_unique_events),
             "min_core_frame_ratio": float(args.min_core_frame_ratio),
         },
@@ -528,6 +536,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         require_raw_report=True,
         max_pose_hold_ratio=args.max_pose_hold_ratio,
         max_single_source_ratio=args.max_source_share,
+        max_single_recording_ratio=args.max_recording_share,
         min_unique_events=args.min_unique_events,
         min_core_frame_ratio=args.min_core_frame_ratio,
     )

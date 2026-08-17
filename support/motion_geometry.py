@@ -14,7 +14,7 @@ there, and projected back to valid 6D rotations.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Sequence, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch

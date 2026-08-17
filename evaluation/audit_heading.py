@@ -18,7 +18,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from contracts.heading import (  # noqa: E402
-    angle_diff,
     heading_metrics_np,
     root_yaw_np,
     slot_turn_policy,

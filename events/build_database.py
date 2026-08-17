@@ -17,7 +17,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -209,6 +209,7 @@ def save_db(
     identity_seed = {
         "paths": _field_array(meta, "path", "", object),
         "source_uids": _field_array(meta, "source_uid", "unknown", object),
+        "recording_uids": _field_array(meta, "recording_uid", "unknown", object),
         "source_files": _field_array(meta, "source_file", "", object),
         "starts": _field_array(meta, "start", 0, np.int32),
         "ends": _field_array(meta, "end", 0, np.int32),
@@ -246,6 +247,9 @@ def save_db(
         "source_files": _field_array(meta, "source_file", "", object),
         "source_bvh": _field_array(meta, "source_bvh", "", object),
         "source_uids": _field_array(meta, "source_uid", "unknown", object),
+        "recording_uids": _field_array(meta, "recording_uid", "unknown", object),
+        "performer_track_ids": _field_array(meta, "performer_track_id", -1, np.int32),
+        "sequence_indices": _field_array(meta, "sequence_index", -1, np.int32),
         "genders": _field_array(meta, "gender", "unknown", object),
         "labels": _field_array(meta, "label", "unknown", object),
         "parent_labels": _field_array(meta, "parent_label", "unknown", object),
@@ -568,6 +572,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "load_path": str(path),
                     "source_uid": source_uid,
                     "source_group": source_uid,
+                    "recording_uid": sem.get("recording_uid", source_uid),
                     "seq_id": int(seq_id),
                     "label": sem.get("label", Path(original_source).stem),
                     "parent_label": sem.get("parent_label", sem.get("label", "unknown")),
@@ -611,7 +616,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
 
                 item = meta[-1]
-                before = heading["before_budget"]
                 after = heading["after_budget"]
                 item.update({
                     "event_original_entry_heading_rad": float(

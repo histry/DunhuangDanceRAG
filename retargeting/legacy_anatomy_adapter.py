@@ -10,8 +10,6 @@ when available because the Chang-E paper provides fitted SMPL parameters.
 from __future__ import annotations
 
 import copy
-import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -27,13 +25,10 @@ except Exception:  # pragma: no cover
 
 import retargeting.bvh_solver as legacy
 from contracts.gravity import (
-    EDGE_DIM,
     FOOT_JOINTS,
     GravityThresholds,
     evaluate_gravity_contract,
-    fk24_np,
     gravity_metrics_np,
-    matrix_to_rot6d_np,
 )
 from contracts.anatomy import (
     AnatomyLossWeights,

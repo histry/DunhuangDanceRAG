@@ -14,9 +14,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 
 # Make the script runnable from repo root without installation.
 ROOT = Path(__file__).resolve().parents[1]

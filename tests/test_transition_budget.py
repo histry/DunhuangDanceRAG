@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from motion_geometry.physical import PHYSICAL_METRICS_SCHEMA
 from routing.boundary_closed_loop import make_seam_mask, physical_quality_gate
 try:
     from scheduling.whole_song_scheduler import cap_transition_budget
@@ -16,6 +17,7 @@ except ModuleNotFoundError as exc:  # lightweight audit runtime may omit 3D deps
 
 def _quality_defaults():
     return {
+        "schema": PHYSICAL_METRICS_SCHEMA,
         "foot_support_drift_m_p95": 0.01,
         "foot_support_drift_m_max": 0.02,
         "foot_contact_height_m_max": 0.02,
@@ -27,6 +29,18 @@ def _quality_defaults():
         "root_horizontal_net_displacement_m": 0.50,
         "root_horizontal_drift_speed_mps": 0.02,
         "root_horizontal_window_displacement_max_m": 0.50,
+        "rot6d_nonfinite_ratio": 0.0,
+        "rot6d_degenerate_ratio": 0.0,
+        "rot6d_collinearity_abs_p99": 0.0,
+        "rotation_near_pi_step_ratio": 0.0,
+        "joint_rotation_step_rad_p95": 0.10,
+        "joint_rotation_step_rad_max": 0.20,
+        "joint_rotation_step_window_p95_max_rad": 0.15,
+        "extremity_rotation_step_rad_p95": 0.10,
+        "extremity_rotation_step_rad_max": 0.20,
+        "joint_angular_acceleration_rps2_p95": 1.0,
+        "joint_angular_acceleration_rps2_max": 2.0,
+        "joint_angular_acceleration_window_p95_max_rps2": 1.5,
     }
 
 

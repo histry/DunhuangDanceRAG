@@ -26,8 +26,6 @@ from support.motion_geometry import (
     MOTION_DIM,
     NUM_JOINTS,
     ROOT,
-    ROOT_X,
-    ROOT_Z,
     ROT,
 )
 from motion_geometry.rotations import (

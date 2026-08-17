@@ -13,7 +13,7 @@ is Y, matching EDGE/SMPL's physical coordinate system.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 try:
@@ -392,8 +392,6 @@ def make_fast_turn_corruption(
     total_context = max(pre_source + post_source, 1)
     output_pre = int(round(remaining * pre_source / total_context))
     output_pre = int(np.clip(output_pre, min_pre, remaining - min_post))
-    output_post = remaining - output_pre
-
     output_control = np.asarray([0, output_pre, output_pre + desired_span, n - 1], dtype=np.float32)
     source_control = np.asarray([0, turn_start, turn_end, n - 1], dtype=np.float32)
     output_frames = np.arange(n, dtype=np.float32)

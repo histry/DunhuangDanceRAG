@@ -9,7 +9,9 @@ low-posture or instrument-specific segments are filtered after event slicing.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -23,6 +25,13 @@ if str(ROOT) not in sys.path:
 
 import retargeting.bvh_solver as legacy
 from contracts.anatomy import env_bool, env_int
+from data_pipeline.chang_e_manifest import (
+    file_sha256,
+    find_source_entry,
+    load_manifest,
+    manifest_sha256,
+    validate_source,
+)
 from retargeting.legacy_anatomy_adapter import load_official_smpl_motion
 from retargeting.anatomy_retarget import retarget_bvh_research
 
@@ -44,7 +53,10 @@ def _discover(in_dir: Path) -> List[Path]:
     return selected
 
 
-def _report_valid(rep: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def _report_valid(
+    rep: Dict[str, Any],
+    expected_provenance: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     version = str(rep.get("version", ""))
     if "v46_53_1" not in version and not env_bool("V46_53_1_ALLOW_LEGACY_RETARGET_CACHE", False):
@@ -57,7 +69,62 @@ def _report_valid(rep: Dict[str, Any]) -> Tuple[bool, List[str]]:
         reasons.append("gravity_not_ok")
     if not bool(rep.get("fit_ok", False)):
         reasons.append("fit_not_ok")
+    if expected_provenance is not None:
+        actual = rep.get("cache_provenance")
+        if not isinstance(actual, dict):
+            reasons.append("missing_cache_provenance")
+        else:
+            for key, expected in expected_provenance.items():
+                observed = actual.get(key)
+                if isinstance(expected, float):
+                    try:
+                        matches = abs(float(observed) - expected) <= 1.0e-8
+                    except (TypeError, ValueError):
+                        matches = False
+                else:
+                    matches = observed == expected
+                if not matches:
+                    reasons.append(f"cache_provenance_mismatch:{key}")
     return not reasons, reasons
+
+
+def _expected_provenance(
+    source: Path,
+    *,
+    target_fps: float,
+    source_manifest: Optional[Path],
+    strict_manifest: bool,
+) -> Dict[str, Any]:
+    provenance: Dict[str, Any] = {
+        "source_sha256": file_sha256(source),
+        "target_fps": float(target_fps),
+        "cache_schema": SCHEMA,
+    }
+    if source.suffix.lower() == ".bvh":
+        timebase = validate_source(
+            source,
+            path=source_manifest,
+            required=strict_manifest,
+            verify_hash=True,
+        )
+        provenance.update({
+            "effective_source_fps": float(timebase["effective_fps"]),
+            "declared_source_fps": float(timebase["declared_fps"]),
+            "manifest_sha256": timebase.get("manifest_sha256"),
+            "source_id": timebase.get("source_id", source.stem),
+            "recording_uid": timebase.get("recording_uid", source.stem),
+        })
+    else:
+        provenance.update({
+            "effective_source_fps": None,
+            "declared_source_fps": None,
+            "manifest_sha256": (
+                manifest_sha256(source_manifest) if source_manifest else None
+            ),
+            "source_id": source.stem,
+            "recording_uid": source.stem,
+        })
+    return provenance
 
 
 def _split_feasible(num_sources: int) -> bool:
@@ -72,6 +139,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--allow_partial", action="store_true")
     ap.add_argument("--device", default=None)
     ap.add_argument("--target_fps", type=float, choices=(30.0, 60.0), default=None)
+    ap.add_argument(
+        "--source_manifest",
+        default=os.environ.get("CHANG_E_SOURCE_MANIFEST", ""),
+        help="Authoritative Chang-E sources.json; auto-detected in --in_dir.",
+    )
+    ap.add_argument(
+        "--allow_unmanifested_bvh",
+        action="store_true",
+        help="Allow generic BVH inputs to use their declared header FPS.",
+    )
     ap.add_argument(
         "--smpl_scaling_mode",
         choices=("canonical_body", "scale_translation", "inverse_scale_translation"),
@@ -91,6 +168,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg.device = args.device
     if args.target_fps is not None:
         cfg.target_fps = float(args.target_fps)
+    manifest_candidate = (
+        Path(args.source_manifest).expanduser().resolve()
+        if str(args.source_manifest).strip()
+        else (in_dir / "sources.json").resolve()
+    )
+    source_manifest: Optional[Path] = (
+        manifest_candidate if manifest_candidate.is_file() else None
+    )
+    strict_manifest = bool(source_manifest is not None and not args.allow_unmanifested_bvh)
+    if source_manifest is not None:
+        load_manifest(source_manifest, required=True)
+        cfg.source_manifest_path = str(source_manifest)
+        cfg.require_source_manifest = strict_manifest
+    elif any(path.suffix.lower() == ".bvh" for path in files) and not args.allow_unmanifested_bvh:
+        raise RuntimeError(
+            "Formal BVH cache construction requires a source manifest. "
+            "Pass --source_manifest or --allow_unmanifested_bvh for a non-Chang-E dataset."
+        )
     allow_partial = bool(args.allow_partial or env_bool("V46_52_ALLOW_PARTIAL_RETARGET", True))
     min_ok = max(3, min(len(files), env_int("V46_52_MIN_OK_SOURCES", min(8, len(files)))))
 
@@ -105,9 +200,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         print(f"[V46.53.1 RETARGET {idx}/{len(files)}] {src} -> {dst}", flush=True)
         try:
+            expected_provenance = _expected_provenance(
+                src,
+                target_fps=float(cfg.target_fps),
+                source_manifest=source_manifest,
+                strict_manifest=strict_manifest,
+            )
             if dst.exists() and rep_path.exists() and not args.overwrite:
                 old = json.loads(rep_path.read_text(encoding="utf-8"))
-                valid, reasons = _report_valid(old)
+                valid, reasons = _report_valid(old, expected_provenance)
                 if valid:
                     print("[SKIP] existing V46.53.1 source-safe cache", flush=True)
                     reports.append(old)
@@ -127,8 +228,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_used = None
             for candidate in candidates:
                 try:
+                    candidate_cfg = copy.deepcopy(cfg)
                     if candidate.suffix.lower() == ".bvh":
-                        motion, rep = retarget_bvh_research(candidate, cfg)
+                        candidate_cfg.source_manifest_path = (
+                            str(source_manifest) if source_manifest else ""
+                        )
+                        candidate_cfg.require_source_manifest = strict_manifest
+                        motion, rep = retarget_bvh_research(candidate, candidate_cfg)
                     else:
                         # Existing official-SMPL loader remains supported. Its strict
                         # report must still pass the source-safety report validator.
@@ -150,12 +256,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError("All source representations failed: " + json.dumps(candidate_errors, ensure_ascii=False))
 
             rep = dict(rep)
+            source_metadata = find_source_entry(
+                source_used,
+                path=source_manifest,
+                required=bool(strict_manifest and source_used.suffix.lower() == ".bvh"),
+            )
+            if source_metadata is not None:
+                source_metadata = {
+                    key: value
+                    for key, value in source_metadata.items()
+                    if key not in {"manifest_path", "manifest_sha256"}
+                }
+            cache_provenance = _expected_provenance(
+                source_used,
+                target_fps=float(cfg.target_fps),
+                source_manifest=source_manifest,
+                strict_manifest=strict_manifest,
+            )
             rep.update({
                 "output": str(dst),
                 "source_relative": str(rel.with_suffix(source_used.suffix)),
                 "preferred_source": str(src),
                 "source_used": str(source_used),
                 "representation_fallbacks": candidate_errors,
+                "source_metadata": source_metadata,
+                "cache_provenance": cache_provenance,
                 "v46_53_1_cache_contract": {
                     "schema": SCHEMA,
                     "source_gate": "catastrophic_only",
@@ -167,7 +292,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "smpl_scaling_mode": str(args.smpl_scaling_mode),
                 },
             })
-            valid, reasons = _report_valid(rep)
+            valid, reasons = _report_valid(rep, cache_provenance)
             if not valid:
                 raise RuntimeError(f"Non-formal V46.53.1 report: {reasons}")
             np.save(dst, np.asarray(motion, dtype=np.float32))
@@ -199,6 +324,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "split_feasible": bool(split_ok),
         "allow_partial": bool(allow_partial),
         "canonical_fps": float(cfg.target_fps),
+        "source_manifest": str(source_manifest) if source_manifest else None,
+        "source_manifest_sha256": (
+            manifest_sha256(source_manifest) if source_manifest else None
+        ),
+        "strict_source_manifest": bool(strict_manifest),
         "smpl_scaling_mode": str(args.smpl_scaling_mode),
         "all_ok": bool(all_ok),
         "policy": {

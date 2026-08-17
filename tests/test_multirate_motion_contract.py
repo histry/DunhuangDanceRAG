@@ -115,10 +115,15 @@ class MultirateMotionContractTests(unittest.TestCase):
             "boundary_joint_jerk_max": 700.0,
             "entry_fk_jump": 0.010,
             "exit_fk_jump": 0.010,
+            "entry_fk_jump_max_m": 0.020,
+            "exit_fk_jump_max_m": 0.020,
             "entry_rotation_step_rad": 0.040,
             "exit_rotation_step_rad": 0.040,
             "foot_slip": 0.040,
+            "foot_slip_p95": 0.050,
+            "foot_slip_max": 0.080,
             "foot_penetration": 0.0001,
+            "foot_penetration_max_m": 0.010,
         }
         environment = {
             "V46_46_MAX_BOUNDARY_JERK_MPS3": "800.0",

@@ -11,7 +11,6 @@ from matplotlib import cm
 from matplotlib.colors import ListedColormap
 from pytorch3d.transforms import (axis_angle_to_quaternion, quaternion_apply,
                                   quaternion_multiply)
-from tqdm import tqdm
 from motion_geometry.smpl24 import JOINT_NAMES, OFFSETS, PARENTS
 
 smpl_joints = list(JOINT_NAMES)
@@ -276,7 +275,7 @@ def skeleton_render(
 
         if render:
             Path(os.path.dirname(outname) or ".").mkdir(parents=True, exist_ok=True)
-            out_cmd = os.system(
+            os.system(
                 "ffmpeg -loglevel error -y "
                 f"-i {shlex.quote(videoname)} "
                 f"-i {shlex.quote(audioname)} "

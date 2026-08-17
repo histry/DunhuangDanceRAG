@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np

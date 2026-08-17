@@ -10,7 +10,7 @@ uniform quota, so a genuine climax slot can still allocate more turning events.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 

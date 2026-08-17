@@ -118,7 +118,6 @@ def calibrate(
     source = _array(db, ("source_uids", "source_groups"), np.asarray(["unknown"] * len(labels)))
     loader = _event_motion_loader(db, db_path)
     rng = np.random.default_rng(int(seed))
-    count = len(labels)
     semantic_groups: Dict[str, np.ndarray] = {}
     for semantic in sorted({str(value) for value in labels}):
         coarse = _transition_category(semantic, semantic).split("_to_", 1)[0]

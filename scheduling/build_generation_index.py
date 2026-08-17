@@ -146,6 +146,7 @@ def build_generation_index(
     contract = make_event_db_contract(event_uids)
 
     source_uids = _array(db, "source_uids", count, "unknown")
+    recording_uids = _array(db, "recording_uids", count, "unknown")
     source_files = _array(db, "source_files", count, "")
     starts = _array(db, "starts", count, 0).astype(np.int64)
     ends = _array(db, "ends", count, 0).astype(np.int64)
@@ -318,6 +319,7 @@ def build_generation_index(
                 "pkl": _portable_reference(path),
                 "path": _portable_reference(path),
                 "source_uid": str(source_uids[index]),
+                "recording_uid": str(recording_uids[index]),
                 "source_file": str(source_files[index]),
                 "source_start": int(starts[index]),
                 "source_end": int(ends[index]),

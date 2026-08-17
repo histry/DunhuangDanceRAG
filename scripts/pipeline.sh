@@ -388,6 +388,7 @@ FRESH_ARGS=(
   --candidate_top_k "$V46_51_CANDIDATE_TOP_K"
   --graph_node_top_k "$V46_51_GRAPH_NODE_TOP_K"
   --max_source_share "$V46_54_MAX_SOURCE_SHARE"
+  --max_recording_share "$V46_54_MAX_RECORDING_SHARE"
   --max_pose_hold_ratio "$V46_51_MAX_POSE_HOLD_RATIO"
   --min_unique_events "$V46_51_MIN_UNIQUE_EVENTS"
   --min_core_frame_ratio "$V46_51_MIN_CORE_FRAME_RATIO"
@@ -457,6 +458,7 @@ echo "========== 12. FRESH-WAV CONTRACT RECHECK =========="
   --max_seconds_error "$V46_51_MAX_SECONDS_ERROR" \
   --max_pose_hold_ratio "$V46_51_MAX_POSE_HOLD_RATIO" \
   --max_single_source_ratio "$V46_54_MAX_SOURCE_SHARE" \
+  --max_single_recording_ratio "$V46_54_MAX_RECORDING_SHARE" \
   --min_unique_events "$V46_51_MIN_UNIQUE_EVENTS" \
   --min_core_frame_ratio "$V46_51_MIN_CORE_FRAME_RATIO" \
   --out "$OUT_ROOT/fresh_schedule.contract.json" \
@@ -489,6 +491,7 @@ if [[ "${V46_53_GROUNDER_ARCHITECTURE:-legacy}" == "mixed" ]]; then
     --max_seconds_error "$V46_51_MAX_SECONDS_ERROR" \
     --max_pose_hold_ratio "$V46_51_MAX_POSE_HOLD_RATIO" \
     --max_single_source_ratio "$V46_54_MAX_SOURCE_SHARE" \
+    --max_single_recording_ratio "$V46_54_MAX_RECORDING_SHARE" \
     --min_unique_events "$V46_51_MIN_UNIQUE_EVENTS" \
     --min_core_frame_ratio "$V46_51_MIN_CORE_FRAME_RATIO" \
     --out "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.json" \

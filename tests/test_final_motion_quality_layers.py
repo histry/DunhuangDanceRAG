@@ -48,10 +48,15 @@ def _safe_boundary_risk() -> dict[str, float]:
         "boundary_joint_jerk_max": 100.0,
         "entry_fk_jump": 0.005,
         "exit_fk_jump": 0.005,
+        "entry_fk_jump_max_m": 0.010,
+        "exit_fk_jump_max_m": 0.010,
         "entry_rotation_step_rad": 0.02,
         "exit_rotation_step_rad": 0.02,
         "foot_slip": 0.01,
+        "foot_slip_p95": 0.02,
+        "foot_slip_max": 0.03,
         "foot_penetration": 0.0001,
+        "foot_penetration_max_m": 0.005,
     }
 
 
@@ -97,6 +102,46 @@ def test_stable_identity_motion_passes_all_physical_layers():
     assert all(layer["ok"] for layer in decision["layers"].values())
 
 
+def test_raw_rot6d_degeneracy_is_not_hidden_by_so3_projection():
+    motion = _identity_motion(60)
+    motion[20, 7:13] = 0.0
+
+    report = motion_physical_metrics_np(motion, fps=30.0)
+    decision = evaluate_physical_audit(report)
+
+    assert report["rot6d_degenerate_ratio"] > 0.0
+    assert decision["layers"]["rotation_quality"]["ok"] is False
+    assert "rot6d_degenerate_ratio_too_high" in decision["reasons"]
+
+
+def test_whole_sequence_so3_step_gate_catches_non_boundary_snap():
+    motion = _identity_motion(90)
+    matrices = np.broadcast_to(
+        np.eye(3, dtype=np.float32),
+        (90, 24, 3, 3),
+    ).copy()
+    matrices[45:, 20] = so3_exp_np(
+        np.asarray([[0.0, 0.0, 1.8]], dtype=np.float32)
+    )[0]
+    motion[:, 7:151] = matrix_to_rot6d_np(matrices).reshape(90, -1)
+
+    report = motion_physical_metrics_np(motion, fps=30.0)
+    decision = evaluate_physical_audit(report)
+
+    assert report["joint_rotation_step_rad_max"] > 1.2
+    assert decision["layers"]["rotation_quality"]["ok"] is False
+
+
+def test_root_vertical_metrics_are_required_fail_closed():
+    report = motion_physical_metrics_np(_identity_motion(60), fps=30.0)
+    del report["root_vertical_speed_mps_max"]
+
+    decision = evaluate_physical_audit(report)
+
+    assert decision["ok"] is False
+    assert "missing_or_nonfinite:root_vertical_speed_mps_max" in decision["reasons"]
+
+
 def test_fast_low_foot_slide_cannot_hide_by_clearing_contact_labels():
     fps = 30.0
     motion = _identity_motion(61)
@@ -127,6 +172,54 @@ def test_boundary_foot_slip_proxy_is_also_speed_independent():
     )
 
     assert risk["foot_slip"] > 0.60
+
+
+def test_boundary_foot_slip_includes_bridge_entry_and_exit_steps():
+    fps = 30.0
+    previous = _identity_motion(4)
+    transition = _identity_motion(3)
+    following = _identity_motion(4)
+    transition[:, 4] = 0.10
+    following[:, 4] = 0.10
+
+    risk = transition_risk(previous, transition, following, fps=fps)
+
+    assert risk["foot_slip_p95"] > 2.0
+    assert risk["foot_slip_max"] > 2.0
+
+
+def test_direct_join_is_measured_instead_of_returning_a_sentinel():
+    motion = _identity_motion(8)
+
+    risk = transition_risk(
+        motion[:4],
+        np.zeros((0, MOTION_DIM), dtype=np.float32),
+        motion[4:],
+        fps=30.0,
+    )
+
+    assert np.isfinite(risk["total"])
+    assert risk["total"] < 1.0e8
+    assert risk["entry_fk_jump_max_m"] == 0.0
+    assert risk["foot_slip_max"] == 0.0
+
+
+def test_boundary_peak_metrics_cannot_hide_behind_safe_means():
+    risk = _safe_boundary_risk()
+    risk["entry_fk_jump"] = 0.005
+    risk["entry_fk_jump_max_m"] = 0.080
+    risk["foot_slip"] = 0.01
+    risk["foot_slip_p95"] = 0.05
+    risk["foot_slip_max"] = 0.50
+
+    decision = evaluate_boundary_continuity(
+        [{"slot": 1, "risk": risk}],
+        expected_boundaries=1,
+    )
+
+    assert decision["ok"] is False
+    assert any("entry_fk_joint_jump_max_m_too_high" in x for x in decision["reasons"])
+    assert any("foot_slip_peak_mps_too_high" in x for x in decision["reasons"])
 
 
 def test_boundary_jerk_uses_true_joint_max_not_joint_average():

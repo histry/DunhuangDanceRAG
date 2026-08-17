@@ -543,7 +543,6 @@ def _scarcity_scale(
     enabled: bool,
 ) -> tuple[bool, bool, float, float, float]:
     safe_count = len(safe_counts)
-    all_count = len(all_counts)
     safe_norm = _normalized_entropy(safe_counts)
     all_norm = _normalized_entropy(all_counts)
     alternative = safe_count >= int(minimum_count)
