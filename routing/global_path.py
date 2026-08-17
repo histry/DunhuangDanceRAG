@@ -888,8 +888,25 @@ def _install_global_path_patches() -> None:
         reordered = _global_route_preorder(slots, candidate_lists, db, banned=banned)
         return original_assemble(motion_runtime, slots, reordered, db, cfg, banned=banned)
 
-    def apply_global_route_guard(motion_runtime: Any, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: Any, cfg: Any):
-        proposal_motion, stage = original_apply(motion_runtime, motion_ref, cond, seam_mask, args, cfg)
+    def apply_global_route_guard(
+        motion_runtime: Any,
+        motion_ref: np.ndarray,
+        cond: np.ndarray,
+        seam_mask: np.ndarray,
+        args: Any,
+        cfg: Any,
+        *,
+        sliding_support_eligible: Optional[np.ndarray] = None,
+    ):
+        proposal_motion, stage = original_apply(
+            motion_runtime,
+            motion_ref,
+            cond,
+            seam_mask,
+            args,
+            cfg,
+            sliding_support_eligible=sliding_support_eligible,
+        )
         if not _env_bool("GROUNDING_BODY_PART_MASK_ENABLE", True):
             return proposal_motion, stage
         masks = build_frame_joint_risk_mask(
@@ -1032,7 +1049,11 @@ def _install_global_path_patches() -> None:
             stage_name="routing_safety_post_merge_physical_rollback",
             reference=proposal_motion,
             candidate=merged,
-            audit_fn=lambda value: motion_runtime.audit_motion_np(value, cfg),
+            audit_fn=lambda value: motion_runtime.audit_motion_np(
+                value,
+                cfg,
+                sliding_support_eligible=sliding_support_eligible,
+            ),
             limits=PhysicalQualityLimits.from_environment(),
             rollback_enabled=_env_bool("ROUTING_SAFETY_FINAL_PHYSICAL_ROLLBACK", True),
         )

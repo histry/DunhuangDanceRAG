@@ -1412,15 +1412,25 @@ def apply_generators_with_heading_guard(
     seam_mask: np.ndarray,
     args: Any,
     cfg: Any,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Refiner/diffusion edit seams; planner root heading remains authoritative."""
     stage: Dict[str, Any] = {}
     motion = np.asarray(motion_ref, dtype=np.float32).copy()
-    stage["pre_refine_audit"] = (
-        motion_runtime.audit_motion_np(motion, cfg)
-        if hasattr(motion_runtime, "audit_motion_np")
-        else {}
-    )
+
+    def physical_audit(value: np.ndarray) -> Dict[str, Any]:
+        if not hasattr(motion_runtime, "audit_motion_np"):
+            return {}
+        return dict(
+            motion_runtime.audit_motion_np(
+                value,
+                cfg,
+                sliding_support_eligible=sliding_support_eligible,
+            )
+        )
+
+    stage["pre_refine_audit"] = physical_audit(motion)
     stage["motion_activity_retrieval"] = save_stage_snapshot(
         getattr(args, "out", None),
         "retrieval",
@@ -1438,11 +1448,7 @@ def apply_generators_with_heading_guard(
             getattr(args, "refiner", None),
             cfg,
         )
-        stage["boundary_refiner_audit"] = (
-            motion_runtime.audit_motion_np(motion, cfg)
-            if hasattr(motion_runtime, "audit_motion_np")
-            else {}
-        )
+        stage["boundary_refiner_audit"] = physical_audit(motion)
     stage["motion_activity_refiner"] = save_stage_snapshot(
         getattr(args, "out", None),
         "refiner",
@@ -1460,11 +1466,7 @@ def apply_generators_with_heading_guard(
             getattr(args, "diffusion", None),
             cfg,
         )
-        stage["motion_diffusion_audit"] = (
-            motion_runtime.audit_motion_np(motion, cfg)
-            if hasattr(motion_runtime, "audit_motion_np")
-            else {}
-        )
+        stage["motion_diffusion_audit"] = physical_audit(motion)
     stage["motion_activity_diffusion"] = save_stage_snapshot(
         getattr(args, "out", None),
         "diffusion",
@@ -1512,11 +1514,7 @@ def apply_generators_with_heading_guard(
         motion,
         fps=float(getattr(cfg, "fps", 30.0)),
     )
-    stage["final_audit"] = (
-        motion_runtime.audit_motion_np(motion, cfg)
-        if hasattr(motion_runtime, "audit_motion_np")
-        else {}
-    )
+    stage["final_audit"] = physical_audit(motion)
     stage["final_physical_gate"] = base.physical_quality_gate(stage["final_audit"])
     stage["motion_activity_full_ik"] = save_stage_snapshot(
         getattr(args, "out", None),
@@ -1525,7 +1523,6 @@ def apply_generators_with_heading_guard(
         fps=float(getattr(cfg, "fps", 30.0)),
     )
     return motion.astype(np.float32), stage
-
 
 def _patch_final_report(args: Any) -> None:
     path = Path(

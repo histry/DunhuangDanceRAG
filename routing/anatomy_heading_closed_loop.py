@@ -353,8 +353,25 @@ def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
     return np.convolve(m.astype(np.int32), kernel, mode="same") > 0
 
 
-def _apply_heading_generators(motion_runtime: Any, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: Any, cfg: Any):
-    motion, stage = _ORIG_APPLY(motion_runtime, motion_ref, cond, seam_mask, args, cfg)
+def _apply_heading_generators(
+    motion_runtime: Any,
+    motion_ref: np.ndarray,
+    cond: np.ndarray,
+    seam_mask: np.ndarray,
+    args: Any,
+    cfg: Any,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
+):
+    motion, stage = _ORIG_APPLY(
+        motion_runtime,
+        motion_ref,
+        cond,
+        seam_mask,
+        args,
+        cfg,
+        sliding_support_eligible=sliding_support_eligible,
+    )
     ref_metrics = anatomy_metrics_np(motion_ref, fps=float(getattr(cfg, "fps", 30.0)))
     out_metrics = anatomy_metrics_np(motion, fps=float(getattr(cfg, "fps", 30.0)))
     out_ok, out_reasons = evaluate_anatomy_contract(out_metrics, AnatomyThresholds.from_env())
@@ -397,13 +414,17 @@ def _apply_heading_generators(motion_runtime: Any, motion_ref: np.ndarray, cond:
         raise RuntimeError(
             "Anatomy-Heading anatomy rollback requires audit_motion_np for final gating"
         )
-    # The anatomy rollback can replace frames after Event-Heading's audit.  Always
+    # The anatomy rollback can replace frames after Event-Heading's audit. Always
     # audit the exact array returned downstream, including full rollbacks.
     motion, physical_rollback = select_physical_candidate(
         stage_name="routing_safety_final_physical_rollback",
         reference=motion_ref,
         candidate=motion,
-        audit_fn=lambda value: motion_runtime.audit_motion_np(value, cfg),
+        audit_fn=lambda value: motion_runtime.audit_motion_np(
+            value,
+            cfg,
+            sliding_support_eligible=sliding_support_eligible,
+        ),
         limits=PhysicalQualityLimits.from_environment(),
         rollback_enabled=env_bool("ROUTING_SAFETY_FINAL_PHYSICAL_ROLLBACK", True),
     )
@@ -413,7 +434,6 @@ def _apply_heading_generators(motion_runtime: Any, motion_ref: np.ndarray, cond:
     stage["final_audit"] = selected_audit
     stage["final_physical_gate"] = selected_gate
     return motion.astype(np.float32), stage
-
 
 def _install_patches() -> None:
     if not hasattr(base, "_RETARGET_ORIG_BUILD_BRIDGE"):

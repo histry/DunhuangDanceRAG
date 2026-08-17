@@ -681,16 +681,60 @@ def make_seam_mask(motion_runtime, T: int, transition_spans: Sequence[Sequence[i
     return finish(mask, centers, "boundary_closed_loop_local_fallback_boundary_mask")
 
 
-def compute_condition(slot_feat: np.ndarray, db: Dict[str, Any]) -> np.ndarray:
-    cond = np.mean(np.asarray(slot_feat, dtype=np.float32), axis=0).astype(np.float32)
-    try:
-        mean = np.asarray(db["desc_mean"], dtype=np.float32)[0]
-        std = np.asarray(db["desc_std"], dtype=np.float32)[0]
-        cond = (cond - mean) / np.maximum(std, 1e-6)
-    except Exception:
-        pass
-    return cond.astype(np.float32)
+def compute_condition(
+    motion_runtime: Any,
+    slot_feat: np.ndarray,
+    assembly_report: Sequence[Dict[str, Any]],
+    total_frames: int,
+    db: Dict[str, Any],
+) -> np.ndarray:
+    """Build frame-local music conditioning for one assembled motion stream.
 
+    The closed-loop scheduler may reselect events and therefore change transition
+    spans between rounds. Conditioning is rebuilt after each assembly using the
+    same authoritative helper as the direct Motion Generation entrypoint.
+    """
+    if not hasattr(motion_runtime, "build_frame_local_conditioning"):
+        raise RuntimeError(
+            "Closed-loop Generation requires "
+            "training.motion_models.build_frame_local_conditioning"
+        )
+
+    features = np.asarray(slot_feat, dtype=np.float32)
+    if features.ndim != 2:
+        raise ValueError(f"slot_feat must be [S,C], got {features.shape}")
+    if features.shape[0] != len(assembly_report):
+        raise RuntimeError(
+            "slot feature/assembly report count mismatch: "
+            f"{features.shape[0]} features vs {len(assembly_report)} reports"
+        )
+
+    try:
+        descriptor_mean = np.asarray(db["desc_mean"], dtype=np.float32).reshape(-1)
+        descriptor_std = np.asarray(db["desc_std"], dtype=np.float32).reshape(-1)
+    except KeyError as exc:
+        raise RuntimeError(
+            "Closed-loop frame-local conditioning requires desc_mean and desc_std "
+            "from the Generation Event-DB"
+        ) from exc
+
+    condition = motion_runtime.build_frame_local_conditioning(
+        features,
+        assembly_report,
+        total_frames=int(total_frames),
+        descriptor_mean=descriptor_mean,
+        descriptor_std=descriptor_std,
+    )
+    condition = np.asarray(condition, dtype=np.float32)
+    expected_shape = (int(total_frames), int(features.shape[1]))
+    if condition.shape != expected_shape:
+        raise RuntimeError(
+            "frame-local conditioning shape mismatch: "
+            f"expected {expected_shape}, got {condition.shape}"
+        )
+    if not np.isfinite(condition).all():
+        raise RuntimeError("frame-local conditioning contains non-finite values")
+    return condition.astype(np.float32)
 
 def sliding_support_eligibility(
     db: Dict[str, Any],
@@ -1155,7 +1199,6 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             pass
 
     db, _contrastive, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(motion_runtime, args, cfg)
-    cond = compute_condition(slot_feat, db)
 
     banned: Dict[int, set] = {}
     rounds: List[Dict[str, Any]] = []
@@ -1165,6 +1208,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
 
     for round_id in range(max_rounds + 1):
         motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(motion_runtime, slots, candidate_lists, db, cfg, banned=banned)
+        cond = compute_condition(
+            motion_runtime,
+            slot_feat,
+            assembly_report,
+            motion_ref.shape[0],
+            db,
+        )
         transition_spans = transition_spans_from_report(assembly_report)
         seam_mask, seam_positions, mask_policy = make_seam_mask(motion_runtime, motion_ref.shape[0], transition_spans, cfg)
         slide_eligible, slide_report = sliding_support_eligibility(
@@ -1182,6 +1232,15 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             sliding_support_eligible=slide_eligible,
         )
         stage_reports["sliding_support_eligibility"] = slide_report
+        stage_reports["neural_music_conditioning"] = {
+            "mode": "frame_local_slot_conditioning",
+            "shape": list(cond.shape),
+            "slot_count": int(len(slots)),
+            "recomputed_after_each_reselection": True,
+            "transition_policy": "linear_previous_to_current_slot_descriptor",
+            "normalization": "generation_event_db_descriptor_coordinates",
+            "whole_song_mean_conditioning": False,
+        }
         boundary_rows = audit_boundaries(motion_runtime, motion, assembly_report, cfg)
         unsafe_rows = [r for r in boundary_rows if not bool(r.get("safe"))]
         round_summary = {
