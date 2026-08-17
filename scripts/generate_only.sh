@@ -5,6 +5,10 @@ ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$ROOT_DIR"
+if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source configs/experiment.env
+fi
 
 AUDIO="${1:?Usage: generate_only.sh AUDIO [TRAINED_RUN_ROOT] [PERFORMER_GROUP]}"
 TRAINED_RUN="${2:-${TRAINED_RUN_ROOT:-}}"

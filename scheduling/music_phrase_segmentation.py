@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from scheduling.audio_features import extract_audio_features
+from scheduling.audio_features import extract_audio_features, validate_rhythm_features
 from scheduling.music_event_calibration import build_phrase_query as calibrated_phrase_query
 
 
@@ -118,6 +118,7 @@ def whole_song_features(
     fps: float = 30.0,
     cache_dir: str | Path | None = None,
     max_seconds: float = 0.0,
+    require_rhythm: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     duration = audio_duration_seconds(audio_path)
     if max_seconds > 0:
@@ -135,9 +136,20 @@ def whole_song_features(
             features = np.load(cache_path).astype(np.float32)
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             if features.shape == (num_frames, 12):
+                extractor_meta = meta.setdefault("extractor", {})
+                validate_rhythm_features(
+                    features,
+                    extractor_meta,
+                    require_rhythm=require_rhythm,
+                )
+                meta["require_rhythm_features"] = bool(require_rhythm)
                 return features, meta
 
-    features, extractor_meta = extract_audio_features(audio_path, num_frames=num_frames)
+    features, extractor_meta = extract_audio_features(
+        audio_path,
+        num_frames=num_frames,
+        require_rhythm=require_rhythm,
+    )
     meta = {
         "audio": str(audio_path),
         "duration_sec": float(duration),
@@ -145,6 +157,7 @@ def whole_song_features(
         "num_frames": int(num_frames),
         "feature_dim": int(features.shape[1]),
         "extractor": extractor_meta,
+        "require_rhythm_features": bool(require_rhythm),
     }
     if cache_path is not None and meta_path is not None:
         np.save(cache_path, features.astype(np.float32))
@@ -630,6 +643,7 @@ def main() -> None:
     parser.add_argument("--beat_snap_seconds", type=float, default=0.35)
     parser.add_argument("--cache_dir", default="")
     parser.add_argument("--max_seconds", type=float, default=0.0)
+    parser.add_argument("--require_rhythm_features", action="store_true")
     args = parser.parse_args()
 
     features, audio_meta = whole_song_features(
@@ -637,6 +651,7 @@ def main() -> None:
         fps=args.fps,
         cache_dir=args.cache_dir or None,
         max_seconds=args.max_seconds,
+        require_rhythm=bool(args.require_rhythm_features),
     )
     phrases, segmentation = segment_music_phrases(
         features,

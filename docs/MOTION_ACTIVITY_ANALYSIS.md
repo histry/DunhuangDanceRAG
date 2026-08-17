@@ -25,8 +25,9 @@ parallel V-numbered pipeline:
   - evaluates whole-song and per-slot activity after the physical gate;
   - writes the NPY and diagnostic JSON first, then fails the run when collapse is
     detected so a static result cannot be silently accepted.
-- `configs/research.env`
-  - receives stable `MOTION_ACTIVITY_*` thresholds.
+- `configs/experiment.env`
+  - is the only public configuration entry and exposes stable
+    `MOTION_ACTIVITY_*` thresholds.
 
 The new analysis implementation is stored in
 `evaluation/motion_activity_analysis.py`, following the project's scientific

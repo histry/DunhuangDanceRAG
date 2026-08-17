@@ -116,6 +116,9 @@ def convert_report_to_descriptor(report_path: Path, args: argparse.Namespace) ->
         "raw_schedule_json": str(report_path),
         "event_db_contract": dict(report.get("event_db_contract", {})),
         "transition_budget": dict(report.get("transition_budget", {})),
+        "music_independent_hard_constraints": dict(
+            report.get("music_independent_hard_constraints", {})
+        ),
         "schedule_summary_json": str(Path(args.schedule_dir) / "V26_WHOLE_SONG_SUMMARY.json"),
         "provenance": {
             "builder": "scheduling.music_slot_descriptor",

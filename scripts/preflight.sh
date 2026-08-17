@@ -8,7 +8,9 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
-source configs/paths.env
-source configs/experiment.env
+if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source configs/experiment.env
+fi
 mkdir -p outputs/preflight
 exec "$PYTHON_BIN" evaluation/preflight.py   --root "$PROJECT_ROOT"   --audio "$TEST_AUDIO"   --music_dir "$TRAIN_MUSIC_DIR"   --change_dir "$BVH_DATASET_DIR"   --out outputs/preflight/report.json

@@ -78,6 +78,13 @@ from scheduling.music_phrase_segmentation import (
     whole_song_features,
 )
 from scheduling.deep_music_features import phrase_semantic_matrix
+from scheduling.schedule_hard_constraints import (
+    DEFAULT_MAX_POSE_HOLD_RATIO,
+    DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    DEFAULT_MIN_CORE_FRAME_RATIO,
+    DEFAULT_MIN_UNIQUE_EVENTS,
+    assert_schedule_hard_constraints,
+)
 from scheduling.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
 from support.scheduler_checkpoint_contracts import assert_scheduler_checkpoint_contract
 from motion_geometry.heading import ROOT_ROT6D, root_yaw_np, yaw_speed_dps_np
@@ -887,6 +894,7 @@ def generate_one(
         fps=args.fps,
         cache_dir=args.feature_dir,
         max_seconds=args.max_seconds,
+        require_rhythm=bool(args.require_rhythm_features),
     )
     source_phrases, segmentation = segment_music_phrases(
         features,
@@ -987,6 +995,25 @@ def generate_one(
         music_content_targets=music_content_targets,
         allow_music_bound_override=args.allow_music_bound_override,
         lock_music_boundaries=args.lock_music_boundaries,
+    )
+
+    schedule_rows: List[Dict[str, Any]] = []
+    for slot, part in enumerate(selected_state.parts):
+        merged = dict(part)
+        if slot < len(slot_expansion.get("slot_meta", [])):
+            merged["slot_meta"] = slot_expansion["slot_meta"][slot]
+        merged["allocated_content_len"] = int(allocation["content_lengths"][slot])
+        merged["allocated_phrase_total"] = int(
+            allocation["phrase_total_lengths"][slot]
+        )
+        merged["time_warp_ratio"] = float(allocation["warp_ratios"][slot])
+        schedule_rows.append(merged)
+    hard_constraint_report = assert_schedule_hard_constraints(
+        schedule_rows,
+        max_pose_hold_ratio=float(args.max_pose_hold_ratio),
+        max_single_source_ratio=float(args.max_source_share),
+        min_unique_events=int(args.min_unique_events),
+        min_core_frame_ratio=float(args.min_core_frame_ratio),
     )
 
     contents: List[np.ndarray] = []
@@ -1178,7 +1205,8 @@ def generate_one(
         "event_db_contract": dict(getattr(args, "event_db_contract", {})),
         "transition_budget": transition_budget,
         "score": selected_state.score,
-        "schedule": [],
+        "schedule": schedule_rows,
+        "music_independent_hard_constraints": hard_constraint_report,
         "boundary_metrics": boundary_reports,
         "timing_policy": {
             "hierarchical_retrieval": bool(args.hierarchical_retrieval),
@@ -1189,6 +1217,7 @@ def generate_one(
             "deep_music_model": str(args.deep_music_model),
             "deep_music_weight": float(args.deep_music_weight),
             "require_deep_music": bool(args.require_deep_music),
+            "require_rhythm_features": bool(args.require_rhythm_features),
             "deep_music_min_success": float(args.deep_music_min_success),
             "graph_node_top_k": int(args.graph_node_top_k),
             "graph_edge_weight": float(args.graph_edge_weight),
@@ -1235,21 +1264,18 @@ def generate_one(
             "max_single_event_seconds": float(args.max_single_event_seconds),
             "calm_max_single_event_seconds": float(args.calm_max_single_event_seconds),
             "anti_static_weight": float(args.anti_static_weight),
+            "max_pose_hold_ratio": float(args.max_pose_hold_ratio),
+            "max_single_source_ratio": float(args.max_source_share),
+            "min_unique_events": int(args.min_unique_events),
+            "min_core_frame_ratio": float(args.min_core_frame_ratio),
             "transition_diffusion": bool(args.transition_diffusion),
             "transition_diffusion_ckpt": str(args.transition_diffusion_ckpt),
             "transition_diffusion_blend": float(args.transition_diffusion_blend),
             "transition_diffusion_steps": int(args.transition_diffusion_steps),
         },
     }
-    for slot, part in enumerate(selected_state.parts):
-        merged = dict(part)
-        if slot < len(slot_expansion.get("slot_meta", [])):
-            merged["slot_meta"] = slot_expansion["slot_meta"][slot]
-        merged["allocated_content_len"] = int(allocation["content_lengths"][slot])
-        merged["allocated_phrase_total"] = int(allocation["phrase_total_lengths"][slot])
-        merged["time_warp_ratio"] = float(allocation["warp_ratios"][slot])
-        merged["resampling"] = resampling_reports[slot]
-        report["schedule"].append(merged)
+    for slot, resampling in enumerate(resampling_reports):
+        report["schedule"][slot]["resampling"] = resampling
     return motion, report
 
 
@@ -1307,6 +1333,7 @@ def main() -> None:
     parser.add_argument("--deep_music_model", default="clap")
     parser.add_argument("--deep_music_weight", type=float, default=0.25)
     parser.add_argument("--require_deep_music", type=_bool_arg, default=False)
+    parser.add_argument("--require_rhythm_features", type=_bool_arg, default=False)
     parser.add_argument("--deep_music_min_success", type=float, default=0.80)
     parser.add_argument("--graph_scheduler", type=_bool_arg, default=True)
     parser.add_argument("--graph_node_top_k", type=int, default=96)
@@ -1344,8 +1371,25 @@ def main() -> None:
     parser.add_argument("--family_repeat_weight", type=float, default=0.58)
     parser.add_argument("--source_repeat_weight", type=float, default=0.18)
     parser.add_argument("--max_source_run", type=int, default=2)
-    parser.add_argument("--max_source_share", type=float, default=0.40)
+    parser.add_argument(
+        "--max_source_share",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    )
     parser.add_argument("--min_source_share_slots", type=int, default=6)
+    parser.add_argument(
+        "--max_pose_hold_ratio",
+        type=float,
+        default=DEFAULT_MAX_POSE_HOLD_RATIO,
+    )
+    parser.add_argument(
+        "--min_unique_events", type=int, default=DEFAULT_MIN_UNIQUE_EVENTS
+    )
+    parser.add_argument(
+        "--min_core_frame_ratio",
+        type=float,
+        default=DEFAULT_MIN_CORE_FRAME_RATIO,
+    )
     parser.add_argument("--hard_family_unique", action="store_true")
     parser.add_argument("--global_music_weight", type=float, default=1.60)
     parser.add_argument("--global_natural_weight", type=float, default=0.85)

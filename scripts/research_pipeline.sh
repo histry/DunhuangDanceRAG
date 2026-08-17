@@ -8,28 +8,19 @@ export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$ROOT_DIR"
 
-[[ -f configs/scheduler.env ]] || {
-  echo "[FATAL] Missing configs/scheduler.env" >&2; exit 2;
-}
-[[ -f configs/research.env ]] || {
-  echo "[FATAL] Missing configs/research.env" >&2; exit 2;
+[[ -f configs/experiment.env ]] || {
+  echo "[FATAL] Missing configs/experiment.env" >&2; exit 2;
 }
 [[ -f scripts/pipeline.sh ]] || {
   echo "[FATAL] Missing preserved V46.51 base launcher" >&2; exit 2;
 }
 
-# Load legacy profiles first when present, then apply the authoritative V46.53.1
-# profile. Repeated sourcing in the preserved base becomes harmless because the
-# repaired code reads V46.53.1 values and this profile is exported to child shells.
-# shellcheck disable=SC1091
-source configs/scheduler.env
-[[ -f configs/anatomy.env ]] && source configs/anatomy.env
-[[ -f configs/geometry.env ]] && source configs/geometry.env
-# shellcheck disable=SC1091
-source configs/research.env
-[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
-
-[[ -f "$ROOT_DIR/configs/performer_policy.env" ]] && source "$ROOT_DIR/configs/performer_policy.env"
+# experiment.env is the only public configuration entry. Nested launchers skip
+# reloading it through EXPERIMENT_CONFIG_LOADED.
+if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source configs/experiment.env
+fi
 
 if [[ $# -ge 1 && -n "${1:-}" ]]; then
   export AUDIO="$(realpath "$1")"

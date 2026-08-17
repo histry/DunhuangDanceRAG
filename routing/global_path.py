@@ -62,6 +62,12 @@ from contracts.duration import audit_dynamic_duration, save_duration_report
 from motion_geometry.product_manifold import (
     riemannian_trust_region_refine_np,
 )
+from scheduling.schedule_hard_constraints import (
+    DEFAULT_MAX_POSE_HOLD_RATIO,
+    DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    DEFAULT_MIN_CORE_FRAME_RATIO,
+    DEFAULT_MIN_UNIQUE_EVENTS,
+)
 
 SCHEMA = "v46_53_geometry_probabilistic_eventrag_closed_loop"
 # Cross-module edge contract.  The numerical implementation lives in
@@ -1108,6 +1114,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_frame_error=int(float(os.environ.get("V46_51_MAX_FRAME_ERROR", "2"))),
         max_seconds_error=float(os.environ.get("V46_51_MAX_SECONDS_ERROR", "0.10")),
         require_raw_report=True,
+        max_pose_hold_ratio=_env_float(
+            "V46_51_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
+        ),
+        max_single_source_ratio=_env_float(
+            "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+        ),
+        min_unique_events=_env_int(
+            "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
+        ),
+        min_core_frame_ratio=_env_float(
+            "V46_51_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
+        ),
     )
     v52.save_json(contract, Path(schedule).with_suffix(Path(schedule).suffix + ".pre_generate_contract.json"))
     if not contract["ok"]:

@@ -9,9 +9,10 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$ROOT_DIR"
 
-source configs/scheduler.env
-source configs/anatomy.env
-[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
+if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source configs/experiment.env
+fi
 
 PY="${V46_51_PYTHON}"
 [[ -x "$PY" ]] || {
@@ -386,6 +387,10 @@ FRESH_ARGS=(
   --beam_size "$V46_51_BEAM_SIZE"
   --candidate_top_k "$V46_51_CANDIDATE_TOP_K"
   --graph_node_top_k "$V46_51_GRAPH_NODE_TOP_K"
+  --max_source_share "$V46_54_MAX_SOURCE_SHARE"
+  --max_pose_hold_ratio "$V46_51_MAX_POSE_HOLD_RATIO"
+  --min_unique_events "$V46_51_MIN_UNIQUE_EVENTS"
+  --min_core_frame_ratio "$V46_51_MIN_CORE_FRAME_RATIO"
   --physical_edge_weight "$V46_54_PHYSICAL_EDGE_WEIGHT"
   --physical_edge_reset_accent "$V46_54_PHYSICAL_EDGE_RESET_ACCENT"
   --root_height_gap_reference_m "$V46_54_ROOT_HEIGHT_GAP_REFERENCE_M"
@@ -424,6 +429,8 @@ fi
   FRESH_ARGS+=(--deep_music_features)
 [[ "$V46_51_REQUIRE_DEEP_MUSIC" == "1" ]] && \
   FRESH_ARGS+=(--require_deep_music)
+[[ "$V46_51_REQUIRE_RHYTHM_FEATURES" == "1" ]] && \
+  FRESH_ARGS+=(--require_rhythm_features)
 FRESH_ARGS+=(--deep_music_model "$V46_51_DEEP_MUSIC_MODEL")
 FRESH_ARGS+=(--deep_music_min_success "$V46_51_DEEP_MUSIC_MIN_SUCCESS")
 
@@ -448,6 +455,10 @@ echo "========== 12. FRESH-WAV CONTRACT RECHECK =========="
   --fps "$V46_51_FPS" \
   --max_frame_error "$V46_51_MAX_FRAME_ERROR" \
   --max_seconds_error "$V46_51_MAX_SECONDS_ERROR" \
+  --max_pose_hold_ratio "$V46_51_MAX_POSE_HOLD_RATIO" \
+  --max_single_source_ratio "$V46_54_MAX_SOURCE_SHARE" \
+  --min_unique_events "$V46_51_MIN_UNIQUE_EVENTS" \
+  --min_core_frame_ratio "$V46_51_MIN_CORE_FRAME_RATIO" \
   --out "$OUT_ROOT/fresh_schedule.contract.json" \
   --csv "$OUT_ROOT/fresh_schedule.contract.csv"
 
@@ -476,6 +487,10 @@ if [[ "${V46_53_GROUNDER_ARCHITECTURE:-legacy}" == "mixed" ]]; then
     --fps "$V46_51_FPS" \
     --max_frame_error "$V46_51_MAX_FRAME_ERROR" \
     --max_seconds_error "$V46_51_MAX_SECONDS_ERROR" \
+    --max_pose_hold_ratio "$V46_51_MAX_POSE_HOLD_RATIO" \
+    --max_single_source_ratio "$V46_54_MAX_SOURCE_SHARE" \
+    --min_unique_events "$V46_51_MIN_UNIQUE_EVENTS" \
+    --min_core_frame_ratio "$V46_51_MIN_CORE_FRAME_RATIO" \
     --out "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.json" \
     --csv "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.csv"
   ROUTING_MSSD="$MIXED_MSSD"

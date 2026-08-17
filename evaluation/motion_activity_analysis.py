@@ -26,6 +26,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from contracts.gravity import fk24_from_local_np
+from motion_geometry.smpl24 import JOINT_NAMES
+
 try:
     from motion_geometry.rotations import (
         angular_velocity_np as _repository_angular_velocity,
@@ -41,6 +44,26 @@ ROOT_SLICE = slice(4, 7)
 ROT6D_SLICE = slice(7, 151)
 NUM_JOINTS = 24
 EPS = 1.0e-8
+VISIBLE_JOINT_NAMES = (
+    "lknee",
+    "rknee",
+    "lankle",
+    "rankle",
+    "ltoes",
+    "rtoes",
+    "neck",
+    "head",
+    "lshoulder",
+    "rshoulder",
+    "lelbow",
+    "relbow",
+    "lwrist",
+    "rwrist",
+    "lhand",
+    "rhand",
+)
+VISIBLE_JOINT_INDICES = tuple(JOINT_NAMES.index(name) for name in VISIBLE_JOINT_NAMES)
+VISIBLE_ACTIVITY_TOP_K = 4
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -159,12 +182,58 @@ def _longest_true_streak(mask: np.ndarray) -> Tuple[int, int, int]:
     return best_end - best_start, best_start, best_end
 
 
+def _top_k_mean(values: np.ndarray, k: int = VISIBLE_ACTIVITY_TOP_K) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    if array.ndim < 1 or array.shape[-1] == 0:
+        return np.zeros(array.shape[:-1], dtype=np.float32)
+    count = min(max(1, int(k)), array.shape[-1])
+    return np.sort(array, axis=-1)[..., -count:].mean(axis=-1).astype(np.float32)
+
+
+def _window_motion_amplitudes(
+    visible_positions: np.ndarray,
+    *,
+    fps: float,
+    window_seconds: float,
+    hop_seconds: float,
+) -> Tuple[np.ndarray, List[List[int]]]:
+    """Return top-visible-joint displacement amplitude for sliding windows."""
+    positions = np.asarray(visible_positions, dtype=np.float32)
+    frames = len(positions)
+    if frames == 0:
+        return np.zeros((0,), dtype=np.float32), []
+    window = min(
+        frames,
+        max(2, int(round(max(float(window_seconds), 1.0 / fps) * fps))),
+    )
+    hop = max(1, int(round(max(float(hop_seconds), 1.0 / fps) * fps)))
+    if frames <= window:
+        starts = [0]
+    else:
+        starts = list(range(0, frames - window + 1, hop))
+        final_start = frames - window
+        if starts[-1] != final_start:
+            starts.append(final_start)
+
+    amplitudes: List[float] = []
+    spans: List[List[int]] = []
+    for start in starts:
+        end = min(frames, start + window)
+        segment = positions[start:end]
+        displacement = np.linalg.norm(segment - segment[:1], axis=-1)
+        per_joint_peak = displacement.max(axis=0)
+        amplitudes.append(float(_top_k_mean(per_joint_peak)))
+        spans.append([int(start), int(end)])
+    return np.asarray(amplitudes, dtype=np.float32), spans
+
+
 @dataclass(frozen=True)
 class ActivityThresholds:
     """Numerical thresholds for candidate and whole-song activity contracts."""
 
     static_joint_speed_rad_s: float = 0.08
     static_root_horizontal_speed_m_s: float = 0.015
+    static_fk_visible_joint_speed_m_s: float = 0.015
     joint_speed_reference_rad_s: float = 0.55
     root_speed_reference_m_s: float = 0.35
 
@@ -179,6 +248,11 @@ class ActivityThresholds:
     final_max_static_seconds: float = 4.0
     final_min_joint_speed_rad_s: float = 0.045
     final_min_root_travel_per_second_m_s: float = 0.006
+    final_min_fk_visible_joint_speed_m_s: float = 0.020
+    final_window_seconds: float = 1.0
+    final_window_hop_seconds: float = 0.5
+    final_min_window_motion_amplitude_m: float = 0.020
+    final_max_low_amplitude_window_ratio: float = 0.60
     high_target_slot_threshold: float = 0.55
     high_target_slot_max_static_ratio: float = 0.75
     high_target_slot_max_density_gap: float = 0.50
@@ -192,6 +266,10 @@ class ActivityThresholds:
             ),
             static_root_horizontal_speed_m_s=max(
                 0.0, _env_float("MOTION_ACTIVITY_STATIC_ROOT_MPS", 0.015)
+            ),
+            static_fk_visible_joint_speed_m_s=max(
+                0.0,
+                _env_float("MOTION_ACTIVITY_STATIC_FK_VISIBLE_MPS", 0.015),
             ),
             joint_speed_reference_rad_s=max(
                 1.0e-6, _env_float("MOTION_ACTIVITY_JOINT_REFERENCE_RADPS", 0.55)
@@ -228,6 +306,34 @@ class ActivityThresholds:
             ),
             final_min_root_travel_per_second_m_s=max(
                 0.0, _env_float("MOTION_ACTIVITY_FINAL_MIN_ROOT_TRAVEL_MPS", 0.006)
+            ),
+            final_min_fk_visible_joint_speed_m_s=max(
+                0.0,
+                _env_float("MOTION_ACTIVITY_FINAL_MIN_FK_VISIBLE_MPS", 0.020),
+            ),
+            final_window_seconds=max(
+                1.0e-3,
+                _env_float("MOTION_ACTIVITY_FINAL_WINDOW_SECONDS", 1.0),
+            ),
+            final_window_hop_seconds=max(
+                1.0e-3,
+                _env_float("MOTION_ACTIVITY_FINAL_WINDOW_HOP_SECONDS", 0.5),
+            ),
+            final_min_window_motion_amplitude_m=max(
+                0.0,
+                _env_float(
+                    "MOTION_ACTIVITY_FINAL_MIN_WINDOW_AMPLITUDE_M", 0.020
+                ),
+            ),
+            final_max_low_amplitude_window_ratio=float(
+                np.clip(
+                    _env_float(
+                        "MOTION_ACTIVITY_FINAL_MAX_LOW_AMPLITUDE_WINDOW_RATIO",
+                        0.60,
+                    ),
+                    0.0,
+                    1.0,
+                )
             ),
             high_target_slot_threshold=float(
                 np.clip(_env_float("MOTION_ACTIVITY_HIGH_TARGET_THRESHOLD", 0.55), 0.0, 1.0)
@@ -272,6 +378,33 @@ def motion_activity_metrics(
         joint_speed_step = np.zeros((0,), dtype=np.float32)
         joint_speed_frame = np.zeros((frames,), dtype=np.float32)
 
+    fk_joints = fk24_from_local_np(x, rotations)
+    visible_world = fk_joints[:, VISIBLE_JOINT_INDICES]
+    visible_root_relative = visible_world - fk_joints[:, :1]
+    visible_world_step = np.linalg.norm(np.diff(visible_world, axis=0), axis=-1)
+    visible_relative_step = np.linalg.norm(
+        np.diff(visible_root_relative, axis=0), axis=-1
+    )
+    visible_speed_per_joint = visible_relative_step * fps
+    visible_world_speed_per_joint = visible_world_step * fps
+    visible_speed_step = _top_k_mean(visible_speed_per_joint)
+    visible_world_speed_step = _top_k_mean(visible_world_speed_per_joint)
+    if len(visible_speed_step):
+        visible_speed_frame = np.concatenate(
+            [visible_speed_step[:1], visible_speed_step]
+        )[:frames]
+    else:
+        visible_speed_frame = np.zeros((frames,), dtype=np.float32)
+    window_amplitudes, window_spans = _window_motion_amplitudes(
+        visible_root_relative,
+        fps=fps,
+        window_seconds=cfg.final_window_seconds,
+        hop_seconds=cfg.final_window_hop_seconds,
+    )
+    low_amplitude_windows = (
+        window_amplitudes < cfg.final_min_window_motion_amplitude_m
+    )
+
     root = x[:, ROOT_SLICE]
     root_delta = np.diff(root, axis=0)
     root_step_3d = np.linalg.norm(root_delta, axis=-1)
@@ -288,6 +421,8 @@ def motion_activity_metrics(
         joint_speed_frame < cfg.static_joint_speed_rad_s
     ) & (
         root_speed_frame < cfg.static_root_horizontal_speed_m_s
+    ) & (
+        visible_speed_frame < cfg.static_fk_visible_joint_speed_m_s
     )
     streak_frames, streak_start, streak_end = _longest_true_streak(static_mask)
 
@@ -334,6 +469,40 @@ def motion_activity_metrics(
             if per_joint_speed.size
             else [0.0] * NUM_JOINTS
         ),
+        "fk_visible_joint_names": list(VISIBLE_JOINT_NAMES),
+        "fk_visible_joint_displacement_top4_mean_m": float(
+            _top_k_mean(visible_relative_step).mean()
+        )
+        if visible_relative_step.size
+        else 0.0,
+        "fk_visible_joint_speed_top4_mean_m_s": float(visible_speed_step.mean())
+        if visible_speed_step.size
+        else 0.0,
+        "fk_visible_joint_speed_top4_p10_m_s": float(
+            np.percentile(visible_speed_step, 10)
+        )
+        if visible_speed_step.size
+        else 0.0,
+        "fk_visible_joint_world_speed_top4_mean_m_s": float(
+            visible_world_speed_step.mean()
+        )
+        if visible_world_speed_step.size
+        else 0.0,
+        "window_motion_amplitude_count": int(len(window_amplitudes)),
+        "window_motion_amplitude_p10_m": float(
+            np.percentile(window_amplitudes, 10)
+        )
+        if window_amplitudes.size
+        else 0.0,
+        "window_motion_amplitude_median_m": float(np.median(window_amplitudes))
+        if window_amplitudes.size
+        else 0.0,
+        "window_motion_amplitude_max_m": float(window_amplitudes.max())
+        if window_amplitudes.size
+        else 0.0,
+        "low_amplitude_window_ratio": float(low_amplitude_windows.mean())
+        if low_amplitude_windows.size
+        else 1.0,
         "static_frame_ratio": float(static_mask.mean()) if frames else 1.0,
         "static_frames": int(static_mask.sum()),
         "longest_static_streak_frames": int(streak_frames),
@@ -349,6 +518,14 @@ def motion_activity_metrics(
             "static_root_horizontal_speed_m_s": float(
                 cfg.static_root_horizontal_speed_m_s
             ),
+            "static_fk_visible_joint_speed_m_s": float(
+                cfg.static_fk_visible_joint_speed_m_s
+            ),
+            "window_seconds": float(cfg.final_window_seconds),
+            "window_hop_seconds": float(cfg.final_window_hop_seconds),
+            "min_window_motion_amplitude_m": float(
+                cfg.final_min_window_motion_amplitude_m
+            ),
         },
     }
     if include_signals:
@@ -356,6 +533,11 @@ def motion_activity_metrics(
         report["static_mask"] = static_mask
         report["joint_speed_signal_rad_s"] = joint_speed_frame.astype(np.float32)
         report["root_speed_signal_m_s"] = root_speed_frame.astype(np.float32)
+        report["fk_visible_joint_speed_signal_m_s"] = (
+            visible_speed_frame.astype(np.float32)
+        )
+        report["window_motion_amplitudes_m"] = window_amplitudes
+        report["window_motion_amplitude_spans"] = window_spans
     return report
 
 
@@ -646,6 +828,15 @@ def per_slot_activity(
                     metrics["longest_static_streak_seconds"]
                 ),
                 "joint_speed_mean_rad_s": float(metrics["joint_speed_mean_rad_s"]),
+                "fk_visible_joint_speed_top4_mean_m_s": float(
+                    metrics["fk_visible_joint_speed_top4_mean_m_s"]
+                ),
+                "window_motion_amplitude_p10_m": float(
+                    metrics["window_motion_amplitude_p10_m"]
+                ),
+                "low_amplitude_window_ratio": float(
+                    metrics["low_amplitude_window_ratio"]
+                ),
                 "root_travel_per_second_m_s": float(
                     metrics["root_travel_per_second_m_s"]
                 ),
@@ -691,7 +882,7 @@ def evaluate_final_motion_activity(
     fps: float = 30.0,
     thresholds: Optional[ActivityThresholds] = None,
 ) -> Dict[str, Any]:
-    """Reject whole-song outputs only when multiple collapse signals agree."""
+    """Apply global activity checks plus independent visible-motion hard gates."""
 
     cfg = thresholds or ActivityThresholds.from_environment()
     metrics = motion_activity_metrics(motion, fps=fps, thresholds=cfg)
@@ -716,6 +907,18 @@ def evaluate_final_motion_activity(
         < cfg.final_min_root_travel_per_second_m_s
     ):
         global_reasons.append("final_root_travel")
+    visible_joint_failure = bool(
+        float(metrics["fk_visible_joint_speed_top4_mean_m_s"])
+        < cfg.final_min_fk_visible_joint_speed_m_s
+    )
+    if visible_joint_failure:
+        global_reasons.append("final_fk_visible_joint_displacement")
+    window_amplitude_failure = bool(
+        float(metrics["low_amplitude_window_ratio"])
+        > cfg.final_max_low_amplitude_window_ratio
+    )
+    if window_amplitude_failure:
+        global_reasons.append("final_window_motion_amplitude")
 
     high_target = [row for row in slot_rows if row["high_activity_target"]]
     high_target_failed = [
@@ -736,6 +939,8 @@ def evaluate_final_motion_activity(
     # do not independently trigger two collapse indicators.
     collapse = bool(
         len(global_reasons) >= 2
+        or visible_joint_failure
+        or window_amplitude_failure
         or slot_failure
     )
     gate_enabled = _env_bool("MOTION_ACTIVITY_FINAL_GATE", True)
@@ -746,6 +951,11 @@ def evaluate_final_motion_activity(
         "collapse_detected": bool(collapse),
         "reasons": reasons,
         "global_collapse_indicators": global_reasons,
+        "fk_visible_joint_gate_failed": visible_joint_failure,
+        "window_motion_amplitude_gate_failed": window_amplitude_failure,
+        "kinematic_visibility_collapse": bool(
+            visible_joint_failure or window_amplitude_failure
+        ),
         "whole_sequence": metrics,
         "per_slot": slot_rows,
         "motion_density_alignment": alignment,
