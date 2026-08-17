@@ -8,8 +8,10 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
-source configs/paths.env
-source configs/experiment.env
+if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source configs/experiment.env
+fi
 : "${OUT_ROOT:?Set OUT_ROOT to an existing run directory with a valid retarget cache}"
 export V46_51_REBUILD_RETARGET_CACHE=0
 export V46_51_REBUILD_EVENT_DB=1

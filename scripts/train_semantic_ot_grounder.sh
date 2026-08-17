@@ -6,9 +6,9 @@ export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$ROOT_DIR"
 
-source configs/scheduler.env
-source configs/anatomy.env
-source configs/semantic_ot.env
+export EXPERIMENT_PROFILE=semantic_ot
+# shellcheck disable=SC1091
+source configs/experiment.env
 
 PY="${PY:-${V46_51_PYTHON:-python}}"
 OUT_ROOT="${OUT_ROOT:?OUT_ROOT must identify the current audited run}"

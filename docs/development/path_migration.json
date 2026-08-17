@@ -1,9 +1,9 @@
 {
   "args.py": "args.py",
-  "configs/v46_51_fresh_wav_schedule.env": "configs/scheduler.env",
-  "configs/v46_52_anatomy_research.env": "configs/anatomy.env",
-  "configs/v46_53_1_research.env": "configs/research.env",
-  "configs/v46_53_research.env": "configs/geometry.env",
+  "configs/v46_51_fresh_wav_schedule.env": "configs/experiment.env",
+  "configs/v46_52_anatomy_research.env": "configs/experiment.env",
+  "configs/v46_53_1_research.env": "configs/experiment.env",
+  "configs/v46_53_research.env": "configs/experiment.env",
   "configs/v46_motionrag_diff_config.json": "configs/motion_model.json",
   "dataset/__init__.py": "dataset/__init__.py",
   "dataset/__pycache__/__init__.cpython-310.pyc": "dataset/__pycache__/__init__.cpython-310.pyc",

@@ -58,8 +58,7 @@ def main() -> int:
         "events/build_pipeline.py",
         "grounding/model.py",
         "scripts/pipeline.sh",
-        "configs/scheduler.env",
-        "configs/research.env",
+        "configs/experiment.env",
     ]
     for rel in required: _check_file(root / rel, rel, errors)
 

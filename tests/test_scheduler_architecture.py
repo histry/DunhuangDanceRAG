@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -330,8 +331,6 @@ class SchedulerArchitectureTests(unittest.TestCase):
             ROOT / "scripts" / "pipeline.sh",
             ROOT / "scripts" / "run_experiment.sh",
             ROOT / "scripts" / "research_pipeline.sh",
-            ROOT / "configs" / "paths.env",
-            ROOT / "configs" / "scheduler.env",
             ROOT / "configs" / "experiment.env",
         ]
         failures = []
@@ -363,19 +362,51 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertIn("* float(self.data_fps)", source)
 
     def test_scheduler_profiles_preserve_external_fps(self):
-        for relative in ("configs/scheduler.env", "configs/experiment.env"):
-            source = (ROOT / relative).read_text(encoding="utf-8")
-            self.assertIn(
-                'export V46_51_FPS="${V46_51_FPS:-30}"',
-                source,
-            )
-            self.assertIn(
-                'export V46_49_RETARGET_FPS="${V46_49_RETARGET_FPS:-$V46_51_FPS}"',
-                source,
-            )
-            self.assertNotIn("export V46_51_FPS=30", source)
-            self.assertIn('export V46_FPS="$V46_51_FPS"', source)
-            self.assertNotIn("export V46_49_RETARGET_FPS=30", source)
+        source = (ROOT / "configs" / "scheduler.env").read_text(encoding="utf-8")
+        entry = (ROOT / "configs" / "experiment.env").read_text(encoding="utf-8")
+        self.assertIn('source "$_EXPERIMENT_CONFIG_DIR/scheduler.env"', entry)
+        self.assertIn('export V46_51_FPS="${V46_51_FPS:-30}"', source)
+        self.assertIn(
+            'export V46_49_RETARGET_FPS="${V46_49_RETARGET_FPS:-$V46_51_FPS}"',
+            source,
+        )
+        self.assertNotIn("export V46_51_FPS=30", source)
+        self.assertIn('export V46_FPS="$V46_51_FPS"', source)
+        self.assertNotIn("export V46_49_RETARGET_FPS=30", source)
+
+    def test_shell_launchers_use_only_authoritative_experiment_entry(self):
+        failures = []
+        for path in [ROOT / "run.sh", *(ROOT / "scripts").glob("*.sh")]:
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if "source" not in line or "configs/" not in line or ".env" not in line:
+                    continue
+                if "configs/experiment.env" not in line:
+                    failures.append(f"{path.relative_to(ROOT)}:{line_number}:{line.strip()}")
+        self.assertEqual([], failures)
+
+    def test_config_variables_have_one_internal_owner(self):
+        owners = {}
+        pattern = re.compile(
+            r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)="
+        )
+        for path in sorted((ROOT / "configs").glob("*.env")):
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                match = pattern.match(line)
+                if match is None or match.group(1).startswith("_"):
+                    continue
+                owners.setdefault(match.group(1), []).append(
+                    f"{path.name}:{line_number}"
+                )
+        duplicates = {
+            name: locations
+            for name, locations in owners.items()
+            if len(locations) > 1
+        }
+        self.assertEqual({}, duplicates)
 
     def test_motion_config_reads_canonical_pipeline_fps(self):
         source = (ROOT / "training" / "motion_models.py").read_text(

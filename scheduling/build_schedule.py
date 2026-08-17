@@ -30,6 +30,12 @@ from scheduling.validate_schedule import (  # noqa: E402
     stamp_descriptor,
     write_rows_csv,
 )
+from scheduling.schedule_hard_constraints import (  # noqa: E402
+    DEFAULT_MAX_POSE_HOLD_RATIO,
+    DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    DEFAULT_MIN_CORE_FRAME_RATIO,
+    DEFAULT_MIN_UNIQUE_EVENTS,
+)
 
 
 def bool_text(value: bool) -> str:
@@ -94,8 +100,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--max_transition_fraction", type=float, default=0.20)
     ap.add_argument("--transition_budget_min_frames", type=int, default=6)
     ap.add_argument("--max_source_run", type=int, default=2)
-    ap.add_argument("--max_source_share", type=float, default=0.40)
+    ap.add_argument(
+        "--max_source_share",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    )
     ap.add_argument("--min_source_share_slots", type=int, default=6)
+    ap.add_argument(
+        "--max_pose_hold_ratio",
+        type=float,
+        default=DEFAULT_MAX_POSE_HOLD_RATIO,
+    )
+    ap.add_argument(
+        "--min_unique_events", type=int, default=DEFAULT_MIN_UNIQUE_EVENTS
+    )
+    ap.add_argument(
+        "--min_core_frame_ratio",
+        type=float,
+        default=DEFAULT_MIN_CORE_FRAME_RATIO,
+    )
     ap.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
 
     ap.add_argument("--beam_size", type=int, default=24)
@@ -124,6 +147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--deep_music_model", default="clap")
     ap.add_argument("--deep_music_weight", type=float, default=0.25)
     ap.add_argument("--require_deep_music", action="store_true")
+    ap.add_argument("--require_rhythm_features", action="store_true")
     ap.add_argument("--deep_music_min_success", type=float, default=0.80)
     ap.add_argument("--deep_music_cache", default="")
 
@@ -278,6 +302,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(args.max_source_share),
         "--min_source_share_slots",
         str(args.min_source_share_slots),
+        "--max_pose_hold_ratio",
+        str(args.max_pose_hold_ratio),
+        "--min_unique_events",
+        str(args.min_unique_events),
+        "--min_core_frame_ratio",
+        str(args.min_core_frame_ratio),
         "--slot_beat_snap_seconds",
         str(args.slot_beat_snap_seconds),
         "--beam_size",
@@ -326,6 +356,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(args.deep_music_weight),
         "--require_deep_music",
         bool_text(args.require_deep_music),
+        "--require_rhythm_features",
+        bool_text(args.require_rhythm_features),
         "--deep_music_min_success",
         str(args.deep_music_min_success),
         "--transition_diffusion",
@@ -473,6 +505,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "graph_scheduler": True,
         "deep_music_features": bool(args.deep_music_features),
         "require_deep_music": bool(args.require_deep_music),
+        "require_rhythm_features": bool(args.require_rhythm_features),
+        "music_independent_hard_constraints": {
+            "max_pose_hold_ratio": float(args.max_pose_hold_ratio),
+            "max_single_source_ratio": float(args.max_source_share),
+            "min_unique_events": int(args.min_unique_events),
+            "min_core_frame_ratio": float(args.min_core_frame_ratio),
+        },
     }
 
     out_json = Path(args.out_json).expanduser().resolve()
@@ -487,6 +526,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_frame_error=args.max_frame_error,
         max_seconds_error=args.max_seconds_error,
         require_raw_report=True,
+        max_pose_hold_ratio=args.max_pose_hold_ratio,
+        max_single_source_ratio=args.max_source_share,
+        min_unique_events=args.min_unique_events,
+        min_core_frame_ratio=args.min_core_frame_ratio,
     )
     contract_path = out_json.with_suffix(
         out_json.suffix + ".contract.json"
@@ -522,6 +565,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ],
         "deep_music_features": bool(args.deep_music_features),
         "require_deep_music": bool(args.require_deep_music),
+        "require_rhythm_features": bool(args.require_rhythm_features),
+        "music_independent_hard_constraints": contract_report[
+            "music_independent_hard_constraints"
+        ],
     }
     build_report_path = run_dir / "v46_51_fresh_mssd_build.json"
     save_json(build_report, build_report_path)

@@ -49,6 +49,40 @@ def _motion(frames: int, dynamic: bool) -> np.ndarray:
     return output
 
 
+def _joint_rotation_motion(
+    frames: int,
+    joint_indices: tuple[int, ...],
+    angle_step: float,
+    *,
+    active_frames: int | None = None,
+) -> np.ndarray:
+    output = np.zeros((frames, 151), dtype=np.float32)
+    output[:, 3] = 1.0
+    matrices = np.broadcast_to(
+        np.eye(3, dtype=np.float32), (frames, 24, 3, 3)
+    ).copy()
+    for frame in range(frames):
+        active_index = (
+            frame
+            if active_frames is None
+            else min(frame, max(0, active_frames - 1))
+        )
+        angle = float(angle_step) * active_index
+        cosine = np.cos(angle)
+        sine = np.sin(angle)
+        rotation = np.asarray(
+            [
+                [cosine, -sine, 0.0],
+                [sine, cosine, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        matrices[frame, list(joint_indices)] = rotation
+    output[:, 7:151] = _matrix_to_canonical_rot6d(matrices).reshape(frames, 144)
+    return output
+
+
 class MotionActivityAnalysisTest(unittest.TestCase):
     def setUp(self) -> None:
         self.thresholds = ActivityThresholds()
@@ -143,6 +177,91 @@ class MotionActivityAnalysisTest(unittest.TestCase):
         self.assertTrue(dynamic["ok"])
         self.assertFalse(dynamic["collapse_detected"])
 
+    def test_fk_gate_rejects_high_angular_leaf_spin_without_visible_motion(self):
+        motion = _joint_rotation_motion(
+            180,
+            (22, 23),
+            angle_step=0.40,
+        )
+        metrics = motion_activity_metrics(motion, fps=30.0)
+        report = evaluate_final_motion_activity(motion, fps=30.0)
+
+        self.assertGreater(metrics["joint_speed_mean_rad_s"], 0.50)
+        self.assertLess(
+            metrics["fk_visible_joint_speed_top4_mean_m_s"], 1.0e-6
+        )
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["fk_visible_joint_gate_failed"])
+        self.assertIn(
+            "final_fk_visible_joint_displacement",
+            report["reasons"],
+        )
+
+    def test_fk_visible_arm_motion_passes_without_root_translation(self):
+        motion = _joint_rotation_motion(
+            180,
+            (16, 17),
+            angle_step=0.03,
+        )
+        report = evaluate_final_motion_activity(motion, fps=30.0)
+        metrics = report["whole_sequence"]
+
+        self.assertGreater(
+            metrics["fk_visible_joint_speed_top4_mean_m_s"], 0.020
+        )
+        self.assertGreater(
+            metrics["window_motion_amplitude_p10_m"], 0.020
+        )
+        self.assertTrue(report["ok"])
+        self.assertFalse(report["fk_visible_joint_gate_failed"])
+        self.assertFalse(report["window_motion_amplitude_gate_failed"])
+
+    def test_window_gate_rejects_motion_concentrated_in_one_short_burst(self):
+        motion = _joint_rotation_motion(
+            300,
+            (16, 17),
+            angle_step=0.12,
+            active_frames=50,
+        )
+        thresholds = ActivityThresholds(
+            final_max_static_ratio=1.0,
+            final_max_static_seconds=999.0,
+            final_min_joint_speed_rad_s=0.0,
+            final_min_root_travel_per_second_m_s=0.0,
+            final_min_fk_visible_joint_speed_m_s=0.0,
+            final_max_low_amplitude_window_ratio=0.60,
+        )
+        report = evaluate_final_motion_activity(
+            motion,
+            fps=30.0,
+            thresholds=thresholds,
+        )
+
+        self.assertFalse(report["fk_visible_joint_gate_failed"])
+        self.assertTrue(report["window_motion_amplitude_gate_failed"])
+        self.assertFalse(report["ok"])
+        self.assertIn("final_window_motion_amplitude", report["reasons"])
+
+    def test_fk_and_window_metrics_are_rate_invariant(self):
+        at_30 = motion_activity_metrics(
+            _joint_rotation_motion(180, (16, 17), angle_step=0.03),
+            fps=30.0,
+        )
+        at_60 = motion_activity_metrics(
+            _joint_rotation_motion(360, (16, 17), angle_step=0.015),
+            fps=60.0,
+        )
+        self.assertAlmostEqual(
+            at_30["fk_visible_joint_speed_top4_mean_m_s"],
+            at_60["fk_visible_joint_speed_top4_mean_m_s"],
+            delta=0.01,
+        )
+        self.assertAlmostEqual(
+            at_30["window_motion_amplitude_median_m"],
+            at_60["window_motion_amplitude_median_m"],
+            delta=0.02,
+        )
+
     def test_per_slot_alignment_is_reported(self) -> None:
         motion = np.concatenate(
             [_motion(90, dynamic=False), _motion(90, dynamic=True)], axis=0
@@ -188,6 +307,8 @@ class MotionActivityAnalysisTest(unittest.TestCase):
             final_max_static_seconds=999.0,
             final_min_joint_speed_rad_s=0.0,
             final_min_root_travel_per_second_m_s=0.0,
+            final_min_fk_visible_joint_speed_m_s=0.0,
+            final_max_low_amplitude_window_ratio=1.0,
             high_target_slot_threshold=0.55,
             high_target_slot_max_static_ratio=0.75,
             high_target_slot_max_density_gap=0.50,

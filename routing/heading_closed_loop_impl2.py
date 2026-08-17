@@ -24,6 +24,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scheduling.validate_schedule import audit_contract, save_json
+from scheduling.schedule_hard_constraints import (
+    DEFAULT_MAX_POSE_HOLD_RATIO,
+    DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    DEFAULT_MIN_CORE_FRAME_RATIO,
+    DEFAULT_MIN_UNIQUE_EVENTS,
+)
 import routing.heading_closed_loop as v4650
 from contracts.anatomy import (
     AnatomyThresholds,
@@ -530,6 +536,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_frame_error=int(float(os.environ.get("V46_51_MAX_FRAME_ERROR", "2"))),
         max_seconds_error=float(os.environ.get("V46_51_MAX_SECONDS_ERROR", "0.10")),
         require_raw_report=True,
+        max_pose_hold_ratio=float(
+            os.environ.get(
+                "V46_51_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
+            )
+        ),
+        max_single_source_ratio=float(
+            os.environ.get(
+                "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+            )
+        ),
+        min_unique_events=int(
+            float(
+                os.environ.get(
+                    "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
+                )
+            )
+        ),
+        min_core_frame_ratio=float(
+            os.environ.get(
+                "V46_51_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
+            )
+        ),
     )
     save_json(contract, Path(schedule).with_suffix(Path(schedule).suffix + ".pre_generate_contract.json"))
     if not contract["ok"]:

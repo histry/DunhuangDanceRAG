@@ -12,10 +12,9 @@ set -euo pipefail
 : "${V46_CKPT:?Set V46_CKPT}"
 : "${BR_HPR_OUT_ROOT:?Set BR_HPR_OUT_ROOT}"
 
-set -a
+export EXPERIMENT_PROFILE=br_hpr
 # shellcheck disable=SC1090
-source "$ROOT/configs/br_hpr.env"
-set +a
+source "$ROOT/configs/experiment.env"
 
 mkdir -p "$BR_HPR_OUT_ROOT"
 MOTION="$BR_HPR_OUT_ROOT/br_hpr.motion.npy"

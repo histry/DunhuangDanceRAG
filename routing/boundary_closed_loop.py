@@ -89,6 +89,14 @@ from support.event_identity import (
     make_event_db_contract,
     normalize_event_db_contract,
 )
+from scheduling.schedule_hard_constraints import (
+    DEFAULT_MAX_POSE_HOLD_RATIO,
+    DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    DEFAULT_MIN_CORE_FRAME_RATIO,
+    DEFAULT_MIN_UNIQUE_EVENTS,
+    assert_schedule_hard_constraints,
+    final_selection_constraint_rows,
+)
 
 
 EDGE_DIM = 151
@@ -1158,6 +1166,29 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
 
     if best_payload is None:
         raise RuntimeError("Closed-loop generation produced no payload")
+
+    final_constraint_rows = final_selection_constraint_rows(
+        db,
+        best_payload["assembly_report"],
+    )
+    final_schedule_hard_constraints = assert_schedule_hard_constraints(
+        final_constraint_rows,
+        max_pose_hold_ratio=env_float(
+            "V46_51_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
+        ),
+        max_single_source_ratio=env_float(
+            "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+        ),
+        min_unique_events=env_int(
+            "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
+        ),
+        min_core_frame_ratio=env_float(
+            "V46_51_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
+        ),
+    )
+    best_payload["stage_reports"][
+        "final_music_independent_hard_constraints"
+    ] = final_schedule_hard_constraints
 
     final_gate = physical_quality_gate(
         best_payload["stage_reports"].get("final_audit", {})

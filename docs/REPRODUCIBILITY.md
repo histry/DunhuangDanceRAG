@@ -1,7 +1,8 @@
 # Reproducibility
 
 1. Create the environment: `conda env create -f environment.yml`.
-2. Edit `configs/paths.env` only when Python or assets are stored elsewhere.
+2. Use `configs/experiment.env` as the only configuration entry; override paths
+   with environment variables before sourcing it when assets live elsewhere.
 3. Run `bash scripts/preflight.sh`.
 4. Run `bash run.sh` for a full rebuild, retraining and whole-song generation.
 5. Use `bash scripts/resume_after_retarget.sh` only after a successful retarget cache.

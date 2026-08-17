@@ -2,10 +2,7 @@
 
 The refactor removed historical version identifiers from public paths.
 
-- `configs/v46_51_fresh_wav_schedule.env` -> `configs/scheduler.env`
-- `configs/v46_52_anatomy_research.env` -> `configs/anatomy.env`
-- `configs/v46_53_1_research.env` -> `configs/research.env`
-- `configs/v46_53_research.env` -> `configs/geometry.env`
+- all historical `.env` launch profiles -> `configs/experiment.env`
 - `configs/v46_motionrag_diff_config.json` -> `configs/motion_model.json`
 - `geometry/v46_53_rotation_contract.py` -> `motion_geometry/rotations.py`
 - `scripts/run_v46_50_full_rebuild_retrain.sh` -> `scripts/research_pipeline.sh`

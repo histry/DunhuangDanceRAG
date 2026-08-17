@@ -31,6 +31,23 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from scheduling.schedule_hard_constraints import (
+        DEFAULT_MAX_POSE_HOLD_RATIO,
+        DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+        DEFAULT_MIN_CORE_FRAME_RATIO,
+        DEFAULT_MIN_UNIQUE_EVENTS,
+        audit_schedule_hard_constraints,
+    )
+except ModuleNotFoundError:  # direct ``python scheduling/validate_schedule.py``
+    from schedule_hard_constraints import (  # type: ignore
+        DEFAULT_MAX_POSE_HOLD_RATIO,
+        DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+        DEFAULT_MIN_CORE_FRAME_RATIO,
+        DEFAULT_MIN_UNIQUE_EVENTS,
+        audit_schedule_hard_constraints,
+    )
+
 
 SCHEMA = "v46_51_fresh_wav_audio_schedule_contract"
 
@@ -403,6 +420,10 @@ def audit_contract(
     max_frame_error: int = 2,
     max_seconds_error: float = 0.10,
     require_raw_report: bool = True,
+    max_pose_hold_ratio: float = DEFAULT_MAX_POSE_HOLD_RATIO,
+    max_single_source_ratio: float = DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    min_unique_events: int = DEFAULT_MIN_UNIQUE_EVENTS,
+    min_core_frame_ratio: float = DEFAULT_MIN_CORE_FRAME_RATIO,
 ) -> Dict[str, Any]:
     info = audio_info(audio, fps=fps)
     schedule_path: Optional[Path]
@@ -420,6 +441,18 @@ def audit_contract(
 
     if not slots:
         reasons.append("schedule_has_no_slots")
+
+    hard_constraints = audit_schedule_hard_constraints(
+        slots,
+        max_pose_hold_ratio=max_pose_hold_ratio,
+        max_single_source_ratio=max_single_source_ratio,
+        min_unique_events=min_unique_events,
+        min_core_frame_ratio=min_core_frame_ratio,
+    )
+    reasons.extend(
+        f"schedule_hard_constraint:{reason}"
+        for reason in hard_constraints["reasons"]
+    )
 
     usage = str(meta.get("usage", "")).lower()
     is_final = bool(meta.get("is_final_schedule", False))
@@ -586,6 +619,20 @@ def audit_contract(
                         ),
                         "out_npy": out_npy,
                     }
+                    raw_hard_constraints = audit_schedule_hard_constraints(
+                        raw_schedule if isinstance(raw_schedule, list) else [],
+                        max_pose_hold_ratio=max_pose_hold_ratio,
+                        max_single_source_ratio=max_single_source_ratio,
+                        min_unique_events=min_unique_events,
+                        min_core_frame_ratio=min_core_frame_ratio,
+                    )
+                    raw_report_audit[
+                        "music_independent_hard_constraints"
+                    ] = raw_hard_constraints
+                    reasons.extend(
+                        f"raw_schedule_hard_constraint:{reason}"
+                        for reason in raw_hard_constraints["reasons"]
+                    )
                     if raw_audio and not _resolved_same_path(raw_audio, info["path"]):
                         reasons.append("raw_report_audio_path_mismatch")
                     if not isinstance(raw_schedule, list) or not raw_schedule:
@@ -646,6 +693,7 @@ def audit_contract(
             duration_field_mismatch_count
         ),
         "nonpositive_slot_count": int(nonpositive_count),
+        "music_independent_hard_constraints": hard_constraints,
         "raw_report_audit": raw_report_audit,
         "rows": rows,
     }
@@ -688,6 +736,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--required_run_id", default=None)
     ap.add_argument("--max_frame_error", type=int, default=2)
     ap.add_argument("--max_seconds_error", type=float, default=0.10)
+    ap.add_argument(
+        "--max_pose_hold_ratio",
+        type=float,
+        default=DEFAULT_MAX_POSE_HOLD_RATIO,
+    )
+    ap.add_argument(
+        "--max_single_source_ratio",
+        type=float,
+        default=DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+    )
+    ap.add_argument(
+        "--min_unique_events",
+        type=int,
+        default=DEFAULT_MIN_UNIQUE_EVENTS,
+    )
+    ap.add_argument(
+        "--min_core_frame_ratio",
+        type=float,
+        default=DEFAULT_MIN_CORE_FRAME_RATIO,
+    )
     ap.add_argument("--allow_failed", action="store_true")
     ap.add_argument("--allow_nonfresh", action="store_true")
     args = ap.parse_args(argv)
@@ -701,6 +769,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_frame_error=args.max_frame_error,
         max_seconds_error=args.max_seconds_error,
         require_raw_report=True,
+        max_pose_hold_ratio=args.max_pose_hold_ratio,
+        max_single_source_ratio=args.max_single_source_ratio,
+        min_unique_events=args.min_unique_events,
+        min_core_frame_ratio=args.min_core_frame_ratio,
     )
     save_json(report, args.out)
     if args.csv:

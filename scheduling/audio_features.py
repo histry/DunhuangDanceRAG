@@ -20,12 +20,75 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import wave
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import numpy as np
+
+
+LOGGER = logging.getLogger(__name__)
+_RHYTHM_ZERO_EPS = 1.0e-8
+
+
+class RhythmFeatureError(RuntimeError):
+    """Raised when the strict beat/tempo extraction contract is violated."""
+
+
+def validate_rhythm_features(
+    features: np.ndarray,
+    meta: Dict[str, Any],
+    *,
+    require_rhythm: bool = False,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Record and optionally enforce the beat/tempo extraction contract."""
+    array = np.asarray(features, dtype=np.float32)
+    if array.ndim != 2 or array.shape[1] < 4:
+        raise ValueError(f"Expected [T,4+] audio features, got {array.shape}")
+
+    beat_column = array[:, 2]
+    finite_beats = beat_column[np.isfinite(beat_column)]
+    beat_nonzero_frames = int(
+        np.count_nonzero(np.abs(finite_beats) > _RHYTHM_ZERO_EPS)
+    )
+    try:
+        tempo_bpm = float(meta.get("tempo_bpm", 0.0))
+    except (TypeError, ValueError):
+        tempo_bpm = 0.0
+    tempo_zero = (not np.isfinite(tempo_bpm)) or abs(tempo_bpm) <= _RHYTHM_ZERO_EPS
+    beat_zero = beat_nonzero_frames == 0
+    contract_ok = not (beat_zero and tempo_zero)
+    meta["rhythm_contract"] = {
+        "strict": bool(require_rhythm),
+        "ok": bool(contract_ok),
+        "tempo_bpm": float(tempo_bpm) if np.isfinite(tempo_bpm) else None,
+        "tempo_zero": bool(tempo_zero),
+        "beat_nonzero_frames": beat_nonzero_frames,
+        "beat_zero": bool(beat_zero),
+    }
+
+    if require_rhythm and not contract_ok:
+        beat_tracking = meta.get("beat_tracking", {})
+        error_type = str(beat_tracking.get("error_type") or "")
+        error_message = str(beat_tracking.get("error_message") or "")
+        if error_type or error_message:
+            beat_error = f"{error_type or 'Exception'}: {error_message}".rstrip()
+        elif meta.get("librosa_error"):
+            librosa_type = str(meta.get("librosa_error_type") or "Exception")
+            beat_error = f"{librosa_type}: {meta['librosa_error']}"
+        else:
+            beat_error = "no extraction exception was reported"
+        message = (
+            "Strict rhythm extraction failed: beat pulse and tempo are both zero; "
+            f"beat_nonzero_frames={beat_nonzero_frames}, tempo_bpm={tempo_bpm}; "
+            f"extraction_error={beat_error}"
+        )
+        LOGGER.error(message)
+        raise RhythmFeatureError(message)
+
+    return array, meta
 
 
 def _robust_01(x: np.ndarray) -> np.ndarray:
@@ -100,7 +163,12 @@ def _fallback_features(path: Path, num_frames: int) -> Tuple[np.ndarray, Dict[st
     return feat, {"backend": "wave_fallback", "tempo_bpm": 0.0, "sample_rate": sr}
 
 
-def extract_audio_features(audio_path: str | Path, num_frames: int = 150) -> Tuple[np.ndarray, Dict[str, Any]]:
+def extract_audio_features(
+    audio_path: str | Path,
+    num_frames: int = 150,
+    *,
+    require_rhythm: bool = False,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     path = Path(audio_path)
     try:
         import librosa  # type: ignore
@@ -113,10 +181,13 @@ def extract_audio_features(audio_path: str | Path, num_frames: int = 150) -> Tup
         onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
         centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
         chroma = librosa.feature.chroma_stft(y=y, sr=sr, hop_length=hop)
+        beat_error: Exception | None = None
         try:
             tempo_value, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop)
             tempo_bpm = float(np.asarray(tempo_value).reshape(-1)[0])
-        except Exception:
+        except Exception as exc:
+            beat_error = exc
+            LOGGER.exception("Beat extraction failed for audio=%s", path)
             tempo_bpm = 0.0
             beat_frames = np.asarray([], dtype=int)
         beat_pulse = np.zeros((max(len(rms), len(onset), chroma.shape[1]),), dtype=np.float32)
@@ -144,12 +215,30 @@ def extract_audio_features(audio_path: str | Path, num_frames: int = 150) -> Tup
         section = np.clip(0.70 * novelty + 0.30 * _robust_01(np.abs(delta)), 0.0, 1.0)
         accent = np.clip(0.65 * onset_n + 0.35 * beat, 0.0, 1.0)
         feat = np.stack([energy, onset_n, beat, tempo, arousal, delta, tension, calm, novelty, brightness, section, accent], axis=1).astype(np.float32)
-        meta = {"backend": "librosa", "tempo_bpm": tempo_bpm, "sample_rate": int(sr), "duration_sec": float(len(y) / sr)}
-        return feat, meta
+        meta = {
+            "backend": "librosa",
+            "tempo_bpm": tempo_bpm,
+            "sample_rate": int(sr),
+            "duration_sec": float(len(y) / sr),
+            "beat_tracking": {
+                "ok": beat_error is None,
+                "beat_count": int(len(beat_frames)),
+                "error_type": type(beat_error).__name__ if beat_error is not None else None,
+                "error_message": str(beat_error) if beat_error is not None else None,
+            },
+        }
     except Exception as exc:
+        LOGGER.exception("Librosa audio feature extraction failed for audio=%s", path)
         feat, meta = _fallback_features(path, num_frames)
         meta["librosa_error"] = str(exc)
-        return feat, meta
+        meta["librosa_error_type"] = type(exc).__name__
+        meta["beat_tracking"] = {
+            "ok": False,
+            "beat_count": int(np.count_nonzero(np.abs(feat[:, 2]) > _RHYTHM_ZERO_EPS)),
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
+    return validate_rhythm_features(feat, meta, require_rhythm=require_rhythm)
 
 
 def classify_frame_events(features: np.ndarray) -> list[str]:
@@ -180,9 +269,14 @@ def main() -> None:
     ap.add_argument("--out_npy", required=True)
     ap.add_argument("--out_json", default="")
     ap.add_argument("--num_frames", type=int, default=150)
+    ap.add_argument("--require_rhythm_features", action="store_true")
     args = ap.parse_args()
 
-    feat, meta = extract_audio_features(args.audio, args.num_frames)
+    feat, meta = extract_audio_features(
+        args.audio,
+        args.num_frames,
+        require_rhythm=bool(args.require_rhythm_features),
+    )
     events = classify_frame_events(feat)
     out_npy = Path(args.out_npy)
     out_npy.parent.mkdir(parents=True, exist_ok=True)

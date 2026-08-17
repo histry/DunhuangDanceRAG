@@ -606,6 +606,7 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
         "schedule_summary_json",
         "event_db_contract",
         "transition_budget",
+        "music_independent_hard_constraints",
     ]:
         if k in meta and meta[k]:
             out[k] = meta[k]

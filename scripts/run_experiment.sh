@@ -6,17 +6,17 @@ set -Eeuo pipefail
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export ROOT_DIR
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-[[ -f "$ROOT_DIR/configs/performer_policy.env" ]] && \
-  source "$ROOT_DIR/configs/performer_policy.env"
-[[ -f "$ROOT_DIR/configs/research_feasibility.env" ]] && source "$ROOT_DIR/configs/research_feasibility.env"
-
 cd "$ROOT_DIR"
+if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
+  # shellcheck disable=SC1091
+  source configs/experiment.env
+fi
 
 export ROOT_DIR
 export V46_51_PYTHON="${V46_51_PYTHON:-${PYTHON_BIN:-python}}"
 export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
 export MUSIC_DIRS="${MUSIC_DIRS:-$ROOT_DIR/data/v21_router_music_999/splits/train}"
-export AUDIO="${1:-${AUDIO:-$ROOT_DIR/test_music_bank/dunhuangwu2.wav}}"
+export AUDIO="${1:-${AUDIO:-$TEST_AUDIO}}"
 export RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 export OUT_ROOT="${OUT_ROOT:-$ROOT_DIR/output/v46_53_1_research_${RUN_TAG}}"
 export V44_CKPT="${V44_CKPT:-$OUT_ROOT/checkpoints/semantic_retriever.pt}"
