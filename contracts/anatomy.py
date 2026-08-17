@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.53.1 posture-aware anatomy and source/event safety contracts.
+"""Retarget Clean posture-aware anatomy and source/event safety contracts.
 
-This module is API-compatible with ``tools.v46_52_anatomy_contract`` while
+This module is API-compatible with ``tools.anatomy_heading_anatomy_contract`` while
 separating two decisions that must not be conflated in a 12-source low-resource
 project:
 
@@ -176,22 +176,22 @@ class AnatomyThresholds:
     @classmethod
     def from_env(cls) -> "AnatomyThresholds":
         return cls(
-            nonfinite_count_max=env_int("V46_52_NONFINITE_MAX", 0),
-            rot_orthogonality_p95_max=env_float("V46_52_ROT_ORTHO_P95_MAX", 2e-4),
-            rot_det_abs_error_p95_max=env_float("V46_52_ROT_DET_P95_MAX", 2e-4),
-            local_angle_violation_ratio_max=env_float("V46_52_EVENT_LOCAL_LIMIT_RATIO_MAX", 0.060),
-            local_angle_severe_ratio_max=env_float("V46_52_EVENT_LOCAL_SEVERE_RATIO_MAX", 0.006),
+            nonfinite_count_max=env_int("RETARGET_NONFINITE_MAX", 0),
+            rot_orthogonality_p95_max=env_float("RETARGET_ROT_ORTHO_P95_MAX", 2e-4),
+            rot_det_abs_error_p95_max=env_float("RETARGET_ROT_DET_P95_MAX", 2e-4),
+            local_angle_violation_ratio_max=env_float("RETARGET_EVENT_LOCAL_LIMIT_RATIO_MAX", 0.060),
+            local_angle_severe_ratio_max=env_float("RETARGET_EVENT_LOCAL_SEVERE_RATIO_MAX", 0.006),
             spine_cumulative_angle_p95_max_rad=math.radians(
-                env_float("V46_52_EVENT_SPINE_CUM_P95_MAX_DEG", 170.0)
+                env_float("RETARGET_EVENT_SPINE_CUM_P95_MAX_DEG", 170.0)
             ),
-            torso_compression_ratio_p05_min=env_float("V46_52_EVENT_TORSO_RATIO_P05_MIN", 0.46),
-            neck_compression_ratio_p05_min=env_float("V46_52_EVENT_NECK_RATIO_P05_MIN", 0.48),
-            self_collision_severe_ratio_max=env_float("V46_52_EVENT_COLLISION_RATIO_MAX", 0.050),
-            knee_collapse_ratio_max=env_float("V46_52_EVENT_KNEE_COLLAPSE_RATIO_MAX", 0.045),
-            elbow_collapse_ratio_max=env_float("V46_52_EVENT_ELBOW_COLLAPSE_RATIO_MAX", 0.060),
-            foot_penetration_p01_min_m=env_float("V46_52_FOOT_PENETRATION_P01_MIN_M", -0.080),
-            bone_length_drift_max=env_float("V46_52_BONE_DRIFT_MAX", 2e-4),
-            anatomy_quality_min=env_float("V46_52_EVENT_ANATOMY_HARD_QUALITY_MIN", 0.30),
+            torso_compression_ratio_p05_min=env_float("RETARGET_EVENT_TORSO_RATIO_P05_MIN", 0.46),
+            neck_compression_ratio_p05_min=env_float("RETARGET_EVENT_NECK_RATIO_P05_MIN", 0.48),
+            self_collision_severe_ratio_max=env_float("RETARGET_EVENT_COLLISION_RATIO_MAX", 0.050),
+            knee_collapse_ratio_max=env_float("RETARGET_EVENT_KNEE_COLLAPSE_RATIO_MAX", 0.045),
+            elbow_collapse_ratio_max=env_float("RETARGET_EVENT_ELBOW_COLLAPSE_RATIO_MAX", 0.060),
+            foot_penetration_p01_min_m=env_float("RETARGET_FOOT_PENETRATION_P01_MIN_M", -0.080),
+            bone_length_drift_max=env_float("RETARGET_BONE_DRIFT_MAX", 2e-4),
+            anatomy_quality_min=env_float("RETARGET_EVENT_ANATOMY_HARD_QUALITY_MIN", 0.30),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -216,19 +216,19 @@ class SourceAnatomyThresholds:
     @classmethod
     def from_env(cls) -> "SourceAnatomyThresholds":
         return cls(
-            nonfinite_count_max=env_int("V46_52_SOURCE_NONFINITE_MAX", 0),
-            rot_orthogonality_p95_max=env_float("V46_52_SOURCE_ROT_ORTHO_P95_MAX", 3e-4),
-            rot_det_abs_error_p95_max=env_float("V46_52_SOURCE_ROT_DET_P95_MAX", 3e-4),
-            local_angle_severe_ratio_max=env_float("V46_52_SOURCE_LOCAL_SEVERE_RATIO_MAX", 0.012),
+            nonfinite_count_max=env_int("RETARGET_SOURCE_NONFINITE_MAX", 0),
+            rot_orthogonality_p95_max=env_float("RETARGET_SOURCE_ROT_ORTHO_P95_MAX", 3e-4),
+            rot_det_abs_error_p95_max=env_float("RETARGET_SOURCE_ROT_DET_P95_MAX", 3e-4),
+            local_angle_severe_ratio_max=env_float("RETARGET_SOURCE_LOCAL_SEVERE_RATIO_MAX", 0.012),
             spine_cumulative_angle_p95_max_rad=math.radians(
-                env_float("V46_52_SOURCE_SPINE_CUM_P95_MAX_DEG", 185.0)
+                env_float("RETARGET_SOURCE_SPINE_CUM_P95_MAX_DEG", 185.0)
             ),
-            torso_compression_ratio_p01_min=env_float("V46_52_SOURCE_TORSO_RATIO_P01_MIN", 0.34),
-            neck_compression_ratio_p01_min=env_float("V46_52_SOURCE_NECK_RATIO_P01_MIN", 0.36),
-            self_collision_severe_ratio_max=env_float("V46_52_SOURCE_COLLISION_RATIO_MAX", 0.080),
-            foot_penetration_p01_min_m=env_float("V46_52_FOOT_PENETRATION_P01_MIN_M", -0.080),
-            bone_length_drift_max=env_float("V46_52_SOURCE_BONE_DRIFT_MAX", 3e-4),
-            anatomy_quality_min=env_float("V46_52_SOURCE_ANATOMY_QUALITY_MIN", 0.18),
+            torso_compression_ratio_p01_min=env_float("RETARGET_SOURCE_TORSO_RATIO_P01_MIN", 0.34),
+            neck_compression_ratio_p01_min=env_float("RETARGET_SOURCE_NECK_RATIO_P01_MIN", 0.36),
+            self_collision_severe_ratio_max=env_float("RETARGET_SOURCE_COLLISION_RATIO_MAX", 0.080),
+            foot_penetration_p01_min_m=env_float("RETARGET_FOOT_PENETRATION_P01_MIN_M", -0.080),
+            bone_length_drift_max=env_float("RETARGET_SOURCE_BONE_DRIFT_MAX", 3e-4),
+            anatomy_quality_min=env_float("RETARGET_SOURCE_ANATOMY_QUALITY_MIN", 0.18),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -248,13 +248,13 @@ class AnatomyLossWeights:
     @classmethod
     def from_env(cls) -> "AnatomyLossWeights":
         return cls(
-            local_limit=env_float("V46_52_LOSS_LOCAL_LIMIT_W", 3.0),
-            local_severe=env_float("V46_52_LOSS_LOCAL_SEVERE_W", 5.0),
-            spine=env_float("V46_52_LOSS_SPINE_W", 4.0),
-            torso=env_float("V46_52_LOSS_TORSO_W", 4.5),
-            bend=env_float("V46_52_LOSS_BEND_W", 1.2),
-            collision=env_float("V46_52_LOSS_COLLISION_W", 2.5),
-            symmetry=env_float("V46_52_LOSS_SYMMETRY_W", 0.0),
+            local_limit=env_float("RETARGET_LOSS_LOCAL_LIMIT_W", 3.0),
+            local_severe=env_float("RETARGET_LOSS_LOCAL_SEVERE_W", 5.0),
+            spine=env_float("RETARGET_LOSS_SPINE_W", 4.0),
+            torso=env_float("RETARGET_LOSS_TORSO_W", 4.5),
+            bend=env_float("RETARGET_LOSS_BEND_W", 1.2),
+            collision=env_float("RETARGET_LOSS_COLLISION_W", 2.5),
+            symmetry=env_float("RETARGET_LOSS_SYMMETRY_W", 0.0),
         )
 
 
@@ -448,9 +448,9 @@ def anatomy_metrics_np(
 
     feet = joints[:, list(FOOT_JOINTS)]
     support_floor = float(np.percentile(feet[..., 1], 5))
-    floor_mode = str(os.environ.get("V46_52_FLOOR_REFERENCE_MODE", "stage_zero")).strip().lower()
+    floor_mode = str(os.environ.get("RETARGET_FLOOR_REFERENCE_MODE", "stage_zero")).strip().lower()
     stage_floor = support_floor if floor_mode in {"auto", "auto_quantile", "sequence_quantile"} else env_float(
-        "V46_52_STAGE_FLOOR_Y_M", 0.0
+        "RETARGET_STAGE_FLOOR_Y_M", 0.0
     )
     penetration = feet[..., 1] - stage_floor
     pelvis_h = (joints[:, PELVIS, 1] - support_floor) / max(REST_LEG_LENGTH, 1e-6)
@@ -468,7 +468,7 @@ def anatomy_metrics_np(
     quality = float(np.clip(math.exp(-quality_penalty), 0.0, 1.0))
 
     return {
-        "schema": "v46_53_1_posture_aware_anatomy_contract",
+        "schema": "retarget_clean_posture_aware_anatomy_contract",
         "frames": int(T),
         "fps": float(fps),
         "nonfinite_count": int((~np.isfinite(x)).sum()),
@@ -639,7 +639,7 @@ def event_anatomy_features(
     detail = evaluate_anatomy_contract_detailed(metric_values)
     edge_n = min(
         len(x),
-        _frames_at_rate(env_int("V46_52_EVENT_EDGE_FRAMES", 6), fps),
+        _frames_at_rate(env_int("RETARGET_EVENT_EDGE_FRAMES", 6), fps),
     )
     return {
         "anatomy_valid": bool(detail["hard_ok"]),
@@ -712,20 +712,20 @@ def transition_anatomy_risk(
     required = 0.20 + 0.30 * posture_gap + 0.90 * max(0.0, pelvis_gap - 0.08)
     hard = (
         not bool(ffeat["anatomy_hard_valid"])
-        or pelvis_gap > env_float("V46_52_PELVIS_GAP_HARD", 0.34)
-        or floor_gap > env_float("V46_52_FLOOR_GAP_HARD_M", 0.20)
+        or pelvis_gap > env_float("RETARGET_PELVIS_GAP_HARD", 0.34)
+        or floor_gap > env_float("RETARGET_FLOOR_GAP_HARD_M", 0.20)
         or root_velocity_gap
-        > env_float("V46_52_ROOT_VELOCITY_GAP_HARD_MPS", 2.0)
+        > env_float("RETARGET_ROOT_VELOCITY_GAP_HARD_MPS", 2.0)
         or (posture_gap >= 3 and transition_seconds + 1e-6 < required)
     )
     score = (
-        env_float("V46_52_RISK_PELVIS_W", 2.5) * pelvis_gap
-        + env_float("V46_52_RISK_BODY_W", 1.0) * body_gap
-        + env_float("V46_52_RISK_POSTURE_W", 0.45) * posture_gap
-        + env_float("V46_52_RISK_FLOOR_W", 4.0) * floor_gap
-        + env_float("V46_52_RISK_ROOT_VELOCITY_W", 0.35)
+        env_float("RETARGET_RISK_PELVIS_W", 2.5) * pelvis_gap
+        + env_float("RETARGET_RISK_BODY_W", 1.0) * body_gap
+        + env_float("RETARGET_RISK_POSTURE_W", 0.45) * posture_gap
+        + env_float("RETARGET_RISK_FLOOR_W", 4.0) * floor_gap
+        + env_float("RETARGET_RISK_ROOT_VELOCITY_W", 0.35)
         * root_velocity_gap
-        + env_float("V46_52_RISK_ANATOMY_W", 2.0) * (1.0 - float(m["anatomy_quality"]))
+        + env_float("RETARGET_RISK_ANATOMY_W", 2.0) * (1.0 - float(m["anatomy_quality"]))
     )
     return {
         "anatomy_quality": float(m["anatomy_quality"]),
@@ -830,7 +830,7 @@ def geodesic_c2_bridge_np(
     p1 = z[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
     v0 = (p[-1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - p[-2, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]) * float(fps) if len(p) > 1 else np.zeros(3, np.float32)
     v1 = (f[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - f[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]) * float(fps) if len(f) > 1 else np.zeros(3, np.float32)
-    max_vel = env_float("V46_52_BRIDGE_ROOT_VEL_CLIP_MPS", 2.4)
+    max_vel = env_float("RETARGET_BRIDGE_ROOT_VEL_CLIP_MPS", 2.4)
     duration_seconds = float(frames + 1) / max(float(fps), 1.0e-8)
     v0 = np.clip(v0, -max_vel, max_vel) * duration_seconds
     v1 = np.clip(v1, -max_vel, max_vel) * duration_seconds

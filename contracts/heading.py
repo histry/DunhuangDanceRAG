@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.50 event-level heading contract for EDGE 151D.
+"""Event-Heading event-level heading contract for EDGE 151D.
 
 This module separates three quantities that must not be conflated:
 
@@ -248,7 +248,7 @@ def heading_metrics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, float
     monotonicity = float(abs(net) / max(abs_total, 1e-8))
 
     sm = moving_average(speed_deg, max(3, int(round(0.6 * fps))))
-    active = np.abs(sm) >= env_float("V46_50_MECHANICAL_MIN_SPEED_DEG_S", 7.0)
+    active = np.abs(sm) >= env_float("EVENT_HEADING_MECHANICAL_MIN_SPEED_DEG_S", 7.0)
     longest = 0
     mechanical = np.zeros(len(sm), dtype=bool)
     for a, b in contiguous_regions(active):
@@ -289,7 +289,7 @@ def canonicalize_event_entry_heading_np(
     x = np.asarray(motion, dtype=np.float32).copy()
     if len(x) == 0:
         return x, {"entry_heading_before_rad": 0.0, "entry_heading_after_rad": 0.0}
-    n = max(1, min(len(x), int(round(env_float("V46_50_ENTRY_HEADING_MEDIAN_SECONDS", 0.15) * fps))))
+    n = max(1, min(len(x), int(round(env_float("EVENT_HEADING_ENTRY_HEADING_MEDIAN_SECONDS", 0.15) * fps))))
     y = root_yaw_np(x[:n])
     # Circular mean is robust to +/-pi wrapping.
     entry = float(math.atan2(float(np.mean(np.sin(y))), float(np.mean(np.cos(y)))))
@@ -334,20 +334,20 @@ def semantic_turn_strength(meta: Mapping[str, Any]) -> float:
 
 def default_yaw_budget_deg(meta: Mapping[str, Any], intent: str) -> float:
     if intent == "explicit_spin":
-        return env_float("V46_50_BUDGET_EXPLICIT_SPIN_DEG", 540.0)
+        return env_float("EVENT_HEADING_BUDGET_EXPLICIT_SPIN_DEG", 540.0)
     if intent == "turn":
-        return env_float("V46_50_BUDGET_TURN_DEG", 360.0)
+        return env_float("EVENT_HEADING_BUDGET_TURN_DEG", 360.0)
 
     text = " ".join(str(meta.get(k, "")).lower() for k in meta.keys())
     if any(k in text for k in ("pose_hold", "pose_motif", "calm_flow", "meditation", "thirty_six")):
-        return env_float("V46_50_BUDGET_POSE_CALM_DEG", 30.0)
+        return env_float("EVENT_HEADING_BUDGET_POSE_CALM_DEG", 30.0)
     if any(k in text for k in ("instrument", "pipa", "upper_body_phrase")):
-        return env_float("V46_50_BUDGET_INSTRUMENT_DEG", 45.0)
+        return env_float("EVENT_HEADING_BUDGET_INSTRUMENT_DEG", 45.0)
     if any(k in text for k in ("footwork", "lotus", "locomotion", "traveling_steps")):
-        return env_float("V46_50_BUDGET_FOOTWORK_DEG", 90.0)
+        return env_float("EVENT_HEADING_BUDGET_FOOTWORK_DEG", 90.0)
     if any(k in text for k in ("aerial", "flying", "transition")):
-        return env_float("V46_50_BUDGET_AERIAL_TRANSITION_DEG", 120.0)
-    return env_float("V46_50_BUDGET_DEFAULT_DEG", 60.0)
+        return env_float("EVENT_HEADING_BUDGET_AERIAL_TRANSITION_DEG", 120.0)
+    return env_float("EVENT_HEADING_BUDGET_DEFAULT_DEG", 60.0)
 
 
 def infer_turn_intent(
@@ -378,9 +378,9 @@ def infer_turn_intent(
     else:
         provisional_budget = default_yaw_budget_deg(meta, "none")
         reset_like = bool(
-            duration >= env_float("V46_50_RESET_MIN_SECONDS", 1.5)
-            and net > provisional_budget * env_float("V46_50_RESET_BUDGET_MULTIPLIER", 1.20)
-            and monotonic >= env_float("V46_50_RESET_MONOTONICITY_MIN", 0.62)
+            duration >= env_float("EVENT_HEADING_RESET_MIN_SECONDS", 1.5)
+            and net > provisional_budget * env_float("EVENT_HEADING_RESET_BUDGET_MULTIPLIER", 1.20)
+            and monotonic >= env_float("EVENT_HEADING_RESET_MONOTONICITY_MIN", 0.62)
             and strength < 0.45
         )
         if reset_like:
@@ -437,11 +437,11 @@ def enforce_event_heading_contract(
     corrected = canonical.copy()
     excess_ratio = abs(float(before["net_yaw_rad"])) / max(budget_rad, 1e-8)
 
-    if intent == "reset_or_drift" and env_bool("V46_50_DROP_RESET_OR_DRIFT", True):
+    if intent == "reset_or_drift" and env_bool("EVENT_HEADING_DROP_RESET_OR_DRIFT", True):
         valid = False
         reason = "drop_reset_or_drift"
     elif excess_ratio > 1.0:
-        hard_mult = env_float("V46_50_NON_TURN_HARD_EXCESS_MULTIPLIER", 1.50)
+        hard_mult = env_float("EVENT_HEADING_NON_TURN_HARD_EXCESS_MULTIPLIER", 1.50)
         if intent in {"none", "uncertain_turn"} and excess_ratio > hard_mult:
             valid = False
             reason = "non_turn_yaw_exceeds_hard_budget"
@@ -465,7 +465,7 @@ def enforce_event_heading_contract(
         quality *= 0.5
 
     report = {
-        "schema": "v46_50_event_heading_contract",
+        "schema": "event_heading_contract",
         "valid": bool(valid),
         "reason": reason,
         "intent": intent,
@@ -521,12 +521,12 @@ def adaptive_event_segments(
     T = len(x)
     min_sec, max_sec = _semantic_duration_range(meta)
     semantic_min_frames = max(
-        env_int("V46_50_MIN_EVENT_FRAMES", int(round(min_sec * fps))),
+        env_int("EVENT_HEADING_MIN_EVENT_FRAMES", int(round(min_sec * fps))),
         int(round(0.8 * fps)),
     )
     semantic_max_frames = min(
-        env_int("V46_50_MAX_EVENT_FRAMES", int(round(max_sec * fps))),
-        int(round(env_float("V46_50_GLOBAL_MAX_EVENT_SECONDS", 6.0) * fps)),
+        env_int("EVENT_HEADING_MAX_EVENT_FRAMES", int(round(max_sec * fps))),
+        int(round(env_float("EVENT_HEADING_GLOBAL_MAX_EVENT_SECONDS", 6.0) * fps)),
     )
     # The project-level motion contract is authoritative.  The semantic range
     # only chooses a preferred duration inside those reproducible bounds.
@@ -550,7 +550,7 @@ def adaptive_event_segments(
 
     if T <= max_frames:
         return [(0, T)], {
-            "schema": "v46_50_motion_adaptive_segmentation",
+            "schema": "event_heading_motion_adaptive_segmentation",
             "frames": T,
             "segments": 1,
             "min_frames": min_frames,
@@ -583,7 +583,7 @@ def adaptive_event_segments(
         + 0.08 * (1.0 - _robust_scale(contact_change))
     ).astype(np.float32)
 
-    turn_thr = np.radians(env_float("V46_50_TURN_INTERVAL_SPEED_DEG_S", 18.0))
+    turn_thr = np.radians(env_float("EVENT_HEADING_TURN_INTERVAL_SPEED_DEG_S", 18.0))
     turn_mask = yaw_speed >= turn_thr
     # Close small holes and remove tiny bursts without scipy.
     gap = max(1, int(round(0.20 * fps)))
@@ -591,7 +591,7 @@ def adaptive_event_segments(
     for (a, b), (c, d) in zip(regions[:-1], regions[1:]):
         if c - b <= gap:
             turn_mask[b:c] = True
-    min_turn = max(2, int(round(env_float("V46_50_MIN_TURN_INTERVAL_SECONDS", 0.40) * fps)))
+    min_turn = max(2, int(round(env_float("EVENT_HEADING_MIN_TURN_INTERVAL_SECONDS", 0.40) * fps)))
     for a, b in contiguous_regions(turn_mask):
         if b - a < min_turn:
             turn_mask[a:b] = False
@@ -615,10 +615,10 @@ def adaptive_event_segments(
         scores = boundary_score[ids] + 0.20 * length_term.astype(np.float32)
         for j, idx in enumerate(ids):
             if int(idx) in turn_edges:
-                scores[j] += env_float("V46_50_TURN_EDGE_BOUNDARY_BONUS", 0.45)
+                scores[j] += env_float("EVENT_HEADING_TURN_EDGE_BOUNDARY_BONUS", 0.45)
             # Cutting through an active spin is undesirable.
             if 0 <= int(idx) < T and turn_mask[int(idx)]:
-                scores[j] -= env_float("V46_50_CUT_THROUGH_TURN_PENALTY", 0.55)
+                scores[j] -= env_float("EVENT_HEADING_CUT_THROUGH_TURN_PENALTY", 0.55)
         end = int(ids[int(np.argmax(scores))])
         if end <= cursor:
             end = min(T, cursor + max_frames)
@@ -654,7 +654,7 @@ def adaptive_event_segments(
         clean.append((last, T))
 
     return clean, {
-        "schema": "v46_50_motion_adaptive_segmentation",
+        "schema": "event_heading_motion_adaptive_segmentation",
         "frames": int(T),
         "segments": int(len(clean)),
         "min_frames": int(min_frames),
@@ -736,14 +736,14 @@ def candidate_heading_penalty(
 
     repeat_penalty = 0.0
     if intent in {"turn", "explicit_spin", "uncertain_turn"}:
-        repeat_penalty = env_float("V46_50_CONSECUTIVE_TURN_PENALTY", 0.75) * max(0, recent_turn_count)
+        repeat_penalty = env_float("EVENT_HEADING_CONSECUTIVE_TURN_PENALTY", 0.75) * max(0, recent_turn_count)
 
     quality_penalty = max(0.0, 1.0 - quality)
     total = (
-        env_float("V46_50_INTENT_MISMATCH_WEIGHT", 1.0) * mismatch
-        + env_float("V46_50_STAGE_FRONT_ANCHOR_WEIGHT", 1.25) * anchor_penalty
+        env_float("EVENT_HEADING_INTENT_MISMATCH_WEIGHT", 1.0) * mismatch
+        + env_float("EVENT_HEADING_STAGE_FRONT_ANCHOR_WEIGHT", 1.25) * anchor_penalty
         + repeat_penalty
-        + env_float("V46_50_HEADING_QUALITY_WEIGHT", 0.75) * quality_penalty
+        + env_float("EVENT_HEADING_QUALITY_WEIGHT", 0.75) * quality_penalty
     )
     return float(total), {
         "slot_policy": policy,
@@ -784,7 +784,7 @@ def restore_planned_root_heading_np(
     after = wrap_angle(root_yaw_np(out) - ry)
     return out.astype(np.float32), {
         "enabled": True,
-        "schema": "v46_50_planned_root_heading_guard",
+        "schema": "event_heading_planned_root_heading_guard",
         "yaw_error_before_deg_p50": float(np.percentile(np.abs(np.degrees(wrap_angle(gy - ry))), 50)),
         "yaw_error_before_deg_p95": float(np.percentile(np.abs(np.degrees(wrap_angle(gy - ry))), 95)),
         "yaw_error_after_deg_p95": float(np.percentile(np.abs(np.degrees(after)), 95)),

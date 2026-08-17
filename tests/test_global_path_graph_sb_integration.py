@@ -51,16 +51,16 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
                 "performer_groups": np.asarray(["female"] * count, dtype=object),
                 "anatomy_hard_valid": np.ones(count, dtype=bool),
                 "event_heading_valid": np.ones(count, dtype=bool),
-                "v46_53_combined_quality": np.full(count, 0.8, dtype=np.float32),
+                "event_geometry_combined_quality": np.full(count, 0.8, dtype=np.float32),
                 "anatomy_quality": np.full(count, 0.9, dtype=np.float32),
-                "v46_55_entry_rotation_matrix": rotation,
-                "v46_55_exit_rotation_matrix": rotation,
-                "v46_53_entry_omega": joint,
-                "v46_53_exit_omega": joint,
-                "v46_53_entry_alpha": joint,
-                "v46_53_exit_alpha": joint,
-                "v46_53_entry_root_velocity_mps": root,
-                "v46_53_exit_root_velocity_mps": root,
+                "graph_route_entry_rotation_matrix": rotation,
+                "graph_route_exit_rotation_matrix": rotation,
+                "event_geometry_entry_omega": joint,
+                "event_geometry_exit_omega": joint,
+                "event_geometry_entry_alpha": joint,
+                "event_geometry_exit_alpha": joint,
+                "event_geometry_entry_root_velocity_mps": root,
+                "event_geometry_exit_root_velocity_mps": root,
                 "posture_entry": np.asarray(["standing"] * count, dtype=object),
                 "posture_exit": np.asarray(["standing"] * count, dtype=object),
                 "contact_entry": np.zeros((count, 4), dtype=np.float32),
@@ -70,7 +70,7 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
             candidates = [list(range(count)) for _ in slots]
             common = {
                 "PERFORMER_GROUP": "female",
-                "V46_53_GLOBAL_ROUTE_TOPK": "4",
+                "GROUNDING_GLOBAL_ROUTE_TOPK": "4",
             }
             with unittest.mock.patch.dict(os.environ, common, clear=False):
                 direct = route._graph_sb_global_route_preorder(
@@ -79,10 +79,10 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
                 direct_report = dict(route._GLOBAL_ROUTE_REPORT)
             fallback_env = {
                 **common,
-                "V46_55_ROUTE_SOLVER": "fisher_rao_graph_sb",
-                "V46_55_SB_MAX_ITER": "1",
-                "V46_55_SB_TOLERANCE": "1e-15",
-                "V46_55_SB_ALLOW_LEGACY_FALLBACK": "1",
+                "GRAPH_ROUTE_SOLVER": "fisher_rao_graph_sb",
+                "GRAPH_ROUTE_SB_MAX_ITER": "1",
+                "GRAPH_ROUTE_SB_TOLERANCE": "1e-15",
+                "GRAPH_ROUTE_SB_ALLOW_LEGACY_FALLBACK": "1",
             }
             with unittest.mock.patch.dict(os.environ, fallback_env, clear=False):
                 fallback = route._global_route_preorder(slots, candidates, db)
@@ -90,8 +90,8 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 report_path = pathlib.Path(tmp) / "report.json"
                 report_path.write_text("{}", encoding="utf-8")
-                route.v52._resolve_motion_path = lambda *args, **kwargs: None
-                route.v52.save_json = lambda payload, path: path.write_text(
+                route.anatomy_heading_runtime._resolve_motion_path = lambda *args, **kwargs: None
+                route.anatomy_heading_runtime.save_json = lambda payload, path: path.write_text(
                     json.dumps(payload), encoding="utf-8"
                 )
                 route._patch_report(report_path)
@@ -108,9 +108,9 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
                 "fallback_used": fallback_report["fallback_used"],
                 "fallback_reason": fallback_report["fallback_reason"],
                 "fallback_route_schema": fallback_report["fallback_route"]["schema"],
-                "would_emit_v46_55_field": fallback_report["schema"].startswith("v46_55_"),
-                "patched_has_compat": "v46_53_global_route" in patched_report,
-                "patched_has_v46_55": "v46_55_graph_sb_route" in patched_report,
+                "would_emit_graph_route_field": fallback_report["schema"].startswith("graph_route_"),
+                "patched_has_compat": "event_geometry_global_route" in patched_report,
+                "patched_has_motion_55": "graph_route_graph_sb_route" in patched_report,
             }))
             """
         )
@@ -136,18 +136,18 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["fallback_slots"], 3)
         self.assertEqual(
             payload["fallback_schema"],
-            "v46_55_fisher_rao_graph_sb_fallback_v1",
+            "graph_route_fisher_rao_graph_sb_fallback_v1",
         )
         self.assertEqual(payload["fallback_solver"], "legacy_beam")
         self.assertTrue(payload["fallback_used"])
         self.assertIn("did not converge", payload["fallback_reason"])
         self.assertEqual(
             payload["fallback_route_schema"],
-            "v46_53_entropy_regularised_global_event_path",
+            "event_geometry_entropy_regularised_global_event_path",
         )
-        self.assertTrue(payload["would_emit_v46_55_field"])
+        self.assertTrue(payload["would_emit_graph_route_field"])
         self.assertTrue(payload["patched_has_compat"])
-        self.assertTrue(payload["patched_has_v46_55"])
+        self.assertTrue(payload["patched_has_motion_55"])
 
 
 if __name__ == "__main__":

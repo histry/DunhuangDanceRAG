@@ -377,7 +377,7 @@ def multi_marginal_schrodinger(
     path_entropy = float(max(0.0, fitted.log_partition - expected_score))
 
     return SchrodingerResult(
-        schema="v46_55_fisher_rao_multi_marginal_graph_sb_v1",
+        schema="graph_route_fisher_rao_multi_marginal_graph_sb_v1",
         target_marginals=tuple(targets),
         node_marginals=fitted.node,
         edge_marginals=fitted.edge,

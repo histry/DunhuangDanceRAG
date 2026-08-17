@@ -664,7 +664,7 @@ def infer_mssd(
         song_uid = "aud_" + audio_sha256(audio_path)[:24]
         payload = {
             "descriptor_type": "music_semantic_slot_descriptor",
-            "descriptor_schema_version": "v46_38_mssd_aesd_routing_descriptor",
+            "descriptor_schema_version": "semantic_routing_mssd_aesd_routing_descriptor",
             "usage": "train_semantic",
             "is_final_schedule": False,
             "slot_source": "pretrained_music_semantic_teacher",

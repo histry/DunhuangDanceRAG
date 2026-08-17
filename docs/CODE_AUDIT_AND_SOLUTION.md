@@ -12,7 +12,7 @@ The previous formal run completed:
 
 Generation then stopped at slot 1 with:
 
-`V46.50 heading contract exhausted candidates for slot 1`.
+`Event-Heading contract exhausted candidates for slot 1`.
 
 This is a feasibility-contract failure, not evidence that the diffusion model
 needed more iterations.

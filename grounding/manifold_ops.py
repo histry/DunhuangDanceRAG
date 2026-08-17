@@ -3,7 +3,8 @@
 """Numerically stable operators for the mixed-curvature grounder.
 
 This module is deliberately independent from ``motion_geometry.product_manifold``.
-The latter represents the physical EDGE-151 motion state used by V45/V46/V53;
+The latter represents the physical EDGE-151 motion state used by Motion Refiner,
+Motion Diffusion, and Global Route;
 this file represents the latent retrieval space used by the paper-one grounder.
 
 The latent product contains four factors:

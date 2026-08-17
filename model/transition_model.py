@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V21 transition duration predictor and endpoint-conditioned local refiner."""
+"""Music Router transition duration predictor and endpoint-conditioned local refiner."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -20,7 +20,7 @@ TRANSITION_LENGTHS = (4, 6, 8, 10, 12, 16)
 NATIVE_ROT6D_LAYOUT = ROT6D_LAYOUT_PYTORCH3D_ROW
 
 
-class V21TransitionDurationPredictor(nn.Module):
+class TransitionDurationPredictor(nn.Module):
     def __init__(self, input_dim: int = 20, hidden_dim: int = 192, num_classes: int = len(TRANSITION_LENGTHS), dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
@@ -37,12 +37,12 @@ class V21TransitionDurationPredictor(nn.Module):
         return self.net(x)
 
 
-class V21EndpointTransitionRefiner(nn.Module):
+class EndpointTransitionRefiner(nn.Module):
     """Predict a small residual over a rough variable-length transition.
 
     The network preserves contacts and root X/Z by default. It refines root Y and
     joint rotations only, matching the conservative strategy that worked best in
-    the V17B experiments.
+    the legacy phrase scheduler experiments.
     """
 
     def __init__(
@@ -125,13 +125,13 @@ def load_transition_checkpoint(path: str | Path, device: torch.device | str = "c
             "This historical transition architecture expects PyTorch3D-row "
             f"Rot6D, but checkpoint declares {checkpoint_layout!r}."
         )
-    dpn = V21TransitionDurationPredictor(
+    dpn = TransitionDurationPredictor(
         input_dim=int(config.get("dpn_input_dim", 20)),
         hidden_dim=int(config.get("dpn_hidden_dim", 192)),
         num_classes=len(config.get("transition_lengths", TRANSITION_LENGTHS)),
         dropout=float(config.get("dropout", 0.1)),
     )
-    refiner = V21EndpointTransitionRefiner(
+    refiner = EndpointTransitionRefiner(
         motion_dim=int(config.get("motion_dim", 151)),
         music_dim=int(config.get("music_dim", 12)),
         hidden_dim=int(config.get("refiner_hidden_dim", 256)),
@@ -153,5 +153,5 @@ def load_transition_checkpoint(path: str | Path, device: torch.device | str = "c
 
 # Version-free class names for new code. Historical checkpoint state keys are
 # intentionally unchanged.
-TransitionDurationPredictor = V21TransitionDurationPredictor
-EndpointTransitionRefiner = V21EndpointTransitionRefiner
+TransitionDurationPredictor = TransitionDurationPredictor
+EndpointTransitionRefiner = EndpointTransitionRefiner

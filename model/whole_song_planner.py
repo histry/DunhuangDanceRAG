@@ -22,7 +22,7 @@ from support.common import EVENT_TYPES
 MUSIC_DOMINANT_TRANSITION_LENGTHS: tuple[int, ...] = (12, 16, 20, 24, 30, 36, 42, 48)
 
 
-class V26WholeSongPlanner(nn.Module):
+class WholeSongPlanner(nn.Module):
     """Predict motion-event type, natural duration and transition class per phrase."""
 
     def __init__(
@@ -91,13 +91,13 @@ class V26WholeSongPlanner(nn.Module):
         }
 
 
-def load_v26_planner_checkpoint(
+def load_whole_song_planner_checkpoint(
     path: str | Path,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = dict(checkpoint.get("config", {}))
-    model = V26WholeSongPlanner(
+    model = WholeSongPlanner(
         feature_dim=int(config.get("feature_dim", 32)),
         hidden_dim=int(config.get("hidden_dim", 128)),
         num_layers=int(config.get("num_layers", 4)),
@@ -117,7 +117,7 @@ def load_v26_planner_checkpoint(
 
 # Public, version-free API. The historical class alias remains only for
 # checkpoint compatibility and is not used in public file names.
-WholeSongPlanner = V26WholeSongPlanner
+WholeSongPlanner = WholeSongPlanner
 
 
 def load_planner_checkpoint(
@@ -125,4 +125,4 @@ def load_planner_checkpoint(
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     """Load a historical planner checkpoint through the public API."""
-    return load_v26_planner_checkpoint(path, device=device)
+    return load_whole_song_planner_checkpoint(path, device=device)

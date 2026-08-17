@@ -223,7 +223,7 @@ def main() -> int:
     args = parser.parse_args()
 
     stages = [
-        ("raw_v26", Path(args.raw)),
+        ("raw_whole_song", Path(args.raw)),
         ("descriptor_unstamped", Path(args.unstamped)),
         ("mixed_grounding", Path(args.mixed)),
         ("final_report", Path(args.final_report)),
@@ -242,7 +242,7 @@ def main() -> int:
 
     print(
         f"{'slot':>4} "
-        f"{'raw_v26':>20} "
+        f"{'raw_whole_song':>20} "
         f"{'unstamped':>20} "
         f"{'mixed':>20} "
         f"{'final':>20}"
@@ -250,7 +250,7 @@ def main() -> int:
     print("-" * 92)
 
     stage_names = [
-        "raw_v26",
+        "raw_whole_song",
         "descriptor_unstamped",
         "mixed_grounding",
         "final_report",

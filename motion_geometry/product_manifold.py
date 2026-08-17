@@ -9,7 +9,7 @@ their four logits separately.  The tangent layout is therefore 75D:
 ``root_xyz[3] + joint_rotvec[24, 3]``.
 
 All NumPy operations are dependency-light.  Torch variants are differentiable
-and are used by the V45/V46 training paths when PyTorch is available.
+and are used by the Motion Refiner and Motion Diffusion training paths when PyTorch is available.
 """
 from __future__ import annotations
 
@@ -269,7 +269,7 @@ def riemannian_trust_region_refine_np(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Repair a proposal with accepted retractions on the masked product manifold.
 
-    The feasible V45/V46 proposal is the initial point.  A three-tap tangent
+    The feasible Motion Refiner and Motion Diffusion proposal is the initial point.  A three-tap tangent
     smoother supplies a local descent proposal; the trust radius expands after
     an accepted objective decrease and shrinks after rejection.  The returned
     objective is therefore never worse than the feasible initial proposal.
@@ -392,7 +392,7 @@ def riemannian_trust_region_refine_np(
 
     report = {
         "algorithm": "masked_product_manifold_adaptive_trust_region",
-        "initial_point": "feasible_v45_v46_proposal",
+        "initial_point": "feasible_motion_refiner_motion_proposal",
         "initial_objective": float(initial_objective),
         "final_objective": float(current_objective),
         "objective_nonincreasing": bool(

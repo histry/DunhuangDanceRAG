@@ -36,7 +36,7 @@ class RoutingDiversityTests(unittest.TestCase):
             (SimpleNamespace(event_id=2, safe=True, risk_score=0.50, rank=0), {}),
             (SimpleNamespace(event_id=3, safe=True, risk_score=0.05, rank=1), {}),
         ]
-        with patch.dict(os.environ, {"V46_54_PRIMARY_EVENT_BONUS": "0.18"}, clear=False):
+        with patch.dict(os.environ, {"ROUTING_SAFETY_PRIMARY_EVENT_BONUS": "0.18"}, clear=False):
             selected, _extra, decision = select_safe_diverse_proposal(
                 rows, db=self.db, selected_event_ids=[], primary_event_id=2
             )
@@ -51,8 +51,8 @@ class RoutingDiversityTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "V46_54_PRIMARY_EVENT_BONUS": "0.18",
-                "V46_54_CANDIDATE_RANK_WEIGHT": "0",
+                "ROUTING_SAFETY_PRIMARY_EVENT_BONUS": "0.18",
+                "ROUTING_SAFETY_CANDIDATE_RANK_WEIGHT": "0",
             },
             clear=False,
         ):
@@ -67,7 +67,7 @@ class RoutingDiversityTests(unittest.TestCase):
             (SimpleNamespace(event_id=1, safe=True, risk_score=0.01, rank=0), {}),
             (SimpleNamespace(event_id=2, safe=True, risk_score=0.2, rank=1), {}),
         ]
-        with patch.dict(os.environ, {"V46_54_MAX_SOURCE_RUN": "1"}, clear=False):
+        with patch.dict(os.environ, {"ROUTING_SAFETY_MAX_SOURCE_RUN": "1"}, clear=False):
             selected, _extra, decision = select_safe_diverse_proposal(
                 rows, db=self.db, selected_event_ids=[0], primary_event_id=1
             )
@@ -78,11 +78,11 @@ class RoutingDiversityTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "V46_54_MIN_SHARE_HISTORY": "3",
-                "V46_54_MAX_SOURCE_SHARE": "0.40",
-                "V46_54_MAX_FAMILY_SHARE": "0.50",
-                "V46_54_EVENT_COOLDOWN_SLOTS": "1",
-                "V46_54_MAX_SOURCE_RUN": "3",
+                "ROUTING_SAFETY_MIN_SHARE_HISTORY": "3",
+                "ROUTING_SAFETY_MAX_SOURCE_SHARE": "0.40",
+                "ROUTING_SAFETY_MAX_FAMILY_SHARE": "0.50",
+                "ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS": "1",
+                "ROUTING_SAFETY_MAX_SOURCE_RUN": "3",
             },
             clear=False,
         ):

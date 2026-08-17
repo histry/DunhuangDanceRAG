@@ -227,7 +227,7 @@ def _reservoir_score(
 ) -> tuple[float, dict[str, Any]]:
     quality = _db_float(
         db,
-        ("v46_53_combined_quality", "event_quality_scores"),
+        ("event_geometry_combined_quality", "event_quality_scores"),
         event_id,
         0.5,
     )

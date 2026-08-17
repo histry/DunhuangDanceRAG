@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Anatomy-constrained Chang-E/SMPL to EDGE151 retargeting for V46.52.
+"""Anatomy-constrained Chang-E/SMPL to EDGE151 retargeting for Anatomy-Heading.
 
 The module reuses the repository's validated BVH parser, source FK, semantic
 mapping and heading stabilization, but replaces the under-constrained chunk
@@ -70,8 +70,8 @@ def _fit_chunk_anatomy(
     floor = torch.tensor(float(floor_y), dtype=torch.float32, device=device)
     anatomy_w = AnatomyLossWeights.from_env()
 
-    iters = env_int("V46_52_RETARGET_ITERS", max(160, int(getattr(cfg, "iterations", 90))))
-    lr = env_float("V46_52_RETARGET_LR", min(float(getattr(cfg, "learning_rate", 0.035)), 0.025))
+    iters = env_int("RETARGET_ITERS", max(160, int(getattr(cfg, "iterations", 90))))
+    lr = env_float("RETARGET_LR", min(float(getattr(cfg, "learning_rate", 0.035)), 0.025))
     optimizer = torch.optim.Adam([root, rot], lr=lr)
     last: Dict[str, float] = {}
 
@@ -101,7 +101,7 @@ def _fit_chunk_anatomy(
         else:
             rot_acc = root.new_zeros(())
 
-        # Stronger reference prior than V46.49: enough to stop optimization from
+        # Stronger reference prior than Source-Gravity: enough to stop optimization from
         # solving sparse keypoints with implausible local rotations.
         pose_prior = (projected[:, 1:] - init_rot[:, 1:]).square().mean()
 
@@ -119,27 +119,27 @@ def _fit_chunk_anatomy(
         # A short warm-up prioritizes coarse keypoint placement, then anatomy
         # losses reach full strength.  This avoids poor local minima at frame 0.
         warm = min(1.0, (step + 1) / max(1.0, 0.20 * iters))
-        key_w = env_float("V46_52_KEYPOINT_W", 24.0)
-        pose_w = env_float("V46_52_POSE_PRIOR_W", 0.075)
+        key_w = env_float("RETARGET_KEYPOINT_W", 24.0)
+        pose_w = env_float("RETARGET_POSE_PRIOR_W", 0.075)
         loss = (
             key_w * key
-            + env_float("V46_52_ROOT_W", 8.0) * root_loss
-            + env_float("V46_52_ROOT_VEL_W", 1.8) * root_vel
-            + env_float("V46_52_ROT_VEL_W", 0.18) * rot_vel
-            + env_float("V46_52_ROT_ACC_W", 0.055) * rot_acc
+            + env_float("RETARGET_ROOT_W", 8.0) * root_loss
+            + env_float("RETARGET_ROOT_VEL_W", 1.8) * root_vel
+            + env_float("RETARGET_ROT_VEL_W", 0.18) * rot_vel
+            + env_float("RETARGET_ROT_ACC_W", 0.055) * rot_acc
             + pose_w * pose_prior
-            + env_float("V46_52_UPRIGHT_W", 7.0) * upright
-            + env_float("V46_52_HEAD_ORDER_W", 3.0) * head_order
-            + env_float("V46_52_FEET_ORDER_W", 2.0) * feet_order
-            + env_float("V46_52_FLOOR_W", 8.0) * penetration
+            + env_float("RETARGET_UPRIGHT_W", 7.0) * upright
+            + env_float("RETARGET_HEAD_ORDER_W", 3.0) * head_order
+            + env_float("RETARGET_FEET_ORDER_W", 2.0) * feet_order
+            + env_float("RETARGET_FLOOR_W", 8.0) * penetration
             + warm * anatomy["total"]
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([root, rot], env_float("V46_52_RETARGET_GRAD_CLIP", 1.5))
+        torch.nn.utils.clip_grad_norm_([root, rot], env_float("RETARGET_GRAD_CLIP", 1.5))
         optimizer.step()
 
-        progress_every = max(1, env_int("V46_52_RETARGET_PROGRESS_EVERY", 25))
+        progress_every = max(1, env_int("RETARGET_PROGRESS_EVERY", 25))
         should_report = step == 0 or step == iters - 1 or (step + 1) % progress_every == 0
         if should_report:
             last = {
@@ -155,9 +155,9 @@ def _fit_chunk_anatomy(
                 "iterations": int(iters),
                 "learning_rate": float(lr),
             }
-            if env_bool("V46_52_RETARGET_PROGRESS", True):
+            if env_bool("RETARGET_PROGRESS", True):
                 print(
-                    "[V46.52 FIT] "
+                    "[Anatomy-Heading FIT] "
                     f"device={device} frames={len(root)} "
                     f"step={step + 1}/{iters} "
                     f"loss={last['loss']:.6f} key={last['key']:.6f} "
@@ -183,18 +183,18 @@ def _strict_contract(
     resolved_fps = float(fps if fps is not None else legacy_report.get("target_fps", 30.0))
     gravity = gravity_metrics_np(motion, resolved_fps)
     gravity_th = GravityThresholds(
-        torso_up_cos_p05_min=env_float("V46_52_GRAVITY_TORSO_P05_MIN", 0.55),
-        torso_up_cos_median_min=env_float("V46_52_GRAVITY_TORSO_MEDIAN_MIN", 0.76),
-        head_above_pelvis_ratio_min=env_float("V46_52_HEAD_ABOVE_RATIO_MIN", 0.97),
-        feet_below_pelvis_ratio_min=env_float("V46_52_FEET_BELOW_RATIO_MIN", 0.94),
-        horizontal_body_ratio_max=env_float("V46_52_HORIZONTAL_BODY_RATIO_MAX", 0.04),
+        torso_up_cos_p05_min=env_float("RETARGET_GRAVITY_TORSO_P05_MIN", 0.55),
+        torso_up_cos_median_min=env_float("RETARGET_GRAVITY_TORSO_MEDIAN_MIN", 0.76),
+        head_above_pelvis_ratio_min=env_float("RETARGET_HEAD_ABOVE_RATIO_MIN", 0.97),
+        feet_below_pelvis_ratio_min=env_float("RETARGET_FEET_BELOW_RATIO_MIN", 0.94),
+        horizontal_body_ratio_max=env_float("RETARGET_HORIZONTAL_BODY_RATIO_MAX", 0.04),
     )
     gravity_ok, gravity_reasons = evaluate_gravity_contract(gravity, gravity_th)
     anatomy = anatomy_metrics_np(motion, fps=resolved_fps)
     anatomy_th = AnatomyThresholds.from_env()
     anatomy_ok, anatomy_reasons = evaluate_anatomy_contract(anatomy, anatomy_th)
     fit_p95 = float(legacy_report.get("fit", {}).get("fit_rmse_p95_m", 1e9))
-    fit_limit = env_float("V46_52_FIT_RMSE_P95_MAX_M", 0.12)
+    fit_limit = env_float("RETARGET_FIT_RMSE_P95_MAX_M", 0.12)
     fit_ok = np.isfinite(fit_p95) and fit_p95 <= fit_limit
     reasons = []
     if not gravity_ok:
@@ -204,7 +204,7 @@ def _strict_contract(
     if not fit_ok:
         reasons.append(f"fit_rmse_p95_m={fit_p95:.6g} > {fit_limit:.6g}")
     report = {
-        "schema": "v46_52_strict_motion_contract",
+        "schema": "anatomy_heading_strict_motion_contract",
         "fps": resolved_fps,
         "ok": bool(gravity_ok and anatomy_ok and fit_ok),
         "reasons": reasons,
@@ -223,10 +223,10 @@ def _strict_contract(
 
 def retarget_bvh_anatomy(path: str | Path, cfg: Optional[Any] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
     cfg = copy.deepcopy(cfg or legacy.RetargetConfig.from_env())
-    cfg.iterations = env_int("V46_52_RETARGET_ITERS", max(160, int(cfg.iterations)))
-    cfg.learning_rate = env_float("V46_52_RETARGET_LR", min(float(cfg.learning_rate), 0.025))
-    cfg.fit_rmse_p95_max_m = env_float("V46_52_FIT_RMSE_P95_MAX_M", 0.12)
-    cfg.hard_gravity_gate = False  # V46.52 evaluates a stronger combined contract.
+    cfg.iterations = env_int("RETARGET_ITERS", max(160, int(cfg.iterations)))
+    cfg.learning_rate = env_float("RETARGET_LR", min(float(cfg.learning_rate), 0.025))
+    cfg.fit_rmse_p95_max_m = env_float("RETARGET_FIT_RMSE_P95_MAX_M", 0.12)
+    cfg.hard_gravity_gate = False  # Anatomy-Heading evaluates a stronger combined contract.
 
     original = legacy._fit_chunk
     legacy._fit_chunk = _fit_chunk_anatomy
@@ -237,16 +237,16 @@ def retarget_bvh_anatomy(path: str | Path, cfg: Optional[Any] = None) -> Tuple[n
 
     ok, contract = _strict_contract(motion, report)
     report = dict(report)
-    report["version"] = "v46_52_anatomy_constrained_bvh_retarget"
-    report["v46_52_contract"] = contract
+    report["version"] = "anatomy_heading_anatomy_constrained_bvh_retarget"
+    report["anatomy_heading_contract"] = contract
     report["anatomy"] = contract["anatomy"]
     report["anatomy_ok"] = contract["anatomy_ok"]
     report["fit_ok"] = contract["fit_ok"]
     report["gravity_ok"] = contract["gravity_ok"]
     report["ok"] = bool(ok)
-    if env_bool("V46_52_HARD_RETARGET_GATE", True) and not ok:
+    if env_bool("RETARGET_HARD_RETARGET_GATE", True) and not ok:
         raise RuntimeError(
-            f"V46.52 retarget contract failed for {path}: " + " | ".join(contract["reasons"])
+            f"Anatomy-Heading retarget contract failed for {path}: " + " | ".join(contract["reasons"])
         )
     return motion.astype(np.float32), report
 
@@ -261,10 +261,10 @@ def load_official_smpl_motion(
         path,
         target_fps=float(target_fps),
         scaling_mode=scaling_mode or os.environ.get("AISTPP_SCALING_MODE", "canonical_body"),
-        localize_root_xz=env_bool("V46_52_LOCALIZE_ROOT_XZ", True),
-        contact_height_m=env_float("V46_52_CONTACT_HEIGHT_M", 0.055),
-        contact_speed_mps=env_float("V46_52_CONTACT_SPEED_MPS", 0.75),
-        contact_median_seconds=env_float("V46_52_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0),
+        localize_root_xz=env_bool("RETARGET_LOCALIZE_ROOT_XZ", True),
+        contact_height_m=env_float("RETARGET_CONTACT_HEIGHT_M", 0.055),
+        contact_speed_mps=env_float("RETARGET_CONTACT_SPEED_MPS", 0.75),
+        contact_median_seconds=env_float("RETARGET_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0),
     )
     base_report = {
         **adapter_report,
@@ -272,9 +272,9 @@ def load_official_smpl_motion(
     }
     ok, contract = _strict_contract(motion, base_report)
     report = {
-        "version": "v46_54_canonical_smpl24_adapter",
+        "version": "routing_safety_canonical_smpl24_adapter",
         **base_report,
-        "v46_52_contract": contract,
+        "anatomy_heading_contract": contract,
         "anatomy": contract["anatomy"],
         "anatomy_ok": contract["anatomy_ok"],
         "gravity": contract["gravity"],
@@ -282,8 +282,8 @@ def load_official_smpl_motion(
         "fit_ok": True,
         "ok": bool(ok),
     }
-    if env_bool("V46_52_HARD_RETARGET_GATE", True) and not ok:
+    if env_bool("RETARGET_HARD_RETARGET_GATE", True) and not ok:
         raise RuntimeError(
-            f"V46.52 direct SMPL contract failed for {path}: " + " | ".join(contract["reasons"])
+            f"Anatomy-Heading direct SMPL contract failed for {path}: " + " | ".join(contract["reasons"])
         )
     return motion.astype(np.float32), report

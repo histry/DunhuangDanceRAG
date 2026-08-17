@@ -58,14 +58,14 @@ class TransitionBudgetTests(unittest.TestCase):
         self.assertTrue(report["capped"])
 
     def test_seam_mask_coverage_is_capped(self):
-        class FakeV46:
+        class FakeMotionRuntime:
             @staticmethod
             def make_transition_budget_mask(T, spans, cfg):
                 return np.ones((T, 1), dtype=np.float32)
 
-        with patch.dict(os.environ, {"V46_54_MAX_TRANSITION_MASK_RATIO": "0.25"}, clear=False):
+        with patch.dict(os.environ, {"ROUTING_SAFETY_MAX_TRANSITION_MASK_RATIO": "0.25"}, clear=False):
             mask, _centers, policy = make_seam_mask(
-                FakeV46(), 100, [[10, 30], [60, 80]], SimpleNamespace()
+                FakeMotionRuntime(), 100, [[10, 30], [60, 80]], SimpleNamespace()
             )
         self.assertLessEqual(int((mask[:, 0] > 0).sum()), 25)
         self.assertIn("coverage_cap", policy)

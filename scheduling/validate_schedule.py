@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.51 Fresh-WAV Audio–Schedule Transaction Contract.
+"""Fresh-WAV audio–schedule transaction contract.
 
 Formal generation must satisfy all of the following:
 
@@ -8,11 +8,11 @@ Formal generation must satisfy all of the following:
 2. the descriptor contains the current WAV SHA-256 and run identifier;
 3. the slot timeline is contiguous, ordered and frame-conserving;
 4. total target frames equal round(audio_duration * fps);
-5. the raw V26 report names the same current audio;
+5. the raw Whole-Song Planner report names the same current audio;
 6. no old MSSD may be silently reused.
 
 This module is importable by both the fresh MSSD builder and the final
-V46.51 generation entrypoint.
+Fresh-Audio Generation generation entrypoint.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ except ModuleNotFoundError:  # direct ``python scheduling/validate_schedule.py``
     )
 
 
-SCHEMA = "v46_51_fresh_wav_audio_schedule_contract"
+SCHEMA = "fresh_audio_fresh_wav_audio_schedule_contract"
 
 
 def jsonable(x: Any) -> Any:
@@ -265,7 +265,7 @@ def normalize_slot_time(
         (
             "target_frames",
             "allocated_phrase_total",
-            "v26_allocated_phrase_total",
+            "whole_song_allocated_phrase_total",
             "music_length",
             "frames",
             "num_frames",
@@ -353,7 +353,7 @@ def stamp_descriptor(
     assets: Mapping[str, Any],
     hash_assets: bool = True,
 ) -> Dict[str, Any]:
-    """Attach immutable V46.51 provenance to a newly rebuilt descriptor."""
+    """Attach immutable Fresh-Audio Generation provenance to a newly rebuilt descriptor."""
     out = dict(descriptor)
     info = audio_info(audio, fps=fps)
     raw_path = Path(raw_schedule_json)
@@ -395,7 +395,7 @@ def stamp_descriptor(
     }
 
     provenance = dict(out.get("provenance", {}))
-    provenance["v46_51"] = transaction
+    provenance["motion_51"] = transaction
     out["provenance"] = provenance
     out["audio"] = str(Path(audio).resolve())
     out["audio_sha256"] = info["sha256"]
@@ -461,7 +461,7 @@ def audit_contract(
         reasons.append(f"usage_not_generate_schedule:{usage}")
     if not is_final:
         reasons.append("is_final_schedule_false")
-    if slot_source != "v21_router_v26_planner":
+    if slot_source != "music_router_whole_song_planner":
         reasons.append(f"unexpected_slot_source:{slot_source}")
 
     descriptor_audio = meta.get("audio")
@@ -471,13 +471,13 @@ def audit_contract(
         )
 
     transaction = (
-        meta.get("provenance", {}).get("v46_51", {})
+        meta.get("provenance", {}).get("motion_51", {})
         if isinstance(meta.get("provenance"), dict)
         else {}
     )
     if require_fresh:
         if not isinstance(transaction, dict) or not transaction:
-            reasons.append("missing_v46_51_transaction_provenance")
+            reasons.append("missing_fresh_audio_transaction_provenance")
         else:
             if transaction.get("schedule_build_mode") != "fresh_from_current_wav":
                 reasons.append("schedule_build_mode_not_fresh_from_current_wav")
@@ -641,7 +641,7 @@ def audit_contract(
                     if out_npy:
                         npy_path = Path(str(out_npy))
                         if not npy_path.is_file():
-                            warnings.append(f"raw_v26_motion_missing:{npy_path}")
+                            warnings.append(f"raw_whole_song_motion_missing:{npy_path}")
                         else:
                             try:
                                 motion = np.load(npy_path, mmap_mode="r")
@@ -653,11 +653,11 @@ def audit_contract(
                                 raw_report_audit["out_npy_frames"] = frames
                                 if abs(frames - expected_frames) > max_frame_error:
                                     reasons.append(
-                                        f"raw_v26_motion_frame_mismatch:{frames}!={expected_frames}"
+                                        f"raw_whole_song_motion_frame_mismatch:{frames}!={expected_frames}"
                                     )
                             except Exception as exc:
                                 reasons.append(
-                                    f"raw_v26_motion_read_error:{exc}"
+                                    f"raw_whole_song_motion_read_error:{exc}"
                                 )
                 except Exception as exc:
                     reasons.append(f"raw_schedule_report_read_error:{exc}")
@@ -727,7 +727,7 @@ def write_rows_csv(report: Mapping[str, Any], path: str | Path) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Audit V46.51 fresh-WAV Audio–Schedule Contract"
+        description="Audit Fresh-Audio Generation fresh-WAV Audio–Schedule Contract"
     )
     ap.add_argument("--audio", required=True)
     ap.add_argument("--schedule", required=True)

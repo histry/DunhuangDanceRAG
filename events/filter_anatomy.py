@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Posture-aware event-level Anatomy gate for V46.53.1.
+"""Posture-aware event-level Anatomy gate for Retarget Clean.
 
 Only catastrophic source failures are removed before slicing. This module performs
 fine-grained event filtering after slicing, preserving valid cultural poses while
@@ -19,7 +19,7 @@ import numpy as np
 
 from contracts.anatomy import env_float, env_int, event_anatomy_features
 
-SCHEMA = "v46_53_1_posture_aware_event_anatomy_filter"
+SCHEMA = "retarget_clean_posture_aware_event_anatomy_filter"
 
 
 def _jsonable(x: Any) -> Any:
@@ -57,7 +57,7 @@ def _quality_threshold(posture: str) -> float:
         "floor_pose": 0.38,
     }
     key = str(posture)
-    env_key = "V46_52_EVENT_QUALITY_MIN_" + key.upper()
+    env_key = "RETARGET_EVENT_QUALITY_MIN_" + key.upper()
     return env_float(env_key, defaults.get(key, 0.44))
 
 
@@ -91,8 +91,8 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
     failures: List[Dict[str, Any]] = []
     keep = np.zeros(n, dtype=bool)
     hard_valid = np.zeros(n, dtype=bool)
-    min_frames = env_int("V46_52_EVENT_MIN_FRAMES", 18)
-    rescue_floor = env_float("V46_52_EVENT_RESCUE_QUALITY_FLOOR", 0.30)
+    min_frames = env_int("RETARGET_EVENT_MIN_FRAMES", 18)
+    rescue_floor = env_float("RETARGET_EVENT_RESCUE_QUALITY_FLOOR", 0.30)
 
     for i, path in enumerate(paths.tolist()):
         try:
@@ -127,7 +127,7 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
     # Rescue is quality-based and can never override a hard anatomy failure.
     split = _split_name(db_path)
     min_per_source = env_int(
-        "V46_52_EVENT_MIN_PER_SOURCE_TRAIN" if split == "train" else "V46_52_EVENT_MIN_PER_SOURCE_EVAL",
+        "RETARGET_EVENT_MIN_PER_SOURCE_TRAIN" if split == "train" else "RETARGET_EVENT_MIN_PER_SOURCE_EVAL",
         4 if split == "train" else 1,
     )
     rescued: List[int] = []
@@ -152,13 +152,13 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
 
     kept = np.where(keep)[0]
     min_events = env_int(
-        "V46_52_EVENT_DB_MIN_EVENTS_TRAIN" if split == "train" else "V46_52_EVENT_DB_MIN_EVENTS_EVAL",
+        "RETARGET_EVENT_DB_MIN_EVENTS_TRAIN" if split == "train" else "RETARGET_EVENT_DB_MIN_EVENTS_EVAL",
         64 if split == "train" else 12,
     )
-    min_ratio = env_float("V46_52_EVENT_DB_MIN_KEEP_RATIO", 0.35)
+    min_ratio = env_float("RETARGET_EVENT_DB_MIN_KEEP_RATIO", 0.35)
     if len(kept) < min_events or len(kept) / max(1, n) < min_ratio:
         raise RuntimeError(
-            f"V46.53.1 event gate retained {len(kept)}/{n} for split={split}; "
+            f"Retarget Clean event gate retained {len(kept)}/{n} for split={split}; "
             f"requires >= {min_events} and ratio >= {min_ratio:.3f}"
         )
 
@@ -209,7 +209,7 @@ def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[st
         out["desc_std"] = std.astype(np.float32)
         out["desc_z"] = ((desc - mean) / std).astype(np.float32)
 
-    backup = db_path.with_name(db_path.stem + ".pre_v46_53_1_anatomy.npz")
+    backup = db_path.with_name(db_path.stem + ".pre_retarget_clean_anatomy.npz")
     if not backup.exists(): shutil.copy2(db_path, backup)
     np.savez_compressed(db_path, **out)
     kept_meta = [meta[i] for i in kept]
@@ -243,7 +243,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     db = Path(args.db)
     meta = Path(args.meta) if args.meta else db.with_name("events_meta.json")
-    audit = Path(args.audit) if args.audit else db.with_name("events.v46_52_anatomy.audit.json")
+    audit = Path(args.audit) if args.audit else db.with_name("events.anatomy_heading_anatomy.audit.json")
     result = filter_database(db, meta, audit)
     print(json.dumps({k: result[k] for k in ("events_before", "events_after", "keep_ratio", "quality_min", "ok")}, indent=2))
     return 0

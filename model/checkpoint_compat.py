@@ -60,7 +60,7 @@ def _clone_reference_value(value):
     """Clone freshly initialized reference tensors without duplicating them on GPU.
 
     The old implementation used value.detach().clone(), which clones GPU tensors
-    on GPU when the model has already been moved to cuda. During V10 inference
+    on GPU when the model has already been moved to cuda. During legacy inference inference
     this can duplicate a large part of the model state and trigger OOM before
     checkpoint loading finishes.
 
@@ -85,7 +85,7 @@ def adapt_checkpoint_state_dict(checkpoint_state_dict, model, log_prefix="checkp
     have ``*.weight``. This helper maps the original weights and keeps any new buffers from
     the freshly initialized model so strict loading can still be used.
 
-    V10 hotfix:
+    legacy inference hotfix:
     - Fallback initialized reference tensors are cloned on CPU by default via
       EDGE_CHECKPOINT_COMPAT_CPU_MERGE=1.
     - This avoids a second GPU copy of model.state_dict() during checkpoint

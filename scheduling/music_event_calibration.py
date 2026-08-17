@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Calibrated phrase-level music event encoder used by V22."""
+"""Calibrated phrase-level music event encoder used by Turn-Pace Model."""
 from __future__ import annotations
 
 from typing import Dict, Tuple

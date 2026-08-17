@@ -4,7 +4,7 @@
 Emotion-conditioned Seam Residual Refiner
 
 设计目标：
-1. 输入 V16C/V17 调度得到的稳定 150 帧 motion；
+1. 输入 legacy scheduler 调度得到的稳定 150 帧 motion；
 2. 输入逐帧音乐情感语义条件 [energy, onset, beat, arousal, tension, calmness 等]；
 3. 只预测小残差，优先修接缝附近，避免重写整段动作；
 4. 强制保留 contacts 和 root X/Z，避免原地约束被破坏。

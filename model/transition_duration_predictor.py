@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Transition Duration Predictor (DPN-lite) for V20 Event-Graph ChoreoRAG."""
+"""Transition Duration Predictor (DPN-lite) for Transition Model Event-Graph ChoreoRAG."""
 from __future__ import annotations
 
 import torch

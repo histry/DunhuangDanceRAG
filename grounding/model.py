@@ -35,7 +35,7 @@ from events.semantic_descriptor import (
     event_probs_from_fields,
 )
 
-SCHEMA = "v46_53_dual_branch_structure_guided_grounding_v1"
+SCHEMA = "event_geometry_dual_branch_structure_guided_grounding_v1"
 POSTURES = ("floor_pose", "kneeling", "deep_squat", "half_squat", "standing", "aerial")
 ROLE_HASH_DIM = 8
 FAMILY_HASH_DIM = 16
@@ -114,18 +114,18 @@ def _load_grounder_checkpoint(path: Path) -> Dict[str, Any]:
 def _training_geometry_contract(
     db: Mapping[str, Any],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    if "v46_53_geometry_desc" not in db:
-        raise RuntimeError("Run v46_53 event geometry augmentation before grounding")
-    schema = _scalar(db, "v46_53_geometry_schema_version")
-    fps = _scalar(db, "v46_53_geometry_fps")
+    if "event_geometry_geometry_desc" not in db:
+        raise RuntimeError("Run motion_53 event geometry augmentation before grounding")
+    schema = _scalar(db, "event_geometry_geometry_schema_version")
+    fps = _scalar(db, "event_geometry_geometry_fps")
     skeleton = _scalar(db, "skeleton_contract_json")
     if schema is None or fps is None or skeleton is None:
         raise RuntimeError(
             "Grounder training database lacks geometry FPS/schema or skeleton contract"
         )
-    raw = np.asarray(db["v46_53_geometry_desc"], dtype=np.float32)
-    mean = np.asarray(db.get("v46_53_geometry_mean"), dtype=np.float32)
-    std = np.asarray(db.get("v46_53_geometry_std"), dtype=np.float32)
+    raw = np.asarray(db["event_geometry_geometry_desc"], dtype=np.float32)
+    mean = np.asarray(db.get("event_geometry_geometry_mean"), dtype=np.float32)
+    std = np.asarray(db.get("event_geometry_geometry_std"), dtype=np.float32)
     if raw.ndim != 2 or mean.shape != (1, raw.shape[1]) or std.shape != (1, raw.shape[1]):
         raise RuntimeError(
             "Grounder geometry statistics have incompatible shapes: "
@@ -150,10 +150,10 @@ def _geometry_for_checkpoint(
 ) -> np.ndarray:
     """Transform any split with train-only geometry statistics."""
 
-    if "v46_53_geometry_desc" not in db:
-        raise RuntimeError("V46.53 raw geometry descriptor is missing")
-    schema = _scalar(db, "v46_53_geometry_schema_version")
-    fps = _scalar(db, "v46_53_geometry_fps")
+    if "event_geometry_geometry_desc" not in db:
+        raise RuntimeError("Geometry-Aware Routing raw geometry descriptor is missing")
+    schema = _scalar(db, "event_geometry_geometry_schema_version")
+    fps = _scalar(db, "event_geometry_geometry_fps")
     skeleton = _scalar(db, "skeleton_contract_json")
     expected = checkpoint.get("geometry_contract")
     if not isinstance(expected, Mapping):
@@ -172,7 +172,7 @@ def _geometry_for_checkpoint(
         mismatches.append(f"fps: db={fps!r}, checkpoint={expected.get('fps')!r}")
     if str(skeleton) != str(expected.get("skeleton_contract_json")):
         mismatches.append("skeleton_contract_json")
-    raw = np.asarray(db["v46_53_geometry_desc"], dtype=np.float32)
+    raw = np.asarray(db["event_geometry_geometry_desc"], dtype=np.float32)
     dimension = int(expected.get("geometry_dim", -1))
     if raw.ndim != 2 or raw.shape[1] != dimension:
         mismatches.append(f"geometry_dim: db={raw.shape}, checkpoint={dimension}")
@@ -227,7 +227,7 @@ def event_semantic_matrix(db: Mapping[str, Any]) -> Tuple[np.ndarray, np.ndarray
         rhythm = _arr(db, "rhythm_labels", n, "unknown")
         loco = _arr(db, "locomotion_labels", n, "unknown")
         support = _arr(db, "support_labels", n, "unknown")
-        quality = _farr(db, "v46_53_combined_quality", n, 0.5)
+        quality = _farr(db, "event_geometry_combined_quality", n, 0.5)
         sem_conf = _farr(db, "semantic_confidence", n, 0.5)
         desc = np.asarray(db.get("desc", np.zeros((n, 32), np.float32)), dtype=np.float32)
         probs = np.stack([
@@ -247,7 +247,7 @@ def event_semantic_matrix(db: Mapping[str, Any]) -> Tuple[np.ndarray, np.ndarray
         ]).astype(np.float32)
 
     durations = _farr(db, "durations", n, 2.0)
-    quality = _farr(db, "v46_53_combined_quality", n, 0.5)
+    quality = _farr(db, "event_geometry_combined_quality", n, 0.5)
     posture = _arr(db, "posture_mode", n, "standing")
     roles = _arr(db, "motion_stage_roles", n, "unknown")
     family = _arr(db, "event_families", n, "unknown")
@@ -384,28 +384,28 @@ def train_grounder(
     seed: int = 20260717,
 ) -> Dict[str, Any]:
     if torch is None:
-        raise RuntimeError("PyTorch is required to train V46.53 grounding")
+        raise RuntimeError("PyTorch is required to train Geometry-Aware Routing grounding")
     raw = np.load(db_path, allow_pickle=True)
     db = {k: raw[k] for k in raw.files}
     geometry, geometry_mean, geometry_std, geometry_contract = (
         _training_geometry_contract(db)
     )
     semantic, top, posture, family = event_semantic_matrix(db)
-    quality = np.asarray(db.get("v46_53_combined_quality", np.ones(len(geometry), np.float32)), dtype=np.float32)
+    quality = np.asarray(db.get("event_geometry_combined_quality", np.ones(len(geometry), np.float32)), dtype=np.float32)
     sources = np.asarray(db.get("source_uids", np.asarray(["unknown"] * len(geometry), object)), dtype=object)
     source_ids = np.asarray([int(hashlib.sha1(str(s).encode()).hexdigest()[:8], 16) % 1024 for s in sources], dtype=np.int64)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("V46_53_GROUNDER_CUDA", True) else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("GROUNDING_GROUNDER_CUDA", True) else "cpu")
     torch.manual_seed(seed)
     np.random.seed(seed)
     model = DualBranchGrounder(
         geometry_dim=geometry.shape[1],
         semantic_dim=semantic.shape[1],
-        hidden=_env_int("V46_53_GROUNDER_HIDDEN", 192),
-        embed=_env_int("V46_53_GROUNDER_EMBED", 96),
-        hyp_dim=_env_int("V46_53_HYPERBOLIC_DIM", 32),
+        hidden=_env_int("GROUNDING_GROUNDER_HIDDEN", 192),
+        embed=_env_int("GROUNDING_GROUNDER_EMBED", 96),
+        hyp_dim=_env_int("GROUNDING_HYPERBOLIC_DIM", 32),
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=_env_float("V46_53_GROUNDER_LR", 2e-4), weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=_env_float("GROUNDING_GROUNDER_LR", 2e-4), weight_decay=1e-4)
 
     g_all = torch.from_numpy(geometry).to(device)
     s_all = torch.from_numpy(semantic).to(device)
@@ -415,7 +415,7 @@ def train_grounder(
     family_t = torch.from_numpy(family).to(device)
     source_t = torch.from_numpy(source_ids).to(device)
     n = len(geometry)
-    temp = _env_float("V46_53_GROUNDER_TEMP", 0.08)
+    temp = _env_float("GROUNDING_GROUNDER_TEMP", 0.08)
     history = []
 
     model.train()
@@ -451,7 +451,7 @@ def train_grounder(
         pos_h = same_family & offdiag
         neg_h = (~same_family) & offdiag
         hierarchy_pos = hdist[pos_h].mean() if pos_h.any() else hdist.sum() * 0.0
-        hierarchy_neg = F.relu(_env_float("V46_53_HYPERBOLIC_MARGIN", 1.25) - hdist[neg_h]).mean() if neg_h.any() else hdist.sum() * 0.0
+        hierarchy_neg = F.relu(_env_float("GROUNDING_HYPERBOLIC_MARGIN", 1.25) - hdist[neg_h]).mean() if neg_h.any() else hdist.sum() * 0.0
         hierarchy_loss = hierarchy_pos + 0.35 * hierarchy_neg
         # Source invariance prevents the shared branch from becoming a dancer ID.
         source_loss = sim[same_source & ~same_family & offdiag].square().mean() if (same_source & ~same_family & offdiag).any() else sim.sum() * 0.0
@@ -471,17 +471,17 @@ def train_grounder(
         consistency = (event_z - model.encode_slot(sem)).square().mean()
         loss = (
             loss_con
-            + _env_float("V46_53_HIERARCHY_LOSS_W", 0.20) * hierarchy_loss
-            + _env_float("V46_53_SOURCE_INVARIANCE_W", 0.05) * source_loss
-            + _env_float("V46_53_JIGSAW_LOSS_W", 0.12) * jigsaw_loss
-            + _env_float("V46_53_DYNAMIC_CONSISTENCY_W", 0.18) * decay * consistency
+            + _env_float("GROUNDING_HIERARCHY_LOSS_W", 0.20) * hierarchy_loss
+            + _env_float("GROUNDING_SOURCE_INVARIANCE_W", 0.05) * source_loss
+            + _env_float("GROUNDING_JIGSAW_LOSS_W", 0.12) * jigsaw_loss
+            + _env_float("GROUNDING_DYNAMIC_CONSISTENCY_W", 0.18) * decay * consistency
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
         opt.step()
 
-        if step == 1 or step % max(1, _env_int("V46_53_GROUNDER_LOG_EVERY", 100)) == 0 or step == steps:
+        if step == 1 or step % max(1, _env_int("GROUNDING_GROUNDER_LOG_EVERY", 100)) == 0 or step == steps:
             row = {
                 "step": int(step),
                 "loss": float(loss.detach().cpu()),
@@ -491,7 +491,7 @@ def train_grounder(
                 "dynamic_consistency_weight": float(decay),
             }
             history.append(row)
-            print("[V46.53 GROUND] " + json.dumps(row, ensure_ascii=False), flush=True)
+            print("[Geometry-Aware Routing GROUND] " + json.dumps(row, ensure_ascii=False), flush=True)
 
     model.eval()
     with torch.no_grad():
@@ -502,9 +502,9 @@ def train_grounder(
         "state_dict": model.state_dict(),
         "geometry_dim": int(geometry.shape[1]),
         "semantic_dim": int(semantic.shape[1]),
-        "hidden": _env_int("V46_53_GROUNDER_HIDDEN", 192),
-        "embed": _env_int("V46_53_GROUNDER_EMBED", 96),
-        "hyp_dim": _env_int("V46_53_HYPERBOLIC_DIM", 32),
+        "hidden": _env_int("GROUNDING_GROUNDER_HIDDEN", 192),
+        "embed": _env_int("GROUNDING_GROUNDER_EMBED", 96),
+        "hyp_dim": _env_int("GROUNDING_HYPERBOLIC_DIM", 32),
         "music_semantic_labels": list(MUSIC_SEMANTIC_LABELS),
         "history": history,
         "seed": int(seed),
@@ -514,13 +514,13 @@ def train_grounder(
     }, out_path)
 
     payload = dict(db)
-    payload["v46_53_grounding_schema_version"] = np.asarray(SCHEMA, dtype=object)
-    payload["v46_53_grounding_embedding"] = event_embed
-    payload["v46_53_grounder_geometry_z"] = geometry
-    payload["v46_53_grounder_normalization"] = np.asarray(
+    payload["event_geometry_grounding_schema_version"] = np.asarray(SCHEMA, dtype=object)
+    payload["event_geometry_grounding_embedding"] = event_embed
+    payload["event_geometry_grounder_geometry_z"] = geometry
+    payload["event_geometry_grounder_normalization"] = np.asarray(
         "train_split_statistics", dtype=object
     )
-    backup = db_path.with_name(db_path.stem + ".pre_v46_53_grounding.npz")
+    backup = db_path.with_name(db_path.stem + ".pre_event_geometry_grounding.npz")
     if not backup.exists():
         shutil.copy2(db_path, backup)
     np.savez_compressed(db_path, **payload)
@@ -547,11 +547,11 @@ def train_grounder(
 def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
     """Embed a non-train split with a grounder learned only on train sources."""
     if torch is None:
-        raise RuntimeError("PyTorch is required for V46.53 grounding embedding")
+        raise RuntimeError("PyTorch is required for Geometry-Aware Routing grounding embedding")
     raw = np.load(db_path, allow_pickle=True)
     db = {k: raw[k] for k in raw.files}
     ckpt = _load_grounder_checkpoint(checkpoint)
-    if ckpt.get("schema") == "v46_53_mixed_curvature_gaussian_grounder_v1":
+    if ckpt.get("schema") == "event_geometry_mixed_curvature_gaussian_grounder_v1":
         raw.close()
         from grounding.mixed_curvature import embed_database_mixed
 
@@ -565,10 +565,10 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
         hyp_dim=int(ckpt.get("hyp_dim", 32)),
     )
     model.load_state_dict(ckpt["state_dict"], strict=True)
-    device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("V46_53_GROUNDER_INFER_CUDA", False) else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("GROUNDING_GROUNDER_INFER_CUDA", False) else "cpu")
     model.to(device).eval()
     sem, _, _, _ = event_semantic_matrix(db)
-    quality = np.asarray(db.get("v46_53_combined_quality", np.ones(len(geom), np.float32)), dtype=np.float32)
+    quality = np.asarray(db.get("event_geometry_combined_quality", np.ones(len(geom), np.float32)), dtype=np.float32)
     with torch.no_grad():
         event_embed = model.encode_event(
             torch.from_numpy(geom).to(device),
@@ -576,10 +576,10 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
             torch.from_numpy(quality).to(device),
         ).cpu().numpy().astype(np.float32)
     payload = dict(db)
-    payload["v46_53_grounding_schema_version"] = np.asarray(SCHEMA, dtype=object)
-    payload["v46_53_grounding_embedding"] = event_embed
-    payload["v46_53_grounder_geometry_z"] = geom
-    payload["v46_53_grounder_normalization"] = np.asarray(
+    payload["event_geometry_grounding_schema_version"] = np.asarray(SCHEMA, dtype=object)
+    payload["event_geometry_grounding_embedding"] = event_embed
+    payload["event_geometry_grounder_geometry_z"] = geom
+    payload["event_geometry_grounder_normalization"] = np.asarray(
         "train_split_statistics", dtype=object
     )
     np.savez_compressed(db_path, **payload)
@@ -594,7 +594,7 @@ def embed_database(db_path: Path, checkpoint: Path) -> Dict[str, Any]:
         "normalization": "train_split_statistics",
         "ok": True,
     }
-    db_path.with_name(db_path.stem + ".v46_53_grounding.json").write_text(
+    db_path.with_name(db_path.stem + ".event_geometry_grounding.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return report
@@ -610,14 +610,14 @@ class GroundingRuntime:
         )
         self.model = None
         self.mixed_runtime = None
-        self.event_embedding = np.asarray(db.get("v46_53_grounding_embedding", np.zeros((len(self.event_probs), 1), np.float32)), dtype=np.float32)
+        self.event_embedding = np.asarray(db.get("event_geometry_grounding_embedding", np.zeros((len(self.event_probs), 1), np.float32)), dtype=np.float32)
         self.device = None
         architecture = str(
-            os.environ.get("V46_53_GROUNDER_ARCHITECTURE", "legacy")
+            os.environ.get("GROUNDING_GROUNDER_ARCHITECTURE", "legacy")
         ).strip().lower()
         strict_mixed = (
             architecture == "mixed"
-            and _env_bool("V46_53_MIXED_REQUIRE_RUNTIME_AUDIO", False)
+            and _env_bool("GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO", False)
         )
         checkpoint_path = Path(self.checkpoint) if self.checkpoint else None
         if strict_mixed and torch is None:
@@ -629,7 +629,7 @@ class GroundingRuntime:
         ):
             raise RuntimeError(
                 "Mixed-curvature Grounder strict mode requires an existing "
-                "V46_53_GROUNDER_CKPT"
+                "GROUNDING_GROUNDER_CKPT"
             )
         if (
             torch is not None
@@ -637,7 +637,7 @@ class GroundingRuntime:
             and checkpoint_path.is_file()
         ):
             ckpt = _load_grounder_checkpoint(checkpoint_path)
-            if ckpt.get("schema") == "v46_53_mixed_curvature_gaussian_grounder_v1":
+            if ckpt.get("schema") == "event_geometry_mixed_curvature_gaussian_grounder_v1":
                 from grounding.mixed_curvature import MixedGroundingRuntime
 
                 self.mixed_runtime = MixedGroundingRuntime(
@@ -646,10 +646,10 @@ class GroundingRuntime:
                 return
             if strict_mixed:
                 raise RuntimeError(
-                    "V46_53_GROUNDER_ARCHITECTURE=mixed but the configured "
+                    "GROUNDING_GROUNDER_ARCHITECTURE=mixed but the configured "
                     f"checkpoint has incompatible schema {ckpt.get('schema')!r}"
                 )
-            if "v46_53_geometry_desc" not in db:
+            if "event_geometry_geometry_desc" not in db:
                 return
             aligned_geometry = _geometry_for_checkpoint(db, ckpt)
             self.model = DualBranchGrounder(
@@ -661,13 +661,13 @@ class GroundingRuntime:
             )
             self.model.load_state_dict(ckpt["state_dict"], strict=True)
             self.model.eval()
-            self.device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("V46_53_GROUNDER_INFER_CUDA", False) else "cpu")
+            self.device = torch.device("cuda" if torch.cuda.is_available() and _env_bool("GROUNDING_GROUNDER_INFER_CUDA", False) else "cpu")
             self.model.to(self.device)
             if self.event_embedding.ndim != 2 or self.event_embedding.shape[1] != int(ckpt.get("embed", 96)):
                 sem, _, _, _ = event_semantic_matrix(db)
                 quality = np.asarray(
                     db.get(
-                        "v46_53_combined_quality",
+                        "event_geometry_combined_quality",
                         np.ones(len(aligned_geometry), np.float32),
                     ),
                     dtype=np.float32,
@@ -689,7 +689,7 @@ class GroundingRuntime:
             # vector is manufactured to force the mixed model to run.
             if learned is None:
                 if _env_bool(
-                    "V46_53_MIXED_REQUIRE_RUNTIME_AUDIO", False
+                    "GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO", False
                 ):
                     raise RuntimeError(
                         "Mixed-curvature Grounder is active but the music slot "

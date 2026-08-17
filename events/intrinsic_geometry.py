@@ -3,8 +3,8 @@
 """Augment an Anatomy-Gated Event-RAG DB with intrinsic motion geometry.
 
 The augmentation is schema-preserving: every existing array is retained.  New
-arrays are event-wise and therefore remain compatible with the V46.38 AESD
-copy/enrichment step and the V44/V45/V46 trainers.
+arrays are event-wise and therefore remain compatible with the Semantic Routing AESD
+copy/enrichment step and the Contrastive Retriever/Motion Refiner and Motion Diffusion trainers.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from contracts.gravity import (
     fk24_np,
 )
 
-SCHEMA = "v46_53_intrinsic_event_geometry_v3_physical_endpoints"
+SCHEMA = "event_geometry_intrinsic_event_geometry_v3_physical_endpoints"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 BODY_PARTS: Dict[str, Tuple[int, ...]] = {
@@ -160,12 +160,12 @@ def _bodypart_gaussian_statistics(
         )
     aligned = min(max(len(w) - 1, 0), len(a))
     shrink = (
-        _env_float("V46_53_GAUSSIAN_COV_SHRINKAGE", 0.20)
+        _env_float("GROUNDING_GAUSSIAN_COV_SHRINKAGE", 0.20)
         if shrinkage is None
         else float(shrinkage)
     )
     floor = (
-        _env_float("V46_53_GAUSSIAN_COV_EPS", 1.0e-4)
+        _env_float("GROUNDING_GAUSSIAN_COV_EPS", 1.0e-4)
         if minimum_eigenvalue is None
         else float(minimum_eigenvalue)
     )
@@ -312,8 +312,8 @@ def _geometry_descriptor(
     # continuous ranking prior that penalizes excessive high-order dynamics.
     omega_p95 = float(np.percentile(np.linalg.norm(omega, axis=-1), 95)) if omega.size else 0.0
     alpha_p95 = float(np.percentile(np.linalg.norm(alpha, axis=-1), 95)) if alpha.size else 0.0
-    jerk_scale = _env_float("V46_53_STRUCTURE_ALPHA_SCALE", 180.0)
-    speed_scale = _env_float("V46_53_STRUCTURE_OMEGA_SCALE", 8.0)
+    jerk_scale = _env_float("GROUNDING_STRUCTURE_ALPHA_SCALE", 180.0)
+    speed_scale = _env_float("GROUNDING_STRUCTURE_OMEGA_SCALE", 8.0)
     structure_quality = float(np.clip(math.exp(-omega_p95 / max(speed_scale, 1e-6) - alpha_p95 / max(jerk_scale, 1e-6)), 0.0, 1.0))
 
     return {
@@ -431,7 +431,7 @@ def augment_database(
     anatomy_q = np.asarray(payload.get("anatomy_quality", np.ones(n, np.float32) * 0.5), dtype=np.float32)
     old_q = np.asarray(payload.get("event_quality_scores", np.ones(n, np.float32) * 0.5), dtype=np.float32)
 
-    edge_frames_30fps = _env_int("V46_53_EVENT_EDGE_FRAMES", 6)
+    edge_frames_30fps = _env_int("GROUNDING_EVENT_EDGE_FRAMES", 6)
     edge_frames = max(1, int(round(edge_frames_30fps * fps / 30.0)))
     (
         rows,
@@ -513,48 +513,48 @@ def augment_database(
     bary_mean, bary_std, shared, private = _diagonal_w2_barycenter(geometry_z, sources, combined_q)
 
     payload.update({
-        "v46_53_geometry_schema_version": np.asarray(SCHEMA, dtype=object),
-        "v46_53_geometry_fps": np.asarray(fps, dtype=np.float32),
-        "v46_53_geometry_desc": geometry,
-        "v46_53_geometry_desc_z": geometry_z,
-        "v46_53_geometry_mean": mean.astype(np.float32),
-        "v46_53_geometry_std": std.astype(np.float32),
-        "v46_53_entry_omega": np.stack(w0).astype(np.float32),
-        "v46_53_exit_omega": np.stack(w1).astype(np.float32),
-        "v46_53_entry_alpha": np.stack(a0).astype(np.float32),
-        "v46_53_exit_alpha": np.stack(a1).astype(np.float32),
-        "v46_53_entry_root_velocity_mps": np.stack(rv0).astype(np.float32),
-        "v46_53_exit_root_velocity_mps": np.stack(rv1).astype(np.float32),
-        "v46_55_route_geometry_schema_version": np.asarray(
-            "v46_55_so3_product_event_edge_state_v1", dtype=object
+        "event_geometry_geometry_schema_version": np.asarray(SCHEMA, dtype=object),
+        "event_geometry_geometry_fps": np.asarray(fps, dtype=np.float32),
+        "event_geometry_geometry_desc": geometry,
+        "event_geometry_geometry_desc_z": geometry_z,
+        "event_geometry_geometry_mean": mean.astype(np.float32),
+        "event_geometry_geometry_std": std.astype(np.float32),
+        "event_geometry_entry_omega": np.stack(w0).astype(np.float32),
+        "event_geometry_exit_omega": np.stack(w1).astype(np.float32),
+        "event_geometry_entry_alpha": np.stack(a0).astype(np.float32),
+        "event_geometry_exit_alpha": np.stack(a1).astype(np.float32),
+        "event_geometry_entry_root_velocity_mps": np.stack(rv0).astype(np.float32),
+        "event_geometry_exit_root_velocity_mps": np.stack(rv1).astype(np.float32),
+        "graph_route_route_geometry_schema_version": np.asarray(
+            "graph_route_so3_product_event_edge_state_v1", dtype=object
         ),
-        "v46_55_entry_rotation_matrix": np.stack(r0).astype(np.float32),
-        "v46_55_exit_rotation_matrix": np.stack(r1).astype(np.float32),
-        "v46_53_bodypart_flow": np.stack(parts).astype(np.float32),
-        "v46_53_bodypart_gaussian_schema_version": np.asarray(
-            "v46_53_bodypart_so3_gaussian_bw_v1", dtype=object
+        "graph_route_entry_rotation_matrix": np.stack(r0).astype(np.float32),
+        "graph_route_exit_rotation_matrix": np.stack(r1).astype(np.float32),
+        "event_geometry_bodypart_flow": np.stack(parts).astype(np.float32),
+        "event_geometry_bodypart_gaussian_schema_version": np.asarray(
+            "event_geometry_bodypart_so3_gaussian_bw_v1", dtype=object
         ),
-        "v46_53_bodypart_gaussian_mean": np.stack(gaussian_means).astype(
+        "event_geometry_bodypart_gaussian_mean": np.stack(gaussian_means).astype(
             np.float32
         ),
-        "v46_53_bodypart_gaussian_covariance": np.stack(
+        "event_geometry_bodypart_gaussian_covariance": np.stack(
             gaussian_covariances
         ).astype(np.float32),
-        "v46_53_bodypart_gaussian_samples": np.stack(
+        "event_geometry_bodypart_gaussian_samples": np.stack(
             gaussian_sample_counts
         ).astype(np.int32),
-        "v46_53_structure_quality": structure_q_arr,
-        "v46_53_combined_quality": combined_q,
-        "v46_53_w2_barycenter_mean": bary_mean,
-        "v46_53_w2_barycenter_std": bary_std,
-        "v46_53_shared_embedding": shared,
-        "v46_53_source_private_embedding": private,
+        "event_geometry_structure_quality": structure_q_arr,
+        "event_geometry_combined_quality": combined_q,
+        "event_geometry_w2_barycenter_mean": bary_mean,
+        "event_geometry_w2_barycenter_std": bary_std,
+        "event_geometry_shared_embedding": shared,
+        "event_geometry_source_private_embedding": private,
         # Existing routing already consumes this key.  Updating it lets the old
-        # V44/V46 path benefit from anatomy and intrinsic dynamics immediately.
+        # Contrastive Retriever/Motion Generation path benefit from anatomy and intrinsic dynamics immediately.
         "event_quality_scores": combined_q,
     })
 
-    backup = db_path.with_name(db_path.stem + ".pre_v46_53_geometry.npz")
+    backup = db_path.with_name(db_path.stem + ".pre_event_geometry_geometry.npz")
     if not backup.exists():
         shutil.copy2(db_path, backup)
     np.savez_compressed(db_path, **payload)
@@ -569,7 +569,7 @@ def augment_database(
         "edge_frames": int(edge_frames),
         "edge_window_seconds": float(edge_frames / fps),
         "route_edge_geometry": {
-            "schema": "v46_55_so3_product_event_edge_state_v1",
+            "schema": "graph_route_so3_product_event_edge_state_v1",
             "rotation_shape": [24, 3, 3],
             "distance": "RMS product SO(3) geodesic",
         },
@@ -579,10 +579,10 @@ def augment_database(
         "gaussian_covariance": {
             "geometry": "Bures-Wasserstein SPD",
             "shrinkage": _env_float(
-                "V46_53_GAUSSIAN_COV_SHRINKAGE", 0.20
+                "GROUNDING_GAUSSIAN_COV_SHRINKAGE", 0.20
             ),
             "minimum_eigenvalue": _env_float(
-                "V46_53_GAUSSIAN_COV_EPS", 1.0e-4
+                "GROUNDING_GAUSSIAN_COV_EPS", 1.0e-4
             ),
         },
         "quality": {
@@ -599,7 +599,7 @@ def augment_database(
         "events": diagnostics,
         "ok": True,
     }
-    target = audit_path or db_path.with_name("events.v46_53_geometry.audit.json")
+    target = audit_path or db_path.with_name("events.event_geometry_geometry.audit.json")
     target.write_text(json.dumps(_jsonable(report), ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 

@@ -103,7 +103,7 @@ class AudioRhythmContractTests(unittest.TestCase):
     def test_strict_mode_rejects_zero_rhythm_from_existing_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
-            cache_path = cache / "cached_song_v26_fps2_2.npy"
+            cache_path = cache / "cached_song_whole_song_fps2_2.npy"
             np.save(cache_path, np.zeros((2, 12), dtype=np.float32))
             cache_path.with_suffix(".json").write_text(
                 json.dumps(

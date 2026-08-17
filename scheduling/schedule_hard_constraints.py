@@ -156,14 +156,14 @@ def audit_schedule_hard_constraints(
             row,
             (
                 "allocated_phrase_total",
-                "v26_allocated_phrase_total",
+                "whole_song_allocated_phrase_total",
                 "target_frames",
                 "music_length",
             ),
         )
         core_value = _finite_number(
             row,
-            ("allocated_content_len", "v26_allocated_content_len"),
+            ("allocated_content_len", "whole_song_allocated_content_len"),
         )
         target = int(round(target_value)) if target_value is not None else 0
         core = int(round(core_value)) if core_value is not None else 0
@@ -174,12 +174,12 @@ def audit_schedule_hard_constraints(
         elif core < 0 or (target > 0 and core > target):
             reasons.append(f"slot_{index}_invalid_core_frames:{core}/{target}")
 
-        source_uid = _text(row, ("source_uid", "v26_source_uid"))
+        source_uid = _text(row, ("source_uid", "whole_song_source_uid"))
         recording_uid = _text(
             row,
-            ("recording_uid", "v26_recording_uid"),
+            ("recording_uid", "whole_song_recording_uid"),
         ) or source_uid
-        event_uid = _text(row, ("event_uid", "v26_event_uid"))
+        event_uid = _text(row, ("event_uid", "whole_song_event_uid"))
         motion_event = _text(row, ("motion_event", "event_type"))
         if not source_uid or source_uid.lower() == "unknown":
             missing_source_slots.append(index)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Shared utilities for V23-v2 natural-duration supervision and runtime.
+"""Shared utilities for natural-duration supervision and runtime.
 
 The central design rule is that every feature used at training time must also be
 available at inference time.  In particular, conditions are built from the
@@ -594,7 +594,7 @@ def detect_natural_turn_events(
 ) -> List[NaturalTurnEvent]:
     """Detect slow, complete and phase-consistent Dunhuang turn events.
 
-    Key differences from V23-v2.1:
+    Key differences from the earlier peak-based duration detector:
     1. slow turns are proposed by accumulated yaw over a long window, not only
        by instantaneous high-speed peaks;
     2. multi-scale pose progression keeps slow preparation and recovery active;
@@ -916,7 +916,7 @@ def inverse_time_map(source_positions: np.ndarray) -> np.ndarray:
     return np.clip(inverse / max(n - 1, 1), 0.0, 1.0).astype(np.float32)
 
 
-def build_v23_condition(
+def build_duration_model_condition(
     observed_motion: np.ndarray,
     event_start: int,
     event_end: int,

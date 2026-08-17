@@ -13,7 +13,7 @@ def final_descriptor(fps=None):
     value = {
         "usage": "generate_schedule",
         "is_final_schedule": True,
-        "slot_source": "v21_router_v26_planner",
+        "slot_source": "music_router_whole_song_planner",
         "slots": [
             {
                 "slot_id": 0,

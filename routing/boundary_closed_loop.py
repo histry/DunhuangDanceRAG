@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.46 Boundary-Simulated Closed-Loop Scheduler for EDGE 151D
+Boundary Closed-Loop Boundary-Simulated Closed-Loop Scheduler for EDGE 151D
 =============================================================
 
-This file is an additive research patch for the histry/EDGE V46.x codebase.
+This file is an additive research patch for the histry/EDGE Motion Generation.x codebase.
 It does not replace training/motion_models.py.  Instead, it imports the
-latest V46.38/V46.41/V46.45 functions and wraps them into a closed-loop
+latest Semantic Routing/Stage Guard/Motion Refinement functions and wraps them into a closed-loop
 boundary-safe generation pipeline.
 
 Research objective
@@ -18,7 +18,7 @@ boundary safety scheduler:
         -> lightweight simulated stitching risk
         -> risk-adaptive transition budget
         -> real stitching
-        -> V32/V34-style cross-boundary risk audit
+        -> Contact and Boundary Transition-style cross-boundary risk audit
         -> candidate reselection / repair / rollback
         -> unified boundary-level audit table
 
@@ -26,7 +26,7 @@ Key properties
 --------------
 1. Search risk is no longer only metadata-level.  For top-k candidates, the
    scheduler quickly simulates yaw/XZ alignment + root-Hermite / rotation-SLERP
-   transition and evaluates a lightweight V32-style risk.
+   transition and evaluates a lightweight Contact Transition-style risk.
 2. Transition length is adapted by pose/yaw/contact/FK risk, not only target
    duration.
 3. Unsafe boundaries can trigger local candidate reselection before relying on
@@ -44,11 +44,11 @@ Run from EDGE root:
         --config configs/motion_model.json \
         --audio dunhuangwu2.wav \
         --db output/.../db \
-        --contrastive output/.../v44.pt \
-        --refiner output/.../v45.pt \
-        --diffusion output/.../v46.pt \
-        --out output/.../dunhuangwu2_v46_46_closed_loop.npy \
-        --json output/.../dunhuangwu2_v46_46_closed_loop.report.json
+        --contrastive output/.../semantic_retriever.pt \
+        --refiner output/.../boundary_refiner.pt \
+        --diffusion output/.../motion_runtime.pt \
+        --out output/.../dunhuangwu2_boundary_closed_loop_closed_loop.npy \
+        --json output/.../dunhuangwu2_boundary_closed_loop_closed_loop.report.json
 """
 from __future__ import annotations
 
@@ -157,7 +157,7 @@ def save_json(obj: Any, path: str | Path) -> None:
     p.write_text(json.dumps(jsonable(obj), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def import_v46():
+def import_motion_runtime():
     return importlib.import_module("training.motion_models")
 
 
@@ -170,17 +170,17 @@ def _as_motion_array(x: Any) -> np.ndarray:
     return arr[:, :EDGE_DIM].astype(np.float32)
 
 
-def enforce_contract(v46, motion: np.ndarray, cfg: Any, source_hint: str) -> np.ndarray:
+def enforce_contract(motion_runtime, motion: np.ndarray, cfg: Any, source_hint: str) -> np.ndarray:
     x = _as_motion_array(motion)
-    if hasattr(v46, "enforce_edge151_contract_np"):
-        y, _ = v46.enforce_edge151_contract_np(
+    if hasattr(motion_runtime, "enforce_edge151_contract_np"):
+        y, _ = motion_runtime.enforce_edge151_contract_np(
             x, cfg, source_hint=source_hint, derive_contact=True, project_rot=True
         )
         return _as_motion_array(y)
     return x.astype(np.float32)
 
 
-def resample_motion(v46, motion: np.ndarray, target_len: int) -> np.ndarray:
+def resample_motion(motion_runtime, motion: np.ndarray, target_len: int) -> np.ndarray:
     target_len = max(1, int(target_len))
     x = _as_motion_array(motion)
     if x.shape[0] == target_len:
@@ -188,24 +188,24 @@ def resample_motion(v46, motion: np.ndarray, target_len: int) -> np.ndarray:
     return _as_motion_array(resample_edge151_np(x, target_frames=target_len))
 
 
-def load_event_motion(v46, path: str | Path, cfg: Any, source_hint: str) -> np.ndarray:
+def load_event_motion(motion_runtime, path: str | Path, cfg: Any, source_hint: str) -> np.ndarray:
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(p)
     obj = np.load(str(p), allow_pickle=True)
     motion = _as_motion_array(obj)
-    return enforce_contract(v46, motion, cfg, source_hint=source_hint)
+    return enforce_contract(motion_runtime, motion, cfg, source_hint=source_hint)
 
 
 def angle_diff(a: float, b: float) -> float:
     return float(math.atan2(math.sin(a - b), math.cos(a - b)))
 
 
-def root_yaw(v46, motion: np.ndarray) -> np.ndarray:
+def root_yaw(motion_runtime, motion: np.ndarray) -> np.ndarray:
     x = _as_motion_array(motion)
-    if hasattr(v46, "root_yaw_np"):
+    if hasattr(motion_runtime, "root_yaw_np"):
         try:
-            return np.asarray(v46.root_yaw_np(x), dtype=np.float32).reshape(-1)
+            return np.asarray(motion_runtime.root_yaw_np(x), dtype=np.float32).reshape(-1)
         except Exception:
             pass
     # Fallback: derive a rough facing/yaw from root XZ velocity.
@@ -218,10 +218,10 @@ def root_yaw(v46, motion: np.ndarray) -> np.ndarray:
     return yaw
 
 
-def fk_positions(v46, motion: np.ndarray) -> Optional[np.ndarray]:
+def fk_positions(motion_runtime, motion: np.ndarray) -> Optional[np.ndarray]:
     x = _as_motion_array(motion)
     for name in ("fk_24_np", "motion_to_joint_positions_np"):
-        fn = getattr(v46, name, None)
+        fn = getattr(motion_runtime, name, None)
         if fn is not None:
             try:
                 return np.asarray(fn(x), dtype=np.float32)
@@ -230,9 +230,9 @@ def fk_positions(v46, motion: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-def transition_risk(v46, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, Any]:
+def transition_risk(motion_runtime, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, Any]:
     """Evaluate one seam through the canonical transition-quality contract."""
-    del v46
+    del motion_runtime
     previous = np.asarray(previous, dtype=np.float32)
     transition = np.asarray(transition, dtype=np.float32)
     following = np.asarray(following, dtype=np.float32)
@@ -263,24 +263,24 @@ def risk_score(risk: Dict[str, Any]) -> float:
     # Normalized scalar used for search and fallback selection.  Every
     # kinematic threshold is named with its SI unit so 30/60 FPS runs share
     # exactly the same physical contract.
-    bj = float(risk.get("boundary_joint_jerk_max", risk.get("joint_jerk", 0.0))) / max(env_float("V46_46_NORM_BOUNDARY_JERK_MPS3", 5000.0), 1e-6)
+    bj = float(risk.get("boundary_joint_jerk_max", risk.get("joint_jerk", 0.0))) / max(env_float("BOUNDARY_NORM_BOUNDARY_JERK_MPS3", 5000.0), 1e-6)
     fk = max(
         float(risk.get("entry_fk_jump", 0.0)),
         float(risk.get("exit_fk_jump", 0.0)),
         float(risk.get("entry_fk_jump_max_m", 0.0)),
         float(risk.get("exit_fk_jump_max_m", 0.0)),
-    ) / max(env_float("V46_46_NORM_EXIT_FK_JUMP_M", 0.040), 1e-6)
+    ) / max(env_float("BOUNDARY_NORM_EXIT_FK_JUMP_M", 0.040), 1e-6)
     rot = max(
         float(risk.get("entry_rotation_step_rad", 0.0)),
         float(risk.get("exit_rotation_step_rad", 0.0)),
-    ) / max(env_float("V46_46_NORM_EXIT_ROT_RAD", 0.12), 1e-6)
+    ) / max(env_float("BOUNDARY_NORM_EXIT_ROT_RAD", 0.12), 1e-6)
     slip = max(
         float(risk.get("foot_slip", 0.0)),
         float(risk.get("foot_slip_p95", 0.0)),
         float(risk.get("foot_slip_max", 0.0)),
-    ) / max(env_float("V46_46_NORM_FOOT_SLIP_MPS", 0.22), 1e-6)
-    cs = float(risk.get("contact_switch", 0.0)) / max(env_float("V46_46_NORM_CONTACT_SWITCH", 0.45), 1e-6)
-    total = float(risk.get("total", 0.0)) / max(env_float("V46_46_NORM_TOTAL", 1.0), 1e-6)
+    ) / max(env_float("BOUNDARY_NORM_FOOT_SLIP_MPS", 0.22), 1e-6)
+    cs = float(risk.get("contact_switch", 0.0)) / max(env_float("BOUNDARY_NORM_CONTACT_SWITCH", 0.45), 1e-6)
+    total = float(risk.get("total", 0.0)) / max(env_float("BOUNDARY_NORM_TOTAL", 1.0), 1e-6)
     return float(0.30 * total + 0.24 * bj + 0.22 * fk + 0.14 * rot + 0.07 * slip + 0.03 * cs)
 
 
@@ -288,7 +288,7 @@ def risk_safe(risk: Dict[str, Any]) -> bool:
     return not boundary_risk_reasons(risk)
 
 
-def estimate_boundary_features(v46, prev: np.ndarray, curr: np.ndarray, cfg: Any) -> Dict[str, float]:
+def estimate_boundary_features(motion_runtime, prev: np.ndarray, curr: np.ndarray, cfg: Any) -> Dict[str, float]:
     p = _as_motion_array(prev)
     c = _as_motion_array(curr)
     pose_gap = float(np.linalg.norm(p[-1, ROT6D_START:ROT6D_END] - c[0, ROT6D_START:ROT6D_END]) / math.sqrt(max(1, ROT6D_END - ROT6D_START)))
@@ -298,13 +298,13 @@ def estimate_boundary_features(v46, prev: np.ndarray, curr: np.ndarray, cfg: Any
         velocity_gap = float(np.linalg.norm(pv - cv) / math.sqrt(max(1, ROT6D_END - ROT6D_START)))
     else:
         velocity_gap = 0.0
-    yaw_prev = float(root_yaw(v46, p[-1:])[0])
-    yaw_curr = float(root_yaw(v46, c[:1])[0])
+    yaw_prev = float(root_yaw(motion_runtime, p[-1:])[0])
+    yaw_curr = float(root_yaw(motion_runtime, c[:1])[0])
     yaw_gap = abs(angle_diff(yaw_prev, yaw_curr))
     contact_gap = float(np.abs(p[-1, CONTACT] - c[0, CONTACT]).mean())
     fk_gap = 0.0
-    fp = fk_positions(v46, p[-1:])
-    fc = fk_positions(v46, c[:1])
+    fp = fk_positions(motion_runtime, p[-1:])
+    fc = fk_positions(motion_runtime, c[:1])
     if fp is not None and fc is not None:
         try:
             fk_gap = float(np.sqrt(np.mean((fp[0] - fc[0]) ** 2)))
@@ -329,56 +329,56 @@ def estimate_boundary_features(v46, prev: np.ndarray, curr: np.ndarray, cfg: Any
     }
 
 
-def choose_transition_lengths(v46, prev: Optional[np.ndarray], source_len: int, target_len: int, raw_curr: np.ndarray, slot: Dict[str, Any], cfg: Any) -> Tuple[int, int, Dict[str, Any]]:
+def choose_transition_lengths(motion_runtime, prev: Optional[np.ndarray], source_len: int, target_len: int, raw_curr: np.ndarray, slot: Dict[str, Any], cfg: Any) -> Tuple[int, int, Dict[str, Any]]:
     target_len = max(1, int(target_len))
     source_len = max(1, int(source_len))
     has_prev = prev is not None and len(prev) > 0
-    if hasattr(v46, "_v46_33_choose_core_and_transition_lengths"):
+    if hasattr(motion_runtime, "_choose_core_and_transition_lengths"):
         try:
-            core_len, trans_len, info = v46._v46_33_choose_core_and_transition_lengths(source_len, target_len, has_prev, cfg)
+            core_len, trans_len, info = motion_runtime._choose_core_and_transition_lengths(source_len, target_len, has_prev, cfg)
             info = dict(info)
         except Exception:
             core_len, trans_len, info = target_len, 0, {"reason": "fallback_exception"}
     else:
         if not has_prev:
             return target_len, 0, {"reason": "first_slot_no_transition"}
-        min_trans = env_int("V46_TRANSITION_MIN_FRAMES", 10)
-        max_trans = env_int("V46_TRANSITION_MAX_FRAMES", 28)
-        trans_len = int(round(target_len * env_float("V46_TRANSITION_RATIO", 0.18)))
+        min_trans = env_int("MOTION_TRANSITION_MIN_FRAMES", 10)
+        max_trans = env_int("MOTION_TRANSITION_MAX_FRAMES", 28)
+        trans_len = int(round(target_len * env_float("MOTION_TRANSITION_RATIO", 0.18)))
         trans_len = max(min_trans, min(max_trans, trans_len))
         core_len = target_len - trans_len
         info = {"reason": "local_default", "transition_frames": trans_len, "core_frames": core_len}
 
-    if not has_prev or not env_bool("V46_46_RISK_ADAPT_TRANSITION_ENABLE", True):
+    if not has_prev or not env_bool("BOUNDARY_RISK_ADAPT_TRANSITION_ENABLE", True):
         core_len = max(1, min(int(core_len), target_len))
         trans_len = max(0, target_len - core_len)
         info.update({"risk_adaptive": False})
         return int(core_len), int(trans_len), info
 
     # Estimate boundary features after a rough core resample but before final transition.
-    rough_core = resample_motion(v46, raw_curr, max(1, int(core_len)))
-    rough_core = enforce_contract(v46, rough_core, cfg, source_hint="v46_46_transition_len_rough_core")
+    rough_core = resample_motion(motion_runtime, raw_curr, max(1, int(core_len)))
+    rough_core = enforce_contract(motion_runtime, rough_core, cfg, source_hint="boundary_closed_loop_transition_len_rough_core")
     # Align for a more realistic yaw/root measurement.
-    aligned, align_info = align_core_to_prev(v46, prev, rough_core, cfg)
-    feats = estimate_boundary_features(v46, prev, aligned, cfg)
+    aligned, align_info = align_core_to_prev(motion_runtime, prev, rough_core, cfg)
+    feats = estimate_boundary_features(motion_runtime, prev, aligned, cfg)
 
     extra = 0.0
-    extra += env_float("V46_46_TLEN_POSE_W", 10.0) * feats["pose_gap"]
-    extra += env_float("V46_46_TLEN_VEL_W", 4.0) * feats["velocity_gap"]
-    extra += env_float("V46_46_TLEN_YAW_W", 3.0) * min(feats["yaw_gap_rad"], math.pi)
-    extra += env_float("V46_46_TLEN_CONTACT_W", 8.0) * feats["contact_gap"]
-    extra += env_float("V46_46_TLEN_FK_W", 80.0) * feats["predicted_fk_gap"]
+    extra += env_float("BOUNDARY_TLEN_POSE_W", 10.0) * feats["pose_gap"]
+    extra += env_float("BOUNDARY_TLEN_VEL_W", 4.0) * feats["velocity_gap"]
+    extra += env_float("BOUNDARY_TLEN_YAW_W", 3.0) * min(feats["yaw_gap_rad"], math.pi)
+    extra += env_float("BOUNDARY_TLEN_CONTACT_W", 8.0) * feats["contact_gap"]
+    extra += env_float("BOUNDARY_TLEN_FK_W", 80.0) * feats["predicted_fk_gap"]
 
     label = str(slot.get("music_alignment_label", slot.get("music_semantic_top_label", slot.get("role", "")))).lower()
     if any(k in label for k in ["calm", "lyrical", "pose", "release", "resolution"]):
-        extra += env_float("V46_46_TLEN_SMOOTH_MUSIC_BONUS", 3.0)
+        extra += env_float("BOUNDARY_TLEN_SMOOTH_MUSIC_BONUS", 3.0)
     if any(k in label for k in ["accent", "percussive", "climax"]):
-        extra -= env_float("V46_46_TLEN_ACCENT_REDUCE", 2.0)
+        extra -= env_float("BOUNDARY_TLEN_ACCENT_REDUCE", 2.0)
 
-    min_trans = env_int("V46_TRANSITION_MIN_FRAMES", 10)
-    max_trans = env_int("V46_TRANSITION_MAX_FRAMES", 36)
-    min_core = env_int("V46_TRANSITION_MIN_CORE_FRAMES", 30)
-    trans_len2 = int(round(float(trans_len) + np.clip(extra, -4.0, env_float("V46_46_TLEN_EXTRA_MAX", 14.0))))
+    min_trans = env_int("MOTION_TRANSITION_MIN_FRAMES", 10)
+    max_trans = env_int("MOTION_TRANSITION_MAX_FRAMES", 36)
+    min_core = env_int("MOTION_TRANSITION_MIN_CORE_FRAMES", 30)
+    trans_len2 = int(round(float(trans_len) + np.clip(extra, -4.0, env_float("BOUNDARY_TLEN_EXTRA_MAX", 14.0))))
     trans_len2 = max(min_trans, min(max_trans, trans_len2))
     trans_len2 = min(trans_len2, max(0, target_len - min_core))
     core_len2 = max(1, target_len - trans_len2)
@@ -394,37 +394,37 @@ def choose_transition_lengths(v46, prev: Optional[np.ndarray], source_len: int, 
     return int(core_len2), int(trans_len2), info
 
 
-def align_core_to_prev(v46, prev: np.ndarray, core: np.ndarray, cfg: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+def align_core_to_prev(motion_runtime, prev: np.ndarray, core: np.ndarray, cfg: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
     p = _as_motion_array(prev)
     c = _as_motion_array(core)
-    for name in ("_v46_33_align_core_to_prev", "align_event_core_to_prev_np"):
-        fn = getattr(v46, name, None)
+    for name in ("_align_core_to_previous", "align_event_core_to_prev_np"):
+        fn = getattr(motion_runtime, name, None)
         if fn is not None:
             try:
                 out, rep = fn(p, c, cfg)
-                return enforce_contract(v46, out, cfg, source_hint=f"v46_46_align:{name}"), dict(rep or {})
+                return enforce_contract(motion_runtime, out, cfg, source_hint=f"boundary_closed_loop_align:{name}"), dict(rep or {})
             except Exception:
                 pass
     out = c.copy().astype(np.float32)
     delta = p[-1, [ROOT_X_IDX, ROOT_Z_IDX]] - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
     out[:, ROOT_X_IDX] += float(delta[0])
     out[:, ROOT_Z_IDX] += float(delta[1])
-    out = enforce_contract(v46, out, cfg, source_hint="v46_46_align:fallback_xz")
+    out = enforce_contract(motion_runtime, out, cfg, source_hint="boundary_closed_loop_align:fallback_xz")
     return out, {"mode": "fallback_xz_only", "delta_xz_applied": [float(delta[0]), float(delta[1])]}
 
 
-def build_bridge(v46, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any) -> np.ndarray:
+def build_bridge(motion_runtime, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any) -> np.ndarray:
     trans_len = int(trans_len)
     if trans_len <= 0:
         return np.zeros((0, EDGE_DIM), dtype=np.float32)
     prev_tail_n = min(max(2, trans_len // 2), len(prev))
     curr_head_n = min(max(2, trans_len // 2), len(core))
-    for name in ("v46_33_motion_inbetween_np", "motion_inbetween_np"):
-        fn = getattr(v46, name, None)
+    for name in ("reference_motion_inbetween_np", "motion_inbetween_np"):
+        fn = getattr(motion_runtime, name, None)
         if fn is not None:
             try:
                 bridge = fn(prev[-prev_tail_n:], core[:curr_head_n], trans_len, cfg)
-                return enforce_contract(v46, bridge, cfg, source_hint=f"v46_46_bridge:{name}")
+                return enforce_contract(motion_runtime, bridge, cfg, source_hint=f"boundary_closed_loop_bridge:{name}")
             except Exception:
                 pass
     # The final fallback still has to honor the same geometry contract as the
@@ -432,7 +432,7 @@ def build_bridge(v46, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: A
     # interpolation for every joint.  Projecting a linearly blended Rot6D
     # vector is not equivalent, especially close to pi.
     bridge = make_geodesic_transition(prev, core, trans_len)
-    return enforce_contract(v46, bridge, cfg, source_hint="v46_46_bridge:fallback_geodesic")
+    return enforce_contract(motion_runtime, bridge, cfg, source_hint="boundary_closed_loop_bridge:fallback_geodesic")
 
 
 @dataclass
@@ -455,7 +455,7 @@ class CandidateProposal:
 
 
 def build_candidate_proposal(
-    v46,
+    motion_runtime,
     prev_motion: Optional[np.ndarray],
     event_id: int,
     event_path: str,
@@ -465,24 +465,24 @@ def build_candidate_proposal(
     target_len: int,
     cfg: Any,
 ) -> CandidateProposal:
-    raw = load_event_motion(v46, event_path, cfg, source_hint=f"v46_46_load_event:{event_id}")
+    raw = load_event_motion(motion_runtime, event_path, cfg, source_hint=f"boundary_closed_loop_load_event:{event_id}")
     has_prev = prev_motion is not None and len(prev_motion) > 0
-    core_len, trans_len, length_info = choose_transition_lengths(v46, prev_motion, raw.shape[0], target_len, raw, slot, cfg)
-    core = resample_motion(v46, raw, core_len)
-    core = enforce_contract(v46, core, cfg, source_hint=f"v46_46_core_resample:{event_id}")
+    core_len, trans_len, length_info = choose_transition_lengths(motion_runtime, prev_motion, raw.shape[0], target_len, raw, slot, cfg)
+    core = resample_motion(motion_runtime, raw, core_len)
+    core = enforce_contract(motion_runtime, core, cfg, source_hint=f"boundary_closed_loop_core_resample:{event_id}")
     align_report: Dict[str, Any] = {"mode": "none"}
     bridge = np.zeros((0, EDGE_DIM), dtype=np.float32)
     if has_prev:
-        core, align_report = align_core_to_prev(v46, prev_motion, core, cfg)
-        bridge = build_bridge(v46, prev_motion, core, trans_len, cfg)
-        risk = transition_risk(v46, prev_motion[-4:], bridge, core[:4], fps=float(getattr(cfg, "fps", 30.0)))
+        core, align_report = align_core_to_prev(motion_runtime, prev_motion, core, cfg)
+        bridge = build_bridge(motion_runtime, prev_motion, core, trans_len, cfg)
+        risk = transition_risk(motion_runtime, prev_motion[-4:], bridge, core[:4], fps=float(getattr(cfg, "fps", 30.0)))
     else:
         risk = {"total": 0.0, "boundary_joint_jerk_max": 0.0, "exit_fk_jump": 0.0, "exit_rotation_step_rad": 0.0, "foot_slip": 0.0, "foot_penetration": 0.0, "contact_switch": 0.0}
     piece = np.concatenate([bridge, core], axis=0).astype(np.float32)
     # Guarantee exact slot length; this should almost always be a no-op.
     if piece.shape[0] != int(target_len):
-        piece = resample_motion(v46, piece, int(target_len))
-        piece = enforce_contract(v46, piece, cfg, source_hint=f"v46_46_slot_exact_len:{event_id}")
+        piece = resample_motion(motion_runtime, piece, int(target_len))
+        piece = enforce_contract(motion_runtime, piece, cfg, source_hint=f"boundary_closed_loop_slot_exact_len:{event_id}")
         # If exact-length repair changed the bridge/core split, keep the recorded split but mark it.
         length_info["slot_exact_repair_applied"] = True
         length_info["slot_exact_frames_after"] = int(piece.shape[0])
@@ -519,7 +519,7 @@ def slot_target_frames(slot: Dict[str, Any], cfg: Any) -> int:
 
 def extract_candidate_lists(path_idx: Sequence[int], retrieval_report: Sequence[Dict[str, Any]], db: Dict[str, Any], cfg: Any) -> List[List[int]]:
     n = len(np.asarray(db["paths"], dtype=object))
-    topk = max(1, env_int("V46_46_RESELECT_TOPK", env_int("V46_46_CANDIDATE_TOPK", 32)))
+    topk = max(1, env_int("BOUNDARY_RESELECT_TOPK", env_int("BOUNDARY_CANDIDATE_TOPK", 32)))
     out: List[List[int]] = []
     for i, sel in enumerate(path_idx):
         ids: List[int] = []
@@ -538,7 +538,7 @@ def extract_candidate_lists(path_idx: Sequence[int], retrieval_report: Sequence[
 
 
 def assemble_closed_loop_reference(
-    v46,
+    motion_runtime,
     slots: Sequence[Dict[str, Any]],
     candidate_lists: Sequence[Sequence[int]],
     db: Dict[str, Any],
@@ -562,7 +562,7 @@ def assemble_closed_loop_reference(
         selected_prop: Optional[CandidateProposal] = None
         for rank, event_id in enumerate(candidates):
             p = build_candidate_proposal(
-                v46=v46,
+                motion_runtime=motion_runtime,
                 prev_motion=prev,
                 event_id=event_id,
                 event_path=str(paths[event_id]),
@@ -603,7 +603,7 @@ def assemble_closed_loop_reference(
             "core_span": core_span,
             "transition_in_frames": int(selected_prop.bridge.shape[0]),
             "core_frames": int(selected_prop.core.shape[0]),
-            "core_warp": float(selected_prop.core.shape[0] / max(1, load_event_motion(v46, selected_prop.event_path, cfg, "v46_46_warp_probe").shape[0])),
+            "core_warp": float(selected_prop.core.shape[0] / max(1, load_event_motion(motion_runtime, selected_prop.event_path, cfg, "boundary_closed_loop_warp_probe").shape[0])),
             "risk_predicted": selected_prop.risk,
             "risk_score_predicted": float(selected_prop.risk_score),
             "safe_predicted": bool(selected_prop.safe),
@@ -622,12 +622,12 @@ def assemble_closed_loop_reference(
                 }
                 for pp in proposals
             ],
-            "version": "v46_46_boundary_simulated_closed_loop_reference",
+            "version": "boundary_closed_loop_boundary_simulated_closed_loop_reference",
         }
         report.append(row)
         cursor += int(piece.shape[0])
     final = np.concatenate(pieces, axis=0).astype(np.float32) if pieces else np.zeros((0, EDGE_DIM), dtype=np.float32)
-    final = enforce_contract(v46, final, cfg, source_hint="v46_46_closed_loop_reference_final")
+    final = enforce_contract(motion_runtime, final, cfg, source_hint="boundary_closed_loop_closed_loop_reference_final")
     return final, report, selected
 
 
@@ -640,10 +640,10 @@ def transition_spans_from_report(assembly_report: Sequence[Dict[str, Any]]) -> L
     return out
 
 
-def make_seam_mask(v46, T: int, transition_spans: Sequence[Sequence[int]], cfg: Any) -> Tuple[np.ndarray, List[int], str]:
+def make_seam_mask(motion_runtime, T: int, transition_spans: Sequence[Sequence[int]], cfg: Any) -> Tuple[np.ndarray, List[int], str]:
     def finish(raw_mask: np.ndarray, centers: List[int], policy: str):
         mask = np.asarray(raw_mask, dtype=np.float32).reshape(int(T), -1)
-        max_ratio = float(np.clip(env_float("V46_54_MAX_TRANSITION_MASK_RATIO", 0.25), 0.0, 1.0))
+        max_ratio = float(np.clip(env_float("ROUTING_SAFETY_MAX_TRANSITION_MASK_RATIO", 0.25), 0.0, 1.0))
         active = np.flatnonzero(mask[:, 0] > 1e-6)
         budget = int(math.floor(int(T) * max_ratio))
         if len(active) > budget and budget >= 0:
@@ -660,25 +660,25 @@ def make_seam_mask(v46, T: int, transition_spans: Sequence[Sequence[int]], cfg: 
             policy += "+coverage_cap"
         return mask, centers, policy
 
-    if transition_spans and hasattr(v46, "make_transition_budget_mask"):
+    if transition_spans and hasattr(motion_runtime, "make_transition_budget_mask"):
         try:
-            mask = v46.make_transition_budget_mask(T, transition_spans, cfg)
+            mask = motion_runtime.make_transition_budget_mask(T, transition_spans, cfg)
             centers = [int((int(a) + int(b)) // 2) for a, b in transition_spans]
-            return finish(mask, centers, "v46_46_transition_spans")
+            return finish(mask, centers, "boundary_closed_loop_transition_spans")
         except Exception:
             pass
     centers = [int((int(a) + int(b)) // 2) for a, b in transition_spans]
-    if hasattr(v46, "make_boundary_mask"):
+    if hasattr(motion_runtime, "make_boundary_mask"):
         try:
-            mask = v46.make_boundary_mask(T, centers, width=env_int("V46_46_FALLBACK_MASK_WIDTH", 24))
-            return finish(mask, centers, "v46_46_fallback_boundary_mask")
+            mask = motion_runtime.make_boundary_mask(T, centers, width=env_int("BOUNDARY_FALLBACK_MASK_WIDTH", 24))
+            return finish(mask, centers, "boundary_closed_loop_fallback_boundary_mask")
         except Exception:
             pass
     mask = np.zeros((int(T), 1), dtype=np.float32)
-    width = env_int("V46_46_FALLBACK_MASK_WIDTH", 24)
+    width = env_int("BOUNDARY_FALLBACK_MASK_WIDTH", 24)
     for c in centers:
         mask[max(0, c - width):min(T, c + width), 0] = 1.0
-    return finish(mask, centers, "v46_46_local_fallback_boundary_mask")
+    return finish(mask, centers, "boundary_closed_loop_local_fallback_boundary_mask")
 
 
 def compute_condition(slot_feat: np.ndarray, db: Dict[str, Any]) -> np.ndarray:
@@ -744,7 +744,7 @@ def sliding_support_eligibility(
 
 
 def apply_generators(
-    v46,
+    motion_runtime,
     motion_ref: np.ndarray,
     cond: np.ndarray,
     seam_mask: np.ndarray,
@@ -754,7 +754,7 @@ def apply_generators(
     sliding_support_eligible: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Apply repair stages with Peak-Jerk support and transactional rollback."""
-    if not hasattr(v46, "audit_motion_np"):
+    if not hasattr(motion_runtime, "audit_motion_np"):
         raise RuntimeError(
             "The generation runtime must provide audit_motion_np for audited stages"
         )
@@ -766,7 +766,7 @@ def apply_generators(
 
     def audit_fn(value: np.ndarray) -> Dict[str, Any]:
         return dict(
-            v46.audit_motion_np(
+            motion_runtime.audit_motion_np(
                 value,
                 cfg,
                 sliding_support_eligible=sliding_support_eligible,
@@ -776,18 +776,18 @@ def apply_generators(
     stage["pre_refine_audit"] = audit_fn(motion)
 
     if bool(getattr(cfg, "refiner_enable", False)) and env_bool(
-        "V46_46_USE_REFINER", True
+        "BOUNDARY_USE_REFINER", True
     ):
         refiner_mask, mask_report = build_repair_mask(
             motion,
             seam_mask,
             fps=float(getattr(cfg, "fps", 30.0)),
         )
-        stage["v45_refiner_repair_mask"] = mask_report
+        stage["boundary_refiner_repair_mask"] = mask_report
         motion, transaction = run_stage_transaction(
             stage_name="refiner",
             motion=motion,
-            apply_fn=lambda value: v46.apply_refiner_model(
+            apply_fn=lambda value: motion_runtime.apply_refiner_model(
                 value,
                 cond,
                 refiner_mask,
@@ -799,22 +799,22 @@ def apply_generators(
             policy=policy,
             require_repair_gain=True,
         )
-        stage["v45_refiner_transaction"] = transaction
-        stage["v45_refiner_audit"] = audit_fn(motion)
+        stage["boundary_refiner_transaction"] = transaction
+        stage["boundary_refiner_audit"] = audit_fn(motion)
 
     if bool(getattr(cfg, "diffusion_enable", False)) and env_bool(
-        "V46_46_USE_DIFFUSION", True
+        "BOUNDARY_USE_DIFFUSION", True
     ):
         diffusion_mask, mask_report = build_repair_mask(
             motion,
             seam_mask,
             fps=float(getattr(cfg, "fps", 30.0)),
         )
-        stage["v46_diffusion_repair_mask"] = mask_report
+        stage["motion_diffusion_repair_mask"] = mask_report
         motion, transaction = run_stage_transaction(
             stage_name="diffusion",
             motion=motion,
-            apply_fn=lambda value: v46.apply_diffusion_model(
+            apply_fn=lambda value: motion_runtime.apply_diffusion_model(
                 value,
                 cond,
                 diffusion_mask,
@@ -826,15 +826,15 @@ def apply_generators(
             policy=policy,
             require_repair_gain=True,
         )
-        stage["v46_diffusion_transaction"] = transaction
-        stage["v46_diffusion_audit"] = audit_fn(motion)
+        stage["motion_diffusion_transaction"] = transaction
+        stage["motion_diffusion_audit"] = audit_fn(motion)
 
     ik_report = {"enabled": False}
     if bool(getattr(cfg, "ik_enable", False)) and env_bool(
-        "V46_46_USE_IK", True
+        "BOUNDARY_USE_IK", True
     ):
-        motion, ik_report = v46.true_lower_body_ik(motion, cfg)
-    stage["v43_true_ik"] = ik_report
+        motion, ik_report = motion_runtime.true_lower_body_ik(motion, cfg)
+    stage["lower_body_ik_true_ik"] = ik_report
     stage["final_audit"] = audit_fn(motion)
     stage["final_physical_gate"] = physical_quality_gate(
         stage["final_audit"]
@@ -850,7 +850,7 @@ def physical_quality_gate(audit: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str, Any]], cfg: Any) -> List[Dict[str, Any]]:
+def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequence[Dict[str, Any]], cfg: Any) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for i in range(1, len(assembly_report)):
         prev_core = assembly_report[i - 1].get("core_span")
@@ -869,7 +869,7 @@ def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str
         previous = motion[max(0, prev_end - 4):prev_end]
         bridge = motion[t0:t1]
         following = motion[c0:min(c1, c0 + 4)]
-        risk = transition_risk(v46, previous, bridge, following, fps=float(getattr(cfg, "fps", 30.0)))
+        risk = transition_risk(motion_runtime, previous, bridge, following, fps=float(getattr(cfg, "fps", 30.0)))
         safe = risk_safe(risk)
         pred = assembly_report[i].get("risk_predicted", {})
         row = {
@@ -958,7 +958,7 @@ def write_audit_csv(rows: Sequence[Dict[str, Any]], path: str | Path) -> None:
 
 
 def render_if_possible(
-    v46,
+    motion_runtime,
     motion_path: str,
     audio_path: Optional[str],
     output_mp4: Optional[str],
@@ -967,9 +967,9 @@ def render_if_possible(
 ) -> None:
     if not output_mp4:
         return
-    if hasattr(v46, "render_if_possible"):
+    if hasattr(motion_runtime, "render_if_possible"):
         try:
-            v46.render_if_possible(
+            motion_runtime.render_if_possible(
                 motion_path,
                 audio_path,
                 output_mp4,
@@ -978,9 +978,9 @@ def render_if_possible(
             )
             return
         except Exception as exc:
-            print(f"[V46.46 WARN] v46.render_if_possible failed: {exc}", file=sys.stderr)
+            print(f"[Boundary Closed-Loop WARN] motion_runtime.render_if_possible failed: {exc}", file=sys.stderr)
     if not audio_path or not Path(render_script).exists():
-        print("[V46.46 WARN] render skipped", file=sys.stderr)
+        print("[Boundary Closed-Loop WARN] render skipped", file=sys.stderr)
         return
     cmd = [
         sys.executable,
@@ -995,7 +995,7 @@ def render_if_possible(
 
 def set_cfg_runtime_knobs(cfg: Any) -> None:
     # Force routing reports to expose enough candidate_preview rows for closed-loop reselection.
-    candidate_topk = env_int("V46_46_CANDIDATE_TOPK", 48)
+    candidate_topk = env_int("BOUNDARY_CANDIDATE_TOPK", 48)
     try:
         setattr(cfg, "classification_report_topk", max(int(getattr(cfg, "classification_report_topk", 8)), candidate_topk))
     except Exception:
@@ -1025,7 +1025,7 @@ def merge_short_terminal_slot(
         int(round(1.0 * fps)),
     )
     min_tail_frames = env_int(
-        "V46_46_MIN_TERMINAL_SLOT_FRAMES",
+        "BOUNDARY_MIN_TERMINAL_SLOT_FRAMES",
         default_min,
     )
 
@@ -1057,7 +1057,7 @@ def merge_short_terminal_slot(
         if key in tail:
             merged[key] = tail[key]
 
-    merged["v46_48_terminal_tail_merge"] = {
+    merged["terminal_tail_merge"] = {
         "enabled": True,
         "previous_frames": int(prev_frames),
         "tail_frames": int(tail_frames),
@@ -1078,7 +1078,7 @@ def merge_short_terminal_slot(
     feat2[-1] = merged_feat.astype(np.float32)
 
     print(
-        f"[V46.48 TAIL MERGE] merged terminal slot: "
+        f"[Terminal Merge TAIL MERGE] merged terminal slot: "
         f"{tail_frames} frames -> previous slot, "
         f"new_frames={total_frames}, slots={len(out_slots)}",
         file=sys.stderr,
@@ -1086,15 +1086,15 @@ def merge_short_terminal_slot(
     return out_slots, feat2.astype(np.float32)
 
 
-def load_slots_and_candidates(v46, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
-    db = v46.load_db(args.db)
-    if hasattr(v46, "_training_db_contract"):
-        v46._training_db_contract(db, cfg, "Closed-loop Generation")
+def load_slots_and_candidates(motion_runtime, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
+    db = motion_runtime.load_db(args.db)
+    if hasattr(motion_runtime, "_training_db_contract"):
+        motion_runtime._training_db_contract(db, cfg, "Closed-loop Generation")
     event_uids = event_uids_from_generation_db(db)
     db["event_uids"] = event_uids
     db_contract = make_event_db_contract(event_uids)
     cfg._event_db_contract = db_contract
-    strict_identity = env_bool("V46_54_REQUIRE_ALIGNED_EVENT_DB", True)
+    strict_identity = env_bool("ROUTING_SAFETY_REQUIRE_ALIGNED_EVENT_DB", True)
     descriptor_contract = None
     slots_json = getattr(args, "slots_json", None)
     if slots_json and Path(slots_json).is_file():
@@ -1108,17 +1108,17 @@ def load_slots_and_candidates(v46, args: argparse.Namespace, cfg: Any) -> Tuple[
             descriptor_contract,
             context="Scheduler/Generation Event-DB alignment",
         )
-    contrastive = v46.load_contrastive(getattr(args, "contrastive", None), cfg)
-    slots, slot_feat = v46.audio_slots(args.audio, cfg, args.slot_seconds, getattr(args, "slots_json", None))
+    contrastive = motion_runtime.load_contrastive(getattr(args, "contrastive", None), cfg)
+    slots, slot_feat = motion_runtime.audio_slots(args.audio, cfg, args.slot_seconds, getattr(args, "slots_json", None))
     slots, slot_feat = merge_short_terminal_slot(slots, slot_feat, cfg)
-    path_idx, retrieval_report = v46.retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
+    path_idx, retrieval_report = motion_runtime.retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
     candidate_lists = extract_candidate_lists(path_idx, retrieval_report, db, cfg)
     uid_to_index = {str(uid): index for index, uid in enumerate(event_uids)}
     for slot_index, slot in enumerate(slots):
-        scheduled_uid = slot.get("v26_event_uid", slot.get("event_uid"))
+        scheduled_uid = slot.get("whole_song_event_uid", slot.get("event_uid"))
         if not scheduled_uid:
             if strict_identity:
-                raise RuntimeError(f"Slot {slot_index} has no stable v26_event_uid")
+                raise RuntimeError(f"Slot {slot_index} has no stable whole_song_event_uid")
             continue
         scheduled_uid = str(scheduled_uid)
         if scheduled_uid not in uid_to_index:
@@ -1137,8 +1137,8 @@ def load_slots_and_candidates(v46, args: argparse.Namespace, cfg: Any) -> Tuple[
 
 
 def generate_closed_loop(args: argparse.Namespace) -> int:
-    v46 = import_v46()
-    cfg = v46.V46Config.from_json(args.config).apply_env()
+    motion_runtime = import_motion_runtime()
+    cfg = motion_runtime.MotionGenerationConfig.from_json(args.config).apply_env()
     if getattr(args, "music_semantic_dirs", None):
         cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in args.music_semantic_dirs])
     if getattr(args, "external_music_semantic_cmd", None):
@@ -1148,32 +1148,32 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     seed = int(getattr(cfg, "seed", 1234))
     random.seed(seed)
     np.random.seed(seed)
-    if hasattr(v46, "torch") and v46.torch is not None:
+    if hasattr(motion_runtime, "torch") and motion_runtime.torch is not None:
         try:
-            v46.torch.manual_seed(seed)
+            motion_runtime.torch.manual_seed(seed)
         except Exception:
             pass
 
-    db, _contrastive, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(v46, args, cfg)
+    db, _contrastive, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(motion_runtime, args, cfg)
     cond = compute_condition(slot_feat, db)
 
     banned: Dict[int, set] = {}
     rounds: List[Dict[str, Any]] = []
     best_payload: Optional[Dict[str, Any]] = None
-    max_rounds = max(0, env_int("V46_46_MAX_RESELECT_ROUNDS", 2))
-    enable_reselect = env_bool("V46_46_RESELECT_ENABLE", True)
+    max_rounds = max(0, env_int("BOUNDARY_MAX_RESELECT_ROUNDS", 2))
+    enable_reselect = env_bool("BOUNDARY_RESELECT_ENABLE", True)
 
     for round_id in range(max_rounds + 1):
-        motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(v46, slots, candidate_lists, db, cfg, banned=banned)
+        motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(motion_runtime, slots, candidate_lists, db, cfg, banned=banned)
         transition_spans = transition_spans_from_report(assembly_report)
-        seam_mask, seam_positions, mask_policy = make_seam_mask(v46, motion_ref.shape[0], transition_spans, cfg)
+        seam_mask, seam_positions, mask_policy = make_seam_mask(motion_runtime, motion_ref.shape[0], transition_spans, cfg)
         slide_eligible, slide_report = sliding_support_eligibility(
             db,
             assembly_report,
             motion_ref.shape[0],
         )
         motion, stage_reports = apply_generators(
-            v46,
+            motion_runtime,
             motion_ref,
             cond,
             seam_mask,
@@ -1182,7 +1182,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             sliding_support_eligible=slide_eligible,
         )
         stage_reports["sliding_support_eligibility"] = slide_report
-        boundary_rows = audit_boundaries(v46, motion, assembly_report, cfg)
+        boundary_rows = audit_boundaries(motion_runtime, motion, assembly_report, cfg)
         unsafe_rows = [r for r in boundary_rows if not bool(r.get("safe"))]
         round_summary = {
             "round": int(round_id),
@@ -1236,19 +1236,19 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     final_schedule_hard_constraints = assert_schedule_hard_constraints(
         final_constraint_rows,
         max_pose_hold_ratio=env_float(
-            "V46_51_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
+            "GENERATION_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
         ),
         max_single_source_ratio=env_float(
-            "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+            "ROUTING_SAFETY_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
         ),
         max_single_recording_ratio=env_float(
-            "V46_54_MAX_RECORDING_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+            "ROUTING_SAFETY_MAX_RECORDING_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
         ),
         min_unique_events=env_int(
-            "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
+            "GENERATION_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
         ),
         min_core_frame_ratio=env_float(
-            "V46_51_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
+            "GENERATION_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
         ),
     )
     best_payload["stage_reports"][
@@ -1289,13 +1289,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         },
     }
     required_failures: list[str] = []
-    if env_bool("V46_54_REQUIRE_FINAL_PHYSICAL_GATE", True) and not bool(
+    if env_bool("ROUTING_SAFETY_REQUIRE_FINAL_PHYSICAL_GATE", True) and not bool(
         final_gate["ok"]
     ):
         required_failures.append(
             "physical:" + ",".join(str(value) for value in final_gate["reasons"])
         )
-    if env_bool("V46_46_REQUIRE_FINAL_BOUNDARY_GATE", True) and not bool(
+    if env_bool("BOUNDARY_REQUIRE_FINAL_BOUNDARY_GATE", True) and not bool(
         final_boundary_continuity["ok"]
     ):
         required_failures.append(
@@ -1350,7 +1350,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     selected_paths = [str(paths[i]) for i in selected_event_indices]
 
     report = {
-        "version": "v46_46_boundary_simulated_closed_loop_scheduler",
+        "version": "boundary_closed_loop_boundary_simulated_closed_loop_scheduler",
         "audio": args.audio,
         "db": args.db,
         "motion_path": str(artifact_out),
@@ -1358,7 +1358,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "fps": float(getattr(cfg, "fps", 30.0)),
         "event_db_contract": make_event_db_contract(db["event_uids"]),
         "config": dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else jsonable(cfg),
-        "selected_event_indices_initial_v46": path_idx,
+        "selected_event_indices_initial": path_idx,
         "selected_event_indices_final": selected_event_indices,
         "selected_event_paths_final": selected_paths,
         "slots": slots,
@@ -1373,13 +1373,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "enabled": True,
             "rounds": rounds,
             "final_round": int(best_payload["round"]),
-            "candidate_topk": int(env_int("V46_46_CANDIDATE_TOPK", 48)),
-            "reselect_topk": int(env_int("V46_46_RESELECT_TOPK", env_int("V46_46_CANDIDATE_TOPK", 32))),
+            "candidate_topk": int(env_int("BOUNDARY_CANDIDATE_TOPK", 48)),
+            "reselect_topk": int(env_int("BOUNDARY_RESELECT_TOPK", env_int("BOUNDARY_CANDIDATE_TOPK", 32))),
             "reselect_enabled": bool(enable_reselect),
-            "risk_adaptive_transition_enabled": env_bool("V46_46_RISK_ADAPT_TRANSITION_ENABLE", True),
+            "risk_adaptive_transition_enabled": env_bool("BOUNDARY_RISK_ADAPT_TRANSITION_ENABLE", True),
             "simulated_edge_risk_enabled": True,
-            "env": {k: v for k, v in os.environ.items() if k.startswith("V46_46_")},
-            "diversity_env": {k: v for k, v in os.environ.items() if k.startswith("V46_54_")},
+            "env": {k: v for k, v in os.environ.items() if k.startswith("BOUNDARY_")},
+            "diversity_env": {k: v for k, v in os.environ.items() if k.startswith("ROUTING_SAFETY_")},
         },
         "stage_reports": {
             "retrieval": retrieval_report,
@@ -1421,13 +1421,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "final_audit": best_payload["stage_reports"].get("final_audit", {}),
     }
     json_path = args.json or str(
-        out.with_name(out.stem + ".v46_46_closed_loop_report.json")
+        out.with_name(out.stem + ".boundary_closed_loop_closed_loop_report.json")
     )
     save_json(report, json_path)
 
     if args.render_output and not required_failures:
         render_if_possible(
-            v46,
+            motion_runtime,
             str(artifact_out),
             args.audio,
             args.render_output,
@@ -1462,7 +1462,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="V46.46 closed-loop boundary-safe generator for EDGE 151D")
+    p = argparse.ArgumentParser(description="Boundary Closed-Loop closed-loop boundary-safe generator for EDGE 151D")
     p.add_argument("cmd", choices=["generate"], help="subcommand")
     p.add_argument("--config", default="configs/motion_model.json")
     p.add_argument("--audio", required=True)

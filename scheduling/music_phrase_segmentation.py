@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Whole-song music feature extraction and variable-length phrase segmentation.
 
-V26 music-dominant revision:
-- keeps the original V21 12D music frame representation;
+Whole-Song Planner music-dominant revision:
+- keeps the original Music Router 12D music frame representation;
 - adds phrase-level rhythm control fields used by the scheduler:
   speed_factor, transition_base_frames, transition_profile, and boundary accent;
 - keeps all frame indices in target motion FPS.
@@ -130,7 +130,7 @@ def whole_song_features(
         cache = Path(cache_dir)
         cache.mkdir(parents=True, exist_ok=True)
         key = Path(audio_path).stem
-        cache_path = cache / f"{key}_v26_fps{float(fps):g}_{num_frames}.npy"
+        cache_path = cache / f"{key}_whole_song_fps{float(fps):g}_{num_frames}.npy"
         meta_path = cache_path.with_suffix(".json")
         if cache_path.is_file() and meta_path.is_file():
             features = np.load(cache_path).astype(np.float32)
@@ -532,7 +532,7 @@ def phrase_rhythm_profile(
         "accent": accent,
         "target_motion_density": target_motion_density,
         "target_motion_density_source":
-            "v26_local_acoustic_drive_v1",
+            "whole_song_local_acoustic_drive_v1",
     }
 
 
@@ -664,7 +664,7 @@ def main() -> None:
     out = Path(args.out_json)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": "v26_music_dominant_phrase_segmentation",
+        "version": "whole_song_music_dominant_phrase_segmentation",
         "audio_meta": audio_meta,
         "segmentation": segmentation,
         "phrases": [phrase.to_dict() for phrase in phrases],

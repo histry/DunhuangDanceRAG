@@ -29,7 +29,7 @@ from support.event_identity import (
 )
 
 
-SCHEMA = "v46_53_real_audio_motion_paired_grounding_v1"
+SCHEMA = "event_geometry_real_audio_motion_paired_grounding_v1"
 TEMPORAL_DIM = 12
 DEFAULT_TEMPORAL_FRAMES = 64
 CONTROL_NAMES = (
@@ -327,10 +327,10 @@ def build_paired_dataset(
 ) -> Dict[str, Any]:
     db = _load_npz_mapping(event_db_path)
     required_db = (
-        "v46_53_geometry_desc",
-        "v46_53_bodypart_flow",
-        "v46_53_bodypart_gaussian_mean",
-        "v46_53_bodypart_gaussian_covariance",
+        "event_geometry_geometry_desc",
+        "event_geometry_bodypart_flow",
+        "event_geometry_bodypart_gaussian_mean",
+        "event_geometry_bodypart_gaussian_covariance",
     )
     missing = [key for key in required_db if key not in db]
     if missing:
@@ -424,7 +424,7 @@ def build_paired_dataset(
     quality = np.clip(
         np.asarray(
             db.get(
-                "v46_53_combined_quality",
+                "event_geometry_combined_quality",
                 np.ones(len(event_uids), dtype=np.float32) * 0.5,
             ),
             dtype=np.float32,
@@ -469,16 +469,16 @@ def build_paired_dataset(
         "clap": np.stack(clap_rows).astype(np.float32),
         "temporal": np.stack(temporal_rows).astype(np.float32),
         "motion_geometry": np.asarray(
-            db["v46_53_geometry_desc"], dtype=np.float32
+            db["event_geometry_geometry_desc"], dtype=np.float32
         )[indices],
         "bodypart_flow": np.asarray(
-            db["v46_53_bodypart_flow"], dtype=np.float32
+            db["event_geometry_bodypart_flow"], dtype=np.float32
         )[indices, : len(GAUSSIAN_BODY_PARTS)],
         "gaussian_mean": np.asarray(
-            db["v46_53_bodypart_gaussian_mean"], dtype=np.float32
+            db["event_geometry_bodypart_gaussian_mean"], dtype=np.float32
         )[indices],
         "gaussian_covariance": np.asarray(
-            db["v46_53_bodypart_gaussian_covariance"], dtype=np.float32
+            db["event_geometry_bodypart_gaussian_covariance"], dtype=np.float32
         )[indices],
         "controls": controls,
         "quality": quality.astype(np.float32),

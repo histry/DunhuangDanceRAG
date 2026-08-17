@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.52 fresh-WAV, anatomy-gated, posture-aware closed-loop generation.
+"""Anatomy-Heading fresh-WAV, anatomy-gated, posture-aware closed-loop generation.
 
-This entrypoint preserves the V46.51 audio transaction and V46.50 heading state,
+This entrypoint preserves the Fresh-Audio Generation audio transaction and Event-Heading heading state,
 then installs four scientifically motivated policies:
 1. event anatomy hard gate and core-warp gate;
 2. support-floor alignment without forcing pelvis height;
@@ -30,7 +30,7 @@ from scheduling.schedule_hard_constraints import (
     DEFAULT_MIN_CORE_FRAME_RATIO,
     DEFAULT_MIN_UNIQUE_EVENTS,
 )
-import routing.heading_closed_loop as v4650
+import routing.heading_closed_loop as heading_runtime
 from contracts.anatomy import (
     AnatomyThresholds,
     anatomy_metrics_np,
@@ -53,10 +53,10 @@ from support.motion_geometry import (
     recompute_transition_contacts_np,
 )
 
-base = v4650.base
-_ORIG_ALIGN = v4650._align_core_to_stage_heading
-_ORIG_BUILD_PROPOSAL = v4650._build_heading_proposal
-_ORIG_APPLY = v4650.apply_generators_with_heading_guard
+base = heading_runtime.base
+_ORIG_ALIGN = heading_runtime._align_core_to_stage_heading
+_ORIG_BUILD_PROPOSAL = heading_runtime._build_heading_proposal
+_ORIG_APPLY = heading_runtime.apply_generators_with_heading_guard
 _ORIG_TRANSITION_RISK = base.transition_risk
 _ORIG_RISK_SCORE = base.risk_score
 _ORIG_RISK_SAFE = base.risk_safe
@@ -84,7 +84,7 @@ def _runtime_fps(argv: Sequence[str]) -> float:
             raise RuntimeError(f"Generation config is not a mapping: {path}")
         if config.get("fps") is not None:
             values["config"] = float(config["fps"])
-    for name in ("V46_FPS", "V46_51_FPS"):
+    for name in ("MOTION_FPS", "GENERATION_FPS"):
         raw = os.environ.get(name)
         if raw is not None and str(raw).strip():
             values[name] = float(raw)
@@ -115,8 +115,8 @@ def _db_value(db: Dict[str, Any], key: str, event_id: int, default: Any) -> Any:
         return default
 
 
-def _align_core_v52(
-    v46: Any,
+def _align_heading_core(
+    motion_runtime: Any,
     prev: Optional[np.ndarray],
     core: np.ndarray,
     stage_heading_rad: float,
@@ -128,24 +128,24 @@ def _align_core_v52(
     # translation is changed, so kneels, crouches and jumps remain intact.
     localized, floor_report = canonicalize_event_root_np(
         core,
-        target_floor_y=env_float("V46_54_STAGE_FLOOR_Y", 0.0),
-        floor_quantile=env_float("V46_54_EVENT_FLOOR_QUANTILE", 5.0),
+        target_floor_y=env_float("ROUTING_SAFETY_STAGE_FLOOR_Y", 0.0),
+        floor_quantile=env_float("ROUTING_SAFETY_EVENT_FLOOR_QUANTILE", 5.0),
         max_floor_penetration_m=env_float(
-            "V46_54_EVENT_MAX_FLOOR_PENETRATION_M",
+            "ROUTING_SAFETY_EVENT_MAX_FLOOR_PENETRATION_M",
             0.005,
         ),
     )
     out, report = _ORIG_ALIGN(
-        v46,
+        motion_runtime,
         prev,
         localized,
         stage_heading_rad,
         cfg,
         event_id,
     )
-    out = base.enforce_contract(v46, out, cfg, source_hint=f"v46_52_floor_align:{event_id}")
+    out = base.enforce_contract(motion_runtime, out, cfg, source_hint=f"anatomy_heading_floor_align:{event_id}")
     report = dict(report or {})
-    report["v46_52_support_floor_alignment"] = floor_report
+    report["anatomy_heading_support_floor_alignment"] = floor_report
     report["root_y_ramp_applied"] = False
     report["root_trajectory_policy"] = (
         "event-local first-frame XZ + cumulative stage endpoint"
@@ -156,12 +156,12 @@ def _align_core_v52(
     return out.astype(np.float32), report
 
 
-def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any) -> np.ndarray:
+def _build_heading_bridge(motion_runtime: Any, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any) -> np.ndarray:
     trans_len = int(trans_len)
     if trans_len <= 0:
         return np.zeros((0, 151), dtype=np.float32)
-    if not env_bool("V46_52_RIEMANNIAN_BRIDGE_ENABLE", True):
-        return base._V46_52_ORIG_BUILD_BRIDGE(v46, prev, core, trans_len, cfg)
+    if not env_bool("RETARGET_RIEMANNIAN_BRIDGE_ENABLE", True):
+        return base._RETARGET_ORIG_BUILD_BRIDGE(motion_runtime, prev, core, trans_len, cfg)
     fps = float(getattr(cfg, "fps", 30.0))
     bridge = make_so3_transition(
         prev,
@@ -169,15 +169,15 @@ def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: i
         trans_len,
         fps=fps,
         angular_speed_cap_radps=env_float(
-            "V46_54_TRANSITION_ANGULAR_SPEED_CAP_RADPS",
+            "ROUTING_SAFETY_TRANSITION_ANGULAR_SPEED_CAP_RADPS",
             8.0,
         ),
         root_horizontal_speed_cap_mps=env_float(
-            "V46_54_TRANSITION_ROOT_XZ_SPEED_CAP_MPS",
+            "ROUTING_SAFETY_TRANSITION_ROOT_XZ_SPEED_CAP_MPS",
             1.5,
         ),
         root_vertical_speed_cap_mps=env_float(
-            "V46_54_TRANSITION_ROOT_Y_SPEED_CAP_MPS",
+            "ROUTING_SAFETY_TRANSITION_ROOT_Y_SPEED_CAP_MPS",
             0.9,
         ),
     )
@@ -185,16 +185,16 @@ def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: i
     # post-processing.  Calling the generic contract afterwards would derive
     # binary contacts again and silently destroy the endpoint contact ramps.
     bridge = base.enforce_contract(
-        v46,
+        motion_runtime,
         bridge,
         cfg,
-        source_hint="v46_52_c2_so3_bridge_pre_physics",
+        source_hint="anatomy_heading_c2_so3_bridge_pre_physics",
     )
     bridge, floor_report = project_transition_floor_np(
         bridge,
-        target_floor_y=env_float("V46_54_STAGE_FLOOR_Y", 0.0),
+        target_floor_y=env_float("ROUTING_SAFETY_STAGE_FLOOR_Y", 0.0),
         clearance_m=env_float(
-            "V46_54_TRANSITION_FLOOR_CLEARANCE_M",
+            "ROUTING_SAFETY_TRANSITION_FLOOR_CLEARANCE_M",
             0.002,
         ),
         smoothing_frames=max(
@@ -202,7 +202,7 @@ def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: i
             int(
                 round(
                     env_float(
-                        "V46_54_TRANSITION_FLOOR_SMOOTH_SECONDS",
+                        "ROUTING_SAFETY_TRANSITION_FLOOR_SMOOTH_SECONDS",
                         5.0 / 30.0,
                     )
                     * fps
@@ -213,11 +213,11 @@ def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: i
     bridge, contact_report = recompute_transition_contacts_np(
         bridge,
         fps=fps,
-        floor_y=env_float("V46_54_STAGE_FLOOR_Y", 0.0),
+        floor_y=env_float("ROUTING_SAFETY_STAGE_FLOOR_Y", 0.0),
         left_contact=prev[-1, :4],
         right_contact=core[0, :4],
         ramp_seconds=env_float(
-            "V46_54_TRANSITION_CONTACT_RAMP_SECONDS",
+            "ROUTING_SAFETY_TRANSITION_CONTACT_RAMP_SECONDS",
             4.0 / 30.0,
         ),
     )
@@ -227,8 +227,8 @@ def _build_bridge_v52(v46: Any, prev: np.ndarray, core: np.ndarray, trans_len: i
     return np.asarray(bridge, dtype=np.float32)
 
 
-def _transition_risk_v52(v46: Any, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, Any]:
-    risk = dict(_ORIG_TRANSITION_RISK(v46, previous, transition, following, fps))
+def _heading_transition_risk(motion_runtime: Any, previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, Any]:
+    risk = dict(_ORIG_TRANSITION_RISK(motion_runtime, previous, transition, following, fps))
     anatomy = transition_anatomy_risk(previous, transition, following, fps=fps)
     risk.update({
         "anatomy_quality": float(anatomy["anatomy_quality"]),
@@ -244,34 +244,34 @@ def _transition_risk_v52(v46: Any, previous: np.ndarray, transition: np.ndarray,
         "posture_entry": anatomy["posture_entry"],
         "required_transition_seconds": float(anatomy["required_transition_seconds"]),
         "available_transition_seconds": float(anatomy["available_transition_seconds"]),
-        "v46_52_anatomy_detail": anatomy,
+        "anatomy_heading_anatomy_detail": anatomy,
     })
     return risk
 
 
-def _risk_score_v52(risk: Dict[str, Any]) -> float:
+def _heading_risk_score(risk: Dict[str, Any]) -> float:
     return float(
         _ORIG_RISK_SCORE(risk)
-        + env_float("V46_52_COMBINED_ANATOMY_RISK_W", 0.85)
+        + env_float("RETARGET_COMBINED_ANATOMY_RISK_W", 0.85)
         * float(risk.get("anatomy_risk_score", 0.0))
     )
 
 
-def _risk_safe_v52(risk: Dict[str, Any]) -> bool:
+def _heading_risk_safe(risk: Dict[str, Any]) -> bool:
     return bool(
         _ORIG_RISK_SAFE(risk)
         and bool(risk.get("anatomy_valid", True))
         and not bool(risk.get("anatomy_hard_reject", False))
         and float(risk.get("pelvis_height_gap_norm", 0.0))
-        <= env_float("V46_52_PELVIS_GAP_SAFE", 0.22)
+        <= env_float("RETARGET_PELVIS_GAP_SAFE", 0.22)
         and float(risk.get("floor_offset_gap_m", 0.0))
-        <= env_float("V46_52_FLOOR_GAP_SAFE_M", 0.15)
+        <= env_float("RETARGET_FLOOR_GAP_SAFE_M", 0.15)
         and float(risk.get("root_velocity_gap_mps", 0.0))
-        <= env_float("V46_52_ROOT_VELOCITY_GAP_SAFE_MPS", 1.25)
+        <= env_float("RETARGET_ROOT_VELOCITY_GAP_SAFE_MPS", 1.25)
     )
 
 
-def _build_proposal_v52(*args, **kwargs):
+def _build_heading_proposal(*args, **kwargs):
     proposal, extra = _ORIG_BUILD_PROPOSAL(*args, **kwargs)
     db = kwargs.get("db")
     event_id = int(kwargs.get("event_id", proposal.event_id))
@@ -286,10 +286,10 @@ def _build_proposal_v52(*args, **kwargs):
     source_frames = int(extra.get("source_frames", 0) or 0)
     if source_frames <= 0:
         raw = base.load_event_motion(
-            kwargs.get("v46"),
+            kwargs.get("motion_runtime"),
             proposal.event_path,
             cfg,
-            source_hint=f"v46_52_warp_probe:{event_id}",
+            source_hint=f"anatomy_heading_warp_probe:{event_id}",
         )
         source_frames = int(len(raw))
     fps = float(getattr(cfg, "fps", 30.0))
@@ -301,25 +301,25 @@ def _build_proposal_v52(*args, **kwargs):
         source_frames=source_frames,
     )
     warp = float(len(proposal.core) / max(1, source_frames))
-    warp_min = env_float("V46_52_CORE_WARP_MIN", 0.72)
-    warp_max = env_float("V46_52_CORE_WARP_MAX", 1.32)
+    warp_min = env_float("RETARGET_CORE_WARP_MIN", 0.72)
+    warp_max = env_float("RETARGET_CORE_WARP_MAX", 1.32)
     warp_hard = not (warp_min <= warp <= warp_max)
 
-    anatomy_detail = proposal.risk.get("v46_52_anatomy_detail", {}) if isinstance(proposal.risk, dict) else {}
+    anatomy_detail = proposal.risk.get("anatomy_heading_anatomy_detail", {}) if isinstance(proposal.risk, dict) else {}
     hard = (
         not event_valid
-        or db_quality < env_float("V46_52_EVENT_ANATOMY_QUALITY_MIN", 0.48)
+        or db_quality < env_float("RETARGET_EVENT_ANATOMY_QUALITY_MIN", 0.48)
         or not bool(core_feat["anatomy_valid"])
         or bool(anatomy_detail.get("anatomy_hard_reject", False))
         or warp_hard
     )
     added = (
-        env_float("V46_52_DB_QUALITY_PENALTY_W", 0.8) * (1.0 - db_quality)
-        + env_float("V46_52_WARP_PENALTY_W", 1.2) * abs(math_log_ratio(warp))
+        env_float("RETARGET_DB_QUALITY_PENALTY_W", 0.8) * (1.0 - db_quality)
+        + env_float("RETARGET_WARP_PENALTY_W", 1.2) * abs(math_log_ratio(warp))
     )
     proposal.risk_score = float(proposal.risk_score + added + (1e6 if hard else 0.0))
     proposal.safe = bool(proposal.safe and not hard)
-    proposal.risk["v46_52_event_gate"] = {
+    proposal.risk["anatomy_heading_event_gate"] = {
         "db_anatomy_valid": event_valid,
         "db_anatomy_quality": db_quality,
         "runtime_core_anatomy": core_feat,
@@ -333,9 +333,9 @@ def _build_proposal_v52(*args, **kwargs):
     extra.setdefault("heading_detail", {})["hard_reject"] = bool(
         extra.get("heading_detail", {}).get("hard_reject", False) or hard
     )
-    extra["v46_52_event_gate"] = proposal.risk["v46_52_event_gate"]
+    extra["anatomy_heading_event_gate"] = proposal.risk["anatomy_heading_event_gate"]
 
-    if not proposal.safe and not env_bool("V46_52_ALLOW_UNSAFE_RESCUE", False):
+    if not proposal.safe and not env_bool("RETARGET_ALLOW_UNSAFE_RESCUE", False):
         extra["heading_detail"]["hard_reject"] = True
     return proposal, extra
 
@@ -353,8 +353,8 @@ def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
     return np.convolve(m.astype(np.int32), kernel, mode="same") > 0
 
 
-def _apply_generators_v52(v46: Any, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: Any, cfg: Any):
-    motion, stage = _ORIG_APPLY(v46, motion_ref, cond, seam_mask, args, cfg)
+def _apply_heading_generators(motion_runtime: Any, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: Any, cfg: Any):
+    motion, stage = _ORIG_APPLY(motion_runtime, motion_ref, cond, seam_mask, args, cfg)
     ref_metrics = anatomy_metrics_np(motion_ref, fps=float(getattr(cfg, "fps", 30.0)))
     out_metrics = anatomy_metrics_np(motion, fps=float(getattr(cfg, "fps", 30.0)))
     out_ok, out_reasons = evaluate_anatomy_contract(out_metrics, AnatomyThresholds.from_env())
@@ -371,14 +371,14 @@ def _apply_generators_v52(v46: Any, motion_ref: np.ndarray, cond: np.ndarray, se
         ref_score = frame_anomaly_score_np(motion_ref)
         out_score = frame_anomaly_score_np(motion)
         seam = np.asarray(seam_mask).reshape(len(motion), -1).max(axis=1) > 0.01
-        bad = seam & (out_score > np.maximum(ref_score + env_float("V46_52_ROLLBACK_SCORE_MARGIN", 0.06), env_float("V46_52_ROLLBACK_SCORE_ABS", 0.12)))
-        bad = _dilate(bad, env_int("V46_52_ROLLBACK_DILATE", 3))
+        bad = seam & (out_score > np.maximum(ref_score + env_float("RETARGET_ROLLBACK_SCORE_MARGIN", 0.06), env_float("RETARGET_ROLLBACK_SCORE_ABS", 0.12)))
+        bad = _dilate(bad, env_int("RETARGET_ROLLBACK_DILATE", 3))
         motion = np.asarray(motion, dtype=np.float32).copy()
         motion[bad] = np.asarray(motion_ref, dtype=np.float32)[bad]
         rollback["rolled_back_frames"] = int(bad.sum())
         repaired = anatomy_metrics_np(motion, fps=float(getattr(cfg, "fps", 30.0)))
         repaired_ok, repaired_reasons = evaluate_anatomy_contract(repaired, AnatomyThresholds.from_env())
-        if not repaired_ok and env_bool("V46_52_FULL_ROLLBACK_ON_ANATOMY_FAIL", True):
+        if not repaired_ok and env_bool("RETARGET_FULL_ROLLBACK_ON_ANATOMY_FAIL", True):
             motion = np.asarray(motion_ref, dtype=np.float32).copy()
             rollback["full_rollback"] = True
             repaired = anatomy_metrics_np(motion, fps=float(getattr(cfg, "fps", 30.0)))
@@ -387,44 +387,44 @@ def _apply_generators_v52(v46: Any, motion_ref: np.ndarray, cond: np.ndarray, se
         rollback["after_ok"] = bool(repaired_ok)
         rollback["after_reasons"] = repaired_reasons
         if not repaired_ok:
-            raise RuntimeError("V46.52 generator anatomy rollback failed: " + " | ".join(repaired_reasons))
+            raise RuntimeError("Anatomy-Heading generator anatomy rollback failed: " + " | ".join(repaired_reasons))
     else:
         rollback["after"] = out_metrics
         rollback["after_ok"] = True
         rollback["after_reasons"] = []
-    stage["v46_52_anatomy_guard"] = rollback
-    if not hasattr(v46, "audit_motion_np"):
+    stage["anatomy_heading_anatomy_guard"] = rollback
+    if not hasattr(motion_runtime, "audit_motion_np"):
         raise RuntimeError(
-            "V46.52 anatomy rollback requires audit_motion_np for final gating"
+            "Anatomy-Heading anatomy rollback requires audit_motion_np for final gating"
         )
-    # The anatomy rollback can replace frames after V46.50's audit.  Always
+    # The anatomy rollback can replace frames after Event-Heading's audit.  Always
     # audit the exact array returned downstream, including full rollbacks.
     motion, physical_rollback = select_physical_candidate(
-        stage_name="v46_54_final_physical_rollback",
+        stage_name="routing_safety_final_physical_rollback",
         reference=motion_ref,
         candidate=motion,
-        audit_fn=lambda value: v46.audit_motion_np(value, cfg),
+        audit_fn=lambda value: motion_runtime.audit_motion_np(value, cfg),
         limits=PhysicalQualityLimits.from_environment(),
-        rollback_enabled=env_bool("V46_54_FINAL_PHYSICAL_ROLLBACK", True),
+        rollback_enabled=env_bool("ROUTING_SAFETY_FINAL_PHYSICAL_ROLLBACK", True),
     )
     selected_audit = physical_rollback["selected_audit"]
     selected_gate = physical_rollback["selected_gate"]
-    stage["v46_54_final_physical_rollback"] = physical_rollback
+    stage["routing_safety_final_physical_rollback"] = physical_rollback
     stage["final_audit"] = selected_audit
     stage["final_physical_gate"] = selected_gate
     return motion.astype(np.float32), stage
 
 
 def _install_patches() -> None:
-    if not hasattr(base, "_V46_52_ORIG_BUILD_BRIDGE"):
-        base._V46_52_ORIG_BUILD_BRIDGE = base.build_bridge
-    base.build_bridge = _build_bridge_v52
-    base.transition_risk = _transition_risk_v52
-    base.risk_score = _risk_score_v52
-    base.risk_safe = _risk_safe_v52
-    v4650._align_core_to_stage_heading = _align_core_v52
-    v4650._build_heading_proposal = _build_proposal_v52
-    v4650.apply_generators_with_heading_guard = _apply_generators_v52
+    if not hasattr(base, "_RETARGET_ORIG_BUILD_BRIDGE"):
+        base._RETARGET_ORIG_BUILD_BRIDGE = base.build_bridge
+    base.build_bridge = _build_heading_bridge
+    base.transition_risk = _heading_transition_risk
+    base.risk_score = _heading_risk_score
+    base.risk_safe = _heading_risk_safe
+    heading_runtime._align_core_to_stage_heading = _align_heading_core
+    heading_runtime._build_heading_proposal = _build_heading_proposal
+    heading_runtime.apply_generators_with_heading_guard = _apply_heading_generators
 
 
 def _resolve_motion_path(
@@ -496,7 +496,7 @@ def _patch_report(
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except Exception:
         return
-    report["version"] = "v46_52_fresh_wav_anatomy_posture_riemannian_closed_loop"
+    report["version"] = "anatomy_heading_fresh_wav_anatomy_posture_riemannian_closed_loop"
     report["audio_schedule_transaction"] = {
         "schema": contract.get("schema"),
         "ok": contract.get("ok"),
@@ -512,7 +512,7 @@ def _patch_report(
         "overlap_count": contract.get("overlap_count"),
         "gap_count": contract.get("gap_count"),
     }
-    report["v46_52_env"] = {k: v for k, v in os.environ.items() if k.startswith("V46_52_")}
+    report["anatomy_heading_env"] = {k: v for k, v in os.environ.items() if k.startswith("RETARGET_")}
     resolved_motion = _resolve_motion_path(
         report_path,
         report,
@@ -528,7 +528,7 @@ def _patch_report(
         m = anatomy_metrics_np(x, fps=float(fps))
         ok, reasons = evaluate_anatomy_contract(m)
 
-        report["v46_52_final_anatomy"] = {
+        report["anatomy_heading_final_anatomy"] = {
             "ok": ok,
             "reasons": reasons,
             "motion_path": str(resolved_motion),
@@ -545,39 +545,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output = _arg_value(args, "--out")
     fps = _runtime_fps(args)
     if not audio or not schedule:
-        raise RuntimeError("V46.52 requires --audio and a fresh --slots_json")
-    required_run_id = os.environ.get("V46_51_SCHEDULE_RUN_ID")
+        raise RuntimeError("Anatomy-Heading requires --audio and a fresh --slots_json")
+    required_run_id = os.environ.get("GENERATION_SCHEDULE_RUN_ID")
     if not required_run_id:
-        raise RuntimeError("V46_51_SCHEDULE_RUN_ID is required")
+        raise RuntimeError("GENERATION_SCHEDULE_RUN_ID is required")
     contract = audit_contract(
         audio=audio,
         schedule=schedule,
         fps=fps,
         required_run_id=required_run_id,
         require_fresh=True,
-        max_frame_error=int(float(os.environ.get("V46_51_MAX_FRAME_ERROR", "2"))),
-        max_seconds_error=float(os.environ.get("V46_51_MAX_SECONDS_ERROR", "0.10")),
+        max_frame_error=int(float(os.environ.get("GENERATION_MAX_FRAME_ERROR", "2"))),
+        max_seconds_error=float(os.environ.get("GENERATION_MAX_SECONDS_ERROR", "0.10")),
         require_raw_report=True,
         max_pose_hold_ratio=float(
             os.environ.get(
-                "V46_51_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
+                "GENERATION_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
             )
         ),
         max_single_source_ratio=float(
             os.environ.get(
-                "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+                "ROUTING_SAFETY_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
             )
         ),
         min_unique_events=int(
             float(
                 os.environ.get(
-                    "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
+                    "GENERATION_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
                 )
             )
         ),
         min_core_frame_ratio=float(
             os.environ.get(
-                "V46_51_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
+                "GENERATION_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
             )
         ),
     )
@@ -585,7 +585,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not contract["ok"]:
         raise RuntimeError("Fresh-WAV contract failed: " + "; ".join(contract["reasons"]))
     _install_patches()
-    rc = int(v4650.main(args))
+    rc = int(heading_runtime.main(args))
     if report_json:
         _patch_report(
             Path(report_json),

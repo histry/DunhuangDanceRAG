@@ -2,7 +2,7 @@
 
 ## 1. 设计边界
 
-本模块只负责音乐—动作事件检索，不修改 V45/V46/V53 的 EDGE-151 物理动作
+本模块只负责音乐—动作事件检索，不修改 the boundary refiner, motion diffusion, and global route 的 EDGE-151 物理动作
 流形。最终隐空间为：
 
 \[
@@ -25,9 +25,9 @@
 先在关闭 Grounder 训练的情况下重建 Event-DB。`events/intrinsic_geometry.py`
 会新增：
 
-- `v46_53_bodypart_gaussian_mean`，形状 `[N,5,8]`；
-- `v46_53_bodypart_gaussian_covariance`，形状 `[N,5,8,8]`；
-- `v46_53_bodypart_gaussian_samples`，形状 `[N,5]`。
+- `event_geometry_bodypart_gaussian_mean`，形状 `[N,5,8]`；
+- `event_geometry_bodypart_gaussian_covariance`，形状 `[N,5,8,8]`；
+- `event_geometry_bodypart_gaussian_samples`，形状 `[N,5]`。
 
 协方差经过对角收缩和最小特征值截断，短事件不会生成奇异 SPD。
 
@@ -60,7 +60,7 @@ python -m grounding.paired_data `
 ```powershell
 python -m grounding.mixed_curvature train `
   --data D:\path\paired_grounding.npz `
-  --out D:\path\v46_53_mixed_curvature_grounder.pt `
+  --out D:\path\event_geometry_mixed_curvature_grounder.pt `
   --epochs 120 `
   --batch_size 96 `
   --seed 20260724
@@ -77,13 +77,13 @@ R@1/5/10、MRR 和 mAP，并记录两侧的来源、配对和音频组。
 ```powershell
 python -m grounding.mixed_curvature embed `
   --db D:\path\test\events.npz `
-  --checkpoint D:\path\v46_53_mixed_curvature_grounder.pt
+  --checkpoint D:\path\event_geometry_mixed_curvature_grounder.pt
 ```
 
 推理只使用 checkpoint 中的训练来源统计量，不读取验证/测试自己的均值和方差。
 通过 `events.build_pipeline` 训练 mixed Grounder 时，训练 Event-DB 会在
 checkpoint 生成后立即执行同一嵌入步骤，写入
-`v46_53_mixed_lorentz` 等全部乘积流形因子；验证/测试库继续使用该训练
+`event_geometry_mixed_lorentz` 等全部乘积流形因子；验证/测试库继续使用该训练
 checkpoint 嵌入。
 
 ### 第五层：接入完整构建链
@@ -91,13 +91,13 @@ checkpoint 嵌入。
 设置：
 
 ```powershell
-$env:V46_53_GROUNDER_ARCHITECTURE = "mixed"
-$env:V46_53_GROUNDER_PAIRED_DATASET = "D:\path\paired_grounding.npz"
+$env:GROUNDING_GROUNDER_ARCHITECTURE = "mixed"
+$env:GROUNDING_GROUNDER_PAIRED_DATASET = "D:\path\paired_grounding.npz"
 ```
 
 随后运行原 Event-DB 构建链。混合 checkpoint 使用
-`v46_53_mixed_curvature_grounder.pt`；历史
-`v46_53_dual_branch_grounder.pt` 仍按原逻辑加载。
+`event_geometry_mixed_curvature_grounder.pt`；历史
+`event_geometry_dual_branch_grounder.pt` 仍按原逻辑加载。
 
 运行时 slot 必须包含：
 
@@ -107,7 +107,7 @@ $env:V46_53_GROUNDER_PAIRED_DATASET = "D:\path\paired_grounding.npz"
 `scripts/pipeline.sh` 在 mixed 模式下会于闭环生成前自动执行
 `grounding.audio_query`，并用 checkpoint 校验 CLAP/时序维度，再将补齐后的
 schedule 交给 Router。科研配置默认
-`V46_53_MIXED_REQUIRE_RUNTIME_AUDIO=1`：缺少任一字段时直接失败，禁止静默
+`GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO=1`：缺少任一字段时直接失败，禁止静默
 回退。只有显式关闭该严格开关时，兼容路径才会回退到确定性 AESD 分数。
 
 可用以下命令为现有 schedule 一次性补齐字段：
@@ -117,7 +117,7 @@ python -m grounding.audio_query `
   --audio D:\path\query.wav `
   --schedule D:\path\schedule.json `
   --out D:\path\schedule.mixed.json `
-  --checkpoint D:\path\v46_53_mixed_curvature_grounder.pt `
+  --checkpoint D:\path\event_geometry_mixed_curvature_grounder.pt `
   --cache_dir D:\path\clap_cache
 ```
 

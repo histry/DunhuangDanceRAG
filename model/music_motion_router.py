@@ -28,7 +28,7 @@ class MLPEncoder(nn.Module):
         return F.normalize(self.net(x), dim=-1)
 
 
-class V21MusicMotionRouter(nn.Module):
+class MusicMotionRouter(nn.Module):
     def __init__(
         self,
         music_dim: int = 12,
@@ -58,10 +58,10 @@ class V21MusicMotionRouter(nn.Module):
         return scale * (m @ e.transpose(-1, -2))
 
 
-def load_router_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> V21MusicMotionRouter:
+def load_router_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> MusicMotionRouter:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config: Dict[str, Any] = dict(checkpoint.get("config", {})) if isinstance(checkpoint, dict) else {}
-    model = V21MusicMotionRouter(
+    model = MusicMotionRouter(
         music_dim=int(config.get("music_dim", 12)),
         motion_dim=int(config.get("motion_dim", 12)),
         hidden_dim=int(config.get("hidden_dim", 128)),
@@ -77,4 +77,4 @@ def load_router_checkpoint(path: str | Path, device: torch.device | str = "cpu")
 
 # Public, version-free API. The historical class alias remains only for
 # checkpoint compatibility and is not used in public file names.
-MusicMotionRouter = V21MusicMotionRouter
+MusicMotionRouter = MusicMotionRouter

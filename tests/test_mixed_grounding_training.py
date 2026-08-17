@@ -61,10 +61,10 @@ class MixedGroundingTrainingSmokeTests(unittest.TestCase):
             checkpoint = root / "mixed.pt"
             np.savez_compressed(dataset, **payload)
             environment = {
-                "V46_53_MIXED_GROUNDER_CUDA": "0",
-                "V46_53_MIXED_HIDDEN": "32",
-                "V46_53_MIXED_LORENTZ_DIM": "4",
-                "V46_53_MIXED_SPHERE_DIM": "8",
+                "GROUNDING_MIXED_GROUNDER_CUDA": "0",
+                "GROUNDING_MIXED_HIDDEN": "32",
+                "GROUNDING_MIXED_LORENTZ_DIM": "4",
+                "GROUNDING_MIXED_SPHERE_DIM": "8",
             }
             with patch.dict(os.environ, environment, clear=False):
                 report = mixed.train_mixed_grounder(

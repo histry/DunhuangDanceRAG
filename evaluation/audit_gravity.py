@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Context-aware gravity audit for retarget sources, event DBs and final motion.
 
-Retarget-cache auditing uses the same catastrophic source thresholds as V46.53.1.
+Retarget-cache auditing uses the same catastrophic source thresholds as Retarget Clean.
 Final generated motion keeps the stricter publication-facing gravity contract.
 """
 from __future__ import annotations
@@ -71,19 +71,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if profile == "auto": profile = "source" if args.motion_dir else "final"
     if profile == "source":
         defaults = {
-            "p05": _env_float("V46_52_SOURCE_GRAVITY_TORSO_P05_MIN", 0.30),
-            "median": _env_float("V46_52_SOURCE_GRAVITY_TORSO_MEDIAN_MIN", 0.55),
-            "head": _env_float("V46_52_SOURCE_HEAD_ABOVE_RATIO_MIN", 0.85),
-            "feet": _env_float("V46_52_SOURCE_FEET_BELOW_RATIO_MIN", 0.85),
-            "horizontal": _env_float("V46_52_SOURCE_HORIZONTAL_BODY_RATIO_MAX", 0.20),
+            "p05": _env_float("RETARGET_SOURCE_GRAVITY_TORSO_P05_MIN", 0.30),
+            "median": _env_float("RETARGET_SOURCE_GRAVITY_TORSO_MEDIAN_MIN", 0.55),
+            "head": _env_float("RETARGET_SOURCE_HEAD_ABOVE_RATIO_MIN", 0.85),
+            "feet": _env_float("RETARGET_SOURCE_FEET_BELOW_RATIO_MIN", 0.85),
+            "horizontal": _env_float("RETARGET_SOURCE_HORIZONTAL_BODY_RATIO_MAX", 0.20),
         }
     else:
         defaults = {
-            "p05": _env_float("V46_49_GRAVITY_TORSO_P05_MIN", 0.45),
-            "median": _env_float("V46_49_GRAVITY_TORSO_MEDIAN_MIN", 0.70),
-            "head": _env_float("V46_49_HEAD_ABOVE_RATIO_MIN", 0.92),
-            "feet": _env_float("V46_49_FEET_BELOW_RATIO_MIN", 0.90),
-            "horizontal": _env_float("V46_49_HORIZONTAL_BODY_RATIO_MAX", 0.10),
+            "p05": _env_float("GRAVITY_TORSO_P05_MIN", 0.45),
+            "median": _env_float("GRAVITY_TORSO_MEDIAN_MIN", 0.70),
+            "head": _env_float("GRAVITY_HEAD_ABOVE_RATIO_MIN", 0.92),
+            "feet": _env_float("GRAVITY_FEET_BELOW_RATIO_MIN", 0.90),
+            "horizontal": _env_float("GRAVITY_HORIZONTAL_BODY_RATIO_MAX", 0.10),
         }
     th = GravityThresholds(
         torso_up_cos_p05_min=defaults["p05"] if args.torso_p05_min is None else args.torso_p05_min,
@@ -101,7 +101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[{i}/{len(paths)}] profile={profile} ok={row['ok']} torso_p05={row['torso_up_cos_p05']:.3f} horizontal={row['horizontal_body_ratio']:.3f} {p}", flush=True)
     failed = [r for r in rows if not r["ok"]]
     summary = {
-        "version": "v46_53_1_context_aware_gravity_audit", "profile": profile,
+        "version": "retarget_clean_context_aware_gravity_audit", "profile": profile,
         "fps": float(args.fps),
         "thresholds": th.to_dict(), "num_motions": len(rows), "num_passed": len(rows)-len(failed),
         "num_failed": len(failed), "all_ok": not failed,

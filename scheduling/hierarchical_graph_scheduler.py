@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Hierarchical Event-RAG features and graph scheduling costs for V26/V27.
+"""Hierarchical Event-RAG features and graph scheduling costs for Whole-Song Planner/Music Encoder.
 
 This module keeps the existing whole-song scheduler intact, but upgrades its
 candidate scoring from flat feature matching to:
@@ -12,7 +12,7 @@ candidate scoring from flat feature matching to:
 
 The implementation is deliberately deterministic and index-compatible.  If a
 prebuilt hierarchy index is provided, it is used; otherwise features are derived
-from the existing V21/V26 duration index arrays.
+from the existing Music Router/Whole-Song Planner duration index arrays.
 """
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ def learned_tangent_to_poincare(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Use a learned hyperbolic encoder checkpoint when available.
 
-    The checkpoint is trained by ``train_v27_hyperbolic_hierarchy.py`` with a
+    The checkpoint is trained by ``train_music_encoder_hyperbolic_hierarchy.py`` with a
     hierarchy-aware contrastive loss.  If loading fails, raise a clear error so
     the caller can decide whether to fall back to deterministic expmap.
     """

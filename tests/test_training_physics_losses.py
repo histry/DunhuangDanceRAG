@@ -24,7 +24,7 @@ def test_batch_fk_and_world_physics_losses_have_finite_gradients():
     prediction = clean.clone()
     prediction[:, 6, 4] += 0.10
     prediction.requires_grad_(True)
-    cfg = models.V46Config(device="cpu")
+    cfg = models.MotionGenerationConfig(device="cpu")
 
     joints = models.fk_24_torch(prediction)
     total, terms = models._world_space_physics_losses(prediction, clean, cfg)
@@ -43,7 +43,7 @@ def test_world_physics_loss_is_zero_at_clean_target():
     total, terms = models._world_space_physics_losses(
         clean,
         clean,
-        models.V46Config(device="cpu"),
+        models.MotionGenerationConfig(device="cpu"),
     )
 
     assert total.item() == pytest.approx(0.0, abs=1.0e-8)

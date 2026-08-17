@@ -20,7 +20,7 @@ def identity_motion(T=40):
     return x
 
 
-class TestV4652Anatomy(unittest.TestCase):
+class TestAnatomyContract(unittest.TestCase):
     def test_identity_contract(self):
         x = identity_motion()
         metrics = anatomy_metrics_np(x)

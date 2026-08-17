@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Extract a compact 12D frame-level music event stream for V21.
+"""Extract a compact 12D frame-level music event stream for Music Router.
 
 Output convention per frame:
   0 energy
@@ -283,7 +283,7 @@ def main() -> None:
     np.save(out_npy, feat.astype(np.float32))
     out_json = Path(args.out_json) if args.out_json else out_npy.with_suffix(".json")
     payload = {
-        "version": "v21_music_event_stream",
+        "version": "music_router_music_event_stream",
         "audio": str(args.audio),
         "npy": str(out_npy),
         "num_frames": int(len(feat)),

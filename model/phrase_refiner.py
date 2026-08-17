@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V16D Phrase Refiner 模型
+Phrase Refiner Phrase Refiner 模型
 输入：45~150帧 motion unit + optional onset embedding
 输出：修正后的 motion
 """

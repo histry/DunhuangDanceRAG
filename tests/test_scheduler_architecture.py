@@ -81,7 +81,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
 
     def test_final_closed_loop_uses_same_geometry_contract_as_scheduler(self):
         source = (
-            ROOT / "routing" / "heading_closed_loop_impl2.py"
+            ROOT / "routing" / "anatomy_heading_closed_loop.py"
         ).read_text(encoding="utf-8")
         for name in (
             "canonicalize_event_root_np",
@@ -104,7 +104,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("Closed-loop slot frame contract mismatch", heading)
         self.assertNotIn(
-            "source_hint=f\"v46_50_slot_exact_len:",
+            "source_hint=f\"event_heading_slot_exact_len:",
             heading,
         )
 
@@ -116,8 +116,8 @@ class SchedulerArchitectureTests(unittest.TestCase):
             encoding="utf-8"
         )
         for name in (
-            "v46_53_entry_root_velocity_mps",
-            "v46_53_exit_root_velocity_mps",
+            "event_geometry_entry_root_velocity_mps",
+            "event_geometry_exit_root_velocity_mps",
         ):
             self.assertIn(name, geometry)
             self.assertIn(name, route)
@@ -210,7 +210,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
         marker = 'scheduling/build_asset_bundle.py'
         start = source.index(marker)
         block = source[start : start + 700]
-        self.assertIn('--fps "$V46_51_FPS"', block)
+        self.assertIn('--fps "$GENERATION_FPS"', block)
 
     def test_pipeline_enriches_mixed_schedule_before_generation(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(
@@ -294,7 +294,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
         marker = 'rendering/render_motion.py'
         start = source.index(marker)
         block = source[start : start + 500]
-        self.assertIn('--fps "$V46_51_FPS"', block)
+        self.assertIn('--fps "$GENERATION_FPS"', block)
 
     def test_pipeline_supplies_all_audit_fps_contracts(self):
         pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
@@ -315,7 +315,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
             self.assertTrue(positions, marker)
             for index in positions:
                 self.assertIn(
-                    '--fps "$V46_51_FPS"', pipeline[index : index + 450]
+                    '--fps "$GENERATION_FPS"', pipeline[index : index + 450]
                 )
 
         research = (ROOT / "scripts" / "research_pipeline.sh").read_text(
@@ -323,7 +323,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
         )
         index = research.index("evaluation/audit_motion.py")
         self.assertIn(
-            '--fps "${V46_51_FPS:-30}"', research[index : index + 450]
+            '--fps "${GENERATION_FPS:-30}"', research[index : index + 450]
         )
 
     def test_runtime_launchers_do_not_embed_machine_specific_paths(self):
@@ -365,14 +365,14 @@ class SchedulerArchitectureTests(unittest.TestCase):
         source = (ROOT / "configs" / "scheduler.env").read_text(encoding="utf-8")
         entry = (ROOT / "configs" / "experiment.env").read_text(encoding="utf-8")
         self.assertIn('source "$_EXPERIMENT_CONFIG_DIR/scheduler.env"', entry)
-        self.assertIn('export V46_51_FPS="${V46_51_FPS:-30}"', source)
+        self.assertIn('export GENERATION_FPS="${GENERATION_FPS:-30}"', source)
         self.assertIn(
-            'export V46_49_RETARGET_FPS="${V46_49_RETARGET_FPS:-$V46_51_FPS}"',
+            'export SOURCE_RETARGET_FPS="${SOURCE_RETARGET_FPS:-$GENERATION_FPS}"',
             source,
         )
-        self.assertNotIn("export V46_51_FPS=30", source)
-        self.assertIn('export V46_FPS="$V46_51_FPS"', source)
-        self.assertNotIn("export V46_49_RETARGET_FPS=30", source)
+        self.assertNotIn("export GENERATION_FPS=30", source)
+        self.assertIn('export MOTION_FPS="$GENERATION_FPS"', source)
+        self.assertNotIn("export SOURCE_RETARGET_FPS=30", source)
 
     def test_shell_launchers_use_only_authoritative_experiment_entry(self):
         failures = []
@@ -412,7 +412,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
         source = (ROOT / "training" / "motion_models.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"V46_FPS": ("fps", float)', source)
+        self.assertIn('"MOTION_FPS": ("fps", float)', source)
 
     def test_pipeline_trains_motion_models_with_source_disjoint_validation(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(
@@ -473,12 +473,12 @@ class SchedulerArchitectureTests(unittest.TestCase):
             encoding="utf-8"
         )
         start = source.index("def train_refiner(")
-        block = source[start : start + 1800]
+        block = source[start : start + 2600]
         self.assertIn("degrade_for_refiner(clean, cfg=cfg)", block)
         self.assertNotIn("degrade_for_refiner(clean)\n", block)
 
     def test_post_processing_reaudits_exact_returned_motion(self):
-        anatomy = (ROOT / "routing" / "heading_closed_loop_impl2.py").read_text(
+        anatomy = (ROOT / "routing" / "anatomy_heading_closed_loop.py").read_text(
             encoding="utf-8"
         )
         final_merge = (ROOT / "routing" / "global_path.py").read_text(
@@ -487,14 +487,14 @@ class SchedulerArchitectureTests(unittest.TestCase):
         for source in (anatomy, final_merge):
             self.assertIn('stage["final_audit"] = selected_audit', source)
             self.assertIn('stage["final_physical_gate"] = selected_gate', source)
-            self.assertIn("V46_54_FINAL_PHYSICAL_ROLLBACK", source)
+            self.assertIn("ROUTING_SAFETY_FINAL_PHYSICAL_ROLLBACK", source)
 
     def test_final_generator_requires_complete_boundary_audit(self):
         source = (ROOT / "routing" / "boundary_closed_loop.py").read_text(
             encoding="utf-8"
         )
         self.assertIn("evaluate_boundary_continuity(", source)
-        self.assertIn('"V46_46_REQUIRE_FINAL_BOUNDARY_GATE"', source)
+        self.assertIn('"BOUNDARY_REQUIRE_FINAL_BOUNDARY_GATE"', source)
         self.assertIn("expected_boundaries=max(", source)
         self.assertIn("if args.render_output and not required_failures", source)
 

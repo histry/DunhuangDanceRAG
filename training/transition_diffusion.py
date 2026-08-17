@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Backward-compatible V32 continuous contact-aware transition sampler.
+"""Backward-compatible Contact Transition continuous contact-aware transition sampler.
 
-Schedulers keep importing this historical module. V32 accepts only the new
+Schedulers keep importing this historical module. Contact Transition accepts only the new
 continuous contact-INR checkpoint for the main model. It samples multiple
 latent candidates, evaluates them with real neighbouring context and falls
 back to the deterministic C2 SO(3) path when learned generation is unsafe.
@@ -38,7 +38,7 @@ from motion_geometry.rotations import (
     so3_log_torch,
 )
 from support.contact_inr import (
-    V32ContactINRSystem,
+    ContactINRSystem,
     config_from_dict,
     linear_beta_schedule,
     make_c2_transition_np,
@@ -49,6 +49,7 @@ from support.transition_quality import (
     transition_risk,
 )
 from support.checkpoint_contracts import assert_checkpoint_fps
+from support.legacy_compatibility import normalize_transition_architecture
 
 
 def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
@@ -85,23 +86,25 @@ def load_transition_diffusion(
             path=str(checkpoint_path),
         )
     config_values = dict(checkpoint.get("config", {}))
-    architecture = str(config_values.get("architecture", ""))
+    architecture = normalize_transition_architecture(
+        config_values.get("architecture", "")
+    )
     supported = {
-        "v32_continuous_c2_contact_inr_latent_diffusion",
-        "v34_continuous_c3_contact_inr_latent_diffusion",
+        "contact_transition_continuous_c2_contact_inr_latent_diffusion",
+        "boundary_transition_continuous_c3_contact_inr_latent_diffusion",
     }
     if architecture not in supported:
         raise RuntimeError(
-            f"Checkpoint architecture={architecture!r} is not V32/V34. "
-            "Retrain with the supplied train_v27_transition_diffusion.py."
+            f"Checkpoint architecture={architecture!r} is not Contact and Boundary Transition. "
+            "Retrain with the supplied train_music_encoder_transition_diffusion.py."
         )
     model_config = config_from_dict(
         dict(config_values.get("model", config_values))
     )
-    system = V32ContactINRSystem(model_config).to(device)
+    system = ContactINRSystem(model_config).to(device)
     state = checkpoint.get("system", checkpoint.get("model"))
     if state is None:
-        raise RuntimeError("V32 checkpoint has no system/model state")
+        raise RuntimeError("Contact Transition checkpoint has no system/model state")
     system.load_state_dict(state)
     ema = checkpoint.get("ema_diffusion")
     if ema is not None:
@@ -235,7 +238,7 @@ def _seed(
     length: int,
     candidate: int,
 ) -> int:
-    base = int(os.getenv("V32_TRANSITION_SEED", "20260610"))
+    base = int(os.getenv("TRANSITION_MODEL_TRANSITION_SEED", "20260610"))
     signature = int(np.round(
         np.sum(np.abs(start[:48])) * 1009.0
         + np.sum(np.abs(end[:48])) * 1709.0
@@ -252,7 +255,7 @@ def _sample_latent(
     steps: int,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    system: V32ContactINRSystem = bundle["system"]
+    system: ContactINRSystem = bundle["system"]
     diffusion_steps = int(
         bundle["config"].get(
             "diffusion_steps", system.config.diffusion_steps
@@ -270,7 +273,7 @@ def _sample_latent(
         device=device,
         generator=generator,
     )
-    guidance = float(os.getenv("V32_GUIDANCE", "1.0"))
+    guidance = float(os.getenv("TRANSITION_MODEL_GUIDANCE", "1.0"))
     with torch.no_grad():
         for position, index in enumerate(indices):
             time = torch.full(
@@ -347,10 +350,10 @@ def sample_transition_diffusion(
         return baseline, {
             "enabled": False,
             "reason": "no_checkpoint",
-            "architecture": "v32_c2_baseline",
+            "architecture": "contact_transition_c2_baseline",
         }
 
-    system: V32ContactINRSystem = bundle["system"]
+    system: ContactINRSystem = bundle["system"]
     device = torch.device(device)
     start_velocity_np = (
         previous[-1] - previous[-2]
@@ -404,10 +407,10 @@ def sample_transition_diffusion(
         max_penetration_ratio=1.0,
     )
     candidate_count = max(
-        1, int(os.getenv("V32_CANDIDATES", "8"))
+        1, int(os.getenv("TRANSITION_MODEL_CANDIDATES", "8"))
     )
     trust = float(np.clip(
-        float(os.getenv("V32_INR_TRUST", str(blend))),
+        float(os.getenv("TRANSITION_MODEL_INR_TRUST", str(blend))),
         0.0, 0.65,
     ))
     candidates: List[Dict[str, Any]] = []
@@ -447,22 +450,22 @@ def sample_transition_diffusion(
             baseline_risk,
             risk,
             max_total_ratio=float(
-                os.getenv("V32_MAX_TOTAL_RISK_RATIO", "1.02")
+                os.getenv("TRANSITION_MODEL_MAX_TOTAL_RISK_RATIO", "1.02")
             ),
             max_entry_ratio=float(
-                os.getenv("V32_MAX_ENTRY_RATIO", "1.05")
+                os.getenv("TRANSITION_MODEL_MAX_ENTRY_RATIO", "1.05")
             ),
             max_exit_ratio=float(
-                os.getenv("V32_MAX_EXIT_RATIO", "1.03")
+                os.getenv("TRANSITION_MODEL_MAX_EXIT_RATIO", "1.03")
             ),
             max_jerk_ratio=float(
-                os.getenv("V32_MAX_JERK_RATIO", "1.03")
+                os.getenv("TRANSITION_MODEL_MAX_JERK_RATIO", "1.03")
             ),
             max_foot_ratio=float(
-                os.getenv("V32_MAX_FOOT_RATIO", "1.02")
+                os.getenv("TRANSITION_MODEL_MAX_FOOT_RATIO", "1.02")
             ),
             max_penetration_ratio=float(
-                os.getenv("V32_MAX_PENETRATION_RATIO", "1.02")
+                os.getenv("TRANSITION_MODEL_MAX_PENETRATION_RATIO", "1.02")
             ),
         )
         row = {
@@ -481,7 +484,7 @@ def sample_transition_diffusion(
 
     latent_blend_meta: Dict[str, Any] = {
         "enabled": os.getenv(
-            "V34_LATENT_SNIPPET_BLEND", "0"
+            "BOUNDARY_TRANSITION_LATENT_SNIPPET_BLEND", "0"
         ).lower() in {"1", "true", "yes", "on"},
         "applied": False,
     }
@@ -493,10 +496,10 @@ def sample_transition_diffusion(
         if latent_blend_meta["enabled"] and len(accepted) >= 2:
             top_count = min(
                 len(accepted),
-                max(2, int(os.getenv("V34_LATENT_BLEND_TOP_K", "3"))),
+                max(2, int(os.getenv("BOUNDARY_TRANSITION_LATENT_BLEND_TOP_K", "3"))),
             )
             temperature = max(
-                1e-4, float(os.getenv("V34_LATENT_BLEND_TEMPERATURE", "0.08"))
+                1e-4, float(os.getenv("BOUNDARY_TRANSITION_LATENT_BLEND_TEMPERATURE", "0.08"))
             )
             top = accepted[:top_count]
             risk_values = torch.as_tensor(
@@ -533,25 +536,25 @@ def sample_transition_diffusion(
                 baseline_risk,
                 blended_risk,
                 max_total_ratio=float(
-                    os.getenv("V32_MAX_TOTAL_RISK_RATIO", "1.02")
+                    os.getenv("TRANSITION_MODEL_MAX_TOTAL_RISK_RATIO", "1.02")
                 ),
                 max_entry_ratio=float(
-                    os.getenv("V32_MAX_ENTRY_RATIO", "1.05")
+                    os.getenv("TRANSITION_MODEL_MAX_ENTRY_RATIO", "1.05")
                 ),
                 max_exit_ratio=float(
-                    os.getenv("V32_MAX_EXIT_RATIO", "1.03")
+                    os.getenv("TRANSITION_MODEL_MAX_EXIT_RATIO", "1.03")
                 ),
                 max_jerk_ratio=float(
-                    os.getenv("V32_MAX_JERK_RATIO", "1.03")
+                    os.getenv("TRANSITION_MODEL_MAX_JERK_RATIO", "1.03")
                 ),
                 max_foot_ratio=float(
-                    os.getenv("V32_MAX_FOOT_RATIO", "1.02")
+                    os.getenv("TRANSITION_MODEL_MAX_FOOT_RATIO", "1.02")
                 ),
                 max_penetration_ratio=float(
-                    os.getenv("V32_MAX_PENETRATION_RATIO", "1.02")
+                    os.getenv("TRANSITION_MODEL_MAX_PENETRATION_RATIO", "1.02")
                 ),
             )
-            keep_ratio = float(os.getenv("V34_LATENT_BLEND_KEEP_RATIO", "1.01"))
+            keep_ratio = float(os.getenv("BOUNDARY_TRANSITION_LATENT_BLEND_KEEP_RATIO", "1.01"))
             use_blend = bool(
                 blended_safe
                 and float(blended_risk["total"]) <= float(accepted[0][0]) * keep_ratio
@@ -578,15 +581,15 @@ def sample_transition_diffusion(
 
     unsafe_fallback = bool(fallback and not baseline_absolute_safe)
     if unsafe_fallback and os.getenv(
-        "V34_FAIL_ON_UNSAFE_BOUNDARY", "1"
+        "BOUNDARY_TRANSITION_FAIL_ON_UNSAFE_BOUNDARY", "1"
     ).lower() in {"1", "true", "yes", "on"}:
         raise RuntimeError(
-            "V34 absolute boundary gate rejected every learned candidate and "
+            "Boundary Transition absolute boundary gate rejected every learned candidate and "
             f"the septic baseline is unsafe: {baseline_gate}"
         )
 
     if os.getenv(
-        "V32_HARD_CONTACT_OUTPUT", "0"
+        "TRANSITION_MODEL_HARD_CONTACT_OUTPUT", "0"
     ).lower() in {"1", "true", "yes", "on"}:
         result[:, CONTACT] = (
             result[:, CONTACT] >= 0.5
@@ -595,7 +598,7 @@ def sample_transition_diffusion(
     return result.astype(np.float32), {
         "enabled": True,
         "architecture":
-            "v34_continuous_c3_contact_inr_latent_diffusion",
+            "boundary_transition_continuous_c3_contact_inr_latent_diffusion",
         "checkpoint": str(bundle.get("path", "")),
         "continuous_time": True,
         "fps": fps,
@@ -605,7 +608,7 @@ def sample_transition_diffusion(
         "selected_index": selected_index,
         "fallback_to_c2_baseline": fallback,
         "inr_trust": trust,
-        "guidance": float(os.getenv("V32_GUIDANCE", "1.0")),
+        "guidance": float(os.getenv("TRANSITION_MODEL_GUIDANCE", "1.0")),
         "baseline_risk": baseline_risk,
         "baseline_gate": baseline_gate,
         "baseline_absolute_safe": bool(baseline_absolute_safe),

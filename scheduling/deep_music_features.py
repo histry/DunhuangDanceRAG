@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Auditable CLAP/MSCLAP music semantics for V27/V28 Event-RAG.
+"""Auditable CLAP/MSCLAP music semantics for Music Encoder and Transition Training Event-RAG.
 
 Temporal segmentation still uses onset/beat/novelty.  CLAP is used only for
 phrase-level semantic query shaping.
@@ -15,11 +15,11 @@ Operational guarantees:
 
 Environment variables:
 
-V27_CLAP_CKPT          optional local LAION-CLAP checkpoint path
-V27_CLAP_AMODEL        default HTSAT-base when V27_CLAP_CKPT is set, else HTSAT-tiny
-V27_CLAP_DEVICE        default cuda:0 if CUDA is available, else cpu
-V27_CLAP_ENABLE_FUSION default 0
-V27_CLAP_USE_FILELIST  default 0; set 1 to call get_audio_embedding_from_filelist
+MUSIC_ENCODER_CLAP_CKPT          optional local LAION-CLAP checkpoint path
+MUSIC_ENCODER_CLAP_AMODEL        default HTSAT-base when MUSIC_ENCODER_CLAP_CKPT is set, else HTSAT-tiny
+MUSIC_ENCODER_CLAP_DEVICE        default cuda:0 if CUDA is available, else cpu
+MUSIC_ENCODER_CLAP_ENABLE_FUSION default 0
+MUSIC_ENCODER_CLAP_USE_FILELIST  default 0; set 1 to call get_audio_embedding_from_filelist
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def _normalize(v: np.ndarray) -> np.ndarray:
 
 
 def _projection_matrix(in_dim: int, out_dim: int = 12) -> np.ndarray:
-    seed = int(hashlib.sha1(f"v27_music_semantic_{in_dim}_{out_dim}".encode("utf-8")).hexdigest()[:8], 16)
+    seed = int(hashlib.sha1(f"music_encoder_music_semantic_{in_dim}_{out_dim}".encode("utf-8")).hexdigest()[:8], 16)
     rng = np.random.default_rng(seed)
     mat = rng.normal(size=(in_dim, out_dim)).astype(np.float32)
     mat /= np.maximum(np.linalg.norm(mat, axis=0, keepdims=True), 1e-8)
@@ -109,11 +109,11 @@ def _backend_fingerprint(enabled: bool, model_name: str) -> str:
     payload = {
         "enabled": bool(enabled),
         "model_name": str(model_name).lower(),
-        "checkpoint": os.environ.get("V27_CLAP_CKPT", ""),
-        "amodel": os.environ.get("V27_CLAP_AMODEL", ""),
-        "device": os.environ.get("V27_CLAP_DEVICE", ""),
-        "fusion": _bool_env("V27_CLAP_ENABLE_FUSION", False),
-        "filelist": _bool_env("V27_CLAP_USE_FILELIST", False),
+        "checkpoint": os.environ.get("MUSIC_ENCODER_CLAP_CKPT", ""),
+        "amodel": os.environ.get("MUSIC_ENCODER_CLAP_AMODEL", ""),
+        "device": os.environ.get("MUSIC_ENCODER_CLAP_DEVICE", ""),
+        "fusion": _bool_env("MUSIC_ENCODER_CLAP_ENABLE_FUSION", False),
+        "filelist": _bool_env("MUSIC_ENCODER_CLAP_USE_FILELIST", False),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -199,14 +199,14 @@ def _write_temp_wav(y: np.ndarray, sr: int) -> str:
         import soundfile as sf  # type: ignore
     except Exception as exc:
         raise RuntimeError(f"soundfile_unavailable:{exc}") from exc
-    tmp = tempfile.NamedTemporaryFile(prefix="v27_clap_phrase_", suffix=".wav", delete=False)
+    tmp = tempfile.NamedTemporaryFile(prefix="music_encoder_clap_phrase_", suffix=".wav", delete=False)
     tmp.close()
     sf.write(tmp.name, np.asarray(y, dtype=np.float32), int(sr))
     return tmp.name
 
 
 def _default_device() -> str:
-    env = os.environ.get("V27_CLAP_DEVICE", "").strip()
+    env = os.environ.get("MUSIC_ENCODER_CLAP_DEVICE", "").strip()
     if env:
         return env
     try:
@@ -218,10 +218,10 @@ def _default_device() -> str:
 
 
 def _get_laion_clap_model() -> Any:
-    ckpt = os.environ.get("V27_CLAP_CKPT", "").strip()
-    amodel = os.environ.get("V27_CLAP_AMODEL", "").strip() or ("HTSAT-base" if ckpt else "HTSAT-tiny")
+    ckpt = os.environ.get("MUSIC_ENCODER_CLAP_CKPT", "").strip()
+    amodel = os.environ.get("MUSIC_ENCODER_CLAP_AMODEL", "").strip() or ("HTSAT-base" if ckpt else "HTSAT-tiny")
     device = _default_device()
-    enable_fusion = _bool_env("V27_CLAP_ENABLE_FUSION", False)
+    enable_fusion = _bool_env("MUSIC_ENCODER_CLAP_ENABLE_FUSION", False)
     key = f"laion_clap|ckpt={ckpt}|amodel={amodel}|device={device}|fusion={int(enable_fusion)}"
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
@@ -238,7 +238,7 @@ def _get_laion_clap_model() -> Any:
     if ckpt:
         path = Path(ckpt)
         if not path.is_file():
-            raise RuntimeError(f"V27_CLAP_CKPT does not exist: {path}")
+            raise RuntimeError(f"MUSIC_ENCODER_CLAP_CKPT does not exist: {path}")
         model.load_ckpt(str(path))
     else:
         model.load_ckpt()
@@ -295,7 +295,7 @@ def _try_clap_phrase_embedding(
     if name in {"laion_clap", "clap"}:
         try:
             model = _get_laion_clap_model()
-            if _bool_env("V27_CLAP_USE_FILELIST", False):
+            if _bool_env("MUSIC_ENCODER_CLAP_USE_FILELIST", False):
                 tmp = _write_temp_wav(y, sr)
                 try:
                     emb = model.get_audio_embedding_from_filelist(x=[tmp], use_tensor=False)
@@ -360,18 +360,18 @@ def _meta_from_modes(
         "feature_dim": int(semantic.shape[1]) if semantic.ndim == 2 else 0,
         "backend_meta": backends,
         "env": {
-            "V27_CLAP_CKPT": os.environ.get("V27_CLAP_CKPT", ""),
-            "V27_CLAP_AMODEL": os.environ.get("V27_CLAP_AMODEL", ""),
-            "V27_CLAP_DEVICE": os.environ.get("V27_CLAP_DEVICE", ""),
-            "V27_CLAP_ENABLE_FUSION": os.environ.get("V27_CLAP_ENABLE_FUSION", ""),
-            "V27_CLAP_USE_FILELIST": os.environ.get("V27_CLAP_USE_FILELIST", ""),
+            "MUSIC_ENCODER_CLAP_CKPT": os.environ.get("MUSIC_ENCODER_CLAP_CKPT", ""),
+            "MUSIC_ENCODER_CLAP_AMODEL": os.environ.get("MUSIC_ENCODER_CLAP_AMODEL", ""),
+            "MUSIC_ENCODER_CLAP_DEVICE": os.environ.get("MUSIC_ENCODER_CLAP_DEVICE", ""),
+            "MUSIC_ENCODER_CLAP_ENABLE_FUSION": os.environ.get("MUSIC_ENCODER_CLAP_ENABLE_FUSION", ""),
+            "MUSIC_ENCODER_CLAP_USE_FILELIST": os.environ.get("MUSIC_ENCODER_CLAP_USE_FILELIST", ""),
         },
     }
 
 
 def _assert_deep_success(meta: Dict[str, Any], min_success: float) -> None:
     if not bool(meta.get("enabled", False)):
-        raise RuntimeError("V27 deep music strict mode is enabled, but deep music features are disabled.")
+        raise RuntimeError("Music Encoder deep music strict mode is enabled, but deep music features are disabled.")
     rate = float(meta.get("deep_success_rate", 0.0))
     if rate < float(min_success):
         raise RuntimeError(
@@ -399,7 +399,7 @@ def phrase_semantic_matrix(
     phrase_hash = _phrase_fingerprint(phrases)
     backend_hash = _backend_fingerprint(enabled, model_name)
     cache_key = (
-        f"{audio.stem}_v27_semantic_{model_name}_{len(phrases)}"
+        f"{audio.stem}_music_encoder_semantic_{model_name}_{len(phrases)}"
         f"_fps{fps:g}"
         f"_audio{audio_hash}_phrases{phrase_hash}_backend{backend_hash}.npz"
     )
@@ -486,7 +486,7 @@ def phrase_deep_embedding_matrix(
     phrase_hash = _phrase_fingerprint(phrases)
     backend_hash = _backend_fingerprint(True, model_name)
     cache_key = (
-        f"{audio.stem}_v46_53_raw_{model_name}_{len(phrases)}"
+        f"{audio.stem}_event_geometry_raw_{model_name}_{len(phrases)}"
         f"_fps{fps:g}_audio{audio_hash}_phrases{phrase_hash}"
         f"_backend{backend_hash}.npz"
     )
@@ -556,7 +556,7 @@ def phrase_deep_embedding_matrix(
     )
     meta.update(
         {
-            "schema": "v46_53_unprojected_deep_audio_embedding_v1",
+            "schema": "event_geometry_unprojected_deep_audio_embedding_v1",
             "projection": "none",
             "rule_semantic_mixing": False,
             "valid_mask": valid.tolist(),

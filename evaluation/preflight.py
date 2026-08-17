@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.53.1 real-data preflight before expensive retargeting/training."""
+"""Retarget Clean real-data preflight before expensive retargeting/training."""
 from __future__ import annotations
 
 import argparse
@@ -55,7 +55,7 @@ def main() -> int:
 
     _check_file(audio, "input audio", errors)
     if not music_dir.is_dir(): errors.append(f"missing training music directory: {music_dir}")
-    if "test_music_bank" in str(music_dir): errors.append("test_music_bank must not enter V44 training")
+    if "test_music_bank" in str(music_dir): errors.append("test_music_bank must not enter Contrastive Retriever training")
     if not change_dir.is_dir(): errors.append(f"missing change source directory: {change_dir}")
 
     required = [
@@ -73,7 +73,7 @@ def main() -> int:
     for rel in required: _check_file(root / rel, rel, errors)
 
     sources = sorted(change_dir.rglob("*.bvh")) if change_dir.is_dir() else []
-    min_sources = int(float(os.environ.get("V46_52_MIN_OK_SOURCES", "8")))
+    min_sources = int(float(os.environ.get("RETARGET_MIN_OK_SOURCES", "8")))
     if len(sources) < min_sources:
         errors.append(f"change BVH count={len(sources)} < minimum source requirement={min_sources}")
     source_manifest = (
@@ -108,7 +108,7 @@ def main() -> int:
         errors.append(f"Chang-E source manifest validation failed: {exc}")
 
     music_count = _count_audio(music_dir) if music_dir.is_dir() else 0
-    expected_music = int(float(os.environ.get("V46_53_1_EXPECTED_TRAIN_MUSIC", "788")))
+    expected_music = int(float(os.environ.get("RETARGET_CLEAN_EXPECTED_TRAIN_MUSIC", "788")))
     if expected_music > 0 and music_count != expected_music:
         errors.append(f"training music count={music_count}; expected={expected_music}")
 
@@ -128,9 +128,9 @@ def main() -> int:
         from data_pipeline.split_sources import exact_split_counts
         runtime["split_counts_at_recording_groups"] = exact_split_counts(
             max(3, len(recording_uids)),
-            float(os.environ.get("V46_51_TRAIN_RATIO", "0.67")),
-            float(os.environ.get("V46_51_VAL_RATIO", "0.165")),
-            float(os.environ.get("V46_51_TEST_RATIO", "0.165")),
+            float(os.environ.get("GENERATION_TRAIN_RATIO", "0.67")),
+            float(os.environ.get("GENERATION_VAL_RATIO", "0.165")),
+            float(os.environ.get("GENERATION_TEST_RATIO", "0.165")),
         )
     except Exception as exc:
         errors.append(f"split contract import/self-test failed: {exc}")

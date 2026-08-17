@@ -45,38 +45,38 @@ class BoundaryContinuityLimits:
     def from_environment(cls) -> "BoundaryContinuityLimits":
         return cls(
             boundary_joint_jerk_max_mps3=_env_float(
-                "V46_46_MAX_BOUNDARY_JERK_MPS3", 650.0
+                "BOUNDARY_MAX_BOUNDARY_JERK_MPS3", 650.0
             ),
             entry_fk_jump_max_m=_env_float(
-                "V46_46_MAX_ENTRY_FK_JUMP_M",
-                _env_float("V46_46_MAX_EXIT_FK_JUMP_M", 0.015),
+                "BOUNDARY_MAX_ENTRY_FK_JUMP_M",
+                _env_float("BOUNDARY_MAX_EXIT_FK_JUMP_M", 0.015),
             ),
-            exit_fk_jump_max_m=_env_float("V46_46_MAX_EXIT_FK_JUMP_M", 0.015),
+            exit_fk_jump_max_m=_env_float("BOUNDARY_MAX_EXIT_FK_JUMP_M", 0.015),
             entry_fk_joint_jump_max_m=_env_float(
-                "V46_46_MAX_ENTRY_FK_JOINT_JUMP_M", 0.050
+                "BOUNDARY_MAX_ENTRY_FK_JOINT_JUMP_M", 0.050
             ),
             exit_fk_joint_jump_max_m=_env_float(
-                "V46_46_MAX_EXIT_FK_JOINT_JUMP_M", 0.050
+                "BOUNDARY_MAX_EXIT_FK_JOINT_JUMP_M", 0.050
             ),
             entry_rotation_step_max_rad=_env_float(
-                "V46_46_MAX_ENTRY_ROT_RAD",
-                _env_float("V46_46_MAX_EXIT_ROT_RAD", 0.08),
+                "BOUNDARY_MAX_ENTRY_ROT_RAD",
+                _env_float("BOUNDARY_MAX_EXIT_ROT_RAD", 0.08),
             ),
             exit_rotation_step_max_rad=_env_float(
-                "V46_46_MAX_EXIT_ROT_RAD", 0.08
+                "BOUNDARY_MAX_EXIT_ROT_RAD", 0.08
             ),
-            foot_slip_max_mps=_env_float("V46_46_MAX_FOOT_SLIP_MPS", 0.06),
+            foot_slip_max_mps=_env_float("BOUNDARY_MAX_FOOT_SLIP_MPS", 0.06),
             foot_slip_p95_max_mps=_env_float(
-                "V46_46_MAX_FOOT_SLIP_P95_MPS", 0.12
+                "BOUNDARY_MAX_FOOT_SLIP_P95_MPS", 0.12
             ),
             foot_slip_peak_max_mps=_env_float(
-                "V46_46_MAX_FOOT_SLIP_PEAK_MPS", 0.25
+                "BOUNDARY_MAX_FOOT_SLIP_PEAK_MPS", 0.25
             ),
             foot_penetration_max_m2=_env_float(
-                "V46_46_MAX_FOOT_PENETRATION_M2", 0.001
+                "BOUNDARY_MAX_FOOT_PENETRATION_M2", 0.001
             ),
             foot_penetration_depth_max_m=_env_float(
-                "V46_46_MAX_FOOT_PENETRATION_DEPTH_M", 0.040
+                "BOUNDARY_MAX_FOOT_PENETRATION_DEPTH_M", 0.040
             ),
         )
 

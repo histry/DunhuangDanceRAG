@@ -33,7 +33,7 @@ Every full run therefore performs this ordered chain:
    the new Router;
 5. validate FPS, SMPL24, ordered `event_uid` fingerprint, Rot6D layout and file
    hashes before same-WAV regression;
-6. only after that gate, train V44/V45/V46.
+6. only after that gate, train the semantic retriever, boundary refiner, and motion diffusion.
 
 Motion-side retriever/refiner/diffusion and the grounding model are trained into
 each run's `checkpoints/` directory.

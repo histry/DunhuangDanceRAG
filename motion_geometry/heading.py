@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Turn-aware utilities for V22 Dunhuang ChoreoRAG.
+"""Turn-aware utilities for Turn-Pace Model Dunhuang ChoreoRAG.
 
 The module keeps the EDGE 151D representation contract:
     [0:4]   foot contacts

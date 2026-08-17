@@ -531,13 +531,13 @@ def train_semantic_ot_grounder(
         gaussian_dim=dimensions["gaussian_dim"],
         control_dim=dimensions["control_dim"],
         num_sources=int(np.max(train_payload["source_ids"])) + 1,
-        hidden_dim=int(os.environ.get("V46_53_MIXED_HIDDEN", 192)),
-        lorentz_dim=int(os.environ.get("V46_53_MIXED_LORENTZ_DIM", 16)),
-        sphere_dim=int(os.environ.get("V46_53_MIXED_SPHERE_DIM", 96)),
-        dropout=float(os.environ.get("V46_53_MIXED_DROPOUT", 0.10)),
-        minimum_covariance=float(os.environ.get("V46_53_MIXED_COV_EPS", 1.0e-4)),
-        initial_curvature=float(os.environ.get("V46_53_MIXED_CURVATURE", 1.0)),
-        initial_temperature=float(os.environ.get("V46_53_MIXED_TEMPERATURE", 0.08)),
+        hidden_dim=int(os.environ.get("GROUNDING_MIXED_HIDDEN", 192)),
+        lorentz_dim=int(os.environ.get("GROUNDING_MIXED_LORENTZ_DIM", 16)),
+        sphere_dim=int(os.environ.get("GROUNDING_MIXED_SPHERE_DIM", 96)),
+        dropout=float(os.environ.get("GROUNDING_MIXED_DROPOUT", 0.10)),
+        minimum_covariance=float(os.environ.get("GROUNDING_MIXED_COV_EPS", 1.0e-4)),
+        initial_curvature=float(os.environ.get("GROUNDING_MIXED_CURVATURE", 1.0)),
+        initial_temperature=float(os.environ.get("GROUNDING_MIXED_TEMPERATURE", 0.08)),
     )
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -546,7 +546,7 @@ def train_semantic_ot_grounder(
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
-        and _env_bool("V46_53_MIXED_GROUNDER_CUDA", True)
+        and _env_bool("GROUNDING_MIXED_GROUNDER_CUDA", True)
         else "cpu"
     )
     model = MixedCurvatureGrounder(config).to(device)
@@ -570,13 +570,13 @@ def train_semantic_ot_grounder(
         pin_memory=device.type == "cuda",
     )
     loss_weights = {
-        "hierarchy_weight": float(os.environ.get("V46_53_MIXED_HIERARCHY_W", 0.20)),
-        "gaussian_anchor_weight": float(os.environ.get("V46_53_MIXED_GAUSSIAN_W", 0.25)),
-        "control_weight": float(os.environ.get("V46_53_MIXED_CONTROL_W", 0.10)),
-        "uncertainty_weight": float(os.environ.get("V46_53_MIXED_UNCERTAINTY_W", 0.05)),
-        "source_weight": float(os.environ.get("V46_53_MIXED_SOURCE_W", 0.05)),
-        "metric_balance_weight": float(os.environ.get("V46_53_MIXED_METRIC_BALANCE_W", 0.01)),
-        "hierarchy_margin": float(os.environ.get("V46_53_MIXED_HIERARCHY_MARGIN", 1.25)),
+        "hierarchy_weight": float(os.environ.get("GROUNDING_MIXED_HIERARCHY_W", 0.20)),
+        "gaussian_anchor_weight": float(os.environ.get("GROUNDING_MIXED_GAUSSIAN_W", 0.25)),
+        "control_weight": float(os.environ.get("GROUNDING_MIXED_CONTROL_W", 0.10)),
+        "uncertainty_weight": float(os.environ.get("GROUNDING_MIXED_UNCERTAINTY_W", 0.05)),
+        "source_weight": float(os.environ.get("GROUNDING_MIXED_SOURCE_W", 0.05)),
+        "metric_balance_weight": float(os.environ.get("GROUNDING_MIXED_METRIC_BALANCE_W", 0.01)),
+        "hierarchy_margin": float(os.environ.get("GROUNDING_MIXED_HIERARCHY_MARGIN", 1.25)),
         "cross_phrase_target_weight": float(
             os.environ.get("SEMANTIC_OT_CROSS_PHRASE_TARGET_W", 0.15)
         ),

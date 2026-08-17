@@ -67,65 +67,65 @@ def diversity_assessment(
 
     # Keep the legacy baseline isolated from BR-HPR environment variables.
     # This is essential for reproducible ablations: sourcing br_hpr.env must not
-    # alter the V46.54 hard-diversity baseline when BR_HPR_ENABLE=0.
+    # alter the Routing Safety hard-diversity baseline when BR_HPR_ENABLE=0.
     if probabilistic:
         cooldown = max(
             1,
             _env_int(
                 "BR_HPR_EVENT_COOLDOWN_SLOTS",
-                _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8),
+                _env_int("ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS", 8),
             ),
         )
         max_source_run = max(
             1,
             _env_int(
                 "BR_HPR_MAX_SOURCE_RUN",
-                _env_int("V46_54_MAX_SOURCE_RUN", 2),
+                _env_int("ROUTING_SAFETY_MAX_SOURCE_RUN", 2),
             ),
         )
         max_source_share = _env_float(
             "BR_HPR_MAX_SOURCE_SHARE",
-            _env_float("V46_54_MAX_SOURCE_SHARE", 0.40),
+            _env_float("ROUTING_SAFETY_MAX_SOURCE_SHARE", 0.40),
         )
         max_recording_share = _env_float(
             "BR_HPR_MAX_RECORDING_SHARE",
-            _env_float("V46_54_MAX_RECORDING_SHARE", max_source_share),
+            _env_float("ROUTING_SAFETY_MAX_RECORDING_SHARE", max_source_share),
         )
         max_family_share = _env_float(
             "BR_HPR_MAX_FAMILY_SHARE",
-            _env_float("V46_54_MAX_FAMILY_SHARE", 0.50),
+            _env_float("ROUTING_SAFETY_MAX_FAMILY_SHARE", 0.50),
         )
         minimum_share_history = max(
             1,
             _env_int(
                 "BR_HPR_MIN_SHARE_HISTORY",
-                _env_int("V46_54_MIN_SHARE_HISTORY", 6),
+                _env_int("ROUTING_SAFETY_MIN_SHARE_HISTORY", 6),
             ),
         )
     else:
         cooldown = max(
             1,
-            _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8),
+            _env_int("ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS", 8),
         )
         max_source_run = max(
             1,
-            _env_int("V46_54_MAX_SOURCE_RUN", 2),
+            _env_int("ROUTING_SAFETY_MAX_SOURCE_RUN", 2),
         )
         max_source_share = _env_float(
-            "V46_54_MAX_SOURCE_SHARE",
+            "ROUTING_SAFETY_MAX_SOURCE_SHARE",
             0.40,
         )
         max_recording_share = _env_float(
-            "V46_54_MAX_RECORDING_SHARE",
+            "ROUTING_SAFETY_MAX_RECORDING_SHARE",
             max_source_share,
         )
         max_family_share = _env_float(
-            "V46_54_MAX_FAMILY_SHARE",
+            "ROUTING_SAFETY_MAX_FAMILY_SHARE",
             0.50,
         )
         minimum_share_history = max(
             1,
-            _env_int("V46_54_MIN_SHARE_HISTORY", 6),
+            _env_int("ROUTING_SAFETY_MIN_SHARE_HISTORY", 6),
         )
 
     recent_uids = [row["event_uid"] for row in history[-cooldown:]]
@@ -237,32 +237,32 @@ def diversity_assessment(
             * family_share_violation
         )
     else:
-        # Preserve the original V46.54 baseline scoring semantics.
+        # Preserve the original Routing Safety baseline scoring semantics.
         penalty = 0.0
         if share_active:
             penalty += (
-                _env_float("V46_54_SOURCE_SHARE_WEIGHT", 2.0)
+                _env_float("ROUTING_SAFETY_SOURCE_SHARE_WEIGHT", 2.0)
                 * max(0.0, source_share - max_source_share)
             )
             penalty += (
-                _env_float("V46_54_RECORDING_SHARE_WEIGHT", 2.0)
+                _env_float("ROUTING_SAFETY_RECORDING_SHARE_WEIGHT", 2.0)
                 * max(0.0, recording_share - max_recording_share)
             )
             penalty += (
-                _env_float("V46_54_FAMILY_SHARE_WEIGHT", 1.2)
+                _env_float("ROUTING_SAFETY_FAMILY_SHARE_WEIGHT", 1.2)
                 * max(0.0, family_share - max_family_share)
             )
 
     penalty += (
-        _env_float("V46_54_SOURCE_REUSE_WEIGHT", 0.08)
+        _env_float("ROUTING_SAFETY_SOURCE_REUSE_WEIGHT", 0.08)
         * source_counts[identity["source_uid"]]
     )
     penalty += (
-        _env_float("V46_54_RECORDING_REUSE_WEIGHT", 0.08)
+        _env_float("ROUTING_SAFETY_RECORDING_REUSE_WEIGHT", 0.08)
         * recording_counts[identity["recording_uid"]]
     )
     penalty += (
-        _env_float("V46_54_FAMILY_REUSE_WEIGHT", 0.05)
+        _env_float("ROUTING_SAFETY_FAMILY_REUSE_WEIGHT", 0.05)
         * family_counts[identity["family_id"]]
     )
 
@@ -304,20 +304,20 @@ def proposal_selection_score(
 
     diversity = extra.get("diversity", {})
     score = float(proposal.risk_score) + float(diversity.get("penalty", 0.0))
-    score += _env_float("V46_54_CANDIDATE_RANK_WEIGHT", 0.01) * float(
+    score += _env_float("ROUTING_SAFETY_CANDIDATE_RANK_WEIGHT", 0.01) * float(
         getattr(proposal, "rank", 0)
     )
-    score += _env_float("V46_50_POSTERIOR_WEIGHT", 0.35) * float(
+    score += _env_float("EVENT_HEADING_POSTERIOR_WEIGHT", 0.35) * float(
         extra.get("route_prior_cost", 0.0)
     )
-    score += _env_float("V46_50_UNCERTAINTY_WEIGHT", 0.20) * float(
+    score += _env_float("EVENT_HEADING_UNCERTAINTY_WEIGHT", 0.20) * float(
         extra.get("route_uncertainty", 0.0)
     )
-    score += _env_float("V46_50_SOURCE_CALIBRATION_WEIGHT", 0.15) * float(
+    score += _env_float("EVENT_HEADING_SOURCE_CALIBRATION_WEIGHT", 0.15) * float(
         extra.get("source_calibration_penalty", 0.0)
     )
     if int(proposal.event_id) == int(primary_event_id):
-        score -= max(0.0, _env_float("V46_54_PRIMARY_EVENT_BONUS", 0.18))
+        score -= max(0.0, _env_float("ROUTING_SAFETY_PRIMARY_EVENT_BONUS", 0.18))
     return float(score)
 
 

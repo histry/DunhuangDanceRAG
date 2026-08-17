@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Endpoint-conditioned transition refiner for V20.
+"""Endpoint-conditioned transition refiner for Transition Model.
 
 The model refines a short rough transition between an exit pose and an entry pose.
 It is small by design: it should repair only the boundary transition, not rewrite

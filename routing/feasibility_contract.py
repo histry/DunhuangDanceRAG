@@ -14,7 +14,7 @@ The research policy is intentionally asymmetric:
 
 * source safety, event anatomy validity, heading validity, performer-group
   policy, and severe physical failures are never relaxed;
-* only duration/warp and the V46.53 multiscale tangent gate receive bounded,
+* only duration/warp and the Geometry-Aware Routing multiscale tangent gate receive bounded,
   reason-specific rescue tiers;
 * a music slot is split, while preserving its total frame budget, when no
   duration-feasible event exists in the expanded candidate pool;
@@ -22,7 +22,7 @@ The research policy is intentionally asymmetric:
   event UID is authoritative only after the Scheduler and Generation DB
   fingerprints have been validated by the base loader.
 
-The implementation is installed after ``v46_53_heading_closed_loop`` has
+The implementation is installed after ``event_geometry_heading_closed_loop`` has
 installed its own patches.  It is API-compatible with the current public main
 commit and with the cleaned DunhuangDanceRAG module layout.
 """
@@ -180,7 +180,7 @@ def performer_groups(db: Mapping[str, Any]) -> np.ndarray:
 
 def event_quality(db: Mapping[str, Any], event_id: int) -> float:
     for key in (
-        "v46_53_combined_quality",
+        "event_geometry_combined_quality",
         "event_quality_scores",
         "anatomy_quality",
         "quality_scores",
@@ -257,12 +257,12 @@ def duration_feasible(
 
 _PROVENANCE_ONLY_KEYS = {
     "event_id", "event_index", "family_id", "motion_event", "natural_duration",
-    "v26_event_id", "v26_event_index", "v26_family_id",
-    "v26_allocated_content_len", "v26_allocated_phrase_total",
-    "v26_time_warp_ratio", "resampling", "time_warp_ratio",
+    "whole_song_event_id", "whole_song_event_index", "whole_song_family_id",
+    "whole_song_allocated_content_len", "whole_song_allocated_phrase_total",
+    "whole_song_time_warp_ratio", "resampling", "time_warp_ratio",
 }
 
-_STABLE_IDENTITY_KEYS = ("v26_event_uid", "event_uid")
+_STABLE_IDENTITY_KEYS = ("whole_song_event_uid", "event_uid")
 
 
 def sanitize_slot(
@@ -292,7 +292,7 @@ def sanitize_slot(
     for key in _STABLE_IDENTITY_KEYS:
         out.pop(key, None)
     if stable_uid and aligned_event_db:
-        out["v26_event_uid"] = stable_uid
+        out["whole_song_event_uid"] = stable_uid
         out["event_uid"] = stable_uid
     elif stable_uid:
         provenance["event_uid"] = stable_uid
@@ -494,13 +494,13 @@ def _tier_env(policy: FeasibilityPolicy, tier: int) -> Dict[str, str]:
     beam = int(round(base_beam + ratio * (maximum_beam - base_beam)))
     branch = int(round(base_branch + ratio * (maximum_branch - base_branch)))
     return {
-        "V46_52_CORE_WARP_MIN": str(warp_min),
-        "V46_52_CORE_WARP_MAX": str(warp_max),
-        "V46_53_OBSERVABILITY_HARD_MIN": str(observability),
-        "V46_50_HEADING_TRIAL_TOPK": str(policy.candidate_pool),
-        "V46_50_DYNAMIC_BEAM_WIDTH": str(beam),
-        "V46_50_DYNAMIC_BEAM_MAX": str(maximum_beam),
-        "V46_50_DYNAMIC_BRANCH_TOPK": str(branch),
+        "RETARGET_CORE_WARP_MIN": str(warp_min),
+        "RETARGET_CORE_WARP_MAX": str(warp_max),
+        "GROUNDING_OBSERVABILITY_HARD_MIN": str(observability),
+        "EVENT_HEADING_TRIAL_TOPK": str(policy.candidate_pool),
+        "EVENT_HEADING_DYNAMIC_BEAM_WIDTH": str(beam),
+        "EVENT_HEADING_DYNAMIC_BEAM_MAX": str(maximum_beam),
+        "EVENT_HEADING_DYNAMIC_BRANCH_TOPK": str(branch),
     }
 
 
@@ -519,23 +519,23 @@ def temporary_environment(values: Mapping[str, str]):
                 os.environ[key] = value
 
 
-def install(v53: Any) -> Dict[str, Any]:
-    """Install the contract after the current V46.53 patch stack is active."""
+def install(route_runtime: Any) -> Dict[str, Any]:
+    """Install the contract after the current Geometry-Aware Routing patch stack is active."""
     global _INSTALLED, _ACTIVE_TIER, _LAST_DIAGNOSTICS
     if _INSTALLED:
         return dict(_LAST_DIAGNOSTICS)
 
     policy = FeasibilityPolicy.from_env()
-    v52 = v53.v52
-    v50 = v52.v4650
-    base = v52.base
+    anatomy_heading_runtime = route_runtime.anatomy_heading_runtime
+    heading_runtime = anatomy_heading_runtime.heading_runtime
+    base = anatomy_heading_runtime.base
 
     original_load = base.load_slots_and_candidates
     original_choose = base.choose_transition_lengths
-    original_proposal = v50._build_heading_proposal
-    original_assemble = v50.assemble_event_heading_reference
+    original_proposal = heading_runtime._build_heading_proposal
+    original_assemble = heading_runtime.assemble_event_heading_reference
 
-    def research_load_slots_and_candidates(v46: Any, args: Any, cfg: Any):
+    def research_load_slots_and_candidates(motion_runtime: Any, args: Any, cfg: Any):
         # The base loader performs the Scheduler/Generation DB fingerprint
         # check and seeds the exact scheduled event_uid.  Never bypass it.
         try:
@@ -555,12 +555,12 @@ def install(v53: Any) -> Dict[str, Any]:
             retrieval_report,
             candidate_lists,
         ) = original_load(
-            v46,
+            motion_runtime,
             args,
             cfg,
         )
         fps = float(getattr(cfg, "fps", 30.0))
-        aligned_event_db = env_bool("V46_54_REQUIRE_ALIGNED_EVENT_DB", True)
+        aligned_event_db = env_bool("ROUTING_SAFETY_REQUIRE_ALIGNED_EVENT_DB", True)
         slots = [
             sanitize_slot(
                 slot,
@@ -575,7 +575,7 @@ def install(v53: Any) -> Dict[str, Any]:
         performer_report: Dict[str, Any] = {}
         for split_pass in range(policy.max_slot_split_passes + 1):
             if split_pass > 0:
-                path_idx, retrieval_report = v46.retrieve_schedule(
+                path_idx, retrieval_report = motion_runtime.retrieve_schedule(
                     slots, features, db, cfg, contrastive
                 )
                 candidate_lists = base.extract_candidate_lists(
@@ -621,7 +621,7 @@ def install(v53: Any) -> Dict[str, Any]:
         raise RuntimeError("Feasibility slot-splitting passes exhausted")
 
     def research_choose_transition_lengths(
-        v46: Any,
+        motion_runtime: Any,
         prev: Optional[np.ndarray],
         source_len: int,
         target_len: int,
@@ -630,7 +630,7 @@ def install(v53: Any) -> Dict[str, Any]:
         cfg: Any,
     ):
         core, transition, info = original_choose(
-            v46, prev, source_len, target_len, raw_curr, slot, cfg
+            motion_runtime, prev, source_len, target_len, raw_curr, slot, cfg
         )
         source_len_i = max(1, int(source_len))
         target_len_i = max(1, int(target_len))
@@ -691,17 +691,17 @@ def install(v53: Any) -> Dict[str, Any]:
         db = kwargs.get("db")
         event_id = int(kwargs.get("event_id", proposal.event_id))
         gate = (
-            proposal.risk.get("v46_52_event_gate", {})
+            proposal.risk.get("anatomy_heading_event_gate", {})
             if isinstance(proposal.risk, dict)
             else {}
         )
         boundary = (
-            proposal.risk.get("v46_53_tangent_boundary")
+            proposal.risk.get("event_geometry_tangent_boundary")
             if isinstance(proposal.risk, dict)
             else None
         )
         grounding = (
-            proposal.risk.get("v46_53_grounding", {})
+            proposal.risk.get("event_geometry_grounding", {})
             if isinstance(proposal.risk, dict)
             else {}
         )
@@ -728,7 +728,7 @@ def install(v53: Any) -> Dict[str, Any]:
         heading_penalty = float(extra.get("heading_penalty", 0.0))
         heading_db_valid = True
         try:
-            heading_db_valid = bool(v50._heading_valid(db, event_id))
+            heading_db_valid = bool(heading_runtime._heading_valid(db, event_id))
         except Exception:
             pass
         physical_ok = bool(base.risk_safe(proposal.risk))
@@ -774,7 +774,7 @@ def install(v53: Any) -> Dict[str, Any]:
             and bool(extra.get("heading_detail", {}).get("hard_reject", False))
         ):
             # Immutable gates above prove that the hard flag came only from the
-            # bounded V46.53 observability/tangent layer.  V46.52 anatomy and
+            # bounded Geometry-Aware Routing observability/tangent layer.  Anatomy-Heading anatomy and
             # base physical safety remain mandatory.
             proposal.safe = True
             if proposal.risk_score >= 1e6:
@@ -818,9 +818,9 @@ def install(v53: Any) -> Dict[str, Any]:
                         }
                         _LAST_DIAGNOSTICS.update(diagnostics)
                         try:
-                            current = dict(getattr(v53, "_GLOBAL_ROUTE_REPORT", {}) or {})
+                            current = dict(getattr(route_runtime, "_GLOBAL_ROUTE_REPORT", {}) or {})
                             current["research_feasibility"] = diagnostics
-                            v53._GLOBAL_ROUTE_REPORT = current
+                            route_runtime._GLOBAL_ROUTE_REPORT = current
                         except Exception:
                             pass
                         return motion, report, selected
@@ -855,15 +855,15 @@ def install(v53: Any) -> Dict[str, Any]:
 
     base.load_slots_and_candidates = research_load_slots_and_candidates
     base.choose_transition_lengths = research_choose_transition_lengths
-    v50._build_heading_proposal = research_proposal
-    v50.assemble_event_heading_reference = research_assemble
+    heading_runtime._build_heading_proposal = research_proposal
+    heading_runtime.assemble_event_heading_reference = research_assemble
 
     # Candidate previews and expensive heading trials must use the same pool.
-    os.environ.setdefault("V46_46_CANDIDATE_TOPK", str(policy.candidate_pool))
-    os.environ.setdefault("V46_46_RESELECT_TOPK", str(policy.candidate_pool))
-    os.environ.setdefault("V46_50_HEADING_TRIAL_TOPK", str(policy.candidate_pool))
-    os.environ.setdefault("V46_53_GLOBAL_ROUTE_TOPK", str(policy.global_route_topk))
-    os.environ.setdefault("V46_52_ALLOW_UNSAFE_RESCUE", "0")
+    os.environ.setdefault("BOUNDARY_CANDIDATE_TOPK", str(policy.candidate_pool))
+    os.environ.setdefault("BOUNDARY_RESELECT_TOPK", str(policy.candidate_pool))
+    os.environ.setdefault("EVENT_HEADING_TRIAL_TOPK", str(policy.candidate_pool))
+    os.environ.setdefault("GROUNDING_GLOBAL_ROUTE_TOPK", str(policy.global_route_topk))
+    os.environ.setdefault("RETARGET_ALLOW_UNSAFE_RESCUE", "0")
 
     _INSTALLED = True
     _LAST_DIAGNOSTICS = {

@@ -404,7 +404,7 @@ class DanceDecoder(nn.Module):
         )
         self.null_energy_embed = nn.Parameter(torch.zeros(1, latent_dim))
 
-        # V9 RAG Summary Token branch.
+        # RAG summary token RAG Summary Token branch.
         # EDGE passes enable_rag_summary_token / rag_summary_dim through **kwargs
         # to preserve old constructor compatibility.
         self.enable_rag_summary_token = bool(kwargs.get("enable_rag_summary_token", False))

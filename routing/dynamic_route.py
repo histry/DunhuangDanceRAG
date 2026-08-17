@@ -133,30 +133,30 @@ class DynamicSearchConfig:
 
     @classmethod
     def from_environment(cls) -> "DynamicSearchConfig":
-        beam = max(1, _env_int("V46_50_DYNAMIC_BEAM_WIDTH", 6))
-        maximum = max(beam, _env_int("V46_50_DYNAMIC_BEAM_MAX", 12))
+        beam = max(1, _env_int("EVENT_HEADING_DYNAMIC_BEAM_WIDTH", 6))
+        maximum = max(beam, _env_int("EVENT_HEADING_DYNAMIC_BEAM_MAX", 12))
         return cls(
             beam_width=beam,
             maximum_beam_width=maximum,
-            branch_topk=max(1, _env_int("V46_50_DYNAMIC_BRANCH_TOPK", 16)),
+            branch_topk=max(1, _env_int("EVENT_HEADING_DYNAMIC_BRANCH_TOPK", 16)),
             candidates_per_source=max(
-                1, _env_int("V46_50_DYNAMIC_MIN_PER_SOURCE", 2)
+                1, _env_int("EVENT_HEADING_DYNAMIC_MIN_PER_SOURCE", 2)
             ),
             primary_bonus=max(
-                0.0, _env_float("V46_54_PRIMARY_EVENT_BONUS", 0.18)
+                0.0, _env_float("ROUTING_SAFETY_PRIMARY_EVENT_BONUS", 0.18)
             ),
             posterior_weight=max(
-                0.0, _env_float("V46_50_POSTERIOR_WEIGHT", 0.35)
+                0.0, _env_float("EVENT_HEADING_POSTERIOR_WEIGHT", 0.35)
             ),
             uncertainty_weight=max(
-                0.0, _env_float("V46_50_UNCERTAINTY_WEIGHT", 0.20)
+                0.0, _env_float("EVENT_HEADING_UNCERTAINTY_WEIGHT", 0.20)
             ),
             source_calibration_weight=max(
-                0.0, _env_float("V46_50_SOURCE_CALIBRATION_WEIGHT", 0.15)
+                0.0, _env_float("EVENT_HEADING_SOURCE_CALIBRATION_WEIGHT", 0.15)
             ),
             minimum_observability=float(
                 np.clip(
-                    _env_float("V46_50_DYNAMIC_OBSERVABILITY_MIN", 0.0),
+                    _env_float("EVENT_HEADING_DYNAMIC_OBSERVABILITY_MIN", 0.0),
                     0.0,
                     1.0,
                 )
@@ -377,7 +377,7 @@ def observability_from_extra(
     *,
     safe_ratio: float,
 ) -> float:
-    grounding = extra.get("v46_53_grounding", {})
+    grounding = extra.get("event_geometry_grounding", {})
     value = grounding.get("observability") if isinstance(grounding, Mapping) else None
     if value is None:
         value = 0.5 + 0.5 * float(np.clip(safe_ratio, 0.0, 1.0))

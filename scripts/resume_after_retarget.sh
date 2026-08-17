@@ -13,9 +13,9 @@ if [[ "${EXPERIMENT_CONFIG_LOADED:-0}" != "1" ]]; then
   source configs/experiment.env
 fi
 : "${OUT_ROOT:?Set OUT_ROOT to an existing run directory with a valid retarget cache}"
-export V46_51_REBUILD_RETARGET_CACHE=0
-export V46_51_REBUILD_EVENT_DB=1
-export V46_51_RETRAIN_V44=1
-export V46_51_RETRAIN_V45=1
-export V46_51_RETRAIN_V46=1
+export GENERATION_REBUILD_RETARGET_CACHE=0
+export GENERATION_REBUILD_EVENT_DB=1
+export GENERATION_RETRAIN_CONTRASTIVE=1
+export GENERATION_RETRAIN_REFINER=1
+export GENERATION_RETRAIN_DIFFUSION=1
 exec bash scripts/run_experiment.sh "${1:-$TEST_AUDIO}"

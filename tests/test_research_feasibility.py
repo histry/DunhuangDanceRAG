@@ -46,7 +46,7 @@ class ResearchFeasibilityTest(unittest.TestCase):
         slot = {
             "event_id": "old_event",
             "event_index": 585,
-            "v26_event_uid": "evt_0123456789abcdef",
+            "whole_song_event_uid": "evt_0123456789abcdef",
             "target_frames": 90,
         }
         unaligned = sanitize_slot(slot, 30.0)
@@ -60,7 +60,7 @@ class ResearchFeasibilityTest(unittest.TestCase):
         aligned = sanitize_slot(slot, 30.0, aligned_event_db=True)
         self.assertTrue(aligned["scheduler_event_identity_authoritative"])
         self.assertEqual(aligned["event_uid"], "evt_0123456789abcdef")
-        self.assertEqual(aligned["v26_event_uid"], "evt_0123456789abcdef")
+        self.assertEqual(aligned["whole_song_event_uid"], "evt_0123456789abcdef")
         self.assertNotIn("event_id", aligned)
 
 

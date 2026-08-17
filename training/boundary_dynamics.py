@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V34 boundary dynamics for continuous Dunhuang transitions.
+"""Boundary Transition boundary dynamics for continuous Dunhuang transitions.
 
 This module provides four pieces used by both training and inference:
 
@@ -11,7 +11,7 @@ This module provides four pieces used by both training and inference:
 
 The septic path has eight degrees of freedom and can match pose, velocity,
 acceleration and (regularised) jerk at both ends.  Learned INR residuals are
-handled separately and use a C3-zero endpoint envelope in v32_contact_inr.py.
+handled separately and use a C3-zero endpoint envelope in contact_inr.py.
 """
 from __future__ import annotations
 
@@ -317,7 +317,7 @@ def septic_so3_root_base(
     length_frames: torch.Tensor,
     boundary_state: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return contact logits, root and local rotations for the V34 C3 base."""
+    """Return contact logits, root and local rotations for the Boundary Transition C3 base."""
     batch, count, _ = t.shape
     r0 = rotation_6d_to_matrix(
         start[..., ROT].reshape(batch, NUM_JOINTS, 6)
@@ -342,7 +342,7 @@ def septic_so3_root_base(
         relative, boundary_state["end_angular_jerk"].unsqueeze(-1)
     ).squeeze(-1)
 
-    jerk_shrink = float(os.getenv("V34_JERK_MATCH_SHRINK", "0.35"))
+    jerk_shrink = float(os.getenv("BOUNDARY_TRANSITION_JERK_MATCH_SHRINK", "0.35"))
     velocity0 = omega0 * length
     velocity1 = omega1 * length
     acceleration0 = alpha0 * length.square()
@@ -352,21 +352,21 @@ def septic_so3_root_base(
 
     path_norm = torch.linalg.norm(delta, dim=-1, keepdim=True)
     velocity_cap = torch.minimum(
-        path_norm + float(os.getenv("V34_VELOCITY_TANGENT_MARGIN", "0.30")),
-        torch.full_like(path_norm, float(os.getenv("V34_VELOCITY_TANGENT_CAP", "0.90"))),
+        path_norm + float(os.getenv("BOUNDARY_TRANSITION_VELOCITY_TANGENT_MARGIN", "0.30")),
+        torch.full_like(path_norm, float(os.getenv("BOUNDARY_TRANSITION_VELOCITY_TANGENT_CAP", "0.90"))),
     )
     velocity0 = _limit_norm(velocity0, velocity_cap)
     velocity1 = _limit_norm(velocity1, velocity_cap)
     acceleration0 = _limit_norm(
         acceleration0,
-        float(os.getenv("V34_ACCELERATION_TANGENT_CAP", "1.40")),
+        float(os.getenv("BOUNDARY_TRANSITION_ACCELERATION_TANGENT_CAP", "1.40")),
     )
     acceleration1 = _limit_norm(
         acceleration1,
-        float(os.getenv("V34_ACCELERATION_TANGENT_CAP", "1.40")),
+        float(os.getenv("BOUNDARY_TRANSITION_ACCELERATION_TANGENT_CAP", "1.40")),
     )
-    jerk0 = _limit_norm(jerk0, float(os.getenv("V34_JERK_TANGENT_CAP", "2.20")))
-    jerk1 = _limit_norm(jerk1, float(os.getenv("V34_JERK_TANGENT_CAP", "2.20")))
+    jerk0 = _limit_norm(jerk0, float(os.getenv("BOUNDARY_TRANSITION_JERK_TANGENT_CAP", "2.20")))
+    jerk1 = _limit_norm(jerk1, float(os.getenv("BOUNDARY_TRANSITION_JERK_TANGENT_CAP", "2.20")))
 
     coefficients = _septic_coefficients(
         delta, velocity0, velocity1,
@@ -420,7 +420,7 @@ def septic_so3_root_base(
     return contact_logits, root, rotations
 
 
-def make_v34_transition_np(
+def make_boundary_transition_np(
     previous: np.ndarray,
     following: np.ndarray,
     length: int,
@@ -478,8 +478,8 @@ def apply_exit_handshake_np(
             "reason": "insufficient_context",
         }
 
-    bridge = make_v34_transition_np(trans[-4:], original[h:], h)
-    mode = os.getenv("V34_HANDSHAKE_MODE", "replace").strip().lower()
+    bridge = make_boundary_transition_np(trans[-4:], original[h:], h)
+    mode = os.getenv("BOUNDARY_TRANSITION_HANDSHAKE_MODE", "replace").strip().lower()
     if mode == "replace":
         # A full bridge preserves the septic endpoint derivatives.  A tapered
         # blend is retained only as an explicit ablation because it can shift
@@ -495,7 +495,7 @@ def apply_exit_handshake_np(
         )
         weights[: min(3, h)] = float(np.clip(strength, 0.0, 1.0))
     else:
-        raise ValueError(f"Unknown V34_HANDSHAKE_MODE={mode!r}")
+        raise ValueError(f"Unknown BOUNDARY_TRANSITION_HANDSHAKE_MODE={mode!r}")
 
     with torch.no_grad():
         orig_m = _native_rotation_matrices_torch(
@@ -533,7 +533,7 @@ def apply_exit_handshake_np(
         (1.0 - root_weight) * original[:h, CONTACT]
         + root_weight * bridge[:, CONTACT]
     ).astype(np.float32)
-    if os.getenv("V34_HARD_CONTACT_OUTPUT", "0").lower() in {
+    if os.getenv("BOUNDARY_TRANSITION_HARD_CONTACT_OUTPUT", "0").lower() in {
         "1", "true", "yes", "on"
     }:
         result[:h, CONTACT] = (result[:h, CONTACT] >= 0.5).astype(np.float32)

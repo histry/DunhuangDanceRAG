@@ -26,16 +26,16 @@ clean project after a full successful run.
 ```bash
 cd /home/disk/lsm/storage/EDGE
 
-export V46_51_REBUILD_RETARGET_CACHE=1
-export V46_51_REBUILD_EVENT_DB=1
-export V46_51_RETRAIN_V44=1
-export V46_51_RETRAIN_V45=1
-export V46_51_RETRAIN_V46=1
+export GENERATION_REBUILD_RETARGET_CACHE=1
+export GENERATION_REBUILD_EVENT_DB=1
+export GENERATION_RETRAIN_CONTRASTIVE=1
+export GENERATION_RETRAIN_REFINER=1
+export GENERATION_RETRAIN_DIFFUSION=1
 
 export PERFORMER_GROUP=auto
 export PERFORMER_ALLOW_CROSS_GROUP_RESCUE=0
 
-bash scripts/run_v46_53_1_research.sh \
+bash scripts/run_experiment.sh \
   "$PWD/test_music_bank/dunhuangwu2.wav"
 ```
 

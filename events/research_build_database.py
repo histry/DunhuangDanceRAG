@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build the current V46.53 Event-DB, then attach performer metadata."""
+"""Build the current Geometry-Aware Routing Event-DB, then attach performer metadata."""
 from __future__ import annotations
 
 import sys

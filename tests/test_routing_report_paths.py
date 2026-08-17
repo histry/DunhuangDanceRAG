@@ -13,7 +13,7 @@ class RoutingReportPathTests(unittest.TestCase):
     def _module():
         try:
             import torch  # noqa: F401
-            import routing.heading_closed_loop_impl2 as implementation
+            import routing.anatomy_heading_closed_loop as implementation
         except Exception as exc:
             raise unittest.SkipTest(f"routing runtime dependencies unavailable: {exc}")
         return implementation
@@ -70,7 +70,7 @@ class RoutingReportPathTests(unittest.TestCase):
             config.write_text(json.dumps({"fps": 60.0}), encoding="utf-8")
             with patch.dict(
                 os.environ,
-                {"V46_51_FPS": "60", "V46_FPS": "60"},
+                {"GENERATION_FPS": "60", "MOTION_FPS": "60"},
                 clear=False,
             ):
                 self.assertEqual(
@@ -85,10 +85,10 @@ class RoutingReportPathTests(unittest.TestCase):
             config.write_text(json.dumps({"fps": 60.0}), encoding="utf-8")
             with patch.dict(
                 os.environ,
-                {"V46_51_FPS": "30"},
+                {"GENERATION_FPS": "30"},
                 clear=False,
             ):
-                os.environ.pop("V46_FPS", None)
+                os.environ.pop("MOTION_FPS", None)
                 with self.assertRaisesRegex(RuntimeError, "Conflicting"):
                     implementation._runtime_fps(["--config", str(config)])
 

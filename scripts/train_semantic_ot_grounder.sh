@@ -10,10 +10,10 @@ export EXPERIMENT_PROFILE=semantic_ot
 # shellcheck disable=SC1091
 source configs/experiment.env
 
-PY="${PY:-${V46_51_PYTHON:-python}}"
+PY="${PY:-${GENERATION_PYTHON:-python}}"
 OUT_ROOT="${OUT_ROOT:?OUT_ROOT must identify the current audited run}"
 DB_SPLIT_ROOT="${DB_SPLIT_ROOT:?DB_SPLIT_ROOT must contain train/val/test events.npz}"
-MUSIC_ENCODER_PRIOR_CKPT="${MUSIC_ENCODER_PRIOR_CKPT:-${V46_54_MUSIC_ENCODER_PRIOR_CKPT:-${V46_51_ROUTER_CKPT:-}}}"
+MUSIC_ENCODER_PRIOR_CKPT="${MUSIC_ENCODER_PRIOR_CKPT:-${ROUTING_SAFETY_MUSIC_ENCODER_PRIOR_CKPT:-${GENERATION_ROUTER_CKPT:-}}}"
 if [[ "$PY" == */* ]]; then
   [[ -x "$PY" ]] || { echo "[FATAL] Python is not executable: $PY" >&2; exit 2; }
 else
@@ -111,7 +111,7 @@ for split in train validation test; do
     --max_phrase_seconds "$SEMANTIC_OT_MAX_PHRASE_SECONDS" \
     --boundary_quantile "$SEMANTIC_OT_BOUNDARY_QUANTILE" \
     --beat_snap_seconds "$SEMANTIC_OT_BEAT_SNAP_SECONDS" \
-    --fps "$V46_51_FPS"
+    --fps "$GENERATION_FPS"
 done
 
 # 5. Build OT only after both music and motion splits. Validation maps to val DB.
@@ -126,7 +126,7 @@ for music_split in train validation test; do
     --cache_dir "$CACHE_ROOT/clap" \
     --temporal_frames 64 \
     --temporal_source_frames 2048 \
-    --phrase_fps "$V46_51_FPS" \
+    --phrase_fps "$GENERATION_FPS" \
     --top_k "$SEMANTIC_OT_TOP_K" \
     --preselect_k "$SEMANTIC_OT_PRESELECT_K" \
     --preselect_per_source "$SEMANTIC_OT_PRESELECT_PER_SOURCE" \
@@ -161,7 +161,7 @@ if [[ "$SEMANTIC_OT_CALIBRATE_RISK" == "1" ]]; then
   "$PY" evaluation/calibrate_transition_risk.py \
     --db "$AESD_ROOT/val/events_aesd.npz" \
     --out "$SEM_ROOT/transition_risk_calibration.json" \
-    --fps "$V46_51_FPS"
+    --fps "$GENERATION_FPS"
   read -r RISK_LOW RISK_HIGH < <(
     "$PY" - "$SEM_ROOT/transition_risk_calibration.json" <<'PY'
 import json
@@ -187,9 +187,9 @@ cat > "$SEM_ROOT/activate_semantic_ot.env" <<ENV
 export SEMANTIC_OT_ENABLE=1
 export SEMANTIC_OT_GENERATION_DB="$EMBED_ROOT/train/events.npz"
 export SEMANTIC_OT_GROUNDER_CKPT="$GROUNDER_CKPT"
-export V46_53_GROUNDER_ARCHITECTURE=mixed
-export V46_53_GROUNDER_CKPT="$GROUNDER_CKPT"
-export V46_53_MIXED_REQUIRE_RUNTIME_AUDIO=1
+export GROUNDING_GROUNDER_ARCHITECTURE=mixed
+export GROUNDING_GROUNDER_CKPT="$GROUNDER_CKPT"
+export GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO=1
 export SEMANTIC_OT_REPAIR_LOW="$RISK_LOW"
 export SEMANTIC_OT_REPAIR_HIGH="$RISK_HIGH"
 export SEMANTIC_OT_RISK_CALIBRATION="$SEM_ROOT/transition_risk_calibration.json"

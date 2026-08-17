@@ -65,7 +65,7 @@ def audit_dynamic_duration(
     )
 
     return {
-        "schema": "v46_53_audio_derived_dynamic_duration_contract",
+        "schema": "event_geometry_audio_derived_dynamic_duration_contract",
         "policy": "fresh_wav_audio_duration_determines_output_frames",
         "fixed_duration_seconds": None,
         "audio": contract.get("audio"),

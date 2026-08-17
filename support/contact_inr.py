@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""EDGE V32: continuous C3-safe SO(3) INR with differentiable contacts.
+"""EDGE Contact Transition: continuous C3-safe SO(3) INR with differentiable contacts.
 
-The historical V30 idea (latent diffusion over a continuous motion INR) is kept,
-but the high-frequency SIREN decoder is removed. V32 uses:
+The historical Latent Transition Prototype idea (latent diffusion over a continuous motion INR) is kept,
+but the high-frequency SIREN decoder is removed. Contact Transition uses:
   * a regularised septic SO(3) base matching pose/velocity/acceleration/jerk;
   * low-band Fourier coordinates and SiLU residual blocks;
   * a C3-zero envelope 256*t^4*(1-t)^4 for every learned residual;
@@ -32,7 +32,7 @@ from motion_geometry.rotations import (
 )
 
 from training.boundary_dynamics import (
-    make_v34_transition_np,
+    make_boundary_transition_np,
     septic_so3_root_base,
 )
 
@@ -58,7 +58,7 @@ axis_angle_to_matrix = so3_exp_torch
 
 
 @dataclass
-class V32INRConfig:
+class ContactINRConfig:
     motion_dim: int = MOTION_DIM
     music_dim: int = 12
     latent_dim: int = 128
@@ -90,12 +90,12 @@ def _project_native_motion_torch(motion: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def config_from_dict(values: Dict[str, object]) -> V32INRConfig:
-    allowed = set(V32INRConfig.__dataclass_fields__)
-    return V32INRConfig(**{k: values[k] for k in values if k in allowed})
+def config_from_dict(values: Dict[str, object]) -> ContactINRConfig:
+    allowed = set(ContactINRConfig.__dataclass_fields__)
+    return ContactINRConfig(**{k: values[k] for k in values if k in allowed})
 
 
-def config_to_dict(config: V32INRConfig) -> Dict[str, object]:
+def config_to_dict(config: ContactINRConfig) -> Dict[str, object]:
     return asdict(config)
 
 
@@ -127,7 +127,7 @@ def c3_zero_envelope(t: torch.Tensor) -> torch.Tensor:
 
 
 def c2_zero_envelope(t: torch.Tensor) -> torch.Tensor:
-    """Backward-compatible alias; V34 now preserves the septic C3 boundary."""
+    """Backward-compatible alias; Boundary Transition now preserves the septic C3 boundary."""
     return c3_zero_envelope(t)
 
 
@@ -233,7 +233,7 @@ def continuous_time_features(t: torch.Tensor, bands: int) -> torch.Tensor:
     """Band-limited continuous coordinates.
 
     Default bands=5 gives frequencies 1,2,4,8,16 instead of the unstable
-    1..512 spectrum used by the first V30 implementation.
+    1..512 spectrum used by the first Latent Transition Prototype implementation.
     """
     if t.shape[-1] != 1:
         t = t[..., :1]
@@ -247,7 +247,7 @@ def continuous_time_features(t: torch.Tensor, bands: int) -> torch.Tensor:
 
 
 class ConditionEncoder(torch.nn.Module):
-    def __init__(self, config: V32INRConfig) -> None:
+    def __init__(self, config: ContactINRConfig) -> None:
         super().__init__()
         self.music_dim = int(config.music_dim)
         input_dim = 4 * config.motion_dim + self.music_dim + 1
@@ -299,11 +299,11 @@ class MaskedTemporalBlock(torch.nn.Module):
 class TransitionINREncoder(torch.nn.Module):
     """Deterministic transition encoder.
 
-    V32 intentionally removes posterior sampling and KL to avoid the V30
+    Contact Transition intentionally removes posterior sampling and KL to avoid the Latent Transition Prototype
     train/inference latent mismatch. Latent variance/covariance regularisation
     is applied by the training script.
     """
-    def __init__(self, config: V32INRConfig) -> None:
+    def __init__(self, config: ContactINRConfig) -> None:
         super().__init__()
         self.input = torch.nn.Conv1d(
             config.motion_dim + 2, config.encoder_hidden, 1
@@ -363,7 +363,7 @@ class INRResidualBlock(torch.nn.Module):
 
 
 class ContinuousContactINR(torch.nn.Module):
-    def __init__(self, config: V32INRConfig) -> None:
+    def __init__(self, config: ContactINRConfig) -> None:
         super().__init__()
         self.config = config
         time_dim = 3 + 2 * config.fourier_bands
@@ -465,7 +465,7 @@ class LatentResidualBlock(torch.nn.Module):
 
 
 class LatentDiffusionDenoiser(torch.nn.Module):
-    def __init__(self, config: V32INRConfig) -> None:
+    def __init__(self, config: ContactINRConfig) -> None:
         super().__init__()
         self.time = torch.nn.Sequential(
             SinusoidalEmbedding(96),
@@ -505,8 +505,8 @@ class LatentDiffusionDenoiser(torch.nn.Module):
         return self.output(x)
 
 
-class V32ContactINRSystem(torch.nn.Module):
-    def __init__(self, config: V32INRConfig) -> None:
+class ContactINRSystem(torch.nn.Module):
+    def __init__(self, config: ContactINRConfig) -> None:
         super().__init__()
         self.config = config
         self.condition_encoder = ConditionEncoder(config)
@@ -618,8 +618,8 @@ def make_c2_transition_np(
     following: np.ndarray,
     length: int,
 ) -> np.ndarray:
-    """Compatibility name for the V34 regularised septic boundary path."""
-    return make_v34_transition_np(previous, following, length)
+    """Compatibility name for the Boundary Transition regularised septic boundary path."""
+    return make_boundary_transition_np(previous, following, length)
 
 
 def linear_beta_schedule(

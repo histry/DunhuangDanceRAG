@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.53.1 research retargeter for Chang-E BVH -> EDGE151.
+"""Retarget Clean research retargeter for Chang-E BVH -> EDGE151.
 
 Key corrections:
 - soft root-orientation anchoring instead of a complete root lock;
@@ -104,8 +104,8 @@ def _fit_chunk_research(
     floor = torch.tensor(float(floor_y), dtype=torch.float32, device=device)
     anatomy_w = AnatomyLossWeights.from_env()
 
-    iters = env_int("V46_53_1_RETARGET_ITERS", env_int("V46_52_RETARGET_ITERS", 280))
-    lr = env_float("V46_53_1_RETARGET_LR", env_float("V46_52_RETARGET_LR", 0.018))
+    iters = env_int("RETARGET_CLEAN_ITERATIONS", env_int("RETARGET_ITERS", 280))
+    lr = env_float("RETARGET_CLEAN_LEARNING_RATE", env_float("RETARGET_LR", 0.018))
     optimizer = torch.optim.AdamW([root, rot], lr=lr, weight_decay=0.0)
 
     # Preserve the source body structure rather than imposing a universal upright pose.
@@ -154,7 +154,7 @@ def _fit_chunk_research(
 
         root_delta = _relative_rotvec_torch(init_mats[:, 0], local_mats[:, 0])
         root_axis_w = torch.as_tensor(
-            [1.0, env_float("V46_53_1_ROOT_YAW_ANCHOR_MULT", 4.0), 1.0],
+            [1.0, env_float("RETARGET_CLEAN_ROOT_YAW_ANCHOR_MULT", 4.0), 1.0],
             dtype=root_delta.dtype,
             device=root_delta.device,
         )
@@ -165,12 +165,12 @@ def _fit_chunk_research(
         head = joints[:, 15]
         feet = joints[:, list(FOOT_JOINTS)]
         torso_cos = F.normalize(head - pelvis, dim=-1, eps=1e-8)[:, 1]
-        source_margin = env_float("V46_53_1_UPRIGHT_SOURCE_MARGIN", 0.10)
+        source_margin = env_float("RETARGET_CLEAN_UPRIGHT_SOURCE_MARGIN", 0.10)
         target_floor = (target_torso_cos - source_margin).clamp_min(0.10)
         upright = F.relu(target_floor - torso_cos).square().mean()
 
-        head_floor = (target_head_margin - env_float("V46_53_1_HEAD_SOURCE_MARGIN_M", 0.06)).clamp_min(0.06)
-        feet_floor = (target_feet_margin - env_float("V46_53_1_FEET_SOURCE_MARGIN_M", 0.08)).clamp_min(0.12)
+        head_floor = (target_head_margin - env_float("RETARGET_CLEAN_HEAD_SOURCE_MARGIN_M", 0.06)).clamp_min(0.06)
+        feet_floor = (target_feet_margin - env_float("RETARGET_CLEAN_FEET_SOURCE_MARGIN_M", 0.08)).clamp_min(0.12)
         head_order = F.relu(head_floor - (head[:, 1] - pelvis[:, 1])).square().mean()
         feet_order = F.relu(feet_floor - (pelvis[:, 1] - feet[..., 1].mean(dim=1))).square().mean()
         penetration = F.relu(floor + 0.003 - feet[..., 1]).square().mean()
@@ -184,26 +184,26 @@ def _fit_chunk_research(
         key_scale = 1.0 + 0.20 * math.exp(-3.0 * progress)
 
         loss = (
-            key_scale * env_float("V46_52_KEYPOINT_W", 24.0) * key
-            + env_float("V46_52_ROOT_W", 8.0) * root_loss
-            + env_float("V46_52_ROOT_VEL_W", 1.8) * root_vel
-            + env_float("V46_53_1_SO3_VEL_W", 0.025) * rot_vel
-            + env_float("V46_53_1_SO3_ACC_W", 0.00008) * rot_acc
-            + prior_scale * env_float("V46_52_POSE_PRIOR_W", 0.08) * pose_prior
-            + env_float("V46_53_1_ROOT_ANCHOR_W", 0.35) * root_anchor
-            + env_float("V46_52_UPRIGHT_W", 4.0) * upright
-            + env_float("V46_52_HEAD_ORDER_W", 2.0) * head_order
-            + env_float("V46_52_FEET_ORDER_W", 1.5) * feet_order
-            + env_float("V46_52_FLOOR_W", 8.0) * penetration
+            key_scale * env_float("RETARGET_KEYPOINT_W", 24.0) * key
+            + env_float("RETARGET_ROOT_W", 8.0) * root_loss
+            + env_float("RETARGET_ROOT_VEL_W", 1.8) * root_vel
+            + env_float("RETARGET_CLEAN_SO3_VEL_W", 0.025) * rot_vel
+            + env_float("RETARGET_CLEAN_SO3_ACC_W", 0.00008) * rot_acc
+            + prior_scale * env_float("RETARGET_POSE_PRIOR_W", 0.08) * pose_prior
+            + env_float("RETARGET_CLEAN_ROOT_ANCHOR_W", 0.35) * root_anchor
+            + env_float("RETARGET_UPRIGHT_W", 4.0) * upright
+            + env_float("RETARGET_HEAD_ORDER_W", 2.0) * head_order
+            + env_float("RETARGET_FEET_ORDER_W", 1.5) * feet_order
+            + env_float("RETARGET_FLOOR_W", 8.0) * penetration
             + anatomy_scale * anatomy["total"]
         )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([root, rot], env_float("V46_52_RETARGET_GRAD_CLIP", 1.5))
+        torch.nn.utils.clip_grad_norm_([root, rot], env_float("RETARGET_GRAD_CLIP", 1.5))
         optimizer.step()
 
-        every = max(1, env_int("V46_52_RETARGET_PROGRESS_EVERY", 25))
+        every = max(1, env_int("RETARGET_PROGRESS_EVERY", 25))
         if step == 0 or step == iters - 1 or (step + 1) % every == 0:
             last = {
                 "loss": float(loss.detach().cpu()),
@@ -222,9 +222,9 @@ def _fit_chunk_research(
                 "iterations": int(iters),
                 "learning_rate": float(lr),
             }
-            if env_bool("V46_52_RETARGET_PROGRESS", True):
+            if env_bool("RETARGET_PROGRESS", True):
                 print(
-                    "[V46.53.1 FIT] "
+                    "[Retarget Clean FIT] "
                     f"device={device} frames={len(root)} step={step + 1}/{iters} "
                     f"loss={last['loss']:.6f} key={last['key']:.6f} "
                     f"so3v={last['so3_velocity']:.6f} anatomy={last['anatomy_total']:.6f} "
@@ -364,7 +364,7 @@ def _fit_target_motion_research(
         "fit_rmse_mean_m": float(fit_arr.mean()) if fit_arr.size else 0.0,
         "fit_rmse_p95_m": float(np.percentile(fit_arr, 95)) if fit_arr.size else 0.0,
         "root_orientation_contract": {
-            "version": "v46_53_1_soft_source_body_frame_contract",
+            "version": "retarget_clean_soft_source_body_frame_contract",
             "mode": "soft_geodesic_anchor",
             "root_translation": "optimized",
             "root_orientation": "optimized_with_source_body_frame_prior",
@@ -377,9 +377,9 @@ def _fit_target_motion_research(
 
 def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
     cfg = copy.deepcopy(cfg or legacy.RetargetConfig.from_env())
-    cfg.iterations = env_int("V46_53_1_RETARGET_ITERS", env_int("V46_52_RETARGET_ITERS", 280))
-    cfg.learning_rate = env_float("V46_53_1_RETARGET_LR", env_float("V46_52_RETARGET_LR", 0.018))
-    cfg.fit_rmse_p95_max_m = env_float("V46_52_FIT_RMSE_P95_MAX_M", 0.14)
+    cfg.iterations = env_int("RETARGET_CLEAN_ITERATIONS", env_int("RETARGET_ITERS", 280))
+    cfg.learning_rate = env_float("RETARGET_CLEAN_LEARNING_RATE", env_float("RETARGET_LR", 0.018))
+    cfg.fit_rmse_p95_max_m = env_float("RETARGET_FIT_RMSE_P95_MAX_M", 0.14)
     cfg.root_orientation_lock = False
     cfg.hard_gravity_gate = False
 
@@ -400,16 +400,16 @@ def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[
     from contracts.gravity import gravity_metrics_np
     gravity = gravity_metrics_np(motion, float(cfg.target_fps))
     gravity_th = GravityThresholds(
-        torso_up_cos_p05_min=env_float("V46_52_SOURCE_GRAVITY_TORSO_P05_MIN", 0.30),
-        torso_up_cos_median_min=env_float("V46_52_SOURCE_GRAVITY_TORSO_MEDIAN_MIN", 0.55),
-        head_above_pelvis_ratio_min=env_float("V46_52_SOURCE_HEAD_ABOVE_RATIO_MIN", 0.85),
-        feet_below_pelvis_ratio_min=env_float("V46_52_SOURCE_FEET_BELOW_RATIO_MIN", 0.85),
-        horizontal_body_ratio_max=env_float("V46_52_SOURCE_HORIZONTAL_BODY_RATIO_MAX", 0.20),
+        torso_up_cos_p05_min=env_float("RETARGET_SOURCE_GRAVITY_TORSO_P05_MIN", 0.30),
+        torso_up_cos_median_min=env_float("RETARGET_SOURCE_GRAVITY_TORSO_MEDIAN_MIN", 0.55),
+        head_above_pelvis_ratio_min=env_float("RETARGET_SOURCE_HEAD_ABOVE_RATIO_MIN", 0.85),
+        feet_below_pelvis_ratio_min=env_float("RETARGET_SOURCE_FEET_BELOW_RATIO_MIN", 0.85),
+        horizontal_body_ratio_max=env_float("RETARGET_SOURCE_HORIZONTAL_BODY_RATIO_MAX", 0.20),
     )
     gravity_ok, gravity_reasons = evaluate_gravity_contract(gravity, gravity_th)
 
     fit_p95 = float(legacy_report.get("fit", {}).get("fit_rmse_p95_m", 1e9))
-    fit_limit = env_float("V46_52_FIT_RMSE_P95_MAX_M", 0.14)
+    fit_limit = env_float("RETARGET_FIT_RMSE_P95_MAX_M", 0.14)
     fit_ok = np.isfinite(fit_p95) and fit_p95 <= fit_limit
 
     reasons = []
@@ -421,8 +421,8 @@ def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[
     report = dict(legacy_report)
     report.update(
         {
-            "version": "v46_52_anatomy_constrained_bvh_retarget_v46_53_1",
-            "schema": "v46_53_1_source_safety_retarget",
+            "version": "anatomy_heading_anatomy_constrained_bvh_retarget_event_geometry_1",
+            "schema": "retarget_clean_source_safety_retarget",
             "source": str(path),
             "anatomy": anatomy,
             "anatomy_thresholds": source_th.to_dict(),
@@ -440,9 +440,9 @@ def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[
         }
     )
 
-    if env_bool("V46_52_HARD_RETARGET_GATE", True) and not report["ok"]:
+    if env_bool("RETARGET_HARD_RETARGET_GATE", True) and not report["ok"]:
         raise RuntimeError(
-            f"V46.53.1 source safety contract failed for {path}: " + " | ".join(reasons)
+            f"Retarget Clean source safety contract failed for {path}: " + " | ".join(reasons)
         )
     return motion.astype(np.float32), report
 
@@ -462,7 +462,7 @@ def main() -> int:
     if args.device:
         cfg.device = args.device
     if args.allow_failed_contract:
-        os.environ["V46_52_HARD_RETARGET_GATE"] = "0"
+        os.environ["RETARGET_HARD_RETARGET_GATE"] = "0"
 
     motion, report = retarget_bvh_research(args.input, cfg)
     out = Path(args.output)

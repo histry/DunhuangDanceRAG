@@ -7,9 +7,9 @@ set -euo pipefail
 : "${SMOKE_AUDIO:?Set SMOKE_AUDIO}"
 : "${FROZEN_MIXED_SCHEDULE:?Set FROZEN_MIXED_SCHEDULE}"
 : "${SEM_DB:?Set SEM_DB}"
-: "${V44_CKPT:?Set V44_CKPT}"
-: "${V45_CKPT:?Set V45_CKPT}"
-: "${V46_CKPT:?Set V46_CKPT}"
+: "${CONTRASTIVE_CKPT:?Set CONTRASTIVE_CKPT}"
+: "${REFINER_CKPT:?Set REFINER_CKPT}"
+: "${MOTION_CKPT:?Set MOTION_CKPT}"
 : "${BR_HPR_OUT_ROOT:?Set BR_HPR_OUT_ROOT}"
 
 export EXPERIMENT_PROFILE=br_hpr
@@ -31,7 +31,7 @@ git -C "$ROOT" diff > "$BR_HPR_OUT_ROOT/source_worktree.diff"
     | tar --null -T - -czf "$BR_HPR_OUT_ROOT/source_untracked_files.tar.gz" \
       2>/dev/null || true
 )
-env | grep -E '^(BR_HPR_|V46_|OMP_NUM_THREADS|MKL_NUM_THREADS|OPENBLAS_NUM_THREADS|NUMEXPR_NUM_THREADS)' \
+env | grep -E '^(BR_HPR_|MOTION_|OMP_NUM_THREADS|MKL_NUM_THREADS|OPENBLAS_NUM_THREADS|NUMEXPR_NUM_THREADS)' \
   | sort > "$BR_HPR_OUT_ROOT/runtime_environment.txt"
 
 set -o pipefail
@@ -44,9 +44,9 @@ timeout --signal=INT --kill-after=60s "${BR_HPR_TIMEOUT:-90m}" \
     --audio "$SMOKE_AUDIO" \
     --slots_json "$FROZEN_MIXED_SCHEDULE" \
     --db "$SEM_DB" \
-    --contrastive "$V44_CKPT" \
-    --refiner "$V45_CKPT" \
-    --diffusion "$V46_CKPT" \
+    --contrastive "$CONTRASTIVE_CKPT" \
+    --refiner "$REFINER_CKPT" \
+    --diffusion "$MOTION_CKPT" \
     --out "$MOTION" \
     --json "$REPORT" \
   2>&1 | tee "$LOG"

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V29 motion geometry utilities for EDGE 151D motions.
+"""Motion Geometry motion geometry utilities for EDGE 151D motions.
 
 Representation:
     [0:4]   foot contacts
     [4:7]   root xyz
     [7:151] 24 local joint rotations in continuous 6D representation
 
-This module centralizes all geometry-sensitive operations used by the V29
+This module centralizes all geometry-sensitive operations used by the Motion Geometry
 research pipeline.  In particular, rotations are never interpolated directly
 in raw 6D coordinates.  They are converted to SO(3), interpolated or filtered
 there, and projected back to valid 6D rotations.

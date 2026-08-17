@@ -32,7 +32,7 @@ from contracts.gravity import (
 )
 from contracts.physical_quality import build_peak_jerk_risk_mask
 
-SCHEMA = "v46_53_bidirectional_tangent_boundary_v2_physical_time"
+SCHEMA = "event_geometry_bidirectional_tangent_boundary_v2_physical_time"
 BODY_PARTS: Dict[str, Tuple[int, ...]] = {
     "root_torso": (0, 3, 6, 9, 12, 15),
     "left_arm": (13, 16, 18, 20, 22),
@@ -116,7 +116,7 @@ def transition_multiscale_risk(
     p = _motion(previous)
     f = _motion(following)
     b = _motion(bridge) if np.asarray(bridge).size else np.zeros((0, EDGE_DIM), np.float32)
-    frames = _frames_at_rate(_env_int("V46_53_TANGENT_WINDOW", 8), fps, 3)
+    frames = _frames_at_rate(_env_int("GROUNDING_TANGENT_WINDOW", 8), fps, 3)
     pt, pw, pa = _window_features(p, True, frames, fps)
     ft, fw, fa = _window_features(f, False, frames, fps)
 
@@ -140,10 +140,10 @@ def transition_multiscale_risk(
         wg = float(np.percentile(omega_gap[ids_a], 95))
         ag = float(np.percentile(alpha_gap[ids_a], 95))
         score = (
-            _env_float("V46_53_PART_POSE_W", 0.85) * pg
-            + _env_float("V46_53_PART_OMEGA_W", 0.10) * wg
-            + _env_float("V46_53_PART_ALPHA_W", 0.004) * ag
-            + _env_float("V46_53_PART_BURES_W", 0.12) * bw
+            _env_float("GROUNDING_PART_POSE_W", 0.85) * pg
+            + _env_float("GROUNDING_PART_OMEGA_W", 0.10) * wg
+            + _env_float("GROUNDING_PART_ALPHA_W", 0.004) * ag
+            + _env_float("GROUNDING_PART_BURES_W", 0.12) * bw
         )
         part_scores.append(score)
         part_detail[name] = {
@@ -173,15 +173,15 @@ def transition_multiscale_risk(
     bidirectional = float(np.mean(reversal))
     score = (
         float(np.mean(part_scores))
-        + _env_float("V46_53_ROOT_VEL_W", 0.35) * root_velocity_gap
-        + _env_float("V46_53_ROOT_Y_W", 2.2) * root_y_gap
-        + _env_float("V46_53_CONTACT_W", 0.55) * contact_gap
-        + _env_float("V46_53_BIDIRECTIONAL_W", 0.08) * bidirectional
+        + _env_float("GROUNDING_ROOT_VEL_W", 0.35) * root_velocity_gap
+        + _env_float("GROUNDING_ROOT_Y_W", 2.2) * root_y_gap
+        + _env_float("GROUNDING_CONTACT_W", 0.55) * contact_gap
+        + _env_float("GROUNDING_BIDIRECTIONAL_W", 0.08) * bidirectional
     )
     hard = bool(
-        float(np.max(pose_gap)) > _env_float("V46_53_POSE_GAP_HARD_RAD", 2.75)
-        or float(np.percentile(omega_gap, 95)) > _env_float("V46_53_OMEGA_GAP_HARD", 12.0)
-        or root_y_gap > _env_float("V46_53_ROOT_Y_GAP_HARD_M", 0.34)
+        float(np.max(pose_gap)) > _env_float("GROUNDING_POSE_GAP_HARD_RAD", 2.75)
+        or float(np.percentile(omega_gap, 95)) > _env_float("GROUNDING_OMEGA_GAP_HARD", 12.0)
+        or root_y_gap > _env_float("GROUNDING_ROOT_Y_GAP_HARD_M", 0.34)
     )
     return {
         "schema": SCHEMA,
@@ -229,7 +229,7 @@ def build_frame_joint_risk_mask(
         seam_f = seam > 0.01
     else:
         seam_f = seam.reshape(t, -1).max(axis=1) > 0.01
-    dilation = _frames_at_rate(_env_int("V46_53_MASK_DILATE", 3), fps, 0)
+    dilation = _frames_at_rate(_env_int("GROUNDING_MASK_DILATE", 3), fps, 0)
     seam_f = _dilate(seam_f, dilation)
 
     r = rot6d_to_matrix_np(
@@ -257,7 +257,7 @@ def build_frame_joint_risk_mask(
         * np.clip(robust_z(angular_acceleration) / 5.0, 0.0, 1.0)
     )
     risk *= seam_f[:, None].astype(np.float32)
-    minimum = _env_float("V46_53_MASK_MIN_ON_SEAM", 0.18)
+    minimum = _env_float("GROUNDING_MASK_MIN_ON_SEAM", 0.18)
     risk[seam_f] = np.maximum(risk[seam_f], minimum)
 
     peak = build_peak_jerk_risk_mask(x, fps=float(fps))
@@ -273,7 +273,7 @@ def build_frame_joint_risk_mask(
         part = np.max(risk[:, ids_a], axis=1, keepdims=True)
         risk[:, ids_a] = np.maximum(
             risk[:, ids_a],
-            part * _env_float("V46_53_PART_PROPAGATION", 0.65),
+            part * _env_float("GROUNDING_PART_PROPAGATION", 0.65),
         )
 
     root_v = np.zeros((t, 3), np.float32)
@@ -286,7 +286,7 @@ def build_frame_joint_risk_mask(
         root_a[2:] = np.diff(root_v[1:], axis=0) * float(fps)
     root_score = np.clip(
         np.linalg.norm(root_a, axis=-1)
-        / _env_float("V46_53_ROOT_ACC_MASK_SCALE", 8.0),
+        / _env_float("GROUNDING_ROOT_ACC_MASK_SCALE", 8.0),
         0.0,
         1.0,
     )

@@ -45,13 +45,13 @@ class EventGeometryTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "FPS mismatch"):
                 augment_database(db, fps=60.0)
             with np.load(db, allow_pickle=True) as obj:
-                self.assertIn("v46_53_geometry_desc_z", obj.files)
-                self.assertIn("v46_53_shared_embedding", obj.files)
-                self.assertIn("v46_55_entry_rotation_matrix", obj.files)
-                self.assertIn("v46_55_exit_rotation_matrix", obj.files)
-                self.assertEqual(obj["v46_53_geometry_desc_z"].shape[0], 4)
+                self.assertIn("event_geometry_geometry_desc_z", obj.files)
+                self.assertIn("event_geometry_shared_embedding", obj.files)
+                self.assertIn("graph_route_entry_rotation_matrix", obj.files)
+                self.assertIn("graph_route_exit_rotation_matrix", obj.files)
+                self.assertEqual(obj["event_geometry_geometry_desc_z"].shape[0], 4)
                 self.assertEqual(
-                    obj["v46_55_entry_rotation_matrix"].shape,
+                    obj["graph_route_entry_rotation_matrix"].shape,
                     (4, 24, 3, 3),
                 )
             self.assertTrue(rep["ok"])

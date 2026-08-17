@@ -56,7 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--out_dir", str(schedule_dir),
         "--router_ckpt", args.router_ckpt,
         "--planner_ckpt", args.planner_ckpt,
-        "--v23_ckpt", args.duration_ckpt,
+        "--duration_model_ckpt", args.duration_ckpt,
         "--fps", str(args.fps),
         "--deep_music_features", "0",
         "--require_deep_music", "0",
@@ -76,25 +76,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     subprocess.run(command, cwd=str(ROOT), env=env, check=True)
 
-    report_path = schedule_dir / f"{Path(args.audio).stem}_v26.schedule_report.json"
-    motion_path = schedule_dir / f"{Path(args.audio).stem}_v26.npy"
+    report_path = schedule_dir / f"{Path(args.audio).stem}.whole_song.schedule_report.json"
+    motion_path = schedule_dir / f"{Path(args.audio).stem}.whole_song.npy"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     schedule = report["schedule"]
     motion = np.load(motion_path, allow_pickle=True)
     if motion.ndim == 3:
         motion = motion[0]
 
-    import training.motion_models as v46
+    import training.motion_models as motion_runtime
 
-    cfg = v46.V46Config.from_json(args.config).apply_env()
+    cfg = motion_runtime.MotionGenerationConfig.from_json(args.config).apply_env()
     if abs(float(cfg.fps) - float(args.fps)) > 1.0e-6:
         raise RuntimeError(
             f"Motion config FPS mismatch: config={cfg.fps}, requested={args.fps}"
         )
     if not args.skip_ik:
-        motion, ik_report = v46.true_lower_body_ik(motion.astype(np.float32), cfg)
+        motion, ik_report = motion_runtime.true_lower_body_ik(motion.astype(np.float32), cfg)
     else:
-        contacts, confidence, floor, _ = v46.derive_contacts_np(motion, cfg)
+        contacts, confidence, floor, _ = motion_runtime.derive_contacts_np(motion, cfg)
         motion = motion.copy().astype(np.float32)
         motion[:, :4] = contacts.astype(np.float32)
         ik_report = {
@@ -105,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
     action_path = out_dir / "same_wav_no_training_action.npy"
     np.save(action_path, motion.astype(np.float32))
-    audit = v46.audit_motion_np(motion, cfg)
+    audit = motion_runtime.audit_motion_np(motion, cfg)
     physical = physical_quality_gate(audit)
 
     event_uids = [str(row.get("event_uid", row.get("event_id"))) for row in schedule]

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build a V46.50 heading-aware Event-RAG database from V46.49.4 caches.
+"""Build a Event-Heading heading-aware Event-RAG database from Source-Motion caches.
 
 Input must be retargeted EDGE151D NPY, not raw BVH.  This guarantees that
 bind-pose, gravity, absolute source heading and root-orientation contracts were
 resolved before event extraction.
 
-The output preserves the existing V46/V44/V45/V46 32D schema and appends
+The output preserves the existing Motion Generation/Contrastive Retriever/Motion Refiner and Motion Diffusion 32D schema and appends
 heading metadata arrays.  Existing AESD enrichment remains compatible because
 events/build_semantics.py copies all input NPZ arrays.
 """
@@ -105,17 +105,17 @@ def sibling_retarget_report(path: Path) -> Dict[str, Any]:
 
 
 def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate legacy V46.49.4 caches and V46.53.1 soft-root caches.
+    """Validate legacy Source-Motion caches and Retarget Clean soft-root caches.
 
-    V46.53.1 intentionally replaces the complete root-orientation lock with a
+    Retarget Clean intentionally replaces the complete root-orientation lock with a
     source-body-frame SO(3) soft geodesic anchor.  The Event-DB builder must not
     reject that newer contract merely because its mode string differs from the
     legacy ``absolute_reference_lock`` contract.  Acceptance remains strict:
-    the report must be produced by the V46.53.1 source-safety retargeter and all
+    the report must be produced by the Retarget Clean source-safety retargeter and all
     source-level anatomy, gravity and fit gates must have passed.
     """
     reasons: List[str] = []
-    strict = str(os.environ.get("V46_50_REQUIRE_V46_49_4_CACHE", "1")).strip().lower() not in {
+    strict = str(os.environ.get("EVENT_HEADING_REQUIRE_SOURCE_MOTION_CACHE", "1")).strip().lower() not in {
         "0", "false", "no", "off"
     }
     if not strict:
@@ -140,18 +140,18 @@ def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool
     root_mode = str(root_contract.get("mode", "")).strip()
 
     if root_mode == "absolute_reference_lock":
-        # Preserved V46.49.4/V46.52 contract.
+        # Preserved Source-Motion/Anatomy-Heading contract.
         pass
     elif root_mode == "soft_geodesic_anchor":
         allow_soft = str(
-            os.environ.get("V46_53_1_ALLOW_SOFT_ROOT_CONTRACT", "1")
+            os.environ.get("RETARGET_CLEAN_ALLOW_SOFT_ROOT_CONTRACT", "1")
         ).strip().lower() in {"1", "true", "yes", "y", "on"}
         if not allow_soft:
-            reasons.append("v46_53_1_soft_root_contract_disabled")
+            reasons.append("retarget_clean_soft_root_contract_disabled")
 
-        if str(report.get("schema", "")) != "v46_53_1_source_safety_retarget":
-            reasons.append("soft_root_missing_v46_53_1_source_safety_schema")
-        if str(root_contract.get("version", "")) != "v46_53_1_soft_source_body_frame_contract":
+        if str(report.get("schema", "")) != "retarget_clean_source_safety_retarget":
+            reasons.append("soft_root_missing_retarget_clean_source_safety_schema")
+        if str(root_contract.get("version", "")) != "retarget_clean_soft_source_body_frame_contract":
             reasons.append("soft_root_contract_version_mismatch")
         if str(root_contract.get("root_orientation", "")) != "optimized_with_source_body_frame_prior":
             reasons.append("soft_root_orientation_prior_missing")
@@ -190,7 +190,7 @@ def save_db(
     c1s: List[np.ndarray],
     music_feats: List[np.ndarray],
     music_masks: List[float],
-    v46: Any,
+    motion_runtime: Any,
     cfg: Any,
 ) -> Path:
     desc = np.stack(descs).astype(np.float32)
@@ -199,10 +199,10 @@ def save_db(
     desc_z = ((desc - mean) / std).astype(np.float32)
 
     name_semantic = np.stack(
-        [v46.filename_semantic_vector_from_meta(m, cfg) for m in meta]
+        [motion_runtime.filename_semantic_vector_from_meta(m, cfg) for m in meta]
     ).astype(np.float32)
     class_semantic = np.stack(
-        [v46.class_semantic_vector_from_meta(m, cfg) for m in meta]
+        [motion_runtime.class_semantic_vector_from_meta(m, cfg) for m in meta]
     ).astype(np.float32)
 
     db_path = out_dir / "events.npz"
@@ -232,7 +232,7 @@ def save_db(
             json.dumps(identity_contract, sort_keys=True), dtype=object
         ),
         "heading_contract_schema_version": np.asarray(
-            "v46_50_event_heading_contract", dtype=object
+            "event_heading_contract", dtype=object
         ),
         "desc": desc,
         "desc_z": desc_z,
@@ -319,7 +319,7 @@ def save_db(
         "music": np.stack(music_feats).astype(np.float32),
         "music_mask": np.asarray(music_masks, dtype=np.float32),
 
-        # V46.50 event-level heading state arrays.
+        # Event-Heading event-level heading state arrays.
         "event_original_entry_heading_rad": _field_array(
             meta, "event_original_entry_heading_rad", 0.0, np.float32
         ),
@@ -382,7 +382,7 @@ def save_db(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Build V46.50 event-heading Event-RAG DB from V46.49.4 NPY"
+        description="Build Event-Heading event-heading Event-RAG DB from Source-Motion NPY"
     )
     ap.add_argument("--motion_dirs", nargs="+", required=True)
     ap.add_argument("--out_db", required=True)
@@ -400,9 +400,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    import training.motion_models as v46  # local latest core
+    import training.motion_models as motion_runtime
 
-    cfg = v46.V46Config.from_json(args.config).apply_env()
+    cfg = motion_runtime.MotionGenerationConfig.from_json(args.config).apply_env()
     interval_lookup: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     expected_interval_count: Optional[int] = None
     if args.canonical_intervals_in:
@@ -462,16 +462,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             or rep.get("source_relative")
             or path
         )
-        sem = v46.parse_change_bvh_semantics(original_source)
-        strong_base = v46.strong_action_semantics_from_meta(sem)
+        sem = motion_runtime.parse_change_bvh_semantics(original_source)
+        strong_base = motion_runtime.strong_action_semantics_from_meta(sem)
         semantic_meta = {**sem, **strong_base}
         source_uid = str(sem.get("source_uid") or Path(original_source).stem)
 
         for seq_id, seq0 in enumerate(seqs):
-            seq, contract = v46.enforce_edge151_contract_np(
+            seq, contract = motion_runtime.enforce_edge151_contract_np(
                 seq0,
                 cfg,
-                source_hint=f"v46_50_source:{path}",
+                source_hint=f"event_heading_source:{path}",
                 derive_contact=True,
                 project_rot=True,
             )
@@ -547,10 +547,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     })
                     continue
 
-                clip, final_contract = v46.enforce_edge151_contract_np(
+                clip, final_contract = motion_runtime.enforce_edge151_contract_np(
                     clip,
                     cfg,
-                    source_hint=f"v46_50_event:{path}:{st}:{ed}",
+                    source_hint=f"event_heading_event:{path}:{st}:{ed}",
                     derive_contact=True,
                     project_rot=True,
                 )
@@ -577,7 +577,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "label": sem.get("label", Path(original_source).stem),
                     "parent_label": sem.get("parent_label", sem.get("label", "unknown")),
                     "fragment_index": int(seg_idx),
-                    "input_mode": "v46_50_v46_49_4_retarget_cache",
+                    "input_mode": "event_heading_source_motion_retarget_cache",
                     "event_start": int(st),
                     "event_end": int(ed),
                     "event_source_frames": int(len(seq)),
@@ -592,11 +592,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "resampled": False,
                         "native_fps": float(cfg.fps),
                         "target_fps": float(cfg.fps),
-                        "source": "v46_49_4_cache",
+                        "source": "source_motion_cache",
                     },
                 }
 
-                v46.add_event_to_db_lists(
+                motion_runtime.add_event_to_db_lists(
                     clip=clip,
                     event_idx=event_idx,
                     out_path=out_path,
@@ -643,11 +643,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "event_segment_start": int(st),
                     "event_segment_end": int(ed),
                     "event_source_seq_frames": int(len(seq)),
-                    "event_segmentation_schema": "v46_50_motion_adaptive_segmentation",
-                    "retarget_contract_source": rep.get("version", "v46_49_4"),
+                    "event_segmentation_schema": "event_heading_motion_adaptive_segmentation",
+                    "retarget_contract_source": rep.get("version", "source_gravity_4"),
                     "edge151_contract_report": {
                         **dict(item.get("edge151_contract_report", {})),
-                        "v46_50_final": final_contract,
+                        "event_heading_final": final_contract,
                     },
                 })
                 # Heading quality contributes to overall event quality but does not
@@ -683,14 +683,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "source_contract": contract,
             })
             print(
-                f"[V46.50 DB {file_idx}/{len(files)}] {path.name}: "
+                f"[Event-Heading DB {file_idx}/{len(files)}] {path.name}: "
                 f"segments={len(segments)} kept={kept_here} dropped={dropped_here}",
                 flush=True,
             )
 
     if not meta:
         raise RuntimeError(
-            "No valid V46.50 events built. Check retarget cache contracts and heading filters."
+            "No valid Event-Heading events built. Check retarget cache contracts and heading filters."
         )
     if expected_interval_count is not None and len(meta) != expected_interval_count:
         raise RuntimeError(
@@ -708,14 +708,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         c1s,
         music_feats,
         music_masks,
-        v46,
+        motion_runtime,
         cfg,
     )
 
     intents = [str(m.get("event_turn_intent", "none")) for m in meta]
     source_uids = [str(m.get("source_uid", "unknown")) for m in meta]
     report = {
-        "schema": "v46_50_event_heading_db",
+        "schema": "event_heading_db",
         "input_motion_dirs": args.motion_dirs,
         "output_db": str(db_path),
         "num_input_files": int(len(files)),
@@ -751,7 +751,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "rejected_sources": rejected_sources,
         "dropped_events": dropped_events,
     }
-    report_path = out_dir / "v46_50_event_heading_db_report.json"
+    report_path = out_dir / "event_heading_db_report.json"
     report_path.write_text(
         json.dumps(jsonable(report), ensure_ascii=False, indent=2),
         encoding="utf-8",

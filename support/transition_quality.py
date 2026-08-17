@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V34 cross-boundary transition risk and absolute safety gate.
+"""Boundary Transition cross-boundary transition risk and absolute safety gate.
 
-The historical filename is retained for import compatibility.  V34 evaluates
+The historical filename is retained for import compatibility.  Boundary Transition evaluates
 previous[-4:] + transition + following[:4], so entry/exit discontinuities can no
 longer hide outside the transition-only window.  Candidate acceptance requires
 both relative improvement and absolute physical safety.

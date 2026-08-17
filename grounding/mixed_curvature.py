@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Real-audio mixed-curvature Gaussian-Wasserstein grounder.
 
-The production V46.53 grounder remains available for historical checkpoints.
+The production Geometry-Aware Routing grounder remains available for historical checkpoints.
 This module implements the research architecture as an opt-in, schema-versioned
 path with strict paired-data and train-only-normalization contracts.
 """
@@ -42,8 +42,8 @@ from grounding.manifold_ops import (
 from grounding.paired_data import _resample_sequence, validate_paired_payload
 
 
-SCHEMA = "v46_53_mixed_curvature_gaussian_grounder_v1"
-EMBED_SCHEMA = "v46_53_mixed_curvature_event_factors_v1"
+SCHEMA = "event_geometry_mixed_curvature_gaussian_grounder_v1"
+EMBED_SCHEMA = "event_geometry_mixed_curvature_event_factors_v1"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -71,7 +71,7 @@ def load_paired_dataset(path: Path) -> Tuple[Dict[str, Any], Dict[str, int]]:
     with np.load(path, allow_pickle=True) as data:
         payload = {key: data[key] for key in data.files}
     schema = str(np.asarray(payload.get("schema", "")).reshape(-1)[0])
-    if schema != "v46_53_real_audio_motion_paired_grounding_v1":
+    if schema != "event_geometry_real_audio_motion_paired_grounding_v1":
         raise RuntimeError(f"Unsupported paired-grounding schema {schema!r}: {path}")
     dimensions = validate_paired_payload(payload)
     return payload, dimensions
@@ -952,18 +952,18 @@ def train_mixed_grounder(
         gaussian_dim=dimensions["gaussian_dim"],
         control_dim=dimensions["control_dim"],
         num_sources=int(np.max(payload["source_ids"])) + 1,
-        hidden_dim=int(os.environ.get("V46_53_MIXED_HIDDEN", 192)),
-        lorentz_dim=int(os.environ.get("V46_53_MIXED_LORENTZ_DIM", 16)),
-        sphere_dim=int(os.environ.get("V46_53_MIXED_SPHERE_DIM", 96)),
-        dropout=float(os.environ.get("V46_53_MIXED_DROPOUT", 0.10)),
+        hidden_dim=int(os.environ.get("GROUNDING_MIXED_HIDDEN", 192)),
+        lorentz_dim=int(os.environ.get("GROUNDING_MIXED_LORENTZ_DIM", 16)),
+        sphere_dim=int(os.environ.get("GROUNDING_MIXED_SPHERE_DIM", 96)),
+        dropout=float(os.environ.get("GROUNDING_MIXED_DROPOUT", 0.10)),
         minimum_covariance=float(
-            os.environ.get("V46_53_MIXED_COV_EPS", 1.0e-4)
+            os.environ.get("GROUNDING_MIXED_COV_EPS", 1.0e-4)
         ),
         initial_curvature=float(
-            os.environ.get("V46_53_MIXED_CURVATURE", 1.0)
+            os.environ.get("GROUNDING_MIXED_CURVATURE", 1.0)
         ),
         initial_temperature=float(
-            os.environ.get("V46_53_MIXED_TEMPERATURE", 0.08)
+            os.environ.get("GROUNDING_MIXED_TEMPERATURE", 0.08)
         ),
     )
     torch.manual_seed(seed)
@@ -973,7 +973,7 @@ def train_mixed_grounder(
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
-        and _env_bool("V46_53_MIXED_GROUNDER_CUDA", True)
+        and _env_bool("GROUNDING_MIXED_GROUNDER_CUDA", True)
         else "cpu"
     )
     model = MixedCurvatureGrounder(config).to(device)
@@ -996,25 +996,25 @@ def train_mixed_grounder(
     validation_loader = loader(validation_indices, False)
     loss_weights = {
         "hierarchy_weight": float(
-            os.environ.get("V46_53_MIXED_HIERARCHY_W", 0.20)
+            os.environ.get("GROUNDING_MIXED_HIERARCHY_W", 0.20)
         ),
         "gaussian_anchor_weight": float(
-            os.environ.get("V46_53_MIXED_GAUSSIAN_W", 0.25)
+            os.environ.get("GROUNDING_MIXED_GAUSSIAN_W", 0.25)
         ),
         "control_weight": float(
-            os.environ.get("V46_53_MIXED_CONTROL_W", 0.10)
+            os.environ.get("GROUNDING_MIXED_CONTROL_W", 0.10)
         ),
         "uncertainty_weight": float(
-            os.environ.get("V46_53_MIXED_UNCERTAINTY_W", 0.05)
+            os.environ.get("GROUNDING_MIXED_UNCERTAINTY_W", 0.05)
         ),
         "source_weight": float(
-            os.environ.get("V46_53_MIXED_SOURCE_W", 0.05)
+            os.environ.get("GROUNDING_MIXED_SOURCE_W", 0.05)
         ),
         "metric_balance_weight": float(
-            os.environ.get("V46_53_MIXED_METRIC_BALANCE_W", 0.01)
+            os.environ.get("GROUNDING_MIXED_METRIC_BALANCE_W", 0.01)
         ),
         "hierarchy_margin": float(
-            os.environ.get("V46_53_MIXED_HIERARCHY_MARGIN", 1.25)
+            os.environ.get("GROUNDING_MIXED_HIERARCHY_MARGIN", 1.25)
         ),
     }
 
@@ -1089,7 +1089,7 @@ def train_mixed_grounder(
             stale += 1
         if epoch == 1 or epoch % 10 == 0 or epoch == epochs:
             print(
-                "[V46.53 MIXED] "
+                "[Geometry-Aware Routing MIXED] "
                 + json.dumps(row, ensure_ascii=False),
                 flush=True,
             )
@@ -1177,11 +1177,11 @@ def _motion_inputs_for_checkpoint(
     db: Mapping[str, Any], checkpoint: Mapping[str, Any]
 ) -> Tuple[np.ndarray, np.ndarray]:
     config = MixedGrounderConfig(**dict(checkpoint["config"]))
-    for key in ("v46_53_geometry_desc", "v46_53_bodypart_flow"):
+    for key in ("event_geometry_geometry_desc", "event_geometry_bodypart_flow"):
         if key not in db:
             raise RuntimeError(f"Event-DB lacks mixed-grounder input {key}")
-    geometry = np.asarray(db["v46_53_geometry_desc"], dtype=np.float32)
-    bodypart = np.asarray(db["v46_53_bodypart_flow"], dtype=np.float32)[
+    geometry = np.asarray(db["event_geometry_geometry_desc"], dtype=np.float32)
+    bodypart = np.asarray(db["event_geometry_bodypart_flow"], dtype=np.float32)[
         :, : config.bodypart_count
     ]
     if geometry.shape[1] != config.motion_geometry_dim:
@@ -1231,7 +1231,7 @@ def embed_database_mixed(
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
-        and _env_bool("V46_53_MIXED_GROUNDER_INFER_CUDA", False)
+        and _env_bool("GROUNDING_MIXED_GROUNDER_INFER_CUDA", False)
         else "cpu"
     )
     model = _model_from_checkpoint(checkpoint, device)
@@ -1254,27 +1254,27 @@ def embed_database_mixed(
     payload = dict(db)
     payload.update(
         {
-            "v46_53_mixed_grounding_schema_version": np.asarray(
+            "event_geometry_mixed_grounding_schema_version": np.asarray(
                 EMBED_SCHEMA, dtype=object
             ),
-            "v46_53_mixed_lorentz": factors_np["lorentz"],
-            "v46_53_mixed_sphere": factors_np["sphere"],
-            "v46_53_mixed_gaussian_mean": factors_np["gaussian_mean"],
-            "v46_53_mixed_gaussian_covariance": factors_np[
+            "event_geometry_mixed_lorentz": factors_np["lorentz"],
+            "event_geometry_mixed_sphere": factors_np["sphere"],
+            "event_geometry_mixed_gaussian_mean": factors_np["gaussian_mean"],
+            "event_geometry_mixed_gaussian_covariance": factors_np[
                 "gaussian_covariance"
             ],
-            "v46_53_mixed_euclidean": factors_np["euclidean"],
-            "v46_53_mixed_uncertainty": factors_np["uncertainty"],
-            "v46_53_mixed_curvature": np.asarray(
+            "event_geometry_mixed_euclidean": factors_np["euclidean"],
+            "event_geometry_mixed_uncertainty": factors_np["uncertainty"],
+            "event_geometry_mixed_curvature": np.asarray(
                 float(model.curvature.detach().cpu()), dtype=np.float32
             ),
-            "v46_53_mixed_metric_weights": model.metric_weights.detach()
+            "event_geometry_mixed_metric_weights": model.metric_weights.detach()
             .cpu()
             .numpy()
             .astype(np.float32),
         }
     )
-    backup = db_path.with_name(db_path.stem + ".pre_v46_53_mixed_grounding.npz")
+    backup = db_path.with_name(db_path.stem + ".pre_event_geometry_mixed_grounding.npz")
     if not backup.exists():
         shutil.copy2(db_path, backup)
     np.savez_compressed(db_path, **payload)
@@ -1289,7 +1289,7 @@ def embed_database_mixed(
         "normalization": "training-sources-only",
         "ok": True,
     }
-    db_path.with_name(db_path.stem + ".v46_53_mixed_grounding.json").write_text(
+    db_path.with_name(db_path.stem + ".event_geometry_mixed_grounding.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return report
@@ -1306,17 +1306,17 @@ class MixedGroundingRuntime:
         self.device = torch.device(
             "cuda"
             if torch.cuda.is_available()
-            and _env_bool("V46_53_MIXED_GROUNDER_INFER_CUDA", False)
+            and _env_bool("GROUNDING_MIXED_GROUNDER_INFER_CUDA", False)
             else "cpu"
         )
         self.model = _model_from_checkpoint(self.checkpoint, self.device)
         required = (
-            "v46_53_mixed_lorentz",
-            "v46_53_mixed_sphere",
-            "v46_53_mixed_gaussian_mean",
-            "v46_53_mixed_gaussian_covariance",
-            "v46_53_mixed_euclidean",
-            "v46_53_mixed_uncertainty",
+            "event_geometry_mixed_lorentz",
+            "event_geometry_mixed_sphere",
+            "event_geometry_mixed_gaussian_mean",
+            "event_geometry_mixed_gaussian_covariance",
+            "event_geometry_mixed_euclidean",
+            "event_geometry_mixed_uncertainty",
         )
         if all(key in db for key in required):
             factors = {
@@ -1351,7 +1351,7 @@ class MixedGroundingRuntime:
             "clap_embedding",
             "clap_features",
             "deep_music_embedding",
-            "v46_53_clap_embedding",
+            "event_geometry_clap_embedding",
         ):
             if key in slot:
                 clap = np.asarray(slot[key], dtype=np.float32).reshape(-1)
@@ -1360,7 +1360,7 @@ class MixedGroundingRuntime:
         for key in (
             "temporal_features",
             "music_temporal_features",
-            "v46_53_temporal_features",
+            "event_geometry_temporal_features",
         ):
             if key in slot:
                 temporal = np.asarray(slot[key], dtype=np.float32)

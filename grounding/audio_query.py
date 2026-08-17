@@ -19,7 +19,7 @@ from scheduling.audio_features import extract_audio_features
 from scheduling.deep_music_features import phrase_deep_embedding_matrix
 
 
-SCHEMA = "v46_53_mixed_grounding_audio_query_v1"
+SCHEMA = "event_geometry_mixed_grounding_audio_query_v1"
 
 
 def _slot_list(payload: Any) -> tuple[list[dict[str, Any]], Optional[str]]:

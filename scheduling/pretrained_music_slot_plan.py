@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.34 pretrained music-router slot-plan builder.
+Music Slot Planning pretrained music-router slot-plan builder.
 
 This script is intentionally independent from README assumptions.  It connects
-previously trained V21/V26 music-structure weights to the current V46
-MotionRAG-Diff generator by producing a V46-compatible --slots_json file.
+previously trained Music Router/Whole-Song Planner music-structure weights to the current Motion Generation
+MotionRAG-Diff generator by producing a Motion Generation-compatible --slots_json file.
 
 Priority order
 --------------
 1) Strict/preferred: call scheduling.whole_song_scheduler with --router_ckpt
-   and optional --planner_ckpt.  This uses the trained V21 music router and V26
+   and optional --planner_ckpt.  This uses the trained Music Router music router and Whole-Song Planner
    whole-song planner to segment an unseen song and produce a schedule.
-2) Optional controlled fallback: if V46_34_ALLOW_SEMANTIC_FALLBACK=1, build a
+2) Optional controlled fallback: if MUSIC_SLOT_ALLOW_SEMANTIC_FALLBACK=1, build a
    slot plan from an existing music_semantics/<song>.music_semantic.json plus
    acoustic energy/onset.  This is only for debugging and is marked as fallback.
 
 Output schema
 -------------
 {
-  "version": "v46_34_pretrained_router_slot_plan",
+  "version": "music_slot_pretrained_router_slot_plan",
   "audio": "...wav",
-  "slot_source": "v21_router_v26_planner" | "external_music_semantic_fallback",
+  "slot_source": "music_router_whole_song_planner" | "external_music_semantic_fallback",
   "router_ckpt": "...best.pt",
   "planner_ckpt": "...best.pt",
   "slots": [
@@ -39,7 +39,7 @@ Output schema
 }
 
 The current training/motion_models.py already supports --slots_json.  The
-companion patch v46_34_router_slot_patch.py strengthens that loader so missing
+companion patch music_slot_router_slot_patch.py strengthens that loader so missing
 features are synthesized and strict router-slot mode can be enforced.
 """
 from __future__ import annotations
@@ -156,7 +156,7 @@ def feature32(duration: float, probs: Dict[str, float], audio_stats: Optional[Di
     onset = float(audio_stats.get("onset", audio_stats.get("onset_p90", 0.02)))
     dyn = float(audio_stats.get("dynamic", 0.04))
     p = normalize_probs(probs)
-    # V46 event_descriptor-like coarse layout.  These are not raw CLAP features;
+    # Motion Generation event_descriptor-like coarse layout.  These are not raw CLAP features;
     # they are retrieval-facing pseudo features with explicit semantic logits.
     x = np.zeros(32, dtype=np.float32)
     x[0] = float(duration)
@@ -209,11 +209,11 @@ def slot_label_from_probs(probs: Dict[str, float]) -> str:
 
 
 def extract_slots_from_any_json(data: Any) -> Optional[List[Dict[str, Any]]]:
-    """Find a slot-like list in arbitrary V21/V26/V34 reports."""
+    """Find a slot-like list in arbitrary Music Router/Whole-Song Planner/Boundary Transition reports."""
     if isinstance(data, dict):
         if isinstance(data.get("slots"), list) and data["slots"]:
             return list(data["slots"])
-        # Some V26 reports store slot info under stage_reports.retrieval.
+        # Some Whole-Song Planner reports store slot info under stage_reports.retrieval.
         sr = data.get("stage_reports")
         if isinstance(sr, dict) and isinstance(sr.get("retrieval"), list) and sr["retrieval"]:
             out = []
@@ -252,10 +252,10 @@ def extract_slots_from_any_json(data: Any) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
-def run_v26_scheduler(args: argparse.Namespace, schedule_dir: Path) -> Optional[Path]:
+def run_whole_song_scheduler(args: argparse.Namespace, schedule_dir: Path) -> Optional[Path]:
     if not args.router_ckpt:
         return None
-    required = [args.index_json, args.duration_index_npz, args.v23_ckpt]
+    required = [args.index_json, args.duration_index_npz, args.duration_model_ckpt]
     if not all(required):
         return None
     if not Path("scheduling/whole_song_scheduler.py").exists():
@@ -267,7 +267,7 @@ def run_v26_scheduler(args: argparse.Namespace, schedule_dir: Path) -> Optional[
         "--music", str(args.audio),
         "--out_dir", str(schedule_dir),
         "--router_ckpt", str(args.router_ckpt),
-        "--v23_ckpt", str(args.v23_ckpt),
+        "--duration_model_ckpt", str(args.duration_model_ckpt),
         "--feature_dir", str(args.feature_dir or (schedule_dir / "music_features")),
         "--fps", str(args.fps),
         "--min_phrase_seconds", str(args.min_phrase_seconds),
@@ -283,7 +283,7 @@ def run_v26_scheduler(args: argparse.Namespace, schedule_dir: Path) -> Optional[
         cmd += ["--hierarchy_index_npz", str(args.hierarchy_index_npz)]
     if args.max_seconds and float(args.max_seconds) > 0:
         cmd += ["--max_seconds", str(args.max_seconds)]
-    print("[V46.34 SCHEDULE]", " ".join(cmd), flush=True)
+    print("[Music Slot Planning SCHEDULE]", " ".join(cmd), flush=True)
     schedule_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(cmd, check=True)
     jsons = sorted(schedule_dir.rglob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -302,9 +302,9 @@ def build_fallback_slots(args: argparse.Namespace) -> Tuple[List[Dict[str, Any]]
     sem_path = find_music_semantic(args.audio, sem_dirs)
     if sem_path is None:
         raise RuntimeError(
-            "No V21/V26 schedule could be produced and no music semantic JSON found. "
-            "Set V26_INDEX_JSON/V26_DURATION_INDEX_NPZ/V26_V23_CKPT/V26_ROUTER_CKPT, "
-            "or set V46_34_ALLOW_SEMANTIC_FALLBACK=1 with music_semantics/<song>.music_semantic.json."
+            "No Music Router/Whole-Song Planner schedule could be produced and no music semantic JSON found. "
+            "Set WHOLE_SONG_INDEX_JSON/WHOLE_SONG_DURATION_INDEX_NPZ/WHOLE_SONG_DURATION_CKPT/WHOLE_SONG_ROUTER_CKPT, "
+            "or set MUSIC_SLOT_ALLOW_SEMANTIC_FALLBACK=1 with music_semantics/<song>.music_semantic.json."
         )
     data = load_json(sem_path)
     slots = extract_slots_from_any_json(data)
@@ -382,62 +382,62 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)
     ap.add_argument("--out_json", required=True)
-    ap.add_argument("--router_ckpt", default=os.environ.get("V26_ROUTER_CKPT", os.environ.get("V21_ROUTER_CKPT", "")))
-    ap.add_argument("--planner_ckpt", default=os.environ.get("V26_PLANNER_CKPT", ""))
-    ap.add_argument("--v23_ckpt", default=os.environ.get("V26_V23_CKPT", ""))
-    ap.add_argument("--index_json", default=os.environ.get("V26_INDEX_JSON", ""))
-    ap.add_argument("--duration_index_npz", default=os.environ.get("V26_DURATION_INDEX_NPZ", ""))
-    ap.add_argument("--hierarchy_index_npz", default=os.environ.get("V26_HIERARCHY_INDEX_NPZ", ""))
-    ap.add_argument("--feature_dir", default=os.environ.get("V26_FEATURE_CACHE", ""))
-    ap.add_argument("--music_semantic_dirs", nargs="*", default=[x for x in os.environ.get("V46_EXTERNAL_MUSIC_SEMANTIC_DIRS", "music_semantics:external_music_semantics:output/music_semantics").split(":") if x])
+    ap.add_argument("--router_ckpt", default=os.environ.get("WHOLE_SONG_ROUTER_CKPT", os.environ.get("MUSIC_ROUTER_ROUTER_CKPT", "")))
+    ap.add_argument("--planner_ckpt", default=os.environ.get("WHOLE_SONG_PLANNER_CKPT", ""))
+    ap.add_argument("--duration_model_ckpt", default=os.environ.get("WHOLE_SONG_DURATION_CKPT", ""))
+    ap.add_argument("--index_json", default=os.environ.get("WHOLE_SONG_INDEX_JSON", ""))
+    ap.add_argument("--duration_index_npz", default=os.environ.get("WHOLE_SONG_DURATION_INDEX_NPZ", ""))
+    ap.add_argument("--hierarchy_index_npz", default=os.environ.get("WHOLE_SONG_HIERARCHY_INDEX_NPZ", ""))
+    ap.add_argument("--feature_dir", default=os.environ.get("WHOLE_SONG_FEATURE_CACHE", ""))
+    ap.add_argument("--music_semantic_dirs", nargs="*", default=[x for x in os.environ.get("MOTION_EXTERNAL_MUSIC_SEMANTIC_DIRS", "music_semantics:external_music_semantics:output/music_semantics").split(":") if x])
     ap.add_argument("--schedule_dir", default="")
-    ap.add_argument("--slot_seconds", type=float, default=float(os.environ.get("V46_34_DEFAULT_SLOT_SECONDS", "4.0")))
-    ap.add_argument("--fps", type=float, default=float(os.environ.get("V46_FPS", "30")))
-    ap.add_argument("--max_seconds", type=float, default=float(os.environ.get("V46_34_MAX_SECONDS", "0")))
-    ap.add_argument("--min_phrase_seconds", type=float, default=float(os.environ.get("V26_MIN_PHRASE_SECONDS", "2.5")))
-    ap.add_argument("--max_phrase_seconds", type=float, default=float(os.environ.get("V26_MAX_PHRASE_SECONDS", "7.5")))
-    ap.add_argument("--max_phrases", type=int, default=int(os.environ.get("V26_MAX_PHRASES", "160")))
-    ap.add_argument("--allow_semantic_fallback", action="store_true", default=bool(int(os.environ.get("V46_34_ALLOW_SEMANTIC_FALLBACK", "0"))))
+    ap.add_argument("--slot_seconds", type=float, default=float(os.environ.get("MUSIC_SLOT_DEFAULT_SLOT_SECONDS", "4.0")))
+    ap.add_argument("--fps", type=float, default=float(os.environ.get("MOTION_FPS", "30")))
+    ap.add_argument("--max_seconds", type=float, default=float(os.environ.get("MUSIC_SLOT_MAX_SECONDS", "0")))
+    ap.add_argument("--min_phrase_seconds", type=float, default=float(os.environ.get("WHOLE_SONG_MIN_PHRASE_SECONDS", "2.5")))
+    ap.add_argument("--max_phrase_seconds", type=float, default=float(os.environ.get("WHOLE_SONG_MAX_PHRASE_SECONDS", "7.5")))
+    ap.add_argument("--max_phrases", type=int, default=int(os.environ.get("WHOLE_SONG_MAX_PHRASES", "160")))
+    ap.add_argument("--allow_semantic_fallback", action="store_true", default=bool(int(os.environ.get("MUSIC_SLOT_ALLOW_SEMANTIC_FALLBACK", "0"))))
     args = ap.parse_args()
 
     out_json = Path(args.out_json)
-    schedule_dir = Path(args.schedule_dir) if args.schedule_dir else out_json.parent / "v21_v26_schedule_raw"
+    schedule_dir = Path(args.schedule_dir) if args.schedule_dir else out_json.parent / "music_router_whole_song_schedule_raw"
     source_meta: Dict[str, Any] = {
-        "slot_source": "v21_router_v26_planner",
+        "slot_source": "music_router_whole_song_planner",
         "router_ckpt": str(args.router_ckpt),
         "planner_ckpt": str(args.planner_ckpt),
-        "v23_ckpt": str(args.v23_ckpt),
+        "duration_model_ckpt": str(args.duration_model_ckpt),
         "index_json": str(args.index_json),
         "duration_index_npz": str(args.duration_index_npz),
     }
     raw_slots: Optional[List[Dict[str, Any]]] = None
     schedule_json: Optional[Path] = None
     try:
-        schedule_json = run_v26_scheduler(args, schedule_dir)
+        schedule_json = run_whole_song_scheduler(args, schedule_dir)
         if schedule_json:
             raw_slots = extract_slots_from_any_json(load_json(schedule_json))
             source_meta["raw_schedule_json"] = str(schedule_json)
     except Exception as exc:
-        print(f"[V46.34 WARN] V21/V26 schedule failed: {exc}", file=sys.stderr)
+        print(f"[Music Slot Planning WARN] Music Router/Whole-Song Planner schedule failed: {exc}", file=sys.stderr)
         raw_slots = None
     if not raw_slots:
         if not args.allow_semantic_fallback:
             raise SystemExit(
-                "[V46.34 ERROR] Could not obtain slots from trained V21/V26 router/planner. "
+                "[Music Slot Planning ERROR] Could not obtain slots from trained Music Router/Whole-Song Planner router/planner. "
                 "This run is intentionally strict because unseen-song slotting must use trained music semantics. "
-                "Set V46_34_ALLOW_SEMANTIC_FALLBACK=1 only for debugging."
+                "Set MUSIC_SLOT_ALLOW_SEMANTIC_FALLBACK=1 only for debugging."
             )
         raw_slots, extra = build_fallback_slots(args)
         source_meta.update(extra)
         source_meta["slot_source"] = "external_music_semantic_fallback"
     slots = finalize_slots(raw_slots, args.audio, args, source_meta)
     obj = {
-        "version": "v46_34_pretrained_router_slot_plan",
+        "version": "music_slot_pretrained_router_slot_plan",
         "audio": str(args.audio),
         "slot_source": source_meta.get("slot_source"),
         "router_ckpt": str(args.router_ckpt),
         "planner_ckpt": str(args.planner_ckpt),
-        "v23_ckpt": str(args.v23_ckpt),
+        "duration_model_ckpt": str(args.duration_model_ckpt),
         "raw_schedule_json": source_meta.get("raw_schedule_json", ""),
         "num_slots": len(slots),
         "fps": float(args.fps),

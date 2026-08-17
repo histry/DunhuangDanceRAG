@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build a V46.53.1 physically-clean retarget cache.
+"""Build a Retarget Clean physically-clean retarget cache.
 
 Source motion must pass anatomy, gravity, fit and whole-recording physical-clean
 gates before it can enter training. Expressive style quality remains an event-level
@@ -37,14 +37,14 @@ from motion_geometry.physical import motion_physical_metrics_np
 from retargeting.legacy_anatomy_adapter import load_official_smpl_motion
 from retargeting.anatomy_retarget import retarget_bvh_research
 
-SCHEMA = "v46_53_1_source_safe_retarget_cache"
+SCHEMA = "retarget_clean_source_safe_retarget_cache"
 
 
 def _discover(in_dir: Path) -> List[Path]:
     bvh = sorted(in_dir.rglob("*.bvh"))
     smpl = sorted([*in_dir.rglob("*.npz"), *in_dir.rglob("*.pkl"), *in_dir.rglob("*.pickle")])
     smpl = [p for p in smpl if not any(t in p.name.lower() for t in ("event", "index", "feature", "cache", "split"))]
-    prefer_smpl = env_bool("V46_52_PREFER_OFFICIAL_SMPL", True)
+    prefer_smpl = env_bool("RETARGET_PREFER_OFFICIAL_SMPL", True)
     grouped: Dict[str, List[Path]] = {}
     for p in [*bvh, *smpl]:
         grouped.setdefault(str(p.relative_to(in_dir).with_suffix("")), []).append(p)
@@ -61,8 +61,8 @@ def _report_valid(
 ) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     version = str(rep.get("version", ""))
-    if "v46_53_1" not in version and not env_bool("V46_53_1_ALLOW_LEGACY_RETARGET_CACHE", False):
-        reasons.append("not_v46_53_1")
+    if "event_geometry_1" not in version and not env_bool("RETARGET_CLEAN_ALLOW_LEGACY_RETARGET_CACHE", False):
+        reasons.append("not_event_geometry_1")
     if not bool(rep.get("ok", False)):
         reasons.append("not_ok")
     if not bool(rep.get("source_gate_ok", rep.get("anatomy_ok", False))):
@@ -190,8 +190,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Formal BVH cache construction requires a source manifest. "
             "Pass --source_manifest or --allow_unmanifested_bvh for a non-Chang-E dataset."
         )
-    allow_partial = bool(args.allow_partial or env_bool("V46_52_ALLOW_PARTIAL_RETARGET", True))
-    min_ok = max(3, min(len(files), env_int("V46_52_MIN_OK_SOURCES", min(8, len(files)))))
+    allow_partial = bool(args.allow_partial or env_bool("RETARGET_ALLOW_PARTIAL_RETARGET", True))
+    min_ok = max(3, min(len(files), env_int("RETARGET_MIN_OK_SOURCES", min(8, len(files)))))
 
     reports: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
@@ -202,7 +202,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dst = (out_dir / rel).with_suffix(".npy")
         rep_path = dst.with_suffix(".retarget.json")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[V46.53.1 RETARGET {idx}/{len(files)}] {src} -> {dst}", flush=True)
+        print(f"[Retarget Clean RETARGET {idx}/{len(files)}] {src} -> {dst}", flush=True)
         try:
             expected_provenance = _expected_provenance(
                 src,
@@ -214,7 +214,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 old = json.loads(rep_path.read_text(encoding="utf-8"))
                 valid, reasons = _report_valid(old, expected_provenance)
                 if valid:
-                    print("[SKIP] existing V46.53.1 source-safe cache", flush=True)
+                    print("[SKIP] existing Retarget Clean source-safe cache", flush=True)
                     reports.append(old)
                     continue
                 stale.append({"source": str(src), "reasons": reasons})
@@ -249,7 +249,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         )
                         rep = dict(rep)
                         rep.setdefault("source_gate_ok", bool(rep.get("anatomy_ok", False)))
-                        rep["version"] = str(rep.get("version", "official_smpl")) + "_v46_53_1"
+                        rep["version"] = str(rep.get("version", "official_smpl")) + "_event_geometry_1"
                     source_used = candidate
                     break
                 except Exception as exc:
@@ -319,7 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "physical_audit": physical_audit,
                 "physical_clean_gate": physical_clean_gate,
                 "physical_clean_ok": bool(physical_clean_gate["ok"]),
-                "v46_53_1_cache_contract": {
+                "retarget_clean_cache_contract": {
                     "schema": SCHEMA,
                     "source_gate": "pretraining_physical_clean",
                     "event_quality_gate_deferred": True,
@@ -329,14 +329,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ),
                     "requires_gravity_ok": True,
                     "requires_fit_ok": True,
-                    "official_smpl_preferred": env_bool("V46_52_PREFER_OFFICIAL_SMPL", True),
+                    "official_smpl_preferred": env_bool("RETARGET_PREFER_OFFICIAL_SMPL", True),
                     "canonical_fps": float(cfg.target_fps),
                     "smpl_scaling_mode": str(args.smpl_scaling_mode),
                 },
             })
             valid, reasons = _report_valid(rep, cache_provenance)
             if not valid:
-                raise RuntimeError(f"Non-formal V46.53.1 report: {reasons}")
+                raise RuntimeError(f"Non-formal Retarget Clean report: {reasons}")
             np.save(dst, np.asarray(motion, dtype=np.float32))
             rep_path.write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
             reports.append(rep)
@@ -382,7 +382,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "reports": reports,
         "failures": failures,
     }
-    for name in ("v46_50_retarget_cache_report.json", "v46_52_retarget_cache_report.json", "v46_53_1_retarget_cache_report.json"):
+    for name in ("event_heading_retarget_cache_report.json", "anatomy_heading_retarget_cache_report.json", "retarget_clean_retarget_cache_report.json"):
         (out_dir / name).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({k: summary[k] for k in ("num_inputs", "num_ok", "num_failed", "minimum_ok_sources", "split_feasible", "all_ok")}, indent=2))
     return 0 if all_ok else 2

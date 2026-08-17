@@ -91,7 +91,7 @@ def main():
     ap.add_argument(
         "--fps",
         type=float,
-        default=float(os.environ.get("V46_51_FPS", 30.0)),
+        default=float(os.environ.get("GENERATION_FPS", 30.0)),
     )
     ap.add_argument("--gravity_audit_json", default=None)
     ap.add_argument("--allow_invalid_gravity", action="store_true")
@@ -114,7 +114,7 @@ def main():
         print(json.dumps(reports[-1], ensure_ascii=False, indent=2))
         if not ok and not args.allow_invalid_gravity:
             raise RuntimeError(
-                "Render blocked by V46.49 gravity contract: " + " | ".join(reasons)
+                "Render blocked by Source-Gravity gravity contract: " + " | ".join(reasons)
             )
 
     audit_path = (

@@ -21,11 +21,11 @@ def _audit(path: Path, fps: float) -> Dict[str, Any]:
         x = np.asarray(x)[0]
     gravity = gravity_metrics_np(x, fps)
     gth = GravityThresholds(
-        torso_up_cos_p05_min=env_float("V46_52_GRAVITY_TORSO_P05_MIN", 0.55),
-        torso_up_cos_median_min=env_float("V46_52_GRAVITY_TORSO_MEDIAN_MIN", 0.76),
-        head_above_pelvis_ratio_min=env_float("V46_52_HEAD_ABOVE_RATIO_MIN", 0.97),
-        feet_below_pelvis_ratio_min=env_float("V46_52_FEET_BELOW_RATIO_MIN", 0.94),
-        horizontal_body_ratio_max=env_float("V46_52_HORIZONTAL_BODY_RATIO_MAX", 0.04),
+        torso_up_cos_p05_min=env_float("RETARGET_GRAVITY_TORSO_P05_MIN", 0.55),
+        torso_up_cos_median_min=env_float("RETARGET_GRAVITY_TORSO_MEDIAN_MIN", 0.76),
+        head_above_pelvis_ratio_min=env_float("RETARGET_HEAD_ABOVE_RATIO_MIN", 0.97),
+        feet_below_pelvis_ratio_min=env_float("RETARGET_FEET_BELOW_RATIO_MIN", 0.94),
+        horizontal_body_ratio_max=env_float("RETARGET_HORIZONTAL_BODY_RATIO_MAX", 0.04),
     )
     gok, greasons = evaluate_gravity_contract(gravity, gth)
     anatomy = anatomy_metrics_np(x, fps)
@@ -65,7 +65,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:
             rows.append({"path": str(path), "ok": False, "reasons": [str(exc)], "gravity_ok": False, "anatomy_ok": False})
     summary = {
-        "schema": "v46_52_combined_motion_contract_audit",
+        "schema": "anatomy_heading_combined_motion_contract_audit",
         "fps": float(args.fps),
         "count": len(rows),
         "ok_count": sum(bool(r["ok"]) for r in rows),

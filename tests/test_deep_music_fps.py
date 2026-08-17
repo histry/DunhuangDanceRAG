@@ -55,7 +55,7 @@ class DeepMusicFpsTests(unittest.TestCase):
             np.testing.assert_allclose(matrix_30, matrix_60, rtol=0.0, atol=1e-7)
             self.assertEqual(meta_30["phrase_fps"], 30.0)
             self.assertEqual(meta_60["phrase_fps"], 60.0)
-            caches = list(cache.glob("*_v27_semantic_*.npz"))
+            caches = list(cache.glob("*_music_encoder_semantic_*.npz"))
             self.assertEqual(len(caches), 2)
             for path in caches:
                 with np.load(path, allow_pickle=True) as data:

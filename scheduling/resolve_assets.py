@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Resolve the trained V21/V26/V23 scheduling assets reproducibly.
+"""Resolve the trained Music Router, Whole-Song Planner, and Duration Model scheduling assets reproducibly.
 
 Explicit environment variables always win.  Otherwise the resolver checks the
 known validated project paths in a fixed priority order.  It never selects an
@@ -21,27 +21,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 CANDIDATES = {
     "index_json": [
-        "data/dunhuang_dynamic_event_rag_physical/v21_shared_event_index.json",
-        "output/V21_BEST_SHARED_MULTIMUSIC_BASELINE/reproducibility/v21_shared_event_index.json",
-        "data/v21_shared_event_index.json",
+        "data/dunhuang_dynamic_event_rag_physical/music_router_shared_event_index.json",
+        "output/MUSIC_ROUTER_BEST_SHARED_MULTIMUSIC_BASELINE/reproducibility/music_router_shared_event_index.json",
+        "data/music_router_shared_event_index.json",
     ],
     "duration_index_npz": [
-        "data/v26_music_dominant_duration_index.npz",
-        "data/v26_duration_augmented_event_index.npz",
+        "data/whole_song_music_dominant_duration_index.npz",
+        "data/whole_song_duration_augmented_event_index.npz",
     ],
     "router_ckpt": [
-        "output/v21_music_router_985songs_20260605_154801/seed_20260607/checkpoints/best.pt",
+        "output/music_router_music_router_985songs_20260605_154801/seed_20260607/checkpoints/best.pt",
     ],
     "planner_ckpt": [
-        "output/v26_music_dominant_whole_song_planner_985/checkpoints/best.pt",
+        "output/whole_song_music_dominant_whole_song_planner_985/checkpoints/best.pt",
     ],
-    "v23_ckpt": [
-        "checkpoints/v23_release/v23_v2_5/v23_v2_5_seed20260610_best.pt",
-        "output/v23_v2_5_continuous_gate_20260607_004858/seed_20260612/stage2_timewarp/checkpoints/best.pt",
+    "duration_model_ckpt": [
+        "checkpoints/duration_model_release/duration_model_v2_5/duration_model_v2_5_seed20260610_best.pt",
+        "output/duration_model_v2_5_continuous_gate_20260607_004858/seed_20260612/stage2_timewarp/checkpoints/best.pt",
     ],
     "hierarchy_index_npz": [
-        "data/v26_hierarchy_index.npz",
-        "data/v26_hierarchical_event_index.npz",
+        "data/whole_song_hierarchy_index.npz",
+        "data/whole_song_hierarchical_event_index.npz",
     ],
     "start_pose": [
         "data/canonical_dunhuang_start_pose.npy",
@@ -50,13 +50,13 @@ CANDIDATES = {
 
 
 ENV_NAMES = {
-    "index_json": "V46_51_INDEX_JSON",
-    "duration_index_npz": "V46_51_DURATION_INDEX_NPZ",
-    "router_ckpt": "V46_51_ROUTER_CKPT",
-    "planner_ckpt": "V46_51_PLANNER_CKPT",
-    "v23_ckpt": "V46_51_V23_CKPT",
-    "hierarchy_index_npz": "V46_51_HIERARCHY_INDEX_NPZ",
-    "start_pose": "V46_51_START_POSE",
+    "index_json": "GENERATION_INDEX_JSON",
+    "duration_index_npz": "GENERATION_DURATION_INDEX_NPZ",
+    "router_ckpt": "GENERATION_ROUTER_CKPT",
+    "planner_ckpt": "GENERATION_PLANNER_CKPT",
+    "duration_model_ckpt": "GENERATION_DURATION_CKPT",
+    "hierarchy_index_npz": "GENERATION_HIERARCHY_INDEX_NPZ",
+    "start_pose": "GENERATION_START_POSE",
 }
 
 
@@ -65,7 +65,7 @@ REQUIRED = {
     "duration_index_npz",
     "router_ckpt",
     "planner_ckpt",
-    "v23_ckpt",
+    "duration_model_ckpt",
 }
 
 
@@ -103,12 +103,12 @@ def resolve_one(key: str) -> Tuple[str, str]:
     if key == "router_ckpt":
         pointer_candidates = [
             ROOT
-            / "output/v21_music_router_985songs_20260605_154801/BEST_ROUTER_CKPT.txt",
+            / "output/music_router_music_router_985songs_20260605_154801/BEST_ROUTER_CKPT.txt",
         ]
     elif key == "planner_ckpt":
         pointer_candidates = [
             ROOT
-            / "output/v26_music_dominant_whole_song_planner_985/BEST_V26_PLANNER_CKPT.txt",
+            / "output/whole_song_music_dominant_whole_song_planner_985/BEST_WHOLE_SONG_PLANNER_CKPT.txt",
         ]
 
     for pointer in pointer_candidates:
@@ -143,7 +143,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sources[key] = source
 
     report = {
-        "schema": "v46_51_scheduler_asset_resolution",
+        "schema": "fresh_audio_scheduler_asset_resolution",
         "root": str(ROOT),
         "assets": assets,
         "resolution_sources": sources,
@@ -158,13 +158,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     shell_names = {
-        "index_json": "V46_51_RESOLVED_INDEX_JSON",
-        "duration_index_npz": "V46_51_RESOLVED_DURATION_INDEX_NPZ",
-        "router_ckpt": "V46_51_RESOLVED_ROUTER_CKPT",
-        "planner_ckpt": "V46_51_RESOLVED_PLANNER_CKPT",
-        "v23_ckpt": "V46_51_RESOLVED_V23_CKPT",
-        "hierarchy_index_npz": "V46_51_RESOLVED_HIERARCHY_INDEX_NPZ",
-        "start_pose": "V46_51_RESOLVED_START_POSE",
+        "index_json": "GENERATION_RESOLVED_INDEX_JSON",
+        "duration_index_npz": "GENERATION_RESOLVED_DURATION_INDEX_NPZ",
+        "router_ckpt": "GENERATION_RESOLVED_ROUTER_CKPT",
+        "planner_ckpt": "GENERATION_RESOLVED_PLANNER_CKPT",
+        "duration_model_ckpt": "GENERATION_RESOLVED_DURATION_CKPT",
+        "hierarchy_index_npz": "GENERATION_RESOLVED_HIERARCHY_INDEX_NPZ",
+        "start_pose": "GENERATION_RESOLVED_START_POSE",
     }
     lines = [
         "# Generated by scheduling/resolve_assets.py",

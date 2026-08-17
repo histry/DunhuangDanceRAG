@@ -2,7 +2,7 @@
 
 ## 1. 实现边界
 
-本模块优化的是整曲离散 Event 路由，不修改 V45/V46 的局部动作生成器，也不
+本模块优化的是整曲离散 Event 路由，不修改 the boundary refiner and motion diffusion 的局部动作生成器，也不
 把 Event ID 当作连续姿态变量。最终决策对象是每个音乐 slot 的候选概率：
 
 \[
@@ -67,12 +67,12 @@ python -m events.intrinsic_geometry `
 
 新增字段：
 
-- `v46_55_route_geometry_schema_version`；
-- `v46_55_entry_rotation_matrix`，形状 `[N,24,3,3]`；
-- `v46_55_exit_rotation_matrix`，形状 `[N,24,3,3]`。
+- `graph_route_route_geometry_schema_version`；
+- `graph_route_entry_rotation_matrix`，形状 `[N,24,3,3]`；
+- `graph_route_exit_rotation_matrix`，形状 `[N,24,3,3]`。
 
 字段来自投影后的合法 SO(3) 矩阵，不直接比较未约束 Rot6D 通道。历史
-`v46_53_geometry_schema_version` 和 112 维 Grounder 描述符保持不变，因此
+`event_geometry_geometry_schema_version` 和 112 维 Grounder 描述符保持不变，因此
 不会使已有 Grounder checkpoint 因新增路由字段失效。
 
 ## 4. 第一层：可选 Lorentz 边因子
@@ -82,13 +82,13 @@ python -m events.intrinsic_geometry `
 ```powershell
 python -m grounding.mixed_curvature embed `
   --db D:\path\events.npz `
-  --checkpoint D:\path\v46_53_mixed_curvature_grounder.pt
+  --checkpoint D:\path\event_geometry_mixed_curvature_grounder.pt
 ```
 
 随后设置：
 
 ```powershell
-$env:V46_55_REQUIRE_LORENTZ_EDGE = "1"
+$env:GRAPH_ROUTE_REQUIRE_LORENTZ_EDGE = "1"
 ```
 
 如果仍在使用 legacy Grounder，应保持为 `0`。代码会在报告中记录 Lorentz
@@ -99,9 +99,9 @@ $env:V46_55_REQUIRE_LORENTZ_EDGE = "1"
 可参考 `configs/fisher_rao_graph_sb.env.example`：
 
 ```powershell
-$env:V46_55_ROUTE_SOLVER = "fisher_rao_graph_sb"
-$env:V46_55_REQUIRE_SO3_EDGE = "1"
-$env:V46_55_SB_ALLOW_LEGACY_FALLBACK = "1"
+$env:GRAPH_ROUTE_SOLVER = "fisher_rao_graph_sb"
+$env:GRAPH_ROUTE_REQUIRE_SO3_EDGE = "1"
+$env:GRAPH_ROUTE_SB_ALLOW_LEGACY_FALLBACK = "1"
 ```
 
 正常运行现有：
@@ -110,8 +110,8 @@ $env:V46_55_SB_ALLOW_LEGACY_FALLBACK = "1"
 python -m routing.closed_loop generate ...
 ```
 
-最终报告同时保留兼容字段 `v46_53_global_route`，并新增
-`v46_55_graph_sb_route`，其中包括：
+最终报告同时保留兼容字段 `event_geometry_global_route`，并新增
+`graph_route_graph_sb_route`，其中包括：
 
 - IPF 迭代数、最大 L1 和 Fisher–Rao 边际残差；
 - 路径熵和 MAP log probability；
@@ -126,22 +126,22 @@ python -m routing.closed_loop generate ...
 ### 生成安全策略
 
 ```powershell
-$env:V46_55_SB_ALLOW_LEGACY_FALLBACK = "1"
+$env:GRAPH_ROUTE_SB_ALLOW_LEGACY_FALLBACK = "1"
 ```
 
 IPF 不收敛、图出现死路或历史约束耗尽时，回退到原有全局 beam。回退不是
 静默行为：顶层报告 schema 保持为
-`v46_55_fisher_rao_graph_sb_fallback_v1`，同时写入兼容字段
-`v46_53_global_route` 和专用字段 `v46_55_graph_sb_route`。其中保留
+`graph_route_fisher_rao_graph_sb_fallback_v1`，同时写入兼容字段
+`event_geometry_global_route` 和专用字段 `graph_route_graph_sb_route`。其中保留
 `requested_solver`、完整失败原因、Graph-SB 尝试记录以及嵌套的 legacy 路由
-报告，避免 fallback 后被 V46.53 schema 覆盖。
+报告，避免 fallback 后被 Event Geometry schema 覆盖。
 
 ### 论文严格评估策略
 
 ```powershell
-$env:V46_55_SB_ALLOW_LEGACY_FALLBACK = "0"
-$env:V46_55_REQUIRE_SO3_EDGE = "1"
-$env:V46_55_REQUIRE_LORENTZ_EDGE = "1"
+$env:GRAPH_ROUTE_SB_ALLOW_LEGACY_FALLBACK = "0"
+$env:GRAPH_ROUTE_REQUIRE_SO3_EDGE = "1"
+$env:GRAPH_ROUTE_REQUIRE_LORENTZ_EDGE = "1"
 ```
 
 严格实验必须 fail closed，不能把 Graph-SB 与 legacy beam 的结果混在同一

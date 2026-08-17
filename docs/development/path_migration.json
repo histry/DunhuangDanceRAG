@@ -125,7 +125,7 @@
   "tools/v46_52_build_event_db.py": "events/anatomy_pipeline.py",
   "tools/v46_52_build_retarget_cache.py": "retargeting/build_cache.py",
   "tools/v46_52_filter_event_db.py": "events/filter_anatomy.py",
-  "tools/v46_52_heading_closed_loop.py": "routing/heading_closed_loop_impl2.py",
+  "tools/v46_52_heading_closed_loop.py": "routing/anatomy_heading_closed_loop.py",
   "tools/v46_53_1_anatomy_retarget.py": "retargeting/anatomy_retarget.py",
   "tools/v46_53_1_preflight.py": "evaluation/preflight.py",
   "tools/v46_53_boundary_contract.py": "contracts/boundary.py",

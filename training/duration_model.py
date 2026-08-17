@@ -25,7 +25,7 @@ from motion_geometry.rotations import (
     convert_motion_rot6d_layout_np,
 )
 from scheduling.duration_features import (
-    build_v23_condition,
+    build_duration_model_condition,
     duration_bin_ids,
     inverse_time_map,
     make_fast_turn_corruption_v2,
@@ -191,7 +191,7 @@ def build_dataset(args: argparse.Namespace) -> int:
                 corrupted_start = int(info["corrupted_turn_start"])
                 corrupted_end = int(info["corrupted_turn_end"])
                 identity = 0.0
-            condition = build_v23_condition(
+            condition = build_duration_model_condition(
                 corrupted,
                 corrupted_start,
                 corrupted_end,

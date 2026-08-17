@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Music-dominant whole-song ChoreoRAG scheduler.
 
-Main change from the previous V26:
+Main change from the previous Whole-Song Planner:
 - music controls phrase speed and transition intent;
 - natural duration is a feasibility/calibration constraint;
 - boundary dynamics defines a physical minimum transition length;
@@ -171,7 +171,7 @@ def smootherstep01(value: float) -> float:
 def dampen_event_edges(motion: np.ndarray, edge_frames: int, strength: float) -> np.ndarray:
     """Blend event edges toward low-velocity ease curves.
 
-    V23 preserves the event's internal monotonic timing, but whole-song stitching
+    Duration Model preserves the event's internal monotonic timing, but whole-song stitching
     can still expose high outgoing/incoming velocity at event boundaries.  This
     local C2-style edge damping leaves the event center untouched and only
     regularizes the first/last few frames before transitions are built.
@@ -864,7 +864,7 @@ def choose_events(
                 )
         if not expanded:
             raise RuntimeError(
-                f"No V26 candidate for phrase {slot}. Increase candidate_top_k/graph_node_top_k or relax hard pruning."
+                f"No Whole-Song Planner candidate for phrase {slot}. Increase candidate_top_k/graph_node_top_k or relax hard pruning."
             )
         expanded.sort(key=lambda state: state.score, reverse=True)
         beam = expanded[: args.beam_size]
@@ -913,7 +913,7 @@ def generate_one(
     motions,
     router,
     transition_bundle,
-    v23_bundle,
+    duration_model_bundle,
     planner_bundle,
     device,
     args,
@@ -1053,11 +1053,11 @@ def generate_one(
         content, report = resample_event(
             motions[idx],
             int(target_len),
-            v23_bundle,
+            duration_model_bundle,
             device,
             fps=float(args.fps),
-            min_turn_angle=args.v23_min_turn_angle,
-            min_peak_dps=args.v23_min_peak_dps,
+            min_turn_angle=args.duration_model_min_turn_angle,
+            min_peak_dps=args.duration_model_min_peak_dps,
         )
         # Edge damping changes Root-Y and joint rotations, so floor
         # canonicalization must be the final event-local geometry operation
@@ -1190,7 +1190,7 @@ def generate_one(
     motion = np.concatenate(pieces, axis=0).astype(np.float32)
     if len(motion) != len(features):
         raise AssertionError(
-            f"V26 output length mismatch: generated={len(motion)} music_frames={len(features)}. "
+            f"Whole-Song Planner output length mismatch: generated={len(motion)} music_frames={len(features)}. "
             "No pad/trim fallback is permitted."
         )
     if args.start_pose:
@@ -1203,13 +1203,13 @@ def generate_one(
             )
 
     report = {
-        "version": "v26_music_dominant_whole_song_choreorag",
+        "version": "whole_song_music_dominant_whole_song_choreorag",
         "audio": str(audio_path),
         "audio_meta": audio_meta,
         "rotation_contract": {
             "motion_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
             "event_index_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
-            "duration_checkpoint_rot6d_layout": v23_bundle.get("rot6d_layout"),
+            "duration_checkpoint_rot6d_layout": duration_model_bundle.get("rot6d_layout"),
             "transition_checkpoint_rot6d_layout": (
                 transition_bundle.get("rot6d_layout")
                 if transition_bundle is not None
@@ -1318,7 +1318,7 @@ def main() -> None:
     parser.add_argument("--music_glob", default="")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--router_ckpt", required=True)
-    parser.add_argument("--v23_ckpt", required=True)
+    parser.add_argument("--duration_model_ckpt", required=True)
     parser.add_argument("--planner_ckpt", default="")
     parser.add_argument("--transition_ckpt", default="")
     parser.add_argument("--transition_diffusion_ckpt", default="")
@@ -1475,8 +1475,8 @@ def main() -> None:
     parser.add_argument("--physical_velocity_frames", type=float, default=10.0)
     parser.add_argument("--physical_acceleration_frames", type=float, default=8.0)
     parser.add_argument("--physical_contact_frames", type=float, default=8.0)
-    parser.add_argument("--v23_min_turn_angle", type=float, default=10.0)
-    parser.add_argument("--v23_min_peak_dps", type=float, default=14.0)
+    parser.add_argument("--duration_model_min_turn_angle", type=float, default=10.0)
+    parser.add_argument("--duration_model_min_peak_dps", type=float, default=14.0)
     args = parser.parse_args()
     if args.fps <= 0.0 or args.frame_parameters_fps <= 0.0:
         raise ValueError("fps and frame_parameters_fps must be positive")
@@ -1549,7 +1549,7 @@ def main() -> None:
         args.duration_index_npz,
     )
     validate_scheduler_checkpoint(
-        args.v23_ckpt,
+        args.duration_model_ckpt,
         "Duration",
         float(args.fps),
         metadata["event_db_contract"],
@@ -1580,15 +1580,15 @@ def main() -> None:
         if args.transition_diffusion and args.transition_diffusion_ckpt
         else None
     )
-    v23_bundle = load_duration_checkpoint(args.v23_ckpt, device=device)
+    duration_model_bundle = load_duration_checkpoint(args.duration_model_ckpt, device=device)
     planner_bundle = load_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
 
     summary = {
-        "version": "v26_music_dominant_whole_song_choreorag",
+        "version": "whole_song_music_dominant_whole_song_choreorag",
         "rotation_contract": {
             "motion_rot6d_layout": CANONICAL_ROT6D_LAYOUT,
             "event_index_rot6d_layout": metadata["rot6d_layout"],
-            "duration_checkpoint_rot6d_layout": v23_bundle.get("rot6d_layout"),
+            "duration_checkpoint_rot6d_layout": duration_model_bundle.get("rot6d_layout"),
             "transition_checkpoint_rot6d_layout": (
                 transition_bundle.get("rot6d_layout")
                 if transition_bundle is not None
@@ -1602,7 +1602,7 @@ def main() -> None:
         },
         "planner_ckpt": args.planner_ckpt,
         "router_ckpt": args.router_ckpt,
-        "v23_ckpt": args.v23_ckpt,
+        "duration_model_ckpt": args.duration_model_ckpt,
         "transition_ckpt": args.transition_ckpt,
         "event_db_contract": dict(metadata["event_db_contract"]),
         "results": {},
@@ -1616,14 +1616,14 @@ def main() -> None:
             motions,
             router,
             transition_bundle,
-            v23_bundle,
+            duration_model_bundle,
             planner_bundle,
             device,
             args,
         )
         key = path.stem
-        npy_path = out_dir / f"{key}_v26.npy"
-        report_path = out_dir / f"{key}_v26.schedule_report.json"
+        npy_path = out_dir / f"{key}.whole_song.npy"
+        report_path = out_dir / f"{key}.whole_song.schedule_report.json"
         np.save(npy_path, motion[None].astype(np.float32))
         report["out_npy"] = str(npy_path)
         report_path.write_text(json.dumps(json_safe(report), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1637,7 +1637,7 @@ def main() -> None:
         }
         print(f"[SAVED] {key}: frames={len(motion)} phrases={len(report['schedule'])}")
 
-    summary_path = out_dir / "V26_WHOLE_SONG_SUMMARY.json"
+    summary_path = out_dir / "WHOLE_SONG_SUMMARY.json"
     summary_path.write_text(json.dumps(json_safe(summary), ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"summary: {summary_path}")
 

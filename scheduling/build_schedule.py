@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.51 rebuild a strict MSSD transaction from the current WAV.
+"""Fresh-Audio Generation rebuild a strict MSSD transaction from the current WAV.
 
 This script never searches for or reuses an old MSSD.  It creates a unique
-run-local feature cache and raw V26 schedule directory, invokes the current
-V21/V26/V23 scheduler directly from the supplied WAV, converts the resulting
-report to the existing V46.38 MSSD schema, stamps immutable provenance, and
-runs the V46.51 Audio–Schedule Contract before returning success.
+run-local feature cache and raw Whole-Song Planner schedule directory, invokes the current
+Music Router, Whole-Song Planner, and Duration Model scheduler directly from the supplied WAV, converts the resulting
+report to the existing Semantic Routing MSSD schema, stamps immutable provenance, and
+runs the Fresh-Audio Generation Audio–Schedule Contract before returning success.
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def run_checked(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Build a fresh current-WAV V21/V26/V23 MSSD transaction"
+        description="Build a fresh current-WAV Music Router, Whole-Song Planner, and Duration Model MSSD transaction"
     )
     ap.add_argument("--audio", required=True)
     ap.add_argument("--out_json", required=True)
@@ -75,7 +75,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ap.add_argument("--router_ckpt", required=True)
     ap.add_argument("--planner_ckpt", required=True)
-    ap.add_argument("--v23_ckpt", required=True)
+    ap.add_argument("--duration_model_ckpt", required=True)
     ap.add_argument("--index_json", required=True)
     ap.add_argument("--duration_index_npz", required=True)
     ap.add_argument("--hierarchy_index_npz", default="")
@@ -186,11 +186,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     audio = require_file(args.audio, "audio")
     router_ckpt = require_file(args.router_ckpt, "router checkpoint")
     planner_ckpt = require_file(args.planner_ckpt, "planner checkpoint")
-    v23_ckpt = require_file(args.v23_ckpt, "V23 checkpoint")
-    index_json = require_file(args.index_json, "V21 index JSON")
+    duration_model_ckpt = require_file(args.duration_model_ckpt, "Duration Model checkpoint")
+    index_json = require_file(args.index_json, "Music Router index JSON")
     duration_npz = require_file(
         args.duration_index_npz,
-        "V26 duration index NPZ",
+        "Whole-Song Planner duration index NPZ",
     )
 
     hierarchy = (
@@ -232,7 +232,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_schedule_dir = run_dir / "raw_v26_schedule"
+    raw_schedule_dir = run_dir / "raw_whole_song_schedule"
     feature_dir = run_dir / "music_features"
     deep_cache = (
         Path(args.deep_music_cache).expanduser().resolve()
@@ -259,8 +259,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(router_ckpt),
         "--planner_ckpt",
         str(planner_ckpt),
-        "--v23_ckpt",
-        str(v23_ckpt),
+        "--duration_model_ckpt",
+        str(duration_model_ckpt),
         "--feature_dir",
         str(feature_dir),
         "--deep_music_cache",
@@ -425,16 +425,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         python_paths.append(env["PYTHONPATH"])
 
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
-    env["V46_51_SCHEDULE_RUN_ID"] = str(args.run_id)
+    env["GENERATION_SCHEDULE_RUN_ID"] = str(args.run_id)
     run_checked(scheduler_cmd, env=env)
 
     raw_report = (
         raw_schedule_dir
-        / f"{audio.stem}_v26.schedule_report.json"
+        / f"{audio.stem}.whole_song.schedule_report.json"
     )
     if not raw_report.is_file():
         raise RuntimeError(
-            f"Fresh V26 scheduler did not produce expected report: {raw_report}"
+            f"Fresh Whole-Song Planner scheduler did not produce expected report: {raw_report}"
         )
 
     temporary_descriptor = run_dir / "descriptor_unstamped.json"
@@ -450,8 +450,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(router_ckpt),
         "--planner_ckpt",
         str(planner_ckpt),
-        "--v23_ckpt",
-        str(v23_ckpt),
+        "--duration_model_ckpt",
+        str(duration_model_ckpt),
         "--index_json",
         str(index_json),
         "--duration_index_npz",
@@ -481,7 +481,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     assets = {
         "router_ckpt": router_ckpt,
         "planner_ckpt": planner_ckpt,
-        "v23_ckpt": v23_ckpt,
+        "duration_model_ckpt": duration_model_ckpt,
         "index_json": index_json,
         "duration_index_npz": duration_npz,
         "hierarchy_index_npz": hierarchy,
@@ -501,7 +501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         assets=assets,
         hash_assets=bool(args.hash_assets),
     )
-    stamped["v46_51_scheduler_policy"] = {
+    stamped["fresh_audio_scheduler_policy"] = {
         "fresh_schedule_each_generation": True,
         "old_mssd_reuse": False,
         "unique_feature_cache": True,
@@ -555,12 +555,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     build_report = {
-        "schema": "v46_51_fresh_wav_mssd_build",
+        "schema": "fresh_audio_fresh_wav_mssd_build",
         "ok": True,
         "run_id": args.run_id,
         "run_dir": str(run_dir),
         "audio": stamped.get("provenance", {})
-        .get("v46_51", {})
+        .get("motion_51", {})
         .get("audio", {}),
         "out_json": str(out_json),
         "contract_json": str(contract_path),
@@ -579,7 +579,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "music_independent_hard_constraints"
         ],
     }
-    build_report_path = run_dir / "v46_51_fresh_mssd_build.json"
+    build_report_path = run_dir / "fresh_audio_fresh_mssd_build.json"
     save_json(build_report, build_report_path)
     print(json.dumps(build_report, ensure_ascii=False, indent=2))
     return 0

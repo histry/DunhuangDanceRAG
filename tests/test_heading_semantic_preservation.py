@@ -27,10 +27,10 @@ def _turning_positions(frames: int = 90) -> tuple[np.ndarray, dict[int, int]]:
 
 def test_known_whirl_semantics_cannot_be_heading_stabilized(monkeypatch):
     positions, mapping = _turning_positions()
-    monkeypatch.setenv("V46_49_HEADING_MODE", "stabilize")
-    monkeypatch.setenv("V46_49_HEADING_MIN_DRIFT_DEG_S", "1")
-    monkeypatch.setenv("V46_49_HEADING_MIN_PERSIST_SECONDS", "0.1")
-    monkeypatch.setenv("V46_49_HEADING_DIRECTION_CONSISTENCY", "0.5")
+    monkeypatch.setenv("SOURCE_HEADING_MODE", "stabilize")
+    monkeypatch.setenv("SOURCE_HEADING_MIN_DRIFT_DEG_S", "1")
+    monkeypatch.setenv("SOURCE_HEADING_MIN_PERSIST_SECONDS", "0.1")
+    monkeypatch.setenv("SOURCE_HEADING_DIRECTION_CONSISTENCY", "0.5")
 
     corrected, report = stabilize_source_heading_positions(
         positions,

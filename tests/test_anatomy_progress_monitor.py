@@ -4,7 +4,7 @@ from routing.anatomy_feature_cache import AnatomyProgressMonitor
 
 
 def test_progress_monitor_emits_auditable_rows(monkeypatch):
-    monkeypatch.setenv("V46_52_ANATOMY_PROGRESS_ENABLE", "1")
+    monkeypatch.setenv("RETARGET_ANATOMY_PROGRESS_ENABLE", "1")
     stream = io.StringIO()
     monitor = AnatomyProgressMonitor(stream=stream)
     monitor.start(3, {"beam": 4, "topk": 8})

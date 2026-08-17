@@ -17,7 +17,7 @@ from motion_geometry.rotations import (
 from motion_geometry.smpl24 import skeleton_contract
 from support.event_identity import make_event_db_contract
 from training.motion_models import (
-    V46Config,
+    MotionGenerationConfig,
     _descriptor_values_in_training_coordinates,
     _training_db_contract,
     _validate_source_disjoint,
@@ -57,14 +57,14 @@ def _database(count=2, fps=30.0, sources=None):
 
 class MotionTrainingContractTests(unittest.TestCase):
     def test_training_db_rejects_false_fps_contract(self):
-        cfg = V46Config()
+        cfg = MotionGenerationConfig()
         cfg.fps = 60.0
         with self.assertRaisesRegex(RuntimeError, "does not match"):
             _training_db_contract(_database(fps=30.0), cfg, "test")
 
     def test_motion_config_uses_normalized_pipeline_fps(self):
-        with mock.patch.dict(os.environ, {"V46_FPS": "60"}, clear=False):
-            cfg = V46Config().apply_env()
+        with mock.patch.dict(os.environ, {"MOTION_FPS": "60"}, clear=False):
+            cfg = MotionGenerationConfig().apply_env()
         self.assertEqual(cfg.fps, 60.0)
 
     def test_validation_sources_must_be_disjoint(self):
@@ -118,18 +118,18 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertTrue(np.allclose(angle, (np.pi - 1.0e-5) * 0.5, atol=2.0e-4))
 
     def test_checkpoint_must_match_generation_event_database(self):
-        cfg = V46Config()
+        cfg = MotionGenerationConfig()
         cfg._event_db_contract = make_event_db_contract(["evt_a"])
         checkpoint = {
-            "motion_contract": motion_checkpoint_contract(cfg, "v45_refiner"),
+            "motion_contract": motion_checkpoint_contract(cfg, "boundary_refiner"),
             "training_event_db_contract": make_event_db_contract(["evt_b"]),
         }
         with self.assertRaisesRegex(RuntimeError, "checkpoint/Generation"):
             assert_motion_checkpoint_contract(
-                checkpoint, cfg, "refiner.pt", "v45_refiner"
+                checkpoint, cfg, "refiner.pt", "boundary_refiner"
             )
 
-    def test_v45_v46_cli_accepts_source_disjoint_validation_db(self):
+    def test_motion_refiner_motion_cli_accepts_source_disjoint_validation_db(self):
         refiner = parse_args([
             "train-refiner", "--db", "train.npz", "--val_db", "val.npz", "--out", "out.pt"
         ])

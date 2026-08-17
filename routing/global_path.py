@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.53 whole-song closed loop.
+"""Geometry-Aware Routing whole-song closed loop.
 
-This module keeps the public V46.52 Fresh-WAV/Heading/Anatomy transaction and
+This module keeps the public Anatomy-Heading Fresh-WAV/Heading/Anatomy transaction and
 adds the strongest low-resource-safe parts of the research reconstruction:
 
 - dual-branch semantic + intrinsic-geometry candidate grounding;
@@ -12,8 +12,8 @@ adds the strongest low-resource-safe parts of the research reconstruction:
 - bidirectional tangent-space transition risk;
 - observability-aware hard rejection;
 - frame x joint risk masks;
-- tangent-space masked merge after V45/V46/IK;
-- final anatomy rollback inherited from V46.52.
+- tangent-space masked merge after Motion Refiner and Motion Diffusion/IK;
+- final anatomy rollback inherited from Anatomy-Heading.
 
 No Event core is globally redrawn.  All neural edits remain bounded by the
 existing seam mask and the new joint-level risk mask.
@@ -50,7 +50,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import routing.heading_closed_loop_impl2 as v52
+import routing.anatomy_heading_closed_loop as anatomy_heading_runtime
 from contracts.boundary import (
     audit_motion,
     build_frame_joint_risk_mask,
@@ -73,17 +73,17 @@ from scheduling.schedule_hard_constraints import (
     DEFAULT_MIN_UNIQUE_EVENTS,
 )
 
-SCHEMA = "v46_53_geometry_probabilistic_eventrag_closed_loop"
+SCHEMA = "event_geometry_geometry_probabilistic_eventrag_closed_loop"
 # Cross-module edge contract.  The numerical implementation lives in
 # routing.event_graph_geometry; keeping the field list here makes the final
 # closed-loop dependency explicit and auditable.
 ROUTE_EDGE_CONTRACT_FIELDS = (
-    "v46_53_entry_root_velocity_mps",
-    "v46_53_exit_root_velocity_mps",
+    "event_geometry_entry_root_velocity_mps",
+    "event_geometry_exit_root_velocity_mps",
     "entry_floor_offset_m",
     "exit_floor_offset_m",
-    "v46_55_entry_rotation_matrix",
-    "v46_55_exit_rotation_matrix",
+    "graph_route_entry_rotation_matrix",
+    "graph_route_exit_rotation_matrix",
 )
 _INSTALLED = False
 _RUNTIME: Optional[GroundingRuntime] = None
@@ -124,19 +124,19 @@ def _runtime(db: Mapping[str, Any]) -> GroundingRuntime:
     global _RUNTIME, _RUNTIME_DB_ID
     identity = id(db)
     if _RUNTIME is None or _RUNTIME_DB_ID != identity:
-        ckpt = str(os.environ.get("V46_53_GROUNDER_CKPT", "")).strip()
+        ckpt = str(os.environ.get("GROUNDING_GROUNDER_CKPT", "")).strip()
         if not ckpt:
             out_root = str(os.environ.get("OUT_ROOT", "")).strip()
             if out_root:
                 architecture = str(
                     os.environ.get(
-                        "V46_53_GROUNDER_ARCHITECTURE", "legacy"
+                        "GROUNDING_GROUNDER_ARCHITECTURE", "legacy"
                     )
                 ).strip().lower()
                 name = (
-                    "v46_53_mixed_curvature_grounder.pt"
+                    "event_geometry_mixed_curvature_grounder.pt"
                     if architecture == "mixed"
-                    else "v46_53_dual_branch_grounder.pt"
+                    else "event_geometry_dual_branch_grounder.pt"
                 )
                 ckpt = str(Path(out_root) / name)
         _RUNTIME = GroundingRuntime(db, ckpt)
@@ -172,20 +172,20 @@ def _legacy_global_route_preorder(
 ) -> List[List[int]]:
     """Entropy-regularised global beam path used only to pre-order candidates.
 
-    The existing V46.52 simulator still performs the authoritative physical and
+    The existing Anatomy-Heading simulator still performs the authoritative physical and
     anatomy check.  This layer prevents local top-1 choices from creating an
     obviously poor long-range family/posture path.
     """
     global _GLOBAL_ROUTE_REPORT
-    if not _env_bool("V46_53_GLOBAL_ROUTE_ENABLE", True):
+    if not _env_bool("GROUNDING_GLOBAL_ROUTE_ENABLE", True):
         return [list(map(int, x)) for x in candidate_lists]
     banned = banned or {}
     candidate_lists, performer_policy = resolve_candidate_policy(candidate_lists, db)
     runtime = _runtime(db)
-    beam_size = max(1, _env_int("V46_53_GLOBAL_ROUTE_BEAM", 32))
-    topk = max(1, _env_int("V46_53_GLOBAL_ROUTE_TOPK", 20))
-    entropy_eps = _env_float("V46_53_GLOBAL_ROUTE_ENTROPY", 0.08)
-    repeat_w = _env_float("V46_53_GLOBAL_REPEAT_W", 0.16)
+    beam_size = max(1, _env_int("GROUNDING_GLOBAL_ROUTE_BEAM", 32))
+    topk = max(1, _env_int("GROUNDING_GLOBAL_ROUTE_TOPK", 20))
+    entropy_eps = _env_float("GROUNDING_GLOBAL_ROUTE_ENTROPY", 0.08)
+    repeat_w = _env_float("GROUNDING_GLOBAL_REPEAT_W", 0.16)
 
     beams: List[Tuple[float, List[int], Dict[str, int]]] = [(0.0, [], {})]
     trace: List[Dict[str, Any]] = []
@@ -195,18 +195,18 @@ def _legacy_global_route_preorder(
             if int(e) not in banned.get(i, set()) and 0 <= int(e) < len(np.asarray(db["paths"]))
         ][:topk]
         if not candidates:
-            raise RuntimeError(f"V46.53 global route has no candidates for slot {i}")
+            raise RuntimeError(f"Geometry-Aware Routing global route has no candidates for slot {i}")
         new: List[Tuple[float, List[int], Dict[str, int]]] = []
         unary_rows = []
         for rank, event_id in enumerate(candidates):
             association = runtime.score(slot, event_id)
-            quality = float(_db_value(db, "v46_53_combined_quality", event_id, _db_value(db, "event_quality_scores", event_id, 0.5)))
+            quality = float(_db_value(db, "event_geometry_combined_quality", event_id, _db_value(db, "event_quality_scores", event_id, 0.5)))
             anatomy = float(_db_value(db, "anatomy_quality", event_id, 0.5))
             prior = math.exp(-rank / max(1.0, topk / 4.0))
             unary = (
-                _env_float("V46_53_GLOBAL_GROUND_W", 1.05) * association
-                + _env_float("V46_53_GLOBAL_QUALITY_W", 0.35) * quality
-                + _env_float("V46_53_GLOBAL_ANATOMY_W", 0.25) * anatomy
+                _env_float("GROUNDING_GLOBAL_GROUND_W", 1.05) * association
+                + _env_float("GROUNDING_GLOBAL_QUALITY_W", 0.35) * quality
+                + _env_float("GROUNDING_GLOBAL_ANATOMY_W", 0.25) * anatomy
                 + entropy_eps * math.log(max(prior, 1e-8))
             )
             unary_rows.append({"event_id": event_id, "rank": rank, "association": association, "unary": unary})
@@ -233,7 +233,7 @@ def _legacy_global_route_preorder(
                 new.append((score + step_score, path + [event_id], ns))
         if not new:
             raise RuntimeError(
-                "V46.53 global route diversity/cooldown contract exhausted "
+                "Geometry-Aware Routing global route diversity/cooldown contract exhausted "
                 f"all candidates for slot {i}"
             )
         new.sort(key=lambda row: row[0], reverse=True)
@@ -251,10 +251,10 @@ def _legacy_global_route_preorder(
         source="legacy_beam",
     )
     _GLOBAL_ROUTE_REPORT = {
-        "schema": "v46_53_entropy_regularised_global_event_path",
+        "schema": "event_geometry_entropy_regularised_global_event_path",
         "solver": "legacy_beam",
         "exact_solver_claim": False,
-        "description": "Schroedinger-inspired entropic discrete path prior followed by V46.52 simulated physical reselection",
+        "description": "Schroedinger-inspired entropic discrete path prior followed by Anatomy-Heading simulated physical reselection",
         "beam_size": beam_size,
         "candidate_topk": topk,
         "chosen_event_path": chosen,
@@ -279,7 +279,7 @@ def _route_unary(
     quality = float(
         _db_value(
             db,
-            "v46_53_combined_quality",
+            "event_geometry_combined_quality",
             event_id,
             _db_value(db, "event_quality_scores", event_id, 0.5),
         )
@@ -287,10 +287,10 @@ def _route_unary(
     anatomy = float(_db_value(db, "anatomy_quality", event_id, 0.5))
     rank_prior = math.exp(-int(rank) / max(1.0, int(topk) / 4.0))
     unary = (
-        _env_float("V46_53_GLOBAL_GROUND_W", 1.05) * association
-        + _env_float("V46_53_GLOBAL_QUALITY_W", 0.35) * quality
-        + _env_float("V46_53_GLOBAL_ANATOMY_W", 0.25) * anatomy
-        + _env_float("V46_53_GLOBAL_ROUTE_ENTROPY", 0.08)
+        _env_float("GROUNDING_GLOBAL_GROUND_W", 1.05) * association
+        + _env_float("GROUNDING_GLOBAL_QUALITY_W", 0.35) * quality
+        + _env_float("GROUNDING_GLOBAL_ANATOMY_W", 0.25) * anatomy
+        + _env_float("GROUNDING_GLOBAL_ROUTE_ENTROPY", 0.08)
         * math.log(max(rank_prior, 1.0e-8))
     )
     if not np.isfinite(unary):
@@ -330,9 +330,9 @@ def _prepare_graph_layers(
     layers: List[List[int]] = []
     target_marginals: List[np.ndarray] = []
     traces: List[Dict[str, Any]] = []
-    temperature = _env_float("V46_55_FR_TEMPERATURE", 0.65)
+    temperature = _env_float("GRAPH_ROUTE_FR_TEMPERATURE", 0.65)
     strength = float(
-        np.clip(_env_float("V46_55_FR_MARGINAL_STRENGTH", 0.90), 0.0, 1.0)
+        np.clip(_env_float("GRAPH_ROUTE_FR_MARGINAL_STRENGTH", 0.90), 0.0, 1.0)
     )
 
     for slot_id, slot in enumerate(slots):
@@ -361,7 +361,7 @@ def _prepare_graph_layers(
                 break
         if not candidates:
             raise RuntimeError(
-                "V46.55 time-expanded graph has no immutable-valid candidates "
+                "Graph Route time-expanded graph has no immutable-valid candidates "
                 f"for slot {slot_id}; rejected={rejected[:12]}"
             )
 
@@ -403,9 +403,9 @@ def _build_graph_edges(
     costs: List[np.ndarray] = []
     masks: List[np.ndarray] = []
     reports: List[Dict[str, Any]] = []
-    repeat_weight = _env_float("V46_53_GLOBAL_REPEAT_W", 0.16)
+    repeat_weight = _env_float("GROUNDING_GLOBAL_REPEAT_W", 0.16)
     geometry_config = EventGraphGeometryConfig.from_environment()
-    cooldown = max(1, _env_int("V46_54_EVENT_COOLDOWN_SLOTS", 8))
+    cooldown = max(1, _env_int("ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS", 8))
 
     for time in range(len(layers) - 1):
         previous_layer = list(map(int, layers[time]))
@@ -424,7 +424,7 @@ def _build_graph_edges(
             )
         )
         boundary_reset = boundary_strength >= _env_float(
-            "V46_55_GRAPH_RESET_ACCENT", 0.82
+            "GRAPH_ROUTE_RESET_ACCENT", 0.82
         )
         for left_index, previous_event in enumerate(previous_layer):
             previous_family = str(
@@ -531,7 +531,7 @@ def _posterior_constrained_decode(
 ) -> tuple[List[int], Dict[str, Any]]:
     """Decode the SB posterior while preserving history-dependent contracts."""
 
-    beam_size = max(1, _env_int("V46_55_SB_DECODE_BEAM", 128))
+    beam_size = max(1, _env_int("GRAPH_ROUTE_SB_DECODE_BEAM", 128))
     beams: List[Tuple[float, List[int], List[int]]] = []
     for local_index, event_id in enumerate(layers[0]):
         assessment = diversity_assessment(db, int(event_id), [])
@@ -596,7 +596,7 @@ def _graph_sb_global_route_preorder(
 ) -> List[List[int]]:
     global _GLOBAL_ROUTE_REPORT
     blocked = banned or {}
-    topk = max(1, _env_int("V46_53_GLOBAL_ROUTE_TOPK", 20))
+    topk = max(1, _env_int("GROUNDING_GLOBAL_ROUTE_TOPK", 20))
     (
         layers,
         targets,
@@ -621,20 +621,20 @@ def _graph_sb_global_route_preorder(
     )
     if (
         total_edges > 0
-        and _env_bool("V46_55_REQUIRE_SO3_EDGE", False)
+        and _env_bool("GRAPH_ROUTE_REQUIRE_SO3_EDGE", False)
         and so3_edges != total_edges
     ):
         raise RuntimeError(
-            "V46.55 strict route requires SO(3) endpoint geometry for every "
+            "Graph Route strict route requires SO(3) endpoint geometry for every "
             f"edge, available={so3_edges}/{total_edges}; rebuild Event-DB"
         )
     if (
         total_edges > 0
-        and _env_bool("V46_55_REQUIRE_LORENTZ_EDGE", False)
+        and _env_bool("GRAPH_ROUTE_REQUIRE_LORENTZ_EDGE", False)
         and lorentz_edges != total_edges
     ):
         raise RuntimeError(
-            "V46.55 strict route requires paper-one Lorentz factors for every "
+            "Graph Route strict route requires paper-one Lorentz factors for every "
             f"edge, available={lorentz_edges}/{total_edges}; embed Event-DB "
             "with the mixed-curvature Grounder"
         )
@@ -642,10 +642,10 @@ def _graph_sb_global_route_preorder(
         targets,
         transition_costs,
         feasible_masks=feasible_masks,
-        epsilon=_env_float("V46_55_SB_EPSILON", 0.35),
-        maximum_iterations=max(1, _env_int("V46_55_SB_MAX_ITER", 300)),
-        tolerance=_env_float("V46_55_SB_TOLERANCE", 1.0e-7),
-        damping=_env_float("V46_55_SB_DAMPING", 1.0),
+        epsilon=_env_float("GRAPH_ROUTE_SB_EPSILON", 0.35),
+        maximum_iterations=max(1, _env_int("GRAPH_ROUTE_SB_MAX_ITER", 300)),
+        tolerance=_env_float("GRAPH_ROUTE_SB_TOLERANCE", 1.0e-7),
+        damping=_env_float("GRAPH_ROUTE_SB_DAMPING", 1.0),
     )
     if not result.converged:
         raise RuntimeError(
@@ -703,20 +703,20 @@ def _graph_sb_global_route_preorder(
         path_entropy=float(result.path_entropy),
     )
     _GLOBAL_ROUTE_REPORT = {
-        "schema": "v46_55_fisher_rao_discrete_graph_schrodinger_route_v1",
+        "schema": "graph_route_fisher_rao_discrete_graph_schrodinger_route_v1",
         "solver": "fisher_rao_graph_sb",
         "formal_path_measure": True,
         "continuous_sde_bridge_claim": False,
         "multi_marginal_constraints": "all music slots",
         "reference_process": "time-inhomogeneous hard-feasible Markov chain",
         "fisher_rao": {
-            "temperature": _env_float("V46_55_FR_TEMPERATURE", 0.65),
+            "temperature": _env_float("GRAPH_ROUTE_FR_TEMPERATURE", 0.65),
             "marginal_strength": _env_float(
-                "V46_55_FR_MARGINAL_STRENGTH", 0.90
+                "GRAPH_ROUTE_FR_MARGINAL_STRENGTH", 0.90
             ),
         },
         "schrodinger": {
-            "epsilon": _env_float("V46_55_SB_EPSILON", 0.35),
+            "epsilon": _env_float("GRAPH_ROUTE_SB_EPSILON", 0.35),
             "iterations": int(result.iterations),
             "converged": bool(result.converged),
             "maximum_l1_residual": float(result.maximum_l1_residual),
@@ -737,9 +737,9 @@ def _graph_sb_global_route_preorder(
             "total_edges": int(total_edges),
             "so3_edges": int(so3_edges),
             "lorentz_edges": int(lorentz_edges),
-            "require_so3": _env_bool("V46_55_REQUIRE_SO3_EDGE", False),
+            "require_so3": _env_bool("GRAPH_ROUTE_REQUIRE_SO3_EDGE", False),
             "require_lorentz": _env_bool(
-                "V46_55_REQUIRE_LORENTZ_EDGE", False
+                "GRAPH_ROUTE_REQUIRE_LORENTZ_EDGE", False
             ),
         },
         "candidate_topk": int(topk),
@@ -770,10 +770,10 @@ def _global_route_preorder(
     # failed current route to inherit the previous song's audit payload.
     _GLOBAL_ROUTE_REPORT = {}
     clear_route_prior()
-    if not _env_bool("V46_53_GLOBAL_ROUTE_ENABLE", True):
+    if not _env_bool("GROUNDING_GLOBAL_ROUTE_ENABLE", True):
         return [list(map(int, values)) for values in candidate_lists]
     solver = str(
-        os.environ.get("V46_55_ROUTE_SOLVER", "legacy_beam")
+        os.environ.get("GRAPH_ROUTE_SOLVER", "legacy_beam")
     ).strip().lower()
     if solver in {"legacy", "beam", "legacy_beam"}:
         return _legacy_global_route_preorder(
@@ -785,7 +785,7 @@ def _global_route_preorder(
         "fisher-rao-graph-sb",
     }:
         raise ValueError(
-            "V46_55_ROUTE_SOLVER must be legacy_beam or "
+            "GRAPH_ROUTE_SOLVER must be legacy_beam or "
             f"fisher_rao_graph_sb, got {solver!r}"
         )
     try:
@@ -793,7 +793,7 @@ def _global_route_preorder(
             slots, candidate_lists, db, banned=banned
         )
     except (FloatingPointError, RuntimeError, ValueError) as exc:
-        if not _env_bool("V46_55_SB_ALLOW_LEGACY_FALLBACK", True):
+        if not _env_bool("GRAPH_ROUTE_SB_ALLOW_LEGACY_FALLBACK", True):
             raise
         fallback_reason = f"{type(exc).__name__}: {exc}"
         graph_attempt_report = dict(_GLOBAL_ROUTE_REPORT)
@@ -803,7 +803,7 @@ def _global_route_preorder(
         legacy_report = dict(_GLOBAL_ROUTE_REPORT)
         _GLOBAL_ROUTE_REPORT = {
             **legacy_report,
-            "schema": "v46_55_fisher_rao_graph_sb_fallback_v1",
+            "schema": "graph_route_fisher_rao_graph_sb_fallback_v1",
             "solver": "legacy_beam",
             "requested_solver": "fisher_rao_graph_sb",
             "fallback_used": True,
@@ -818,17 +818,17 @@ def _global_route_preorder(
         return reordered
 
 
-def _install_v53_patches() -> None:
+def _install_global_path_patches() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
-    # Install all V46.52 policies first, then capture the resulting functions.
-    v52._install_patches()
-    original_proposal = v52.v4650._build_heading_proposal
-    original_apply = v52.v4650.apply_generators_with_heading_guard
-    original_assemble = v52.v4650.assemble_event_heading_reference
+    # Install all Anatomy-Heading policies first, then capture the resulting functions.
+    anatomy_heading_runtime._install_patches()
+    original_proposal = anatomy_heading_runtime.heading_runtime._build_heading_proposal
+    original_apply = anatomy_heading_runtime.heading_runtime.apply_generators_with_heading_guard
+    original_assemble = anatomy_heading_runtime.heading_runtime.assemble_event_heading_reference
 
-    def proposal_v53(*args, **kwargs):
+    def proposal_with_global_route(*args, **kwargs):
         proposal, extra = original_proposal(*args, **kwargs)
         db = kwargs.get("db")
         slot = kwargs.get("slot", {})
@@ -839,14 +839,14 @@ def _install_v53_patches() -> None:
             return proposal, extra
 
         association = _runtime(db).score(slot, event_id)
-        quality = float(_db_value(db, "v46_53_combined_quality", event_id, _db_value(db, "event_quality_scores", event_id, 0.5)))
-        structure_q = float(_db_value(db, "v46_53_structure_quality", event_id, 0.5))
+        quality = float(_db_value(db, "event_geometry_combined_quality", event_id, _db_value(db, "event_quality_scores", event_id, 0.5)))
+        structure_q = float(_db_value(db, "event_geometry_structure_quality", event_id, 0.5))
         boundary = None
         if prev is not None and len(prev) and len(proposal.core):
             boundary = transition_multiscale_risk(
-                np.asarray(prev)[-max(8, _env_int("V46_53_TANGENT_WINDOW", 8)):],
+                np.asarray(prev)[-max(8, _env_int("GROUNDING_TANGENT_WINDOW", 8)):],
                 proposal.bridge,
-                proposal.core[:max(8, _env_int("V46_53_TANGENT_WINDOW", 8))],
+                proposal.core[:max(8, _env_int("GROUNDING_TANGENT_WINDOW", 8))],
                 fps=float(getattr(cfg, "fps", 30.0)),
             )
 
@@ -856,17 +856,17 @@ def _install_v53_patches() -> None:
             0.0, 1.0,
         ))
         reward = (
-            _env_float("V46_53_ASSOCIATION_REWARD_W", 0.75) * association
-            + _env_float("V46_53_STRUCTURE_REWARD_W", 0.25) * structure_q
+            _env_float("GROUNDING_ASSOCIATION_REWARD_W", 0.75) * association
+            + _env_float("GROUNDING_STRUCTURE_REWARD_W", 0.25) * structure_q
         )
-        penalty = 0.0 if boundary is None else _env_float("V46_53_TANGENT_RISK_W", 0.55) * float(boundary["score"])
+        penalty = 0.0 if boundary is None else _env_float("GROUNDING_TANGENT_RISK_W", 0.55) * float(boundary["score"])
         hard = bool(
             (boundary is not None and boundary.get("hard_reject", False))
-            or observability < _env_float("V46_53_OBSERVABILITY_HARD_MIN", 0.22)
+            or observability < _env_float("GROUNDING_OBSERVABILITY_HARD_MIN", 0.22)
         )
         proposal.risk_score = float(proposal.risk_score + penalty - reward + (1e6 if hard else 0.0))
         proposal.safe = bool(proposal.safe and not hard)
-        proposal.risk["v46_53_grounding"] = {
+        proposal.risk["event_geometry_grounding"] = {
             "association": association,
             "quality": quality,
             "structure_quality": structure_q,
@@ -875,22 +875,22 @@ def _install_v53_patches() -> None:
             "penalty": penalty,
             "hard_reject": hard,
         }
-        proposal.risk["v46_53_tangent_boundary"] = boundary
+        proposal.risk["event_geometry_tangent_boundary"] = boundary
         extra = dict(extra)
-        extra["v46_53_grounding"] = proposal.risk["v46_53_grounding"]
-        extra["v46_53_tangent_boundary"] = boundary
+        extra["event_geometry_grounding"] = proposal.risk["event_geometry_grounding"]
+        extra["event_geometry_tangent_boundary"] = boundary
         extra.setdefault("heading_detail", {})["hard_reject"] = bool(
             extra.get("heading_detail", {}).get("hard_reject", False) or hard
         )
         return proposal, extra
 
-    def assemble_v53(v46: Any, slots: Sequence[Dict[str, Any]], candidate_lists: Sequence[Sequence[int]], db: Dict[str, Any], cfg: Any, banned: Optional[Dict[int, set]] = None):
+    def assemble_with_global_route(motion_runtime: Any, slots: Sequence[Dict[str, Any]], candidate_lists: Sequence[Sequence[int]], db: Dict[str, Any], cfg: Any, banned: Optional[Dict[int, set]] = None):
         reordered = _global_route_preorder(slots, candidate_lists, db, banned=banned)
-        return original_assemble(v46, slots, reordered, db, cfg, banned=banned)
+        return original_assemble(motion_runtime, slots, reordered, db, cfg, banned=banned)
 
-    def apply_v53(v46: Any, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: Any, cfg: Any):
-        proposal_motion, stage = original_apply(v46, motion_ref, cond, seam_mask, args, cfg)
-        if not _env_bool("V46_53_BODY_PART_MASK_ENABLE", True):
+    def apply_global_route_guard(motion_runtime: Any, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: Any, cfg: Any):
+        proposal_motion, stage = original_apply(motion_runtime, motion_ref, cond, seam_mask, args, cfg)
+        if not _env_bool("GROUNDING_BODY_PART_MASK_ENABLE", True):
             return proposal_motion, stage
         masks = build_frame_joint_risk_mask(
             motion_ref,
@@ -899,7 +899,7 @@ def _install_v53_patches() -> None:
         )
         trust_region_report: Dict[str, Any]
         if _env_bool(
-            "V46_53_RIEMANNIAN_TRUST_REGION_ENABLE",
+            "GROUNDING_RIEMANNIAN_TRUST_REGION_ENABLE",
             bool(
                 getattr(
                     cfg, "riemannian_trust_region_enable", True
@@ -915,7 +915,7 @@ def _install_v53_patches() -> None:
                         root_mask=masks["root"],
                         contact_mask=masks["contact"],
                         steps=_env_int(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_STEPS",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_STEPS",
                             int(
                                 getattr(
                                     cfg,
@@ -925,7 +925,7 @@ def _install_v53_patches() -> None:
                             ),
                         ),
                         initial_radius=_env_float(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_INITIAL_RADIUS",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_INITIAL_RADIUS",
                             float(
                                 getattr(
                                     cfg,
@@ -935,7 +935,7 @@ def _install_v53_patches() -> None:
                             ),
                         ),
                         min_radius=_env_float(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_MIN_RADIUS",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_MIN_RADIUS",
                             float(
                                 getattr(
                                     cfg,
@@ -945,7 +945,7 @@ def _install_v53_patches() -> None:
                             ),
                         ),
                         max_rotation_rad=_env_float(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_ROTATION_CAP_RAD",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_ROTATION_CAP_RAD",
                             float(
                                 getattr(
                                     cfg,
@@ -955,7 +955,7 @@ def _install_v53_patches() -> None:
                             ),
                         ),
                         max_root_m=_env_float(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_ROOT_CAP_M",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_ROOT_CAP_M",
                             float(
                                 getattr(
                                     cfg,
@@ -965,11 +965,11 @@ def _install_v53_patches() -> None:
                             ),
                         ),
                         fidelity_weight=_env_float(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_FIDELITY_WEIGHT",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_FIDELITY_WEIGHT",
                             0.35,
                         ),
                         smoothness_weight=_env_float(
-                            "V46_53_RIEMANNIAN_TRUST_REGION_SMOOTHNESS_WEIGHT",
+                            "GROUNDING_RIEMANNIAN_TRUST_REGION_SMOOTHNESS_WEIGHT",
                             0.65,
                         ),
                     )
@@ -995,57 +995,57 @@ def _install_v53_patches() -> None:
                 "enabled": False,
                 "fallback": "legacy_tangent_masked_merge",
             }
-        merged = v52.base.enforce_contract(
-            v46,
+        merged = anatomy_heading_runtime.base.enforce_contract(
+            motion_runtime,
             merged,
             cfg,
-            source_hint="v46_53_tangent_masked_merge",
+            source_hint="event_geometry_tangent_masked_merge",
         )
-        # V46.52 has already guarded proposal_motion; the second check ensures
+        # Anatomy-Heading has already guarded proposal_motion; the second check ensures
         # the tangent projection itself did not introduce a contract regression.
-        metrics = v52.anatomy_metrics_np(merged, fps=float(getattr(cfg, "fps", 30.0)))
-        ok, reasons = v52.evaluate_anatomy_contract(metrics, v52.AnatomyThresholds.from_env())
+        metrics = anatomy_heading_runtime.anatomy_metrics_np(merged, fps=float(getattr(cfg, "fps", 30.0)))
+        ok, reasons = anatomy_heading_runtime.evaluate_anatomy_contract(metrics, anatomy_heading_runtime.AnatomyThresholds.from_env())
         fallback = False
         if not ok:
-            if _env_bool("V46_53_FULL_ROLLBACK_ON_FAIL", True):
+            if _env_bool("GROUNDING_FULL_ROLLBACK_ON_FAIL", True):
                 merged = np.asarray(motion_ref, dtype=np.float32).copy()
                 fallback = True
             else:
-                raise RuntimeError("V46.53 tangent-masked merge failed anatomy contract: " + " | ".join(reasons))
-        stage["v46_53_bodypart_tangent_mask"] = {
+                raise RuntimeError("Geometry-Aware Routing tangent-masked merge failed anatomy contract: " + " | ".join(reasons))
+        stage["event_geometry_bodypart_tangent_mask"] = {
             **dict(masks["report"]),
             "riemannian_trust_region": trust_region_report,
             "anatomy_ok": bool(ok),
             "anatomy_reasons": reasons,
             "full_rollback": fallback,
         }
-        stage["v46_53_motion_audit"] = audit_motion(merged, fps=float(getattr(cfg, "fps", 30.0)))
-        # This merge occurs after V46.52's audit.  Recompute the authoritative
+        stage["event_geometry_motion_audit"] = audit_motion(merged, fps=float(getattr(cfg, "fps", 30.0)))
+        # This merge occurs after Anatomy-Heading's audit.  Recompute the authoritative
         # SI audit on the exact motion returned to the final generator gate;
         # otherwise a post-audit tangent/trust-region edit could bypass every
         # Anti-Jitter, Foot-Contact and Root-Drift acceptance limit.
-        if not hasattr(v46, "audit_motion_np"):
+        if not hasattr(motion_runtime, "audit_motion_np"):
             raise RuntimeError(
-                "V46.53 final merge requires audit_motion_np for final gating"
+                "Geometry-Aware Routing final merge requires audit_motion_np for final gating"
             )
         merged, physical_rollback = select_physical_candidate(
-            stage_name="v46_54_post_merge_physical_rollback",
+            stage_name="routing_safety_post_merge_physical_rollback",
             reference=proposal_motion,
             candidate=merged,
-            audit_fn=lambda value: v46.audit_motion_np(value, cfg),
+            audit_fn=lambda value: motion_runtime.audit_motion_np(value, cfg),
             limits=PhysicalQualityLimits.from_environment(),
-            rollback_enabled=_env_bool("V46_54_FINAL_PHYSICAL_ROLLBACK", True),
+            rollback_enabled=_env_bool("ROUTING_SAFETY_FINAL_PHYSICAL_ROLLBACK", True),
         )
         selected_audit = physical_rollback["selected_audit"]
         selected_gate = physical_rollback["selected_gate"]
-        stage["v46_54_post_merge_physical_rollback"] = physical_rollback
+        stage["routing_safety_post_merge_physical_rollback"] = physical_rollback
         stage["final_audit"] = selected_audit
         stage["final_physical_gate"] = selected_gate
         return merged.astype(np.float32), stage
 
-    v52.v4650._build_heading_proposal = proposal_v53
-    v52.v4650.assemble_event_heading_reference = assemble_v53
-    v52.v4650.apply_generators_with_heading_guard = apply_v53
+    anatomy_heading_runtime.heading_runtime._build_heading_proposal = proposal_with_global_route
+    anatomy_heading_runtime.heading_runtime.assemble_event_heading_reference = assemble_with_global_route
+    anatomy_heading_runtime.heading_runtime.apply_generators_with_heading_guard = apply_global_route_guard
     _INSTALLED = True
 
 
@@ -1060,18 +1060,18 @@ def _dynamic_duration_guard(
         contract=contract,
         fps=fps,
         output_frame_tolerance=_env_int(
-            "V46_53_OUTPUT_FRAME_TOLERANCE",
-            _env_int("V46_51_MAX_FRAME_ERROR", 2),
+            "GROUNDING_OUTPUT_FRAME_TOLERANCE",
+            _env_int("GENERATION_MAX_FRAME_ERROR", 2),
         ),
-        schedule_audio_tolerance=_env_int("V46_51_MAX_FRAME_ERROR", 2),
+        schedule_audio_tolerance=_env_int("GENERATION_MAX_FRAME_ERROR", 2),
     )
     save_duration_report(
         report,
-        output_path.with_suffix(output_path.suffix + ".v46_53_duration.json"),
+        output_path.with_suffix(output_path.suffix + ".event_geometry_duration.json"),
     )
-    if _env_bool("V46_53_ENFORCE_DYNAMIC_DURATION", True) and not report["ok"]:
+    if _env_bool("GROUNDING_ENFORCE_DYNAMIC_DURATION", True) and not report["ok"]:
         raise RuntimeError(
-            "V46.53 dynamic-duration contract failed: "
+            "Geometry-Aware Routing dynamic-duration contract failed: "
             f"actual={report['actual_output_frames']}, "
             f"schedule={report['schedule_target_frames']}, "
             f"audio={report['expected_audio_frames']}"
@@ -1093,16 +1093,16 @@ def _patch_report(
         return
     report["version"] = SCHEMA
     if _GLOBAL_ROUTE_REPORT:
-        report["v46_53_global_route"] = _GLOBAL_ROUTE_REPORT
-        if str(_GLOBAL_ROUTE_REPORT.get("schema", "")).startswith("v46_55_"):
-            report["v46_55_graph_sb_route"] = _GLOBAL_ROUTE_REPORT
-    report["v46_53_env"] = {k: v for k, v in os.environ.items() if k.startswith("V46_53_")}
-    report["v46_55_env"] = {
-        k: v for k, v in os.environ.items() if k.startswith("V46_55_")
+        report["event_geometry_global_route"] = _GLOBAL_ROUTE_REPORT
+        if str(_GLOBAL_ROUTE_REPORT.get("schema", "")).startswith("graph_route_"):
+            report["graph_route_graph_sb_route"] = _GLOBAL_ROUTE_REPORT
+    report["event_geometry_env"] = {k: v for k, v in os.environ.items() if k.startswith("GROUNDING_")}
+    report["graph_route_env"] = {
+        k: v for k, v in os.environ.items() if k.startswith("GRAPH_ROUTE_")
     }
     if duration_guard is not None:
-        report["v46_53_dynamic_duration"] = dict(duration_guard)
-    resolved_motion = v52._resolve_motion_path(
+        report["event_geometry_dynamic_duration"] = dict(duration_guard)
+    resolved_motion = anatomy_heading_runtime._resolve_motion_path(
         report_path,
         report,
         explicit_motion_path=motion_path,
@@ -1110,54 +1110,54 @@ def _patch_report(
 
     if resolved_motion is not None:
         x = np.load(resolved_motion, allow_pickle=True)
-        report["v46_53_final_intrinsic_audit"] = audit_motion(
+        report["event_geometry_final_intrinsic_audit"] = audit_motion(
             x,
             fps=float(fps),
         )
-        report["v46_53_final_motion_path"] = str(resolved_motion)
-    v52.save_json(report, report_path)
+        report["event_geometry_final_motion_path"] = str(resolved_motion)
+    anatomy_heading_runtime.save_json(report, report_path)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    audio = v52._arg_value(args, "--audio")
-    schedule = v52._arg_value(args, "--slots_json")
-    report_json = v52._arg_value(args, "--json")
-    output = v52._arg_value(args, "--out")
-    fps = v52._runtime_fps(args)
+    audio = anatomy_heading_runtime._arg_value(args, "--audio")
+    schedule = anatomy_heading_runtime._arg_value(args, "--slots_json")
+    report_json = anatomy_heading_runtime._arg_value(args, "--json")
+    output = anatomy_heading_runtime._arg_value(args, "--out")
+    fps = anatomy_heading_runtime._runtime_fps(args)
     if not audio or not schedule or not output:
-        raise RuntimeError("V46.53 requires --audio, a fresh --slots_json, and --out")
-    required_run_id = os.environ.get("V46_51_SCHEDULE_RUN_ID")
+        raise RuntimeError("Geometry-Aware Routing requires --audio, a fresh --slots_json, and --out")
+    required_run_id = os.environ.get("GENERATION_SCHEDULE_RUN_ID")
     if not required_run_id:
-        raise RuntimeError("V46_51_SCHEDULE_RUN_ID is required")
-    contract = v52.audit_contract(
+        raise RuntimeError("GENERATION_SCHEDULE_RUN_ID is required")
+    contract = anatomy_heading_runtime.audit_contract(
         audio=audio,
         schedule=schedule,
         fps=fps,
         required_run_id=required_run_id,
         require_fresh=True,
-        max_frame_error=int(float(os.environ.get("V46_51_MAX_FRAME_ERROR", "2"))),
-        max_seconds_error=float(os.environ.get("V46_51_MAX_SECONDS_ERROR", "0.10")),
+        max_frame_error=int(float(os.environ.get("GENERATION_MAX_FRAME_ERROR", "2"))),
+        max_seconds_error=float(os.environ.get("GENERATION_MAX_SECONDS_ERROR", "0.10")),
         require_raw_report=True,
         max_pose_hold_ratio=_env_float(
-            "V46_51_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
+            "GENERATION_MAX_POSE_HOLD_RATIO", DEFAULT_MAX_POSE_HOLD_RATIO
         ),
         max_single_source_ratio=_env_float(
-            "V46_54_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
+            "ROUTING_SAFETY_MAX_SOURCE_SHARE", DEFAULT_MAX_SINGLE_SOURCE_RATIO
         ),
         min_unique_events=_env_int(
-            "V46_51_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
+            "GENERATION_MIN_UNIQUE_EVENTS", DEFAULT_MIN_UNIQUE_EVENTS
         ),
         min_core_frame_ratio=_env_float(
-            "V46_51_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
+            "GENERATION_MIN_CORE_FRAME_RATIO", DEFAULT_MIN_CORE_FRAME_RATIO
         ),
     )
-    v52.save_json(contract, Path(schedule).with_suffix(Path(schedule).suffix + ".pre_generate_contract.json"))
+    anatomy_heading_runtime.save_json(contract, Path(schedule).with_suffix(Path(schedule).suffix + ".pre_generate_contract.json"))
     if not contract["ok"]:
         raise RuntimeError("Fresh-WAV contract failed: " + "; ".join(contract["reasons"]))
 
-    _install_v53_patches()
-    rc = int(v52.v4650.main(args))
+    _install_global_path_patches()
+    rc = int(anatomy_heading_runtime.heading_runtime.main(args))
     duration_guard: Optional[Dict[str, Any]] = None
     if rc == 0:
         duration_guard = _dynamic_duration_guard(
@@ -1168,7 +1168,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if report_json:
         resolved_output = Path(output)
 
-        v52._patch_report(
+        anatomy_heading_runtime._patch_report(
             Path(report_json),
             contract,
             motion_path=resolved_output,

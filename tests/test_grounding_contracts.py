@@ -8,18 +8,18 @@ from grounding.model import _geometry_for_checkpoint
 
 def database(fps: float = 60.0) -> dict:
     return {
-        "v46_53_geometry_desc": np.asarray(
+        "event_geometry_geometry_desc": np.asarray(
             [[12.0, 14.0], [8.0, 6.0]], dtype=np.float32
         ),
         # Deliberately incompatible split-local values.  They must never be
         # consumed by validation/test embedding.
-        "v46_53_geometry_desc_z": np.asarray(
+        "event_geometry_geometry_desc_z": np.asarray(
             [[99.0, 99.0], [-99.0, -99.0]], dtype=np.float32
         ),
-        "v46_53_geometry_schema_version": np.asarray(
+        "event_geometry_geometry_schema_version": np.asarray(
             "geometry_v2", dtype=object
         ),
-        "v46_53_geometry_fps": np.asarray(fps, dtype=np.float32),
+        "event_geometry_geometry_fps": np.asarray(fps, dtype=np.float32),
         "skeleton_contract_json": np.asarray(
             json.dumps({"schema": "smpl24"}, sort_keys=True), dtype=object
         ),

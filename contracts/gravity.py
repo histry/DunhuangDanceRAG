@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.49 gravity/body-frame contract for EDGE 151D.
+"""Source-Gravity gravity/body-frame contract for EDGE 151D.
 
 Representation:
   [0:4]   contacts
   [4:7]   root XYZ, Y-up
   [7:151] 24 local joint rotations, column-concatenated 6D
 
-This module is deliberately independent from tools.v46_motionrag_diff to avoid
+This module is deliberately independent from training.motion_models to avoid
 circular imports when it is used as a training loss.
 """
 from __future__ import annotations

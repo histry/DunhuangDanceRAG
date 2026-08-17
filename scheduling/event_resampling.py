@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Per-event SO(3) resampling for whole-song scheduling.
 
-V23 Tau is never allowed to cross an event boundary.  Turn-bearing events use a
-V23-conditioned local time map; other events use uniform SO(3) resampling.
+Duration Model Tau is never allowed to cross an event boundary.  Turn-bearing events use a
+Duration Model-conditioned local time map; other events use uniform SO(3) resampling.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from motion_geometry.rotations import (
     normalize_rot6d_layout,
 )
 from scheduling.duration_features import (
-    build_v23_condition,
+    build_duration_model_condition,
     detect_natural_turn_events,
     extract_window_with_event,
     make_soft_event_mask,
@@ -36,7 +36,7 @@ def _uniform_positions(source_len: int, target_len: int) -> np.ndarray:
 def resample_event(
     motion: np.ndarray,
     target_len: int,
-    v23_bundle: Dict[str, Any] | None,
+    duration_model_bundle: Dict[str, Any] | None,
     device: torch.device,
     fps: float = 30.0,
     min_turn_angle: float = 10.0,
@@ -85,7 +85,7 @@ def resample_event(
         smooth_window=scaled(9),
         minimum_input_frames=scaled(24),
     )
-    if v23_bundle is None or not events:
+    if duration_model_bundle is None or not events:
         positions = _uniform_positions(len(source), target_len)
         return resample_motion_so3(source, positions).astype(np.float32), {
             "method": "uniform_so3",
@@ -96,14 +96,14 @@ def resample_event(
 
     event = max(events, key=lambda x: (x.path_angle_deg, x.peak_speed_dps))
     checkpoint_layout = normalize_rot6d_layout(
-        v23_bundle.get("rot6d_layout", ROT6D_LAYOUT_PYTORCH3D_ROW)
+        duration_model_bundle.get("rot6d_layout", ROT6D_LAYOUT_PYTORCH3D_ROW)
     )
     model_source = convert_motion_rot6d_layout_np(
         source,
         CANONICAL_ROT6D_LAYOUT,
         checkpoint_layout,
     )
-    window_len = int(v23_bundle["config"].get("window_len", 120))
+    window_len = int(duration_model_bundle["config"].get("window_len", 120))
     window, _, local_start, local_end = extract_window_with_event(
         model_source,
         event,
@@ -115,14 +115,14 @@ def resample_event(
         local_end,
         context=scaled(6),
     )
-    condition = build_v23_condition(
+    condition = build_duration_model_condition(
         window,
         local_start,
         local_end,
         fps=float(fps),
         rot6d_layout=checkpoint_layout,
     )
-    model = v23_bundle["model"]
+    model = duration_model_bundle["model"]
     with torch.no_grad():
         tau_output = model.predict_tau(
             torch.from_numpy(window[None]).to(device),
@@ -149,7 +149,7 @@ def resample_event(
     positions = np.maximum.accumulate(positions)
     result = resample_motion_so3(source, positions).astype(np.float32)
     return result, {
-        "method": "v23_local_tau",
+        "method": "duration_model_local_tau",
         "source_len": len(source),
         "target_len": target_len,
         "fps": float(fps),

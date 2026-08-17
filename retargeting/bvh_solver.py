@@ -10,7 +10,7 @@ retargeting operation.  This implementation follows the scientific logic of
 the Chang-E paper: source BVH *global keypoints* supervise optimisation of
 target root orientation, root translation, body pose and a global scale.
 
-The output is directly compatible with the V46 MotionRAG-Diff contract:
+The output is directly compatible with the MotionRAG-Diff generation contract:
   [contacts(4), root_xyz(3), local_rot6d(24*6)] = 151 dimensions.
 
 The fitter intentionally uses the repository's fixed 24-joint kinematic tree,
@@ -33,7 +33,7 @@ try:
     import torch
     import torch.nn.functional as F
 except Exception as exc:  # pragma: no cover
-    raise RuntimeError("PyTorch is required for V46.49 retargeting") from exc
+    raise RuntimeError("PyTorch is required for Source-Gravity retargeting") from exc
 
 try:
     from scipy.ndimage import median_filter
@@ -100,9 +100,9 @@ class RetargetConfig:
     feet_order_weight: float = 1.5
     floor_weight: float = 4.0
     root_velocity_weight: float = 1.5
-    # ===== V46.49.4 ABSOLUTE ROOT ORIENTATION CONTRACT =====
+    # ===== Source-Motion ABSOLUTE ROOT ORIENTATION CONTRACT =====
     root_orientation_lock: bool = True
-    # ===== V46.49.4 ABSOLUTE ROOT ORIENTATION CONTRACT END =====
+    # ===== Source-Motion ABSOLUTE ROOT ORIENTATION CONTRACT END =====
     gradient_clip: float = 2.0
     contact_height_m: float = 0.055
     contact_speed_mps: float = 0.75
@@ -135,41 +135,39 @@ class RetargetConfig:
             return raw in {"1", "true", "yes", "y", "on"}
 
         return cls(
-            target_fps=f("V46_49_RETARGET_FPS", 30.0),
-            device=os.environ.get("V46_49_RETARGET_DEVICE", os.environ.get("V46_DEVICE", "cuda")),
-            chunk_frames=i("V46_49_RETARGET_CHUNK", 256),
-            chunk_overlap=i("V46_49_RETARGET_OVERLAP", 32),
-            iterations=i("V46_49_RETARGET_ITERS", 90),
-            learning_rate=f("V46_49_RETARGET_LR", 0.035),
-            keypoint_weight=f("V46_49_RETARGET_KEYPOINT_W", 30.0),
-            root_weight=f("V46_49_RETARGET_ROOT_W", 8.0),
-            temporal_velocity_weight=f("V46_49_RETARGET_VEL_W", 0.10),
-            temporal_acceleration_weight=f("V46_49_RETARGET_ACC_W", 0.025),
-            pose_prior_weight=f("V46_49_RETARGET_POSE_W", 0.006),
-            upright_weight=f("V46_49_RETARGET_UPRIGHT_W", 5.0),
-            head_order_weight=f("V46_49_RETARGET_HEAD_W", 2.0),
-            feet_order_weight=f("V46_49_RETARGET_FEET_W", 1.5),
-            floor_weight=f("V46_49_RETARGET_FLOOR_W", 4.0),
-            root_velocity_weight=f("V46_49_RETARGET_ROOT_VEL_W", 1.5),
-            root_orientation_lock=b("V46_49_ROOT_ORIENTATION_LOCK", True),
-            gradient_clip=f("V46_49_RETARGET_GRAD_CLIP", 2.0),
-            contact_height_m=f("V46_49_CONTACT_HEIGHT_M", 0.055),
-            contact_speed_mps=f("V46_49_CONTACT_SPEED_MPS", 0.75),
-            contact_median_seconds=f("V46_49_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0),
-            localize_root_xz=b("V46_49_LOCALIZE_ROOT_XZ", True),
-            floor_to_zero=b("V46_49_FLOOR_TO_ZERO", True),
-            hard_gravity_gate=b("V46_49_GRAVITY_HARD_FAIL", True),
-            gravity_torso_p05_min=f(
-                "V46_49_GRAVITY_TORSO_P05_MIN", 0.45
-            ),
+            target_fps=f("SOURCE_RETARGET_FPS", 30.0),
+            device=os.environ.get("SOURCE_RETARGET_DEVICE", os.environ.get("MOTION_DEVICE", "cuda")),
+            chunk_frames=i("SOURCE_RETARGET_CHUNK", 256),
+            chunk_overlap=i("SOURCE_RETARGET_OVERLAP", 32),
+            iterations=i("SOURCE_RETARGET_ITERS", 90),
+            learning_rate=f("SOURCE_RETARGET_LR", 0.035),
+            keypoint_weight=f("SOURCE_RETARGET_KEYPOINT_W", 30.0),
+            root_weight=f("SOURCE_RETARGET_ROOT_W", 8.0),
+            temporal_velocity_weight=f("SOURCE_RETARGET_VEL_W", 0.10),
+            temporal_acceleration_weight=f("SOURCE_RETARGET_ACC_W", 0.025),
+            pose_prior_weight=f("SOURCE_RETARGET_POSE_W", 0.006),
+            upright_weight=f("SOURCE_RETARGET_UPRIGHT_W", 5.0),
+            head_order_weight=f("SOURCE_RETARGET_HEAD_W", 2.0),
+            feet_order_weight=f("SOURCE_RETARGET_FEET_W", 1.5),
+            floor_weight=f("SOURCE_RETARGET_FLOOR_W", 4.0),
+            root_velocity_weight=f("SOURCE_RETARGET_ROOT_VEL_W", 1.5),
+            root_orientation_lock=b("SOURCE_MOTION_ROOT_ORIENTATION_LOCK", True),
+            gradient_clip=f("SOURCE_RETARGET_GRAD_CLIP", 2.0),
+            contact_height_m=f("SOURCE_CONTACT_HEIGHT_M", 0.055),
+            contact_speed_mps=f("SOURCE_CONTACT_SPEED_MPS", 0.75),
+            contact_median_seconds=f("SOURCE_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0),
+            localize_root_xz=b("SOURCE_MOTION_LOCALIZE_ROOT_XZ", True),
+            floor_to_zero=b("SOURCE_GRAVITY_FLOOR_TO_ZERO", True),
+            hard_gravity_gate=b("SOURCE_GRAVITY_HARD_FAIL", True),
+            gravity_torso_p05_min=f("GRAVITY_TORSO_P05_MIN", 0.45),
             fit_rmse_p95_max_m=f(
-                "V46_49_FIT_RMSE_P95_MAX_M", 0.18
+                "SOURCE_RETARGET_FIT_RMSE_P95_MAX_M", 0.18
             ),
             source_manifest_path=str(
                 os.environ.get("CHANG_E_SOURCE_MANIFEST", "")
             ).strip(),
             require_source_manifest=b("CHANG_E_REQUIRE_SOURCE_MANIFEST", False),
-            seed=i("V46_49_SEED", 1234),
+            seed=i("SOURCE_RETARGET_SEED", 1234),
         )
 
 
@@ -372,7 +370,7 @@ def source_fk(bvh: BVHMotion, use_motion: bool = True) -> Tuple[np.ndarray, np.n
     local_r = np.tile(np.eye(3, dtype=np.float32), (T, J, 1, 1))
     local_t = np.zeros((T, J, 3), dtype=np.float32)
 
-    # ===== V46.49.2 NONROOT POSITION CONTRACT =====
+    # ===== Nonroot-Position NONROOT POSITION CONTRACT =====
     # Chang-E files expose XYZ position channels on every articulated joint.
     # Dataset inspection shows that non-root position channels are approximately
     # static calibration values. They must not be added on top of hierarchy
@@ -384,11 +382,11 @@ def source_fk(bvh: BVHMotion, use_motion: bool = True) -> Tuple[np.ndarray, np.n
     #   delta: preserve only non-root displacement relative to frame 0
     #   raw: old diagnostic behaviour; add full non-root position channels
     _position_mode = str(
-        os.environ.get("V46_49_NONROOT_POSITION_MODE", "ignore")
+        os.environ.get("SOURCE_MOTION_NONROOT_POSITION_MODE", "ignore")
     ).strip().lower()
     if _position_mode not in {"ignore", "delta", "raw"}:
         raise ValueError(
-            "V46_49_NONROOT_POSITION_MODE must be ignore/delta/raw, "
+            "SOURCE_MOTION_NONROOT_POSITION_MODE must be ignore/delta/raw, "
             f"got {_position_mode!r}"
         )
 
@@ -420,7 +418,7 @@ def source_fk(bvh: BVHMotion, use_motion: bool = True) -> Tuple[np.ndarray, np.n
                     local_r[:, j_idx] = local_r[:, j_idx] @ _axis_matrix_batch(
                         ch[0], bvh.values[:, joint.channel_start + k]
                     )
-    # ===== V46.49.2 NONROOT POSITION CONTRACT END =====
+    # ===== Nonroot-Position NONROOT POSITION CONTRACT END =====
 
     for j in range(J):
         p = bvh.joints[j].parent
@@ -593,7 +591,7 @@ def load_bvh_as_edge151(
             95,
         )
     ) if root_xyz.size else 0.0
-    scale_mode = str(os.environ.get("V46_BVH_ROOT_SCALE_MODE", "auto")).strip().lower()
+    scale_mode = str(os.environ.get("MOTION_BVH_ROOT_SCALE_MODE", "auto")).strip().lower()
     if scale_mode in {"none", "meter", "meters", "1", "1.0"}:
         root_scale = 1.0
     elif scale_mode in {"cm", "centimeter", "centimeters", "0.01"}:
@@ -606,8 +604,8 @@ def load_bvh_as_edge151(
 
     root_mode = str(
         os.environ.get(
-            "V46_47_BVH_ROOT_ROT_MODE",
-            os.environ.get("V46_45_BVH_ROOT_ROT_MODE", "raw"),
+            "BVH_IMPORT_BVH_ROOT_ROT_MODE",
+            os.environ.get("BVH_IMPORT_ROOT_ROT_MODE", "raw"),
         )
     ).strip().lower()
     if root_mode in {"identity", "upright", "zero", "none"}:
@@ -624,7 +622,7 @@ def load_bvh_as_edge151(
         yaw_matrix[:, 2, 2] = c
         local_rot[:, 0] = yaw_matrix
     elif root_mode not in {"raw", "full", "original"}:
-        raise ValueError(f"Unsupported V46_47_BVH_ROOT_ROT_MODE={root_mode!r}")
+        raise ValueError(f"Unsupported BVH_IMPORT_BVH_ROOT_ROT_MODE={root_mode!r}")
 
     mapping = build_joint_mapping(bvh.joints)
     target_local = np.tile(
@@ -852,15 +850,15 @@ def _fit_chunk(
 
 
 
-# ===== V46.49.3 ABSOLUTE HEADING CONTRACT =====
-def _v46_49_3_env_float(name: str, default: float) -> float:
+# ===== Source-Heading ABSOLUTE HEADING CONTRACT =====
+def _heading_env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
     except Exception:
         return float(default)
 
 
-def _v46_49_3_moving_average(x: np.ndarray, size: int) -> np.ndarray:
+def _heading_moving_average(x: np.ndarray, size: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     size = max(1, int(size))
     if size % 2 == 0:
@@ -873,17 +871,17 @@ def _v46_49_3_moving_average(x: np.ndarray, size: int) -> np.ndarray:
     return np.convolve(xp, kernel, mode="valid").astype(np.float32)
 
 
-def _v46_49_3_moving_median(x: np.ndarray, size: int) -> np.ndarray:
+def _heading_moving_median(x: np.ndarray, size: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     size = max(1, int(size))
     if size % 2 == 0:
         size += 1
     if median_filter is not None:
         return median_filter(x, size=size, mode="nearest").astype(np.float32)
-    return _v46_49_3_moving_average(x, size)
+    return _heading_moving_average(x, size)
 
 
-def _v46_49_3_runs(mask: np.ndarray):
+def _boolean_runs(mask: np.ndarray):
     m = np.asarray(mask, dtype=bool)
     if not m.size:
         return []
@@ -893,7 +891,7 @@ def _v46_49_3_runs(mask: np.ndarray):
     return list(zip(starts.tolist(), ends.tolist()))
 
 
-def _v46_49_3_body_yaw(
+def _body_yaw_from_positions(
     positions: np.ndarray,
     mapping: Dict[int, int],
 ) -> np.ndarray:
@@ -934,7 +932,7 @@ def _v46_49_3_body_yaw(
     ).astype(np.float32)
 
 
-def _v46_49_3_heading_metrics(
+def _heading_motion_metrics(
     yaw: np.ndarray,
     fps: float,
     min_rate_deg_s: float,
@@ -948,7 +946,7 @@ def _v46_49_3_heading_metrics(
     rate_deg = np.degrees(rate)
     active = np.abs(rate_deg) >= float(min_rate_deg_s)
     longest = max(
-        (b - a for a, b in _v46_49_3_runs(active)),
+        (b - a for a, b in _boolean_runs(active)),
         default=0,
     )
     return {
@@ -982,15 +980,15 @@ def stabilize_source_heading_positions(
 ) -> Tuple[np.ndarray, dict]:
     x = np.asarray(positions, dtype=np.float32).copy()
     mode = str(
-        os.environ.get("V46_49_HEADING_MODE", "raw")
+        os.environ.get("SOURCE_HEADING_MODE", "raw")
     ).strip().lower()
     if mode not in {"stabilize", "raw", "lock"}:
         raise ValueError(
-            "V46_49_HEADING_MODE must be stabilize/raw/lock, "
+            "SOURCE_HEADING_MODE must be stabilize/raw/lock, "
             f"got {mode!r}"
         )
 
-    raw_yaw = _v46_49_3_body_yaw(x, mapping)
+    raw_yaw = _body_yaw_from_positions(x, mapping)
     semantic_text = " ".join(
         str(value).strip().lower()
         for value in (source_semantics or {}).values()
@@ -999,7 +997,7 @@ def stabilize_source_heading_positions(
     preserve_tokens = {
         token.strip().lower()
         for token in os.environ.get(
-            "V46_49_PRESERVE_TURN_TOKENS",
+            "SOURCE_HEADING_PRESERVE_TURN_TOKENS",
             "sogdian_whirl,sogdian,whirl,turning_climax,turning_flow,explicit_spin",
         ).split(",")
         if token.strip()
@@ -1008,43 +1006,43 @@ def stabilize_source_heading_positions(
         token in semantic_text for token in preserve_tokens
     )
 
-    smooth_seconds = _v46_49_3_env_float(
-        "V46_49_HEADING_SMOOTH_SECONDS", 0.45
+    smooth_seconds = _heading_env_float(
+        "SOURCE_HEADING_SMOOTH_SECONDS", 0.45
     )
-    baseline_seconds = _v46_49_3_env_float(
-        "V46_49_HEADING_BASELINE_SECONDS", 4.0
+    baseline_seconds = _heading_env_float(
+        "SOURCE_HEADING_BASELINE_SECONDS", 4.0
     )
-    min_rate_deg_s = _v46_49_3_env_float(
-        "V46_49_HEADING_MIN_DRIFT_DEG_S", 7.0
+    min_rate_deg_s = _heading_env_float(
+        "SOURCE_HEADING_MIN_DRIFT_DEG_S", 7.0
     )
-    min_persist_seconds = _v46_49_3_env_float(
-        "V46_49_HEADING_MIN_PERSIST_SECONDS", 3.0
+    min_persist_seconds = _heading_env_float(
+        "SOURCE_HEADING_MIN_PERSIST_SECONDS", 3.0
     )
-    consistency_min = _v46_49_3_env_float(
-        "V46_49_HEADING_SIGN_CONSISTENCY", 0.82
+    consistency_min = _heading_env_float(
+        "SOURCE_HEADING_SIGN_CONSISTENCY", 0.82
     )
-    max_variation_deg_s = _v46_49_3_env_float(
-        "V46_49_HEADING_MAX_BASELINE_VARIATION_DEG_S", 14.0
+    max_variation_deg_s = _heading_env_float(
+        "SOURCE_HEADING_MAX_BASELINE_VARIATION_DEG_S", 14.0
     )
-    max_correction_deg_s = _v46_49_3_env_float(
-        "V46_49_HEADING_MAX_CORRECTION_DEG_S", 60.0
+    max_correction_deg_s = _heading_env_float(
+        "SOURCE_HEADING_MAX_CORRECTION_DEG_S", 60.0
     )
 
     smooth_n = max(3, int(round(smooth_seconds * fps)))
     baseline_n = max(5, int(round(baseline_seconds * fps)))
     min_persist_n = max(2, int(round(min_persist_seconds * fps)))
 
-    yaw_smooth = _v46_49_3_moving_average(raw_yaw, smooth_n)
+    yaw_smooth = _heading_moving_average(raw_yaw, smooth_n)
     yaw_rate = np.gradient(yaw_smooth) * float(fps)
-    baseline = _v46_49_3_moving_median(yaw_rate, baseline_n)
+    baseline = _heading_moving_median(yaw_rate, baseline_n)
 
     same_sign = (
         np.sign(yaw_rate) == np.sign(baseline)
     ).astype(np.float32)
-    consistency = _v46_49_3_moving_average(
+    consistency = _heading_moving_average(
         same_sign, baseline_n
     )
-    variation = _v46_49_3_moving_average(
+    variation = _heading_moving_average(
         np.abs(yaw_rate - baseline), baseline_n
     )
 
@@ -1056,7 +1054,7 @@ def stabilize_source_heading_positions(
 
     persistent = np.zeros(len(x), dtype=bool)
     longest_candidate = 0
-    for a, b in _v46_49_3_runs(candidate):
+    for a, b in _boolean_runs(candidate):
         longest_candidate = max(longest_candidate, b - a)
         if b - a >= min_persist_n:
             persistent[a:b] = True
@@ -1081,7 +1079,7 @@ def stabilize_source_heading_positions(
             np.clip(baseline, -max_rate, max_rate),
             0.0,
         ).astype(np.float32)
-        drift_rate = _v46_49_3_moving_average(
+        drift_rate = _heading_moving_average(
             drift_rate,
             max(3, int(round(0.75 * fps))),
         )
@@ -1100,9 +1098,9 @@ def stabilize_source_heading_positions(
     rel[..., 2] = -s[:, None] * old_x + c[:, None] * old_z
     corrected = rel + pelvis[:, None, :]
 
-    corrected_yaw = _v46_49_3_body_yaw(corrected, mapping)
+    corrected_yaw = _body_yaw_from_positions(corrected, mapping)
     report = {
-        "version": "v46_49_3_absolute_heading_contract",
+        "version": "source_heading_absolute_heading_contract",
         "mode": mode,
         "semantic_turn_preserved": bool(preserve_semantic_turn),
         "source_semantics": dict(source_semantics or {}),
@@ -1116,15 +1114,15 @@ def stabilize_source_heading_positions(
         "correction_speed_deg_s_p95": float(
             np.percentile(np.abs(np.degrees(drift_rate)), 95)
         ) if len(drift_rate) else 0.0,
-        "raw": _v46_49_3_heading_metrics(
+        "raw": _heading_motion_metrics(
             raw_yaw, fps, min_rate_deg_s
         ),
-        "corrected": _v46_49_3_heading_metrics(
+        "corrected": _heading_motion_metrics(
             corrected_yaw, fps, min_rate_deg_s
         ),
     }
     return corrected.astype(np.float32), report
-# ===== V46.49.3 ABSOLUTE HEADING CONTRACT END =====
+# ===== Source-Heading ABSOLUTE HEADING CONTRACT END =====
 
 
 def fit_target_motion(
@@ -1268,7 +1266,7 @@ def fit_target_motion(
         "fit_rmse_mean_m": float(fit_arr.mean()) if fit_arr.size else 0.0,
         "fit_rmse_p95_m": float(np.percentile(fit_arr, 95)) if fit_arr.size else 0.0,
         "root_orientation_contract": {
-            "version": "v46_49_4_absolute_root_orientation_contract",
+            "version": "source_motion_absolute_root_orientation_contract",
             "mode": "absolute_reference_lock"
             if cfg.root_orientation_lock
             else "unconstrained_ablation",
@@ -1339,7 +1337,7 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
     ok = gravity_ok and fit_ok
 
     report = {
-        "version": "v46_49_optimization_keypoint_retarget",
+        "version": "source_gravity_optimization_keypoint_retarget",
         "source": str(path),
         "source_fps": float(source_fps),
         "declared_source_fps": float(bvh.fps),
@@ -1349,10 +1347,10 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
         "target_frames": int(len(motion)),
         "source_joint_count": int(len(bvh.joints)),
         "source_position_contract": {
-            "version": "v46_49_2_nonroot_position_contract",
+            "version": "nonroot_position_contract",
             "root_position": "retained",
             "nonroot_position_mode": str(
-                os.environ.get("V46_49_NONROOT_POSITION_MODE", "ignore")
+                os.environ.get("SOURCE_MOTION_NONROOT_POSITION_MODE", "ignore")
             ).strip().lower(),
             "hierarchy_offsets": "retained",
         },

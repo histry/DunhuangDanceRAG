@@ -69,7 +69,7 @@ class GroundingAudioQueryTests(unittest.TestCase):
         runtime.mixed_runtime = MissingAudioRuntime()
         with patch.dict(
             os.environ,
-            {"V46_53_MIXED_REQUIRE_RUNTIME_AUDIO": "1"},
+            {"GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO": "1"},
             clear=False,
         ):
             with self.assertRaisesRegex(RuntimeError, "grounding.audio_query"):
@@ -79,8 +79,8 @@ class GroundingAudioQueryTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "V46_53_GROUNDER_ARCHITECTURE": "mixed",
-                "V46_53_MIXED_REQUIRE_RUNTIME_AUDIO": "1",
+                "GROUNDING_GROUNDER_ARCHITECTURE": "mixed",
+                "GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO": "1",
             },
             clear=False,
         ):

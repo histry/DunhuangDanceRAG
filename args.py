@@ -161,7 +161,7 @@ def parse_train_opt():
         help="Weight for matching generated and target motion-energy envelopes.",
     )
 
-    # ===== V9 RAG Summary Token =====
+    # ===== RAG summary token RAG Summary Token =====
     parser.add_argument(
         "--enable_rag_summary_token",
         action="store_true",

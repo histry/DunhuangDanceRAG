@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.50 Event-Heading Closed-Loop Planner.
+"""Event-Heading Event-Heading Closed-Loop Planner.
 
 This is an additive replacement entry point for
 routing/boundary_closed_loop.py.  It reuses the latest retrieval,
@@ -12,7 +12,7 @@ replaces two policies:
 2. refiner/diffusion/IK output is guarded against changing the planned root
    heading.
 
-Run with the same CLI as V46.46:
+Run with the same CLI as Boundary Closed-Loop:
     python routing/heading_closed_loop.py generate ...
 """
 from __future__ import annotations
@@ -129,14 +129,14 @@ def _heading_schema_guard(db: Dict[str, Any]) -> None:
     missing = [k for k in required if k not in db]
     if missing:
         raise RuntimeError(
-            "V46.50 requires a heading-aware DB. Missing arrays: "
+            "Event-Heading requires a heading-aware DB. Missing arrays: "
             + ", ".join(missing)
             + ". Rebuild with events/build_database_entry.py"
         )
 
 
 def _align_core_to_stage_heading(
-    v46: Any,
+    motion_runtime: Any,
     prev: Optional[np.ndarray],
     core: np.ndarray,
     stage_heading_rad: float,
@@ -151,8 +151,8 @@ def _align_core_to_stage_heading(
     dyaw = angle_diff(float(stage_heading_rad), entry_before)
     pivot = out[0, [ROOT_X_IDX, ROOT_Z_IDX]].copy()
 
-    if hasattr(v46, "rotate_motion_around_y_np"):
-        out = v46.rotate_motion_around_y_np(out, dyaw, pivot_xz=pivot)
+    if hasattr(motion_runtime, "rotate_motion_around_y_np"):
+        out = motion_runtime.rotate_motion_around_y_np(out, dyaw, pivot_xz=pivot)
     else:
         out = rotate_motion_constant_yaw_np(out, dyaw, pivot_xz=pivot)
 
@@ -166,14 +166,14 @@ def _align_core_to_stage_heading(
         out[:, ROOT_Z_IDX] += float(delta_xz[1])
 
     out = base.enforce_contract(
-        v46,
+        motion_runtime,
         out,
         cfg,
-        source_hint=f"v46_50_stage_heading_align:{event_id}",
+        source_hint=f"event_heading_stage_heading_align:{event_id}",
     )
     entry_after = float(root_yaw_np(out[:1])[0])
     return out.astype(np.float32), {
-        "schema": "v46_50_stage_heading_alignment",
+        "schema": "event_heading_stage_heading_alignment",
         "mode": "planner_absolute_stage_heading_plus_xz_continuity",
         "event_id": int(event_id),
         "stage_heading_target_rad": float(stage_heading_rad),
@@ -188,7 +188,7 @@ def _align_core_to_stage_heading(
 
 
 def _build_heading_proposal(
-    v46: Any,
+    motion_runtime: Any,
     prev_motion: Optional[np.ndarray],
     event_id: int,
     event_path: str,
@@ -202,14 +202,14 @@ def _build_heading_proposal(
     recent_turn_count: int,
 ) -> Tuple[base.CandidateProposal, Dict[str, Any]]:
     raw = base.load_event_motion(
-        v46,
+        motion_runtime,
         event_path,
         cfg,
-        source_hint=f"v46_50_load_event:{event_id}",
+        source_hint=f"event_heading_load_event:{event_id}",
     )
     has_prev = prev_motion is not None and len(prev_motion) > 0
     core_len, trans_len, length_info = base.choose_transition_lengths(
-        v46,
+        motion_runtime,
         prev_motion,
         raw.shape[0],
         target_len,
@@ -217,12 +217,12 @@ def _build_heading_proposal(
         slot,
         cfg,
     )
-    core = base.resample_motion(v46, raw, core_len)
+    core = base.resample_motion(motion_runtime, raw, core_len)
     core = base.enforce_contract(
-        v46,
+        motion_runtime,
         core,
         cfg,
-        source_hint=f"v46_50_core_resample:{event_id}",
+        source_hint=f"event_heading_core_resample:{event_id}",
     )
 
     event_meta = event_meta_from_db(db, event_id)
@@ -234,7 +234,7 @@ def _build_heading_proposal(
     )
 
     core, align_report = _align_core_to_stage_heading(
-        v46,
+        motion_runtime,
         prev_motion,
         core,
         stage_heading_rad,
@@ -254,9 +254,9 @@ def _build_heading_proposal(
 
     bridge = np.zeros((0, EDGE_DIM), dtype=np.float32)
     if has_prev:
-        bridge = base.build_bridge(v46, prev_motion, core, trans_len, cfg)
+        bridge = base.build_bridge(motion_runtime, prev_motion, core, trans_len, cfg)
         risk = base.transition_risk(
-            v46,
+            motion_runtime,
             prev_motion[-4:],
             bridge,
             core[:4],
@@ -291,7 +291,7 @@ def _build_heading_proposal(
     physical_risk = float(base.risk_score(risk))
     combined = (
         physical_risk
-        + env_float("V46_50_HEADING_PLANNER_WEIGHT", 0.85)
+        + env_float("EVENT_HEADING_PLANNER_WEIGHT", 0.85)
         * float(heading_penalty)
         + float(core_activity_assessment["penalty"])
     )
@@ -303,7 +303,7 @@ def _build_heading_proposal(
     heading_detail["motion_activity_hard_reject"] = activity_hard_reject
 
     length_info = dict(length_info)
-    length_info["v46_50_heading"] = heading_detail
+    length_info["event_heading_heading"] = heading_detail
     proposal = base.CandidateProposal(
         slot=int(slot_idx),
         event_id=int(event_id),
@@ -337,7 +337,7 @@ def _build_heading_proposal(
 
 
 def assemble_event_heading_reference(
-    v46: Any,
+    motion_runtime: Any,
     slots: Sequence[Dict[str, Any]],
     candidate_lists: Sequence[Sequence[int]],
     db: Dict[str, Any],
@@ -407,7 +407,7 @@ def assemble_event_heading_reference(
     )
 
     initial_heading = float(
-        np.radians(env_float("V46_50_STAGE_INITIAL_HEADING_DEG", 0.0))
+        np.radians(env_float("EVENT_HEADING_STAGE_INITIAL_HEADING_DEG", 0.0))
     )
     initial_usage, initial_duals = constraint_config.initial_state()
     beam: List[DynamicBeamState] = [
@@ -526,7 +526,7 @@ def assemble_event_heading_reference(
             ) -> None:
                 skip_pairs_raw = str(
                     os.environ.get(
-                        "V46_50_EXACT_SKIP_PAIRS",
+                        "EVENT_HEADING_EXACT_SKIP_PAIRS",
                         "",
                     )
                 ).strip()
@@ -547,7 +547,7 @@ def assemble_event_heading_reference(
                             )
                         except (TypeError, ValueError) as exc:
                             raise RuntimeError(
-                                "Invalid V46_50_EXACT_SKIP_PAIRS "
+                                "Invalid EVENT_HEADING_EXACT_SKIP_PAIRS "
                                 f"item: {item!r}; expected slot:event"
                             ) from exc
 
@@ -588,7 +588,7 @@ def assemble_event_heading_reference(
                     target_frames=target_len,
                 )
                 proposal, extra0 = _build_heading_proposal(
-                    v46=v46,
+                    motion_runtime=motion_runtime,
                     prev_motion=(state.motion if len(state.motion) else None),
                     event_id=event_id,
                     event_path=str(paths[event_id]),
@@ -1038,7 +1038,7 @@ def assemble_event_heading_reference(
                 source_frames = int(extra.get("source_frames", 0) or 0)
                 if source_frames <= 0:
                     source_frames = base.load_event_motion(
-                        v46,
+                        motion_runtime,
                         proposal.event_path,
                         cfg,
                         "state_aware_br_hpr_warp_probe",
@@ -1337,7 +1337,7 @@ def assemble_event_heading_reference(
 
     best = min(beam, key=lambda state: float(state.score))
     final = base.enforce_contract(
-        v46,
+        motion_runtime,
         np.asarray(best.motion, dtype=np.float32),
         cfg,
         source_hint="viability_aware_br_hpr_dynamic_heading_reference_final",
@@ -1406,7 +1406,7 @@ def assemble_event_heading_reference(
     return final, list(best.report), selected
 
 def apply_generators_with_heading_guard(
-    v46: Any,
+    motion_runtime: Any,
     motion_ref: np.ndarray,
     cond: np.ndarray,
     seam_mask: np.ndarray,
@@ -1417,8 +1417,8 @@ def apply_generators_with_heading_guard(
     stage: Dict[str, Any] = {}
     motion = np.asarray(motion_ref, dtype=np.float32).copy()
     stage["pre_refine_audit"] = (
-        v46.audit_motion_np(motion, cfg)
-        if hasattr(v46, "audit_motion_np")
+        motion_runtime.audit_motion_np(motion, cfg)
+        if hasattr(motion_runtime, "audit_motion_np")
         else {}
     )
     stage["motion_activity_retrieval"] = save_stage_snapshot(
@@ -1429,18 +1429,18 @@ def apply_generators_with_heading_guard(
     )
 
     if bool(getattr(cfg, "refiner_enable", False)) and base.env_bool(
-        "V46_46_USE_REFINER", True
+        "BOUNDARY_USE_REFINER", True
     ):
-        motion = v46.apply_refiner_model(
+        motion = motion_runtime.apply_refiner_model(
             motion,
             cond,
             seam_mask,
             getattr(args, "refiner", None),
             cfg,
         )
-        stage["v45_refiner_audit"] = (
-            v46.audit_motion_np(motion, cfg)
-            if hasattr(v46, "audit_motion_np")
+        stage["boundary_refiner_audit"] = (
+            motion_runtime.audit_motion_np(motion, cfg)
+            if hasattr(motion_runtime, "audit_motion_np")
             else {}
         )
     stage["motion_activity_refiner"] = save_stage_snapshot(
@@ -1451,18 +1451,18 @@ def apply_generators_with_heading_guard(
     )
 
     if bool(getattr(cfg, "diffusion_enable", False)) and base.env_bool(
-        "V46_46_USE_DIFFUSION", True
+        "BOUNDARY_USE_DIFFUSION", True
     ):
-        motion = v46.apply_diffusion_model(
+        motion = motion_runtime.apply_diffusion_model(
             motion,
             cond,
             seam_mask,
             getattr(args, "diffusion", None),
             cfg,
         )
-        stage["v46_diffusion_audit"] = (
-            v46.audit_motion_np(motion, cfg)
-            if hasattr(v46, "audit_motion_np")
+        stage["motion_diffusion_audit"] = (
+            motion_runtime.audit_motion_np(motion, cfg)
+            if hasattr(motion_runtime, "audit_motion_np")
             else {}
         )
     stage["motion_activity_diffusion"] = save_stage_snapshot(
@@ -1472,49 +1472,49 @@ def apply_generators_with_heading_guard(
         fps=float(getattr(cfg, "fps", 30.0)),
     )
 
-    if env_bool("V46_50_PROTECT_PLANNED_ROOT_HEADING", True):
+    if env_bool("EVENT_HEADING_PROTECT_PLANNED_ROOT_HEADING", True):
         motion, heading_guard_pre_ik = restore_planned_root_heading_np(
             motion,
             motion_ref,
         )
         motion = base.enforce_contract(
-            v46,
+            motion_runtime,
             motion,
             cfg,
-            source_hint="v46_50_heading_guard_pre_ik",
+            source_hint="event_heading_heading_guard_pre_ik",
         )
     else:
         heading_guard_pre_ik = {"enabled": False}
-    stage["v46_50_heading_guard_pre_ik"] = heading_guard_pre_ik
+    stage["event_heading_heading_guard_pre_ik"] = heading_guard_pre_ik
 
     ik_report = {"enabled": False}
     if bool(getattr(cfg, "ik_enable", False)) and base.env_bool(
-        "V46_46_USE_IK", True
+        "BOUNDARY_USE_IK", True
     ):
-        motion, ik_report = v46.true_lower_body_ik(motion, cfg)
-    stage["v43_true_ik"] = ik_report
+        motion, ik_report = motion_runtime.true_lower_body_ik(motion, cfg)
+    stage["lower_body_ik_true_ik"] = ik_report
 
-    if env_bool("V46_50_PROTECT_PLANNED_ROOT_HEADING", True):
+    if env_bool("EVENT_HEADING_PROTECT_PLANNED_ROOT_HEADING", True):
         motion, heading_guard_post_ik = restore_planned_root_heading_np(
             motion,
             motion_ref,
         )
         motion = base.enforce_contract(
-            v46,
+            motion_runtime,
             motion,
             cfg,
-            source_hint="v46_50_heading_guard_post_ik",
+            source_hint="event_heading_heading_guard_post_ik",
         )
     else:
         heading_guard_post_ik = {"enabled": False}
-    stage["v46_50_heading_guard_post_ik"] = heading_guard_post_ik
-    stage["v46_50_final_heading_metrics"] = heading_metrics_np(
+    stage["event_heading_heading_guard_post_ik"] = heading_guard_post_ik
+    stage["event_heading_final_heading_metrics"] = heading_metrics_np(
         motion,
         fps=float(getattr(cfg, "fps", 30.0)),
     )
     stage["final_audit"] = (
-        v46.audit_motion_np(motion, cfg)
-        if hasattr(v46, "audit_motion_np")
+        motion_runtime.audit_motion_np(motion, cfg)
+        if hasattr(motion_runtime, "audit_motion_np")
         else {}
     )
     stage["final_physical_gate"] = base.physical_quality_gate(stage["final_audit"])
@@ -1532,7 +1532,7 @@ def _patch_final_report(args: Any) -> None:
         args.json
         or str(
             Path(args.out).with_name(
-                Path(args.out).stem + ".v46_46_closed_loop_report.json"
+                Path(args.out).stem + ".boundary_closed_loop_closed_loop_report.json"
             )
         )
     )
@@ -1542,19 +1542,19 @@ def _patch_final_report(args: Any) -> None:
         report = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return
-    report["version"] = "v46_50_event_heading_closed_loop_scheduler"
+    report["version"] = "event_heading_closed_loop_scheduler"
     report["event_heading_planner"] = _LAST_HEADING_PLAN
-    report["v46_50_env"] = {
-        k: v for k, v in os.environ.items() if k.startswith("V46_50_")
+    report["event_heading_env"] = {
+        k: v for k, v in os.environ.items() if k.startswith("EVENT_HEADING_")
     }
     motion_path = Path(args.out)
     if motion_path.is_file():
         x = np.load(motion_path, allow_pickle=True).astype(np.float32)
         if x.ndim == 3:
             x = x[0]
-        report["v46_50_final_heading_metrics"] = heading_metrics_np(
+        report["event_heading_final_heading_metrics"] = heading_metrics_np(
             x,
-            fps=float(getattr(args, "fps", os.environ.get("V46_51_FPS", 30.0))),
+            fps=float(getattr(args, "fps", os.environ.get("GENERATION_FPS", 30.0))),
         )
     path.write_text(
         json.dumps(base.jsonable(report), ensure_ascii=False, indent=2),
@@ -1567,8 +1567,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.cmd != "generate":
         raise RuntimeError(args.cmd)
 
-    # Monkey-patch only the policies owned by V46.50. All other current code,
-    # including V46.38 routing and V46.46 boundary reselection, remains latest.
+    # Monkey-patch only the policies owned by Event-Heading. All other current code,
+    # including Semantic Routing routing and Boundary Closed-Loop boundary reselection, remains latest.
     base.assemble_closed_loop_reference = assemble_event_heading_reference
     base.apply_generators = apply_generators_with_heading_guard
 

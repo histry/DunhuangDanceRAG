@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.12 MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
+External Music Semantics MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
 ==================================================================
 
 This file is designed as a drop-in research patch for an EDGE-style repository.
@@ -9,13 +9,13 @@ It does not depend on README assumptions. It directly operates on EDGE 151D
 motion arrays and can rebuild a source-aware motion database from a new
 "change" dataset.
 
-Core versions included:
-- V43: true lower-body IK that writes lower-body rotation channels back into
+Core components:
+- Lower-Body IK: true lower-body IK that writes lower-body rotation channels back into
        EDGE 151D, rather than saving fake foot XYZ columns.
-- V44: music-motion contrastive learning for retrieval alignment.
-- V45: residual temporal Motion Refiner to escape pure stitching.
-- V46: retrieval-augmented conditional residual diffusion with IK finalization.
-- V46.12 External Classical-Music Semantic Encoder integration plus V46.11 canonical Chang-E semantics: manifest-authoritative Chang-E BVH loading, effective-FPS resampling, recording-aware RAG semantics, external slot-level music semantic labels, unpaired semantic OT, true lower-body IK, residual refiner, conditional diffusion, capped root-Y physics, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
+- Contrastive Retriever: music-motion contrastive learning for retrieval alignment.
+- Boundary Refiner: residual temporal refinement to escape pure stitching.
+- Motion Generation: retrieval-augmented conditional residual diffusion with IK finalization.
+- External classical-music semantics plus canonical Chang-E semantics: manifest-authoritative Chang-E BVH loading, effective-FPS resampling, recording-aware RAG semantics, external slot-level music labels, unpaired semantic OT, true lower-body IK, residual refinement, conditional diffusion, capped root-Y physics, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
 
 Expected EDGE 151D convention
 -----------------------------
@@ -25,11 +25,11 @@ foot FK ids: [7, 8, 10, 11]
 
 Typical commands
 ----------------
-python training/motion_models.py build-db --motion_dirs change data/motions --out_db output/v46_db
-python training/motion_models.py train-contrastive --db output/v46_db/events.npz --out output/v46_db/v44_contrastive.pt
-python training/motion_models.py train-refiner --db output/v46_db/events.npz --out output/v46_db/v45_refiner.pt
-python training/motion_models.py train-diffusion --db output/v46_db/events.npz --out output/v46_db/v46_diffusion.pt
-python training/motion_models.py generate --audio test_music_bank/dunhuangwu2.wav --db output/v46_db/events.npz --out output/v46_dunhuangwu2.npy
+python -m training.motion_models build-db --motion_dirs change data/motions --out_db output/motion_db
+python -m training.motion_models train-contrastive --db output/motion_db/events.npz --out output/motion_db/semantic_retriever.pt
+python -m training.motion_models train-refiner --db output/motion_db/events.npz --out output/motion_db/boundary_refiner.pt
+python -m training.motion_models train-diffusion --db output/motion_db/events.npz --out output/motion_db/motion_diffusion.pt
+python -m training.motion_models generate --audio test_music_bank/dunhuangwu2.wav --db output/motion_db/events.npz --out output/motion_dunhuangwu2.npy
 """
 
 from __future__ import annotations
@@ -115,6 +115,11 @@ from support.event_identity import (
     make_event_db_contract,
     normalize_event_db_contract,
 )
+from support.legacy_compatibility import (
+    has_scheduler_provenance,
+    normalize_motion_checkpoint_role,
+    normalize_motion_checkpoint_version,
+)
 from motion_geometry.resampling import blend_edge151_geodesic_np
 from data_pipeline.chang_e_manifest import semantic_metadata as chang_e_semantic_metadata
 from retargeting.bvh_solver import load_bvh_as_edge151
@@ -150,10 +155,10 @@ def load_json(path: Optional[str | Path], default: Optional[dict] = None) -> dic
     return base
 
 
-def _v46_json_safe(x):
+def _json_safe(x):
     """Make report/meta objects JSON serializable.
 
-    V46.31 hotfix:
+    Event Semantics hotfix:
     Chang-E semantic ontology may contain Python set values, e.g. aliases.
     events_meta.json must remain writable, so convert sets/numpy/Path safely.
     """
@@ -162,17 +167,17 @@ def _v46_json_safe(x):
     from pathlib import Path as _Path
 
     if _dataclasses.is_dataclass(x):
-        return _v46_json_safe(_dataclasses.asdict(x))
+        return _json_safe(_dataclasses.asdict(x))
     if isinstance(x, dict):
-        return {str(k): _v46_json_safe(v) for k, v in x.items()}
+        return {str(k): _json_safe(v) for k, v in x.items()}
     if isinstance(x, set):
-        return sorted([_v46_json_safe(v) for v in x], key=lambda z: str(z))
+        return sorted([_json_safe(v) for v in x], key=lambda z: str(z))
     if isinstance(x, (list, tuple)):
-        return [_v46_json_safe(v) for v in x]
+        return [_json_safe(v) for v in x]
     if isinstance(x, _Path):
         return str(x)
     if isinstance(x, _np.ndarray):
-        return _v46_json_safe(x.tolist())
+        return _json_safe(x.tolist())
     if isinstance(x, _np.generic):
         return x.item()
     if isinstance(x, (str, int, float, bool)) or x is None:
@@ -184,7 +189,7 @@ def save_json(obj, path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(_v46_json_safe(obj), f, ensure_ascii=False, indent=2)
+        json.dump(_json_safe(obj), f, ensure_ascii=False, indent=2)
 def smooth_np(x: np.ndarray, sigma: float) -> np.ndarray:
     if sigma <= 0 or ndi is None:
         return x
@@ -255,8 +260,8 @@ def load_bvh_file(path: str | Path) -> List[np.ndarray]:
 
     BVH files commonly store positions in centimeters. The loader auto-scales
     to meters when skeleton offsets look centimeter-scale. This direct adapter
-    is sufficient for source-aware event indexing, retrieval, V45/V46 training,
-    and V43 IK; for exact SMPL/EDGE reproduction, a dedicated retargeting stage
+    is sufficient for source-aware event indexing, retrieval, Motion Refiner and Motion Diffusion training,
+    and Lower-Body IK IK; for exact SMPL/EDGE reproduction, a dedicated retargeting stage
     can still be used before build-db.
     """
     motion, _report = load_bvh_as_edge151(
@@ -291,7 +296,7 @@ def load_motion_file(path: str | Path) -> List[np.ndarray]:
         elif p.suffix.lower() == ".bvh":
             outs.extend(load_bvh_file(p))
     except Exception as exc:
-        print(f"[V46 WARN] failed loading {p}: {exc}", file=sys.stderr)
+        print(f"[Motion Generation WARN] failed loading {p}: {exc}", file=sys.stderr)
     return [x for x in outs if x.ndim == 2 and x.shape[0] >= 8]
 
 
@@ -302,7 +307,7 @@ def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
 def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
     """Convert rotation matrices to EDGE/Zhou 6D in column-concatenated form.
 
-    V46.21/V46.31 critical fix:
+    Motion Loading/Event Semantics critical fix:
     The inverse of rot6d_to_matrix_np() must concatenate the first two matrix
     columns as [R[:,0], R[:,1]].  The previous row-major expression
     ``mat[..., :, 0:2].reshape(..., 6)`` interleaves rows as
@@ -343,7 +348,7 @@ def rot6d_to_matrix_torch(x):
 
 
 def matrix_to_rot6d_torch(mat):
-    """Convert rotation matrices to V46/EDGE column-concatenated 6D.
+    """Convert rotation matrices to Motion Generation/EDGE column-concatenated 6D.
 
     Must match matrix_to_rot6d_np(): [R[:,0], R[:,1]].  The old
     mat[..., :, 0:2].reshape(...) interleaves rows and corrupts identity
@@ -393,7 +398,7 @@ def angle_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 @dataclasses.dataclass
-class V46Config:
+class MotionGenerationConfig:
     fps: float = 30.0
     window_len: int = 120
     hop_len: int = 60
@@ -406,10 +411,10 @@ class V46Config:
     manifest_enable: bool = True
     manifest_secondary_event_split: bool = True
 
-    # V46.9: Chang-E/change BVH filename semantics are scientifically meaningful.
+    # Filename Semantics: Chang-E/change BVH filename semantics are scientifically meaningful.
     # Each original BVH file is a source_uid/source_group, while the parsed
     # category/gender/take fields become semantic metadata and weak alignment
-    # priors for unpaired slot-to-event routing.  This fixes the V46.8 issue
+    # priors for unpaired slot-to-event routing.  This fixes the Root-Aware Motion Safety issue
     # where singleton names such as female_lotus/male_ribbon were collapsed
     # into the same directory-level source group.
     source_group_mode: str = "filename"  # filename | legacy_prefix
@@ -417,14 +422,14 @@ class V46Config:
     filename_semantic_weight: float = 0.35
     filename_semantic_retrieval_weight: float = 0.20
     filename_semantic_ot_weight: float = 0.35
-    # V46.11: stronger multi-label RAG action semantics and music alignment labels.
+    # Chang-E Semantics: stronger multi-label RAG action semantics and music alignment labels.
     classification_semantic_enable: bool = True
     classification_semantic_ratio: float = 0.70
     classification_retrieval_weight: float = 0.34
     classification_ot_weight: float = 0.45
     classification_retrieval_bonus: float = 0.28
     classification_report_topk: int = 8
-    # V46.31: Chang-E event-level semantic routing.
+    # Event Semantics: Chang-E event-level semantic routing.
     chang_e_event_semantic_enable: bool = True
     semantic_routing_weight: float = 0.72
     event_family_bonus: float = 0.58
@@ -451,17 +456,17 @@ class V46Config:
     route_source_run_hard_penalty: float = 0.30
     route_semantic_bonus_scale: float = 1.50
 
-    # V46.12: external classical-music semantic encoder.  The current EDGE
+    # External Music Semantics: external classical-music semantic encoder.  The current EDGE
     # repository contains rule/librosa music feature extractors, not a trained
     # classical-music classifier.  When a trained external encoder exists, it
     # can write slot-level JSON/NPZ semantics or be invoked through a command
-    # template.  These semantic probabilities then drive V44 unpaired OT and
-    # V46 retrieval reports.
+    # template.  These semantic probabilities then drive Contrastive Retriever unpaired OT and
+    # Motion Generation retrieval reports.
     external_music_semantic_enable: bool = True
     external_music_semantic_required: bool = False
     external_music_semantic_dirs: str = ""
     external_music_semantic_cmd: str = ""
-    external_music_semantic_cache_dir: str = "output/v46_external_music_semantic_cache"
+    external_music_semantic_cache_dir: str = "output/motion_external_music_semantic_cache"
     external_music_semantic_weight: float = 0.78
     external_music_semantic_temperature: float = 0.65
     external_music_semantic_proxy_enable: bool = True
@@ -496,7 +501,7 @@ class V46Config:
     ik_hard_contact_min_confidence: float = 0.85
     ik_contact_ramp_seconds: float = 4.0 / 30.0
     ik_max_delta_rot: float = 0.30
-    # V46.4: cloud-step is not a release / continue any more.  Large XZ travel
+    # Sliding-Support IK: cloud-step is not a release / continue any more.  Large XZ travel
     # in contact is classified by speed and then mapped to a sliding anchor.
     # This avoids the Footskate Forgiveness Paradox: severe slow AI drifting is
     # still locked, while true Dunhuang cloud-step gets a smooth moving target.
@@ -505,7 +510,7 @@ class V46Config:
     ik_cloud_step_speed_mps: float = 0.15
     ik_sliding_anchor_seconds: float = 10.0 / 30.0
     ik_cloud_speed_cv_max: float = 1.75
-    # V46.1: root-Y ballistic/damping pass. It is deliberately C1-safe and
+    # Root-Vertical Dynamics: root-Y ballistic/damping pass. It is deliberately C1-safe and
     # never breaks a damping cycle mid-contact.
     # Disabled by default: contact labels must first pass the final contact
     # reconstruction gate.  Enabling ballistics on sparse/corrupt contacts can
@@ -513,40 +518,40 @@ class V46Config:
     root_y_physics_enable: bool = False
     root_y_flight_strength: float = 0.18
     root_y_min_flight_seconds: float = 3.0 / 30.0
-    # V46.3: biological fuse. If the no-contact interval is longer than this,
+    # Flight Safety Fuse: biological fuse. If the no-contact interval is longer than this,
     # treat it as corrupted contact labels / bad upstream generation, not a
     # real human jump. Do not inject a huge ballistic parabola or landing dip.
     root_y_max_flight_seconds: float = 1.20
     root_y_damping_max_dip: float = 0.018
-    # V46.8: cap landing damping to an early post-touchdown window.  The window
+    # Root-Aware Motion Safety: cap landing damping to an early post-touchdown window.  The window
     # still starts and ends at zero dip, but it no longer stretches across a
     # multi-second support island and therefore cannot create delayed squats.
     root_y_damping_max_seconds: float = 0.28
 
-    # V46.8: root-aware cloud-step guard. A true cloud-step requires foot travel
+    # Root-Aware Motion Safety: root-aware cloud-step guard. A true cloud-step requires foot travel
     # to be consistent with root/CoM translation; smooth AI dark-drift with no
     # body support is kept on the static-anchor repair path.
     ik_cloud_root_min_travel_m: float = 0.045
     ik_cloud_direction_cos_min: float = 0.35
     ik_cloud_root_foot_rel_max_m: float = 0.18
 
-    # V46.8: long-sequence IK stitching and rollback safety.
+    # Root-Aware Motion Safety: long-sequence IK stitching and rollback safety.
     ik_chunk_overlap: int = 24
     rollback_root_delta_max_m: float = 0.12
     ik_post_stabilize_enable: bool = True
     ik_post_stabilize_passes: int = 2
 
-    # Controls use of a trained V44 model during generation.  Training remains
+    # Controls use of a trained Contrastive Retriever model during generation.  Training remains
     # an explicit CLI operation, so this switch must not silently suppress a
     # user-invoked train-contrastive command.
     contrastive_enable: bool = True
-    # V46.8: require real audio features for V44; false keeps the weak-proxy
+    # Root-Aware Motion Safety: require real audio features for Contrastive Retriever; false keeps the weak-proxy
     # fallback for smoke tests, while reports mark it as weak supervision.
     contrastive_require_real_music: bool = False
     audio_pair_min_coverage: float = 0.15
 
-    # V46.8: Chang-E BVH is usually motion-only.  When no synchronized
-    # BVH/audio pairs exist, train V44 with real unpaired music clips plus
+    # Root-Aware Motion Safety: Chang-E BVH is usually motion-only.  When no synchronized
+    # BVH/audio pairs exist, train Contrastive Retriever with real unpaired music clips plus
     # semantic optimal-transport pseudo pairs instead of motion-descriptor
     # self-distillation.  This keeps the method honest: the checkpoint records
     # unpaired_audio_semantic_ot, not paired supervision.
@@ -560,13 +565,13 @@ class V46Config:
     lower_body_only: bool = True
     refiner_enable: bool = True
     diffusion_enable: bool = True
-    # Geometry-safe V45/V46 path.  Existing 151D checkpoints remain loadable;
+    # Geometry-safe Motion Refiner and Motion Diffusion path.  Existing 151D checkpoints remain loadable;
     # newly trained checkpoints use a 79D contact/root/joint-tangent state.
     product_manifold_enable: bool = True
     product_refiner_rotation_cap_rad: float = 0.35
     product_refiner_root_cap_m: float = 0.08
     product_refiner_outside_weight: float = 0.25
-    # Differentiable world-space supervision shared by V45 and V46.  The
+    # Differentiable world-space supervision shared by Motion Refiner and Motion Generation.  The
     # acceleration/jerk residuals are normalized inside the loss, so these
     # weights are comparable to the product-manifold reconstruction term.
     physics_fk_loss_weight: float = 0.08
@@ -593,8 +598,8 @@ class V46Config:
     device: str = "cuda"
 
     @staticmethod
-    def from_json(path: Optional[str | Path]) -> "V46Config":
-        cfg = V46Config()
+    def from_json(path: Optional[str | Path]) -> "MotionGenerationConfig":
+        cfg = MotionGenerationConfig()
         if path and Path(path).exists():
             data = load_json(path)
             if "fps" in data:
@@ -616,124 +621,124 @@ class V46Config:
                     setattr(cfg, new, float(data[old]) * float(scale))
         return cfg
 
-    def apply_env(self) -> "V46Config":
+    def apply_env(self) -> "MotionGenerationConfig":
         env_map = {
-            "V46_FPS": ("fps", float),
-            "V46_ENABLE_TRUE_IK": ("ik_enable", lambda x: bool(int(x))),
-            "V46_ENABLE_REFINER": ("refiner_enable", lambda x: bool(int(x))),
-            "V46_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
-            "V46_PRODUCT_MANIFOLD_ENABLE": ("product_manifold_enable", lambda x: bool(int(x))),
-            "V46_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
-            "V46_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
-            "V46_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
-            "V46_PHYSICS_FK_LOSS_WEIGHT": ("physics_fk_loss_weight", float),
-            "V46_PHYSICS_FOOT_LOSS_WEIGHT": ("physics_foot_loss_weight", float),
-            "V46_PHYSICS_SUPPORT_LOSS_WEIGHT": ("physics_support_loss_weight", float),
-            "V46_PHYSICS_PENETRATION_LOSS_WEIGHT": ("physics_penetration_loss_weight", float),
-            "V46_PHYSICS_ACCELERATION_LOSS_WEIGHT": ("physics_acceleration_loss_weight", float),
-            "V46_PHYSICS_JERK_LOSS_WEIGHT": ("physics_jerk_loss_weight", float),
-            "V46_PHYSICS_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
+            "MOTION_FPS": ("fps", float),
+            "MOTION_ENABLE_TRUE_IK": ("ik_enable", lambda x: bool(int(x))),
+            "MOTION_ENABLE_REFINER": ("refiner_enable", lambda x: bool(int(x))),
+            "MOTION_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
+            "MOTION_PRODUCT_MANIFOLD_ENABLE": ("product_manifold_enable", lambda x: bool(int(x))),
+            "MOTION_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
+            "MOTION_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
+            "MOTION_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
+            "MOTION_PHYSICS_FK_LOSS_WEIGHT": ("physics_fk_loss_weight", float),
+            "MOTION_PHYSICS_FOOT_LOSS_WEIGHT": ("physics_foot_loss_weight", float),
+            "MOTION_PHYSICS_SUPPORT_LOSS_WEIGHT": ("physics_support_loss_weight", float),
+            "MOTION_PHYSICS_PENETRATION_LOSS_WEIGHT": ("physics_penetration_loss_weight", float),
+            "MOTION_PHYSICS_ACCELERATION_LOSS_WEIGHT": ("physics_acceleration_loss_weight", float),
+            "MOTION_PHYSICS_JERK_LOSS_WEIGHT": ("physics_jerk_loss_weight", float),
+            "MOTION_PHYSICS_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
             "CONTACT_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
-            "V46_TANGENT_DIFFUSION_ENABLE": ("tangent_diffusion_enable", lambda x: bool(int(x))),
-            "V46_TANGENT_DIFFUSION_ROTATION_CAP_RAD": ("tangent_diffusion_rotation_cap_rad", float),
-            "V46_TANGENT_DIFFUSION_ROOT_CAP_M": ("tangent_diffusion_root_cap_m", float),
-            "V46_RIEMANNIAN_TRUST_REGION_ENABLE": ("riemannian_trust_region_enable", lambda x: bool(int(x))),
-            "V46_RIEMANNIAN_TRUST_REGION_STEPS": ("riemannian_trust_region_steps", int),
-            "V46_RIEMANNIAN_TRUST_REGION_INITIAL_RADIUS": ("riemannian_trust_region_initial_radius", float),
-            "V46_RIEMANNIAN_TRUST_REGION_MIN_RADIUS": ("riemannian_trust_region_min_radius", float),
-            "V46_TOP_K": ("top_k", int),
-            "V46_BEAM_SIZE": ("beam_size", int),
-            "V46_CHANG_E_EVENT_SEMANTIC_ENABLE": ("chang_e_event_semantic_enable", lambda x: bool(int(x))),
-            "V46_SEMANTIC_ROUTING_WEIGHT": ("semantic_routing_weight", float),
-            "V46_EVENT_FAMILY_BONUS": ("event_family_bonus", float),
-            "V46_MOTION_STAGE_ROLE_BONUS": ("motion_stage_role_bonus", float),
-            "V46_PREFERRED_DANCE_KEY_BONUS": ("preferred_dance_key_bonus", float),
-            "V46_ROUTE_NATURAL_DURATION_WEIGHT": ("route_natural_duration_weight", float),
-            "V46_ROUTE_FAMILY_BALANCE_PENALTY": ("route_family_balance_penalty", float),
-            "V46_ROUTE_FAMILY_RECENT_WINDOW": ("route_family_recent_window", int),
-            "V46_ROUTE_FAMILY_PENALTY_CAP": ("route_family_penalty_cap", float),
-            "V46_ROUTE_DANCE_KEY_REPEAT_PENALTY": ("route_dance_key_repeat_penalty", float),
-            "V46_ROUTE_FAMILY_REPEAT_PENALTY": ("route_family_repeat_penalty", float),
-            "V46_ROUTE_SOURCE_REPEAT_PENALTY": ("route_source_repeat_penalty", float),
-            "V46_ROUTE_MOTIF_RECALL_BONUS": ("route_motif_recall_bonus", float),
-            "V46_ROUTE_DEBUG_TOPK": ("route_debug_topk", int),
-            "V46_CHANG_E_BOUNDARY_EVENT_SPLIT": ("chang_e_boundary_event_split", lambda x: bool(int(x))),
-            "V46_CHANG_E_BOUNDARY_MAX_EXTRA_STARTS": ("chang_e_boundary_max_extra_starts", int),
-            "V46_CHANG_E_MIN_EVENT_QUALITY": ("chang_e_min_event_quality", float),
-            "V46_CHANG_E_KEEP_POSE_ANCHOR_QUALITY": ("chang_e_keep_pose_anchor_quality", float),
-            "V46_EVENT_QUALITY_WEIGHT": ("event_quality_weight", float),
-            "V46_ROUTE_SUPPORT_BONUS": ("route_support_bonus", float),
-            "V46_ROUTE_LOCOMOTION_BONUS": ("route_locomotion_bonus", float),
-            "V46_ROUTE_STAGE_SEQUENCE_WEIGHT": ("route_stage_sequence_weight", float),
-            "V46_ROUTE_SOURCE_RUN_HARD_PENALTY": ("route_source_run_hard_penalty", float),
-            "V46_ROUTE_SEMANTIC_BONUS_SCALE": ("route_semantic_bonus_scale", float),
-            "V46_OVERLAP": ("overlap", int),
-            "V46_TRANSITION_TRAIN_MIN_SECONDS": ("transition_train_min_seconds", float),
-            "V46_TRANSITION_TRAIN_MAX_SECONDS": ("transition_train_max_seconds", float),
-            "V46_TRANSITION_MASK_HALO_SECONDS": ("transition_mask_halo_seconds", float),
-            "V46_WINDOW_LEN": ("window_len", int),
-            "V46_HOP_LEN": ("hop_len", int),
-            "V46_MIN_EVENT_FRAMES": ("min_event_frames", int),
-            "V46_MAX_EVENT_FRAMES": ("max_event_frames", int),
-            "V46_ENABLE_CONTRASTIVE": ("contrastive_enable", lambda x: bool(int(x))),
-            "V46_IK_ITERS": ("ik_iters", int),
-            "V46_IK_CONTACT_W": ("ik_contact_w", float),
-            "V46_IK_PENETRATION_W": ("ik_penetration_w", float),
-            "V46_IK_CONTACT_HIGH": ("ik_contact_high", float),
-            "V46_IK_CONTACT_LOW": ("ik_contact_low", float),
-            "V46_IK_SPEED_GATE_MPS": ("ik_speed_gate_mps", float),
+            "MOTION_TANGENT_DIFFUSION_ENABLE": ("tangent_diffusion_enable", lambda x: bool(int(x))),
+            "MOTION_TANGENT_DIFFUSION_ROTATION_CAP_RAD": ("tangent_diffusion_rotation_cap_rad", float),
+            "MOTION_TANGENT_DIFFUSION_ROOT_CAP_M": ("tangent_diffusion_root_cap_m", float),
+            "MOTION_RIEMANNIAN_TRUST_REGION_ENABLE": ("riemannian_trust_region_enable", lambda x: bool(int(x))),
+            "MOTION_RIEMANNIAN_TRUST_REGION_STEPS": ("riemannian_trust_region_steps", int),
+            "MOTION_RIEMANNIAN_TRUST_REGION_INITIAL_RADIUS": ("riemannian_trust_region_initial_radius", float),
+            "MOTION_RIEMANNIAN_TRUST_REGION_MIN_RADIUS": ("riemannian_trust_region_min_radius", float),
+            "MOTION_TOP_K": ("top_k", int),
+            "MOTION_BEAM_SIZE": ("beam_size", int),
+            "MOTION_CHANG_E_EVENT_SEMANTIC_ENABLE": ("chang_e_event_semantic_enable", lambda x: bool(int(x))),
+            "MOTION_SEMANTIC_ROUTING_WEIGHT": ("semantic_routing_weight", float),
+            "MOTION_EVENT_FAMILY_BONUS": ("event_family_bonus", float),
+            "MOTION_STAGE_ROLE_BONUS": ("motion_stage_role_bonus", float),
+            "MOTION_PREFERRED_DANCE_KEY_BONUS": ("preferred_dance_key_bonus", float),
+            "MOTION_ROUTE_NATURAL_DURATION_WEIGHT": ("route_natural_duration_weight", float),
+            "MOTION_ROUTE_FAMILY_BALANCE_PENALTY": ("route_family_balance_penalty", float),
+            "MOTION_ROUTE_FAMILY_RECENT_WINDOW": ("route_family_recent_window", int),
+            "MOTION_ROUTE_FAMILY_PENALTY_CAP": ("route_family_penalty_cap", float),
+            "MOTION_ROUTE_DANCE_KEY_REPEAT_PENALTY": ("route_dance_key_repeat_penalty", float),
+            "MOTION_ROUTE_FAMILY_REPEAT_PENALTY": ("route_family_repeat_penalty", float),
+            "MOTION_ROUTE_SOURCE_REPEAT_PENALTY": ("route_source_repeat_penalty", float),
+            "MOTION_ROUTE_MOTIF_RECALL_BONUS": ("route_motif_recall_bonus", float),
+            "MOTION_ROUTE_DEBUG_TOPK": ("route_debug_topk", int),
+            "MOTION_CHANG_E_BOUNDARY_EVENT_SPLIT": ("chang_e_boundary_event_split", lambda x: bool(int(x))),
+            "MOTION_CHANG_E_BOUNDARY_MAX_EXTRA_STARTS": ("chang_e_boundary_max_extra_starts", int),
+            "MOTION_CHANG_E_MIN_EVENT_QUALITY": ("chang_e_min_event_quality", float),
+            "MOTION_CHANG_E_KEEP_POSE_ANCHOR_QUALITY": ("chang_e_keep_pose_anchor_quality", float),
+            "MOTION_EVENT_QUALITY_WEIGHT": ("event_quality_weight", float),
+            "MOTION_ROUTE_SUPPORT_BONUS": ("route_support_bonus", float),
+            "MOTION_ROUTE_LOCOMOTION_BONUS": ("route_locomotion_bonus", float),
+            "MOTION_ROUTE_STAGE_SEQUENCE_WEIGHT": ("route_stage_sequence_weight", float),
+            "MOTION_ROUTE_SOURCE_RUN_HARD_PENALTY": ("route_source_run_hard_penalty", float),
+            "MOTION_ROUTE_SEMANTIC_BONUS_SCALE": ("route_semantic_bonus_scale", float),
+            "MOTION_OVERLAP": ("overlap", int),
+            "MOTION_TRANSITION_TRAIN_MIN_SECONDS": ("transition_train_min_seconds", float),
+            "MOTION_TRANSITION_TRAIN_MAX_SECONDS": ("transition_train_max_seconds", float),
+            "MOTION_TRANSITION_MASK_HALO_SECONDS": ("transition_mask_halo_seconds", float),
+            "MOTION_WINDOW_LEN": ("window_len", int),
+            "MOTION_HOP_LEN": ("hop_len", int),
+            "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
+            "MOTION_MAX_EVENT_FRAMES": ("max_event_frames", int),
+            "MOTION_ENABLE_CONTRASTIVE": ("contrastive_enable", lambda x: bool(int(x))),
+            "MOTION_IK_ITERS": ("ik_iters", int),
+            "MOTION_IK_CONTACT_W": ("ik_contact_w", float),
+            "MOTION_IK_PENETRATION_W": ("ik_penetration_w", float),
+            "MOTION_IK_CONTACT_HIGH": ("ik_contact_high", float),
+            "MOTION_IK_CONTACT_LOW": ("ik_contact_low", float),
+            "MOTION_IK_SPEED_GATE_MPS": ("ik_speed_gate_mps", float),
             "CONTACT_IK_LOCK_SPEED_MPS": ("ik_speed_gate_mps", float),
-            "V46_IK_CONTACT_BREAK_SPEED_MPS": ("ik_contact_break_speed_mps", float),
-            "V46_IK_HARD_CONTACT_LOCK": ("ik_hard_contact_lock", lambda x: bool(int(x))),
-            "V46_IK_HARD_CONTACT_MIN_CONFIDENCE": ("ik_hard_contact_min_confidence", float),
-            "V46_IK_SLIDE_RELEASE_M": ("ik_slide_release_m", float),
-            "V46_IK_CLOUD_STEP_SPEED_MPS": ("ik_cloud_step_speed_mps", float),
-            "V46_IK_SLIDING_ANCHOR_SECONDS": ("ik_sliding_anchor_seconds", float),
-            "V46_IK_CLOUD_SPEED_CV_MAX": ("ik_cloud_speed_cv_max", float),
-            "V46_IK_CLOUD_ROOT_MIN_TRAVEL_M": ("ik_cloud_root_min_travel_m", float),
-            "V46_IK_CLOUD_DIRECTION_COS_MIN": ("ik_cloud_direction_cos_min", float),
-            "V46_IK_CLOUD_ROOT_FOOT_REL_MAX_M": ("ik_cloud_root_foot_rel_max_m", float),
-            "V46_IK_CHUNK_OVERLAP": ("ik_chunk_overlap", int),
-            "V46_IK_CONTACT_RAMP_SECONDS": ("ik_contact_ramp_seconds", float),
-            "V46_IK_POST_STABILIZE_ENABLE": ("ik_post_stabilize_enable", lambda x: bool(int(x))),
-            "V46_IK_POST_STABILIZE_PASSES": ("ik_post_stabilize_passes", int),
-            "V46_ROLLBACK_ROOT_DELTA_MAX_M": ("rollback_root_delta_max_m", float),
-            "V46_CONTRASTIVE_REQUIRE_REAL_MUSIC": ("contrastive_require_real_music", lambda x: bool(int(x))),
-            "V46_AUDIO_PAIR_MIN_COVERAGE": ("audio_pair_min_coverage", float),
-            "V46_UNPAIRED_AUDIO_ENABLE": ("unpaired_audio_enable", lambda x: bool(int(x))),
-            "V46_UNPAIRED_AUDIO_SLOT_SECONDS": ("unpaired_audio_slot_seconds", float),
-            "V46_UNPAIRED_POSITIVE_TOPK": ("unpaired_positive_topk", int),
-            "V46_UNPAIRED_PAIRS_PER_AUDIO_SLOT": ("unpaired_pairs_per_audio_slot", int),
-            "V46_UNPAIRED_DISABLE_MOTION_PROXY": ("unpaired_disable_motion_proxy", lambda x: bool(int(x))),
-            "V46_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
-            "V46_ENABLE_ROOT_Y_PHYSICS": ("root_y_physics_enable", lambda x: bool(int(x))),
-            "V46_ROOT_Y_MIN_FLIGHT_SECONDS": ("root_y_min_flight_seconds", float),
-            "V46_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
-            "V46_DIFFUSION_STEPS": ("diffusion_steps", int),
-            "V46_DEVICE": ("device", str),
-            "V46_BVH_RESAMPLE_TO_CONFIG_FPS": ("bvh_resample_to_config_fps", lambda x: bool(int(x))),
-            "V46_SOURCE_GROUP_MODE": ("source_group_mode", str),
-            "V46_FILENAME_SEMANTIC_ENABLE": ("filename_semantic_enable", lambda x: bool(int(x))),
-            "V46_FILENAME_SEMANTIC_WEIGHT": ("filename_semantic_weight", float),
-            "V46_FILENAME_SEMANTIC_RETRIEVAL_WEIGHT": ("filename_semantic_retrieval_weight", float),
-            "V46_FILENAME_SEMANTIC_OT_WEIGHT": ("filename_semantic_ot_weight", float),
-            "V46_CLASSIFICATION_SEMANTIC_ENABLE": ("classification_semantic_enable", lambda x: bool(int(x))),
-            "V46_CLASSIFICATION_SEMANTIC_RATIO": ("classification_semantic_ratio", float),
-            "V46_CLASSIFICATION_RETRIEVAL_WEIGHT": ("classification_retrieval_weight", float),
-            "V46_CLASSIFICATION_OT_WEIGHT": ("classification_ot_weight", float),
-            "V46_CLASSIFICATION_RETRIEVAL_BONUS": ("classification_retrieval_bonus", float),
-            "V46_CLASSIFICATION_REPORT_TOPK": ("classification_report_topk", int),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_ENABLE": ("external_music_semantic_enable", lambda x: bool(int(x))),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_REQUIRED": ("external_music_semantic_required", lambda x: bool(int(x))),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_DIRS": ("external_music_semantic_dirs", str),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_CMD": ("external_music_semantic_cmd", str),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR": ("external_music_semantic_cache_dir", str),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_WEIGHT": ("external_music_semantic_weight", float),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE": ("external_music_semantic_temperature", float),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE": ("external_music_semantic_proxy_enable", lambda x: bool(int(x))),
-            "V46_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY": ("external_music_semantic_filename_proxy", lambda x: bool(int(x))),
-            "V46_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
-            "V46_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
+            "MOTION_IK_CONTACT_BREAK_SPEED_MPS": ("ik_contact_break_speed_mps", float),
+            "MOTION_IK_HARD_CONTACT_LOCK": ("ik_hard_contact_lock", lambda x: bool(int(x))),
+            "MOTION_IK_HARD_CONTACT_MIN_CONFIDENCE": ("ik_hard_contact_min_confidence", float),
+            "MOTION_IK_SLIDE_RELEASE_M": ("ik_slide_release_m", float),
+            "MOTION_IK_CLOUD_STEP_SPEED_MPS": ("ik_cloud_step_speed_mps", float),
+            "MOTION_IK_SLIDING_ANCHOR_SECONDS": ("ik_sliding_anchor_seconds", float),
+            "MOTION_IK_CLOUD_SPEED_CV_MAX": ("ik_cloud_speed_cv_max", float),
+            "MOTION_IK_CLOUD_ROOT_MIN_TRAVEL_M": ("ik_cloud_root_min_travel_m", float),
+            "MOTION_IK_CLOUD_DIRECTION_COS_MIN": ("ik_cloud_direction_cos_min", float),
+            "MOTION_IK_CLOUD_ROOT_FOOT_REL_MAX_M": ("ik_cloud_root_foot_rel_max_m", float),
+            "MOTION_IK_CHUNK_OVERLAP": ("ik_chunk_overlap", int),
+            "MOTION_IK_CONTACT_RAMP_SECONDS": ("ik_contact_ramp_seconds", float),
+            "MOTION_IK_POST_STABILIZE_ENABLE": ("ik_post_stabilize_enable", lambda x: bool(int(x))),
+            "MOTION_IK_POST_STABILIZE_PASSES": ("ik_post_stabilize_passes", int),
+            "MOTION_ROLLBACK_ROOT_DELTA_MAX_M": ("rollback_root_delta_max_m", float),
+            "MOTION_CONTRASTIVE_REQUIRE_REAL_MUSIC": ("contrastive_require_real_music", lambda x: bool(int(x))),
+            "MOTION_AUDIO_PAIR_MIN_COVERAGE": ("audio_pair_min_coverage", float),
+            "MOTION_UNPAIRED_AUDIO_ENABLE": ("unpaired_audio_enable", lambda x: bool(int(x))),
+            "MOTION_UNPAIRED_AUDIO_SLOT_SECONDS": ("unpaired_audio_slot_seconds", float),
+            "MOTION_UNPAIRED_POSITIVE_TOPK": ("unpaired_positive_topk", int),
+            "MOTION_UNPAIRED_PAIRS_PER_AUDIO_SLOT": ("unpaired_pairs_per_audio_slot", int),
+            "MOTION_UNPAIRED_DISABLE_MOTION_PROXY": ("unpaired_disable_motion_proxy", lambda x: bool(int(x))),
+            "MOTION_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
+            "MOTION_ENABLE_ROOT_Y_PHYSICS": ("root_y_physics_enable", lambda x: bool(int(x))),
+            "MOTION_ROOT_Y_MIN_FLIGHT_SECONDS": ("root_y_min_flight_seconds", float),
+            "MOTION_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
+            "MOTION_DIFFUSION_STEPS": ("diffusion_steps", int),
+            "MOTION_DEVICE": ("device", str),
+            "MOTION_BVH_RESAMPLE_TO_CONFIG_FPS": ("bvh_resample_to_config_fps", lambda x: bool(int(x))),
+            "MOTION_SOURCE_GROUP_MODE": ("source_group_mode", str),
+            "MOTION_FILENAME_SEMANTIC_ENABLE": ("filename_semantic_enable", lambda x: bool(int(x))),
+            "MOTION_FILENAME_SEMANTIC_WEIGHT": ("filename_semantic_weight", float),
+            "MOTION_FILENAME_SEMANTIC_RETRIEVAL_WEIGHT": ("filename_semantic_retrieval_weight", float),
+            "MOTION_FILENAME_SEMANTIC_OT_WEIGHT": ("filename_semantic_ot_weight", float),
+            "MOTION_CLASSIFICATION_SEMANTIC_ENABLE": ("classification_semantic_enable", lambda x: bool(int(x))),
+            "MOTION_CLASSIFICATION_SEMANTIC_RATIO": ("classification_semantic_ratio", float),
+            "MOTION_CLASSIFICATION_RETRIEVAL_WEIGHT": ("classification_retrieval_weight", float),
+            "MOTION_CLASSIFICATION_OT_WEIGHT": ("classification_ot_weight", float),
+            "MOTION_CLASSIFICATION_RETRIEVAL_BONUS": ("classification_retrieval_bonus", float),
+            "MOTION_CLASSIFICATION_REPORT_TOPK": ("classification_report_topk", int),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_ENABLE": ("external_music_semantic_enable", lambda x: bool(int(x))),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_REQUIRED": ("external_music_semantic_required", lambda x: bool(int(x))),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_DIRS": ("external_music_semantic_dirs", str),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_CMD": ("external_music_semantic_cmd", str),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR": ("external_music_semantic_cache_dir", str),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_WEIGHT": ("external_music_semantic_weight", float),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE": ("external_music_semantic_temperature", float),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE": ("external_music_semantic_proxy_enable", lambda x: bool(int(x))),
+            "MOTION_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY": ("external_music_semantic_filename_proxy", lambda x: bool(int(x))),
+            "MOTION_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
+            "MOTION_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
         }
         for e, (attr, caster) in env_map.items():
             if e in os.environ:
@@ -746,7 +751,7 @@ class V46Config:
 MOTION_CHECKPOINT_CONTRACT_SCHEMA = "dunhuang_motion_checkpoint_contract_v2"
 
 
-def motion_checkpoint_contract(cfg: V46Config, role: str) -> Dict[str, Any]:
+def motion_checkpoint_contract(cfg: MotionGenerationConfig, role: str) -> Dict[str, Any]:
     """Return the immutable representation/time contract embedded in a checkpoint."""
     return {
         "schema": MOTION_CHECKPOINT_CONTRACT_SCHEMA,
@@ -770,32 +775,39 @@ def motion_checkpoint_contract(cfg: V46Config, role: str) -> Dict[str, Any]:
 
 def assert_motion_checkpoint_contract(
     checkpoint: Dict[str, Any],
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
     path: str | Path,
     role: str,
 ) -> None:
     """Reject mixed-FPS, mixed-Rot6D and mixed-skeleton model assets."""
     actual = checkpoint.get("motion_contract")
     if not isinstance(actual, dict):
-        if os.environ.get("V46_ALLOW_LEGACY_CHECKPOINT_CONTRACT", "0") == "1" and abs(float(cfg.fps) - 30.0) < 1.0e-6:
+        if os.environ.get("MOTION_ALLOW_LEGACY_CHECKPOINT_CONTRACT", "0") == "1" and abs(float(cfg.fps) - 30.0) < 1.0e-6:
             return
         raise RuntimeError(
             f"Checkpoint {path} has no {MOTION_CHECKPOINT_CONTRACT_SCHEMA}. "
             "It must be rebuilt for this repository contract. For a read-only "
-            "30 FPS parity baseline only, set V46_ALLOW_LEGACY_CHECKPOINT_CONTRACT=1."
+            "30 FPS parity baseline only, set MOTION_ALLOW_LEGACY_CHECKPOINT_CONTRACT=1."
         )
 
     expected = motion_checkpoint_contract(cfg, role)
     mismatches: List[str] = []
     for key in ("schema", "role", "motion_dim", "rot6d_layout", "skeleton_schema", "skeleton_sha256"):
-        if actual.get(key) != expected[key]:
-            mismatches.append(f"{key}: checkpoint={actual.get(key)!r}, runtime={expected[key]!r}")
+        actual_value = actual.get(key)
+        expected_value = expected[key]
+        if key == "role":
+            actual_value = normalize_motion_checkpoint_role(actual_value)
+            expected_value = normalize_motion_checkpoint_role(expected_value)
+        if actual_value != expected_value:
+            mismatches.append(
+                f"{key}: checkpoint={actual.get(key)!r}, runtime={expected[key]!r}"
+            )
     try:
         if abs(float(actual.get("fps")) - expected["fps"]) > 1.0e-6:
             mismatches.append(f"fps: checkpoint={actual.get('fps')!r}, runtime={expected['fps']!r}")
     except (TypeError, ValueError):
         mismatches.append(f"fps: checkpoint={actual.get('fps')!r}, runtime={expected['fps']!r}")
-    if role in {"v45_refiner", "v46_diffusion"}:
+    if role in {"boundary_refiner", "motion_diffusion"}:
         if int(actual.get("window_len", -1)) != expected["window_len"]:
             mismatches.append(
                 f"window_len: checkpoint={actual.get('window_len')!r}, runtime={expected['window_len']!r}"
@@ -930,7 +942,7 @@ def motion_boundary_state(
 
 
 # -----------------------------------------------------------------------------
-# V46.31 research contract guards for Chang-E/change RAG DB
+# Event Semantics research contract guards for Chang-E/change RAG DB
 # -----------------------------------------------------------------------------
 def identity6d_np(shape_prefix: Tuple[int, ...] = ()) -> np.ndarray:
     """Return identity rotation in the repository's 6D convention."""
@@ -953,7 +965,7 @@ def sanitize_rot6d_np(rot6d: np.ndarray) -> Tuple[np.ndarray, dict]:
     a2_clean = np.nan_to_num(a2, nan=0.0, posinf=0.0, neginf=0.0)
     n1 = np.linalg.norm(a1_clean, axis=-1)
     n2 = np.linalg.norm(a2_clean, axis=-1)
-    # V46.31: also reject near-collinear 6D vectors.  Gram-Schmidt
+    # Event Semantics: also reject near-collinear 6D vectors.  Gram-Schmidt
     # can collapse when a1 and a2 are parallel/anti-parallel even if both
     # vector norms are valid, which can happen during early diffusion denoising.
     denom = np.maximum(n1 * n2, 1e-8)
@@ -1031,10 +1043,10 @@ def _safe_percentile(arr: np.ndarray, q: float, default: float = 0.0) -> float:
         return float(default)
 
 
-def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hint: str = "") -> Tuple[np.ndarray, dict]:
+def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: MotionGenerationConfig, source_hint: str = "") -> Tuple[np.ndarray, dict]:
     """Kinematic fallback for contact channels when the main FK contact builder fails.
 
-    V46.19 fix: never replace a time-varying foot contact signal with a static
+    Contact Reconstruction fix: never replace a time-varying foot contact signal with a static
     scalar such as 0.50 or 0.60.  First try a simple foot-height + foot-velocity
     heuristic from FK joints.  If even FK is unavailable, fall back to a root
     height/speed heuristic so the signal remains temporally varying rather than
@@ -1081,7 +1093,7 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
         report["fk_heuristic_error"] = str(exc)
 
     # Last-resort fallback when FK is unavailable.  Without foot joints, there is
-    # no physically reliable way to decide left/right support.  Therefore V46.19
+    # no physically reliable way to decide left/right support.  Therefore Contact Reconstruction
     # deliberately avoids copying one root-level state to all four foot contacts:
     # that would weld both feet on near-root frames and release both feet otherwise.
     # Instead, produce a weak, non-anchoring, time-varying uncertainty signal that
@@ -1116,7 +1128,7 @@ def heuristic_contacts_fallback_np(motion: np.ndarray, cfg: V46Config, source_hi
 
 def enforce_edge151_contract_np(
     motion: np.ndarray,
-    cfg: Optional[V46Config] = None,
+    cfg: Optional[MotionGenerationConfig] = None,
     source_hint: str = "",
     derive_contact: bool = True,
     project_rot: bool = True,
@@ -1126,12 +1138,12 @@ def enforce_edge151_contract_np(
     Critical reason:
     direct BVH loading may temporarily use channel 0 to carry native fps before
     resampling.  That is legal only inside loading.  Once an array is saved as an
-    Event-RAG clip or passed into V45/V46, EDGE [0:4] must again mean contacts.
+    Event-RAG clip or passed into Motion Refiner and Motion Diffusion, EDGE [0:4] must again mean contacts.
     """
-    cfg = cfg or V46Config()
+    cfg = cfg or MotionGenerationConfig()
     x0 = np.asarray(motion, dtype=np.float32)
     report = {
-        "version": "v46_24_edge151_contract_guard",
+        "version": "edge151_contract_edge151_contract_guard",
         "source_hint": str(source_hint),
         "input_shape": list(x0.shape),
     }
@@ -1176,7 +1188,7 @@ def enforce_edge151_contract_np(
             report["contact_conf_mean"] = float(np.mean(conf))
             report["floor_y"] = float(floor_y)
         except Exception as exc:
-            # V46.19: do not replace a dynamic contact signal with a global
+            # Contact Reconstruction: do not replace a dynamic contact signal with a global
             # constant such as 0.50 or 0.60.  Generate a per-frame kinematic
             # fallback so IK neither releases nor welds both feet for the whole clip.
             if contact_polluted:
@@ -1233,7 +1245,7 @@ def sliding_window_ranges(T: int, window: int, hop: int) -> List[Tuple[int, int]
 def overlap_add_weight_np(length: int, start: int, total: int, hop: int, window: int) -> np.ndarray:
     """Raised-cosine weight with global-boundary one-sided protection.
 
-    V46.19 fix:
+    Contact Reconstruction fix:
     a full symmetric Hann window attenuates the very first and very last global
     frames even though no outside window can compensate them.  We therefore keep
     the non-overlapped side of the first/last chunk at weight 1.0 and only use
@@ -1275,7 +1287,7 @@ def normalize_quat_np(q: np.ndarray) -> np.ndarray:
 def matrix_to_quat_np(R: np.ndarray) -> np.ndarray:
     """Vectorized rotation-matrix to unit quaternion conversion [w,x,y,z].
 
-    V46.19 fix: avoid per-matrix Python loops.  Long whole-song inference calls
+    Contact Reconstruction fix: avoid per-matrix Python loops.  Long whole-song inference calls
     this function many times for [T,24,3,3] arrays, so the branch logic is
     implemented with NumPy masks to keep official evaluation practical.
     """
@@ -1398,7 +1410,7 @@ def finalize_motion_window_accum_np(
     weight_sum: np.ndarray,
     rot_quat_accum: np.ndarray,
     rot_quat_weight: np.ndarray,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
     source_hint: str,
     derive_contact: bool = True,
 ) -> Tuple[np.ndarray, dict]:
@@ -1428,7 +1440,7 @@ def blend_motion_overlap_np(
     a: np.ndarray,
     b: np.ndarray,
     w_b: np.ndarray,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
     source_hint: str = "blend_motion_overlap",
 ) -> Tuple[np.ndarray, dict]:
     """Blend two overlap clips with quaternion rotation fusion, not Rot6D LERP.
@@ -1600,7 +1612,7 @@ def chang_e_event_quality_from_numbers(nums: Dict[str, float], family: str, dura
     content = max(energy, travel, turn, lower, upper, onset, jump)
     if family in {"pose_motif", "calm_flow"}:
         content = max(content * 0.65, pose_hold)
-    # V46.31: stationary Dunhuang postures / meditation motifs are supposed to
+    # Event Semantics: stationary Dunhuang postures / meditation motifs are supposed to
     # have long stable support. Do not score contact_ratio=1.0 as bad gait.
     if family in {"pose_motif", "calm_flow"} or pose_hold > 0.70:
         contact_score = 1.0 if contact_ratio >= 0.70 else float(contact_ratio / 0.70)
@@ -1614,7 +1626,7 @@ def chang_e_event_quality_from_numbers(nums: Dict[str, float], family: str, dura
     return float(np.clip(q, 0.02, 1.0))
 
 
-def chang_e_semantic_event_starts(seq: np.ndarray, cfg: V46Config) -> List[int]:
+def chang_e_semantic_event_starts(seq: np.ndarray, cfg: MotionGenerationConfig) -> List[int]:
     """Boundary-aware starts for Chang-E long BVH.
 
     Compact action libraries naturally provide event-sized files. Chang-E files
@@ -1674,14 +1686,14 @@ def chang_e_semantic_event_starts(seq: np.ndarray, cfg: V46Config) -> List[int]:
     merged: List[int] = []
     min_start_sep = max(6, min(hop // 2, win // 4))
     tail = max(0, T - win)
-    # V46.31: if the sequence is only slightly longer than one window, [0:win]
+    # Event Semantics: if the sequence is only slightly longer than one window, [0:win]
     # and [tail:T] are >95% overlapping twins. Keep one centered representative
     # rather than polluting the RAG DB with near-identical embeddings.
     if 0 < tail < min_start_sep:
         return [int(max(0, tail // 2))]
     for st in out:
         st = int(st)
-        # V46.31: keep coverage endpoints without creating near-duplicate twins.
+        # Event Semantics: keep coverage endpoints without creating near-duplicate twins.
         # When a novelty start lies too close to the required tail window, replace
         # the previous start with the exact tail start instead of appending both.
         if st == 0:
@@ -1690,7 +1702,7 @@ def chang_e_semantic_event_starts(seq: np.ndarray, cfg: V46Config) -> List[int]:
             continue
         if st == tail:
             if merged and abs(st - merged[-1]) < min_start_sep:
-                # V46.31: protect the unique opener for very short sequences.
+                # Event Semantics: protect the unique opener for very short sequences.
                 # If T is only slightly larger than win, tail can be only a few
                 # frames after 0. Replacing [0] with [tail] permanently drops
                 # opening frames. Keep the opener and add the tail only in this
@@ -1718,7 +1730,7 @@ def chang_e_semantic_event_starts(seq: np.ndarray, cfg: V46Config) -> List[int]:
 
 
 def refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof: Dict[str, object]) -> Dict[str, object]:
-    # V46.31 window-level semantics for Chang-E event slicing.
+    # Event Semantics window-level semantics for Chang-E event slicing.
     # Chang-E is a long, category-complete MoCap corpus; each local window is
     # converted into a curated event with explicit recording provenance.
     out = dict(prof)
@@ -1815,7 +1827,7 @@ def refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof:
     return out
 
 
-def class_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = None) -> np.ndarray:
+def class_semantic_vector_from_meta(meta: dict, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
     key = _safe_profile_key(meta)
     base = filename_semantic_vector_from_meta(meta, cfg).copy()
     cls = strong_action_semantics_from_meta(meta)
@@ -1884,7 +1896,7 @@ def audio_slot_classification_from_pseudo(pseudo: np.ndarray, duration: float, e
 
 
 
-# V46.12 external classical-music semantic interface.
+# External Music Semantics external classical-music semantic interface.
 # Supported labels are deliberately identical to RAG event music_alignment labels,
 # so a trained classical model can supervise retrieval without paired BVH/audio.
 MUSIC_SEMANTIC_LABELS = MUSIC_ALIGNMENT_LABELS
@@ -2014,7 +2026,7 @@ def music_semantic_slot_from_probs(probs: Dict[str, float], duration: float = 4.
     }
 
 
-def music_probs_to_pseudo_feature(probs: Dict[str, float], duration: float, cfg: V46Config) -> np.ndarray:
+def music_probs_to_pseudo_feature(probs: Dict[str, float], duration: float, cfg: MotionGenerationConfig) -> np.ndarray:
     # Label prototypes occupy the same descriptor layout used by motion events.
     prototypes = {
         "calm_meditative": (0.020, 0.010, 0.012, 0.85),
@@ -2060,7 +2072,7 @@ def music_probs_to_pseudo_feature(probs: Dict[str, float], duration: float, cfg:
     return pseudo.astype(np.float32)
 
 
-def sidecar_music_semantic_candidates(audio_path: str | Path, cfg: V46Config) -> List[Path]:
+def sidecar_music_semantic_candidates(audio_path: str | Path, cfg: MotionGenerationConfig) -> List[Path]:
     p = Path(audio_path)
     names = [
         f"{p.stem}.music_semantic.json", f"{p.stem}_music_semantic.json", f"{p.stem}.semantic.json", f"{p.stem}_semantic.json",
@@ -2075,11 +2087,11 @@ def sidecar_music_semantic_candidates(audio_path: str | Path, cfg: V46Config) ->
     return cands
 
 
-def run_external_music_semantic_cmd(audio_path: str | Path, cfg: V46Config) -> Optional[Path]:
+def run_external_music_semantic_cmd(audio_path: str | Path, cfg: MotionGenerationConfig) -> Optional[Path]:
     cmd = str(getattr(cfg, "external_music_semantic_cmd", "") or "").strip()
     if not cmd:
         return None
-    cache = ensure_dir(getattr(cfg, "external_music_semantic_cache_dir", "output/v46_external_music_semantic_cache"))
+    cache = ensure_dir(getattr(cfg, "external_music_semantic_cache_dir", "output/motion_external_music_semantic_cache"))
     audio_p = Path(audio_path)
     out_json = cache / f"{audio_p.stem}.music_semantic.json"
     out_npz = cache / f"{audio_p.stem}.music_semantic.npz"
@@ -2089,7 +2101,7 @@ def run_external_music_semantic_cmd(audio_path: str | Path, cfg: V46Config) -> O
     try:
         subprocess.run(expanded, shell=True, check=True)
     except Exception as exc:
-        print(f"[V46.12 WARN] external music semantic command failed for {audio_p}: {exc}", file=sys.stderr)
+        print(f"[External Music Semantics WARN] external music semantic command failed for {audio_p}: {exc}", file=sys.stderr)
         return None
     if out_json.exists() or out_npz.exists():
         return out_json if out_json.exists() else out_npz
@@ -2098,7 +2110,7 @@ def run_external_music_semantic_cmd(audio_path: str | Path, cfg: V46Config) -> O
 
 
 
-def filename_proxy_music_semantic(audio_path: str | Path, cfg: V46Config, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
+def filename_proxy_music_semantic(audio_path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
     if not bool(getattr(cfg, "external_music_semantic_filename_proxy", True)):
         return None
     stem = Path(audio_path).stem.lower()
@@ -2131,8 +2143,8 @@ def filename_proxy_music_semantic(audio_path: str | Path, cfg: V46Config, slot_s
 
 
 
-def semantic_label_match_bonus(slot: dict, db: dict, cfg: V46Config) -> np.ndarray:
-    """V46.31 interpretable music-router bonus for Chang-E semantic Event-RAG."""
+def semantic_label_match_bonus(slot: dict, db: dict, cfg: MotionGenerationConfig) -> np.ndarray:
+    """Event Semantics interpretable music-router bonus for Chang-E semantic Event-RAG."""
     n = len(db.get("paths", []))
     bonus = np.zeros(n, dtype=np.float32)
     if not bool(getattr(cfg, "classification_semantic_enable", True)) or n == 0:
@@ -2182,7 +2194,7 @@ def semantic_label_match_bonus(slot: dict, db: dict, cfg: V46Config) -> np.ndarr
     conf = np.asarray(db.get("semantic_confidence", np.ones(n, dtype=np.float32)), dtype=np.float32)
     q_gate = np.clip(0.45 + 0.55 * quality, 0.25, 1.15)
     bonus *= np.clip(0.65 + 0.35 * conf, 0.5, 1.15) * q_gate
-    # V46.31: never normalize by the current candidate max.  That dynamic
+    # Event Semantics: never normalize by the current candidate max.  That dynamic
     # min-max scaling can turn a weak accidental match in a vague slot into a
     # full-strength routing reward.  Use a fixed saturating scale instead.
     scale = max(0.25, float(getattr(cfg, "route_semantic_bonus_scale", 1.50)))
@@ -2290,7 +2302,7 @@ def infer_label_from_filename(path: str | Path) -> str:
     return str(parse_change_bvh_semantics(path).get("label"))
 
 
-def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = None) -> np.ndarray:
+def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
     """Convert filename/category semantics into a 32D slot-compatible prior.
 
     The vector uses the same coarse channel layout as audio_slots()/event_descriptor():
@@ -2351,7 +2363,7 @@ def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[V46Config] = No
     return v.astype(np.float32)
 
 
-def motion_feature_z_for_alignment(db: dict, cfg: V46Config, weight: Optional[float] = None) -> np.ndarray:
+def motion_feature_z_for_alignment(db: dict, cfg: MotionGenerationConfig, weight: Optional[float] = None) -> np.ndarray:
     """Return descriptor z mixed with filename and strong classification priors."""
     desc_z = np.asarray(db["desc_z"], dtype=np.float32)
     if not bool(getattr(cfg, "filename_semantic_enable", True)):
@@ -2456,10 +2468,10 @@ def _coerce_float(value: object, default: Optional[float] = None) -> Optional[fl
         return default
 
 
-def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+def resample_motion_to_config_fps(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
     """Resample BVH-derived EDGE-like arrays to cfg.fps before event slicing.
 
-    V46.15 fix:
+    Timebase Resampling fix:
     channel 0 may temporarily carry BVH native fps from load_bvh_file(), but it
     must never be overwritten with target fps after resampling because EDGE
     channel 0 is a contact channel.  The DB writer rebuilds contacts from FK.
@@ -2474,7 +2486,7 @@ def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[n
         ch0_med = float(np.nanmedian(finite_ch0))
         ch0_p05 = float(np.nanpercentile(finite_ch0, 5))
         ch0_p95 = float(np.nanpercentile(finite_ch0, 95))
-        # V46.31: FPS metadata written by the BVH loader is nearly constant, but
+        # Event Semantics: FPS metadata written by the BVH loader is nearly constant, but
         # a few boundary/cropping frames may contain small jitter.  Use the middle
         # 90% band for the main constant-column test and keep raw std only for
         # diagnostics.  This avoids silently skipping required high-FPS -> 30 FPS
@@ -2517,7 +2529,7 @@ def resample_motion_to_config_fps(motion: np.ndarray, cfg: V46Config) -> Tuple[n
     }
 
 
-def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[str], cfg: V46Config) -> List[dict]:
+def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[str], cfg: MotionGenerationConfig) -> List[dict]:
     """
     Read an optional manifest.csv and return normalized source-aware records.
 
@@ -2572,7 +2584,7 @@ def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[st
     return rows
 
 
-def iter_source_records(args: argparse.Namespace, cfg: V46Config) -> Tuple[List[dict], dict]:
+def iter_source_records(args: argparse.Namespace, cfg: MotionGenerationConfig) -> Tuple[List[dict], dict]:
     """Return load records from manifest when available, otherwise from motion_dirs."""
     motion_dirs = list(getattr(args, "motion_dirs", None) or [])
     manifest_records = read_manifest_records(getattr(args, "manifest", None), motion_dirs, cfg)
@@ -2594,7 +2606,7 @@ def add_event_to_db_lists(
     clip: np.ndarray,
     event_idx: int,
     out_path: Path,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
     source: str,
     matched_audio: Optional[str],
     st: int,
@@ -2617,7 +2629,7 @@ def add_event_to_db_lists(
             music_feat = audio_feature_for_motion_clip(matched_audio, st, clip.shape[0], cfg)
             music_mask = 1.0
         except Exception as exc:
-            print(f"[V46.11 WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
+            print(f"[Chang-E Semantics WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
             music_feat = np.zeros(32, dtype=np.float32)
             music_mask = 0.0
     else:
@@ -2681,7 +2693,7 @@ def add_event_to_db_lists(
     meta.append(item)
 
 def build_db(args: argparse.Namespace) -> int:
-    cfg = V46Config.from_json(args.config).apply_env()
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     out_dir = ensure_dir(args.out_db)
@@ -2855,7 +2867,7 @@ def build_db(args: argparse.Namespace) -> int:
         "train_val_group_overlap": 0,  # no random sample split is produced here; downstream split must remain source-disjoint.
     }
     report = {
-        "version": "v46_11_canonical_strong_class_semantic_source_aware_db",
+        "version": "semantic_source_aware_event_db",
         "config": dataclasses.asdict(cfg),
         "events": meta,
         "num_events": len(meta),
@@ -2940,7 +2952,7 @@ def audio_global_features(wav: np.ndarray, sr: int) -> np.ndarray:
 
 
 def collect_audio_files(audio_dirs: Optional[Sequence[str]]) -> List[str]:
-    """Collect wav/mp3-like files for optional real-audio V44 pairing."""
+    """Collect wav/mp3-like files for optional real-audio Contrastive Retriever pairing."""
     if not audio_dirs:
         return []
     exts = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
@@ -2992,7 +3004,7 @@ def find_matching_audio_for_motion(motion_path: str | Path, audio_files: Sequenc
     return best[1] if best[0] >= 0.35 else None
 
 
-def audio_feature_for_motion_clip(audio_path: str | Path, start_frame: int, frames: int, cfg: V46Config) -> np.ndarray:
+def audio_feature_for_motion_clip(audio_path: str | Path, start_frame: int, frames: int, cfg: MotionGenerationConfig) -> np.ndarray:
     """Extract a 32D real audio descriptor aligned to a motion clip interval."""
     sr, wav = read_wav_mono(audio_path)
     st = max(0, int(round((start_frame / max(float(cfg.fps), 1e-6)) * sr)))
@@ -3013,9 +3025,9 @@ def standardize_features(x: np.ndarray, mask: Optional[np.ndarray] = None) -> Tu
     return ((x - mean) / std).astype(np.float32), mean, std
 
 
-def audio_slots_v46_default(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
+def build_default_audio_slots(path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
     if slots_json and Path(slots_json).exists():
-        # V46.12: slots_json can be either the old feature JSON or a new
+        # External Music Semantics: slots_json can be either the old feature JSON or a new
         # external classical-music semantic JSON/NPZ.
         if str(slots_json).lower().endswith(".npz"):
             parsed = parse_external_music_semantic_file(slots_json, cfg)
@@ -3088,15 +3100,15 @@ def audio_slots_v46_default(path: str | Path, cfg: V46Config, slot_seconds: floa
 
 
 
-# ===== V46.34 PRETRAINED ROUTER SLOT PATCH START =====
-def _v46_34_env_bool(name: str, default: bool = False) -> bool:
+# ===== Music Slot Planning PRETRAINED ROUTER SLOT PATCH START =====
+def _slot_plan_env_bool(name: str, default: bool = False) -> bool:
     try:
         return bool(int(os.environ.get(name, "1" if default else "0")))
     except Exception:
         return bool(default)
 
 
-_V46_34_SEMANTIC_LABELS = [
+_SLOT_PLAN_SEMANTIC_LABELS = [
     "calm_meditative",
     "lyrical_flow",
     "pose_hold",
@@ -3107,30 +3119,30 @@ _V46_34_SEMANTIC_LABELS = [
 ]
 
 
-def _v46_34_normalize_probs(obj, top_label=None):
+def _normalize_slot_probabilities(obj, top_label=None):
     if isinstance(obj, dict):
-        raw = {str(k): float(v) for k, v in obj.items() if str(k) in _V46_34_SEMANTIC_LABELS}
+        raw = {str(k): float(v) for k, v in obj.items() if str(k) in _SLOT_PLAN_SEMANTIC_LABELS}
     else:
         raw = {}
-    if not raw and top_label in _V46_34_SEMANTIC_LABELS:
-        raw = {k: 0.02 for k in _V46_34_SEMANTIC_LABELS}
+    if not raw and top_label in _SLOT_PLAN_SEMANTIC_LABELS:
+        raw = {k: 0.02 for k in _SLOT_PLAN_SEMANTIC_LABELS}
         raw[str(top_label)] = 0.88
     if not raw:
-        raw = {k: 1.0 / len(_V46_34_SEMANTIC_LABELS) for k in _V46_34_SEMANTIC_LABELS}
+        raw = {k: 1.0 / len(_SLOT_PLAN_SEMANTIC_LABELS) for k in _SLOT_PLAN_SEMANTIC_LABELS}
     s = sum(max(0.0, float(v)) for v in raw.values())
     if s <= 1e-8:
-        return {k: 1.0 / len(_V46_34_SEMANTIC_LABELS) for k in _V46_34_SEMANTIC_LABELS}
-    return {k: float(max(0.0, raw.get(k, 0.0)) / s) for k in _V46_34_SEMANTIC_LABELS}
+        return {k: 1.0 / len(_SLOT_PLAN_SEMANTIC_LABELS) for k in _SLOT_PLAN_SEMANTIC_LABELS}
+    return {k: float(max(0.0, raw.get(k, 0.0)) / s) for k in _SLOT_PLAN_SEMANTIC_LABELS}
 
 
-def _v46_34_top_label(probs):
-    p = _v46_34_normalize_probs(probs)
+def _top_slot_label(probs):
+    p = _normalize_slot_probabilities(probs)
     return max(p.items(), key=lambda kv: kv[1])[0]
 
 
-def _v46_34_feature_from_slot(slot: dict) -> np.ndarray:
+def _feature_from_music_slot(slot: dict) -> np.ndarray:
     dur = float(slot.get("duration", slot.get("duration_sec", 4.0)))
-    probs = _v46_34_normalize_probs(slot.get("music_semantic_probs", {}), slot.get("music_semantic_top_label", slot.get("music_alignment_label")))
+    probs = _normalize_slot_probabilities(slot.get("music_semantic_probs", {}), slot.get("music_semantic_top_label", slot.get("music_alignment_label")))
     energy = float(slot.get("energy", slot.get("music_energy", slot.get("slot_energy", 0.06))))
     onset = float(slot.get("onset", slot.get("accent", slot.get("music_accent_score", 0.02))))
     dyn = float(slot.get("dynamic", slot.get("beat_density", 0.04)))
@@ -3157,14 +3169,14 @@ def _v46_34_feature_from_slot(slot: dict) -> np.ndarray:
     x[20] = probs["percussive_accent"]
     x[21] = probs["calm_meditative"]
     x[22] = probs["pose_hold"]
-    for i, lab in enumerate(_V46_34_SEMANTIC_LABELS):
+    for i, lab in enumerate(_SLOT_PLAN_SEMANTIC_LABELS):
         if 23 + i < 32:
             x[23 + i] = probs[lab]
     x[31] = 1.0
     return x.astype(np.float32)
 
 
-def _v46_34_find_slots_in_json(data):
+def _find_music_slots_in_json(data):
     if isinstance(data, dict):
         if isinstance(data.get("slots"), list):
             return data.get("slots"), data
@@ -3185,7 +3197,7 @@ def _v46_34_find_slots_in_json(data):
             if slots:
                 return slots, data
         for v in data.values():
-            got, meta = _v46_34_find_slots_in_json(v)
+            got, meta = _find_music_slots_in_json(v)
             if got is not None:
                 return got, meta
     elif isinstance(data, list):
@@ -3196,17 +3208,17 @@ def _v46_34_find_slots_in_json(data):
             if "duration" in keys or {"start", "end"}.issubset(keys):
                 return data, {"version": "list_slots"}
         for v in data:
-            got, meta = _v46_34_find_slots_in_json(v)
+            got, meta = _find_music_slots_in_json(v)
             if got is not None:
                 return got, meta
     return None, {}
 
 
-def _v46_34_load_slots_json(slots_json: str | Path, cfg: V46Config) -> Tuple[List[dict], np.ndarray, dict]:
+def _load_music_slots_json(slots_json: str | Path, cfg: MotionGenerationConfig) -> Tuple[List[dict], np.ndarray, dict]:
     data = load_json(slots_json)
-    slots, meta = _v46_34_find_slots_in_json(data)
+    slots, meta = _find_music_slots_in_json(data)
     if not slots:
-        raise RuntimeError(f"V46.34 slots_json has no slots: {slots_json}")
+        raise RuntimeError(f"Music Slot Planning slots_json has no slots: {slots_json}")
     fps = float(getattr(cfg, "fps", 30.0))
     out_slots: List[dict] = []
     feats: List[np.ndarray] = []
@@ -3229,13 +3241,13 @@ def _v46_34_load_slots_json(slots_json: str | Path, cfg: V46Config) -> Tuple[Lis
         ed = float(ed)
         dur = max(0.10, ed - st)
         cursor = ed
-        probs = _v46_34_normalize_probs(s.get("music_semantic_probs", {}), s.get("music_semantic_top_label", s.get("music_alignment_label")))
-        top = s.get("music_semantic_top_label", s.get("music_alignment_label", _v46_34_top_label(probs)))
-        if top not in _V46_34_SEMANTIC_LABELS:
-            top = _v46_34_top_label(probs)
+        probs = _normalize_slot_probabilities(s.get("music_semantic_probs", {}), s.get("music_semantic_top_label", s.get("music_alignment_label")))
+        top = s.get("music_semantic_top_label", s.get("music_alignment_label", _top_slot_label(probs)))
+        if top not in _SLOT_PLAN_SEMANTIC_LABELS:
+            top = _top_slot_label(probs)
         base = np.asarray(s.get("feature", []), dtype=np.float32)
         if base.size < 32 or float(np.max(np.abs(base))) == 0.0:
-            base = _v46_34_feature_from_slot({**s, "duration": dur, "music_semantic_probs": probs, "music_semantic_top_label": top})
+            base = _feature_from_music_slot({**s, "duration": dur, "music_semantic_probs": probs, "music_semantic_top_label": top})
         if base.size < 32:
             base = np.pad(base, (0, 32 - base.size))
         s.update({
@@ -3247,7 +3259,7 @@ def _v46_34_load_slots_json(slots_json: str | Path, cfg: V46Config) -> Tuple[Lis
             "music_alignment_label": str(s.get("music_alignment_label", top)),
             "music_semantic_top_label": str(top),
             "music_semantic_probs": probs,
-            "slot_plan_source": str(s.get("slot_plan_source", meta.get("slot_source", "v46_34_slots_json"))),
+            "slot_plan_source": str(s.get("slot_plan_source", meta.get("slot_source", "music_slot_slots_json"))),
             "feature": base[:32].astype(float).tolist(),
         })
         out_slots.append(s)
@@ -3255,7 +3267,7 @@ def _v46_34_load_slots_json(slots_json: str | Path, cfg: V46Config) -> Tuple[Lis
     return out_slots, np.stack(feats).astype(np.float32), meta if isinstance(meta, dict) else {}
 
 
-# ===== V46.34 PRETRAINED ROUTER SLOT PATCH END =====
+# ===== Music Slot Planning PRETRAINED ROUTER SLOT PATCH END =====
 
 class MLPEncoder(nn.Module):
     def __init__(self, in_dim: int = 32, emb_dim: int = 128):
@@ -3286,7 +3298,7 @@ class ContrastiveModel(nn.Module):
 
 def make_weak_music_features_from_motion(desc: np.ndarray, noise: float = 0.08) -> np.ndarray:
     # Weak-pair fallback: retain duration/energy/turn/contact semantics with jitter.
-    # V46.8 keeps this only as an explicitly marked smoke-test fallback.  For
+    # Root-Aware Motion Safety keeps this only as an explicitly marked smoke-test fallback.  For
     # motion-only Chang-E BVH, prefer unpaired real-audio semantic OT below.
     m = desc.copy().astype(np.float32)
     rng = np.random.default_rng(1234)
@@ -3362,7 +3374,7 @@ def load_db(db_path: str | Path) -> dict:
     return db
 
 
-def _training_db_contract(db: Dict[str, Any], cfg: V46Config, label: str) -> Dict[str, Any]:
+def _training_db_contract(db: Dict[str, Any], cfg: MotionGenerationConfig, label: str) -> Dict[str, Any]:
     """Validate the immutable geometry/time/identity contract of a training DB."""
     paths = np.asarray(db.get("paths", []), dtype=object)
     desc = np.asarray(db.get("desc", []), dtype=np.float32)
@@ -3487,8 +3499,8 @@ def _descriptor_values_in_training_coordinates(
 
 def train_contrastive(args: argparse.Namespace) -> int:
     if torch is None:
-        raise RuntimeError("PyTorch is required for V44 training.")
-    cfg = V46Config.from_json(args.config).apply_env()
+        raise RuntimeError("PyTorch is required for Contrastive Retriever training.")
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     sem_dirs = getattr(args, "music_semantic_dirs", None)
     if sem_dirs:
         cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in sem_dirs])
@@ -3498,7 +3510,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
-    database_contract = _training_db_contract(db, cfg, "V44 training")
+    database_contract = _training_db_contract(db, cfg, "Contrastive Retriever training")
     motion_db = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_weight", 0.35)))
     supervision_mode = "weak_motion_proxy"
     pair_report: Dict[str, object] = {}
@@ -3532,7 +3544,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
                 raise RuntimeError(
                     "No paired audio and no usable unpaired audio were found. "
                     "Put target music under test_music_bank/ or data/music/, or set "
-                    "V46_UNPAIRED_DISABLE_MOTION_PROXY=0 for a smoke-test-only fallback."
+                    "MOTION_UNPAIRED_DISABLE_MOTION_PROXY=0 for a smoke-test-only fallback."
                 )
             music_raw = make_weak_music_features_from_motion(np.asarray(db["desc"], dtype=np.float32))
             mean = np.asarray(db["desc_mean"], dtype=np.float32)
@@ -3545,7 +3557,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
 
     N = int(motion.shape[0])
     if N < 2:
-        raise RuntimeError("V44 contrastive needs at least two training pairs.")
+        raise RuntimeError("Contrastive Retriever contrastive needs at least two training pairs.")
     device = torch.device(cfg.device)
     model = ContrastiveModel(motion.shape[1], cfg.embed_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
@@ -3568,11 +3580,11 @@ def train_contrastive(args: argparse.Namespace) -> int:
             opt.step()
             losses.append(float(loss.detach().cpu()))
         if ep % 10 == 0 or ep == int(args.epochs or cfg.contrastive_epochs) - 1:
-            print(f"[V44 contrastive] epoch={ep} loss={np.mean(losses):.5f} scale={model.logit_scale.exp().item():.2f} mode={supervision_mode}")
+            print(f"[Contrastive Retriever contrastive] epoch={ep} loss={np.mean(losses):.5f} scale={model.logit_scale.exp().item():.2f} mode={supervision_mode}")
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
-        "version": "v44_12_external_classical_music_semantic_grounding",
+        "version": "contrastive_retrieval_12_external_classical_music_semantic_grounding",
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "feat_dim": motion.shape[1],
@@ -3581,7 +3593,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
         "music_mean": music_mean.astype(np.float32),
         "music_std": music_std.astype(np.float32),
         "pair_report": pair_report,
-        "motion_contract": motion_checkpoint_contract(cfg, "v44_contrastive"),
+        "motion_contract": motion_checkpoint_contract(cfg, "semantic_retriever"),
         "training_event_db_contract": database_contract["event_db_contract"],
         "training_database": database_contract,
     }
@@ -3590,7 +3602,7 @@ def train_contrastive(args: argparse.Namespace) -> int:
     return 0
 
 class TemporalRefiner(nn.Module):
-    """Legacy 151D Euclidean refiner kept for old V45 checkpoints."""
+    """Legacy 151D Euclidean refiner kept for old Motion Refiner checkpoints."""
 
     def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256):
         super().__init__()
@@ -3616,7 +3628,7 @@ class TemporalRefiner(nn.Module):
 
 
 class ProductManifoldTemporalRefiner(nn.Module):
-    """V45 refiner with a joint-risk-conditioned 79D geometric output.
+    """Boundary refiner with a joint-risk-conditioned 79D geometric output.
 
     Output layout:
       - 4 contact logits;
@@ -3662,7 +3674,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
 def _risk_masks_for_batch_np(
     motion_batch: np.ndarray,
     seam_batch: np.ndarray,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build the same frame x joint risk masks for training and inference."""
     joint_masks: List[np.ndarray] = []
@@ -3695,7 +3707,7 @@ def _decode_product_refiner_output(
     joint_mask,
     root_mask,
     contact_mask,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
 ):
     if output.shape[-1] != PRODUCT_STATE_DIM:
         raise ValueError(
@@ -3719,7 +3731,7 @@ def _decode_product_refiner_output(
     return torch.cat([contacts, geometry[..., 4:]], dim=-1)
 
 
-def _world_space_physics_losses(prediction, clean, cfg: V46Config):
+def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
     """Differentiable FK/foot/dynamics losses for EDGE-151D batches.
 
     Static support is defined from the clean target's contact and world-space
@@ -3821,7 +3833,7 @@ def _product_motion_losses(
     joint_mask,
     root_mask,
     contact_mask,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
 ):
     contact_target = clean[..., :4].clamp(0.0, 1.0)
     contact_weight = 0.25 + 0.75 * contact_mask
@@ -3888,7 +3900,7 @@ def _product_motion_losses(
     return total, terms
 
 
-def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[V46Config] = None) -> np.ndarray:
+def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
     """Sample a training window and keep the EDGE-151D contract after resampling."""
     p = str(random.choice(paths.tolist()))
     return load_motion_window(p, target_len, cfg)
@@ -3897,7 +3909,7 @@ def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[V46Co
 def load_motion_window(
     path: str | Path,
     target_len: int,
-    cfg: Optional[V46Config] = None,
+    cfg: Optional[MotionGenerationConfig] = None,
     *,
     random_crop: bool = True,
 ) -> np.ndarray:
@@ -3918,20 +3930,20 @@ def load_motion_window(
 
 
 
-def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional[V46Config] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """V46.33 transition-masked corruption for V45/V46 training.
+def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional[MotionGenerationConfig] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Reference Inbetweening transition-masked corruption for Motion Refiner and Motion Diffusion training.
 
     Instead of arbitrary global drift only, corrupt a local transition region by
     replacing it with a weak root-Hermite / rotation-SLERP inbetweening path plus
     noise. This matches the inference-time transition-budget mask: the model
     learns to repair motion_ref only near boundaries while preserving core clips.
     """
-    cfg = cfg or V46Config()
+    cfg = cfg or MotionGenerationConfig()
     x = np.asarray(clean, dtype=np.float32).copy()
     T, D = x.shape
     seam = np.zeros((T, 1), dtype=np.float32)
     if T <= 12:
-        x, _ = enforce_edge151_contract_np(x, cfg, source_hint="v46_33_degrade_too_short", derive_contact=True, project_rot=True)
+        x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_too_short", derive_contact=True, project_rot=True)
         return x.astype(np.float32), seam
 
     min_w = max(1, int(round(float(cfg.transition_train_min_seconds) * float(cfg.fps))))
@@ -3947,7 +3959,7 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
         prev_tail = x[max(0, a - 4):a]
         curr_head = x[b:min(T, b + 4)]
         if prev_tail.shape[0] >= 1 and curr_head.shape[0] >= 1:
-            bridge = v46_33_motion_inbetween_np(prev_tail, curr_head, b - a, cfg)
+            bridge = reference_motion_inbetween_np(prev_tail, curr_head, b - a, cfg)
             # Add light residual corruption mainly in root/rot channels; contacts rebuilt later.
             noise = np.zeros_like(bridge, dtype=np.float32)
             noise[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.18, size=(bridge.shape[0], 3)).astype(np.float32)
@@ -3969,7 +3981,7 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
     noise[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.025, size=(T, 3)).astype(np.float32)
     noise[:, ROT6D_START:ROT6D_END] = np.random.normal(0, severity * 0.012, size=(T, ROT6D_END - ROT6D_START)).astype(np.float32)
     x += noise
-    x, _ = enforce_edge151_contract_np(x, cfg, source_hint="v46_33_degrade_for_transition_refiner", derive_contact=True, project_rot=True)
+    x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_for_transition_refiner", derive_contact=True, project_rot=True)
     return x.astype(np.float32), np.clip(seam, 0.0, 1.0).astype(np.float32)
 
 
@@ -3983,7 +3995,7 @@ def _evaluate_refiner_validation(
     model: Any,
     validation_db: Dict[str, Any],
     train_db: Dict[str, Any],
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
     device: Any,
 ) -> Dict[str, Any]:
     indices = _validation_indices(len(validation_db["paths"]))
@@ -4068,7 +4080,7 @@ def _evaluate_diffusion_validation(
     model: Any,
     validation_db: Dict[str, Any],
     train_db: Dict[str, Any],
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
     device: Any,
     abar: Any,
     diffusion_steps: int,
@@ -4176,20 +4188,20 @@ def _evaluate_diffusion_validation(
 
 def train_refiner(args: argparse.Namespace) -> int:
     if torch is None:
-        raise RuntimeError("PyTorch is required for V45 training.")
-    cfg = V46Config.from_json(args.config).apply_env()
+        raise RuntimeError("PyTorch is required for Motion Refiner training.")
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
-    database_contract = _training_db_contract(db, cfg, "V45 training")
+    database_contract = _training_db_contract(db, cfg, "Motion Refiner training")
     paths = db["paths"]
     desc_z = _descriptor_values_in_training_coordinates(db, db)
     validation_db = None
     validation_report: Dict[str, Any] = {"enabled": False}
     if getattr(args, "val_db", None):
         validation_db = load_db(args.val_db)
-        validation_contract = _training_db_contract(validation_db, cfg, "V45 validation")
+        validation_contract = _training_db_contract(validation_db, cfg, "Motion Refiner validation")
         validation_report = {
             "enabled": True,
             "database": validation_contract,
@@ -4265,7 +4277,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 200 == 0 or step == steps - 1:
-            print(f"[V45 refiner] step={step} loss={loss.item():.6f} rec={rec.item():.6f}")
+            print(f"[Boundary Refiner] step={step} loss={loss.item():.6f} rec={rec.item():.6f}")
     if validation_db is not None:
         validation_report["metrics"] = _evaluate_refiner_validation(
             model, validation_db, db, cfg, device
@@ -4274,9 +4286,9 @@ def train_refiner(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "version": (
-            "v45_product_manifold_79d_v1"
+            "product_manifold_boundary_refiner_v1"
             if product_mode
-            else "v45_refiner"
+            else "boundary_refiner"
         ),
         "output_mode": (
             "contact_logits_root_joint_tangent"
@@ -4287,7 +4299,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         "joint_mask_conditioned": bool(product_mode),
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
-        "motion_contract": motion_checkpoint_contract(cfg, "v45_refiner"),
+        "motion_contract": motion_checkpoint_contract(cfg, "boundary_refiner"),
         "training_event_db_contract": database_contract["event_db_contract"],
         "training_database": database_contract,
         "descriptor_normalization": {
@@ -4318,7 +4330,7 @@ class SinusoidalTimeEmbedding(nn.Module):
 
 
 class DiffusionDenoiser(nn.Module):
-    """Legacy raw EDGE-151 denoiser kept for old V46 checkpoints."""
+    """Legacy raw EDGE-151 denoiser kept for old Motion Generation checkpoints."""
 
     def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256, time_dim: int = 128):
         super().__init__()
@@ -4438,7 +4450,7 @@ def _decode_reference_tangent_state(
     joint_mask,
     root_mask,
     contact_mask,
-    cfg: V46Config,
+    cfg: MotionGenerationConfig,
 ):
     if state.shape[-1] != PRODUCT_STATE_DIM:
         raise ValueError(
@@ -4468,20 +4480,20 @@ def make_beta_schedule(n: int, device) -> Tuple[torch.Tensor, torch.Tensor, torc
 
 def train_diffusion(args: argparse.Namespace) -> int:
     if torch is None:
-        raise RuntimeError("PyTorch is required for V46 diffusion training.")
-    cfg = V46Config.from_json(args.config).apply_env()
+        raise RuntimeError("PyTorch is required for Motion Generation diffusion training.")
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
     db = load_db(args.db)
-    database_contract = _training_db_contract(db, cfg, "V46 training")
+    database_contract = _training_db_contract(db, cfg, "Motion Generation training")
     paths = db["paths"]
     desc_z = _descriptor_values_in_training_coordinates(db, db)
     validation_db = None
     validation_report: Dict[str, Any] = {"enabled": False}
     if getattr(args, "val_db", None):
         validation_db = load_db(args.val_db)
-        validation_contract = _training_db_contract(validation_db, cfg, "V46 validation")
+        validation_contract = _training_db_contract(validation_db, cfg, "Motion Generation validation")
         validation_report = {
             "enabled": True,
             "database": validation_contract,
@@ -4601,7 +4613,7 @@ def train_diffusion(args: argparse.Namespace) -> int:
         opt.step()
         if step % 250 == 0 or step == steps - 1:
             print(
-                f"[V46 diffusion] step={step} loss={loss.item():.6f} "
+                f"[Motion Generation diffusion] step={step} loss={loss.item():.6f} "
                 f"noise={loss_noise.item():.6f} "
                 f"physics={loss_physics.item():.6f} "
                 f"jerk={physics_terms['jerk'].item():.6f}"
@@ -4614,9 +4626,9 @@ def train_diffusion(args: argparse.Namespace) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "version": (
-            "v46_reference_tangent_diffusion_79d_v1"
+            "reference_tangent_motion_diffusion_v1"
             if tangent_mode
-            else "v46_conditional_residual_diffusion"
+            else "conditional_residual_motion_diffusion"
         ),
         "diffusion_space": (
             "reference_point_product_tangent"
@@ -4628,7 +4640,7 @@ def train_diffusion(args: argparse.Namespace) -> int:
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "diffusion_steps": Tdiff,
-        "motion_contract": motion_checkpoint_contract(cfg, "v46_diffusion"),
+        "motion_contract": motion_checkpoint_contract(cfg, "motion_diffusion"),
         "training_event_db_contract": database_contract["event_db_contract"],
         "training_database": database_contract,
         "descriptor_normalization": {
@@ -4646,11 +4658,11 @@ def train_diffusion(args: argparse.Namespace) -> int:
 
 
 # ===== TRUSTED LOCAL CKPT LOAD FIX START =====
-def _v46_trusted_torch_load(path, map_location=None, **_unused_kwargs):
+def _trusted_torch_load(path, map_location=None, **_unused_kwargs):
     """Load trusted local checkpoints saved by this project.
 
     PyTorch 2.6 defaults torch.load(..., weights_only=True), which may reject
-    V44 checkpoints containing numpy arrays. These ckpts are generated locally
+    Contrastive Retriever checkpoints containing numpy arrays. These ckpts are generated locally
     in this experiment, so we explicitly use weights_only=False.
     """
     if torch is None:
@@ -4662,13 +4674,13 @@ def _v46_trusted_torch_load(path, map_location=None, **_unused_kwargs):
         return torch.load(path, map_location=map_location)
 # ===== TRUSTED LOCAL CKPT LOAD FIX END =====
 
-def load_contrastive(path: Optional[str], cfg: V46Config):
+def load_contrastive(path: Optional[str], cfg: MotionGenerationConfig):
     if not bool(cfg.contrastive_enable):
         return None
     if torch is None or not path or not Path(path).exists():
         return None
-    ckpt = _v46_trusted_torch_load(path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, path, "v44_contrastive")
+    ckpt = _trusted_torch_load(path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, path, "semantic_retriever")
     model = ContrastiveModel(ckpt.get("feat_dim", 32), ckpt.get("embed_dim", cfg.embed_dim)).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.music_mean = np.asarray(ckpt.get("music_mean", np.zeros((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
@@ -4678,7 +4690,7 @@ def load_contrastive(path: Optional[str], cfg: V46Config):
     return model
 
 
-def embed_with_contrastive(model, music_feat_z: np.ndarray, motion_feat_z: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, np.ndarray]:
+def embed_with_contrastive(model, music_feat_z: np.ndarray, motion_feat_z: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, np.ndarray]:
     if model is None or torch is None:
         mz = music_feat_z / np.maximum(np.linalg.norm(music_feat_z, axis=-1, keepdims=True), 1e-8)
         dz = motion_feat_z / np.maximum(np.linalg.norm(motion_feat_z, axis=-1, keepdims=True), 1e-8)
@@ -4716,14 +4728,14 @@ def align_next_to_prev(prev: np.ndarray, nxt: np.ndarray) -> np.ndarray:
     return out
 
 
-def concat_events_v46_31_overlap(event_paths: Sequence[str], target_durations: Sequence[float], cfg: V46Config) -> Tuple[np.ndarray, List[dict]]:
+def concatenate_events_with_overlap(event_paths: Sequence[str], target_durations: Sequence[float], cfg: MotionGenerationConfig) -> Tuple[np.ndarray, List[dict]]:
     """Concatenate retrieved RAG events under the EDGE-151D contract.
 
-    V46.31 fix:
+    Event Semantics fix:
     The overlap cross-fade is now compensated locally per segment, not by a
     whole-song global resample.  Every music slot keeps its assigned net frame
     budget after overlap trimming, so local beat/phrase boundaries do not drift.
-    We also keep the V46.28/V46.29 yaw-aligned overlap start, no root-Y ramp,
+    We also keep the Overlap Alignment/Overlap Alignment yaw-aligned overlap start, no root-Y ramp,
     ov==1 midpoint weighting, and safe one-frame overlap slicing.
     """
     pieces: List[np.ndarray] = []
@@ -4735,7 +4747,7 @@ def concat_events_v46_31_overlap(event_paths: Sequence[str], target_durations: S
             m_raw, cfg, source_hint=f"concat_load:{p}", derive_contact=True, project_rot=True
         )
         target_len = int(target_lens[i])
-        # V46.31: compensate overlap locally.  Incoming clips lose ov frames
+        # Event Semantics: compensate overlap locally.  Incoming clips lose ov frames
         # when m = m[ov:] removes the overlapped prefix.  Rather than globally
         # resampling the entire final song, pre-extend non-first clips by the
         # maximum plausible overlap and then locally normalize their post-overlap
@@ -4816,7 +4828,7 @@ def concat_events_v46_31_overlap(event_paths: Sequence[str], target_durations: S
                 )
                 local_timing_report["post_overlap_frames_before_local_fix"] = int(m.shape[0])
 
-            # V46.31: after overlap handling, repair only this incoming segment's
+            # Event Semantics: after overlap handling, repair only this incoming segment's
             # net length.  This prevents whole-song interpolation from smearing
             # contact steps and preserves local music slot boundaries.
             if int(m.shape[0]) != int(target_len):
@@ -4890,22 +4902,22 @@ def concat_events_v46_31_overlap(event_paths: Sequence[str], target_durations: S
 
 
 
-# ===== V46.32 TRANSITION-BUDGET PATCH START =====
-def _v46_env_bool(name: str, default: bool = False) -> bool:
+# ===== Transition Budget TRANSITION-BUDGET PATCH START =====
+def _transition_env_bool(name: str, default: bool = False) -> bool:
     try:
         return bool(int(os.environ.get(name, "1" if default else "0")))
     except Exception:
         return bool(default)
 
 
-def _v46_env_int(name: str, default: int) -> int:
+def _transition_env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return int(default)
 
 
-def _v46_env_float(name: str, default: float) -> float:
+def _transition_env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, str(default)))
     except Exception:
@@ -4936,7 +4948,7 @@ def quat_slerp_np(q0: np.ndarray, q1: np.ndarray, w: np.ndarray) -> np.ndarray:
     return normalize_quat_np(out).astype(np.float32)
 
 
-def _v46_root_velocity(m: np.ndarray, at_end: bool) -> np.ndarray:
+def _root_velocity(m: np.ndarray, at_end: bool) -> np.ndarray:
     if m.shape[0] < 2:
         return np.zeros(3, dtype=np.float32)
     if at_end:
@@ -4944,17 +4956,17 @@ def _v46_root_velocity(m: np.ndarray, at_end: bool) -> np.ndarray:
     return (m[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - m[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
 
 
-def transition_len_for_boundary(prev: np.ndarray, curr: np.ndarray, target_len: int, cfg: V46Config) -> int:
+def transition_len_for_boundary(prev: np.ndarray, curr: np.ndarray, target_len: int, cfg: MotionGenerationConfig) -> int:
     """Choose a boundary transition budget for the *incoming* slot.
 
     The length is risk-aware but capped by the current music slot so that the
     retrieved core motion remains dominant.  This implements the paper position:
     real events preserve cultural vocabulary, local generation repairs only seams.
     """
-    min_t = _v46_env_int("V46_TRANSITION_MIN_FRAMES", 8)
-    max_t = _v46_env_int("V46_TRANSITION_MAX_FRAMES", 24)
-    ratio = _v46_env_float("V46_TRANSITION_RATIO", 0.18)
-    min_core = _v46_env_int("V46_TRANSITION_MIN_CORE_FRAMES", max(18, int(getattr(cfg, "min_event_frames", 36) * 0.55)))
+    min_t = _transition_env_int("MOTION_TRANSITION_MIN_FRAMES", 8)
+    max_t = _transition_env_int("MOTION_TRANSITION_MAX_FRAMES", 24)
+    ratio = _transition_env_float("MOTION_TRANSITION_RATIO", 0.18)
+    min_core = _transition_env_int("MOTION_TRANSITION_MIN_CORE_FRAMES", max(18, int(getattr(cfg, "min_event_frames", 36) * 0.55)))
     base = int(round(float(target_len) * float(ratio)))
 
     try:
@@ -4975,8 +4987,8 @@ def transition_len_for_boundary(prev: np.ndarray, curr: np.ndarray, target_len: 
     return int(max(0, L))
 
 
-def motion_inbetween_np(left_ctx: np.ndarray, right_ctx: np.ndarray, length: int, cfg: V46Config,
-                        source_hint: str = "v46_32_inbetween") -> np.ndarray:
+def motion_inbetween_np(left_ctx: np.ndarray, right_ctx: np.ndarray, length: int, cfg: MotionGenerationConfig,
+                        source_hint: str = "reference_inbetween") -> np.ndarray:
     """Generate a kinematic transition in EDGE-151D space.
 
     The bridge interpolates root trajectory with cubic Hermite and rotations with
@@ -4999,10 +5011,10 @@ def motion_inbetween_np(left_ctx: np.ndarray, right_ctx: np.ndarray, length: int
 
     p0 = a[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
     p1 = b[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
-    v0 = _v46_root_velocity(left_ctx, at_end=True)
-    v1 = _v46_root_velocity(right_ctx, at_end=False)
+    v0 = _root_velocity(left_ctx, at_end=True)
+    v1 = _root_velocity(right_ctx, at_end=False)
     # Limit velocity to prevent a transition budget from launching the body.
-    vmax = _v46_env_float("V46_TRANSITION_ROOT_VEL_CLAMP_MPF", 0.055)
+    vmax = _transition_env_float("MOTION_TRANSITION_ROOT_VEL_CLAMP_MPF", 0.055)
     v0 = np.clip(v0, -vmax, vmax)
     v1 = np.clip(v1, -vmax, vmax)
     root = h00 * p0[None] + h10 * (L * v0[None]) + h01 * p1[None] + h11 * (L * v1[None])
@@ -5023,7 +5035,7 @@ def motion_inbetween_np(left_ctx: np.ndarray, right_ctx: np.ndarray, length: int
     return out.astype(np.float32)
 
 
-def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
     """Yaw + XZ align the incoming event core to the previous exit."""
     out = np.asarray(curr, dtype=np.float32).copy()
     rep: Dict[str, object] = {"mode": "none"}
@@ -5039,7 +5051,7 @@ def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: V46Conf
     delta_xz = prev[-1, [ROOT_X_IDX, ROOT_Z_IDX]] - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
     out[:, ROOT_X_IDX] += float(delta_xz[0])
     out[:, ROOT_Z_IDX] += float(delta_xz[1])
-    out, contract = enforce_edge151_contract_np(out, cfg, source_hint="v46_32_align_event_core_to_prev", derive_contact=True, project_rot=True)
+    out, contract = enforce_edge151_contract_np(out, cfg, source_hint="align_event_core_to_previous", derive_contact=True, project_rot=True)
     rep = {"mode": "yaw_xz_entry_to_prev_exit", "yaw_ref": yaw_ref, "yaw_incoming_before": yaw_m,
            "dyaw_applied": dyaw, "delta_xz_applied": [float(delta_xz[0]), float(delta_xz[1])],
            "root_y_ramp_applied": False, "contract": contract}
@@ -5047,7 +5059,7 @@ def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: V46Conf
 
 
 
-# === V46.33 reference-conditioned transition budget begin ===
+# === Reference Inbetweening reference-conditioned transition budget begin ===
 
 
 
@@ -5069,7 +5081,7 @@ def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: V46Conf
 
 
 
-# === V46.33 reference-conditioned transition budget begin ===
+# === Reference Inbetweening reference-conditioned transition budget begin ===
 
 
 
@@ -5091,8 +5103,8 @@ def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: V46Conf
 
 
 
-# === V46.33 reference-conditioned transition budget begin ===
-def _v46_33_env_bool(name: str, default: bool) -> bool:
+# === Reference Inbetweening reference-conditioned transition budget begin ===
+def _inbetween_env_bool(name: str, default: bool) -> bool:
     if name in os.environ:
         try:
             return bool(int(os.environ[name]))
@@ -5101,33 +5113,33 @@ def _v46_33_env_bool(name: str, default: bool) -> bool:
     return bool(default)
 
 
-def _v46_33_env_int(name: str, default: int) -> int:
+def _inbetween_env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
     except Exception:
         return int(default)
 
 
-def _v46_33_env_float(name: str, default: float) -> float:
+def _inbetween_env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
     except Exception:
         return float(default)
 
 
-def _v46_33_cfg_bool(cfg: V46Config, attr: str, env: str, default: bool) -> bool:
-    return _v46_33_env_bool(env, bool(getattr(cfg, attr, default)))
+def _inbetween_config_bool(cfg: MotionGenerationConfig, attr: str, env: str, default: bool) -> bool:
+    return _inbetween_env_bool(env, bool(getattr(cfg, attr, default)))
 
 
-def _v46_33_cfg_int(cfg: V46Config, attr: str, env: str, default: int) -> int:
-    return _v46_33_env_int(env, int(getattr(cfg, attr, default)))
+def _inbetween_config_int(cfg: MotionGenerationConfig, attr: str, env: str, default: int) -> int:
+    return _inbetween_env_int(env, int(getattr(cfg, attr, default)))
 
 
-def _v46_33_cfg_float(cfg: V46Config, attr: str, env: str, default: float) -> float:
-    return _v46_33_env_float(env, float(getattr(cfg, attr, default)))
+def _inbetween_config_float(cfg: MotionGenerationConfig, attr: str, env: str, default: float) -> float:
+    return _inbetween_env_float(env, float(getattr(cfg, attr, default)))
 
 
-def _v46_33_slerp_quat_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.ndarray:
+def _slerp_quaternion_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.ndarray:
     """Vectorized quaternion SLERP. q0/q1: [J,4], t: [T,1,1]."""
     q0 = normalize_quat_np(np.asarray(q0, dtype=np.float32))
     q1 = normalize_quat_np(np.asarray(q1, dtype=np.float32))
@@ -5150,7 +5162,7 @@ def _v46_33_slerp_quat_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.n
     return np.where(use_lerp, lerp, slerp).astype(np.float32)
 
 
-def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_frames: int, cfg: V46Config) -> np.ndarray:
+def reference_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_frames: int, cfg: MotionGenerationConfig) -> np.ndarray:
     """Kinematic inbetweening in EDGE-151D: root Hermite + per-joint rotation SLERP.
 
     prev_tail and curr_head are short clips. The generated bridge excludes both
@@ -5185,7 +5197,7 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     fps = max(float(cfg.fps), 1.0e-8)
     v0 *= fps
     v1 *= fps
-    max_step = _v46_33_cfg_float(cfg, "transition_root_tangent_max_mps", "V46_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35)
+    max_step = _inbetween_config_float(cfg, "transition_root_tangent_max_mps", "MOTION_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35)
     for vv in (v0, v1):
         norm = float(np.linalg.norm(vv[[0, 2]]))
         if norm > max_step:
@@ -5204,15 +5216,15 @@ def v46_33_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_f
     Rb = rot6d_to_matrix_np(b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
     qa = matrix_to_quat_np(Ra)
     qb = matrix_to_quat_np(Rb)
-    q = _v46_33_slerp_quat_np(qa, qb, phase.reshape(n, 1, 1))
+    q = _slerp_quaternion_np(qa, qb, phase.reshape(n, 1, 1))
     R = quat_to_matrix_np(q)
     out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(R).reshape(n, -1)
 
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="v46_33_motion_inbetween", derive_contact=True, project_rot=True)
+    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="inbetween_motion_inbetween", derive_contact=True, project_rot=True)
     return out.astype(np.float32)
 
 
-def _v46_33_align_core_to_prev(prev_piece: np.ndarray, core: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+def _align_core_to_previous(prev_piece: np.ndarray, core: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
     """Align current core to previous endpoint in yaw and XZ only."""
     out = core.copy().astype(np.float32)
     report: Dict[str, object] = {"mode": "yaw_xz_to_previous_endpoint_no_root_y_ramp"}
@@ -5228,7 +5240,7 @@ def _v46_33_align_core_to_prev(prev_piece: np.ndarray, core: np.ndarray, cfg: V4
     delta = prev_piece[-1, [ROOT_X_IDX, ROOT_Z_IDX]] - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
     out[:, ROOT_X_IDX] += float(delta[0])
     out[:, ROOT_Z_IDX] += float(delta[1])
-    out, contract = enforce_edge151_contract_np(out, cfg, source_hint="v46_33_align_core_to_prev", derive_contact=True, project_rot=True)
+    out, contract = enforce_edge151_contract_np(out, cfg, source_hint="inbetween_align_core_to_prev", derive_contact=True, project_rot=True)
     report.update({
         "yaw_prev": float(yaw_prev),
         "yaw_core_before": float(yaw_core),
@@ -5240,19 +5252,19 @@ def _v46_33_align_core_to_prev(prev_piece: np.ndarray, core: np.ndarray, cfg: V4
     return out.astype(np.float32), report
 
 
-def _v46_33_choose_core_and_transition_lengths(source_len: int, target_len: int, has_prev: bool, cfg: V46Config) -> Tuple[int, int, dict]:
+def _choose_core_and_transition_lengths(source_len: int, target_len: int, has_prev: bool, cfg: MotionGenerationConfig) -> Tuple[int, int, dict]:
     """Return (core_len, transition_in_len) while preserving target_len exactly."""
     target_len = max(1, int(target_len))
     source_len = max(1, int(source_len))
     if not has_prev:
         return target_len, 0, {"reason": "first_slot_no_transition", "core_warp": float(target_len / source_len)}
 
-    min_trans = _v46_33_cfg_int(cfg, "transition_min_frames", "V46_TRANSITION_MIN_FRAMES", 10)
-    max_trans = _v46_33_cfg_int(cfg, "transition_max_frames", "V46_TRANSITION_MAX_FRAMES", 28)
-    ratio = _v46_33_cfg_float(cfg, "transition_ratio", "V46_TRANSITION_RATIO", 0.18)
-    min_core = _v46_33_cfg_int(cfg, "transition_min_core_frames", "V46_TRANSITION_MIN_CORE_FRAMES", 30)
-    warp_min = _v46_33_cfg_float(cfg, "core_warp_min", "V46_CORE_WARP_MIN", 0.72)
-    warp_max = _v46_33_cfg_float(cfg, "core_warp_max", "V46_CORE_WARP_MAX", 1.38)
+    min_trans = _inbetween_config_int(cfg, "transition_min_frames", "MOTION_TRANSITION_MIN_FRAMES", 10)
+    max_trans = _inbetween_config_int(cfg, "transition_max_frames", "MOTION_TRANSITION_MAX_FRAMES", 28)
+    ratio = _inbetween_config_float(cfg, "transition_ratio", "MOTION_TRANSITION_RATIO", 0.18)
+    min_core = _inbetween_config_int(cfg, "transition_min_core_frames", "MOTION_TRANSITION_MIN_CORE_FRAMES", 30)
+    warp_min = _inbetween_config_float(cfg, "core_warp_min", "MOTION_CORE_WARP_MIN", 0.72)
+    warp_max = _inbetween_config_float(cfg, "core_warp_max", "MOTION_CORE_WARP_MAX", 1.38)
 
     if target_len <= min_core + 2:
         return target_len, 0, {"reason": "slot_too_short_for_transition", "core_warp": float(target_len / source_len)}
@@ -5287,19 +5299,19 @@ def _v46_33_choose_core_and_transition_lengths(source_len: int, target_len: int,
     return int(core), int(trans), info
 
 
-def concat_events(event_paths: Sequence[str], target_durations: Sequence[float], cfg: V46Config) -> Tuple[np.ndarray, List[dict]]:
-    """V46.33 reference-conditioned transition-budget concatenation.
+def concat_events(event_paths: Sequence[str], target_durations: Sequence[float], cfg: MotionGenerationConfig) -> Tuple[np.ndarray, List[dict]]:
+    """Reference Inbetweening reference-conditioned transition-budget concatenation.
 
     This constructs a strong reference motion stream (motion_ref): each music
     slot contributes exactly target_frames.  For non-first slots, part of the
     slot is reserved as transition budget; the core event is lightly resampled,
     aligned in yaw/XZ, and connected through root-Hermite + rotation-SLERP
     inbetweening.  The generated transition spans are reported so generate()
-    can build a precise transition mask for V45/V46.
+    can build a precise transition mask for Motion Refiner and Motion Diffusion.
     """
-    if not _v46_33_cfg_bool(cfg, "transition_budget_enable", "V46_TRANSITION_BUDGET_ENABLE", True):
-        if "concat_events_v46_31_overlap" in globals():
-            return concat_events_v46_31_overlap(event_paths, target_durations, cfg)
+    if not _inbetween_config_bool(cfg, "transition_budget_enable", "MOTION_TRANSITION_BUDGET_ENABLE", True):
+        if "concatenate_events_with_overlap" in globals():
+            return concatenate_events_with_overlap(event_paths, target_durations, cfg)
 
     pieces: List[np.ndarray] = []
     rep: List[dict] = []
@@ -5310,24 +5322,24 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
     for i, (p, dur) in enumerate(zip(event_paths, target_durations)):
         m_raw = np.load(str(p)).astype(np.float32)
         m, pre_report = enforce_edge151_contract_np(
-            m_raw, cfg, source_hint=f"v46_33_concat_load:{p}", derive_contact=True, project_rot=True
+            m_raw, cfg, source_hint=f"inbetween_concat_load:{p}", derive_contact=True, project_rot=True
         )
         target_len = int(target_lens[i])
         has_prev = bool(pieces)
-        core_len, trans_len, length_info = _v46_33_choose_core_and_transition_lengths(m.shape[0], target_len, has_prev, cfg)
+        core_len, trans_len, length_info = _choose_core_and_transition_lengths(m.shape[0], target_len, has_prev, cfg)
         core = resample_motion_np(m, int(core_len)).astype(np.float32)
         core, core_report = enforce_edge151_contract_np(
-            core, cfg, source_hint=f"v46_33_core_resample:{p}", derive_contact=True, project_rot=True
+            core, cfg, source_hint=f"inbetween_core_resample:{p}", derive_contact=True, project_rot=True
         )
         align_report = None
         bridge_report: Dict[str, object] = {"enabled": False, "frames": 0}
         transition_span = None
 
-        if has_prev and trans_len > 0 and _v46_33_cfg_bool(cfg, "transition_inbetween_enable", "V46_TRANSITION_INBETWEEN_ENABLE", True):
-            core, align_report = _v46_33_align_core_to_prev(pieces[-1], core, cfg)
+        if has_prev and trans_len > 0 and _inbetween_config_bool(cfg, "transition_inbetween_enable", "MOTION_TRANSITION_INBETWEEN_ENABLE", True):
+            core, align_report = _align_core_to_previous(pieces[-1], core, cfg)
             prev_tail_n = min(max(2, trans_len // 2), len(pieces[-1]))
             curr_head_n = min(max(2, trans_len // 2), len(core))
-            bridge = v46_33_motion_inbetween_np(pieces[-1][-prev_tail_n:], core[:curr_head_n], trans_len, cfg)
+            bridge = reference_motion_inbetween_np(pieces[-1][-prev_tail_n:], core[:curr_head_n], trans_len, cfg)
             start = cursor
             end = cursor + int(bridge.shape[0])
             transition_span = [int(start), int(end)]
@@ -5343,13 +5355,13 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
                 "curr_head_frames": int(curr_head_n),
             }
         elif has_prev:
-            core, align_report = _v46_33_align_core_to_prev(pieces[-1], core, cfg)
+            core, align_report = _align_core_to_previous(pieces[-1], core, cfg)
 
         pieces.append(core.astype(np.float32))
         core_span = [int(cursor), int(cursor + core.shape[0])]
         cursor += int(core.shape[0])
         rep.append({
-            "version": "v46_33_reference_conditioned_transition_budget",
+            "version": "inbetween_reference_conditioned_transition_budget",
             "path": str(p),
             "target_frames": int(target_len),
             "source_frames": int(m_raw.shape[0]),
@@ -5382,7 +5394,7 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
         "frames_before_terminal_guard": int(final.shape[0]),
         "timing_frame_delta_before_terminal_guard": int(total_target_frames - final.shape[0]),
         "timing_compensation_applied": False,
-        "timing_compensation_mode": "v46_33_slot_exact_transition_budget_no_global_resample",
+        "timing_compensation_mode": "inbetween_slot_exact_transition_budget_no_global_resample",
         "global_resample_applied": False,
         "transition_spans_global": [[int(a), int(b)] for a, b in transition_spans_global],
     }
@@ -5402,7 +5414,7 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
         })
     timing_report["frames_after_terminal_guard"] = int(final.shape[0])
     final, final_report = enforce_edge151_contract_np(
-        final, cfg, source_hint="v46_33_concat_final_motion_ref", derive_contact=True, project_rot=True
+        final, cfg, source_hint="inbetween_concat_final_motion_ref", derive_contact=True, project_rot=True
     )
     if rep:
         rep[-1]["concat_timing_compensation"] = timing_report
@@ -5410,15 +5422,15 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
     return final.astype(np.float32), rep
 
 
-# === V46.33 reference-conditioned transition budget end ===
+# === Reference Inbetweening reference-conditioned transition budget end ===
 
 
-# === V46.33 reference-conditioned transition budget end ===
+# === Reference Inbetweening reference-conditioned transition budget end ===
 
 
-def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: V46Config) -> np.ndarray:
+def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]], cfg: MotionGenerationConfig) -> np.ndarray:
     """Build precise transition mask with optional halo and low core mask."""
-    core_val = _v46_33_cfg_float(cfg, "transition_core_mask_value", "V46_TRANSITION_CORE_MASK_VALUE", 0.0)
+    core_val = _inbetween_config_float(cfg, "transition_core_mask_value", "MOTION_TRANSITION_CORE_MASK_VALUE", 0.0)
     halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     mask = np.full((int(T), 1), float(core_val), dtype=np.float32)
     for sp in transition_spans:
@@ -5441,7 +5453,7 @@ def make_transition_budget_mask(T: int, transition_spans: Sequence[Sequence[int]
                 ramp = np.linspace(1.0, float(core_val), rb - b, endpoint=False, dtype=np.float32)
                 mask[b:rb, 0] = np.maximum(mask[b:rb, 0], ramp)
     return np.clip(mask, 0.0, 1.0).astype(np.float32)
-# === V46.33 reference-conditioned transition budget end ===
+# === Reference Inbetweening reference-conditioned transition budget end ===
 
 
 def make_boundary_mask(T: int, seams: Sequence[int], width: int = 18) -> np.ndarray:
@@ -5482,14 +5494,14 @@ def analytic_residual_refine(motion: np.ndarray, seam_positions: Sequence[int], 
 
 
 
-def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, ckpt_path: Optional[str], cfg: V46Config) -> np.ndarray:
-    """Apply V45 as reference-conditioned transition residual refiner.
+def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, ckpt_path: Optional[str], cfg: MotionGenerationConfig) -> np.ndarray:
+    """Apply Motion Refiner as reference-conditioned transition residual refiner.
 
     Core regions are strongly locked.  By default only a tiny residual is allowed
     outside transition masks; transition regions receive the full correction.
     """
-    core_strength = _v46_33_cfg_float(cfg, "refiner_core_strength", "V46_REFINER_CORE_STRENGTH", 0.02)
-    trans_strength = _v46_33_cfg_float(cfg, "refiner_transition_strength", "V46_REFINER_TRANSITION_STRENGTH", 1.00)
+    core_strength = _inbetween_config_float(cfg, "refiner_core_strength", "MOTION_REFINER_CORE_STRENGTH", 0.02)
+    trans_strength = _inbetween_config_float(cfg, "refiner_transition_strength", "MOTION_REFINER_TRANSITION_STRENGTH", 1.00)
     if torch is None or not ckpt_path or not Path(ckpt_path).exists():
         seam_centers = []
         for a, b in contiguous_regions(seam_mask[:, 0] > 0.5):
@@ -5499,14 +5511,16 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         w = np.clip(core_strength + (trans_strength - core_strength) * seam_mask.astype(np.float32), 0.0, 1.0)
         refined = motion.astype(np.float32) * (1.0 - w) + refined.astype(np.float32) * w
         refined, _ = enforce_edge151_contract_np(
-            refined, cfg, source_hint="apply_refiner_model:v46_33_reference_analytic", derive_contact=True, project_rot=True
+            refined, cfg, source_hint="apply_refiner_model:inbetween_reference_analytic", derive_contact=True, project_rot=True
         )
         return refined.astype(np.float32)
 
-    ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v45_refiner")
-    product_mode = str(ckpt.get("version", "")).startswith(
-        "v45_product_manifold_79d"
+    ckpt = _trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "boundary_refiner")
+    product_mode = normalize_motion_checkpoint_version(
+        ckpt.get("version", "")
+    ).startswith(
+        "product_manifold_boundary_refiner"
     )
     model = (
         ProductManifoldTemporalRefiner(EDGE_DIM, 32)
@@ -5533,7 +5547,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
                 chunk_in = chunk
                 mask_in = mask
             chunk_in, _ = enforce_edge151_contract_np(
-                chunk_in, cfg, source_hint="apply_refiner_model:v46_33_input_chunk", derive_contact=True, project_rot=True
+                chunk_in, cfg, source_hint="apply_refiner_model:inbetween_input_chunk", derive_contact=True, project_rot=True
             )
             x = torch.from_numpy(chunk_in[None]).float().to(cfg.device)
             c = torch.from_numpy(cond[None].astype(np.float32)).float().to(cfg.device)
@@ -5564,7 +5578,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             y_np, _ = enforce_edge151_contract_np(
                 y_np,
                 cfg,
-                source_hint="apply_refiner_model:v46_33_output_chunk",
+                source_hint="apply_refiner_model:inbetween_output_chunk",
                 derive_contact=not product_mode,
                 project_rot=True,
             )
@@ -5577,7 +5591,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         rot_quat_accum,
         rot_quat_weight,
         cfg,
-        source_hint="apply_refiner_model:v46_33_final",
+        source_hint="apply_refiner_model:inbetween_final",
         derive_contact=not product_mode,
     )
     # Hard blend with original reference according to the exact transition mask.
@@ -5608,7 +5622,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
     out, _ = enforce_edge151_contract_np(
         out,
         cfg,
-        source_hint="apply_refiner_model:v46_33_reference_blend",
+        source_hint="apply_refiner_model:inbetween_reference_blend",
         derive_contact=not product_mode,
         project_rot=True,
     )
@@ -5616,8 +5630,8 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
 
 
 
-def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, ckpt_path: Optional[str], cfg: V46Config) -> np.ndarray:
-    """Apply V46 diffusion as transition-masked residual generation.
+def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, ckpt_path: Optional[str], cfg: MotionGenerationConfig) -> np.ndarray:
+    """Apply Motion Generation diffusion as transition-masked residual generation.
 
     The input motion is motion_ref / motion_refined and is treated as a strong
     retrieval/reference condition.  Core frames are locked by mask, while
@@ -5625,19 +5639,21 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
     """
     if torch is None or not ckpt_path or not Path(ckpt_path).exists():
         motion, _ = enforce_edge151_contract_np(
-            motion, cfg, source_hint="apply_diffusion_model:v46_33_disabled", derive_contact=True, project_rot=True
+            motion, cfg, source_hint="apply_diffusion_model:inbetween_disabled", derive_contact=True, project_rot=True
         )
         return motion.astype(np.float32)
 
-    core_strength = _v46_33_cfg_float(cfg, "diffusion_core_strength", "V46_DIFFUSION_CORE_STRENGTH", 0.00)
-    trans_strength = _v46_33_cfg_float(cfg, "diffusion_transition_strength", "V46_DIFFUSION_TRANSITION_STRENGTH", 0.72)
-    noise_scale = _v46_33_cfg_float(cfg, "diffusion_reference_noise_scale", "V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.03)
+    core_strength = _inbetween_config_float(cfg, "diffusion_core_strength", "MOTION_DIFFUSION_CORE_STRENGTH", 0.00)
+    trans_strength = _inbetween_config_float(cfg, "diffusion_transition_strength", "MOTION_DIFFUSION_TRANSITION_STRENGTH", 0.72)
+    noise_scale = _inbetween_config_float(cfg, "diffusion_reference_noise_scale", "MOTION_DIFFUSION_REFERENCE_NOISE_SCALE", 0.03)
 
-    ckpt = _v46_trusted_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
+    ckpt = _trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "motion_diffusion")
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
-    tangent_mode = str(ckpt.get("version", "")).startswith(
-        "v46_reference_tangent_diffusion_79d"
+    tangent_mode = normalize_motion_checkpoint_version(
+        ckpt.get("version", "")
+    ).startswith(
+        "reference_tangent_motion_diffusion"
     )
     model = (
         TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32)
@@ -5665,7 +5681,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
                 retr_in = retr_np
                 mask_in = mask_np
             retr_in, _ = enforce_edge151_contract_np(
-                retr_in, cfg, source_hint="apply_diffusion_model:v46_33_retrieval_chunk", derive_contact=True, project_rot=True
+                retr_in, cfg, source_hint="apply_diffusion_model:inbetween_retrieval_chunk", derive_contact=True, project_rot=True
             )
             retr = torch.from_numpy(retr_in[None]).float().to(cfg.device)
             raw_mask = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
@@ -5751,7 +5767,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
             y, _ = enforce_edge151_contract_np(
                 y,
                 cfg,
-                source_hint="apply_diffusion_model:v46_33_output_chunk",
+                source_hint="apply_diffusion_model:inbetween_output_chunk",
                 derive_contact=not tangent_mode,
                 project_rot=True,
             )
@@ -5764,7 +5780,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
         rot_quat_accum,
         rot_quat_weight,
         cfg,
-        source_hint="apply_diffusion_model:v46_33_final",
+        source_hint="apply_diffusion_model:inbetween_final",
         derive_contact=not tangent_mode,
     )
     # Final exact reference blend in the original-length mask coordinates.
@@ -5795,14 +5811,14 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
     out, _ = enforce_edge151_contract_np(
         out,
         cfg,
-        source_hint="apply_diffusion_model:v46_33_reference_blend",
+        source_hint="apply_diffusion_model:inbetween_reference_blend",
         derive_contact=not tangent_mode,
         project_rot=True,
     )
     return out.astype(np.float32)
 
 
-def derive_contacts_np(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+def derive_contacts_np(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     joints = fk_24_np(motion)
     foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
     foot_y = foot[..., 1]
@@ -5852,9 +5868,9 @@ def smoothstep01(x: np.ndarray | float) -> np.ndarray | float:
     return out.astype(np.float32)
 
 
-def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
     """
-    V46.2 root-Y safety pass.
+    Root-Vertical Safety root-Y safety pass.
 
     Fixes three common post-process artifacts:
     1) Damping Snap Bug: landing damping length is the real contact duration,
@@ -5893,7 +5909,7 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
             flight_skipped_micro += 1
             continue
         air_duration = n / fps
-        # V46.3 biological fuse: a 2+ second no-contact interval in generated
+        # Flight Safety Fuse biological fuse: a 2+ second no-contact interval in generated
         # long dance is almost always broken contact labels / bad retrieval, not
         # a valid human jump. Injecting a physical parabola would create a
         # multi-meter "space launch". Preserve the native root trajectory instead.
@@ -5926,7 +5942,7 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
         if start <= 0 or any_contact[start - 1]:
             continue
 
-        # V46.2 terminal guard: trace the immediately preceding no-contact
+        # Root-Vertical Safety terminal guard: trace the immediately preceding no-contact
         # island. Damping is allowed only if this flight island was long enough
         # to receive the ballistic treatment. This preserves logical
         # conservation between parabola and landing damping, and prevents a
@@ -5974,7 +5990,7 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
         n = min(contact_len, max_damp_frames)
         if n <= 2:
             continue
-        # V46.8 critical fix: damping is capped to an early post-touchdown window
+        # Root-Aware Motion Safety critical fix: damping is capped to an early post-touchdown window
         # instead of stretching across the whole contact island.  The chosen
         # window still has zero dip at both ends, so it is C0-safe at the next
         # untouched frame but cannot create a delayed squat in long support.
@@ -6005,7 +6021,7 @@ def apply_root_y_c1_physics_np(motion: np.ndarray, contacts: np.ndarray, cfg: V4
     delta = out[:, ROOT_Y_IDX] - root_y0
     return out.astype(np.float32), {
         "enabled": True,
-        "version": "v46_3_biological_max_flight_fused_root_y_physics",
+        "version": "biological_flight_root_y_physics",
         "fixes_damping_snap": True,
         "fixes_c1_discontinuity": True,
         "fixes_micro_flight_shock": True,
@@ -6063,9 +6079,9 @@ def contact_ramp_weights_np(
     return weights.astype(np.float32)
 
 
-def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V46Config, root_xz: Optional[np.ndarray] = None) -> Tuple[np.ndarray, dict]:
+def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: MotionGenerationConfig, root_xz: Optional[np.ndarray] = None) -> Tuple[np.ndarray, dict]:
     """
-    Generate V43 lower-body IK targets with a V46.4 sliding-anchor cloud-step guard.
+    Generate Lower-Body IK lower-body IK targets with a Sliding-Support IK sliding-anchor cloud-step guard.
 
     The old span-only guard caused a Footskate Forgiveness Paradox: the worse a
     slow AI foot-drift became, the more likely it was to exceed the XZ threshold
@@ -6130,7 +6146,7 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
 
             is_large_contact_travel = length >= min_frames and span > span_thr
 
-            # V46.8 root-foot relative test.  Smooth high-speed foot travel is
+            # Root-Aware Motion Safety root-foot relative test.  Smooth high-speed foot travel is
             # not sufficient evidence for an intentional Dunhuang cloud-step:
             # severe AI footskate can also be smooth.  A true cloud-step should
             # be supported by root/CoM translation in a compatible direction and
@@ -6163,7 +6179,7 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
             is_cloud_step = bool(is_large_contact_travel and velocity_consistent and root_consistent)
 
             if is_cloud_step:
-                # V46.4 critical fix: use a sliding local-window anchor rather
+                # Sliding-Support IK critical fix: use a sliding local-window anchor rather
                 # than releasing the target. This preserves intentional support
                 # travel while smoothing high-frequency foot jitter.
                 sliding_anchor_segments += 1
@@ -6234,7 +6250,7 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
     diff = np.linalg.norm(targets - native_foot, axis=-1)
     non_contact = ~contacts
     meta = {
-        "version": "v46_4_sliding_anchor_cloud_step_target_generator",
+        "version": "sliding_anchor_step_target_generator",
         "fixes_footskate_forgiveness_paradox": True,
         "intentional_slide_guard": "root_aware_velocity_classified_sliding_anchor",
         "no_span_only_release": True,
@@ -6260,7 +6276,7 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: V
     return targets.astype(np.float32), meta
 
 
-def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, dict]:
+def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
     if torch is None:
         return motion, {"enabled": False, "reason": "torch_unavailable"}
     contacts0, _, _, _ = derive_contacts_np(motion, cfg)
@@ -6279,7 +6295,7 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     chunk = int(cfg.ik_chunk)
     overlap = max(0, int(cfg.ik_chunk_overlap))
     stride = max(1, chunk - overlap)
-    # V46.8: independent chunk solves are merged by weighted accumulation,
+    # Root-Aware Motion Safety: independent chunk solves are merged by weighted accumulation,
     # rather than half-overlap overwrite.  This avoids long-sequence IK seams at
     # chunk boundaries and preserves every overlapping frame as a blend.
     starts = list(range(0, T, stride))
@@ -6553,9 +6569,9 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
         if (
             not relative_reasons
             and not absolute_reasons
-            and callable(globals().get("_v46_41_kbo"))
+            and callable(globals().get("_kinematic_barrier_oracle"))
         ):
-            kbo_ok, kbo_reasons, kbo_detail = globals()["_v46_41_kbo"](
+            kbo_ok, kbo_reasons, kbo_detail = globals()["_kinematic_barrier_oracle"](
                 trial[audit_start:audit_end],
                 final[audit_start:audit_end],
                 cfg,
@@ -6599,7 +6615,7 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     final = final.copy().astype(np.float32)
     final[:, :4] = final_contacts.astype(np.float32)
     report = {
-        "version": "v46_9_true_lower_body_ik_contact_ramps_local_transactions",
+        "version": "lower_body_ik_contact_transactions",
         "enabled": True,
         "writes_lower_body_rot6d": True,
         "root_y_physics": root_y_report,
@@ -6667,11 +6683,11 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
 
 def audit_motion_np(
     motion: np.ndarray,
-    cfg: Optional[V46Config] = None,
+    cfg: Optional[MotionGenerationConfig] = None,
     *,
     sliding_support_eligible: Optional[np.ndarray] = None,
 ) -> dict:
-    cfg = cfg or V46Config()
+    cfg = cfg or MotionGenerationConfig()
     contacts, _, _, _ = derive_contacts_np(motion, cfg)
     audited_motion = np.asarray(motion, dtype=np.float32).copy()
     audited_motion[:, :4] = contacts.astype(np.float32)
@@ -6698,7 +6714,7 @@ def render_if_possible(
     if not output_mp4 or not audio_path:
         return
     if not Path(render_script).exists() or not Path(audio_path).exists():
-        print("[V46 WARN] render skipped: render script or audio missing", file=sys.stderr)
+        print("[Motion Generation WARN] render skipped: render script or audio missing", file=sys.stderr)
         return
     cmd = [
         sys.executable,
@@ -6710,7 +6726,7 @@ def render_if_possible(
         "--camera_mode", "follow",
         "--render_smooth_window", "5",
     ]
-    print("[V46 RENDER]", " ".join(cmd))
+    print("[Motion Generation RENDER]", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
@@ -6718,7 +6734,7 @@ def render_if_possible(
 
 
 def generate(args: argparse.Namespace) -> int:
-    cfg = V46Config.from_json(args.config).apply_env()
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     sem_dirs = getattr(args, "music_semantic_dirs", None)
     if sem_dirs:
         cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in sem_dirs])
@@ -6747,7 +6763,7 @@ def generate(args: argparse.Namespace) -> int:
     if transition_spans:
         seam_mask = make_transition_budget_mask(motion_ref.shape[0], transition_spans, cfg)
         seam_positions = [int((a + b) // 2) for a, b in transition_spans]
-        mask_policy = "v46_33_transition_budget_spans"
+        mask_policy = "inbetween_transition_budget_spans"
     else:
         seam_positions = []
         acc = 0
@@ -6772,16 +6788,16 @@ def generate(args: argparse.Namespace) -> int:
             "max": float(np.max(seam_mask)) if seam_mask.size else 0.0,
             "transition_frame_ratio": float(np.mean(seam_mask[:, 0] > 0.5)) if seam_mask.size else 0.0,
         },
-        "v46_33_reference_conditioning": {
+        "inbetween_reference_conditioning": {
             "motion_ref_as_strong_reference": True,
             "diffusion_edit_policy": "transition_masked_residual_generation",
             "ik_finalization": bool(cfg.ik_enable),
             "env": {
-                "V46_TRANSITION_BUDGET_ENABLE": os.environ.get("V46_TRANSITION_BUDGET_ENABLE", "1"),
-                "V46_TRANSITION_INBETWEEN_ENABLE": os.environ.get("V46_TRANSITION_INBETWEEN_ENABLE", "1"),
-                "V46_REFINER_CORE_STRENGTH": os.environ.get("V46_REFINER_CORE_STRENGTH", "0.02"),
-                "V46_DIFFUSION_CORE_STRENGTH": os.environ.get("V46_DIFFUSION_CORE_STRENGTH", "0.00"),
-                "V46_DIFFUSION_TRANSITION_STRENGTH": os.environ.get("V46_DIFFUSION_TRANSITION_STRENGTH", "0.72"),
+                "MOTION_TRANSITION_BUDGET_ENABLE": os.environ.get("MOTION_TRANSITION_BUDGET_ENABLE", "1"),
+                "MOTION_TRANSITION_INBETWEEN_ENABLE": os.environ.get("MOTION_TRANSITION_INBETWEEN_ENABLE", "1"),
+                "MOTION_REFINER_CORE_STRENGTH": os.environ.get("MOTION_REFINER_CORE_STRENGTH", "0.02"),
+                "MOTION_DIFFUSION_CORE_STRENGTH": os.environ.get("MOTION_DIFFUSION_CORE_STRENGTH", "0.00"),
+                "MOTION_DIFFUSION_TRANSITION_STRENGTH": os.environ.get("MOTION_DIFFUSION_TRANSITION_STRENGTH", "0.72"),
             },
         },
     }
@@ -6790,10 +6806,10 @@ def generate(args: argparse.Namespace) -> int:
 
     if cfg.refiner_enable:
         motion = apply_refiner_model(motion, cond, seam_mask, args.refiner, cfg)
-        stage_reports["v45_refiner_audit"] = audit_motion_np(motion, cfg)
+        stage_reports["boundary_refiner_audit"] = audit_motion_np(motion, cfg)
     if cfg.diffusion_enable:
         motion = apply_diffusion_model(motion, cond, seam_mask, args.diffusion, cfg)
-        stage_reports["v46_diffusion_audit"] = audit_motion_np(motion, cfg)
+        stage_reports["motion_diffusion_audit"] = audit_motion_np(motion, cfg)
 
     ik_report = {"enabled": False}
     if cfg.ik_enable:
@@ -6809,7 +6825,7 @@ def generate(args: argparse.Namespace) -> int:
     np.save(mask_path, seam_mask.astype(np.float32))
 
     report = {
-        "version": "v46_33_reference_conditioned_transition_masked_motionrag_diff",
+        "version": "inbetween_reference_conditioned_transition_masked_motionrag_diff",
         "audio": args.audio,
         "db": args.db,
         "config": dataclasses.asdict(cfg),
@@ -6821,10 +6837,10 @@ def generate(args: argparse.Namespace) -> int:
         "transition_mask_path": mask_path,
         "pre_refine_audit": pre_audit,
         "stage_reports": stage_reports,
-        "v43_true_ik": ik_report,
+        "lower_body_ik_true_ik": ik_report,
         "final_audit": audit_motion_np(motion, cfg),
     }
-    json_path = args.json or str(out).replace(".npy", ".v46_33_report.json")
+    json_path = args.json or str(out).replace(".npy", ".inbetween_report.json")
     save_json(report, json_path)
     if args.render_output:
         render_if_possible(
@@ -6839,18 +6855,18 @@ def generate(args: argparse.Namespace) -> int:
 
 
 def run_ik(args: argparse.Namespace) -> int:
-    cfg = V46Config.from_json(args.config).apply_env()
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     motion = np.load(args.input).astype(np.float32)
     out_motion, report = true_lower_body_ik(motion, cfg)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output, out_motion)
-    save_json(report, args.json or str(args.output).replace(".npy", ".v43_true_ik.json"))
+    save_json(report, args.json or str(args.output).replace(".npy", ".lower_body_ik_true_ik.json"))
     print(json.dumps({"output": args.output, "audit_final": report.get("audit_final")}, ensure_ascii=False, indent=2))
     return 0
 
 
 def run_audit(args: argparse.Namespace) -> int:
-    cfg = V46Config.from_json(args.config).apply_env()
+    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     motion = np.load(args.input).astype(np.float32)
     report = audit_motion_np(motion, cfg)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -6860,7 +6876,7 @@ def run_audit(args: argparse.Namespace) -> int:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="V46 MotionRAG-Diff for EDGE 151D")
+    p = argparse.ArgumentParser(description="MotionRAG-Diff generation for EDGE 151D")
     p.add_argument("--config", default="configs/motion_model.json")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -6868,28 +6884,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     b.add_argument("--motion_dirs", nargs="+", required=True)
     b.add_argument("--manifest", default=None, help="Optional manifest.csv. When present, its source_bvh/fragment_file/label/start_frame/end_frame fields become parent metadata for source-aware Event-RAG.")
     b.add_argument("--out_db", required=True, help="Output directory, containing events.npz and events/*.npy")
-    b.add_argument("--audio_dirs", nargs="*", default=None, help="Optional paired audio/music directories. Same-stem files are used for real V44 music features.")
+    b.add_argument("--audio_dirs", nargs="*", default=None, help="Optional paired audio/music directories. Same-stem files are used for real Contrastive Retriever music features.")
     b.set_defaults(func=build_db)
 
-    c = sub.add_parser("train-contrastive", help="V44 music-motion contrastive training")
+    c = sub.add_parser("train-contrastive", help="Contrastive Retriever music-motion contrastive training")
     c.add_argument("--db", required=True)
     c.add_argument("--out", required=True)
     c.add_argument("--music_feature_npz", default=None)
-    c.add_argument("--unpaired_audio_dirs", nargs="*", default=None, help="Unpaired target/background music directories. Used for V46.8 semantic OT pseudo-pairs when BVH has no synchronized audio.")
+    c.add_argument("--unpaired_audio_dirs", nargs="*", default=None, help="Unpaired target/background music directories. Used for Root-Aware Motion Safety semantic OT pseudo-pairs when BVH has no synchronized audio.")
     c.add_argument("--audio_dirs", nargs="*", default=None, help="Alias for --unpaired_audio_dirs; kept for script compatibility.")
-    c.add_argument("--music_semantic_dirs", nargs="*", default=None, help="V46.12 directories containing external classical-music semantic JSON/NPZ sidecars.")
+    c.add_argument("--music_semantic_dirs", nargs="*", default=None, help="External Music Semantics directories containing external classical-music semantic JSON/NPZ sidecars.")
     c.add_argument("--external_music_semantic_cmd", default=None, help="Optional command template: use {audio}, {out_json}, {out_npz}, {stem} placeholders to call an external trained music semantic model.")
     c.add_argument("--epochs", type=int, default=None)
     c.set_defaults(func=train_contrastive)
 
-    r = sub.add_parser("train-refiner", help="V45 residual Motion Refiner training")
+    r = sub.add_parser("train-refiner", help="Motion Refiner residual Motion Refiner training")
     r.add_argument("--db", required=True)
     r.add_argument("--val_db", default=None, help="Source-disjoint validation Event-DB used for contract and leakage gates")
     r.add_argument("--out", required=True)
     r.add_argument("--steps", type=int, default=None)
     r.set_defaults(func=train_refiner)
 
-    d = sub.add_parser("train-diffusion", help="V46 conditional residual diffusion training")
+    d = sub.add_parser("train-diffusion", help="Motion Generation conditional residual diffusion training")
     d.add_argument("--db", required=True)
     d.add_argument("--val_db", default=None, help="Source-disjoint validation Event-DB used for contract and leakage gates")
     d.add_argument("--out", required=True)
@@ -6897,10 +6913,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     d.add_argument("--diffusion_steps", type=int, default=None)
     d.set_defaults(func=train_diffusion)
 
-    g = sub.add_parser("generate", help="Generate whole-song motion from music via V46 pipeline")
+    g = sub.add_parser("generate", help="Generate whole-song motion from music via Motion Generation pipeline")
     g.add_argument("--audio", required=True)
     g.add_argument("--slots_json", default=None)
-    g.add_argument("--music_semantic_dirs", nargs="*", default=None, help="V46.12 directories containing external classical-music semantic JSON/NPZ sidecars.")
+    g.add_argument("--music_semantic_dirs", nargs="*", default=None, help="External Music Semantics directories containing external classical-music semantic JSON/NPZ sidecars.")
     g.add_argument("--external_music_semantic_cmd", default=None, help="Optional command template for an external trained music semantic model.")
     g.add_argument("--slot_seconds", type=float, default=4.0)
     g.add_argument("--db", required=True)
@@ -6913,7 +6929,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     g.add_argument("--render_script", default="rendering/render_motion.py")
     g.set_defaults(func=generate)
 
-    ik = sub.add_parser("ik", help="Run V43 true lower-body IK on an existing EDGE 151D npy")
+    ik = sub.add_parser("ik", help="Run Lower-Body IK true lower-body IK on an existing EDGE 151D npy")
     ik.add_argument("--input", required=True)
     ik.add_argument("--output", required=True)
     ik.add_argument("--json", default=None)
@@ -6934,54 +6950,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 
-# ===== V46.38 COMPLETE MSSD-AESD ROUTING PATCH START =====
+# ===== Semantic Routing COMPLETE MSSD-AESD ROUTING PATCH START =====
 # Complete chain: MSSD music slots -> AESD action descriptors -> routing-aware
-# Semantic OT for V44 -> routing-aware beam search for Event-RAG.
+# Semantic OT for Contrastive Retriever -> routing-aware beam search for Event-RAG.
 try:
     from events.semantic_descriptor import (
-        MUSIC_SEMANTIC_LABELS as _V46_38_LABELS,
-        parse_descriptor_file as _v46_38_parse_descriptor_file,
-        load_descriptor_for_audio as _v46_38_load_descriptor_for_audio,
-        env_bool as _v46_38_env_bool,
-        get_aesd_prob_matrix as _v46_38_get_aesd_prob_matrix,
-        slot_prob_vector as _v46_38_slot_prob_vector,
-        dot_compat as _v46_38_dot_compat,
-        normalize_vector as _v46_38_normalize_vector,
+        MUSIC_SEMANTIC_LABELS as _ROUTING_SEMANTIC_LABELS,
+        parse_descriptor_file as _semantic_routing_parse_descriptor_file,
+        load_descriptor_for_audio as _semantic_routing_load_descriptor_for_audio,
+        env_bool as _semantic_routing_env_bool,
+        get_aesd_prob_matrix as _event_semantic_probability_matrix,
+        slot_prob_vector as _semantic_routing_slot_prob_vector,
+        dot_compat as _semantic_routing_dot_compat,
+        normalize_vector as _semantic_routing_normalize_vector,
     )
-except Exception as _v46_38_import_exc:  # pragma: no cover
-    _V46_38_LABELS = ["calm_meditative", "pose_hold", "lyrical_flow", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow", "aerial_curve"]
-    _v46_38_parse_descriptor_file = None
-    _v46_38_load_descriptor_for_audio = None
-    _v46_38_env_bool = None
-    _v46_38_get_aesd_prob_matrix = None
-    _v46_38_slot_prob_vector = None
-    _v46_38_dot_compat = None
-    _v46_38_normalize_vector = None
-    print(f"[V46.38 WARN] import failed: {_v46_38_import_exc}", file=sys.stderr)
+except Exception as _routing_import_error:  # pragma: no cover
+    _ROUTING_SEMANTIC_LABELS = ["calm_meditative", "pose_hold", "lyrical_flow", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow", "aerial_curve"]
+    _semantic_routing_parse_descriptor_file = None
+    _semantic_routing_load_descriptor_for_audio = None
+    _semantic_routing_env_bool = None
+    _event_semantic_probability_matrix = None
+    _semantic_routing_slot_prob_vector = None
+    _semantic_routing_dot_compat = None
+    _semantic_routing_normalize_vector = None
+    print(f"[Semantic Routing WARN] import failed: {_routing_import_error}", file=sys.stderr)
 
 
-def _v46_38_bool(name: str, default: bool = False) -> bool:
+def _routing_env_bool(name: str, default: bool = False) -> bool:
     try:
         return bool(int(os.environ.get(name, "1" if default else "0")))
     except Exception:
         return bool(default)
 
 
-def _v46_38_float(name: str, default: float) -> float:
+def _routing_env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, str(default)))
     except Exception:
         return float(default)
 
 
-def _v46_38_int(name: str, default: int) -> int:
+def _routing_env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
     except Exception:
         return int(default)
 
 
-def _v46_38_descriptor_dirs_from_cfg(cfg: V46Config) -> str:
+def _descriptor_directories_from_config(cfg: MotionGenerationConfig) -> str:
     parts = []
     for attr in ["music_descriptor_dirs", "external_music_semantic_dirs"]:
         val = getattr(cfg, attr, "")
@@ -6990,62 +7006,62 @@ def _v46_38_descriptor_dirs_from_cfg(cfg: V46Config) -> str:
                 parts.extend([str(x) for x in val])
             else:
                 parts.extend(str(val).replace(";", os.pathsep).split(os.pathsep))
-    extra = os.environ.get("V46_MSSD_DESCRIPTOR_DIRS", "") or os.environ.get("V46_38_DESCRIPTOR_DIRS", "")
+    extra = os.environ.get("MOTION_MSSD_DESCRIPTOR_DIRS", "") or os.environ.get("SEMANTIC_ROUTING_DESCRIPTOR_DIRS", "")
     if extra:
         parts.extend(extra.replace(";", os.pathsep).split(os.pathsep))
     return os.pathsep.join([p for p in parts if str(p).strip()])
 
 
-def _v46_38_mark_slots_with_meta(slots: List[dict], meta: dict) -> List[dict]:
+def _mark_slots_with_metadata(slots: List[dict], meta: dict) -> List[dict]:
     out = []
     for s0 in slots:
         s = dict(s0)
         s.setdefault("mssd_usage", meta.get("usage"))
         s.setdefault("mssd_is_final_schedule", bool(meta.get("is_final_schedule", False)))
         s.setdefault("mssd_slot_source", meta.get("slot_source", s.get("slot_source", "")))
-        for k in ["router_ckpt", "planner_ckpt", "v23_ckpt", "raw_schedule_json", "schedule_summary_json", "descriptor_schema_version"]:
+        for k in ["router_ckpt", "planner_ckpt", "duration_model_ckpt", "raw_schedule_json", "schedule_summary_json", "descriptor_schema_version"]:
             if meta.get(k) is not None:
                 s.setdefault("mssd_" + k, meta.get(k))
         out.append(s)
     return out
 
 
-def _v46_38_load_slots_json(slots_json: str | Path, cfg: V46Config, require_final: bool = False) -> Tuple[List[dict], np.ndarray, dict]:
-    if _v46_38_parse_descriptor_file is None:
-        slots, feats, meta = _v46_34_load_slots_json(slots_json, cfg)
+def _load_routing_slots_json(slots_json: str | Path, cfg: MotionGenerationConfig, require_final: bool = False) -> Tuple[List[dict], np.ndarray, dict]:
+    if _semantic_routing_parse_descriptor_file is None:
+        slots, feats, meta = _load_music_slots_json(slots_json, cfg)
         return slots, feats, meta
-    slots, feats, meta = _v46_38_parse_descriptor_file(
+    slots, feats, meta = _semantic_routing_parse_descriptor_file(
         slots_json,
         require_final_schedule=bool(require_final),
         fps=float(getattr(cfg, "fps", 30.0)),
         temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
         usage="generate_schedule" if require_final else "auto",
     )
-    slots = _v46_38_mark_slots_with_meta(slots, meta)
+    slots = _mark_slots_with_metadata(slots, meta)
     return slots, feats, meta
 
 
-def _v46_38_audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
-    strict = _v46_34_env_bool("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS", False)
-    mssd_enabled = _v46_38_bool("V46_MSSD_ENABLE", True)
-    require_final = strict or _v46_38_bool("V46_MSSD_REQUIRE_FINAL_SCHEDULE_FOR_GENERATE", False)
+def _build_routing_audio_slots(path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
+    strict = _slot_plan_env_bool("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS", False)
+    mssd_enabled = _routing_env_bool("MOTION_MSSD_ENABLE", True)
+    require_final = strict or _routing_env_bool("MOTION_MSSD_REQUIRE_FINAL_SCHEDULE_FOR_GENERATE", False)
     if slots_json and Path(slots_json).exists():
-        if mssd_enabled and _v46_38_parse_descriptor_file is not None:
-            slots, feats, meta = _v46_38_load_slots_json(slots_json, cfg, require_final=require_final)
-            print(f"[V46.38 MSSD] loaded descriptor: {slots_json} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
+        if mssd_enabled and _semantic_routing_parse_descriptor_file is not None:
+            slots, feats, meta = _load_routing_slots_json(slots_json, cfg, require_final=require_final)
+            print(f"[Semantic Routing MSSD] loaded descriptor: {slots_json} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
             return slots, feats
-        slots, feats, meta = _v46_34_load_slots_json(slots_json, cfg)
+        slots, feats, meta = _load_music_slots_json(slots_json, cfg)
         allowed = not strict
-        raw = " ".join(str(meta.get(k, "")) for k in ["slot_source", "router_ckpt", "planner_ckpt", "v23_ckpt"])
-        if any(k in raw.lower() for k in ["v21", "v23", "v26", "router", "planner", "pretrained"]):
+        raw = " ".join(str(meta.get(k, "")) for k in ["slot_source", "router_ckpt", "planner_ckpt", "duration_model_ckpt"])
+        if has_scheduler_provenance(raw):
             allowed = True
         if not allowed:
-            raise RuntimeError("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but slots_json is not final trained-router/planner MSSD")
-        return _v46_38_mark_slots_with_meta(slots, meta), feats
-    if mssd_enabled and _v46_38_load_descriptor_for_audio is not None:
-        loaded = _v46_38_load_descriptor_for_audio(
+            raise RuntimeError("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but slots_json is not final trained-router/planner MSSD")
+        return _mark_slots_with_metadata(slots, meta), feats
+    if mssd_enabled and _semantic_routing_load_descriptor_for_audio is not None:
+        loaded = _semantic_routing_load_descriptor_for_audio(
             path,
-            descriptor_dirs=_v46_38_descriptor_dirs_from_cfg(cfg),
+            descriptor_dirs=_descriptor_directories_from_config(cfg),
             require_final_schedule=require_final,
             fps=float(getattr(cfg, "fps", 30.0)),
             temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
@@ -7053,42 +7069,42 @@ def _v46_38_audio_slots(path: str | Path, cfg: V46Config, slot_seconds: float = 
         )
         if loaded is not None:
             slots, feats, meta = loaded
-            slots = _v46_38_mark_slots_with_meta(slots, meta)
-            print(f"[V46.38 MSSD] loaded sidecar descriptor: audio={path} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
+            slots = _mark_slots_with_metadata(slots, meta)
+            print(f"[Semantic Routing MSSD] loaded sidecar descriptor: audio={path} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
             return slots, feats
     if strict:
-        raise RuntimeError("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but no final MSSD/slots_json was provided. Build it with python -m scheduling.music_slot_descriptor")
-    return audio_slots_v46_default(path, cfg, slot_seconds, slots_json)
+        raise RuntimeError("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but no final MSSD/slots_json was provided. Build it with python -m scheduling.music_slot_descriptor")
+    return build_default_audio_slots(path, cfg, slot_seconds, slots_json)
 
 
-# Override old loaders.  Generate uses strict final MSSD; V44 training does not.
-audio_slots = _v46_38_audio_slots
+# Override old loaders.  Generate uses strict final MSSD; Contrastive Retriever training does not.
+audio_slots = _build_routing_audio_slots
 
 
-def parse_external_music_semantic_file(path: str | Path, cfg: V46Config) -> Optional[Tuple[List[dict], np.ndarray]]:
-    if _v46_38_parse_descriptor_file is None:
+def parse_external_music_semantic_file(path: str | Path, cfg: MotionGenerationConfig) -> Optional[Tuple[List[dict], np.ndarray]]:
+    if _semantic_routing_parse_descriptor_file is None:
         return None
     try:
-        slots, feats, meta = _v46_38_parse_descriptor_file(
+        slots, feats, meta = _semantic_routing_parse_descriptor_file(
             path,
             require_final_schedule=False,
             fps=float(getattr(cfg, "fps", 30.0)),
             temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
             usage="train_semantic",
         )
-        return _v46_38_mark_slots_with_meta(slots, meta), feats
+        return _mark_slots_with_metadata(slots, meta), feats
     except Exception as exc:
-        print(f"[V46.38 MSSD WARN] failed parsing weak descriptor {path}: {exc}", file=sys.stderr)
+        print(f"[Semantic Routing MSSD WARN] failed parsing weak descriptor {path}: {exc}", file=sys.stderr)
         return None
 
 
-def load_external_music_semantic_slots(audio_path: str | Path, cfg: V46Config, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
+def load_external_music_semantic_slots(audio_path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
     if not bool(getattr(cfg, "external_music_semantic_enable", True)):
         return None
-    if _v46_38_load_descriptor_for_audio is not None:
-        loaded = _v46_38_load_descriptor_for_audio(
+    if _semantic_routing_load_descriptor_for_audio is not None:
+        loaded = _semantic_routing_load_descriptor_for_audio(
             audio_path,
-            descriptor_dirs=_v46_38_descriptor_dirs_from_cfg(cfg),
+            descriptor_dirs=_descriptor_directories_from_config(cfg),
             require_final_schedule=False,
             fps=float(getattr(cfg, "fps", 30.0)),
             temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
@@ -7096,7 +7112,7 @@ def load_external_music_semantic_slots(audio_path: str | Path, cfg: V46Config, s
         )
         if loaded is not None:
             slots, feats, meta = loaded
-            return _v46_38_mark_slots_with_meta(slots, meta), feats
+            return _mark_slots_with_metadata(slots, meta), feats
     cmd_out = run_external_music_semantic_cmd(audio_path, cfg)
     if cmd_out is not None:
         parsed = parse_external_music_semantic_file(cmd_out, cfg)
@@ -7111,52 +7127,52 @@ def load_external_music_semantic_slots(audio_path: str | Path, cfg: V46Config, s
     return None
 
 
-def load_unpaired_audio_feature_pool(audio_dirs: Optional[Sequence[str]], cfg: V46Config) -> Tuple[np.ndarray, List[dict]]:
+def load_unpaired_audio_feature_pool(audio_dirs: Optional[Sequence[str]], cfg: MotionGenerationConfig) -> Tuple[np.ndarray, List[dict]]:
     files = collect_audio_files(audio_dirs)
     feats: List[np.ndarray] = []
     meta: List[dict] = []
-    old_strict = os.environ.get("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS")
+    old_strict = os.environ.get("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS")
     try:
-        os.environ["V46_REQUIRE_PRETRAINED_ROUTER_SLOTS"] = "0"
+        os.environ["MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS"] = "0"
         for f in files:
             try:
                 parsed = load_external_music_semantic_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds))
                 if parsed is not None:
                     slots, sf = parsed
                 else:
-                    slots, sf = audio_slots_v46_default(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds), slots_json=None)
+                    slots, sf = build_default_audio_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds), slots_json=None)
             except Exception as exc:
-                print(f"[V46.38 WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
+                print(f"[Semantic Routing WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
                 continue
             for slot, feat in zip(slots, sf):
                 feats.append(feat.astype(np.float32))
                 meta.append({"audio": str(f), "slot": dict(slot)})
     finally:
         if old_strict is None:
-            os.environ.pop("V46_REQUIRE_PRETRAINED_ROUTER_SLOTS", None)
+            os.environ.pop("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS", None)
         else:
-            os.environ["V46_REQUIRE_PRETRAINED_ROUTER_SLOTS"] = old_strict
+            os.environ["MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS"] = old_strict
     if not feats:
         return np.zeros((0, 32), dtype=np.float32), []
     return np.stack(feats).astype(np.float32), meta
 
 
-def _v46_38_slot_prob_matrix(audio_meta: List[dict]) -> np.ndarray:
+def _slot_probability_matrix(audio_meta: List[dict]) -> np.ndarray:
     rows = []
     for m in audio_meta:
         slot = m.get("slot", {})
-        if _v46_38_slot_prob_vector is not None:
-            rows.append(_v46_38_slot_prob_vector(slot))
+        if _semantic_routing_slot_prob_vector is not None:
+            rows.append(_semantic_routing_slot_prob_vector(slot))
         else:
-            rows.append(np.ones((len(_V46_38_LABELS),), dtype=np.float32) / max(1, len(_V46_38_LABELS)))
-    return np.stack(rows).astype(np.float32) if rows else np.zeros((0, len(_V46_38_LABELS)), dtype=np.float32)
+            rows.append(np.ones((len(_ROUTING_SEMANTIC_LABELS),), dtype=np.float32) / max(1, len(_ROUTING_SEMANTIC_LABELS)))
+    return np.stack(rows).astype(np.float32) if rows else np.zeros((0, len(_ROUTING_SEMANTIC_LABELS)), dtype=np.float32)
 
 
-def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[str]], cfg: V46Config) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]]:
-    """V46.38 MSSD-AESD Semantic OT.
+def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[str]], cfg: MotionGenerationConfig) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]]:
+    """Semantic Routing MSSD-AESD Semantic OT.
 
     It still uses real unpaired music features and motion descriptors, but the OT
-    cost now includes a soft MSSD-to-AESD probability distance.  Thus V44 is no
+    cost now includes a soft MSSD-to-AESD probability distance.  Thus Contrastive Retriever is no
     longer trained from only low-level energy/duration hints.
     """
     audio_raw, audio_meta = load_unpaired_audio_feature_pool(audio_dirs, cfg)
@@ -7171,15 +7187,15 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
     dims, weights = semantic_dims_and_weights()
     diff = music_z_all[:, None, dims] - motion_z[None, :, dims]
     cost_num = np.sum((diff * weights[None, None, :]) ** 2, axis=-1)
-    if _v46_38_get_aesd_prob_matrix is not None:
-        slot_probs = _v46_38_slot_prob_matrix(audio_meta)
-        aesd_probs = _v46_38_get_aesd_prob_matrix(db, motion_z.shape[0])
+    if _event_semantic_probability_matrix is not None:
+        slot_probs = _slot_probability_matrix(audio_meta)
+        aesd_probs = _event_semantic_probability_matrix(db, motion_z.shape[0])
         sem_compat = np.clip(slot_probs @ aesd_probs.T, 0.0, 1.0)
         cost_sem = 1.0 - sem_compat
     else:
         sem_compat = np.zeros((music_z_all.shape[0], motion_z.shape[0]), dtype=np.float32)
         cost_sem = 0.0
-    lam_sem = _v46_38_float("V46_38_OT_SEMANTIC_WEIGHT", 1.25)
+    lam_sem = _routing_env_float("SEMANTIC_ROUTING_OT_SEMANTIC_WEIGHT", 1.25)
     rng = np.random.default_rng(int(cfg.seed) + 4638)
     cost = cost_num + lam_sem * cost_sem + rng.normal(0.0, 1e-5, size=cost_num.shape).astype(np.float32)
     topk = max(1, min(int(cfg.unpaired_positive_topk), motion_z.shape[0]))
@@ -7209,7 +7225,7 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
     music = np.stack(music_pairs).astype(np.float32)
     motion = np.stack(motion_pairs).astype(np.float32)
     report = {
-        "mode": "v46_38_mssd_aesd_semantic_ot",
+        "mode": "semantic_routing_mssd_aesd_semantic_ot",
         "audio_files": sorted(set(m["audio"] for m in audio_meta)),
         "num_audio_slots": int(audio_raw.shape[0]),
         "num_motion_events": int(motion_z.shape[0]),
@@ -7225,7 +7241,7 @@ def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[st
     return music, motion, desc_mean.astype(np.float32), desc_std.astype(np.float32), report
 
 
-def _v46_38_stage_score(slot: dict, stages: np.ndarray) -> np.ndarray:
+def _stage_sequence_score(slot: dict, stages: np.ndarray) -> np.ndarray:
     role = str(slot.get("role", slot.get("slot_role", "normal")))
     out = np.zeros((len(stages),), dtype=np.float32)
     good = {
@@ -7247,8 +7263,8 @@ def _v46_38_stage_score(slot: dict, stages: np.ndarray) -> np.ndarray:
     return out
 
 
-def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V46Config, contrastive=None) -> Tuple[List[int], List[dict]]:
-    """V46.38 global MSSD-AESD routing-aware Event-RAG."""
+def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: MotionGenerationConfig, contrastive=None) -> Tuple[List[int], List[dict]]:
+    """Semantic Routing global MSSD-AESD routing-aware Event-RAG."""
     desc = np.asarray(db["desc"], dtype=np.float32)
     desc_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "classification_retrieval_weight", getattr(cfg, "filename_semantic_retrieval_weight", 0.20))))
     mean = np.asarray(db["desc_mean"], dtype=np.float32)
@@ -7279,19 +7295,19 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
     event_quality = np.asarray(db.get("event_quality_scores", np.ones(n, dtype=np.float32)), dtype=np.float32)
     nat_min = np.asarray(db.get("natural_duration_min", np.ones(n, dtype=np.float32) * 1.5), dtype=np.float32)
     nat_max = np.asarray(db.get("natural_duration_max", np.ones(n, dtype=np.float32) * 4.0), dtype=np.float32)
-    aesd_probs = _v46_38_get_aesd_prob_matrix(db, n) if _v46_38_get_aesd_prob_matrix is not None else np.zeros((n, len(_V46_38_LABELS)), dtype=np.float32)
+    aesd_probs = _event_semantic_probability_matrix(db, n) if _event_semantic_probability_matrix is not None else np.zeros((n, len(_ROUTING_SEMANTIC_LABELS)), dtype=np.float32)
     aesd_risk = np.asarray(db.get("aesd_boundary_risk", np.zeros(n, dtype=np.float32)), dtype=np.float32)
     aesd_semantics = np.asarray(db.get("aesd_event_semantics", align_arr), dtype=object)
 
-    w_contrastive = _v46_38_float("V46_38_ROUTE_CONTRASTIVE_WEIGHT", 1.00)
-    w_mssd_aesd = _v46_38_float("V46_38_ROUTE_MSSD_AESD_WEIGHT", 1.15)
-    w_legacy_sem = _v46_38_float("V46_38_ROUTE_LEGACY_SEM_WEIGHT", float(getattr(cfg, "semantic_routing_weight", 0.72)))
-    w_duration = _v46_38_float("V46_38_ROUTE_DURATION_WEIGHT", float(getattr(cfg, "route_natural_duration_weight", 0.20)))
-    w_quality = _v46_38_float("V46_38_ROUTE_QUALITY_WEIGHT", float(getattr(cfg, "event_quality_weight", 0.22)))
-    w_stage = _v46_38_float("V46_38_ROUTE_STAGE_WEIGHT", float(getattr(cfg, "route_stage_sequence_weight", 0.16)))
-    w_boundary_risk = _v46_38_float("V46_38_ROUTE_BOUNDARY_RISK_WEIGHT", 0.35)
+    w_contrastive = _routing_env_float("SEMANTIC_ROUTING_ROUTE_CONTRASTIVE_WEIGHT", 1.00)
+    w_mssd_aesd = _routing_env_float("SEMANTIC_ROUTING_ROUTE_MSSD_AESD_WEIGHT", 1.15)
+    w_legacy_sem = _routing_env_float("SEMANTIC_ROUTING_ROUTE_LEGACY_SEM_WEIGHT", float(getattr(cfg, "semantic_routing_weight", 0.72)))
+    w_duration = _routing_env_float("SEMANTIC_ROUTING_ROUTE_DURATION_WEIGHT", float(getattr(cfg, "route_natural_duration_weight", 0.20)))
+    w_quality = _routing_env_float("SEMANTIC_ROUTING_ROUTE_QUALITY_WEIGHT", float(getattr(cfg, "event_quality_weight", 0.22)))
+    w_stage = _routing_env_float("SEMANTIC_ROUTING_ROUTE_STAGE_WEIGHT", float(getattr(cfg, "route_stage_sequence_weight", 0.16)))
+    w_boundary_risk = _routing_env_float("SEMANTIC_ROUTING_ROUTE_BOUNDARY_RISK_WEIGHT", 0.35)
     top_debug = max(1, int(getattr(cfg, "classification_report_topk", 8)))
-    candidate_k = max(int(getattr(cfg, "top_k", 32)), int(getattr(cfg, "beam_size", 8)), _v46_38_int("V46_38_ROUTE_CANDIDATE_TOPK", 96), top_debug)
+    candidate_k = max(int(getattr(cfg, "top_k", 32)), int(getattr(cfg, "beam_size", 8)), _routing_env_int("SEMANTIC_ROUTING_ROUTE_CANDIDATE_TOPK", 96), top_debug)
 
     beams: List[Tuple[float, List[int], Dict[str, int]]] = [(0.0, [], {})]
     reports: List[dict] = []
@@ -7303,12 +7319,12 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
         center = np.maximum((nat_min + nat_max) * 0.5, 1e-4)
         natural_score = in_range + (1.0 - in_range) * np.exp(-np.abs(np.log(slot_dur / center))).astype(np.float32)
         legacy_sem = semantic_label_match_bonus(slot, db, cfg)
-        if _v46_38_slot_prob_vector is not None and _v46_38_dot_compat is not None:
-            slot_prob = _v46_38_slot_prob_vector(slot)
-            mssd_aesd_score = _v46_38_dot_compat(slot_prob, aesd_probs)
+        if _semantic_routing_slot_prob_vector is not None and _semantic_routing_dot_compat is not None:
+            slot_prob = _semantic_routing_slot_prob_vector(slot)
+            mssd_aesd_score = _semantic_routing_dot_compat(slot_prob, aesd_probs)
         else:
             mssd_aesd_score = legacy_sem.astype(np.float32)
-        stage_score = _v46_38_stage_score(slot, stages)
+        stage_score = _stage_sequence_score(slot, stages)
         quality_term = np.clip(event_quality, 0.0, 1.0)
         low_quality_penalty = np.maximum(0.0, float(getattr(cfg, "chang_e_min_event_quality", 0.22)) - quality_term)
         base_score = (
@@ -7411,15 +7427,15 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
             "slot_music_semantic_top_label": slot.get("music_semantic_top_label", slot.get("music_alignment_label")),
             "slot_music_semantic_probs": slot.get("music_semantic_probs", {}),
             "slot_preferred_dance_keys": slot.get("preferred_dance_keys", []),
-            "mssd_audit": {k: slot.get(k) for k in ["usage", "is_final_schedule", "slot_source", "mssd_usage", "mssd_is_final_schedule", "mssd_slot_source", "mssd_router_ckpt", "mssd_planner_ckpt", "mssd_v23_ckpt", "mssd_raw_schedule_json"] if k in slot},
+            "mssd_audit": {k: slot.get(k) for k in ["usage", "is_final_schedule", "slot_source", "mssd_usage", "mssd_is_final_schedule", "mssd_slot_source", "mssd_router_ckpt", "mssd_planner_ckpt", "mssd_duration_model_ckpt", "mssd_raw_schedule_json"] if k in slot},
             "top_candidate": int(cand[0]) if cand else -1,
             "beam_best_score": float(beams[0][0]) if beams else float("nan"),
-            "routing_policy": "V46.38 MSSD-AESD global Event-RAG: contrastive + MSSD-AESD semantic + natural duration + stage + quality + boundary/source/family costs",
+            "routing_policy": "Semantic Routing MSSD-AESD global Event-RAG: contrastive + MSSD-AESD semantic + natural duration + stage + quality + boundary/source/family costs",
             "routing_weights": {"contrastive": w_contrastive, "mssd_aesd": w_mssd_aesd, "legacy_semantic": w_legacy_sem, "duration": w_duration, "quality": w_quality, "stage": w_stage, "boundary_risk": w_boundary_risk},
             "candidate_preview": preview,
         })
     return beams[0][1], reports
-# ===== V46.38 COMPLETE MSSD-AESD ROUTING PATCH END =====
+# ===== Semantic Routing COMPLETE MSSD-AESD ROUTING PATCH END =====
 
 
 
@@ -7437,51 +7453,51 @@ def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: V
 
 
 
-# ===== V46.41 STAGE-ANCHORED GUIDED TGT PATCH START =====
-# V46.41: Macroscopic Stage Anchoring + KBO-guided Temporal Generative Transactions.
-# This layer is intentionally generation-time only. It preserves the V46.38
-# MSSD/AESD routing objective and protects V45/V46/IK from long-horizon drift.
+# ===== Stage Guard STAGE-ANCHORED GUIDED TGT PATCH START =====
+# Stage Guard: Macroscopic Stage Anchoring + KBO-guided Temporal Generative Transactions.
+# This layer is intentionally generation-time only. It preserves the Semantic Routing
+# MSSD/AESD routing objective and protects Motion Refiner and Motion Diffusion/IK from long-horizon drift.
 
-_v46_41_orig_concat_events = concat_events
-_v46_41_orig_apply_refiner_model = apply_refiner_model
-_v46_41_orig_apply_diffusion_model = apply_diffusion_model
-_v46_41_orig_true_lower_body_ik = true_lower_body_ik
-_v46_41_orig_generate = generate
+_stage_guard_orig_concat_events = concat_events
+_stage_guard_orig_apply_refiner_model = apply_refiner_model
+_stage_guard_orig_apply_diffusion_model = apply_diffusion_model
+_stage_guard_orig_true_lower_body_ik = true_lower_body_ik
+_stage_guard_orig_generate = generate
 
-_V46_41_AUDIT_TOKENS = []
-_V46_41_STAGE_PRIOR_XZ = None
-_V46_41_STAGE_PRIOR_META = {}
+_STAGE_TRANSACTION_AUDIT = []
+_STAGE_PRIOR_XZ = None
+_STAGE_PRIOR_METADATA = {}
 
 
-def _v46_41_env_bool(name, default=True):
+def _stage_guard_env_bool(name, default=True):
     try:
         return bool(int(os.environ.get(name, "1" if default else "0")))
     except Exception:
         return bool(default)
 
 
-def _v46_41_env_float(name, default):
+def _stage_guard_env_float(name, default):
     try:
         return float(os.environ.get(name, str(default)))
     except Exception:
         return float(default)
 
 
-def _v46_41_env_int(name, default):
+def _stage_guard_env_int(name, default):
     try:
         return int(float(os.environ.get(name, str(default))))
     except Exception:
         return int(default)
 
 
-def _v46_41_jsonable(x):
+def _stage_guard_jsonable(x):
     try:
-        return _v46_json_safe(x)
+        return _json_safe(x)
     except Exception:
         if isinstance(x, dict):
-            return {str(k): _v46_41_jsonable(v) for k, v in x.items()}
+            return {str(k): _stage_guard_jsonable(v) for k, v in x.items()}
         if isinstance(x, (list, tuple)):
-            return [_v46_41_jsonable(v) for v in x]
+            return [_stage_guard_jsonable(v) for v in x]
         if isinstance(x, np.ndarray):
             return x.tolist()
         if isinstance(x, np.generic):
@@ -7489,29 +7505,29 @@ def _v46_41_jsonable(x):
         return x if isinstance(x, (str, int, float, bool)) or x is None else str(x)
 
 
-def _v46_41_reset_audit():
-    global _V46_41_AUDIT_TOKENS
-    _V46_41_AUDIT_TOKENS = []
+def _reset_stage_transaction_audit():
+    global _STAGE_TRANSACTION_AUDIT
+    _STAGE_TRANSACTION_AUDIT = []
 
 
-def _v46_41_add_token(item):
-    global _V46_41_AUDIT_TOKENS
-    if len(_V46_41_AUDIT_TOKENS) < _v46_41_env_int("V46_41_AUDIT_MAX_RECORDS", 4000):
-        _V46_41_AUDIT_TOKENS.append(_v46_41_jsonable(dict(item)))
+def _append_stage_transaction_audit(item):
+    global _STAGE_TRANSACTION_AUDIT
+    if len(_STAGE_TRANSACTION_AUDIT) < _stage_guard_env_int("STAGE_GUARD_AUDIT_MAX_RECORDS", 4000):
+        _STAGE_TRANSACTION_AUDIT.append(_stage_guard_jsonable(dict(item)))
 
 
-def _v46_41_trusted_torch_load(path, map_location=None):
+def _stage_guard_torch_load(path, map_location=None):
     if torch is None:
         raise RuntimeError("PyTorch is required")
-    if "_v46_trusted_torch_load" in globals():
-        return _v46_trusted_torch_load(path, map_location=map_location)
+    if "_trusted_torch_load" in globals():
+        return _trusted_torch_load(path, map_location=map_location)
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
 
 
-def _v46_41_build_stage_prior_xz(motion, target_durations=None, cfg=None):
+def _build_stage_prior_xz(motion, target_durations=None, cfg=None):
     """Build a low-frequency root-XZ anchor prior from the retrieved motion.
 
     The prior is conservative: it keeps the macro route but pulls it back into a
@@ -7527,17 +7543,17 @@ def _v46_41_build_stage_prior_xz(motion, target_durations=None, cfg=None):
     center = np.median(xz, axis=0, keepdims=True).astype(np.float32)
     rel = xz - center
     if ndi is not None:
-        sigma = max(8.0, T / max(8.0, _v46_41_env_float("V46_41_MSA_SMOOTH_DIV", 72.0)))
+        sigma = max(8.0, T / max(8.0, _stage_guard_env_float("STAGE_GUARD_MSA_SMOOTH_DIV", 72.0)))
         rel_s = ndi.gaussian_filter1d(rel, sigma=float(sigma), axis=0, mode="nearest")
     else:
         rel_s = rel
-    radius = _v46_41_env_float("V46_41_STAGE_RADIUS_M", 1.80)
+    radius = _stage_guard_env_float("STAGE_GUARD_RADIUS_M", 1.80)
     norm = np.linalg.norm(rel_s, axis=1, keepdims=True)
     rel_clamped = rel_s * np.minimum(1.0, radius / np.maximum(norm, 1e-6))
     prior = (center + rel_clamped).astype(np.float32)
     meta = {
         "enabled": True,
-        "version": "v46_41_macroscopic_stage_anchoring",
+        "version": "stage_guard_macroscopic_stage_anchoring",
         "stage_radius_m": float(radius),
         "prior_root_xz_range_before": (xz.max(axis=0) - xz.min(axis=0)).tolist(),
         "prior_root_xz_range_after": (prior.max(axis=0) - prior.min(axis=0)).tolist(),
@@ -7549,20 +7565,20 @@ def _v46_41_build_stage_prior_xz(motion, target_durations=None, cfg=None):
 
 
 def concat_events(event_paths, target_durations, cfg):
-    global _V46_41_STAGE_PRIOR_XZ, _V46_41_STAGE_PRIOR_META
-    motion, rep = _v46_41_orig_concat_events(event_paths, target_durations, cfg)
-    if _v46_41_env_bool("V46_41_MSA_ENABLE", True):
-        _V46_41_STAGE_PRIOR_XZ, _V46_41_STAGE_PRIOR_META = _v46_41_build_stage_prior_xz(motion, target_durations, cfg)
-        motion2, meta = _v46_41_apply_stage_prior(motion, cfg, strength=_v46_41_env_float("V46_41_MSA_REFERENCE_STRENGTH", 0.10))
-        _V46_41_STAGE_PRIOR_META.update(meta)
+    global _STAGE_PRIOR_XZ, _STAGE_PRIOR_METADATA
+    motion, rep = _stage_guard_orig_concat_events(event_paths, target_durations, cfg)
+    if _stage_guard_env_bool("STAGE_GUARD_MSA_ENABLE", True):
+        _STAGE_PRIOR_XZ, _STAGE_PRIOR_METADATA = _build_stage_prior_xz(motion, target_durations, cfg)
+        motion2, meta = _apply_guarded_stage_prior(motion, cfg, strength=_stage_guard_env_float("STAGE_GUARD_MSA_REFERENCE_STRENGTH", 0.10))
+        _STAGE_PRIOR_METADATA.update(meta)
         if isinstance(rep, list) and rep:
-            rep[-1].setdefault("v46_41_macroscopic_stage_anchor", _V46_41_STAGE_PRIOR_META)
-        _v46_41_add_token({"mechanism": "MSA", "stage": "concat", "commit_state": "anchor_applied", "meta": _V46_41_STAGE_PRIOR_META})
+            rep[-1].setdefault("stage_guard_macroscopic_stage_anchor", _STAGE_PRIOR_METADATA)
+        _append_stage_transaction_audit({"mechanism": "MSA", "stage": "concat", "commit_state": "anchor_applied", "meta": _STAGE_PRIOR_METADATA})
         return motion2.astype(np.float32), rep
     return motion, rep
 
 
-def _v46_41_kinematic_stats(motion, cfg):
+def _kinematic_stability_metrics(motion, cfg):
     """Return KBO statistics using the same true frame-joint SI metrics as final audit."""
     m = np.asarray(motion, dtype=np.float32)
     stats = {"finite": bool(np.isfinite(m).all()), "shape": list(m.shape)}
@@ -7620,7 +7636,7 @@ def _v46_41_kinematic_stats(motion, cfg):
 
 
 
-def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
+def _kinematic_barrier_oracle(candidate, reference, cfg, stage="stage", global_start=0):
     """Kinematic barrier oracle aligned with the final SI physical gate."""
     cand = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
@@ -7630,8 +7646,8 @@ def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
             "reference_shape": list(ref.shape),
         }
 
-    candidate_stats = _v46_41_kinematic_stats(cand, cfg)
-    reference_stats = _v46_41_kinematic_stats(ref, cfg)
+    candidate_stats = _kinematic_stability_metrics(cand, cfg)
+    reference_stats = _kinematic_stability_metrics(ref, cfg)
     reasons = []
 
     if not candidate_stats.get("finite", False) or not candidate_stats.get(
@@ -7639,7 +7655,7 @@ def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
     ):
         reasons.append("nan_or_inf_or_fk_invalid")
 
-    if float(candidate_stats.get("bone_length_violation_max_m", 0.0)) > _v46_41_env_float(
+    if float(candidate_stats.get("bone_length_violation_max_m", 0.0)) > _stage_guard_env_float(
         "PHYSICAL_STAGE_BONE_LENGTH_EPS_M", 0.02
     ):
         reasons.append("bone_length_violation")
@@ -7647,10 +7663,10 @@ def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
     if abs(
         float(candidate_stats.get("floor_y", 0.0))
         - float(reference_stats.get("floor_y", 0.0))
-    ) > _v46_41_env_float("PHYSICAL_STAGE_FLOOR_SHIFT_MAX_M", 1.50):
+    ) > _stage_guard_env_float("PHYSICAL_STAGE_FLOOR_SHIFT_MAX_M", 1.50):
         reasons.append("floor_shift_exceeded")
 
-    if float(candidate_stats.get("joint_acceleration_mps2_max", 0.0)) > _v46_41_env_float(
+    if float(candidate_stats.get("joint_acceleration_mps2_max", 0.0)) > _stage_guard_env_float(
         "PHYSICAL_STAGE_ACCELERATION_MAX_MPS2", 2700.0
     ):
         reasons.append("acceleration_spike")
@@ -7680,10 +7696,10 @@ def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
 
     reasons.extend(decision["reasons"])
 
-    if _v46_41_env_bool("V46_41_KBO_STAGE_ANCHOR_ENABLE", True):
-        anchor_error = _v46_41_anchor_error(cand, global_start)
-        if anchor_error > _v46_41_env_float(
-            "V46_41_KBO_ANCHOR_P95_MAX_M", 0.85
+    if _stage_guard_env_bool("STAGE_GUARD_KBO_STAGE_ANCHOR_ENABLE", True):
+        anchor_error = _stage_anchor_error(cand, global_start)
+        if anchor_error > _stage_guard_env_float(
+            "STAGE_GUARD_KBO_ANCHOR_P95_MAX_M", 0.85
         ):
             reasons.append("stage_anchor_deviation")
         candidate_stats["stage_anchor_error_p95_m"] = anchor_error
@@ -7699,10 +7715,10 @@ def _v46_41_kbo(candidate, reference, cfg, stage="stage", global_start=0):
     return len(reasons) == 0, reasons, detail
 
 
-def _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected, accepted, reasons, global_span):
-    if not _v46_41_env_bool("V46_41_HN_DPO_SAVE_PAIRS", True):
+def _save_hard_negative_pair(stage, tx_id, snapshot, rejected, accepted, reasons, global_span):
+    if not _stage_guard_env_bool("STAGE_GUARD_HN_DPO_SAVE_PAIRS", True):
         return {}
-    root = Path(os.environ.get("V46_41_HN_DPO_DIR", "output/v46_41_hn_dpo_pairs"))
+    root = Path(os.environ.get("STAGE_GUARD_HN_DPO_DIR", "output/stage_guard_hn_dpo_pairs"))
     root.mkdir(parents=True, exist_ok=True)
     tag = f"{stage}_tx{int(tx_id):04d}_{int(time.time()*1000)}"
     snap_p = root / f"{tag}_snapshot.npy"
@@ -7713,7 +7729,7 @@ def _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected, accepted, reasons, gl
     np.save(acc_p, np.asarray(accepted, dtype=np.float32))
     meta = {"stage": stage, "transaction_id": int(tx_id), "span": list(map(int, global_span)), "snapshot": str(snap_p), "rejected": str(rej_p), "accepted": str(acc_p), "reasons": list(map(str, reasons))}
     with open(root / "pairs.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(_v46_41_jsonable(meta), ensure_ascii=False) + "\n")
+        f.write(json.dumps(_stage_guard_jsonable(meta), ensure_ascii=False) + "\n")
     return meta
 
 
@@ -7721,17 +7737,17 @@ def _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected, accepted, reasons, gl
 
 
 
-def _v46_41_regions(seam_mask, T):
+def _repair_regions(seam_mask, T):
     sm = np.asarray(seam_mask, dtype=np.float32)
     if sm.ndim == 1:
         sm = sm[:, None]
-    active = sm[:, 0] > _v46_41_env_float("V46_41_TGT_ACTIVE_THRESHOLD", 0.05)
+    active = sm[:, 0] > _stage_guard_env_float("STAGE_GUARD_TGT_ACTIVE_THRESHOLD", 0.05)
     raw = contiguous_regions(active)
     if not raw:
         return []
-    halo = _v46_41_env_int("V46_41_TGT_HALO", 12)
-    min_len = _v46_41_env_int("V46_41_TGT_MIN_FRAMES", 16)
-    max_len = _v46_41_env_int("V46_41_TGT_MAX_FRAMES", 96)
+    halo = _stage_guard_env_int("STAGE_GUARD_TGT_HALO", 12)
+    min_len = _stage_guard_env_int("STAGE_GUARD_TGT_MIN_FRAMES", 16)
+    max_len = _stage_guard_env_int("STAGE_GUARD_TGT_MAX_FRAMES", 96)
     out = []
     for a, b in raw:
         a = max(0, int(a) - halo); b = min(int(T), int(b) + halo)
@@ -7756,25 +7772,27 @@ def _v46_41_regions(seam_mask, T):
 
 
 
-def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cfg):
+def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cfg):
     preserve_neural_contacts = False
     if torch is not None and ckpt_path and Path(ckpt_path).exists():
         try:
-            checkpoint_meta = _v46_41_trusted_torch_load(
+            checkpoint_meta = _stage_guard_torch_load(
                 ckpt_path, map_location="cpu"
             )
-            checkpoint_version = str(checkpoint_meta.get("version", ""))
+            checkpoint_version = normalize_motion_checkpoint_version(
+                checkpoint_meta.get("version", "")
+            )
             preserve_neural_contacts = bool(
                 (
                     stage == "refiner"
                     and checkpoint_version.startswith(
-                        "v45_product_manifold_79d"
+                        "product_manifold_boundary_refiner"
                     )
                 )
                 or (
                     stage == "diffusion"
                     and checkpoint_version.startswith(
-                        "v46_reference_tangent_diffusion_79d"
+                        "reference_tangent_motion_diffusion"
                     )
                 )
             )
@@ -7783,9 +7801,9 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
             # The actual model loader below remains the authority and will
             # surface invalid checkpoints; this metadata probe is optional.
             preserve_neural_contacts = False
-    if not _v46_41_env_bool("V46_41_TGT_ENABLE", True):
+    if not _stage_guard_env_bool("STAGE_GUARD_TGT_ENABLE", True):
         cand = orig_func(motion, cond, seam_mask, ckpt_path, cfg)
-        return _v46_41_safe_residual(
+        return _bounded_residual_update(
             cand,
             motion,
             seam_mask,
@@ -7796,9 +7814,9 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
         )
     ref_all = np.asarray(motion, dtype=np.float32)
     out = ref_all.copy().astype(np.float32)
-    regions = _v46_41_regions(seam_mask, ref_all.shape[0])
+    regions = _repair_regions(seam_mask, ref_all.shape[0])
     if not regions:
-        _v46_41_add_token({"mechanism": "TGT", "stage": stage, "event": "no_transaction_regions", "commit_state": "return_reference"})
+        _append_stage_transaction_audit({"mechanism": "TGT", "stage": stage, "event": "no_transaction_regions", "commit_state": "return_reference"})
         return out.astype(np.float32)
     for tx_id, (a, b) in enumerate(regions):
         snapshot = out[a:b].copy().astype(np.float32)
@@ -7806,12 +7824,12 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
         token = {"mechanism": "TGT+KBO", "stage": stage, "temporal_transaction_id": int(tx_id), "atomic_window": [int(a), int(b)], "frames": int(b-a), "commit_state": "pending"}
         rejected_candidate = None
         try:
-            if stage == "diffusion" and _v46_41_env_bool("V46_41_DIFFUSION_EARLY_ABORT_ENABLE", True):
-                cand = _v46_41_diffusion_window_proposal(snapshot.copy(), cond, sm_win, ckpt_path, cfg, global_start=a)
+            if stage == "diffusion" and _stage_guard_env_bool("STAGE_GUARD_DIFFUSION_EARLY_ABORT_ENABLE", True):
+                cand = _diffusion_window_proposal(snapshot.copy(), cond, sm_win, ckpt_path, cfg, global_start=a)
             else:
                 cand = orig_func(snapshot.copy(), cond, sm_win, ckpt_path, cfg)
             rejected_candidate = np.asarray(cand, dtype=np.float32)
-            cand = _v46_41_safe_residual(
+            cand = _bounded_residual_update(
                 cand,
                 snapshot,
                 sm_win,
@@ -7820,7 +7838,7 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
                 global_start=a,
                 preserve_contacts=preserve_neural_contacts,
             )
-            ok, reasons, detail = _v46_41_kbo(cand, snapshot, cfg, stage=f"{stage}_neural_commit", global_start=a)
+            ok, reasons, detail = _kinematic_barrier_oracle(cand, snapshot, cfg, stage=f"{stage}_neural_commit", global_start=a)
             if ok:
                 out[a:b] = cand.astype(np.float32)
                 token.update({"commit_state": "committed", "fallback_level": "neural_bounded_commit", "kbo_status": "pass", "hard_negative": False})
@@ -7829,54 +7847,54 @@ def _v46_41_apply_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cf
                 raise RuntimeError("kbo_reject:" + ",".join(reasons))
         except Exception as exc:
             token["neural_exception"] = str(exc)[:500]
-            fb, fb_report = _v46_41_deterministic_bridge(snapshot, sm_win, cfg, stage=stage, global_start=a)
+            fb, fb_report = _deterministic_repair_bridge(snapshot, sm_win, cfg, stage=stage, global_start=a)
             if fb_report.get("committed"):
                 out[a:b] = fb.astype(np.float32)
                 token.update({"commit_state": "committed", "fallback_level": "deterministic_root_rotation_prior", "kbo_status": "fallback_pass", "fallback_report": fb_report, "hard_negative": True})
                 if rejected_candidate is not None:
-                    token["hn_dpo_pair"] = _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected_candidate, fb, token.get("barrier_violations", [str(exc)]), [a, b])
+                    token["hn_dpo_pair"] = _save_hard_negative_pair(stage, tx_id, snapshot, rejected_candidate, fb, token.get("barrier_violations", [str(exc)]), [a, b])
             else:
                 out[a:b] = snapshot.astype(np.float32)
                 token.update({"commit_state": "rolled_back", "fallback_level": "snapshot_rollback", "kbo_status": "fallback_fail", "fallback_report": fb_report, "hard_negative": True})
                 if rejected_candidate is not None:
-                    token["hn_dpo_pair"] = _v46_41_save_hn_pair(stage, tx_id, snapshot, rejected_candidate, snapshot, token.get("barrier_violations", [str(exc)]), [a, b])
-        _v46_41_add_token(token)
+                    token["hn_dpo_pair"] = _save_hard_negative_pair(stage, tx_id, snapshot, rejected_candidate, snapshot, token.get("barrier_violations", [str(exc)]), [a, b])
+        _append_stage_transaction_audit(token)
     out, _ = enforce_edge151_contract_np(
         out,
         cfg,
-        source_hint=f"v46_41_tgt_final:{stage}",
+        source_hint=f"stage_guard_tgt_final:{stage}",
         derive_contact=not preserve_neural_contacts,
         project_rot=True,
     )
-    out, _ = _v46_41_apply_stage_prior(
+    out, _ = _apply_guarded_stage_prior(
         out,
         cfg,
-        strength=_v46_41_env_float(
-            "V46_41_MSA_STAGE_FINAL_STRENGTH", 0.08
+        strength=_stage_guard_env_float(
+            "STAGE_GUARD_MSA_STAGE_FINAL_STRENGTH", 0.08
         ),
         preserve_contacts=preserve_neural_contacts,
     )
-    ok, reasons, detail = _v46_41_kbo(out, ref_all, cfg, stage=f"{stage}_whole_stage_guard", global_start=0)
+    ok, reasons, detail = _kinematic_barrier_oracle(out, ref_all, cfg, stage=f"{stage}_whole_stage_guard", global_start=0)
     if not ok:
-        _v46_41_add_token({"mechanism": "KBO", "stage": stage, "event": "whole_stage_rollback", "commit_state": "rolled_back", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
+        _append_stage_transaction_audit({"mechanism": "KBO", "stage": stage, "event": "whole_stage_rollback", "commit_state": "rolled_back", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
         return ref_all.astype(np.float32)
     return out.astype(np.float32)
 
 
 def apply_refiner_model(motion, cond, seam_mask, ckpt_path, cfg):
-    return _v46_41_apply_stage("refiner", _v46_41_orig_apply_refiner_model, motion, cond, seam_mask, ckpt_path, cfg)
+    return _apply_guarded_stage("refiner", _stage_guard_orig_apply_refiner_model, motion, cond, seam_mask, ckpt_path, cfg)
 
 
 def apply_diffusion_model(motion, cond, seam_mask, ckpt_path, cfg):
-    return _v46_41_apply_stage("diffusion", _v46_41_orig_apply_diffusion_model, motion, cond, seam_mask, ckpt_path, cfg)
+    return _apply_guarded_stage("diffusion", _stage_guard_orig_apply_diffusion_model, motion, cond, seam_mask, ckpt_path, cfg)
 
 
 def true_lower_body_ik(motion, cfg):
-    if not _v46_41_env_bool("V46_41_IK_TGT_ENABLE", True):
-        return _v46_41_orig_true_lower_body_ik(motion, cfg)
+    if not _stage_guard_env_bool("STAGE_GUARD_IK_TGT_ENABLE", True):
+        return _stage_guard_orig_true_lower_body_ik(motion, cfg)
     snapshot = np.asarray(motion, dtype=np.float32).copy()
     try:
-        out, report = _v46_41_orig_true_lower_body_ik(snapshot.copy(), cfg)
+        out, report = _stage_guard_orig_true_lower_body_ik(snapshot.copy(), cfg)
         local_transactions = dict(report.get("local_transactions", {}))
         local_mode = str(
             report.get("rollback_policy", {}).get("mode", "")
@@ -7885,19 +7903,19 @@ def true_lower_body_ik(motion, cfg):
         # derivative halos.  A second whole-song stage prior would modify
         # frames outside those audited ownership windows.
         if not local_mode:
-            out, _ = _v46_41_apply_stage_prior(
+            out, _ = _apply_guarded_stage_prior(
                 out,
                 cfg,
-                strength=_v46_41_env_float(
-                    "V46_41_MSA_IK_STRENGTH", 0.04
+                strength=_stage_guard_env_float(
+                    "STAGE_GUARD_MSA_IK_STRENGTH", 0.04
                 ),
             )
-        ok, reasons, detail = _v46_41_kbo(out, snapshot, cfg, stage="ik_final", global_start=0)
+        ok, reasons, detail = _kinematic_barrier_oracle(out, snapshot, cfg, stage="ik_final", global_start=0)
         if ok:
-            _v46_41_add_token({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "committed", "fallback_level": "ik_commit", "kbo_status": "pass", "frames": int(snapshot.shape[0])})
+            _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "committed", "fallback_level": "ik_commit", "kbo_status": "pass", "frames": int(snapshot.shape[0])})
             return out.astype(np.float32), report
         if local_mode and int(local_transactions.get("accepted", 0)) > 0:
-            _v46_41_add_token(
+            _append_stage_transaction_audit(
                 {
                     "mechanism": "IK_TGT",
                     "stage": "ik",
@@ -7910,7 +7928,7 @@ def true_lower_body_ik(motion, cfg):
                 }
             )
             report = dict(report)
-            report["v46_41_global_kbo_after_local_transactions"] = {
+            report["stage_guard_global_kbo_after_local_transactions"] = {
                 "ok": False,
                 "reasons": reasons,
                 "detail": detail,
@@ -7920,21 +7938,21 @@ def true_lower_body_ik(motion, cfg):
                 ),
             }
             return out.astype(np.float32), report
-        _v46_41_add_token({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "fk_snapshot_rollback", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
+        _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "fk_snapshot_rollback", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
         try:
             report = dict(report)
-            report["v46_41_ik_rollback_to_fk"] = True
-            report["v46_41_rollback_reasons"] = reasons
+            report["stage_guard_ik_rollback_to_fk"] = True
+            report["stage_guard_rollback_reasons"] = reasons
         except Exception:
             pass
         return snapshot.astype(np.float32), report
     except Exception as exc:
-        _v46_41_add_token({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "ik_exception_to_fk", "exception": str(exc)[:500], "hard_negative": True})
-        return snapshot.astype(np.float32), {"enabled": True, "v46_41_ik_exception_to_fk": True, "exception": str(exc)[:500]}
+        _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "ik_exception_to_fk", "exception": str(exc)[:500], "hard_negative": True})
+        return snapshot.astype(np.float32), {"enabled": True, "stage_guard_ik_exception_to_fk": True, "exception": str(exc)[:500]}
 
 
-def _v46_41_summary(records):
-    out = {"version": "v46_41_stage_anchored_guided_tgt_kbo", "num_records": int(len(records)), "by_stage": {}, "fallback_counts": {}, "hard_negatives": 0}
+def _summarize_stage_transactions(records):
+    out = {"version": "stage_guard_stage_anchored_guided_tgt_kbo", "num_records": int(len(records)), "by_stage": {}, "fallback_counts": {}, "hard_negatives": 0}
     for r in records:
         st = str(r.get("stage", "unknown"))
         out["by_stage"].setdefault(st, {"records": 0, "committed": 0, "rolled_back": 0})
@@ -7948,73 +7966,73 @@ def _v46_41_summary(records):
         out["fallback_counts"][fb] = out["fallback_counts"].get(fb, 0) + 1
         if bool(r.get("hard_negative", False)):
             out["hard_negatives"] += 1
-    out["stage_anchor"] = _v46_41_jsonable(_V46_41_STAGE_PRIOR_META)
+    out["stage_anchor"] = _stage_guard_jsonable(_STAGE_PRIOR_METADATA)
     return out
 
 
 def generate(args):
-    _v46_41_reset_audit()
-    rc = int(_v46_41_orig_generate(args))
+    _reset_stage_transaction_audit()
+    rc = int(_stage_guard_orig_generate(args))
     try:
         out_path = Path(args.out)
-        json_path = Path(args.json or str(out_path).replace(".npy", ".v46_33_report.json"))
+        json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
         if json_path.exists():
             with open(json_path, "r", encoding="utf-8") as f:
                 report = json.load(f)
-            report.setdefault("stage_reports", {})["v46_41_temporal_generative_transactions"] = _V46_41_AUDIT_TOKENS
-            report["v46_41_tgt_kbo_summary"] = _v46_41_summary(_V46_41_AUDIT_TOKENS)
-            report["v46_41_scientific_mechanism"] = {
+            report.setdefault("stage_reports", {})["stage_guard_temporal_generative_transactions"] = _STAGE_TRANSACTION_AUDIT
+            report["stage_guard_tgt_kbo_summary"] = _summarize_stage_transactions(_STAGE_TRANSACTION_AUDIT)
+            report["stage_guard_scientific_mechanism"] = {
                 "name": "Stage-Anchored KBO-guided Temporal Generative Transactions",
                 "problem": "long-horizon covariate shift and topological fragility",
                 "mechanisms": ["Macroscopic Stage Anchoring", "Temporal Generative Transactions", "Kinematic Barrier Oracle", "Confidence-aware Cascaded Degradation", "Diffusion Early-Abort", "Hard-negative Audit Tokens"],
             }
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(_v46_41_jsonable(report), f, ensure_ascii=False, indent=2)
-            print(json.dumps({"v46_41_tgt_kbo_summary": report["v46_41_tgt_kbo_summary"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
+                json.dump(_stage_guard_jsonable(report), f, ensure_ascii=False, indent=2)
+            print(json.dumps({"stage_guard_tgt_kbo_summary": report["stage_guard_tgt_kbo_summary"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"[V46.41 WARN] failed to append audit tokens: {exc}", file=sys.stderr)
+        print(f"[Stage Guard WARN] failed to append audit tokens: {exc}", file=sys.stderr)
     return rc
-# ===== V46.41 STAGE-ANCHORED GUIDED TGT PATCH END =====
+# ===== Stage Guard STAGE-ANCHORED GUIDED TGT PATCH END =====
 
 
 
-# ===== V46.42 STABILITY ALIGNMENT PATCH START =====
-# Fixes for V46.41 scientific loopholes:
+# ===== Energy Stability STABILITY ALIGNMENT PATCH START =====
+# Fixes for Stage Guard scientific loopholes:
 # 1) Tweedie jitter false positives: early-abort probe is low-pass filtered and
 #    checked with relaxed early thresholds.
 # 2) Rubber-band MSA: stage-anchor strength is modulated by MSSD energy/role and
 #    local root velocity; high-energy leaps are not over-constrained.
-# 3) Audit exposes V46.42 policy; kinetic HN-DPO is implemented in the separate
-#    v46_42_train_hn_dpo_diffusion.py tool.
+# 3) Audit exposes Energy Stability policy; kinetic HN-DPO is implemented in the separate
+#    energy_stability_train_hn_dpo_diffusion.py tool.
 
-_v46_42_orig_generate = generate
+_energy_stability_orig_generate = generate
 
-_V46_42_FRAME_MSA_WEIGHT = None
-_V46_42_MSSD_WEIGHT_META = {}
+_FRAME_STAGE_ANCHOR_WEIGHT = None
+_STAGE_WEIGHT_METADATA = {}
 
 
-def _v46_42_env_bool(name, default=True):
+def _energy_gate_env_bool(name, default=True):
     try:
         return bool(int(os.environ.get(name, "1" if default else "0")))
     except Exception:
         return bool(default)
 
 
-def _v46_42_env_float(name, default):
+def _energy_gate_env_float(name, default):
     try:
         return float(os.environ.get(name, str(default)))
     except Exception:
         return float(default)
 
 
-def _v46_42_env_int(name, default):
+def _energy_gate_env_int(name, default):
     try:
         return int(float(os.environ.get(name, str(default))))
     except Exception:
         return int(default)
 
 
-def _v46_42_slot_energy_weight(slot):
+def _slot_energy_weight(slot):
     """Return anchor weight in [min,max]; lower weight means freer movement."""
     label = " ".join([
         str(slot.get("music_event", "")),
@@ -8030,32 +8048,32 @@ def _v46_42_slot_energy_weight(slot):
     energy = float(slot.get("energy", slot.get("boundary_accent_strength", 0.0)) or 0.0)
     tension = float(slot.get("tension", 0.0) or 0.0)
     speed = float(slot.get("music_speed_factor", 1.0) or 1.0)
-    w = _v46_42_env_float("V46_42_MSA_CALM_WEIGHT", 1.0)
+    w = _energy_gate_env_float("ENERGY_STABILITY_MSA_CALM_WEIGHT", 1.0)
     if any(x in label for x in high_words):
-        w *= _v46_42_env_float("V46_42_MSA_HIGH_ENERGY_SCALE", 0.22)
+        w *= _energy_gate_env_float("ENERGY_STABILITY_MSA_HIGH_ENERGY_SCALE", 0.22)
     elif any(x in label for x in calm_words):
-        w *= _v46_42_env_float("V46_42_MSA_CALM_SCALE", 1.00)
+        w *= _energy_gate_env_float("ENERGY_STABILITY_MSA_CALM_SCALE", 1.00)
     # Continuous attenuation from music dynamics.
     dyn = max(0.0, min(1.0, 0.60 * energy + 0.30 * tension + 0.10 * max(0.0, speed - 1.0)))
-    w *= (1.0 - dyn * _v46_42_env_float("V46_42_MSA_DYNAMIC_ATTENUATION", 0.75))
-    return float(np.clip(w, _v46_42_env_float("V46_42_MSA_MIN_WEIGHT", 0.05), _v46_42_env_float("V46_42_MSA_MAX_WEIGHT", 1.0)))
+    w *= (1.0 - dyn * _energy_gate_env_float("ENERGY_STABILITY_MSA_DYNAMIC_ATTENUATION", 0.75))
+    return float(np.clip(w, _energy_gate_env_float("ENERGY_STABILITY_MSA_MIN_WEIGHT", 0.05), _energy_gate_env_float("ENERGY_STABILITY_MSA_MAX_WEIGHT", 1.0)))
 
 
-def _v46_42_load_mssd_stage_weights(slots_json, total_frames_hint=0):
-    global _V46_42_FRAME_MSA_WEIGHT, _V46_42_MSSD_WEIGHT_META
-    _V46_42_FRAME_MSA_WEIGHT = None
-    _V46_42_MSSD_WEIGHT_META = {"enabled": False, "reason": "no_slots_json"}
+def _load_stage_anchor_weights(slots_json, total_frames_hint=0):
+    global _FRAME_STAGE_ANCHOR_WEIGHT, _STAGE_WEIGHT_METADATA
+    _FRAME_STAGE_ANCHOR_WEIGHT = None
+    _STAGE_WEIGHT_METADATA = {"enabled": False, "reason": "no_slots_json"}
     if not slots_json:
         return
     try:
         p = Path(slots_json)
         if not p.exists():
-            _V46_42_MSSD_WEIGHT_META = {"enabled": False, "reason": f"missing:{slots_json}"}
+            _STAGE_WEIGHT_METADATA = {"enabled": False, "reason": f"missing:{slots_json}"}
             return
         obj = json.load(open(p, "r", encoding="utf-8"))
         slots = obj.get("slots", []) if isinstance(obj, dict) else []
         if not isinstance(slots, list) or not slots:
-            _V46_42_MSSD_WEIGHT_META = {"enabled": False, "reason": "no_slots"}
+            _STAGE_WEIGHT_METADATA = {"enabled": False, "reason": "no_slots"}
             return
         total = int(obj.get("total_target_frames", 0) or 0)
         if total <= 0:
@@ -8063,7 +8081,7 @@ def _v46_42_load_mssd_stage_weights(slots_json, total_frames_hint=0):
         if total <= 0:
             total = int(total_frames_hint or 0)
         if total <= 0:
-            _V46_42_MSSD_WEIGHT_META = {"enabled": False, "reason": "invalid_total_frames"}
+            _STAGE_WEIGHT_METADATA = {"enabled": False, "reason": "invalid_total_frames"}
             return
         w = np.ones((total,), dtype=np.float32)
         hist = {}
@@ -8073,53 +8091,53 @@ def _v46_42_load_mssd_stage_weights(slots_json, total_frames_hint=0):
             if b <= a:
                 b = a + int(s.get("target_frames", 1) or 1)
             a = max(0, min(total, a)); b = max(a, min(total, b))
-            sw = _v46_42_slot_energy_weight(s)
+            sw = _slot_energy_weight(s)
             if b > a:
                 w[a:b] = sw
             key = str(s.get("music_semantic_top_label", s.get("music_event", "unknown")))
             hist[key] = hist.get(key, 0) + 1
         if ndi is not None and len(w) > 7:
-            w = ndi.gaussian_filter1d(w, sigma=float(_v46_42_env_float("V46_42_MSA_WEIGHT_SMOOTH_SIGMA", 3.0)), mode="nearest").astype(np.float32)
-        _V46_42_FRAME_MSA_WEIGHT = np.clip(w, _v46_42_env_float("V46_42_MSA_MIN_WEIGHT", 0.05), 1.0).astype(np.float32)
-        _V46_42_MSSD_WEIGHT_META = {
+            w = ndi.gaussian_filter1d(w, sigma=float(_energy_gate_env_float("ENERGY_STABILITY_MSA_WEIGHT_SMOOTH_SIGMA", 3.0)), mode="nearest").astype(np.float32)
+        _FRAME_STAGE_ANCHOR_WEIGHT = np.clip(w, _energy_gate_env_float("ENERGY_STABILITY_MSA_MIN_WEIGHT", 0.05), 1.0).astype(np.float32)
+        _STAGE_WEIGHT_METADATA = {
             "enabled": True,
             "source": str(p),
             "total_frames": int(total),
-            "min": float(np.min(_V46_42_FRAME_MSA_WEIGHT)),
-            "mean": float(np.mean(_V46_42_FRAME_MSA_WEIGHT)),
-            "p95": float(np.percentile(_V46_42_FRAME_MSA_WEIGHT, 95)),
+            "min": float(np.min(_FRAME_STAGE_ANCHOR_WEIGHT)),
+            "mean": float(np.mean(_FRAME_STAGE_ANCHOR_WEIGHT)),
+            "p95": float(np.percentile(_FRAME_STAGE_ANCHOR_WEIGHT, 95)),
             "semantic_histogram": hist,
             "interpretation": "lower weights indicate high-energy/climax windows where MSA is relaxed",
         }
     except Exception as exc:
-        _V46_42_FRAME_MSA_WEIGHT = None
-        _V46_42_MSSD_WEIGHT_META = {"enabled": False, "reason": str(exc)}
+        _FRAME_STAGE_ANCHOR_WEIGHT = None
+        _STAGE_WEIGHT_METADATA = {"enabled": False, "reason": str(exc)}
 
 
-def _v46_42_frame_weights(T, global_start=0):
-    if _V46_42_FRAME_MSA_WEIGHT is None or T <= 0:
+def _frame_stage_weights(T, global_start=0):
+    if _FRAME_STAGE_ANCHOR_WEIGHT is None or T <= 0:
         return np.ones((int(T), 1), dtype=np.float32)
     a = int(global_start)
     b = a + int(T)
-    if a < 0 or b > len(_V46_42_FRAME_MSA_WEIGHT):
+    if a < 0 or b > len(_FRAME_STAGE_ANCHOR_WEIGHT):
         # Defensive resize for rare report/motion length drifts.
-        idx = np.linspace(0, len(_V46_42_FRAME_MSA_WEIGHT) - 1, int(T)).clip(0, len(_V46_42_FRAME_MSA_WEIGHT) - 1).astype(int)
-        return _V46_42_FRAME_MSA_WEIGHT[idx, None].astype(np.float32)
-    return _V46_42_FRAME_MSA_WEIGHT[a:b, None].astype(np.float32)
+        idx = np.linspace(0, len(_FRAME_STAGE_ANCHOR_WEIGHT) - 1, int(T)).clip(0, len(_FRAME_STAGE_ANCHOR_WEIGHT) - 1).astype(int)
+        return _FRAME_STAGE_ANCHOR_WEIGHT[idx, None].astype(np.float32)
+    return _FRAME_STAGE_ANCHOR_WEIGHT[a:b, None].astype(np.float32)
 
 
-def _v46_42_velocity_gate(motion):
+def _root_velocity_gate(motion):
     m = np.asarray(motion, dtype=np.float32)
     if m.shape[0] < 3:
         return np.ones((m.shape[0], 1), dtype=np.float32)
     v = np.linalg.norm(np.diff(m[:, [ROOT_X_IDX, ROOT_Z_IDX]], axis=0), axis=-1)
     v = np.concatenate([[v[0]], v]).astype(np.float32)
-    thr = _v46_42_env_float("V46_42_MSA_ROOT_SPEED_RELAX_THRESH", 0.045)
+    thr = _energy_gate_env_float("ENERGY_STABILITY_MSA_ROOT_SPEED_RELAX_THRESH", 0.045)
     if thr <= 0:
         return np.ones((m.shape[0], 1), dtype=np.float32)
     # High root speed means possible leap/large travel; attenuate anchor.
     g = 1.0 / (1.0 + (v / max(thr, 1e-6)) ** 2)
-    g = np.clip(g, _v46_42_env_float("V46_42_MSA_VELOCITY_MIN_GATE", 0.12), 1.0)
+    g = np.clip(g, _energy_gate_env_float("ENERGY_STABILITY_MSA_VELOCITY_MIN_GATE", 0.12), 1.0)
     if ndi is not None and len(g) > 7:
         g = ndi.gaussian_filter1d(g, sigma=2.0, mode="nearest")
     return g[:, None].astype(np.float32)
@@ -8129,14 +8147,14 @@ def _v46_42_velocity_gate(motion):
 
 
 
-def _v46_42_jsonable(x):
+def _energy_gate_jsonable(x):
     try:
-        return _v46_41_jsonable(x)
+        return _stage_guard_jsonable(x)
     except Exception:
         if isinstance(x, dict):
-            return {str(k): _v46_42_jsonable(v) for k, v in x.items()}
+            return {str(k): _energy_gate_jsonable(v) for k, v in x.items()}
         if isinstance(x, (list, tuple)):
-            return [_v46_42_jsonable(v) for v in x]
+            return [_energy_gate_jsonable(v) for v in x]
         if isinstance(x, np.ndarray):
             return x.tolist()
         if isinstance(x, np.generic):
@@ -8144,7 +8162,7 @@ def _v46_42_jsonable(x):
         return x if isinstance(x, (str, int, float, bool)) or x is None else str(x)
 
 
-def _v46_42_lowpass_motion_for_kbo(motion, cfg, sigma=None):
+def _lowpass_motion_for_barrier_oracle(motion, cfg, sigma=None):
     """Low-pass a Tweedie/intermediate probe before high-order KBO.
 
     This prevents high-frequency residual noise from creating false positive jerk
@@ -8153,17 +8171,17 @@ def _v46_42_lowpass_motion_for_kbo(motion, cfg, sigma=None):
     """
     m = np.asarray(motion, dtype=np.float32).copy()
     if sigma is None:
-        sigma = _v46_42_env_float("V46_42_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35)
+        sigma = _energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35)
     if ndi is not None and m.shape[0] > 5 and float(sigma) > 0:
         idx = [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX] + list(range(ROT6D_START, ROT6D_END))
         m[:, idx] = ndi.gaussian_filter1d(m[:, idx], sigma=float(sigma), axis=0, mode="nearest")
-    m, _ = enforce_edge151_contract_np(m, cfg, source_hint="v46_42_lowpass_tweedie_probe", derive_contact=True, project_rot=True)
+    m, _ = enforce_edge151_contract_np(m, cfg, source_hint="energy_stability_lowpass_tweedie_probe", derive_contact=True, project_rot=True)
     return m.astype(np.float32)
 
 
 
 
-def _v46_41_safe_residual(
+def _bounded_residual_update(
     candidate,
     reference,
     seam_mask,
@@ -8181,19 +8199,19 @@ def _v46_41_safe_residual(
         sm = sm[:, None]
     if sm.shape[0] != ref.shape[0]:
         sm = resample_motion_np(sm, ref.shape[0])
-    core = _v46_41_env_float(f"V46_41_{stage.upper()}_CORE_COMMIT", 0.0)
+    core = _stage_guard_env_float(f"STAGE_GUARD_{stage.upper()}_CORE_COMMIT", 0.0)
     trans_default = 0.18 if stage == "refiner" else 0.12
-    trans = _v46_41_env_float(f"V46_41_{stage.upper()}_TRANSITION_COMMIT", trans_default)
+    trans = _stage_guard_env_float(f"STAGE_GUARD_{stage.upper()}_TRANSITION_COMMIT", trans_default)
     w = np.clip(core + (trans - core) * sm.astype(np.float32), 0.0, 1.0)
     delta = cand - ref
     bounded = cand.copy().astype(np.float32)
-    root_xz_max = _v46_41_env_float("V46_41_ROOT_XZ_DELTA_MAX_M", 0.05)
-    root_y_max = _v46_41_env_float("V46_41_ROOT_Y_DELTA_MAX_M", 0.02)
+    root_xz_max = _stage_guard_env_float("STAGE_GUARD_ROOT_XZ_DELTA_MAX_M", 0.05)
+    root_y_max = _stage_guard_env_float("STAGE_GUARD_ROOT_Y_DELTA_MAX_M", 0.02)
     for idx, mx in [(ROOT_X_IDX, root_xz_max), (ROOT_Y_IDX, root_y_max), (ROOT_Z_IDX, root_xz_max)]:
         bounded[:, idx] = ref[:, idx] + np.clip(delta[:, idx], -mx, mx)
-    max_rotation_rad = _v46_41_env_float(
-        "V46_41_ROTATION_DELTA_MAX_RAD",
-        _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12),
+    max_rotation_rad = _stage_guard_env_float(
+        "STAGE_GUARD_ROTATION_DELTA_MAX_RAD",
+        _stage_guard_env_float("STAGE_GUARD_ROT6D_DELTA_MAX", 0.12),
     )
     out = blend_edge151_geodesic_np(
         ref,
@@ -8209,39 +8227,39 @@ def _v46_41_safe_residual(
     out, _ = enforce_edge151_contract_np(
         out,
         cfg,
-        source_hint=f"v46_42_safe_residual:{stage}",
+        source_hint=f"energy_stability_safe_residual:{stage}",
         derive_contact=not preserve_contacts,
         project_rot=True,
     )
-    out, _ = _v46_41_apply_stage_prior(
+    out, _ = _apply_guarded_stage_prior(
         out,
         cfg,
-        strength=_v46_41_env_float(
-            "V46_41_MSA_TRANSACTION_STRENGTH", 0.08
+        strength=_stage_guard_env_float(
+            "STAGE_GUARD_MSA_TRANSACTION_STRENGTH", 0.08
         ),
         global_start=global_start,
         preserve_contacts=preserve_contacts,
     )
-    ok, reasons, detail = _v46_41_kbo(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
+    ok, reasons, detail = _kinematic_barrier_oracle(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
     if not ok:
-        _v46_41_add_token({"mechanism": "KBO", "version": "v46_42", "stage": stage, "event": "bounded_residual_rejected", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
+        _append_stage_transaction_audit({"mechanism": "KBO", "version": "motion_42", "stage": stage, "event": "bounded_residual_rejected", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
         return ref.astype(np.float32)
     return out.astype(np.float32)
 
 
-def _v46_41_deterministic_bridge(reference, seam_mask, cfg, stage="fallback", global_start=0):
+def _deterministic_repair_bridge(reference, seam_mask, cfg, stage="fallback", global_start=0):
     ref = np.asarray(reference, dtype=np.float32).copy()
     if ref.shape[0] < 4:
         return ref.astype(np.float32), {"mode": "snapshot_too_short", "committed": False}
     sm = np.asarray(seam_mask, dtype=np.float32)
     if sm.ndim == 1:
         sm = sm[:, None]
-    active = sm[:, 0] > _v46_41_env_float("V46_41_TGT_ACTIVE_THRESHOLD", 0.05)
+    active = sm[:, 0] > _stage_guard_env_float("STAGE_GUARD_TGT_ACTIVE_THRESHOLD", 0.05)
     regs = contiguous_regions(active)
     if not regs:
         return ref.astype(np.float32), {"mode": "no_active_mask", "committed": False}
     out = ref.copy().astype(np.float32)
-    fallback_strength = _v46_41_env_float("V46_41_DETERMINISTIC_FALLBACK_STRENGTH", 0.35)
+    fallback_strength = _stage_guard_env_float("STAGE_GUARD_DETERMINISTIC_FALLBACK_STRENGTH", 0.35)
     reports = []
     for a, b in regs:
         a = max(1, int(a)); b = min(int(b), ref.shape[0] - 1)
@@ -8249,10 +8267,10 @@ def _v46_41_deterministic_bridge(reference, seam_mask, cfg, stage="fallback", gl
             continue
         n = b - a
         try:
-            if "v46_33_motion_inbetween_np" in globals():
-                bridge = v46_33_motion_inbetween_np(ref[max(0, a-2):a], ref[b:min(ref.shape[0], b+2)], n, cfg)
+            if "reference_motion_inbetween_np" in globals():
+                bridge = reference_motion_inbetween_np(ref[max(0, a-2):a], ref[b:min(ref.shape[0], b+2)], n, cfg)
             else:
-                raise RuntimeError("v46_33_motion_inbetween_np unavailable")
+                raise RuntimeError("reference_motion_inbetween_np unavailable")
         except Exception:
             left = ref[a - 1].copy(); right = ref[b].copy()
             x = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
@@ -8265,92 +8283,92 @@ def _v46_41_deterministic_bridge(reference, seam_mask, cfg, stage="fallback", gl
         w = np.clip(sm[a:b], 0.0, 1.0) * float(fallback_strength)
         out[a:b] = blend_edge151_geodesic_np(out[a:b], bridge, w)
         reports.append({"span": [int(a), int(b)], "frames": int(n)})
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"v46_42_deterministic_bridge:{stage}", derive_contact=True, project_rot=True)
-    out, _ = _v46_41_apply_stage_prior(out, cfg, strength=_v46_41_env_float("V46_41_MSA_FALLBACK_STRENGTH", 0.10), global_start=global_start)
-    ok, reasons, detail = _v46_41_kbo(out, ref, cfg, stage=f"{stage}_deterministic_bridge", global_start=global_start)
+    out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"energy_stability_deterministic_bridge:{stage}", derive_contact=True, project_rot=True)
+    out, _ = _apply_guarded_stage_prior(out, cfg, strength=_stage_guard_env_float("STAGE_GUARD_MSA_FALLBACK_STRENGTH", 0.10), global_start=global_start)
+    ok, reasons, detail = _kinematic_barrier_oracle(out, ref, cfg, stage=f"{stage}_deterministic_bridge", global_start=global_start)
     if not ok:
         return ref.astype(np.float32), {"mode": "deterministic_bridge_rejected", "committed": False, "reasons": reasons, "detail": detail}
-    return out.astype(np.float32), {"mode": "deterministic_root_rotation_bridge", "committed": True, "regions": reports, "v46_42_dynamic_msa": True}
+    return out.astype(np.float32), {"mode": "deterministic_root_rotation_bridge", "committed": True, "regions": reports, "energy_stability_dynamic_msa": True}
 
 
 
 
 def generate(args):
     try:
-        _v46_42_load_mssd_stage_weights(getattr(args, "slots_json", None))
+        _load_stage_anchor_weights(getattr(args, "slots_json", None))
     except Exception as exc:
-        print(f"[V46.42 WARN] failed to load MSSD dynamic stage weights: {exc}", file=sys.stderr)
-    rc = int(_v46_42_orig_generate(args))
+        print(f"[Energy Stability WARN] failed to load MSSD dynamic stage weights: {exc}", file=sys.stderr)
+    rc = int(_energy_stability_orig_generate(args))
     try:
         out_path = Path(args.out)
-        json_path = Path(args.json or str(out_path).replace(".npy", ".v46_33_report.json"))
+        json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
         if json_path.exists():
             with open(json_path, "r", encoding="utf-8") as f:
                 report = json.load(f)
-            report["v46_42_stability_alignment"] = {
-                "version": "v46_42_lowpass_early_abort_dynamic_msa_kinetic_hn_dpo",
+            report["energy_stability_stability_alignment"] = {
+                "version": "energy_stability_lowpass_early_abort_dynamic_msa_kinetic_hn_dpo",
                 "fixes": [
                     "low-pass relaxed KBO for early-abort probes",
                     "music-energy and root-velocity adaptive macroscopic stage anchoring",
                     "kinetic-energy preserving HN-DPO fine-tuning tool",
                 ],
-                "mssd_stage_weight_meta": _v46_42_jsonable(_V46_42_MSSD_WEIGHT_META),
-                "early_abort_relax": float(_v46_42_env_float("V46_42_EARLY_ABORT_KBO_RELAX", 3.0)),
-                "early_abort_smooth_sigma": float(_v46_42_env_float("V46_42_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35)),
+                "mssd_stage_weight_meta": _energy_gate_jsonable(_STAGE_WEIGHT_METADATA),
+                "early_abort_relax": float(_energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_RELAX", 3.0)),
+                "early_abort_smooth_sigma": float(_energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35)),
             }
-            mech = report.get("v46_41_scientific_mechanism", {})
+            mech = report.get("stage_guard_scientific_mechanism", {})
             if isinstance(mech, dict):
-                mech.setdefault("v46_42_fixes", report["v46_42_stability_alignment"]["fixes"])
-                report["v46_41_scientific_mechanism"] = mech
+                mech.setdefault("energy_stability_fixes", report["energy_stability_stability_alignment"]["fixes"])
+                report["stage_guard_scientific_mechanism"] = mech
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(_v46_42_jsonable(report), f, ensure_ascii=False, indent=2)
-            print(json.dumps({"v46_42_stability_alignment": report["v46_42_stability_alignment"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
+                json.dump(_energy_gate_jsonable(report), f, ensure_ascii=False, indent=2)
+            print(json.dumps({"energy_stability_stability_alignment": report["energy_stability_stability_alignment"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"[V46.42 WARN] failed to append stability-alignment metadata: {exc}", file=sys.stderr)
+        print(f"[Energy Stability WARN] failed to append stability-alignment metadata: {exc}", file=sys.stderr)
     return rc
-# ===== V46.42 STABILITY ALIGNMENT PATCH END =====
+# ===== Energy Stability STABILITY ALIGNMENT PATCH END =====
 
 
 
-# ===== V46.43 PHYSICS-CONSISTENT STABILITY PATCH START =====
-# Physics-consistent fixes after V46.42.
-# This block intentionally redefines V46.41/V46.42 runtime functions because the
+# ===== Physics Stability PHYSICS-CONSISTENT STABILITY PATCH START =====
+# Physics-consistent fixes after Energy Stability.
+# This block intentionally redefines Stage Guard/Energy Stability runtime functions because the
 # generation code resolves them by global name at call time.
 
-_v46_43_orig_generate = generate
+_physics_stability_orig_generate = generate
 
-_V46_43_EARLY_ABORT_TRACE = []
+_EARLY_ABORT_TRACE = []
 
 
-def _v46_43_env_bool(name, default=True):
+def _physics_stability_env_bool(name, default=True):
     try:
         return bool(int(os.environ.get(name, "1" if default else "0")))
     except Exception:
         return bool(default)
 
 
-def _v46_43_env_float(name, default):
+def _physics_stability_env_float(name, default):
     try:
         return float(os.environ.get(name, str(default)))
     except Exception:
         return float(default)
 
 
-def _v46_43_env_int(name, default):
+def _physics_stability_env_int(name, default):
     try:
         return int(float(os.environ.get(name, str(default))))
     except Exception:
         return int(default)
 
 
-def _v46_43_jsonable(x):
+def _physics_stability_jsonable(x):
     try:
-        return _v46_42_jsonable(x)
+        return _energy_gate_jsonable(x)
     except Exception:
         if isinstance(x, dict):
-            return {str(k): _v46_43_jsonable(v) for k, v in x.items()}
+            return {str(k): _physics_stability_jsonable(v) for k, v in x.items()}
         if isinstance(x, (list, tuple)):
-            return [_v46_43_jsonable(v) for v in x]
+            return [_physics_stability_jsonable(v) for v in x]
         if isinstance(x, np.ndarray):
             return x.tolist()
         if isinstance(x, np.generic):
@@ -8358,17 +8376,17 @@ def _v46_43_jsonable(x):
         return x if isinstance(x, (str, int, float, bool)) or x is None else str(x)
 
 
-def _v46_43_lowpass_channels(motion, cfg, sigma=2.25):
+def _lowpass_motion_channels(motion, cfg, sigma=2.25):
     """Only used for oracle decisions, never as committed sample."""
     m = np.asarray(motion, dtype=np.float32).copy()
     if ndi is not None and m.ndim == 2 and m.shape[0] > 7 and float(sigma) > 0:
         idx = [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX] + list(range(ROT6D_START, ROT6D_END))
         m[:, idx] = ndi.gaussian_filter1d(m[:, idx], sigma=float(sigma), axis=0, mode="nearest")
-    m, _ = enforce_edge151_contract_np(m, cfg, source_hint="v46_43_derivative_safe_lowpass_probe", derive_contact=True, project_rot=True)
+    m, _ = enforce_edge151_contract_np(m, cfg, source_hint="physics_stability_derivative_safe_lowpass_probe", derive_contact=True, project_rot=True)
     return m.astype(np.float32)
 
 
-def _v46_43_robust_derivative_stats(motion, cfg):
+def _robust_derivative_metrics(motion, cfg):
     """Robust derivative statistics after low-pass filtering.
 
     Uses p95/p99 rather than raw max to avoid one-frame Tweedie jitter causing
@@ -8415,7 +8433,7 @@ def _v46_43_robust_derivative_stats(motion, cfg):
     return st
 
 
-def _v46_43_early_abort_oracle(candidate, reference, cfg, stage="diffusion_early_abort_probe", global_start=0):
+def _physics_early_abort_oracle(candidate, reference, cfg, stage="diffusion_early_abort_probe", global_start=0):
     """Derivative-safe early-abort oracle.
 
     It deliberately separates fatal low-frequency barriers from derivative-only
@@ -8424,45 +8442,45 @@ def _v46_43_early_abort_oracle(candidate, reference, cfg, stage="diffusion_early
     """
     raw = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
-    sigma = _v46_43_env_float("V46_43_EARLY_ABORT_LOWPASS_SIGMA", 2.25)
-    relax = _v46_43_env_float("V46_43_EARLY_ABORT_RELAX", 4.0)
-    smooth = _v46_43_lowpass_channels(raw, cfg, sigma=sigma)
-    c = _v46_43_robust_derivative_stats(smooth, cfg)
-    r = _v46_43_robust_derivative_stats(ref, cfg)
+    sigma = _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA", 2.25)
+    relax = _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_RELAX", 4.0)
+    smooth = _lowpass_motion_channels(raw, cfg, sigma=sigma)
+    c = _robust_derivative_metrics(smooth, cfg)
+    r = _robust_derivative_metrics(ref, cfg)
     fatal = []
     soft = []
 
     if not c.get("finite", False) or not c.get("fk_finite", False):
         fatal.append("non_finite_or_fk_invalid")
-    if float(c.get("root_y_range_m", 0.0)) > _v46_41_env_float("V46_41_KBO_ROOT_RANGE_ABS_MAX_M", 2.50) * max(1.0, relax * 0.75):
+    if float(c.get("root_y_range_m", 0.0)) > _stage_guard_env_float("STAGE_GUARD_KBO_ROOT_RANGE_ABS_MAX_M", 2.50) * max(1.0, relax * 0.75):
         fatal.append("root_y_range_abs_exceeded")
-    if abs(float(c.get("floor_y", 0.0)) - float(r.get("floor_y", 0.0))) > _v46_41_env_float("V46_41_KBO_FLOOR_SHIFT_MAX_M", 1.50) * max(1.0, relax):
+    if abs(float(c.get("floor_y", 0.0)) - float(r.get("floor_y", 0.0))) > _stage_guard_env_float("STAGE_GUARD_KBO_FLOOR_SHIFT_MAX_M", 1.50) * max(1.0, relax):
         fatal.append("floor_shift_exceeded")
-    if float(c.get("bone_length_violation_max_m", 0.0)) > _v46_41_env_float("V46_41_KBO_BONE_LENGTH_EPS_M", 0.02) * max(1.0, relax):
+    if float(c.get("bone_length_violation_max_m", 0.0)) > _stage_guard_env_float("STAGE_GUARD_KBO_BONE_LENGTH_EPS_M", 0.02) * max(1.0, relax):
         fatal.append("bone_length_violation")
 
     # Derivative barriers are soft in early-abort mode. They need co-occurring
     # fatal evidence, or a very large robust p99 excursion when the user enables it.
-    acc_thr = _v46_41_env_float("V46_41_KBO_ACC_MAX_MPS2", 2700.0) * max(1.0, relax)
-    jerk_thr = _v46_41_env_float("V46_41_KBO_JERK_MAX_MPS3", 81000.0) * max(1.0, relax)
+    acc_thr = _stage_guard_env_float("STAGE_GUARD_KBO_ACC_MAX_MPS2", 2700.0) * max(1.0, relax)
+    jerk_thr = _stage_guard_env_float("STAGE_GUARD_KBO_JERK_MAX_MPS3", 81000.0) * max(1.0, relax)
     if float(c.get("joint_acceleration_p99_mps2", 0.0)) > acc_thr:
         soft.append("robust_acc_p99_spike")
     if float(c.get("joint_jerk_p99_mps3", 0.0)) > jerk_thr:
         soft.append("robust_jerk_p99_spike")
 
-    if _v46_41_env_bool("V46_41_KBO_STAGE_ANCHOR_ENABLE", True):
-        ae = _v46_41_anchor_error(smooth, global_start)
+    if _stage_guard_env_bool("STAGE_GUARD_KBO_STAGE_ANCHOR_ENABLE", True):
+        ae = _stage_anchor_error(smooth, global_start)
         # Anchor is a soft early signal; high-energy windows already get low
-        # weights through V46.43 anchor_error.
+        # weights through Physics Stability anchor_error.
         c["stage_anchor_error_p95_m"] = float(ae)
-        if ae > _v46_41_env_float("V46_41_KBO_ANCHOR_P95_MAX_M", 0.85) * max(1.0, relax):
+        if ae > _stage_guard_env_float("STAGE_GUARD_KBO_ANCHOR_P95_MAX_M", 0.85) * max(1.0, relax):
             soft.append("weighted_stage_anchor_deviation")
 
-    derivative_only_abort = _v46_43_env_bool("V46_43_EARLY_ABORT_ALLOW_DERIVATIVE_ONLY_FATAL", False)
+    derivative_only_abort = _physics_stability_env_bool("PHYSICS_STABILITY_EARLY_ABORT_ALLOW_DERIVATIVE_ONLY_FATAL", False)
     if fatal:
         ok = False
         reasons = fatal + soft
-    elif derivative_only_abort and len(soft) >= _v46_43_env_int("V46_43_EARLY_ABORT_MIN_SOFT_BARRIERS", 2):
+    elif derivative_only_abort and len(soft) >= _physics_stability_env_int("PHYSICS_STABILITY_EARLY_ABORT_MIN_SOFT_BARRIERS", 2):
         ok = False
         reasons = soft
     else:
@@ -8470,7 +8488,7 @@ def _v46_43_early_abort_oracle(candidate, reference, cfg, stage="diffusion_early
         reasons = soft  # diagnostic only
 
     detail = {
-        "kbo_mode": "v46_43_derivative_safe_early_abort",
+        "kbo_mode": "physics_stability_derivative_safe_early_abort",
         "lowpass_sigma": float(sigma),
         "relax": float(relax),
         "fatal_barriers": fatal,
@@ -8484,22 +8502,22 @@ def _v46_43_early_abort_oracle(candidate, reference, cfg, stage="diffusion_early
     return ok, reasons, detail
 
 
-# Preserve the V46.42 function name used by diffusion proposal, but replace its logic.
-def _v46_42_kbo_early_abort(candidate, reference, cfg, stage="diffusion_early_abort_probe", global_start=0):
-    return _v46_43_early_abort_oracle(candidate, reference, cfg, stage=stage, global_start=global_start)
+# Preserve the Energy Stability function name used by diffusion proposal, but replace its logic.
+def _barrier_oracle_early_abort(candidate, reference, cfg, stage="diffusion_early_abort_probe", global_start=0):
+    return _physics_early_abort_oracle(candidate, reference, cfg, stage=stage, global_start=global_start)
 
 
-def _v46_43_anchor_weight_for_motion(motion, global_start=0):
+def _stage_anchor_weight_for_motion(motion, global_start=0):
     m = np.asarray(motion, dtype=np.float32)
     T = len(m)
     if T <= 0:
         return np.ones((0, 1), dtype=np.float32)
     try:
-        frame_w = _v46_42_frame_weights(T, global_start=global_start)
+        frame_w = _frame_stage_weights(T, global_start=global_start)
     except Exception:
         frame_w = np.ones((T, 1), dtype=np.float32)
     try:
-        vel_gate = _v46_42_velocity_gate(m)
+        vel_gate = _root_velocity_gate(m)
     except Exception:
         vel_gate = np.ones((T, 1), dtype=np.float32)
     # Harder leap gate: if root speed is high, do not pull the body back to a
@@ -8507,18 +8525,18 @@ def _v46_43_anchor_weight_for_motion(motion, global_start=0):
     if T >= 3:
         v = np.linalg.norm(np.diff(m[:, [ROOT_X_IDX, ROOT_Z_IDX]], axis=0), axis=-1)
         v = np.concatenate([[v[0]], v]).astype(np.float32)
-        leap_thr = _v46_43_env_float("V46_43_MSA_LEAP_SPEED_THRESH", 0.070)
+        leap_thr = _physics_stability_env_float("PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH", 0.070)
         leap = v > leap_thr
         if ndi is not None and np.any(leap):
-            leap = ndi.binary_dilation(leap.astype(bool), iterations=_v46_43_env_int("V46_43_MSA_LEAP_DILATE", 4))
-        leap_gate = np.where(leap, _v46_43_env_float("V46_43_MSA_LEAP_MIN_GATE", 0.0), 1.0).astype(np.float32)[:, None]
+            leap = ndi.binary_dilation(leap.astype(bool), iterations=_physics_stability_env_int("PHYSICS_STABILITY_MSA_LEAP_DILATE", 4))
+        leap_gate = np.where(leap, _physics_stability_env_float("PHYSICS_STABILITY_MSA_LEAP_MIN_GATE", 0.0), 1.0).astype(np.float32)[:, None]
     else:
         leap_gate = np.ones((T, 1), dtype=np.float32)
     w = frame_w * vel_gate * leap_gate
-    return np.clip(w, _v46_42_env_float("V46_42_MSA_MIN_WEIGHT", 0.05), 1.0).astype(np.float32)
+    return np.clip(w, _energy_gate_env_float("ENERGY_STABILITY_MSA_MIN_WEIGHT", 0.05), 1.0).astype(np.float32)
 
 
-def _v46_41_apply_stage_prior(
+def _apply_guarded_stage_prior(
     motion,
     cfg,
     strength=None,
@@ -8531,29 +8549,29 @@ def _v46_41_apply_stage_prior(
     only low-frequency drift with capped, smoothed offsets. Leap/high-speed
     frames are gated out to avoid moonwalk/airborne rubber-band artifacts.
     """
-    global _V46_41_STAGE_PRIOR_XZ
-    if not _v46_41_env_bool("V46_41_MSA_ENABLE", True):
+    global _STAGE_PRIOR_XZ
+    if not _stage_guard_env_bool("STAGE_GUARD_MSA_ENABLE", True):
         return np.asarray(motion, dtype=np.float32), {"enabled": False}
     m = np.asarray(motion, dtype=np.float32).copy()
-    prior = _V46_41_STAGE_PRIOR_XZ
+    prior = _STAGE_PRIOR_XZ
     if prior is None or len(prior) < int(global_start) + len(m):
-        prior_local, meta = _v46_41_build_stage_prior_xz(m, None, cfg)
+        prior_local, meta = _build_stage_prior_xz(m, None, cfg)
     else:
         prior_local = prior[int(global_start):int(global_start)+len(m)]
-        meta = dict(_V46_41_STAGE_PRIOR_META)
-    base_alpha = _v46_41_env_float("V46_41_MSA_COMMIT_STRENGTH", 0.16) if strength is None else float(strength)
-    w = _v46_43_anchor_weight_for_motion(m, global_start=global_start)
+        meta = dict(_STAGE_PRIOR_METADATA)
+    base_alpha = _stage_guard_env_float("STAGE_GUARD_MSA_COMMIT_STRENGTH", 0.16) if strength is None else float(strength)
+    w = _stage_anchor_weight_for_motion(m, global_start=global_start)
     raw_corr = prior_local - m[:, [ROOT_X_IDX, ROOT_Z_IDX]]
-    sigma = _v46_43_env_float("V46_43_MSA_CORRECTION_LOWPASS_SIGMA", 10.0)
+    sigma = _physics_stability_env_float("PHYSICS_STABILITY_MSA_CORRECTION_LOWPASS_SIGMA", 10.0)
     if ndi is not None and len(raw_corr) > 7 and sigma > 0:
         corr = ndi.gaussian_filter1d(raw_corr, sigma=float(sigma), axis=0, mode="nearest")
     else:
         corr = raw_corr
     # Capping the correction magnitude and its frame-to-frame velocity preserves
     # local foot/root dynamics and prevents rubber-band deceleration.
-    max_delta = _v46_43_env_float("V46_43_MSA_MAX_OFFSET_DELTA_M", _v46_41_env_float("V46_41_MSA_MAX_DELTA_M", 0.06))
+    max_delta = _physics_stability_env_float("PHYSICS_STABILITY_MSA_MAX_OFFSET_DELTA_M", _stage_guard_env_float("STAGE_GUARD_MSA_MAX_DELTA_M", 0.06))
     corr = np.clip(corr, -max_delta, max_delta)
-    max_corr_vel = _v46_43_env_float("V46_43_MSA_MAX_CORRECTION_VEL_MPS", 0.18)
+    max_corr_vel = _physics_stability_env_float("PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPS", 0.18)
     max_corr_step = max_corr_vel / max(float(cfg.fps), 1.0e-8)
     if len(corr) > 1 and max_corr_vel > 0:
         smooth_corr = corr.copy()
@@ -8567,13 +8585,13 @@ def _v46_41_apply_stage_prior(
     m, _ = enforce_edge151_contract_np(
         m,
         cfg,
-        source_hint="v46_43_velocity_preserving_msa",
+        source_hint="physics_stability_velocity_preserving_msa",
         derive_contact=not preserve_contacts,
         project_rot=True,
     )
     meta.update({
         "applied": True,
-        "version": "v46_43_velocity_preserving_dynamic_msa",
+        "version": "physics_stability_velocity_preserving_dynamic_msa",
         "base_strength": float(base_alpha),
         "effective_strength_mean": float(base_alpha * float(np.mean(w))) if len(w) else 0.0,
         "effective_strength_min": float(base_alpha * float(np.min(w))) if len(w) else 0.0,
@@ -8585,39 +8603,39 @@ def _v46_41_apply_stage_prior(
     return m.astype(np.float32), meta
 
 
-def _v46_41_anchor_error(candidate, a0=0):
+def _stage_anchor_error(candidate, a0=0):
     """Anchor error for KBO, with leap/high-energy weighting.
 
     High-energy or high-root-speed windows are not rejected only because they
     deviate from the low-frequency stage prior.
     """
-    global _V46_41_STAGE_PRIOR_XZ
+    global _STAGE_PRIOR_XZ
     cand = np.asarray(candidate, dtype=np.float32)
-    if _V46_41_STAGE_PRIOR_XZ is None:
+    if _STAGE_PRIOR_XZ is None:
         return 0.0
     a = int(a0); b = a + len(cand)
-    if a < 0 or b > len(_V46_41_STAGE_PRIOR_XZ):
+    if a < 0 or b > len(_STAGE_PRIOR_XZ):
         return 0.0
-    prior = _V46_41_STAGE_PRIOR_XZ[a:b]
+    prior = _STAGE_PRIOR_XZ[a:b]
     err = np.linalg.norm(cand[:, [ROOT_X_IDX, ROOT_Z_IDX]] - prior, axis=-1)
-    w = _v46_43_anchor_weight_for_motion(cand, global_start=a)[:, 0]
-    weighted = err * np.clip(w, _v46_42_env_float("V46_42_MSA_MIN_WEIGHT", 0.05), 1.0)
+    w = _stage_anchor_weight_for_motion(cand, global_start=a)[:, 0]
+    weighted = err * np.clip(w, _energy_gate_env_float("ENERGY_STABILITY_MSA_MIN_WEIGHT", 0.05), 1.0)
     return float(np.percentile(weighted, 95))
 
 
-def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, global_start=0):
-    """V46.43 diffusion proposal with consecutive robust early probes."""
+def _diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, global_start=0):
+    """Physics Stability diffusion proposal with consecutive robust early probes."""
     if torch is None or not ckpt_path or not Path(ckpt_path).exists():
-        return _v46_41_orig_apply_diffusion_model(snapshot, cond, sm_win, ckpt_path, cfg)
-    core_strength = _v46_41_env_float("V46_DIFFUSION_CORE_STRENGTH", 0.00)
-    trans_strength = _v46_41_env_float("V46_DIFFUSION_TRANSITION_STRENGTH", 0.25)
-    noise_scale = _v46_41_env_float("V46_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
-    ckpt = _v46_41_trusted_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "v46_diffusion")
-    if str(ckpt.get("version", "")).startswith(
-        "v46_reference_tangent_diffusion_79d"
+        return _stage_guard_orig_apply_diffusion_model(snapshot, cond, sm_win, ckpt_path, cfg)
+    core_strength = _stage_guard_env_float("MOTION_DIFFUSION_CORE_STRENGTH", 0.00)
+    trans_strength = _stage_guard_env_float("MOTION_DIFFUSION_TRANSITION_STRENGTH", 0.25)
+    noise_scale = _stage_guard_env_float("MOTION_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
+    ckpt = _stage_guard_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "motion_diffusion")
+    if normalize_motion_checkpoint_version(ckpt.get("version", "")).startswith(
+        "reference_tangent_motion_diffusion"
     ):
-        return _v46_41_orig_apply_diffusion_model(
+        return _stage_guard_orig_apply_diffusion_model(
             snapshot, cond, sm_win, ckpt_path, cfg
         )
     Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
@@ -8625,14 +8643,14 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
     betas, alphas, abar = make_beta_schedule(Tdiff, torch.device(cfg.device))
-    retr_in, _ = enforce_edge151_contract_np(np.asarray(snapshot, dtype=np.float32), cfg, source_hint="v46_43_diffusion_window_retrieval", derive_contact=True, project_rot=True)
+    retr_in, _ = enforce_edge151_contract_np(np.asarray(snapshot, dtype=np.float32), cfg, source_hint="physics_stability_diffusion_window_retrieval", derive_contact=True, project_rot=True)
     mask_in = np.asarray(sm_win, dtype=np.float32)
     if mask_in.ndim == 1:
         mask_in = mask_in[:, None]
     if mask_in.shape[0] != retr_in.shape[0]:
         mask_in = resample_motion_np(mask_in, retr_in.shape[0])
     # Multiple probe points reduce single-step false positives.
-    probe_fracs = os.environ.get("V46_43_EARLY_ABORT_PROBE_FRACTIONS", "0.66,0.50,0.33")
+    probe_fracs = os.environ.get("PHYSICS_STABILITY_EARLY_ABORT_PROBE_FRACTIONS", "0.66,0.50,0.33")
     probe_ts = set()
     for part in probe_fracs.split(','):
         part = part.strip()
@@ -8642,7 +8660,7 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
             probe_ts.add(int(round(Tdiff * float(part))))
         except Exception:
             pass
-    consecutive_needed = max(1, _v46_43_env_int("V46_43_EARLY_ABORT_CONSECUTIVE_FATAL", 2))
+    consecutive_needed = max(1, _physics_stability_env_int("PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL", 2))
     fatal_streak = 0
     with torch.no_grad():
         retr = torch.from_numpy(retr_in[None]).float().to(cfg.device)
@@ -8662,59 +8680,59 @@ def _v46_41_diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, gl
             x = retr * (1.0 - mask) + x * mask
             if ti in probe_ts:
                 probe = x[0].detach().cpu().numpy().astype(np.float32)
-                probe, _ = enforce_edge151_contract_np(probe, cfg, source_hint="v46_43_diffusion_early_probe_raw", derive_contact=True, project_rot=True)
+                probe, _ = enforce_edge151_contract_np(probe, cfg, source_hint="physics_stability_diffusion_early_probe_raw", derive_contact=True, project_rot=True)
                 # Important: do NOT call strict safe_residual before early KBO.
                 # Bound channel residuals lightly without running final KBO.
                 delta = probe - retr_in
                 bounded_proposal = probe.copy().astype(np.float32)
-                root_xz = _v46_41_env_float("V46_41_ROOT_XZ_DELTA_MAX_M", 0.05) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
-                root_y = _v46_41_env_float("V46_41_ROOT_Y_DELTA_MAX_M", 0.02) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
+                root_xz = _stage_guard_env_float("STAGE_GUARD_ROOT_XZ_DELTA_MAX_M", 0.05) * _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_BOUND_RELAX", 2.0)
+                root_y = _stage_guard_env_float("STAGE_GUARD_ROOT_Y_DELTA_MAX_M", 0.02) * _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_BOUND_RELAX", 2.0)
                 for idx, mx in [(ROOT_X_IDX, root_xz), (ROOT_Y_IDX, root_y), (ROOT_Z_IDX, root_xz)]:
                     bounded_proposal[:, idx] = retr_in[:, idx] + np.clip(delta[:, idx], -mx, mx)
-                rotation_cap = _v46_41_env_float(
-                    "V46_41_ROTATION_DELTA_MAX_RAD",
-                    _v46_41_env_float("V46_41_ROT6D_DELTA_MAX", 0.12),
-                ) * _v46_43_env_float("V46_43_EARLY_ABORT_BOUND_RELAX", 2.0)
+                rotation_cap = _stage_guard_env_float(
+                    "STAGE_GUARD_ROTATION_DELTA_MAX_RAD",
+                    _stage_guard_env_float("STAGE_GUARD_ROT6D_DELTA_MAX", 0.12),
+                ) * _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_BOUND_RELAX", 2.0)
                 bounded = blend_edge151_geodesic_np(
                     retr_in,
                     bounded_proposal,
                     np.clip(mask_in, 0.0, 1.0),
                     max_rotation_rad=rotation_cap,
                 )
-                bounded, _ = enforce_edge151_contract_np(bounded, cfg, source_hint="v46_43_diffusion_early_probe_bounded_no_strict_kbo", derive_contact=True, project_rot=True)
-                ok, reasons, detail = _v46_43_early_abort_oracle(bounded, retr_in, cfg, stage="diffusion_early_abort_probe", global_start=global_start)
-                _V46_43_EARLY_ABORT_TRACE.append({"ti": int(ti), "ok": bool(ok), "reasons": reasons, "detail": detail})
+                bounded, _ = enforce_edge151_contract_np(bounded, cfg, source_hint="physics_stability_diffusion_early_probe_bounded_no_strict_kbo", derive_contact=True, project_rot=True)
+                ok, reasons, detail = _physics_early_abort_oracle(bounded, retr_in, cfg, stage="diffusion_early_abort_probe", global_start=global_start)
+                _EARLY_ABORT_TRACE.append({"ti": int(ti), "ok": bool(ok), "reasons": reasons, "detail": detail})
                 # Only fatal barriers count toward abort; soft derivative-only
-                # barriers are diagnostics in _v46_43_early_abort_oracle.
+                # barriers are diagnostics in _physics_early_abort_oracle.
                 fatal_now = bool(detail.get("fatal_barriers"))
                 fatal_streak = fatal_streak + 1 if fatal_now else 0
                 if fatal_streak >= consecutive_needed:
-                    _v46_41_add_token({
+                    _append_stage_transaction_audit({
                         "mechanism": "early_abort",
-                        "version": "v46_43_derivative_safe_consecutive",
+                        "version": "physics_stability_derivative_safe_consecutive",
                         "stage": "diffusion",
                         "commit_state": "abort_to_ccd",
                         "barrier_violations": reasons,
                         "detail": detail,
                         "hard_negative": True,
                     })
-                    raise RuntimeError("diffusion_early_abort_v46_43:" + ",".join(reasons))
+                    raise RuntimeError("diffusion_early_abort_motion_43:" + ",".join(reasons))
         y = x[0].detach().cpu().numpy().astype(np.float32)
-    y, _ = enforce_edge151_contract_np(y, cfg, source_hint="v46_43_diffusion_window_output", derive_contact=True, project_rot=True)
+    y, _ = enforce_edge151_contract_np(y, cfg, source_hint="physics_stability_diffusion_window_output", derive_contact=True, project_rot=True)
     return y.astype(np.float32)
 
 
 def generate(args):
-    global _V46_43_EARLY_ABORT_TRACE
-    _V46_43_EARLY_ABORT_TRACE = []
-    rc = int(_v46_43_orig_generate(args))
+    global _EARLY_ABORT_TRACE
+    _EARLY_ABORT_TRACE = []
+    rc = int(_physics_stability_orig_generate(args))
     try:
         out_path = Path(args.out)
-        json_path = Path(args.json or str(out_path).replace(".npy", ".v46_33_report.json"))
+        json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
         if json_path.exists():
             report = json.load(open(json_path, "r", encoding="utf-8"))
-            report["v46_43_physics_consistent_stability"] = {
-                "version": "v46_43_derivative_safe_msa_velocity_preserving_kinetic_dpo",
+            report["physics_stability_physics_consistent_stability"] = {
+                "version": "physics_stability_derivative_safe_msa_velocity_preserving_kinetic_dpo",
                 "fixes": [
                     "early-abort uses low-pass robust derivative oracle",
                     "derivative-only Tweedie jitter cannot abort by default",
@@ -8722,23 +8740,23 @@ def generate(args):
                     "stage anchoring preserves local velocity and releases leap/high-speed windows",
                     "HN-DPO training uses kinetic and motion-density preservation",
                 ],
-                "early_abort_probe_trace_count": int(len(_V46_43_EARLY_ABORT_TRACE)),
-                "early_abort_probe_trace_preview": _v46_43_jsonable(_V46_43_EARLY_ABORT_TRACE[:20]),
+                "early_abort_probe_trace_count": int(len(_EARLY_ABORT_TRACE)),
+                "early_abort_probe_trace_preview": _physics_stability_jsonable(_EARLY_ABORT_TRACE[:20]),
                 "env": {
-                    "V46_43_EARLY_ABORT_LOWPASS_SIGMA": _v46_43_env_float("V46_43_EARLY_ABORT_LOWPASS_SIGMA", 2.25),
-                    "V46_43_EARLY_ABORT_RELAX": _v46_43_env_float("V46_43_EARLY_ABORT_RELAX", 4.0),
-                    "V46_43_EARLY_ABORT_CONSECUTIVE_FATAL": _v46_43_env_int("V46_43_EARLY_ABORT_CONSECUTIVE_FATAL", 2),
-                    "V46_43_MSA_LEAP_SPEED_THRESH": _v46_43_env_float("V46_43_MSA_LEAP_SPEED_THRESH", 0.070),
-                    "V46_43_MSA_MAX_CORRECTION_VEL_MPF": _v46_43_env_float("V46_43_MSA_MAX_CORRECTION_VEL_MPF", 0.006),
+                    "PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA": _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA", 2.25),
+                    "PHYSICS_STABILITY_EARLY_ABORT_RELAX": _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_RELAX", 4.0),
+                    "PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL": _physics_stability_env_int("PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL", 2),
+                    "PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH": _physics_stability_env_float("PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH", 0.070),
+                    "PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPF": _physics_stability_env_float("PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPF", 0.006),
                 },
             }
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(_v46_43_jsonable(report), f, ensure_ascii=False, indent=2)
-            print(json.dumps({"v46_43_physics_consistent_stability": report["v46_43_physics_consistent_stability"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
+                json.dump(_physics_stability_jsonable(report), f, ensure_ascii=False, indent=2)
+            print(json.dumps({"physics_stability_physics_consistent_stability": report["physics_stability_physics_consistent_stability"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"[V46.43 WARN] failed to append metadata: {exc}", file=sys.stderr)
+        print(f"[Physics Stability WARN] failed to append metadata: {exc}", file=sys.stderr)
     return rc
-# ===== V46.43 PHYSICS-CONSISTENT STABILITY PATCH END =====
+# ===== Physics Stability PHYSICS-CONSISTENT STABILITY PATCH END =====
 
 
 if __name__ == "__main__":

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V46.35 Unified Music Semantic Slot Descriptor (MSSD)
+Semantic Descriptor Unified Music Semantic Slot Descriptor (MSSD)
 =====================================================
 
 This module unifies two formerly separated JSON concepts:
 
-1) external music semantic sidecar for unpaired-audio V44 training;
-2) final V21/V26/V23 slot plan for V46 whole-song generation.
+1) external music semantic sidecar for unpaired-audio Contrastive Retriever training;
+2) final Music Router, Whole-Song Planner, and Duration Model slot plan for Motion Generation whole-song generation.
 
 The format is intentionally backward compatible with existing `slots`,
-`segments`, and V26 `schedule` JSON files.  The important distinction is kept
+`segments`, and Whole-Song Planner `schedule` JSON files.  The important distinction is kept
 explicit through:
 
 - usage:                train_semantic | generate_schedule
 - is_final_schedule:    false | true
-- slot_source:          external_sidecar | v21_router_v26_planner | ...
+- slot_source:          external_sidecar | music_router_whole_song_planner | ...
 
 Training may consume weak descriptors without final timing.  Generation in
 scientific/strict mode must consume a final schedule descriptor.
@@ -31,9 +31,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-MSSD_SCHEMA_VERSION = "v46_38_mssd_aesd_routing_descriptor"
+from support.legacy_compatibility import has_scheduler_provenance
 
-# Keep the same label space as V46 music_alignment labels.  `aerial_curve` is
+MSSD_SCHEMA_VERSION = "semantic_routing_mssd_aesd_routing_descriptor"
+
+# Keep the same label space as Motion Generation music_alignment labels.  `aerial_curve` is
 # accepted as a compatibility label because some Chang-E event metadata uses it
 # as an intermediate family/semantic route.
 MUSIC_SEMANTIC_LABELS: List[str] = [
@@ -80,8 +82,8 @@ ENERGY_RHYTHM_MAP: Dict[str, Tuple[str, str]] = {
     "aerial_curve": ("moderate", "lyrical"),
 }
 
-# 32D pseudo feature follows V46 descriptor layout sufficiently for V44 OT and
-# V46 retrieval.  It deliberately reserves class channels around 22/23/26/28-30.
+# 32D pseudo feature follows Motion Generation descriptor layout sufficiently for Contrastive Retriever OT and
+# Motion Generation retrieval.  It deliberately reserves class channels around 22/23/26/28-30.
 LABEL_PROTOTYPES: Dict[str, Tuple[float, float, float, float]] = {
     "calm_meditative": (0.020, 0.010, 0.012, 0.85),
     "pose_hold": (0.030, 0.012, 0.010, 0.78),
@@ -272,7 +274,7 @@ def pseudo_feature_from_probs(probs: Dict[str, float], duration: float) -> np.nd
     feat[17] = dyn
     feat[18] = dyn
     top = top_label_from_probs(probs)
-    # These are normalized categorical channels aligned with V46 semantic dims.
+    # These are normalized categorical channels aligned with Motion Generation semantic dims.
     feat[22] = 0.0 if top in {"calm_meditative", "pose_hold"} else (1.0 if top == "percussive_accent" else 0.5)
     feat[23] = 1.0 if top == "percussive_accent" else (0.75 if top in {"turning_climax", "instrument_phrase"} else 0.35)
     feat[26] = MUSIC_SEMANTIC_LABELS.index(top) / max(1, len(MUSIC_SEMANTIC_LABELS) - 1)
@@ -290,31 +292,31 @@ def is_final_schedule_meta(meta: Dict[str, Any]) -> bool:
         return True
     if usage in {"generate", "generate_schedule", "final_schedule", "router_schedule"}:
         return True
-    if any(k in src for k in ["v21", "v23", "v26", "router", "planner", "pretrained"]):
+    if has_scheduler_provenance(src):
         return True
     return False
 
 
 def _extract_raw_slots(obj: Any) -> Tuple[List[dict], Dict[str, Any]]:
     if isinstance(obj, dict):
-        # Native MSSD / V46 slots JSON.
+        # Native MSSD / Motion Generation slots JSON.
         for key in ["slots", "segments", "descriptors"]:
             if isinstance(obj.get(key), list):
                 return list(obj[key]), dict(obj)
-        # Raw V26 schedule report.
+        # Raw Whole-Song Planner schedule report.
         if isinstance(obj.get("schedule"), list):
             meta = dict(obj)
             meta.setdefault("usage", "generate_schedule")
             meta.setdefault("is_final_schedule", True)
-            meta.setdefault("slot_source", "v21_router_v26_planner")
+            meta.setdefault("slot_source", "music_router_whole_song_planner")
             return list(obj["schedule"]), meta
-        # V26 summary file: caller normally resolves report, but support simple form.
+        # Whole-Song Planner summary file: caller normally resolves report, but support simple form.
         results = obj.get("results")
         if isinstance(results, dict) and len(results) == 1:
             val = next(iter(results.values()))
             if isinstance(val, dict) and val.get("report") and Path(str(val["report"])).exists():
                 return _extract_raw_slots(json_load(str(val["report"])))
-        # Generated V46 report fallback.
+        # Generated Motion Generation report fallback.
         sr = obj.get("stage_reports")
         if isinstance(sr, dict) and isinstance(sr.get("retrieval"), list):
             slots = []
@@ -336,9 +338,9 @@ def _extract_raw_slots(obj: Any) -> Tuple[List[dict], Dict[str, Any]]:
 
 
 def slot_duration_frames(slot: dict, fps: float, default_index: int = 0, default_seconds: float = 4.0) -> Tuple[float, float, float, int]:
-    # V26 schedule uses frame-level music_start/music_end/music_length and
+    # Whole-Song Planner schedule uses frame-level music_start/music_end/music_length and
     # allocated_phrase_total.  Native MSSD may use seconds and/or frame indices.
-    target_frames = slot.get("target_frames", slot.get("allocated_phrase_total", slot.get("v26_allocated_phrase_total", None)))
+    target_frames = slot.get("target_frames", slot.get("allocated_phrase_total", slot.get("whole_song_allocated_phrase_total", None)))
     if target_frames is None:
         target_frames = slot.get("music_length", None)
     if target_frames is not None:
@@ -414,21 +416,21 @@ def normalize_slot(slot0: dict, meta: Dict[str, Any], index: int, fps: float, so
         "feature": feature[:32].astype(float).tolist(),
         **sem,
     }
-    # Preserve V26 raw fields in a predictable namespace for auditing.
-    if "event_id" in slot and "v26_event_id" not in out:
-        out["v26_event_id"] = slot.get("event_id")
-    if "event_uid" in slot and "v26_event_uid" not in out:
-        out["v26_event_uid"] = slot.get("event_uid")
-    if "event_index" in slot and "v26_event_index" not in out:
-        out["v26_event_index"] = slot.get("event_index")
-    if "family_id" in slot and "v26_family_id" not in out:
-        out["v26_family_id"] = slot.get("family_id")
-    if "allocated_content_len" in slot and "v26_allocated_content_len" not in out:
-        out["v26_allocated_content_len"] = slot.get("allocated_content_len")
-    if "allocated_phrase_total" in slot and "v26_allocated_phrase_total" not in out:
-        out["v26_allocated_phrase_total"] = slot.get("allocated_phrase_total")
-    if "time_warp_ratio" in slot and "v26_time_warp_ratio" not in out:
-        out["v26_time_warp_ratio"] = slot.get("time_warp_ratio")
+    # Preserve Whole-Song Planner raw fields in a predictable namespace for auditing.
+    if "event_id" in slot and "whole_song_event_id" not in out:
+        out["whole_song_event_id"] = slot.get("event_id")
+    if "event_uid" in slot and "whole_song_event_uid" not in out:
+        out["whole_song_event_uid"] = slot.get("event_uid")
+    if "event_index" in slot and "whole_song_event_index" not in out:
+        out["whole_song_event_index"] = slot.get("event_index")
+    if "family_id" in slot and "whole_song_family_id" not in out:
+        out["whole_song_family_id"] = slot.get("family_id")
+    if "allocated_content_len" in slot and "whole_song_allocated_content_len" not in out:
+        out["whole_song_allocated_content_len"] = slot.get("allocated_content_len")
+    if "allocated_phrase_total" in slot and "whole_song_allocated_phrase_total" not in out:
+        out["whole_song_allocated_phrase_total"] = slot.get("allocated_phrase_total")
+    if "time_warp_ratio" in slot and "whole_song_time_warp_ratio" not in out:
+        out["whole_song_time_warp_ratio"] = slot.get("time_warp_ratio")
     return out, feature[:32].astype(np.float32)
 
 
@@ -459,7 +461,7 @@ def parse_descriptor_file(path: str | Path, *, require_final_schedule: bool = Fa
     meta = dict(meta)
     meta.setdefault("descriptor_type", "music_semantic_slot_descriptor")
     meta.setdefault("descriptor_schema_version", MSSD_SCHEMA_VERSION)
-    meta.setdefault("slot_source", "v21_router_v26_planner" if is_final_schedule_meta(meta) else "external_sidecar")
+    meta.setdefault("slot_source", "music_router_whole_song_planner" if is_final_schedule_meta(meta) else "external_sidecar")
     meta.setdefault("usage", "generate_schedule" if is_final_schedule_meta(meta) else "train_semantic")
     meta.setdefault("is_final_schedule", is_final_schedule_meta(meta))
     if usage != "auto":
@@ -568,7 +570,7 @@ def load_descriptor_for_audio(audio_path: str | Path, *, descriptor_dirs: Any = 
             try:
                 return parse_descriptor_file(cand, require_final_schedule=require_final_schedule, fps=fps, temperature=temperature, usage=usage)
             except Exception as exc:
-                print(f"[V46.35 MSSD WARN] failed descriptor {cand}: {exc}", file=sys.stderr)
+                print(f"[Semantic Descriptor MSSD WARN] failed descriptor {cand}: {exc}", file=sys.stderr)
     if require_final_schedule:
         raise RuntimeError(f"No final MSSD descriptor found for {audio_path}; searched dirs={descriptor_dirs}")
     return None
@@ -587,7 +589,7 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
         "descriptor_schema_version": MSSD_SCHEMA_VERSION,
         "usage": str(meta.get("usage", "generate_schedule")),
         "is_final_schedule": bool(meta.get("is_final_schedule", True)),
-        "slot_source": str(meta.get("slot_source", "v21_router_v26_planner")),
+        "slot_source": str(meta.get("slot_source", "music_router_whole_song_planner")),
         "audio": str(audio),
         "fps": fps,
         "num_slots": int(len(slots)),
@@ -600,7 +602,7 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
     for k in [
         "router_ckpt",
         "planner_ckpt",
-        "v23_ckpt",
+        "duration_model_ckpt",
         "raw_schedule_json",
         "schedule_summary_json",
         "event_db_contract",
@@ -613,9 +615,9 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
 
 
 # -----------------------------------------------------------------------------
-# V46.38 Action Event Semantic Descriptor (AESD) and routing helpers
+# Semantic Routing Action Event Semantic Descriptor (AESD) and routing helpers
 # -----------------------------------------------------------------------------
-AESD_SCHEMA_VERSION = "v46_38_action_event_semantic_descriptor"
+AESD_SCHEMA_VERSION = "semantic_routing_action_event_semantic_descriptor"
 
 DANCE_KEY_TO_MUSIC_LABEL = {
     "revelation_meditation": "calm_meditative",

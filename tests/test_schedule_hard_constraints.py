@@ -164,7 +164,7 @@ class ScheduleHardConstraintTests(unittest.TestCase):
         descriptor = {
             "usage": "generate_schedule",
             "is_final_schedule": True,
-            "slot_source": "v21_router_v26_planner",
+            "slot_source": "music_router_whole_song_planner",
             "total_target_frames": 100,
             "slots": rows,
         }

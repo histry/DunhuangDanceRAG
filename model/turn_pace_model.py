@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Learned turn-aware temporal pace refiner for V22.
+"""Learned turn-aware temporal pace refiner for Turn-Pace Model.
 
 The model reconstructs a natural-speed Dunhuang turn from a synthetically
 compressed (too-fast) turn window.  It is deliberately conservative:
@@ -49,7 +49,7 @@ class FiLMResidualBlock1D(nn.Module):
         return x + h
 
 
-class V22TurnPaceRefiner(nn.Module):
+class TurnPaceRefiner(nn.Module):
     """Conservative local residual model for too-fast turn events.
 
     Inputs:
@@ -160,7 +160,7 @@ class V22TurnPaceRefiner(nn.Module):
 def load_turn_pace_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = dict(checkpoint.get("config", {}))
-    model = V22TurnPaceRefiner(
+    model = TurnPaceRefiner(
         motion_dim=int(config.get("motion_dim", 151)),
         condition_dim=int(config.get("condition_dim", 17)),
         hidden_dim=int(config.get("hidden_dim", 256)),

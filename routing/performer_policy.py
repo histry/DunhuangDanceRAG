@@ -26,7 +26,7 @@ def _db_groups(db: Mapping[str, Any]) -> np.ndarray:
 
 
 def _quality(db: Mapping[str, Any], event_id: int) -> float:
-    for key in ("v46_53_combined_quality", "event_quality_scores", "anatomy_quality"):
+    for key in ("event_geometry_combined_quality", "event_quality_scores", "anatomy_quality"):
         try:
             return float(np.asarray(db[key])[int(event_id)])
         except Exception:

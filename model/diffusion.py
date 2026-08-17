@@ -828,7 +828,7 @@ class GaussianDiffusion(nn.Module):
     def _kinematic_sync_loss(self, model_motion_x0, target_motion_x0=None, cond=None):
         """Contrastive condition-driven root-lower coupling loss.
 
-        v4 design:
+        Contrastive phase design:
         Absolute trajectory-speed thresholds are unreliable because trajectory
         conditions may be normalized and heavily scaled.  Instead, this loss
         uses within-sequence contrast:
@@ -949,7 +949,7 @@ class GaussianDiffusion(nn.Module):
             if self._root_lower_debug_printed < 20:
                 with torch.no_grad():
                     print(
-                        "🧪 root-lower v4 | "
+                        "🧪 root-lower contrastive-phase | "
                         f"drive raw mean/max={drive_speed.mean().item():.6f}/{drive_speed.max().item():.6f} | "
                         f"drive_norm mean/max={drive_norm.mean().item():.6f}/{drive_norm.max().item():.6f} | "
                         f"high_lower={high_lower.mean().item():.6f} | "

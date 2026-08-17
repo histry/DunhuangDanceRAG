@@ -29,7 +29,7 @@ def identity_motion(frames: int) -> np.ndarray:
 
 
 class ProductManifoldTests(unittest.TestCase):
-    def test_v45_v46_state_dimensions(self) -> None:
+    def test_motion_refiner_motion_state_dimensions(self) -> None:
         self.assertEqual(TANGENT_DIM, 75)
         self.assertEqual(PRODUCT_STATE_DIM, 79)
 

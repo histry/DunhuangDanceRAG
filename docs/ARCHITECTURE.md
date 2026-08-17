@@ -38,7 +38,7 @@ layout.
 
 ## Paper-one mixed-curvature grounding
 
-The research path is layered so the physical motion manifold used by V45/V46
+The research path is layered so the physical motion manifold used by the boundary refiner and motion diffusion
 does not leak into the latent retrieval metric:
 
 ```text

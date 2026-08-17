@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V21 scalable query-time multi-music scheduler.
+"""Music Router scalable query-time multi-music scheduler.
 
 Key properties:
 - one shared Dunhuang style-safe Event-RAG for any number of songs;
@@ -178,16 +178,16 @@ def load_music_task(path: Path, phrase_count: int, num_frames: int, feature_dir:
     if path.suffix.lower() == ".npy":
         features = np.load(path).astype(np.float32)
         audio = None
-        key = path.stem.replace("_v21_music", "")
+        key = path.stem.replace("_music_router_music", "")
     else:
         key = path.stem
-        cache = feature_dir / f"{key}_v21_music.npy"
+        cache = feature_dir / f"{key}_music_router_music.npy"
         if cache.is_file():
             features = np.load(cache).astype(np.float32)
         else:
             features, meta = extract_audio_features(path, num_frames=num_frames)
             np.save(cache, features.astype(np.float32))
-            (feature_dir / f"{key}_v21_music.json").write_text(
+            (feature_dir / f"{key}_music_router_music.json").write_text(
                 json.dumps({"audio": str(path), "meta": meta}, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         audio = path
@@ -358,7 +358,7 @@ def schedule_one(
 
         if not new_beam:
             raise RuntimeError(
-                f"No V21 candidate for music={task.key} slot={slot}. "
+                f"No Music Router candidate for music={task.key} slot={slot}. "
                 "Increase candidate_top_k or relax min/max_time_warp."
             )
         new_beam.sort(key=lambda x: x[0], reverse=True)
@@ -555,10 +555,10 @@ def main() -> None:
                 device,
             )
         results = working
-        print(f"[V21] coordinate refinement round {round_idx + 1}/{args.refine_rounds} complete", flush=True)
+        print(f"[Music Router] coordinate refinement round {round_idx + 1}/{args.refine_rounds} complete", flush=True)
 
     summary = {
-        "version": "v21_query_time_multi_music_router",
+        "version": "music_router_query_time_multi_music_router",
         "index_json": str(args.index_json),
         "index_npz": str(args.index_npz),
         "router_ckpt": str(args.router_ckpt),
@@ -571,7 +571,7 @@ def main() -> None:
 
     for task in tasks:
         result = results[task.key]
-        out_npy = out_dir / f"{task.key}_v21.npy"
+        out_npy = out_dir / f"{task.key}.music_route.npy"
         np.save(out_npy, result.motion[None].astype(np.float32))
         report = {
             "music": task.key,
@@ -585,9 +585,9 @@ def main() -> None:
         }
         for idx, part in zip(result.selected, result.slot_parts):
             item = dict(items[idx])
-            item["v21_slot"] = part
+            item["music_router_slot"] = part
             report["schedule"].append(item)
-        report_path = out_dir / f"{task.key}_v21.schedule_report.json"
+        report_path = out_dir / f"{task.key}.music_route.schedule_report.json"
         report_path.write_text(json.dumps(json_safe(report), ensure_ascii=False, indent=2), encoding="utf-8")
         summary["results"][task.key] = {
             "npy": str(out_npy),
@@ -617,10 +617,10 @@ def main() -> None:
                 }
             )
     summary["pairwise_overlap"] = overlaps
-    (out_dir / "V21_MULTI_MUSIC_SUMMARY.json").write_text(
+    (out_dir / "MUSIC_ROUTER_MULTI_MUSIC_SUMMARY.json").write_text(
         json.dumps(json_safe(summary), ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print("summary:", out_dir / "V21_MULTI_MUSIC_SUMMARY.json")
+    print("summary:", out_dir / "MUSIC_ROUTER_MULTI_MUSIC_SUMMARY.json")
     for row in overlaps:
         print(row)
 

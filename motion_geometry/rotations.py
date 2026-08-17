@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V46.53 single-source-of-truth rotation and tangent-space contract.
+"""Geometry-Aware Routing single-source-of-truth rotation and tangent-space contract.
 
 EDGE uses a *column-concatenated* 6D rotation representation:
 ``[R[:, 0], R[:, 1]]``.  This module is intentionally independent of the

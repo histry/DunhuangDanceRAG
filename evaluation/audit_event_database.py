@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Hard audit for a V46.50 event-heading Event-RAG database."""
+"""Hard audit for a Event-Heading event-heading Event-RAG database."""
 from __future__ import annotations
 
 import argparse
@@ -64,7 +64,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     missing = [k for k in required if k not in db]
     if missing:
         report = {
-            "schema": "v46_50_event_heading_db_audit",
+            "schema": "event_heading_db_audit",
             "ok": False,
             "reasons": [f"missing_arrays:{','.join(missing)}"],
         }
@@ -139,7 +139,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mech_fail = bool(
             is_nonturn
             and float(metrics["longest_same_sign_turn_seconds"])
-            > float(os.environ.get("V46_50_NON_TURN_MAX_MECHANICAL_SECONDS", 3.0))
+            > float(os.environ.get("EVENT_HEADING_NON_TURN_MAX_MECHANICAL_SECONDS", 3.0))
         )
         row["nonturn_mechanical_fail"] = mech_fail
         if mech_fail:
@@ -148,7 +148,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     entry_p95 = float(np.percentile(np.abs(np.degrees(entry)), 95)) if n else 0.0
     max_entry = float(
-        os.environ.get("V46_50_ENTRY_HEADING_P95_MAX_DEG", 5.0)
+        os.environ.get("EVENT_HEADING_ENTRY_HEADING_P95_MAX_DEG", 5.0)
     )
     reasons = []
     if not bool(np.all(valid)):
@@ -175,7 +175,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for k in sorted(set(map(str, intents.tolist())))
     }
     report = {
-        "schema": "v46_50_event_heading_db_audit",
+        "schema": "event_heading_db_audit",
         "db": args.db,
         "ok": not reasons,
         "reasons": reasons,

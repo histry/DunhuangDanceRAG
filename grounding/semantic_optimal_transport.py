@@ -312,10 +312,10 @@ def sparse_sinkhorn(
 
 def _event_arrays(db: Mapping[str, Any]) -> Dict[str, np.ndarray]:
     required = (
-        "v46_53_geometry_desc",
-        "v46_53_bodypart_flow",
-        "v46_53_bodypart_gaussian_mean",
-        "v46_53_bodypart_gaussian_covariance",
+        "event_geometry_geometry_desc",
+        "event_geometry_bodypart_flow",
+        "event_geometry_bodypart_gaussian_mean",
+        "event_geometry_bodypart_gaussian_covariance",
         "aesd_music_alignment_probs",
     )
     missing = [key for key in required if key not in db]
@@ -333,7 +333,7 @@ def _event_arrays(db: Mapping[str, Any]) -> Dict[str, np.ndarray]:
     quality = np.clip(
         np.asarray(
             db.get(
-                "v46_53_combined_quality",
+                "event_geometry_combined_quality",
                 db.get("event_quality_scores", np.full(count, 0.5)),
             ),
             dtype=np.float32,
@@ -390,10 +390,10 @@ def _event_arrays(db: Mapping[str, Any]) -> Dict[str, np.ndarray]:
         "source_ids": source_ids,
         "family_ids": family_ids,
         "source_penalty": source_penalty.astype(np.float32),
-        "geometry": np.asarray(db["v46_53_geometry_desc"], dtype=np.float32),
-        "bodypart": np.asarray(db["v46_53_bodypart_flow"], dtype=np.float32)[:, :5],
-        "gaussian_mean": np.asarray(db["v46_53_bodypart_gaussian_mean"], dtype=np.float32),
-        "gaussian_covariance": np.asarray(db["v46_53_bodypart_gaussian_covariance"], dtype=np.float32),
+        "geometry": np.asarray(db["event_geometry_geometry_desc"], dtype=np.float32),
+        "bodypart": np.asarray(db["event_geometry_bodypart_flow"], dtype=np.float32)[:, :5],
+        "gaussian_mean": np.asarray(db["event_geometry_bodypart_gaussian_mean"], dtype=np.float32),
+        "gaussian_covariance": np.asarray(db["event_geometry_bodypart_gaussian_covariance"], dtype=np.float32),
         "source_values": source_values,
         "family_values": family_values,
         "source_vocab": np.asarray(sorted(source_vocab), dtype=object),

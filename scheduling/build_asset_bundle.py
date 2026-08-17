@@ -159,8 +159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "train_whole_song_planner",
             "validate_scheduler_asset_bundle",
             "same_wav_no_training_regression",
-            "train_v45",
-            "train_v46",
+            "train_boundary_refiner",
+            "train_motion_diffusion",
         ],
     }
     target = Path(args.out)

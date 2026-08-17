@@ -81,26 +81,26 @@ class EventGraphGeometryConfig:
     @classmethod
     def from_environment(cls) -> "EventGraphGeometryConfig":
         return cls(
-            omega_weight=_env_float("V46_53_GLOBAL_OMEGA_W", 0.10),
-            alpha_weight=_env_float("V46_53_GLOBAL_ALPHA_W", 0.002),
-            posture_weight=_env_float("V46_53_GLOBAL_POSTURE_W", 0.35),
-            pelvis_weight=_env_float("V46_53_GLOBAL_PELVIS_W", 1.8),
-            floor_weight=_env_float("V46_53_GLOBAL_FLOOR_W", 2.0),
-            contact_weight=_env_float("V46_53_GLOBAL_CONTACT_W", 0.45),
+            omega_weight=_env_float("GROUNDING_GLOBAL_OMEGA_W", 0.10),
+            alpha_weight=_env_float("GROUNDING_GLOBAL_ALPHA_W", 0.002),
+            posture_weight=_env_float("GROUNDING_GLOBAL_POSTURE_W", 0.35),
+            pelvis_weight=_env_float("GROUNDING_GLOBAL_PELVIS_W", 1.8),
+            floor_weight=_env_float("GROUNDING_GLOBAL_FLOOR_W", 2.0),
+            contact_weight=_env_float("GROUNDING_GLOBAL_CONTACT_W", 0.45),
             root_velocity_weight=_env_float(
-                "V46_53_GLOBAL_ROOT_VEL_W", 0.30
+                "GROUNDING_GLOBAL_ROOT_VEL_W", 0.30
             ),
-            so3_weight=_env_float("V46_55_GRAPH_SO3_W", 0.55),
-            lorentz_weight=_env_float("V46_55_GRAPH_LORENTZ_W", 0.15),
-            posture_hard=_env_float("V46_55_GRAPH_POSTURE_HARD", 2.0),
-            floor_hard_m=_env_float("V46_55_GRAPH_FLOOR_HARD_M", 0.20),
-            contact_hard=_env_float("V46_55_GRAPH_CONTACT_HARD", 0.75),
+            so3_weight=_env_float("GRAPH_ROUTE_SO3_W", 0.55),
+            lorentz_weight=_env_float("GRAPH_ROUTE_LORENTZ_W", 0.15),
+            posture_hard=_env_float("GRAPH_ROUTE_POSTURE_HARD", 2.0),
+            floor_hard_m=_env_float("GRAPH_ROUTE_FLOOR_HARD_M", 0.20),
+            contact_hard=_env_float("GRAPH_ROUTE_CONTACT_HARD", 0.75),
             root_velocity_hard_mps=_env_float(
-                "V46_55_GRAPH_ROOT_VEL_HARD_MPS", 2.0
+                "GRAPH_ROUTE_ROOT_VEL_HARD_MPS", 2.0
             ),
             # Disabled by default: the downstream physical simulator remains
             # authoritative and existing code has no historical SO(3) hard cap.
-            so3_hard_rad=_env_float("V46_55_GRAPH_SO3_HARD_RAD", 0.0),
+            so3_hard_rad=_env_float("GRAPH_ROUTE_SO3_HARD_RAD", 0.0),
         )
 
 
@@ -124,7 +124,7 @@ def event_node_feasibility(
     quality = float(
         _db_value(
             db,
-            "v46_53_combined_quality",
+            "event_geometry_combined_quality",
             index,
             _db_value(db, "event_quality_scores", index, 0.5),
         )
@@ -141,8 +141,8 @@ def so3_product_endpoint_distance(
 ) -> tuple[float, bool]:
     """RMS product-manifold distance over the 24 endpoint rotations."""
 
-    left_key = "v46_55_exit_rotation_matrix"
-    right_key = "v46_55_entry_rotation_matrix"
+    left_key = "graph_route_exit_rotation_matrix"
+    right_key = "graph_route_entry_rotation_matrix"
     if left_key not in db or right_key not in db:
         return 0.0, False
     try:
@@ -165,7 +165,7 @@ def lorentz_hierarchy_distance(
 ) -> tuple[float, bool]:
     """Distance between paper-one Lorentz factors when they are embedded."""
 
-    key = "v46_53_mixed_lorentz"
+    key = "event_geometry_mixed_lorentz"
     if key not in db:
         return 0.0, False
     try:
@@ -175,7 +175,7 @@ def lorentz_hierarchy_distance(
         if left.ndim != 1 or left.shape != right.shape or left.size < 2:
             return 0.0, False
         curvature = float(
-            np.asarray(db.get("v46_53_mixed_curvature", 1.0)).reshape(-1)[0]
+            np.asarray(db.get("event_geometry_mixed_curvature", 1.0)).reshape(-1)[0]
         )
         distance_sq = float(
             np.asarray(
@@ -203,15 +203,15 @@ def manifold_edge_cost(
     previous = int(previous_event)
     current = int(current_event)
     omega = _vector_gap(
-        db, "v46_53_exit_omega", "v46_53_entry_omega", previous, current
+        db, "event_geometry_exit_omega", "event_geometry_entry_omega", previous, current
     )
     alpha = _vector_gap(
-        db, "v46_53_exit_alpha", "v46_53_entry_alpha", previous, current
+        db, "event_geometry_exit_alpha", "event_geometry_entry_alpha", previous, current
     )
     root_velocity = _vector_gap(
         db,
-        "v46_53_exit_root_velocity_mps",
-        "v46_53_entry_root_velocity_mps",
+        "event_geometry_exit_root_velocity_mps",
+        "event_geometry_entry_root_velocity_mps",
         previous,
         current,
     )

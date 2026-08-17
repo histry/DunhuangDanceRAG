@@ -23,7 +23,7 @@
   "external_music_semantic_required": false,
   "external_music_semantic_dirs": "music_semantics:external_music_semantics:output/music_semantics",
   "external_music_semantic_cmd": "",
-  "external_music_semantic_cache_dir": "output/v46_external_music_semantic_cache",
+  "external_music_semantic_cache_dir": "output/motion_external_music_semantic_cache",
   "external_music_semantic_weight": 0.78,
   "external_music_semantic_temperature": 0.65,
   "external_music_semantic_proxy_enable": false,

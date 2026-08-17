@@ -2,8 +2,8 @@
 """Build isolated canonical-30 and native-60 data/model branches.
 
 The command is dry-run by default.  Pass ``--execute`` to rebuild caches,
-Event-DBs, Scheduler indexes and duration assets.  V45/V46 training remains an
-explicit ``--train_v45_v46`` action because it is expensive.
+Event-DBs, Scheduler indexes and duration assets.  Motion Refiner and Motion Diffusion training remains an
+explicit ``--train_motion_models`` action because it is expensive.
 """
 from __future__ import annotations
 
@@ -152,13 +152,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--planner_ckpt_60")
     parser.add_argument(
         "--regression_audio",
-        help="One WAV used for the mandatory no-training gate before V45/V46 training.",
+        help="One WAV used for the mandatory no-training gate before Motion Refiner and Motion Diffusion training.",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--smpl_scaling_mode", default="canonical_body", choices=("canonical_body", "scale_translation", "inverse_scale_translation"))
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--train_v45_v46", action="store_true")
+    parser.add_argument("--train_motion_models", action="store_true")
     parser.add_argument("--refiner_steps", type=int)
     parser.add_argument("--diffusion_steps", type=int)
     parser.add_argument("--split_seed", type=int, default=20260718)
@@ -167,9 +167,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--test_ratio", type=float, default=0.165)
     args = parser.parse_args(argv)
 
-    if args.execute and args.train_v45_v46 and not args.regression_audio:
+    if args.execute and args.train_motion_models and not args.regression_audio:
         raise RuntimeError(
-            "--train_v45_v46 requires --regression_audio so route/action metrics "
+            "--train_motion_models requires --regression_audio so route/action metrics "
             "can gate training for both frame-rate branches."
         )
 
@@ -202,10 +202,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile = _write_profile(base, float(fps), config)
         branch_env = dict(env)
         branch_env.update({
-            "V46_FPS": str(float(fps)),
-            "V46_51_FPS": str(float(fps)),
-            "V46_49_RETARGET_FPS": str(float(fps)),
-            "V46_53_GROUNDER_CKPT": str(
+            "MOTION_FPS": str(float(fps)),
+            "GENERATION_FPS": str(float(fps)),
+            "SOURCE_RETARGET_FPS": str(float(fps)),
+            "GROUNDING_GROUNDER_CKPT": str(
                 branch / "checkpoints" / "dual_branch_grounder.pt"
             ),
         })
@@ -301,7 +301,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python, "-m", "scheduling.build_duration_index",
                 "--index_json", str(scheduler / "event_index.json"),
                 "--index_npz", str(base_index),
-                "--v23_checkpoint", str(Path(duration_ckpt).resolve()),
+                "--duration_model_checkpoint", str(Path(duration_ckpt).resolve()),
                 "--out_npz", str(scheduler / "duration_index.npz"),
                 "--out_json", str(scheduler / "duration_index.report.json"),
                 "--fps", str(fps),
@@ -332,7 +332,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--out", str(scheduler / "asset_bundle.json"),
             ])
 
-        if args.train_v45_v46:
+        if args.train_motion_models:
             refiner = [python, "training/motion_models.py", "--config", str(config), "train-refiner", "--db", str(semantic_db), "--val_db", str(semantic_dbs["val"]), "--out", str(branch / "checkpoints" / "boundary_refiner.pt")]
             diffusion = [python, "training/motion_models.py", "--config", str(config), "train-diffusion", "--db", str(semantic_db), "--val_db", str(semantic_dbs["val"]), "--out", str(branch / "checkpoints" / "local_diffusion.pt")]
             if args.refiner_steps:

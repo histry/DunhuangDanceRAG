@@ -126,18 +126,18 @@ class MultirateMotionContractTests(unittest.TestCase):
             "foot_penetration_max_m": 0.010,
         }
         environment = {
-            "V46_46_MAX_BOUNDARY_JERK_MPS3": "800.0",
-            "V46_46_MAX_EXIT_FK_JUMP_M": "0.015",
-            "V46_46_MAX_EXIT_ROT_RAD": "0.08",
-            "V46_46_MAX_FOOT_SLIP_MPS": "0.06",
-            "V46_46_MAX_FOOT_PENETRATION_M2": "0.001",
+            "BOUNDARY_MAX_BOUNDARY_JERK_MPS3": "800.0",
+            "BOUNDARY_MAX_EXIT_FK_JUMP_M": "0.015",
+            "BOUNDARY_MAX_EXIT_ROT_RAD": "0.08",
+            "BOUNDARY_MAX_FOOT_SLIP_MPS": "0.06",
+            "BOUNDARY_MAX_FOOT_PENETRATION_M2": "0.001",
             # This ambiguous legacy value must not change the SI gate.
-            "V46_46_MAX_BOUNDARY_JERK": "1.0",
+            "BOUNDARY_MAX_BOUNDARY_JERK": "1.0",
         }
         with mock.patch.dict(os.environ, environment, clear=False):
             self.assertTrue(risk_safe(risk))
 
-        environment["V46_46_MAX_BOUNDARY_JERK_MPS3"] = "600.0"
+        environment["BOUNDARY_MAX_BOUNDARY_JERK_MPS3"] = "600.0"
         with mock.patch.dict(os.environ, environment, clear=False):
             self.assertFalse(risk_safe(risk))
 

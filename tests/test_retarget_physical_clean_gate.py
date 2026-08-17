@@ -3,7 +3,7 @@ from retargeting.build_cache import _report_valid
 
 def _report(physical_clean_ok: bool):
     return {
-        "version": "official_smpl_v46_53_1",
+        "version": "official_smpl_event_geometry_1",
         "ok": True,
         "source_gate_ok": True,
         "gravity_ok": True,

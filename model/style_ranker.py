@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 
-class V21StyleRanker(nn.Module):
+class StyleRanker(nn.Module):
     def __init__(self, input_dim: int = 64, hidden_dim: int = 128, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
@@ -27,10 +27,10 @@ class V21StyleRanker(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def load_style_ranker(path: str | Path, device: torch.device | str = "cpu") -> V21StyleRanker:
+def load_style_ranker(path: str | Path, device: torch.device | str = "cpu") -> StyleRanker:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     config: Dict[str, Any] = dict(ckpt.get("config", {}))
-    model = V21StyleRanker(
+    model = StyleRanker(
         input_dim=int(config.get("input_dim", 64)),
         hidden_dim=int(config.get("hidden_dim", 128)),
         dropout=float(config.get("dropout", 0.1)),

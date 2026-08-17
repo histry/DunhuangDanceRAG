@@ -166,7 +166,7 @@ def install(latest: Any) -> None:
         return
 
     original_route = latest._global_route_preorder
-    original_proposal = latest.v52.v4650._build_heading_proposal
+    original_proposal = latest.anatomy_heading_runtime.heading_runtime._build_heading_proposal
 
     def route_with_diversity(
         slots: Sequence[Mapping[str, Any]],
@@ -200,10 +200,10 @@ def install(latest: Any) -> None:
             return proposal, extra
         decision = transition_decision(
             np.asarray(previous, dtype=np.float32)[
-                -max(8, _env_int("V46_53_TANGENT_WINDOW", 8)) :
+                -max(8, _env_int("GROUNDING_TANGENT_WINDOW", 8)) :
             ],
             np.asarray(proposal.core, dtype=np.float32)[
-                : max(8, _env_int("V46_53_TANGENT_WINDOW", 8))
+                : max(8, _env_int("GROUNDING_TANGENT_WINDOW", 8))
             ],
             previous_intrinsic_prior=None,
             following_intrinsic_prior=_current_intrinsic_prior(db, event_id),
@@ -224,5 +224,5 @@ def install(latest: Any) -> None:
         return proposal, updated_extra
 
     latest._global_route_preorder = route_with_diversity
-    latest.v52.v4650._build_heading_proposal = proposal_with_pairwise_policy
+    latest.anatomy_heading_runtime.heading_runtime._build_heading_proposal = proposal_with_pairwise_policy
     _INSTALLED = True

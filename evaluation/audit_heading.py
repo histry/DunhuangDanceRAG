@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Audit a V46.50 generated whole-song motion against the heading plan."""
+"""Audit a Event-Heading generated whole-song motion against the heading plan."""
 from __future__ import annotations
 
 import argparse
@@ -201,7 +201,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     reasons: List[str] = []
     max_plan_err = float(
-        os.environ.get("V46_50_PLANNED_HEADING_ERROR_P95_MAX_DEG", 2.0)
+        os.environ.get("EVENT_HEADING_PLANNED_HEADING_ERROR_P95_MAX_DEG", 2.0)
     )
     if planned_error_p95 > max_plan_err:
         reasons.append(
@@ -219,7 +219,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         reasons.append("missing_event_heading_planner_report")
 
     result = {
-        "schema": "v46_50_generated_heading_audit",
+        "schema": "event_heading_generated_heading_audit",
         "ok": not reasons,
         "reasons": reasons,
         "motion": args.motion,

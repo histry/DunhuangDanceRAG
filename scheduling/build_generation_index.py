@@ -158,7 +158,7 @@ def build_generation_index(
     posture_exit = _array(db, "posture_exit", count, "unknown")
     posture_mode = _array(db, "posture_mode", count, "unknown")
     semantics = _array(db, "aesd_event_semantics", count, "neutral_flow")
-    quality = _array(db, "v46_53_combined_quality", count, 0.5).astype(np.float32)
+    quality = _array(db, "event_geometry_combined_quality", count, 0.5).astype(np.float32)
     anatomy_quality = _array(db, "anatomy_quality", count, 0.5).astype(np.float32)
     hard_valid = _array(db, "anatomy_hard_valid", count, True).astype(bool)
     heading_quality = _array(db, "event_heading_quality", count, 0.5).astype(np.float32)
@@ -404,7 +404,7 @@ def build_generation_index(
         safety_score=safety.astype(np.float32),
         natural_duration=frames.astype(np.float32),
         duration_confidence=np.ones(count, dtype=np.float32),
-        v23_duration_used=np.zeros(count, dtype=bool),
+        duration_model_duration_used=np.zeros(count, dtype=bool),
         turn_peak_dps=turn_peak_dps.astype(np.float32),
         turn_angle_deg=turn_angle_deg.astype(np.float32),
         event_db_contract_json=np.asarray(json.dumps(contract, sort_keys=True), dtype=object),

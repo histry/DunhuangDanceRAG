@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""V23-v2.5 continuous-calibrated duration and monotonic time-warp model.
+"""Continuous-calibrated duration and monotonic time-warp model.
 
 Stage 1 predicts natural event duration from pace/dynamics rather than absolute
 pose identity.  It uses:
@@ -238,7 +238,7 @@ class OrderedThresholdHead(nn.Module):
         return logits, probability, score
 
 
-class V23MonotonicDurationNet(nn.Module):
+class MonotonicDurationModel(nn.Module):
     """Ordinal event-consistent natural duration and monotonic time-warp model."""
 
     def __init__(
@@ -598,7 +598,7 @@ class V23MonotonicDurationNet(nn.Module):
                     parameter.requires_grad = True
 
 
-def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> Dict[str, Any]:
+def load_duration_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = dict(checkpoint.get("config", {}))
     checkpoint_layout = normalize_rot6d_layout(
@@ -610,7 +610,7 @@ def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") ->
             f"checkpoint declares rot6d_layout={checkpoint_layout!r}."
         )
     duration_edges = config.get("duration_edges", [12, 24, 37, 50, 63, 76, 89])
-    model = V23MonotonicDurationNet(
+    model = MonotonicDurationModel(
         motion_dim=int(config.get("motion_dim", 151)),
         condition_dim=int(config.get("condition_dim", 17)),
         hidden_dim=int(config.get("hidden_dim", 96)),
@@ -639,11 +639,11 @@ def load_v23_checkpoint(path: str | Path, device: torch.device | str = "cpu") ->
 
 
 # Version-free public API; historical names remain for checkpoint compatibility.
-DurationPredictor = V23MonotonicDurationNet
+DurationPredictor = MonotonicDurationModel
 
 
 def load_duration_checkpoint(
     path: str | Path,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
-    return load_v23_checkpoint(path, device=device)
+    return load_duration_checkpoint(path, device=device)

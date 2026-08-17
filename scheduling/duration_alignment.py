@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Exact whole-song integer duration allocation for music-dominant V26.
+"""Exact whole-song integer duration allocation for music-dominant Whole-Song Planner.
 
 Principle:
 1. music phrase length and local speed factor define the target rhythm;
@@ -208,7 +208,7 @@ def allocate_whole_song_durations(
         if bool(np.any(over) or np.any(under)):
             override_reason = "music_boundaries_locked_with_natural_warp_override"
         return {
-            "version": "v26_music_dominant_duration_alignment",
+            "version": "whole_song_music_dominant_duration_alignment",
             "total_frames": int(total_frames),
             "content_budget": int(allocation.sum()),
             "content_lengths": allocation.astype(int).tolist(),
@@ -305,7 +305,7 @@ def allocate_whole_song_durations(
         boundaries.append(boundaries[-1] + int(length))
 
     return {
-        "version": "v26_music_dominant_duration_alignment",
+        "version": "whole_song_music_dominant_duration_alignment",
         "total_frames": int(total_frames),
         "content_budget": int(content_budget),
         "content_lengths": allocation.tolist(),

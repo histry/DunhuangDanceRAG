@@ -93,7 +93,7 @@ class CandidateAnatomyCache:
         self.maximum_entries = max(
             1,
             int(
-                _env_int("V46_52_ANATOMY_CACHE_MAX_ENTRIES", 2048)
+                _env_int("RETARGET_ANATOMY_CACHE_MAX_ENTRIES", 2048)
                 if maximum_entries is None
                 else maximum_entries
             ),
@@ -148,7 +148,7 @@ class CandidateAnatomyCache:
         with self._lock:
             return {
                 "schema": "candidate_anatomy_lru_cache",
-                "enabled": _env_bool("V46_52_ANATOMY_CACHE_ENABLE", True),
+                "enabled": _env_bool("RETARGET_ANATOMY_CACHE_ENABLE", True),
                 "entries": int(len(self._items)),
                 "maximum_entries": int(self.maximum_entries),
                 "requests": int(self.requests),
@@ -273,7 +273,7 @@ def evaluate_candidate_anatomy(
     static_feature, static_complete = static_event_anatomy(db, int(event_id))
     tolerance = max(
         0.0,
-        _env_float("V46_52_ANATOMY_STATIC_WARP_TOLERANCE", 0.02),
+        _env_float("RETARGET_ANATOMY_STATIC_WARP_TOLERANCE", 0.02),
     )
 
     if static_complete and abs(warp - 1.0) <= tolerance:
@@ -295,7 +295,7 @@ def evaluate_candidate_anatomy(
 
     configured_sample = max(
         8,
-        _env_int("V46_52_ANATOMY_REVALIDATION_SAMPLE_FRAMES", 32),
+        _env_int("RETARGET_ANATOMY_REVALIDATION_SAMPLE_FRAMES", 32),
     )
     sample_n = min(target_n, configured_sample)
     mode = (
@@ -312,7 +312,7 @@ def evaluate_candidate_anatomy(
         evaluation_mode=mode,
     )
 
-    if _env_bool("V46_52_ANATOMY_CACHE_ENABLE", True):
+    if _env_bool("RETARGET_ANATOMY_CACHE_ENABLE", True):
         cached = cache.get(key)
         if cached is not None:
             report = dict(cached.pop("__evaluation_report__", {}))
@@ -340,7 +340,7 @@ def evaluate_candidate_anatomy(
     }
     payload = copy.deepcopy(feature)
     payload["__evaluation_report__"] = dict(report)
-    if _env_bool("V46_52_ANATOMY_CACHE_ENABLE", True):
+    if _env_bool("RETARGET_ANATOMY_CACHE_ENABLE", True):
         cache.put(key, payload)
     report["cache"] = cache.snapshot()
     return feature, report
@@ -358,7 +358,7 @@ class AnatomyProgressMonitor:
         self._state: Dict[str, Any] = {}
 
     def _emit(self, event: str) -> None:
-        if not _env_bool("V46_52_ANATOMY_PROGRESS_ENABLE", True):
+        if not _env_bool("RETARGET_ANATOMY_PROGRESS_ENABLE", True):
             return
         with self._lock:
             row = dict(self._state)
@@ -385,7 +385,7 @@ class AnatomyProgressMonitor:
         interval = max(
             1.0,
             _env_float(
-                "V46_52_ANATOMY_PROGRESS_HEARTBEAT_SECONDS", 30.0
+                "RETARGET_ANATOMY_PROGRESS_HEARTBEAT_SECONDS", 30.0
             ),
         )
         while not self._stop.wait(interval):
@@ -464,7 +464,7 @@ class AnatomyProgressMonitor:
             self._state["last_candidate_safe"] = bool(safe)
         every = max(
             1,
-            _env_int("V46_52_ANATOMY_PROGRESS_EVERY_PROPOSALS", 25),
+            _env_int("RETARGET_ANATOMY_PROGRESS_EVERY_PROPOSALS", 25),
         )
         if int(self._state.get("proposal_count", 0)) % every == 0:
             self._emit("proposal_progress")
