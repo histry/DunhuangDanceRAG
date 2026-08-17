@@ -2,10 +2,12 @@ import json
 import os
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import training.motion_models as motion_runtime
 
 from motion_geometry.resampling import blend_edge151_geodesic_np
 from motion_geometry.rotations import (
@@ -18,10 +20,16 @@ from motion_geometry.smpl24 import skeleton_contract
 from support.event_identity import make_event_db_contract
 from training.motion_models import (
     MotionGenerationConfig,
+    _finalize_generation_outputs,
+    _new_validation_physical_accumulator,
+    _record_validation_physical_prediction,
+    _summarize_validation_physical_metrics,
     _descriptor_values_in_training_coordinates,
     _training_db_contract,
     _validate_source_disjoint,
     assert_motion_checkpoint_contract,
+    build_frame_local_conditioning,
+    identity6d_np,
     load_db,
     motion_checkpoint_contract,
     parse_args,
@@ -56,6 +64,12 @@ def _database(count=2, fps=30.0, sources=None):
 
 
 class MotionTrainingContractTests(unittest.TestCase):
+    @staticmethod
+    def _identity_motion(frames=60):
+        motion = np.zeros((frames, 151), dtype=np.float32)
+        motion[:, 7:151] = np.tile(identity6d_np(), 24)[None]
+        return motion
+
     def test_training_db_rejects_false_fps_contract(self):
         cfg = MotionGenerationConfig()
         cfg.fps = 60.0
@@ -138,6 +152,108 @@ class MotionTrainingContractTests(unittest.TestCase):
         ])
         self.assertEqual(refiner.val_db, "val.npz")
         self.assertEqual(diffusion.val_db, "val.npz")
+
+    def test_motion_training_cli_requires_validation_db(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["train-refiner", "--db", "train.npz", "--out", "out.pt"])
+        with self.assertRaises(SystemExit):
+            parse_args(["train-diffusion", "--db", "train.npz", "--out", "out.pt"])
+
+    def test_frame_local_conditioning_interpolates_transition(self):
+        features = np.stack(
+            [np.zeros(32, dtype=np.float32), np.ones(32, dtype=np.float32)]
+        )
+        reports = [
+            {"target_frames": 3, "transition_span": None},
+            {"target_frames": 3, "transition_span": [3, 5]},
+        ]
+        condition = build_frame_local_conditioning(
+            features,
+            reports,
+            total_frames=6,
+            descriptor_mean=np.zeros(32, dtype=np.float32),
+            descriptor_std=np.ones(32, dtype=np.float32),
+        )
+        self.assertEqual(condition.shape, (6, 32))
+        self.assertTrue(np.allclose(condition[:4], 0.0))
+        self.assertTrue(np.allclose(condition[4:], 1.0))
+        self.assertGreater(float(np.std(condition)), 0.0)
+
+    @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
+    def test_neural_models_accept_frame_local_conditioning(self):
+        torch = motion_runtime.torch
+        frames = 8
+        condition = torch.randn(1, frames, 32)
+        motion = torch.zeros(1, frames, 151)
+        seam = torch.zeros(1, frames, 1)
+        refiner = motion_runtime.TemporalRefiner()
+        refined = refiner(motion, condition, seam)
+        self.assertEqual(tuple(refined.shape), (1, frames, 151))
+
+        denoiser = motion_runtime.DiffusionDenoiser()
+        denoised = denoiser(
+            motion,
+            motion,
+            condition,
+            seam,
+            torch.zeros(1, dtype=torch.long),
+        )
+        self.assertEqual(tuple(denoised.shape), (1, frames, 151))
+
+    def test_generation_has_one_explicit_public_entrypoint(self):
+        source = (Path(__file__).parents[1] / "training" / "motion_models.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(source.count("\ndef generate("), 1)
+        self.assertNotIn("_stage_guard_orig_generate", source)
+        self.assertNotIn("_energy_stability_orig_generate", source)
+        self.assertNotIn("_physics_stability_orig_generate", source)
+        self.assertNotIn("PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPF", source)
+
+    def test_validation_summary_contains_deployment_physical_metrics(self):
+        cfg = MotionGenerationConfig()
+        motion = self._identity_motion(60)
+        accumulator = _new_validation_physical_accumulator()
+        _record_validation_physical_prediction(accumulator, motion, motion, cfg)
+        summary = _summarize_validation_physical_metrics(accumulator)
+        self.assertEqual(summary["num_windows"], 1)
+        self.assertIn("fk_position_error_m_p95", summary)
+        self.assertIn("foot_skate_mps_p95", summary["worst_window"])
+        self.assertIn("joint_jerk_mps3_p95", summary["worst_window"])
+        self.assertIn("joint_rotation_step_rad_p95", summary["worst_window"])
+        self.assertIn("root_horizontal_net_displacement_m", summary["worst_window"])
+
+    def test_final_physical_gate_rejects_without_writing_accepted_output(self):
+        cfg = MotionGenerationConfig()
+        motion = self._identity_motion(60)
+        motion[:, 4] = np.where(np.arange(60) % 2 == 0, 0.0, 2.0)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            args = Namespace(
+                out=str(root / "motion.npy"),
+                json=str(root / "report.json"),
+                audio=None,
+                render_output=None,
+                render_script="rendering/render_motion.py",
+            )
+            np.save(root / "motion.npy", self._identity_motion(10))
+            rc = _finalize_generation_outputs(
+                args,
+                cfg,
+                motion,
+                self._identity_motion(60),
+                np.zeros((60, 1), dtype=np.float32),
+                {},
+            )
+            self.assertEqual(rc, 2)
+            self.assertFalse((root / "motion.npy").exists())
+            self.assertTrue((root / "motion.rejected.npy").exists())
+            self.assertEqual(len(list(root.glob("motion.preexisting_*.npy"))), 1)
+            report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["generation_status"], "rejected_by_final_physical_gate")
+            self.assertFalse(report["accepted_output_written"])
+            self.assertFalse(report["final_physical_gate"]["ok"])
+            self.assertIsNotNone(report["preexisting_accepted_output_quarantined"])
 
 
 if __name__ == "__main__":

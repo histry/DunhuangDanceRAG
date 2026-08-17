@@ -27,8 +27,8 @@ Typical commands
 ----------------
 python -m training.motion_models build-db --motion_dirs change data/motions --out_db output/motion_db
 python -m training.motion_models train-contrastive --db output/motion_db/events.npz --out output/motion_db/semantic_retriever.pt
-python -m training.motion_models train-refiner --db output/motion_db/events.npz --out output/motion_db/boundary_refiner.pt
-python -m training.motion_models train-diffusion --db output/motion_db/events.npz --out output/motion_db/motion_diffusion.pt
+python -m training.motion_models train-refiner --db output/motion_db/events.train.npz --val_db output/motion_db/events.val.npz --out output/motion_db/boundary_refiner.pt
+python -m training.motion_models train-diffusion --db output/motion_db/events.train.npz --val_db output/motion_db/events.val.npz --out output/motion_db/motion_diffusion.pt
 python -m training.motion_models generate --audio test_music_bank/dunhuangwu2.wav --db output/motion_db/events.npz --out output/motion_dunhuangwu2.npy
 """
 
@@ -581,6 +581,12 @@ class MotionGenerationConfig:
     physics_acceleration_loss_weight: float = 0.02
     physics_jerk_loss_weight: float = 0.01
     physics_static_support_speed_mps: float = 0.18
+    # Whole-sequence acceptance is authoritative. A candidate that fails the
+    # SI physical gate is written only as an explicitly rejected diagnostic,
+    # never to the requested accepted-output path.
+    final_physical_gate_enable: bool = True
+    final_physical_gate_fail_closed: bool = True
+    final_physical_gate_save_rejected: bool = True
     tangent_diffusion_enable: bool = True
     tangent_diffusion_rotation_cap_rad: float = 0.45
     tangent_diffusion_root_cap_m: float = 0.10
@@ -639,6 +645,9 @@ class MotionGenerationConfig:
             "MOTION_PHYSICS_JERK_LOSS_WEIGHT": ("physics_jerk_loss_weight", float),
             "MOTION_PHYSICS_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
             "CONTACT_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
+            "MOTION_FINAL_PHYSICAL_GATE_ENABLE": ("final_physical_gate_enable", lambda x: bool(int(x))),
+            "MOTION_FINAL_PHYSICAL_GATE_FAIL_CLOSED": ("final_physical_gate_fail_closed", lambda x: bool(int(x))),
+            "MOTION_FINAL_PHYSICAL_GATE_SAVE_REJECTED": ("final_physical_gate_save_rejected", lambda x: bool(int(x))),
             "MOTION_TANGENT_DIFFUSION_ENABLE": ("tangent_diffusion_enable", lambda x: bool(int(x))),
             "MOTION_TANGENT_DIFFUSION_ROTATION_CAP_RAD": ("tangent_diffusion_rotation_cap_rad", float),
             "MOTION_TANGENT_DIFFUSION_ROOT_CAP_M": ("tangent_diffusion_root_cap_m", float),
@@ -3601,6 +3610,112 @@ def train_contrastive(args: argparse.Namespace) -> int:
     print(json.dumps({"contrastive_ckpt": str(out), "num_pairs": int(N), "supervision_mode": supervision_mode, "pair_report": pair_report}, ensure_ascii=False, indent=2))
     return 0
 
+def _expand_temporal_condition_torch(cond, frames: int):
+    """Return condition as ``[batch, frames, features]``.
+
+    Checkpoint parameters are unchanged: legacy callers may still pass one
+    descriptor per sequence, while whole-song generation can pass a local
+    descriptor for every frame.
+    """
+
+    if cond.ndim == 2:
+        return cond[:, None, :].expand(cond.shape[0], int(frames), cond.shape[-1])
+    if cond.ndim == 3 and cond.shape[1] == int(frames):
+        return cond
+    raise ValueError(
+        f"condition must be [B,C] or [B,T,C] with T={frames}, got {tuple(cond.shape)}"
+    )
+
+
+def _condition_with_time_torch(cond, time_embedding, frames: int, projector):
+    frame_cond = _expand_temporal_condition_torch(cond, frames)
+    frame_time = time_embedding[:, None, :].expand(
+        frame_cond.shape[0], int(frames), time_embedding.shape[-1]
+    )
+    return projector(torch.cat([frame_cond, frame_time], dim=-1)).transpose(1, 2)
+
+
+def _condition_chunk_np(
+    condition: np.ndarray,
+    start: int,
+    end: int,
+    target_frames: Optional[int] = None,
+) -> np.ndarray:
+    """Slice frame-local conditioning while retaining legacy vector inputs."""
+
+    value = np.asarray(condition, dtype=np.float32)
+    if value.ndim == 1:
+        return value
+    if value.ndim != 2:
+        raise ValueError(f"condition must be [C] or [T,C], got {value.shape}")
+    chunk = value[int(start):int(end)]
+    if chunk.shape[0] < 1:
+        raise ValueError(f"empty condition slice [{start}:{end}] for {value.shape}")
+    desired = int(target_frames if target_frames is not None else end - start)
+    if chunk.shape[0] != desired:
+        chunk = resample_motion_np(chunk, desired)
+    return np.asarray(chunk, dtype=np.float32)
+
+
+def build_frame_local_conditioning(
+    slot_features: np.ndarray,
+    concat_report: Sequence[Mapping[str, Any]],
+    total_frames: int,
+    descriptor_mean: np.ndarray,
+    descriptor_std: np.ndarray,
+) -> np.ndarray:
+    """Expand slot descriptors to frames and interpolate every transition.
+
+    Each slot owns exactly ``target_frames`` in the reference concatenation.
+    A transition at the start of slot *i* interpolates from slot *i-1* to slot
+    *i*, so neural repair observes the local musical change instead of one
+    whole-song average descriptor.
+    """
+
+    features = np.asarray(slot_features, dtype=np.float32)
+    if features.ndim != 2 or features.shape[0] < 1:
+        raise ValueError(f"slot_features must be non-empty [S,C], got {features.shape}")
+    if len(concat_report) != features.shape[0]:
+        raise ValueError(
+            "slot feature/report count mismatch: "
+            f"{features.shape[0]} features vs {len(concat_report)} reports"
+        )
+
+    frame_parts: List[np.ndarray] = []
+    transition_spans: List[Tuple[int, int, int]] = []
+    for index, report in enumerate(concat_report):
+        count = int(report.get("target_frames", report.get("slot_total_frames", 0)))
+        if count <= 0:
+            raise ValueError(f"slot {index} has invalid target_frames={count}")
+        frame_parts.append(np.repeat(features[index:index + 1], count, axis=0))
+        span = report.get("transition_span")
+        if index > 0 and span is not None and len(span) >= 2:
+            transition_spans.append((int(span[0]), int(span[1]), index))
+    frame_condition = np.concatenate(frame_parts, axis=0).astype(np.float32)
+    if frame_condition.shape[0] != int(total_frames):
+        frame_condition = resample_motion_np(frame_condition, int(total_frames))
+
+    for start, end, index in transition_spans:
+        start = max(0, min(int(total_frames), start))
+        end = max(start, min(int(total_frames), end))
+        if end <= start:
+            continue
+        alpha = np.linspace(0.0, 1.0, end - start, dtype=np.float32)[:, None]
+        frame_condition[start:end] = (
+            (1.0 - alpha) * features[index - 1][None]
+            + alpha * features[index][None]
+        )
+
+    mean = np.asarray(descriptor_mean, dtype=np.float32).reshape(-1)
+    std = np.asarray(descriptor_std, dtype=np.float32).reshape(-1)
+    if mean.shape[0] != features.shape[1] or std.shape[0] != features.shape[1]:
+        raise ValueError(
+            f"descriptor normalization mismatch: features={features.shape[1]}, "
+            f"mean={mean.shape[0]}, std={std.shape[0]}"
+        )
+    return ((frame_condition - mean[None]) / np.maximum(std[None], 1.0e-8)).astype(np.float32)
+
+
 class TemporalRefiner(nn.Module):
     """Legacy 151D Euclidean refiner kept for old Motion Refiner checkpoints."""
 
@@ -3617,9 +3732,9 @@ class TemporalRefiner(nn.Module):
         nn.init.zeros_(self.out.bias)
 
     def forward(self, x, cond, seam_mask):
-        # x: B,T,D cond: B,C seam_mask: B,T,1
+        # x: B,T,D cond: B,C or B,T,C seam_mask: B,T,1
         B, T, D = x.shape
-        c = cond[:, None, :].expand(B, T, cond.shape[-1])
+        c = _expand_temporal_condition_torch(cond, T)
         y = torch.cat([x, c, seam_mask], dim=-1).transpose(1, 2)
         h = self.in_proj(y)
         h = h + self.net(h)
@@ -3662,9 +3777,9 @@ class ProductManifoldTemporalRefiner(nn.Module):
         nn.init.zeros_(self.out.bias)
 
     def forward(self, x, cond, seam_mask, joint_mask):
-        # x: B,T,151; cond: B,32; seam: B,T,1; joint_mask: B,T,24.
+        # x: B,T,151; cond: B,32 or B,T,32; seam: B,T,1.
         batch, frames, _ = x.shape
-        c = cond[:, None, :].expand(batch, frames, cond.shape[-1])
+        c = _expand_temporal_condition_torch(cond, frames)
         y = torch.cat([x, c, seam_mask, joint_mask], dim=-1).transpose(1, 2)
         h = self.in_proj(y)
         h = h + self.net(h)
@@ -3991,6 +4106,112 @@ def _validation_indices(count: int, maximum: int = 16) -> List[int]:
     return sorted(set(np.linspace(0, count - 1, min(count, maximum), dtype=np.int64).tolist()))
 
 
+_VALIDATION_PHYSICAL_KEYS = (
+    "foot_skate_mps_p95",
+    "foot_skate_mps_max",
+    "foot_support_drift_m_p95",
+    "foot_support_drift_m_max",
+    "foot_contact_height_m_max",
+    "foot_contact_mismatch_ratio",
+    "foot_penetration_min_m",
+    "joint_jerk_mps3_p95",
+    "joint_jerk_mps3_max",
+    "joint_jerk_window_p95_max_mps3",
+    "extremity_jerk_mps3_p95",
+    "extremity_jerk_window_p95_max_mps3",
+    "joint_rotation_step_rad_p95",
+    "joint_rotation_step_rad_max",
+    "joint_rotation_step_window_p95_max_rad",
+    "root_y_robust_range_m",
+    "root_vertical_speed_mps_p95",
+    "root_horizontal_radius_p95_m",
+    "root_horizontal_net_displacement_m",
+    "root_horizontal_window_displacement_max_m",
+)
+
+
+def _new_validation_physical_accumulator() -> Dict[str, Any]:
+    return {"audits": [], "gates": [], "fk_errors": []}
+
+
+def _record_validation_physical_prediction(
+    accumulator: Dict[str, Any],
+    prediction: np.ndarray,
+    clean: np.ndarray,
+    cfg: MotionGenerationConfig,
+) -> None:
+    predicted = np.asarray(prediction, dtype=np.float32)
+    target, _ = enforce_edge151_contract_np(
+        np.asarray(clean, dtype=np.float32),
+        cfg,
+        source_hint="checkpoint_validation_target",
+        derive_contact=True,
+        project_rot=True,
+    )
+    try:
+        audit = audit_motion_np(predicted, cfg)
+    except Exception as exc:
+        # Validation is fail-closed: never project or sanitize a broken model
+        # prediction into an apparently healthy physical sample.
+        audit = {
+            "schema": "invalid_validation_prediction",
+            "validation_audit_error": f"{type(exc).__name__}: {exc}",
+        }
+    gate = evaluate_physical_audit(audit)
+    try:
+        fk_error = np.linalg.norm(
+            fk_24_np(predicted) - fk_24_np(target), axis=-1
+        )
+        if not np.isfinite(fk_error).all():
+            fk_error = np.full((1,), np.inf, dtype=np.float32)
+    except Exception:
+        fk_error = np.full((1,), np.inf, dtype=np.float32)
+    accumulator["audits"].append(audit)
+    accumulator["gates"].append(gate)
+    accumulator["fk_errors"].append(fk_error.reshape(-1))
+
+
+def _summarize_validation_physical_metrics(
+    accumulator: Mapping[str, Any],
+) -> Dict[str, Any]:
+    audits = list(accumulator.get("audits", []))
+    gates = list(accumulator.get("gates", []))
+    error_parts = list(accumulator.get("fk_errors", []))
+    errors = np.concatenate(error_parts) if error_parts else np.zeros(0, dtype=np.float32)
+    failure_counts: Dict[str, int] = {}
+    for gate in gates:
+        for reason in gate.get("reasons", []):
+            failure_counts[str(reason)] = failure_counts.get(str(reason), 0) + 1
+
+    worst_window: Dict[str, Optional[float]] = {}
+    mean_across_windows: Dict[str, Optional[float]] = {}
+    for key in _VALIDATION_PHYSICAL_KEYS:
+        values = [float(audit[key]) for audit in audits if key in audit]
+        if not values:
+            worst_window[key] = None
+            mean_across_windows[key] = None
+            continue
+        worst_window[key] = (
+            float(min(values)) if key == "foot_penetration_min_m" else float(max(values))
+        )
+        mean_across_windows[key] = float(np.mean(values))
+
+    passed = sum(bool(gate.get("ok", False)) for gate in gates)
+    return {
+        "num_windows": len(audits),
+        "fk_position_error_m_mean": float(np.mean(errors)) if errors.size else None,
+        "fk_position_error_m_p95": float(np.percentile(errors, 95)) if errors.size else None,
+        "fk_position_error_m_max": float(np.max(errors)) if errors.size else None,
+        "physical_gate_pass_rate": float(passed / len(gates)) if gates else None,
+        "physical_gate_failed_windows": int(len(gates) - passed),
+        "physical_gate_failure_reasons": failure_counts,
+        "worst_window": worst_window,
+        "mean_across_windows": mean_across_windows,
+        "gate": "contracts.physical_quality.evaluate_physical_audit",
+        "aggregation_note": "worst_window is conservative across deterministic validation windows",
+    }
+
+
 def _evaluate_refiner_validation(
     model: Any,
     validation_db: Dict[str, Any],
@@ -4005,6 +4226,7 @@ def _evaluate_refiner_validation(
     np.random.seed(int(cfg.seed) + 45001)
     rec_values: List[float] = []
     velocity_values: List[float] = []
+    physical = _new_validation_physical_accumulator()
     model.eval()
     try:
         with torch.no_grad():
@@ -4059,6 +4281,12 @@ def _evaluate_refiner_validation(
                         pred[:, 1:] - pred[:, :-1],
                         clean_t[:, 1:] - clean_t[:, :-1],
                     ).cpu()))
+                _record_validation_physical_prediction(
+                    physical,
+                    pred[0].detach().cpu().numpy(),
+                    clean,
+                    cfg,
+                )
     finally:
         random.setstate(python_state)
         np.random.set_state(numpy_state)
@@ -4073,6 +4301,7 @@ def _evaluate_refiner_validation(
             else "legacy_edge151_euclidean"
         ),
         "descriptor_coordinates": "training_event_db",
+        "physical_quality": _summarize_validation_physical_metrics(physical),
     }
 
 
@@ -4095,6 +4324,7 @@ def _evaluate_diffusion_validation(
     torch.manual_seed(int(cfg.seed) + 46001)
     noise_values: List[float] = []
     velocity_values: List[float] = []
+    physical = _new_validation_physical_accumulator()
     model.eval()
     try:
         with torch.no_grad():
@@ -4166,6 +4396,13 @@ def _evaluate_diffusion_validation(
                         x0_hat[:, 1:] - x0_hat[:, :-1],
                         x0[:, 1:] - x0[:, :-1],
                     ).cpu()))
+                    decoded = x0_hat
+                _record_validation_physical_prediction(
+                    physical,
+                    decoded[0].detach().cpu().numpy(),
+                    clean,
+                    cfg,
+                )
     finally:
         random.setstate(python_state)
         np.random.set_state(numpy_state)
@@ -4183,6 +4420,7 @@ def _evaluate_diffusion_validation(
             else "legacy_edge151_euclidean"
         ),
         "descriptor_coordinates": "training_event_db",
+        "physical_quality": _summarize_validation_physical_metrics(physical),
     }
 
 
@@ -4197,16 +4435,15 @@ def train_refiner(args: argparse.Namespace) -> int:
     database_contract = _training_db_contract(db, cfg, "Motion Refiner training")
     paths = db["paths"]
     desc_z = _descriptor_values_in_training_coordinates(db, db)
-    validation_db = None
-    validation_report: Dict[str, Any] = {"enabled": False}
-    if getattr(args, "val_db", None):
-        validation_db = load_db(args.val_db)
-        validation_contract = _training_db_contract(validation_db, cfg, "Motion Refiner validation")
-        validation_report = {
-            "enabled": True,
-            "database": validation_contract,
-            "source_disjoint": _validate_source_disjoint(db, validation_db),
-        }
+    validation_db = load_db(args.val_db)
+    validation_contract = _training_db_contract(
+        validation_db, cfg, "Motion Refiner validation"
+    )
+    validation_report: Dict[str, Any] = {
+        "enabled": True,
+        "database": validation_contract,
+        "source_disjoint": _validate_source_disjoint(db, validation_db),
+    }
     device = torch.device(cfg.device)
     product_mode = bool(cfg.product_manifold_enable)
     model = (
@@ -4278,10 +4515,9 @@ def train_refiner(args: argparse.Namespace) -> int:
         opt.step()
         if step % 200 == 0 or step == steps - 1:
             print(f"[Boundary Refiner] step={step} loss={loss.item():.6f} rec={rec.item():.6f}")
-    if validation_db is not None:
-        validation_report["metrics"] = _evaluate_refiner_validation(
-            model, validation_db, db, cfg, device
-        )
+    validation_report["metrics"] = _evaluate_refiner_validation(
+        model, validation_db, db, cfg, device
+    )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -4350,7 +4586,7 @@ class DiffusionDenoiser(nn.Module):
         inp = torch.cat([x_t, retrieval, seam_mask], dim=-1).transpose(1, 2)
         h = self.in_proj(inp)
         te = self.time(t)
-        ce = self.cond_proj(torch.cat([cond, te], dim=-1))[:, :, None]
+        ce = _condition_with_time_torch(cond, te, T, self.cond_proj)
         h = h + ce
         for blk in self.blocks:
             h = h + blk(h)
@@ -4404,12 +4640,13 @@ class TangentDiffusionDenoiser(nn.Module):
         self.out = nn.Conv1d(hidden, tangent_dim, 1)
 
     def forward(self, x_tangent, retrieval, cond, seam_mask, joint_mask, t):
+        frames = x_tangent.shape[1]
         inp = torch.cat(
             [x_tangent, retrieval, seam_mask, joint_mask], dim=-1
         ).transpose(1, 2)
         h = self.in_proj(inp)
         te = self.time(t)
-        ce = self.cond_proj(torch.cat([cond, te], dim=-1))[:, :, None]
+        ce = _condition_with_time_torch(cond, te, frames, self.cond_proj)
         h = h + ce
         for block in self.blocks:
             h = h + block(h)
@@ -4489,16 +4726,15 @@ def train_diffusion(args: argparse.Namespace) -> int:
     database_contract = _training_db_contract(db, cfg, "Motion Generation training")
     paths = db["paths"]
     desc_z = _descriptor_values_in_training_coordinates(db, db)
-    validation_db = None
-    validation_report: Dict[str, Any] = {"enabled": False}
-    if getattr(args, "val_db", None):
-        validation_db = load_db(args.val_db)
-        validation_contract = _training_db_contract(validation_db, cfg, "Motion Generation validation")
-        validation_report = {
-            "enabled": True,
-            "database": validation_contract,
-            "source_disjoint": _validate_source_disjoint(db, validation_db),
-        }
+    validation_db = load_db(args.val_db)
+    validation_contract = _training_db_contract(
+        validation_db, cfg, "Motion Generation validation"
+    )
+    validation_report: Dict[str, Any] = {
+        "enabled": True,
+        "database": validation_contract,
+        "source_disjoint": _validate_source_disjoint(db, validation_db),
+    }
     device = torch.device(cfg.device)
     tangent_mode = bool(
         cfg.product_manifold_enable and cfg.tangent_diffusion_enable
@@ -4618,10 +4854,9 @@ def train_diffusion(args: argparse.Namespace) -> int:
                 f"physics={loss_physics.item():.6f} "
                 f"jerk={physics_terms['jerk'].item():.6f}"
             )
-    if validation_db is not None:
-        validation_report["metrics"] = _evaluate_diffusion_validation(
-            model, validation_db, db, cfg, device, abar, Tdiff
-        )
+    validation_report["metrics"] = _evaluate_diffusion_validation(
+        model, validation_db, db, cfg, device, abar, Tdiff
+    )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -5540,6 +5775,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             chunk = motion[st:ed]
             mask = seam_mask[st:ed]
             orig_len = len(chunk)
+            cond_in = _condition_chunk_np(cond, st, ed, win if orig_len < win else orig_len)
             if orig_len < win:
                 chunk_in = resample_motion_np(chunk, win)
                 mask_in = resample_motion_np(mask, win)
@@ -5550,7 +5786,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
                 chunk_in, cfg, source_hint="apply_refiner_model:inbetween_input_chunk", derive_contact=True, project_rot=True
             )
             x = torch.from_numpy(chunk_in[None]).float().to(cfg.device)
-            c = torch.from_numpy(cond[None].astype(np.float32)).float().to(cfg.device)
+            c = torch.from_numpy(cond_in[None].astype(np.float32)).float().to(cfg.device)
             sm = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
             strength = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * sm, 0.0, 1.0)
             if product_mode:
@@ -5674,6 +5910,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
             retr_np = motion[st:ed]
             mask_np = seam_mask[st:ed]
             orig_len = len(retr_np)
+            cond_in = _condition_chunk_np(cond, st, ed, win if orig_len < win else orig_len)
             if orig_len < win:
                 retr_in = resample_motion_np(retr_np, win)
                 mask_in = resample_motion_np(mask_np, win)
@@ -5686,7 +5923,7 @@ def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.nd
             retr = torch.from_numpy(retr_in[None]).float().to(cfg.device)
             raw_mask = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
             mask = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * raw_mask, 0.0, 1.0)
-            c = torch.from_numpy(cond[None].astype(np.float32)).float().to(cfg.device)
+            c = torch.from_numpy(cond_in[None].astype(np.float32)).float().to(cfg.device)
             if tangent_mode:
                 joint_np, root_np, contact_np = _risk_masks_for_batch_np(
                     retr_in[None], mask_in[None], cfg
@@ -6730,10 +6967,140 @@ def render_if_possible(
     subprocess.run(cmd, check=True)
 
 
+def _finalize_generation_outputs(
+    args: argparse.Namespace,
+    cfg: MotionGenerationConfig,
+    motion: np.ndarray,
+    motion_ref: np.ndarray,
+    seam_mask: np.ndarray,
+    report: Dict[str, Any],
+) -> int:
+    """Write an accepted motion only after the authoritative physical gate."""
+
+    out = Path(args.out)
+    if out.suffix.lower() != ".npy":
+        raise ValueError(f"accepted motion output must use .npy suffix, got {out}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    motion_ref_path = str(out).replace(".npy", ".motion_ref.npy")
+    mask_path = str(out).replace(".npy", ".transition_mask.npy")
+    json_path = args.json or str(out).replace(".npy", ".inbetween_report.json")
+
+    final_audit = audit_motion_np(motion, cfg)
+    if bool(cfg.final_physical_gate_enable):
+        final_gate = evaluate_physical_audit(final_audit)
+        final_gate["enabled"] = True
+    else:
+        final_gate = {
+            "ok": True,
+            "enabled": False,
+            "reasons": [],
+            "audit": dict(final_audit),
+            "policy": "explicitly_disabled",
+        }
+    final_gate_report = dict(final_gate)
+    final_gate_report.pop("audit", None)
+    final_gate_report["audit_ref"] = "final_audit"
+
+    report.update(
+        {
+            "motion_ref_path": motion_ref_path,
+            "transition_mask_path": mask_path,
+            "final_audit": final_audit,
+            "final_physical_gate": final_gate_report,
+            "accepted_output_path": str(out),
+        }
+    )
+    np.save(motion_ref_path, motion_ref.astype(np.float32))
+    np.save(mask_path, seam_mask.astype(np.float32))
+
+    rejected = bool(
+        cfg.final_physical_gate_enable
+        and cfg.final_physical_gate_fail_closed
+        and not final_gate["ok"]
+    )
+    if rejected:
+        quarantined_output: Optional[Path] = None
+        if out.exists():
+            quarantined_output = out.with_name(
+                f"{out.stem}.preexisting_{now_tag()}{out.suffix}"
+            )
+            serial = 1
+            while quarantined_output.exists():
+                quarantined_output = out.with_name(
+                    f"{out.stem}.preexisting_{now_tag()}_{serial}{out.suffix}"
+                )
+                serial += 1
+            out.replace(quarantined_output)
+        rejected_path: Optional[Path] = None
+        if bool(cfg.final_physical_gate_save_rejected):
+            rejected_path = out.with_name(f"{out.stem}.rejected{out.suffix or '.npy'}")
+            np.save(rejected_path, motion.astype(np.float32))
+        report.update(
+            {
+                "generation_status": "rejected_by_final_physical_gate",
+                "accepted_output_written": False,
+                "rejected_motion_path": str(rejected_path) if rejected_path else None,
+                "preexisting_accepted_output_quarantined": (
+                    str(quarantined_output) if quarantined_output else None
+                ),
+            }
+        )
+        save_json(report, json_path)
+        print(
+            json.dumps(
+                {
+                    "status": report["generation_status"],
+                    "motion": None,
+                    "rejected_motion": report["rejected_motion_path"],
+                    "json": json_path,
+                    "final_physical_gate": final_gate_report,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    np.save(out, motion.astype(np.float32))
+    report.update(
+        {
+            "generation_status": "accepted",
+            "accepted_output_written": True,
+            "rejected_motion_path": None,
+        }
+    )
+    save_json(report, json_path)
+    if args.render_output:
+        render_if_possible(
+            str(out),
+            args.audio,
+            args.render_output,
+            args.render_script,
+            fps=float(cfg.fps),
+        )
+    print(
+        json.dumps(
+            {
+                "status": report["generation_status"],
+                "motion": str(out),
+                "motion_ref": motion_ref_path,
+                "transition_mask": mask_path,
+                "json": json_path,
+                "frames": int(motion.shape[0]),
+                "final_physical_gate": final_gate_report,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
 
 
 
-def generate(args: argparse.Namespace) -> int:
+
+
+def _generate_motion_core(args: argparse.Namespace) -> int:
     cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     sem_dirs = getattr(args, "music_semantic_dirs", None)
     if sem_dirs:
@@ -6773,8 +7140,13 @@ def generate(args: argparse.Namespace) -> int:
         seam_mask = make_boundary_mask(motion_ref.shape[0], seam_positions, width=24)
         mask_policy = "fallback_boundary_mask_no_transition_spans"
 
-    cond = np.mean(slot_feat, axis=0).astype(np.float32)
-    cond = (cond - np.asarray(db["desc_mean"], dtype=np.float32)[0]) / np.asarray(db["desc_std"], dtype=np.float32)[0]
+    cond = build_frame_local_conditioning(
+        slot_feat,
+        concat_report,
+        motion_ref.shape[0],
+        np.asarray(db["desc_mean"], dtype=np.float32)[0],
+        np.asarray(db["desc_std"], dtype=np.float32)[0],
+    )
 
     stage_reports = {
         "retrieval": retrieval_report,
@@ -6800,6 +7172,13 @@ def generate(args: argparse.Namespace) -> int:
                 "MOTION_DIFFUSION_TRANSITION_STRENGTH": os.environ.get("MOTION_DIFFUSION_TRANSITION_STRENGTH", "0.72"),
             },
         },
+        "neural_music_conditioning": {
+            "mode": "frame_local_slot_conditioning",
+            "shape": list(cond.shape),
+            "transition_policy": "linear_previous_to_current_slot_descriptor",
+            "normalization": "training_event_db_descriptor_coordinates",
+            "whole_song_mean_conditioning": False,
+        },
     }
     pre_audit = audit_motion_np(motion_ref, cfg)
     motion = motion_ref.astype(np.float32)
@@ -6815,15 +7194,6 @@ def generate(args: argparse.Namespace) -> int:
     if cfg.ik_enable:
         motion, ik_report = true_lower_body_ik(motion, cfg)
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out, motion.astype(np.float32))
-    # Save reference motion next to final output for ablation and paper figures.
-    motion_ref_path = str(out).replace(".npy", ".motion_ref.npy")
-    np.save(motion_ref_path, motion_ref.astype(np.float32))
-    mask_path = str(out).replace(".npy", ".transition_mask.npy")
-    np.save(mask_path, seam_mask.astype(np.float32))
-
     report = {
         "version": "inbetween_reference_conditioned_transition_masked_motionrag_diff",
         "audio": args.audio,
@@ -6833,25 +7203,13 @@ def generate(args: argparse.Namespace) -> int:
         "selected_event_indices": path_idx,
         "selected_event_paths": selected_paths,
         "slots": slots,
-        "motion_ref_path": motion_ref_path,
-        "transition_mask_path": mask_path,
         "pre_refine_audit": pre_audit,
         "stage_reports": stage_reports,
         "lower_body_ik_true_ik": ik_report,
-        "final_audit": audit_motion_np(motion, cfg),
     }
-    json_path = args.json or str(out).replace(".npy", ".inbetween_report.json")
-    save_json(report, json_path)
-    if args.render_output:
-        render_if_possible(
-            str(out),
-            args.audio,
-            args.render_output,
-            args.render_script,
-            fps=float(cfg.fps),
-        )
-    print(json.dumps({"motion": str(out), "motion_ref": motion_ref_path, "transition_mask": mask_path, "json": json_path, "frames": int(motion.shape[0]), "final_audit": report["final_audit"]}, ensure_ascii=False, indent=2))
-    return 0
+    return _finalize_generation_outputs(
+        args, cfg, motion, motion_ref, seam_mask, report
+    )
 
 
 def run_ik(args: argparse.Namespace) -> int:
@@ -6900,14 +7258,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     r = sub.add_parser("train-refiner", help="Motion Refiner residual Motion Refiner training")
     r.add_argument("--db", required=True)
-    r.add_argument("--val_db", default=None, help="Source-disjoint validation Event-DB used for contract and leakage gates")
+    r.add_argument("--val_db", required=True, help="Required source-disjoint validation Event-DB used for physical, contract and leakage gates")
     r.add_argument("--out", required=True)
     r.add_argument("--steps", type=int, default=None)
     r.set_defaults(func=train_refiner)
 
     d = sub.add_parser("train-diffusion", help="Motion Generation conditional residual diffusion training")
     d.add_argument("--db", required=True)
-    d.add_argument("--val_db", default=None, help="Source-disjoint validation Event-DB used for contract and leakage gates")
+    d.add_argument("--val_db", required=True, help="Required source-disjoint validation Event-DB used for physical, contract and leakage gates")
     d.add_argument("--out", required=True)
     d.add_argument("--steps", type=int, default=None)
     d.add_argument("--diffusion_steps", type=int, default=None)
@@ -7462,7 +7820,6 @@ _stage_guard_orig_concat_events = concat_events
 _stage_guard_orig_apply_refiner_model = apply_refiner_model
 _stage_guard_orig_apply_diffusion_model = apply_diffusion_model
 _stage_guard_orig_true_lower_body_ik = true_lower_body_ik
-_stage_guard_orig_generate = generate
 
 _STAGE_TRANSACTION_AUDIT = []
 _STAGE_PRIOR_XZ = None
@@ -7821,13 +8178,14 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
     for tx_id, (a, b) in enumerate(regions):
         snapshot = out[a:b].copy().astype(np.float32)
         sm_win = np.asarray(seam_mask[a:b], dtype=np.float32).copy()
+        cond_win = _condition_chunk_np(cond, a, b)
         token = {"mechanism": "TGT+KBO", "stage": stage, "temporal_transaction_id": int(tx_id), "atomic_window": [int(a), int(b)], "frames": int(b-a), "commit_state": "pending"}
         rejected_candidate = None
         try:
             if stage == "diffusion" and _stage_guard_env_bool("STAGE_GUARD_DIFFUSION_EARLY_ABORT_ENABLE", True):
-                cand = _diffusion_window_proposal(snapshot.copy(), cond, sm_win, ckpt_path, cfg, global_start=a)
+                cand = _diffusion_window_proposal(snapshot.copy(), cond_win, sm_win, ckpt_path, cfg, global_start=a)
             else:
-                cand = orig_func(snapshot.copy(), cond, sm_win, ckpt_path, cfg)
+                cand = orig_func(snapshot.copy(), cond_win, sm_win, ckpt_path, cfg)
             rejected_candidate = np.asarray(cand, dtype=np.float32)
             cand = _bounded_residual_update(
                 cand,
@@ -7970,28 +8328,6 @@ def _summarize_stage_transactions(records):
     return out
 
 
-def generate(args):
-    _reset_stage_transaction_audit()
-    rc = int(_stage_guard_orig_generate(args))
-    try:
-        out_path = Path(args.out)
-        json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
-        if json_path.exists():
-            with open(json_path, "r", encoding="utf-8") as f:
-                report = json.load(f)
-            report.setdefault("stage_reports", {})["stage_guard_temporal_generative_transactions"] = _STAGE_TRANSACTION_AUDIT
-            report["stage_guard_tgt_kbo_summary"] = _summarize_stage_transactions(_STAGE_TRANSACTION_AUDIT)
-            report["stage_guard_scientific_mechanism"] = {
-                "name": "Stage-Anchored KBO-guided Temporal Generative Transactions",
-                "problem": "long-horizon covariate shift and topological fragility",
-                "mechanisms": ["Macroscopic Stage Anchoring", "Temporal Generative Transactions", "Kinematic Barrier Oracle", "Confidence-aware Cascaded Degradation", "Diffusion Early-Abort", "Hard-negative Audit Tokens"],
-            }
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(_stage_guard_jsonable(report), f, ensure_ascii=False, indent=2)
-            print(json.dumps({"stage_guard_tgt_kbo_summary": report["stage_guard_tgt_kbo_summary"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
-    except Exception as exc:
-        print(f"[Stage Guard WARN] failed to append audit tokens: {exc}", file=sys.stderr)
-    return rc
 # ===== Stage Guard STAGE-ANCHORED GUIDED TGT PATCH END =====
 
 
@@ -8005,7 +8341,6 @@ def generate(args):
 # 3) Audit exposes Energy Stability policy; kinetic HN-DPO is implemented in the separate
 #    energy_stability_train_hn_dpo_diffusion.py tool.
 
-_energy_stability_orig_generate = generate
 
 _FRAME_STAGE_ANCHOR_WEIGHT = None
 _STAGE_WEIGHT_METADATA = {}
@@ -8293,49 +8628,14 @@ def _deterministic_repair_bridge(reference, seam_mask, cfg, stage="fallback", gl
 
 
 
-def generate(args):
-    try:
-        _load_stage_anchor_weights(getattr(args, "slots_json", None))
-    except Exception as exc:
-        print(f"[Energy Stability WARN] failed to load MSSD dynamic stage weights: {exc}", file=sys.stderr)
-    rc = int(_energy_stability_orig_generate(args))
-    try:
-        out_path = Path(args.out)
-        json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
-        if json_path.exists():
-            with open(json_path, "r", encoding="utf-8") as f:
-                report = json.load(f)
-            report["energy_stability_stability_alignment"] = {
-                "version": "energy_stability_lowpass_early_abort_dynamic_msa_kinetic_hn_dpo",
-                "fixes": [
-                    "low-pass relaxed KBO for early-abort probes",
-                    "music-energy and root-velocity adaptive macroscopic stage anchoring",
-                    "kinetic-energy preserving HN-DPO fine-tuning tool",
-                ],
-                "mssd_stage_weight_meta": _energy_gate_jsonable(_STAGE_WEIGHT_METADATA),
-                "early_abort_relax": float(_energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_RELAX", 3.0)),
-                "early_abort_smooth_sigma": float(_energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35)),
-            }
-            mech = report.get("stage_guard_scientific_mechanism", {})
-            if isinstance(mech, dict):
-                mech.setdefault("energy_stability_fixes", report["energy_stability_stability_alignment"]["fixes"])
-                report["stage_guard_scientific_mechanism"] = mech
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(_energy_gate_jsonable(report), f, ensure_ascii=False, indent=2)
-            print(json.dumps({"energy_stability_stability_alignment": report["energy_stability_stability_alignment"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
-    except Exception as exc:
-        print(f"[Energy Stability WARN] failed to append stability-alignment metadata: {exc}", file=sys.stderr)
-    return rc
 # ===== Energy Stability STABILITY ALIGNMENT PATCH END =====
 
 
 
 # ===== Physics Stability PHYSICS-CONSISTENT STABILITY PATCH START =====
 # Physics-consistent fixes after Energy Stability.
-# This block intentionally redefines Stage Guard/Energy Stability runtime functions because the
-# generation code resolves them by global name at call time.
-
-_physics_stability_orig_generate = generate
+# Runtime functions below replace the earlier stability implementations by
+# global name, but generation itself has one explicit orchestration entrypoint.
 
 _EARLY_ABORT_TRACE = []
 
@@ -8722,39 +9022,123 @@ def _diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, global_st
     return y.astype(np.float32)
 
 
-def generate(args):
+def _append_generation_runtime_metadata(args: argparse.Namespace) -> None:
+    """Append all stability metadata in one report transaction."""
+
+    out_path = Path(args.out)
+    json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
+    if not json_path.exists():
+        return
+    with open(json_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+
+    report.setdefault("stage_reports", {})[
+        "stage_guard_temporal_generative_transactions"
+    ] = _STAGE_TRANSACTION_AUDIT
+    report["stage_guard_tgt_kbo_summary"] = _summarize_stage_transactions(
+        _STAGE_TRANSACTION_AUDIT
+    )
+    report["stage_guard_scientific_mechanism"] = {
+        "name": "Stage-Anchored KBO-guided Temporal Generative Transactions",
+        "problem": "long-horizon covariate shift and topological fragility",
+        "mechanisms": [
+            "Macroscopic Stage Anchoring",
+            "Temporal Generative Transactions",
+            "Kinematic Barrier Oracle",
+            "Confidence-aware Cascaded Degradation",
+            "Diffusion Early-Abort",
+            "Hard-negative Audit Tokens",
+        ],
+    }
+    report["energy_stability_stability_alignment"] = {
+        "version": "energy_stability_lowpass_early_abort_dynamic_msa_kinetic_hn_dpo",
+        "fixes": [
+            "low-pass relaxed KBO for early-abort probes",
+            "music-energy and root-velocity adaptive macroscopic stage anchoring",
+            "kinetic-energy preserving HN-DPO fine-tuning tool",
+        ],
+        "mssd_stage_weight_meta": _energy_gate_jsonable(_STAGE_WEIGHT_METADATA),
+        "early_abort_relax": float(
+            _energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_RELAX", 3.0)
+        ),
+        "early_abort_smooth_sigma": float(
+            _energy_gate_env_float(
+                "ENERGY_STABILITY_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35
+            )
+        ),
+    }
+    report["stage_guard_scientific_mechanism"]["energy_stability_fixes"] = report[
+        "energy_stability_stability_alignment"
+    ]["fixes"]
+    report["physics_stability_physics_consistent_stability"] = {
+        "version": "physics_stability_derivative_safe_msa_velocity_preserving_kinetic_dpo",
+        "fixes": [
+            "early-abort uses low-pass robust derivative oracle",
+            "derivative-only Tweedie jitter cannot abort by default",
+            "multiple early probes require consecutive fatal low-frequency barriers",
+            "stage anchoring preserves local velocity and releases leap/high-speed windows",
+            "HN-DPO training uses kinetic and motion-density preservation",
+        ],
+        "early_abort_probe_trace_count": int(len(_EARLY_ABORT_TRACE)),
+        "early_abort_probe_trace_preview": _physics_stability_jsonable(
+            _EARLY_ABORT_TRACE[:20]
+        ),
+        "env": {
+            "PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA": _physics_stability_env_float(
+                "PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA", 2.25
+            ),
+            "PHYSICS_STABILITY_EARLY_ABORT_RELAX": _physics_stability_env_float(
+                "PHYSICS_STABILITY_EARLY_ABORT_RELAX", 4.0
+            ),
+            "PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL": _physics_stability_env_int(
+                "PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL", 2
+            ),
+            "PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH": _physics_stability_env_float(
+                "PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH", 0.070
+            ),
+            "PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPS": _physics_stability_env_float(
+                "PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPS", 0.18
+            ),
+        },
+    }
+    save_json(_physics_stability_jsonable(report), json_path)
+    print(
+        json.dumps(
+            {
+                "runtime_metadata_updated": str(json_path),
+                "stage_transactions": report["stage_guard_tgt_kbo_summary"],
+                "physics_stability": report[
+                    "physics_stability_physics_consistent_stability"
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def generate(args: argparse.Namespace) -> int:
+    """Explicit whole-song generation orchestration with one public entrypoint."""
+
     global _EARLY_ABORT_TRACE
     _EARLY_ABORT_TRACE = []
-    rc = int(_physics_stability_orig_generate(args))
+    _reset_stage_transaction_audit()
     try:
-        out_path = Path(args.out)
-        json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
-        if json_path.exists():
-            report = json.load(open(json_path, "r", encoding="utf-8"))
-            report["physics_stability_physics_consistent_stability"] = {
-                "version": "physics_stability_derivative_safe_msa_velocity_preserving_kinetic_dpo",
-                "fixes": [
-                    "early-abort uses low-pass robust derivative oracle",
-                    "derivative-only Tweedie jitter cannot abort by default",
-                    "multiple early probes require consecutive fatal low-frequency barriers",
-                    "stage anchoring preserves local velocity and releases leap/high-speed windows",
-                    "HN-DPO training uses kinetic and motion-density preservation",
-                ],
-                "early_abort_probe_trace_count": int(len(_EARLY_ABORT_TRACE)),
-                "early_abort_probe_trace_preview": _physics_stability_jsonable(_EARLY_ABORT_TRACE[:20]),
-                "env": {
-                    "PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA": _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA", 2.25),
-                    "PHYSICS_STABILITY_EARLY_ABORT_RELAX": _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_RELAX", 4.0),
-                    "PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL": _physics_stability_env_int("PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL", 2),
-                    "PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH": _physics_stability_env_float("PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH", 0.070),
-                    "PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPF": _physics_stability_env_float("PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPF", 0.006),
-                },
-            }
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(_physics_stability_jsonable(report), f, ensure_ascii=False, indent=2)
-            print(json.dumps({"physics_stability_physics_consistent_stability": report["physics_stability_physics_consistent_stability"], "json_updated": str(json_path)}, ensure_ascii=False, indent=2))
+        _load_stage_anchor_weights(getattr(args, "slots_json", None))
     except Exception as exc:
-        print(f"[Physics Stability WARN] failed to append metadata: {exc}", file=sys.stderr)
+        print(
+            f"[Energy Stability WARN] failed to load MSSD dynamic stage weights: {exc}",
+            file=sys.stderr,
+        )
+
+    rc = int(_generate_motion_core(args))
+    try:
+        _append_generation_runtime_metadata(args)
+    except Exception as exc:
+        print(
+            f"[Motion Generation WARN] failed to append runtime metadata: {exc}",
+            file=sys.stderr,
+        )
     return rc
 # ===== Physics Stability PHYSICS-CONSISTENT STABILITY PATCH END =====
 

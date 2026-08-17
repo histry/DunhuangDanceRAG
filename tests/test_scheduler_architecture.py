@@ -225,7 +225,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
         generation_block = source[generate : generate + 500]
         self.assertIn('--slots_json "$ROUTING_MSSD"', generation_block)
 
-    def test_pipeline_trains_scheduler_models_before_regression_and_v45(self):
+    def test_pipeline_trains_scheduler_models_before_motion_refinement(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
         markers = [
             "training/music_router.py train",
