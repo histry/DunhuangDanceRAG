@@ -74,7 +74,13 @@ from evaluation.motion_activity_analysis import (
     write_activity_report,
 )
 # MOTION_ACTIVITY_INTEGRATION_END
+from contracts.boundary_continuity import (
+    boundary_risk_reasons,
+    evaluate_boundary_continuity,
+)
+from contracts.gravity import fk24_np
 from motion_geometry.resampling import resample_edge151_np
+from motion_geometry.rotations import rot6d_to_matrix_np, so3_geodesic_np
 from contracts.physical_quality import (
     PhysicalQualityLimits,
     StageAcceptancePolicy,
@@ -239,29 +245,81 @@ def fk_positions(v46, motion: np.ndarray) -> Optional[np.ndarray]:
 def simple_boundary_risk(previous: np.ndarray, transition: np.ndarray, following: np.ndarray, fps: float) -> Dict[str, float]:
     ctx = np.concatenate([previous[-4:], transition, following[:4]], axis=0).astype(np.float32)
     if len(ctx) < 4:
-        return {"total": 1e9, "boundary_joint_jerk_max": 1e9, "exit_fk_jump": 1e9, "exit_rotation_step_rad": 1e9, "foot_slip": 1e9, "contact_switch": 1e9}
-    root = ctx[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
-    vel = np.diff(root, axis=0) * fps
+        return {
+            "total": 1e9,
+            "boundary_joint_jerk_max": 1e9,
+            "entry_fk_jump": 1e9,
+            "exit_fk_jump": 1e9,
+            "entry_rotation_step_rad": 1e9,
+            "exit_rotation_step_rad": 1e9,
+            "foot_slip": 1e9,
+            "foot_penetration": 1e9,
+            "contact_switch": 1e9,
+        }
+    positions = fk24_np(ctx)
+    vel = np.diff(positions, axis=0) * fps
     acc = np.diff(vel, axis=0) * fps
-    jerk = np.diff(acc, axis=0) * fps if len(acc) > 1 else np.zeros((0, 3), dtype=np.float32)
+    jerk = (
+        np.diff(acc, axis=0) * fps
+        if len(acc) > 1
+        else np.zeros((0, NUM_JOINTS, 3), dtype=np.float32)
+    )
     boundary_jerk = float(np.max(np.linalg.norm(jerk, axis=-1))) if jerk.size else 0.0
     left = min(4, len(previous[-4:]))
     right = left + len(transition)
-    exit_jump = 0.0
-    if 0 < right < len(ctx):
-        exit_jump = float(np.linalg.norm(ctx[right, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - ctx[right - 1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]))
+    entry_step = left if 0 < left < len(ctx) else None
+    exit_step = right if 0 < right < len(ctx) else None
+
+    def fk_jump(step: Optional[int]) -> float:
+        if step is None:
+            return 1e9
+        delta = positions[step] - positions[step - 1]
+        return float(np.sqrt(np.mean(np.square(delta))))
+
+    rotations = rot6d_to_matrix_np(
+        ctx[:, ROT6D_START:ROT6D_END].reshape(len(ctx), NUM_JOINTS, 6)
+    )
+    rotation_step = so3_geodesic_np(rotations[:-1], rotations[1:])
+
+    def rotation_jump(step: Optional[int]) -> float:
+        if step is None or step - 1 >= len(rotation_step):
+            return 1e9
+        return float(np.max(rotation_step[step - 1]))
+
+    feet = positions[:, list(DEFAULT_FOOT_JOINTS)]
+    floor_y = float(np.percentile(feet[..., 1], 5))
+    foot_speed = np.zeros(feet.shape[:2], dtype=np.float32)
+    foot_speed[1:] = (
+        np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+        * float(fps)
+    )
+    declared_contact = ctx[:, CONTACT] > 0.5
+    support = declared_contact | (feet[..., 1] <= floor_y + 0.055)
+    foot_slip = float(np.mean(foot_speed[support])) if np.any(support) else 0.0
+    penetration = np.maximum(floor_y - feet[..., 1] - 0.008, 0.0)
+    foot_penetration = float(np.mean(np.square(penetration)))
     contact = transition[:, CONTACT] if len(transition) else np.zeros((0, 4), dtype=np.float32)
     contact_switch = float(np.abs(np.diff(contact, axis=0)).mean()) if len(contact) > 1 else 0.0
-    total = 0.002 * boundary_jerk + 3.0 * exit_jump + 0.25 * contact_switch
+    entry_jump = fk_jump(entry_step)
+    exit_jump = fk_jump(exit_step)
+    entry_rotation = rotation_jump(entry_step)
+    exit_rotation = rotation_jump(exit_step)
+    total = (
+        0.002 * boundary_jerk
+        + 3.0 * (entry_jump + exit_jump)
+        + 2.0 * (entry_rotation + exit_rotation)
+        + 2.0 * foot_slip
+        + 0.25 * contact_switch
+    )
     return {
         "total": float(total),
         "boundary_joint_jerk_max": float(boundary_jerk),
+        "entry_fk_jump": float(entry_jump),
         "exit_fk_jump": float(exit_jump),
-        "entry_fk_jump": 0.0,
-        "exit_rotation_step_rad": 0.0,
-        "entry_rotation_step_rad": 0.0,
-        "foot_slip": 0.0,
-        "foot_penetration": 0.0,
+        "entry_rotation_step_rad": float(entry_rotation),
+        "exit_rotation_step_rad": float(exit_rotation),
+        "foot_slip": float(foot_slip),
+        "foot_penetration": float(foot_penetration),
         "contact_switch": float(contact_switch),
     }
 
@@ -310,8 +368,14 @@ def risk_score(risk: Dict[str, Any]) -> float:
     # kinematic threshold is named with its SI unit so 30/60 FPS runs share
     # exactly the same physical contract.
     bj = float(risk.get("boundary_joint_jerk_max", risk.get("joint_jerk", 0.0))) / max(env_float("V46_46_NORM_BOUNDARY_JERK_MPS3", 5000.0), 1e-6)
-    fk = float(risk.get("exit_fk_jump", 0.0)) / max(env_float("V46_46_NORM_EXIT_FK_JUMP_M", 0.040), 1e-6)
-    rot = float(risk.get("exit_rotation_step_rad", 0.0)) / max(env_float("V46_46_NORM_EXIT_ROT_RAD", 0.12), 1e-6)
+    fk = max(
+        float(risk.get("entry_fk_jump", 0.0)),
+        float(risk.get("exit_fk_jump", 0.0)),
+    ) / max(env_float("V46_46_NORM_EXIT_FK_JUMP_M", 0.040), 1e-6)
+    rot = max(
+        float(risk.get("entry_rotation_step_rad", 0.0)),
+        float(risk.get("exit_rotation_step_rad", 0.0)),
+    ) / max(env_float("V46_46_NORM_EXIT_ROT_RAD", 0.12), 1e-6)
     slip = float(risk.get("foot_slip", 0.0)) / max(env_float("V46_46_NORM_FOOT_SLIP_MPS", 0.22), 1e-6)
     cs = float(risk.get("contact_switch", 0.0)) / max(env_float("V46_46_NORM_CONTACT_SWITCH", 0.45), 1e-6)
     total = float(risk.get("total", 0.0)) / max(env_float("V46_46_NORM_TOTAL", 1.0), 1e-6)
@@ -319,13 +383,7 @@ def risk_score(risk: Dict[str, Any]) -> float:
 
 
 def risk_safe(risk: Dict[str, Any]) -> bool:
-    return bool(
-        float(risk.get("boundary_joint_jerk_max", 0.0)) <= env_float("V46_46_MAX_BOUNDARY_JERK_MPS3", 650.0)
-        and float(risk.get("exit_fk_jump", 0.0)) <= env_float("V46_46_MAX_EXIT_FK_JUMP_M", 0.015)
-        and float(risk.get("exit_rotation_step_rad", 0.0)) <= env_float("V46_46_MAX_EXIT_ROT_RAD", 0.08)
-        and float(risk.get("foot_slip", 0.0)) <= env_float("V46_46_MAX_FOOT_SLIP_MPS", 0.06)
-        and float(risk.get("foot_penetration", 0.0)) <= env_float("V46_46_MAX_FOOT_PENETRATION_M2", 0.001)
-    )
+    return not boundary_risk_reasons(risk)
 
 
 def estimate_boundary_features(v46, prev: np.ndarray, curr: np.ndarray, cfg: Any) -> Dict[str, float]:
@@ -856,10 +914,13 @@ def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str
             "content_start": int(c0),
             "predicted_risk_score": float(assembly_report[i].get("risk_score_predicted", 0.0)),
             "predicted_boundary_jerk": float(pred.get("boundary_joint_jerk_max", 0.0)) if isinstance(pred, dict) else 0.0,
+            "predicted_entry_fk_jump": float(pred.get("entry_fk_jump", 0.0)) if isinstance(pred, dict) else 0.0,
             "predicted_exit_fk_jump": float(pred.get("exit_fk_jump", 0.0)) if isinstance(pred, dict) else 0.0,
             "actual_risk_score": float(risk_score(risk)),
             "actual_boundary_jerk": float(risk.get("boundary_joint_jerk_max", 0.0)),
+            "actual_entry_fk_jump": float(risk.get("entry_fk_jump", 0.0)),
             "actual_exit_fk_jump": float(risk.get("exit_fk_jump", 0.0)),
+            "actual_entry_rotation_step_rad": float(risk.get("entry_rotation_step_rad", 0.0)),
             "actual_exit_rotation_step_rad": float(risk.get("exit_rotation_step_rad", 0.0)),
             "actual_foot_slip": float(risk.get("foot_slip", 0.0)),
             "actual_foot_penetration": float(risk.get("foot_penetration", 0.0)),
@@ -875,8 +936,10 @@ def audit_boundaries(v46, motion: np.ndarray, assembly_report: Sequence[Dict[str
         row.update(
             {
                 "predicted_boundary_jerk_mps3": row["predicted_boundary_jerk"],
+                "predicted_entry_fk_jump_m": row["predicted_entry_fk_jump"],
                 "predicted_exit_fk_jump_m": row["predicted_exit_fk_jump"],
                 "actual_boundary_jerk_mps3": row["actual_boundary_jerk"],
+                "actual_entry_fk_jump_m": row["actual_entry_fk_jump"],
                 "actual_exit_fk_jump_m": row["actual_exit_fk_jump"],
                 "actual_foot_slip_mps": row["actual_foot_slip"],
                 "actual_foot_penetration_m2": row["actual_foot_penetration"],
@@ -894,12 +957,12 @@ def write_audit_csv(rows: Sequence[Dict[str, Any]], path: str | Path) -> None:
     keys = [
         "slot", "prev_event_id", "curr_event_id", "candidate_rank",
         "transition_start", "transition_end", "transition_len", "content_start",
-        "predicted_risk_score", "predicted_boundary_jerk", "predicted_exit_fk_jump",
-        "actual_risk_score", "actual_boundary_jerk", "actual_exit_fk_jump",
-        "actual_exit_rotation_step_rad", "actual_foot_slip", "actual_foot_penetration",
+        "predicted_risk_score", "predicted_boundary_jerk", "predicted_entry_fk_jump", "predicted_exit_fk_jump",
+        "actual_risk_score", "actual_boundary_jerk", "actual_entry_fk_jump", "actual_exit_fk_jump",
+        "actual_entry_rotation_step_rad", "actual_exit_rotation_step_rad", "actual_foot_slip", "actual_foot_penetration",
         "actual_contact_switch", "core_warp", "safe", "decision",
-        "predicted_boundary_jerk_mps3", "predicted_exit_fk_jump_m",
-        "actual_boundary_jerk_mps3", "actual_exit_fk_jump_m",
+        "predicted_boundary_jerk_mps3", "predicted_entry_fk_jump_m", "predicted_exit_fk_jump_m",
+        "actual_boundary_jerk_mps3", "actual_entry_fk_jump_m", "actual_exit_fk_jump_m",
         "actual_foot_slip_mps", "actual_foot_penetration_m2",
     ]
     with p.open("w", encoding="utf-8", newline="") as f:
@@ -1194,11 +1257,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         best_payload["stage_reports"].get("final_audit", {})
     )
     best_payload["stage_reports"]["final_physical_gate"] = final_gate
-    if env_bool("V46_54_REQUIRE_FINAL_PHYSICAL_GATE", True) and not final_gate["ok"]:
-        raise RuntimeError(
-            "Final physical gate rejected generated motion: "
-            + ",".join(final_gate["reasons"])
-        )
+    final_boundary_continuity = evaluate_boundary_continuity(
+        best_payload["boundary_rows"],
+        expected_boundaries=max(0, len(best_payload["assembly_report"]) - 1),
+    )
+    best_payload["stage_reports"][
+        "final_boundary_continuity_gate"
+    ] = final_boundary_continuity
 
     # The activity gate is additive and is evaluated only after immutable
     # physical/anatomy/heading processing has completed.
@@ -1209,6 +1274,47 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         fps=float(getattr(cfg, "fps", 30.0)),
     )
     best_payload["stage_reports"]["final_motion_activity"] = final_motion_activity
+
+    quality_layers = {
+        "anti_freeze_anti_collapse": {
+            "ok": bool(final_motion_activity["ok"]),
+            "reasons": list(final_motion_activity["reasons"]),
+        },
+        **dict(final_gate.get("layers", {})),
+        "boundary_continuity": {
+            "ok": bool(final_boundary_continuity["ok"]),
+            "reasons": list(final_boundary_continuity["reasons"]),
+        },
+    }
+    required_failures: list[str] = []
+    if env_bool("V46_54_REQUIRE_FINAL_PHYSICAL_GATE", True) and not bool(
+        final_gate["ok"]
+    ):
+        required_failures.append(
+            "physical:" + ",".join(str(value) for value in final_gate["reasons"])
+        )
+    if env_bool("V46_46_REQUIRE_FINAL_BOUNDARY_GATE", True) and not bool(
+        final_boundary_continuity["ok"]
+    ):
+        required_failures.append(
+            "boundary:"
+            + ",".join(str(value) for value in final_boundary_continuity["reasons"])
+        )
+    if env_bool("MOTION_ACTIVITY_FINAL_GATE", True) and not bool(
+        final_motion_activity["ok"]
+    ):
+        required_failures.append(
+            "activity:"
+            + ",".join(str(value) for value in final_motion_activity["reasons"])
+        )
+    final_quality_gate = {
+        "schema": "final_motion_quality_layers_v1",
+        "ok": not required_failures,
+        "reasons": list(required_failures),
+        "layers": quality_layers,
+        "rejected_output_is_renderable": False,
+    }
+    best_payload["stage_reports"]["final_quality_gate"] = final_quality_gate
 
     out = Path(args.out)
     if out.suffix.lower() != ".npy":
@@ -1249,6 +1355,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "boundary_audit_json": audit_json_path,
         "motion_activity_json": motion_activity_path,
         "motion_activity": final_motion_activity,
+        "final_quality_gate": final_quality_gate,
         "closed_loop": {
             "enabled": True,
             "rounds": rounds,
@@ -1274,13 +1381,16 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "safe_boundaries": int(sum(bool(r.get("safe")) for r in best_payload["boundary_rows"])),
             "unsafe_boundaries": int(sum(not bool(r.get("safe")) for r in best_payload["boundary_rows"])),
             "actual_boundary_jerk_p95": float(np.percentile([r.get("actual_boundary_jerk", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "actual_entry_fk_jump_p95": float(np.percentile([r.get("actual_entry_fk_jump", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_exit_fk_jump_p95": float(np.percentile([r.get("actual_exit_fk_jump", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_foot_slip_p95": float(np.percentile([r.get("actual_foot_slip", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_boundary_jerk_p95_mps3": float(np.percentile([r.get("actual_boundary_jerk_mps3", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
+            "actual_entry_fk_jump_p95_m": float(np.percentile([r.get("actual_entry_fk_jump_m", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_exit_fk_jump_p95_m": float(np.percentile([r.get("actual_exit_fk_jump_m", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "actual_foot_slip_p95_mps": float(np.percentile([r.get("actual_foot_slip_mps", 0.0) for r in best_payload["boundary_rows"]], 95)) if best_payload["boundary_rows"] else 0.0,
             "physical_units": {
                 "boundary_jerk": "m/s^3",
+                "entry_fk_jump": "m",
                 "exit_fk_jump": "m",
                 "exit_rotation_step": "rad/frame",
                 "foot_slip": "m/s",
@@ -1294,7 +1404,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     )
     save_json(report, json_path)
 
-    if args.render_output:
+    if args.render_output and not required_failures:
         render_if_possible(
             v46,
             str(out),
@@ -1315,20 +1425,16 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "boundary_audit_summary": report["boundary_audit_summary"],
         "final_audit": report["final_audit"],
         "final_motion_activity": final_motion_activity,
+        "final_quality_gate": final_quality_gate,
     }), ensure_ascii=False, indent=2))
 
-    # Preserve NPY and JSON evidence, then fail the run so static collapse is
-    # never silently accepted as a successful generation.
-    if (
-        env_bool("MOTION_ACTIVITY_FINAL_GATE", True)
-        and not bool(final_motion_activity["ok"])
-    ):
+    # Preserve NPY/JSON diagnostics but never render or silently accept an
+    # output that fails any required final quality layer.
+    if required_failures:
         raise RuntimeError(
-            "Final motion activity gate rejected a physically safe but "
-            "nearly static sequence; diagnostics were preserved at "
-            + motion_activity_path
-            + "; reasons="
-            + ",".join(final_motion_activity["reasons"])
+            "Final motion quality gate rejected generated motion; diagnostics "
+            f"were preserved at {json_path}; reasons="
+            + ";".join(required_failures)
         )
     return 0
 

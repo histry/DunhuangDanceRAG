@@ -12,15 +12,17 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 import numpy as np
-import torch
-from pytorch3d.transforms import matrix_to_axis_angle
-
-from support.motion_geometry import (
+from contracts.gravity import fk24_np
+from motion_geometry.rotations import (
+    angular_velocity_np,
+    rot6d_to_matrix_np,
+    so3_geodesic_np,
+)
+from motion_geometry.smpl24 import (
     CONTACT,
     NUM_JOINTS,
-    angular_velocity_np,
-    motion_rotation_matrices_np,
-    motion_to_joint_positions_np,
+    ROT6D_END,
+    ROT6D_START,
 )
 
 FOOT_JOINTS = (7, 8, 10, 11)
@@ -36,17 +38,21 @@ def _ratio(value: float, reference: float, floor: float) -> float:
 
 
 def _rotation_step(motion: np.ndarray) -> np.ndarray:
-    matrix = motion_rotation_matrices_np(motion)
+    x = np.asarray(motion, dtype=np.float32)
+    matrix = rot6d_to_matrix_np(
+        x[:, ROT6D_START:ROT6D_END].reshape(len(x), NUM_JOINTS, 6)
+    )
     if len(matrix) < 2:
         return np.zeros((0, NUM_JOINTS), np.float32)
-    with torch.no_grad():
-        first = torch.from_numpy(matrix[:-1])
-        second = torch.from_numpy(matrix[1:])
-        relative = torch.matmul(first.transpose(-1, -2), second)
-        angle = torch.linalg.norm(
-            matrix_to_axis_angle(relative), dim=-1
-        )
-    return angle.cpu().numpy().astype(np.float32)
+    return so3_geodesic_np(matrix[:-1], matrix[1:]).astype(np.float32)
+
+
+def _angular_velocity_motion(motion: np.ndarray, fps: float) -> np.ndarray:
+    x = np.asarray(motion, dtype=np.float32)
+    matrix = rot6d_to_matrix_np(
+        x[:, ROT6D_START:ROT6D_END].reshape(len(x), NUM_JOINTS, 6)
+    )
+    return angular_velocity_np(matrix, fps=float(fps))
 
 
 def _sigmoid(value: np.ndarray) -> np.ndarray:
@@ -60,16 +66,14 @@ def _kinematic_contact_proxy(
     if len(feet) == 0:
         return np.zeros((0, 4), np.float32)
     height = feet[..., 1]
-    velocity = np.diff(feet, axis=0, prepend=feet[:1]) * fps
-    horizontal = np.linalg.norm(velocity[..., (0, 2)], axis=-1)
     ground = np.percentile(height, 5, axis=0)
     height_probability = _sigmoid(
         (ground[None] + 0.045 - height) / 0.010
     )
-    speed_probability = _sigmoid((0.16 - horizontal) / 0.035)
-    return (
-        height_probability ** 0.70 * speed_probability ** 0.30
-    ).astype(np.float32)
+    # Deliberately exclude foot speed from support inference.  A speed-based
+    # contact veto would remove the worst sliding frames before foot_slip is
+    # measured, creating a circular and bypassable acceptance metric.
+    return height_probability.astype(np.float32)
 
 
 def _boundary_jerk_regions(
@@ -87,7 +91,9 @@ def _boundary_jerk_regions(
         return 0.0, 0.0, 0.0
     score = np.linalg.norm(values, axis=-1)
     if score.ndim > 1:
-        score = score.mean(axis=-1)
+        # A single wrist/ankle spike must fail the seam; averaging over all 24
+        # joints hides exactly the terminal jitter this contract protects.
+        score = score.max(axis=-1)
     entry = left_count
     exit_ = left_count + transition_count
     indices = np.arange(len(score))
@@ -127,7 +133,7 @@ def transition_risk(
     prev_context = prev[-4:] if len(prev) >= 4 else prev
     next_context = nxt[:4] if len(nxt) >= 4 else nxt
     context = np.concatenate([prev_context, trans, next_context], axis=0)
-    positions = motion_to_joint_positions_np(context)
+    positions = fk24_np(context)
     velocity = np.diff(positions, axis=0) * fps
     acceleration = np.diff(velocity, axis=0) * fps
     jerk = np.diff(acceleration, axis=0) * fps
@@ -164,7 +170,7 @@ def transition_risk(
         _boundary_jerk_regions(jerk, left, len(trans))
     )
 
-    transition_positions = motion_to_joint_positions_np(trans)
+    transition_positions = fk24_np(trans)
     tv = np.diff(transition_positions, axis=0) * fps
     ta = np.diff(tv, axis=0) * fps
     tj = np.diff(ta, axis=0) * fps
@@ -174,13 +180,13 @@ def transition_risk(
         if len(tj) > 1 else joint_jerk
     )
 
-    context_angular = angular_velocity_np(context) * fps
+    context_angular = _angular_velocity_motion(context, fps)
     context_angular_acc = np.diff(context_angular, axis=0) * fps
     context_angular_jerk = np.diff(context_angular_acc, axis=0) * fps
     _, _, boundary_angular_jerk_max = _boundary_jerk_regions(
         context_angular_jerk, left, len(trans)
     )
-    angular = angular_velocity_np(trans) * fps
+    angular = _angular_velocity_motion(trans, fps)
     angular_acc = np.diff(angular, axis=0) * fps
     angular_jerk_values = np.diff(angular_acc, axis=0) * fps
     angular_jerk = _rms(angular_jerk_values)

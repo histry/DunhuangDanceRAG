@@ -190,6 +190,40 @@ def _top_k_mean(values: np.ndarray, k: int = VISIBLE_ACTIVITY_TOP_K) -> np.ndarr
     return np.sort(array, axis=-1)[..., -count:].mean(axis=-1).astype(np.float32)
 
 
+def _moving_average_time(
+    values: np.ndarray,
+    *,
+    fps: float,
+    seconds: float,
+) -> np.ndarray:
+    """Low-pass positions so alternating jitter cannot masquerade as activity."""
+
+    x = np.asarray(values, dtype=np.float32)
+    if len(x) <= 1 or seconds <= 0.0:
+        return x.copy()
+    window = max(1, int(round(float(seconds) * float(fps))))
+    if window % 2 == 0:
+        window += 1
+    if window <= 1:
+        return x.copy()
+    radius = window // 2
+    padded = np.pad(
+        x,
+        ((radius, radius),) + ((0, 0),) * (x.ndim - 1),
+        mode="edge",
+    )
+    prefix = np.cumsum(
+        np.concatenate(
+            [np.zeros_like(padded[:1], dtype=np.float64), padded.astype(np.float64)],
+            axis=0,
+        ),
+        axis=0,
+    )
+    return ((prefix[window:] - prefix[:-window]) / float(window)).astype(
+        np.float32
+    )
+
+
 def _window_motion_amplitudes(
     visible_positions: np.ndarray,
     *,
@@ -249,6 +283,7 @@ class ActivityThresholds:
     final_min_joint_speed_rad_s: float = 0.045
     final_min_root_travel_per_second_m_s: float = 0.006
     final_min_fk_visible_joint_speed_m_s: float = 0.020
+    sustained_motion_filter_seconds: float = 0.20
     final_window_seconds: float = 1.0
     final_window_hop_seconds: float = 0.5
     final_min_window_motion_amplitude_m: float = 0.020
@@ -310,6 +345,10 @@ class ActivityThresholds:
             final_min_fk_visible_joint_speed_m_s=max(
                 0.0,
                 _env_float("MOTION_ACTIVITY_FINAL_MIN_FK_VISIBLE_MPS", 0.020),
+            ),
+            sustained_motion_filter_seconds=max(
+                0.0,
+                _env_float("MOTION_ACTIVITY_SUSTAINED_FILTER_SECONDS", 0.20),
             ),
             final_window_seconds=max(
                 1.0e-3,
@@ -381,9 +420,27 @@ def motion_activity_metrics(
     fk_joints = fk24_from_local_np(x, rotations)
     visible_world = fk_joints[:, VISIBLE_JOINT_INDICES]
     visible_root_relative = visible_world - fk_joints[:, :1]
-    visible_world_step = np.linalg.norm(np.diff(visible_world, axis=0), axis=-1)
-    visible_relative_step = np.linalg.norm(
+    visible_world_sustained = _moving_average_time(
+        visible_world,
+        fps=fps,
+        seconds=cfg.sustained_motion_filter_seconds,
+    )
+    visible_root_relative_sustained = _moving_average_time(
+        visible_root_relative,
+        fps=fps,
+        seconds=cfg.sustained_motion_filter_seconds,
+    )
+    visible_world_step_raw = np.linalg.norm(
+        np.diff(visible_world, axis=0), axis=-1
+    )
+    visible_relative_step_raw = np.linalg.norm(
         np.diff(visible_root_relative, axis=0), axis=-1
+    )
+    visible_world_step = np.linalg.norm(
+        np.diff(visible_world_sustained, axis=0), axis=-1
+    )
+    visible_relative_step = np.linalg.norm(
+        np.diff(visible_root_relative_sustained, axis=0), axis=-1
     )
     visible_speed_per_joint = visible_relative_step * fps
     visible_world_speed_per_joint = visible_world_step * fps
@@ -396,7 +453,7 @@ def motion_activity_metrics(
     else:
         visible_speed_frame = np.zeros((frames,), dtype=np.float32)
     window_amplitudes, window_spans = _window_motion_amplitudes(
-        visible_root_relative,
+        visible_root_relative_sustained,
         fps=fps,
         window_seconds=cfg.final_window_seconds,
         hop_seconds=cfg.final_window_hop_seconds,
@@ -470,6 +527,19 @@ def motion_activity_metrics(
             else [0.0] * NUM_JOINTS
         ),
         "fk_visible_joint_names": list(VISIBLE_JOINT_NAMES),
+        "sustained_motion_filter_seconds": float(
+            cfg.sustained_motion_filter_seconds
+        ),
+        "fk_visible_joint_raw_speed_top4_mean_m_s": float(
+            _top_k_mean(visible_relative_step_raw).mean() * fps
+        )
+        if visible_relative_step_raw.size
+        else 0.0,
+        "fk_visible_joint_raw_world_speed_top4_mean_m_s": float(
+            _top_k_mean(visible_world_step_raw).mean() * fps
+        )
+        if visible_world_step_raw.size
+        else 0.0,
         "fk_visible_joint_displacement_top4_mean_m": float(
             _top_k_mean(visible_relative_step).mean()
         )

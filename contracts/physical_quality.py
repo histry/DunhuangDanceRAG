@@ -68,12 +68,23 @@ class PhysicalQualityLimits:
 
     foot_skate_mps_p95: float = 0.18
     foot_skate_mps_max: float = 0.60
+    foot_support_drift_m_p95: float = 0.06
+    foot_support_drift_m_max: float = 0.12
+    foot_contact_height_m_max: float = 0.10
     foot_penetration_min_m: float = -0.05
     joint_jerk_mps3_p95: float = 810.0
     joint_jerk_mps3_max: float = 1620.0
+    joint_jerk_window_p95_max_mps3: float = 1080.0
+    extremity_jerk_mps3_p95: float = 810.0
+    extremity_jerk_window_p95_max_mps3: float = 1080.0
     root_y_robust_range_m: float = 0.90
     root_vertical_speed_mps_p95: float = 1.25
     root_vertical_speed_mps_max: float = 4.0
+    root_horizontal_radius_p95_m: float = 1.80
+    root_horizontal_radius_max_m: float = 2.20
+    root_horizontal_net_displacement_m: float = 3.00
+    root_horizontal_drift_speed_mps: float = 0.12
+    root_horizontal_window_displacement_max_m: float = 1.50
 
     @classmethod
     def from_environment(cls) -> "PhysicalQualityLimits":
@@ -87,6 +98,21 @@ class PhysicalQualityLimits:
                 "PHYSICAL_MAX_FOOT_SKATE_MAX_MPS",
                 "V46_54_MAX_FOOT_SKATE_MAX_MPS",
                 0.60,
+            ),
+            foot_support_drift_m_p95=_env_float(
+                "PHYSICAL_MAX_FOOT_SUPPORT_DRIFT_P95_M",
+                "V46_54_MAX_FOOT_SUPPORT_DRIFT_P95_M",
+                0.06,
+            ),
+            foot_support_drift_m_max=_env_float(
+                "PHYSICAL_MAX_FOOT_SUPPORT_DRIFT_MAX_M",
+                "V46_54_MAX_FOOT_SUPPORT_DRIFT_MAX_M",
+                0.12,
+            ),
+            foot_contact_height_m_max=_env_float(
+                "PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M",
+                "V46_54_MAX_FOOT_CONTACT_HEIGHT_M",
+                0.10,
             ),
             foot_penetration_min_m=_env_float(
                 "PHYSICAL_MIN_FOOT_PENETRATION_M",
@@ -103,6 +129,21 @@ class PhysicalQualityLimits:
                 "V46_54_MAX_JOINT_JERK_MAX_MPS3",
                 1620.0,
             ),
+            joint_jerk_window_p95_max_mps3=_env_float(
+                "PHYSICAL_MAX_JOINT_JERK_WINDOW_P95_MPS3",
+                "V46_54_MAX_JOINT_JERK_WINDOW_P95_MPS3",
+                1080.0,
+            ),
+            extremity_jerk_mps3_p95=_env_float(
+                "PHYSICAL_MAX_EXTREMITY_JERK_P95_MPS3",
+                "V46_54_MAX_EXTREMITY_JERK_P95_MPS3",
+                810.0,
+            ),
+            extremity_jerk_window_p95_max_mps3=_env_float(
+                "PHYSICAL_MAX_EXTREMITY_JERK_WINDOW_P95_MPS3",
+                "V46_54_MAX_EXTREMITY_JERK_WINDOW_P95_MPS3",
+                1080.0,
+            ),
             root_y_robust_range_m=_env_float(
                 "PHYSICAL_MAX_ROOT_Y_ROBUST_RANGE_M",
                 "V46_54_MAX_ROOT_Y_ROBUST_RANGE_M",
@@ -118,18 +159,64 @@ class PhysicalQualityLimits:
                 "V46_54_MAX_ROOT_VERTICAL_SPEED_MAX_MPS",
                 4.0,
             ),
+            root_horizontal_radius_p95_m=_env_float(
+                "PHYSICAL_MAX_ROOT_XZ_RADIUS_P95_M",
+                "V46_54_MAX_ROOT_XZ_RADIUS_P95_M",
+                1.80,
+            ),
+            root_horizontal_radius_max_m=_env_float(
+                "PHYSICAL_MAX_ROOT_XZ_RADIUS_MAX_M",
+                "V46_54_MAX_ROOT_XZ_RADIUS_MAX_M",
+                2.20,
+            ),
+            root_horizontal_net_displacement_m=_env_float(
+                "PHYSICAL_MAX_ROOT_XZ_NET_DISPLACEMENT_M",
+                "V46_54_MAX_ROOT_XZ_NET_DISPLACEMENT_M",
+                3.00,
+            ),
+            root_horizontal_drift_speed_mps=_env_float(
+                "PHYSICAL_MAX_ROOT_XZ_DRIFT_SPEED_MPS",
+                "V46_54_MAX_ROOT_XZ_DRIFT_SPEED_MPS",
+                0.12,
+            ),
+            root_horizontal_window_displacement_max_m=_env_float(
+                "PHYSICAL_MAX_ROOT_XZ_WINDOW_DISPLACEMENT_M",
+                "V46_54_MAX_ROOT_XZ_WINDOW_DISPLACEMENT_M",
+                1.50,
+            ),
         )
 
     def as_audit_limits(self) -> Dict[str, float]:
         return {
             "foot_skate_mps_p95": float(self.foot_skate_mps_p95),
             "foot_skate_mps_max": float(self.foot_skate_mps_max),
+            "foot_support_drift_m_p95": float(self.foot_support_drift_m_p95),
+            "foot_support_drift_m_max": float(self.foot_support_drift_m_max),
+            "foot_contact_height_m_max": float(self.foot_contact_height_m_max),
             "foot_penetration_min_m": float(self.foot_penetration_min_m),
             "joint_jerk_mps3_p95": float(self.joint_jerk_mps3_p95),
             "joint_jerk_mps3_max": float(self.joint_jerk_mps3_max),
+            "joint_jerk_window_p95_max_mps3": float(
+                self.joint_jerk_window_p95_max_mps3
+            ),
+            "extremity_jerk_mps3_p95": float(self.extremity_jerk_mps3_p95),
+            "extremity_jerk_window_p95_max_mps3": float(
+                self.extremity_jerk_window_p95_max_mps3
+            ),
             "root_y_robust_range_m": float(self.root_y_robust_range_m),
             "root_vertical_speed_mps_p95": float(self.root_vertical_speed_mps_p95),
             "root_vertical_speed_mps_max": float(self.root_vertical_speed_mps_max),
+            "root_horizontal_radius_p95_m": float(self.root_horizontal_radius_p95_m),
+            "root_horizontal_radius_max_m": float(self.root_horizontal_radius_max_m),
+            "root_horizontal_net_displacement_m": float(
+                self.root_horizontal_net_displacement_m
+            ),
+            "root_horizontal_drift_speed_mps": float(
+                self.root_horizontal_drift_speed_mps
+            ),
+            "root_horizontal_window_displacement_max_m": float(
+                self.root_horizontal_window_displacement_max_m
+            ),
         }
 
     def to_dict(self) -> Dict[str, float]:
@@ -305,16 +392,48 @@ def evaluate_physical_audit(
 
     lim = limits or PhysicalQualityLimits.from_environment()
     limit_map = lim.as_audit_limits()
-    reasons = []
+    layer_reasons: Dict[str, list[str]] = {
+        "anti_jitter": [],
+        "foot_contact": [],
+        "root_vertical": [],
+        "long_horizon_root_drift": [],
+    }
 
-    for key in (
-        "foot_skate_mps_p95",
-        "foot_skate_mps_max",
-        "joint_jerk_mps3_p95",
-        "joint_jerk_mps3_max",
-    ):
-        if _metric(audit, key, float("inf")) > limit_map[key]:
-            reasons.append(f"{key}_too_high")
+    def reject_high(layer: str, keys: Sequence[str]) -> None:
+        for key in keys:
+            if _metric(audit, key, float("inf")) > limit_map[key]:
+                layer_reasons[layer].append(f"{key}_too_high")
+
+    reject_high(
+        "anti_jitter",
+        (
+            "joint_jerk_mps3_p95",
+            "joint_jerk_mps3_max",
+            "joint_jerk_window_p95_max_mps3",
+            "extremity_jerk_mps3_p95",
+            "extremity_jerk_window_p95_max_mps3",
+        ),
+    )
+    reject_high(
+        "foot_contact",
+        (
+            "foot_skate_mps_p95",
+            "foot_skate_mps_max",
+            "foot_support_drift_m_p95",
+            "foot_support_drift_m_max",
+            "foot_contact_height_m_max",
+        ),
+    )
+    reject_high(
+        "long_horizon_root_drift",
+        (
+            "root_horizontal_radius_p95_m",
+            "root_horizontal_radius_max_m",
+            "root_horizontal_net_displacement_m",
+            "root_horizontal_drift_speed_mps",
+            "root_horizontal_window_displacement_max_m",
+        ),
+    )
 
     robust_root_range = _metric(
         audit,
@@ -322,25 +441,40 @@ def evaluate_physical_audit(
         _metric(audit, "root_y_range_m", float("inf")),
     )
     if robust_root_range > limit_map["root_y_robust_range_m"]:
-        reasons.append("root_y_robust_range_m_too_high")
+        layer_reasons["root_vertical"].append("root_y_robust_range_m_too_high")
 
     for key in (
         "root_vertical_speed_mps_p95",
         "root_vertical_speed_mps_max",
     ):
         if key in audit and _metric(audit, key, float("inf")) > limit_map[key]:
-            reasons.append(f"{key}_too_high")
+            layer_reasons["root_vertical"].append(f"{key}_too_high")
 
     if _metric(audit, "foot_penetration_min_m", float("-inf")) < limit_map[
         "foot_penetration_min_m"
     ]:
-        reasons.append("foot_penetration_too_low")
+        layer_reasons["foot_contact"].append("foot_penetration_too_low")
+
+    reasons = [
+        reason
+        for layer in (
+            "anti_jitter",
+            "foot_contact",
+            "root_vertical",
+            "long_horizon_root_drift",
+        )
+        for reason in layer_reasons[layer]
+    ]
 
     return {
         "ok": not reasons,
         "reasons": reasons,
         "limits": limit_map,
         "audit": dict(audit),
+        "layers": {
+            name: {"ok": not values, "reasons": list(values)}
+            for name, values in layer_reasons.items()
+        },
     }
 
 

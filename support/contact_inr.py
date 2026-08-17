@@ -24,11 +24,12 @@ from typing import Dict, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
+from motion_geometry.rotations import (
+    ROT6D_LAYOUT_PYTORCH3D_ROW,
+    matrix_to_rot6d_layout_torch,
+    rot6d_to_matrix_layout_torch,
+    so3_exp_torch,
+    so3_log_torch,
 )
 
 from training.boundary_dynamics import (
@@ -47,6 +48,18 @@ from support.motion_geometry import (
     ROOT_Z,
     ROT,
 )
+
+
+def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
+    return rot6d_to_matrix_layout_torch(value, ROT6D_LAYOUT_PYTORCH3D_ROW)
+
+
+def matrix_to_rotation_6d(value: torch.Tensor) -> torch.Tensor:
+    return matrix_to_rot6d_layout_torch(value, ROT6D_LAYOUT_PYTORCH3D_ROW)
+
+
+matrix_to_axis_angle = so3_log_torch
+axis_angle_to_matrix = so3_exp_torch
 
 
 @dataclass

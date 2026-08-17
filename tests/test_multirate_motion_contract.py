@@ -113,7 +113,9 @@ class MultirateMotionContractTests(unittest.TestCase):
     def test_boundary_gate_reads_only_explicit_si_thresholds(self):
         risk = {
             "boundary_joint_jerk_max": 700.0,
+            "entry_fk_jump": 0.010,
             "exit_fk_jump": 0.010,
+            "entry_rotation_step_rad": 0.040,
             "exit_rotation_step_rad": 0.040,
             "foot_slip": 0.040,
             "foot_penetration": 0.0001,

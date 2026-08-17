@@ -1016,6 +1016,33 @@ def _install_v53_patches() -> None:
             "full_rollback": fallback,
         }
         stage["v46_53_motion_audit"] = audit_motion(merged, fps=float(getattr(cfg, "fps", 30.0)))
+        # This merge occurs after V46.52's audit.  Recompute the authoritative
+        # SI audit on the exact motion returned to the final generator gate;
+        # otherwise a post-audit tangent/trust-region edit could bypass every
+        # Anti-Jitter, Foot-Contact and Root-Drift acceptance limit.
+        if not hasattr(v46, "audit_motion_np"):
+            raise RuntimeError(
+                "V46.53 final merge requires audit_motion_np for final gating"
+            )
+        selected_audit = dict(v46.audit_motion_np(merged, cfg))
+        selected_gate = v52.base.physical_quality_gate(selected_audit)
+        physical_rollback = {
+            "enabled": _env_bool("V46_54_FINAL_PHYSICAL_ROLLBACK", True),
+            "rolled_back": False,
+            "candidate_gate": selected_gate,
+        }
+        if physical_rollback["enabled"] and not bool(selected_gate["ok"]):
+            proposal_audit = dict(v46.audit_motion_np(proposal_motion, cfg))
+            proposal_gate = v52.base.physical_quality_gate(proposal_audit)
+            physical_rollback["proposal_gate"] = proposal_gate
+            if bool(proposal_gate["ok"]):
+                merged = np.asarray(proposal_motion, dtype=np.float32).copy()
+                selected_audit = proposal_audit
+                selected_gate = proposal_gate
+                physical_rollback["rolled_back"] = True
+        stage["v46_54_post_merge_physical_rollback"] = physical_rollback
+        stage["final_audit"] = selected_audit
+        stage["final_physical_gate"] = selected_gate
         return merged.astype(np.float32), stage
 
     v52.v4650._build_heading_proposal = proposal_v53

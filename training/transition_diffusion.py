@@ -15,12 +15,6 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
-)
 
 from training.boundary_dynamics import (
     boundary_state_from_context_np,
@@ -40,6 +34,10 @@ from motion_geometry.rotations import (
     ROT6D_LAYOUT_COLUMN,
     ROT6D_LAYOUT_PYTORCH3D_ROW,
     convert_motion_rot6d_layout_np,
+    matrix_to_rot6d_layout_torch,
+    rot6d_to_matrix_layout_torch,
+    so3_exp_torch,
+    so3_log_torch,
 )
 from support.contact_inr import (
     V32ContactINRSystem,
@@ -53,6 +51,18 @@ from support.transition_quality import (
     transition_risk,
 )
 from support.checkpoint_contracts import assert_checkpoint_fps
+
+
+def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
+    return rot6d_to_matrix_layout_torch(value, ROT6D_LAYOUT_PYTORCH3D_ROW)
+
+
+def matrix_to_rotation_6d(value: torch.Tensor) -> torch.Tensor:
+    return matrix_to_rot6d_layout_torch(value, ROT6D_LAYOUT_PYTORCH3D_ROW)
+
+
+matrix_to_axis_angle = so3_log_torch
+axis_angle_to_matrix = so3_exp_torch
 
 
 def load_transition_diffusion(

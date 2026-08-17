@@ -8,10 +8,26 @@ import numpy as np
 from routing.boundary_closed_loop import make_seam_mask, physical_quality_gate
 try:
     from scheduling.whole_song_scheduler import cap_transition_budget
-except ModuleNotFoundError as exc:  # lightweight audit runtime may omit torch
-    if exc.name != "torch":
+except ModuleNotFoundError as exc:  # lightweight audit runtime may omit 3D deps
+    if exc.name not in {"torch", "pytorch3d"}:
         raise
     cap_transition_budget = None
+
+
+def _quality_defaults():
+    return {
+        "foot_support_drift_m_p95": 0.01,
+        "foot_support_drift_m_max": 0.02,
+        "foot_contact_height_m_max": 0.02,
+        "joint_jerk_window_p95_max_mps3": 300.0,
+        "extremity_jerk_mps3_p95": 200.0,
+        "extremity_jerk_window_p95_max_mps3": 300.0,
+        "root_horizontal_radius_p95_m": 0.50,
+        "root_horizontal_radius_max_m": 0.75,
+        "root_horizontal_net_displacement_m": 0.50,
+        "root_horizontal_drift_speed_mps": 0.02,
+        "root_horizontal_window_displacement_max_m": 0.50,
+    }
 
 
 class TransitionBudgetTests(unittest.TestCase):
@@ -43,6 +59,7 @@ class TransitionBudgetTests(unittest.TestCase):
     def test_physical_gate_rejects_skate(self):
         result = physical_quality_gate(
             {
+                **_quality_defaults(),
                 "foot_skate_mps_p95": 0.60,
                 "foot_skate_mps_max": 1.20,
                 "foot_penetration_min_m": -0.01,
@@ -60,6 +77,7 @@ class TransitionBudgetTests(unittest.TestCase):
     def test_physical_gate_rejects_single_frame_jerk_spike(self):
         result = physical_quality_gate(
             {
+                **_quality_defaults(),
                 "foot_skate_mps_p95": 0.06,
                 "foot_skate_mps_max": 0.30,
                 "foot_penetration_min_m": -0.01,
@@ -77,6 +95,7 @@ class TransitionBudgetTests(unittest.TestCase):
     def test_physical_gate_accepts_stable_locked_feet(self):
         result = physical_quality_gate(
             {
+                **_quality_defaults(),
                 "foot_skate_mps_p95": 0.096,
                 "foot_skate_mps_max": 0.54,
                 "foot_penetration_min_m": -0.046,
@@ -92,6 +111,7 @@ class TransitionBudgetTests(unittest.TestCase):
 
     def test_physical_gate_preserves_legitimate_posture_range_but_rejects_root_spike(self):
         stable_posture_change = {
+            **_quality_defaults(),
             "foot_skate_mps_p95": 0.06,
             "foot_skate_mps_max": 0.30,
             "foot_penetration_min_m": -0.01,

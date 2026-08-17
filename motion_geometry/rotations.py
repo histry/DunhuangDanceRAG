@@ -419,6 +419,46 @@ def so3_log_torch(m: "torch.Tensor") -> "torch.Tensor":
     return result
 
 
+def so3_exp_torch(v: "torch.Tensor") -> "torch.Tensor":
+    """Differentiable exponential map from rotation vectors to SO(3)."""
+
+    if torch is None:
+        raise RuntimeError("PyTorch is required")
+    value = v
+    theta2 = (value * value).sum(dim=-1, keepdim=True)
+    theta = torch.sqrt(theta2.clamp_min(1.0e-16))
+    small = theta2 < 1.0e-8
+    a = torch.where(
+        small,
+        1.0 - theta2 / 6.0 + theta2.square() / 120.0,
+        torch.sin(theta) / theta.clamp_min(1.0e-8),
+    )
+    b = torch.where(
+        small,
+        0.5 - theta2 / 24.0 + theta2.square() / 720.0,
+        (1.0 - torch.cos(theta)) / theta2.clamp_min(1.0e-8),
+    )
+    x, y, z = value.unbind(dim=-1)
+    zero = torch.zeros_like(x)
+    skew = torch.stack(
+        [
+            zero,
+            -z,
+            y,
+            z,
+            zero,
+            -x,
+            -y,
+            x,
+            zero,
+        ],
+        dim=-1,
+    ).reshape(*value.shape[:-1], 3, 3)
+    identity = torch.eye(3, dtype=value.dtype, device=value.device)
+    identity = identity.expand(*value.shape[:-1], 3, 3)
+    return identity + a[..., None] * skew + b[..., None] * (skew @ skew)
+
+
 def validate_rot6d_roundtrip_np(x: np.ndarray) -> dict:
     m = rot6d_to_matrix_np(x)
     x2 = matrix_to_rot6d_np(m)

@@ -390,6 +390,31 @@ def _apply_generators_v52(v46: Any, motion_ref: np.ndarray, cond: np.ndarray, se
         rollback["after_ok"] = True
         rollback["after_reasons"] = []
     stage["v46_52_anatomy_guard"] = rollback
+    if not hasattr(v46, "audit_motion_np"):
+        raise RuntimeError(
+            "V46.52 anatomy rollback requires audit_motion_np for final gating"
+        )
+    # The anatomy rollback can replace frames after V46.50's audit.  Always
+    # audit the exact array returned downstream, including full rollbacks.
+    selected_audit = dict(v46.audit_motion_np(motion, cfg))
+    selected_gate = base.physical_quality_gate(selected_audit)
+    physical_rollback = {
+        "enabled": env_bool("V46_54_FINAL_PHYSICAL_ROLLBACK", True),
+        "rolled_back": False,
+        "candidate_gate": selected_gate,
+    }
+    if physical_rollback["enabled"] and not bool(selected_gate["ok"]):
+        reference_audit = dict(v46.audit_motion_np(motion_ref, cfg))
+        reference_gate = base.physical_quality_gate(reference_audit)
+        physical_rollback["reference_gate"] = reference_gate
+        if bool(reference_gate["ok"]):
+            motion = np.asarray(motion_ref, dtype=np.float32).copy()
+            selected_audit = reference_audit
+            selected_gate = reference_gate
+            physical_rollback["rolled_back"] = True
+    stage["v46_54_final_physical_rollback"] = physical_rollback
+    stage["final_audit"] = selected_audit
+    stage["final_physical_gate"] = selected_gate
     return motion.astype(np.float32), stage
 
 

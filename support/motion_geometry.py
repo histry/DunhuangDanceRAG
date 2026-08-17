@@ -18,13 +18,11 @@ from typing import Any, Dict, Iterable, Sequence, Tuple
 
 import numpy as np
 import torch
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-)
 from motion_geometry.rotations import (
     matrix_to_rot6d_torch as matrix_to_rotation_6d,
     rot6d_to_matrix_torch as rotation_6d_to_matrix,
+    so3_exp_torch as axis_angle_to_matrix,
+    so3_log_torch as matrix_to_axis_angle,
 )
 from motion_geometry.smpl24 import (
     CONTACT,

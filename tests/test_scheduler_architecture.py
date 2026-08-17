@@ -477,6 +477,27 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertIn("degrade_for_refiner(clean, cfg=cfg)", block)
         self.assertNotIn("degrade_for_refiner(clean)\n", block)
 
+    def test_post_processing_reaudits_exact_returned_motion(self):
+        anatomy = (ROOT / "routing" / "heading_closed_loop_impl2.py").read_text(
+            encoding="utf-8"
+        )
+        final_merge = (ROOT / "routing" / "global_path.py").read_text(
+            encoding="utf-8"
+        )
+        for source in (anatomy, final_merge):
+            self.assertIn('stage["final_audit"] = selected_audit', source)
+            self.assertIn('stage["final_physical_gate"] = selected_gate', source)
+            self.assertIn("V46_54_FINAL_PHYSICAL_ROLLBACK", source)
+
+    def test_final_generator_requires_complete_boundary_audit(self):
+        source = (ROOT / "routing" / "boundary_closed_loop.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("evaluate_boundary_continuity(", source)
+        self.assertIn('"V46_46_REQUIRE_FINAL_BOUNDARY_GATE"', source)
+        self.assertIn("expected_boundaries=max(", source)
+        self.assertIn("if args.render_output and not required_failures", source)
+
 
 if __name__ == "__main__":
     unittest.main()

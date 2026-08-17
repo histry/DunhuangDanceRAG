@@ -13,6 +13,7 @@ from motion_geometry.rotations import (
     rot6d_to_matrix_layout_np,
     so3_exp_np,
     so3_geodesic_np,
+    so3_exp_torch,
     so3_log_np,
     so3_log_torch,
 )
@@ -84,6 +85,27 @@ class RotationContractTest(unittest.TestCase):
         value = so3_log_torch(rotations)
         self.assertTrue(bool(torch.isfinite(value).all()))
         self.assertTrue(bool((torch.linalg.vector_norm(value, dim=-1) > 3.0).all()))
+
+    def test_torch_exp_matches_numpy_and_has_finite_gradient(self):
+        try:
+            import torch
+        except Exception:
+            self.skipTest("PyTorch is not installed in the lightweight test runtime")
+        vectors = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, -0.4, 0.7],
+                [float(np.pi - 1.0e-5), 0.0, 0.0],
+            ],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        actual = so3_exp_torch(vectors)
+        expected = so3_exp_np(vectors.detach().numpy())
+        error = so3_geodesic_np(actual.detach().numpy(), expected)
+        self.assertLess(float(error.max()), 2.0e-5)
+        actual.square().sum().backward()
+        self.assertTrue(bool(torch.isfinite(vectors.grad).all()))
 
     def test_legacy_row_adapter_preserves_physical_rotation(self):
         rng = np.random.default_rng(17)

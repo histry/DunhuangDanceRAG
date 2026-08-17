@@ -22,16 +22,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch3d.transforms import (
-    axis_angle_to_matrix,
-    matrix_to_axis_angle,
-    matrix_to_rotation_6d,
-    rotation_6d_to_matrix,
-)
 from motion_geometry.rotations import (
     CANONICAL_ROT6D_LAYOUT,
     ROT6D_LAYOUT_PYTORCH3D_ROW,
+    matrix_to_rot6d_layout_torch,
     normalize_rot6d_layout,
+    rot6d_to_matrix_layout_torch,
+    so3_exp_torch,
+    so3_log_torch,
 )
 
 CONTACT = slice(0, 4)
@@ -43,6 +41,18 @@ ROOT_ROT6D = slice(7, 13)
 # representation.  Project callers use the column-concatenated canonical
 # contract and must adapt at the checkpoint boundary.
 NATIVE_ROT6D_LAYOUT = ROT6D_LAYOUT_PYTORCH3D_ROW
+
+
+def rotation_6d_to_matrix(value: torch.Tensor) -> torch.Tensor:
+    return rot6d_to_matrix_layout_torch(value, NATIVE_ROT6D_LAYOUT)
+
+
+def matrix_to_rotation_6d(value: torch.Tensor) -> torch.Tensor:
+    return matrix_to_rot6d_layout_torch(value, NATIVE_ROT6D_LAYOUT)
+
+
+matrix_to_axis_angle = so3_log_torch
+axis_angle_to_matrix = so3_exp_torch
 
 
 class FiLMBlock1D(nn.Module):
