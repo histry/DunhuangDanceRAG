@@ -692,7 +692,67 @@ def compute_condition(slot_feat: np.ndarray, db: Dict[str, Any]) -> np.ndarray:
     return cond.astype(np.float32)
 
 
-def apply_generators(v46, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, args: argparse.Namespace, cfg: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+def sliding_support_eligibility(
+    db: Dict[str, Any],
+    assembly_report: Sequence[Dict[str, Any]],
+    frames: int,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Map explicit Chang-E cloud/pivot semantics onto assembled frame spans."""
+    mask = np.zeros(int(frames), dtype=bool)
+    tokens = {
+        token.strip().lower()
+        for token in os.environ.get(
+            "CHANG_E_SLIDING_SUPPORT_TOKENS",
+            "sogdian_whirl,lotus_steps,turning_travel,traveling_steps,"
+            "alternating_or_pivot_support,alternating_foot_support",
+        ).split(",")
+        if token.strip()
+    }
+    dance = np.asarray(db.get("dance_keys", []), dtype=object)
+    locomotion = np.asarray(db.get("locomotion_labels", []), dtype=object)
+    support = np.asarray(db.get("support_labels", []), dtype=object)
+    eligible_events: list[int] = []
+    for row in assembly_report:
+        event_id = int(row.get("event_id", -1))
+        if event_id < 0:
+            continue
+        values = []
+        for array in (dance, locomotion, support):
+            if event_id < len(array):
+                values.append(str(array[event_id]).strip().lower())
+        eligible = any(
+            token in " ".join(values)
+            for token in tokens
+        )
+        if not eligible:
+            continue
+        eligible_events.append(event_id)
+        for key in ("transition_span", "core_span"):
+            span = row.get(key)
+            if isinstance(span, Sequence) and len(span) == 2:
+                start = max(0, int(span[0]))
+                end = min(len(mask), int(span[1]))
+                mask[start:end] = True
+    return mask, {
+        "schema": "chang_e_sliding_support_eligibility_v1",
+        "eligible_frames": int(mask.sum()),
+        "eligible_frame_ratio": float(mask.mean()) if len(mask) else 0.0,
+        "eligible_event_ids": sorted(set(eligible_events)),
+        "tokens": sorted(tokens),
+        "kinematic_confirmation_required": True,
+    }
+
+
+def apply_generators(
+    v46,
+    motion_ref: np.ndarray,
+    cond: np.ndarray,
+    seam_mask: np.ndarray,
+    args: argparse.Namespace,
+    cfg: Any,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Apply repair stages with Peak-Jerk support and transactional rollback."""
     if not hasattr(v46, "audit_motion_np"):
         raise RuntimeError(
@@ -705,7 +765,13 @@ def apply_generators(v46, motion_ref: np.ndarray, cond: np.ndarray, seam_mask: n
     stage: Dict[str, Any] = {}
 
     def audit_fn(value: np.ndarray) -> Dict[str, Any]:
-        return dict(v46.audit_motion_np(value, cfg))
+        return dict(
+            v46.audit_motion_np(
+                value,
+                cfg,
+                sliding_support_eligible=sliding_support_eligible,
+            )
+        )
 
     stage["pre_refine_audit"] = audit_fn(motion)
 
@@ -1101,7 +1167,21 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(v46, slots, candidate_lists, db, cfg, banned=banned)
         transition_spans = transition_spans_from_report(assembly_report)
         seam_mask, seam_positions, mask_policy = make_seam_mask(v46, motion_ref.shape[0], transition_spans, cfg)
-        motion, stage_reports = apply_generators(v46, motion_ref, cond, seam_mask, args, cfg)
+        slide_eligible, slide_report = sliding_support_eligibility(
+            db,
+            assembly_report,
+            motion_ref.shape[0],
+        )
+        motion, stage_reports = apply_generators(
+            v46,
+            motion_ref,
+            cond,
+            seam_mask,
+            args,
+            cfg,
+            sliding_support_eligible=slide_eligible,
+        )
+        stage_reports["sliding_support_eligibility"] = slide_report
         boundary_rows = audit_boundaries(v46, motion, assembly_report, cfg)
         unsafe_rows = [r for r in boundary_rows if not bool(r.get("safe"))]
         round_summary = {

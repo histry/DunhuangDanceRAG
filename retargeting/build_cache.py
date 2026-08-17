@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build a V46.53.1 source-safe retarget cache.
+"""Build a V46.53.1 physically-clean retarget cache.
 
-This replacement separates source-level catastrophic safety from event-level style
-quality. A source is retained when it is numerically/physically usable; expressive
-low-posture or instrument-specific segments are filtered after event slicing.
+Source motion must pass anatomy, gravity, fit and whole-recording physical-clean
+gates before it can enter training. Expressive style quality remains an event-level
+decision after slicing; intentional travel is not treated as root drift here.
 """
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ from data_pipeline.chang_e_manifest import (
     manifest_sha256,
     validate_source,
 )
+from contracts.physical_quality import evaluate_source_physical_clean_audit
+from motion_geometry.physical import motion_physical_metrics_np
 from retargeting.legacy_anatomy_adapter import load_official_smpl_motion
 from retargeting.anatomy_retarget import retarget_bvh_research
 
@@ -69,6 +71,8 @@ def _report_valid(
         reasons.append("gravity_not_ok")
     if not bool(rep.get("fit_ok", False)):
         reasons.append("fit_not_ok")
+    if not bool(rep.get("physical_clean_ok", False)):
+        reasons.append("physical_clean_not_ok")
     if expected_provenance is not None:
         actual = rep.get("cache_provenance")
         if not isinstance(actual, dict):
@@ -267,6 +271,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     for key, value in source_metadata.items()
                     if key not in {"manifest_path", "manifest_sha256"}
                 }
+            semantic_text = " ".join(
+                (
+                    str(source_used).lower(),
+                    json.dumps(source_metadata or {}, ensure_ascii=False).lower(),
+                    json.dumps(rep, ensure_ascii=False, default=str).lower(),
+                )
+            )
+            sliding_tokens = {
+                token.strip().lower()
+                for token in os.environ.get(
+                    "CHANG_E_SLIDING_SUPPORT_TOKENS",
+                    "sogdian_whirl,sogdian,whirl,ribbon,lotus_steps,lotus,"
+                    "turning_travel,alternating_or_pivot_support",
+                ).split(",")
+                if token.strip()
+            }
+            source_sliding_eligible = any(
+                token in semantic_text for token in sliding_tokens
+            )
+            physical_audit = motion_physical_metrics_np(
+                np.asarray(motion, dtype=np.float32),
+                fps=float(cfg.target_fps),
+                sliding_support_eligible=(
+                    np.full(len(motion), True, dtype=bool)
+                    if source_sliding_eligible
+                    else None
+                ),
+            )
+            physical_clean_gate = evaluate_source_physical_clean_audit(
+                physical_audit
+            )
             cache_provenance = _expected_provenance(
                 source_used,
                 target_fps=float(cfg.target_fps),
@@ -281,10 +316,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "representation_fallbacks": candidate_errors,
                 "source_metadata": source_metadata,
                 "cache_provenance": cache_provenance,
+                "physical_audit": physical_audit,
+                "physical_clean_gate": physical_clean_gate,
+                "physical_clean_ok": bool(physical_clean_gate["ok"]),
                 "v46_53_1_cache_contract": {
                     "schema": SCHEMA,
-                    "source_gate": "catastrophic_only",
+                    "source_gate": "pretraining_physical_clean",
                     "event_quality_gate_deferred": True,
+                    "requires_physical_clean_ok": True,
+                    "sliding_support_semantic_eligible": bool(
+                        source_sliding_eligible
+                    ),
                     "requires_gravity_ok": True,
                     "requires_fit_ok": True,
                     "official_smpl_preferred": env_bool("V46_52_PREFER_OFFICIAL_SMPL", True),
@@ -332,7 +374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "smpl_scaling_mode": str(args.smpl_scaling_mode),
         "all_ok": bool(all_ok),
         "policy": {
-            "source_gate": "catastrophic numerical/physical failures only",
+            "source_gate": "pretraining anatomy/gravity/fit/physical clean",
             "style_quality": "deferred to event-level posture-aware gate",
             "minimum_split_cardinality": 3,
         },

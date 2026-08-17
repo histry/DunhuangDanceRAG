@@ -633,6 +633,44 @@ def evaluate_physical_audit(
     }
 
 
+def evaluate_source_physical_clean_audit(
+    audit: Mapping[str, Any],
+    limits: Optional[PhysicalQualityLimits] = None,
+) -> Dict[str, Any]:
+    """Fail-closed pre-training clean gate for full source recordings.
+
+    Intentional source travel is allowed, so long-horizon root displacement is
+    not a source-cleanliness failure. All remaining layers use the exact same
+    metric registry and thresholds as final output.
+    """
+    full = evaluate_physical_audit(audit, limits=limits)
+    required_layers = (
+        "contract",
+        "anti_jitter",
+        "foot_contact",
+        "root_vertical",
+        "rotation_quality",
+    )
+    layers = {
+        name: dict(full["layers"][name])
+        for name in required_layers
+    }
+    reasons = [
+        reason
+        for name in required_layers
+        for reason in layers[name]["reasons"]
+    ]
+    return {
+        "schema": "source_physical_clean_gate_v1",
+        "ok": not reasons,
+        "reasons": reasons,
+        "excluded_final_only_layers": ["long_horizon_root_drift"],
+        "limits": dict(full["limits"]),
+        "audit": dict(audit),
+        "layers": layers,
+    }
+
+
 def _allowed_after_stage(
     before: float,
     absolute_limit: float,
@@ -924,6 +962,13 @@ def build_peak_jerk_risk_mask(
 
     # Root translation is editable only when the pelvis/root chain is implicated.
     root_mask = joint_mask[:, 0].copy()
+    # A foot/ankle Peak-Jerk repair must update the contact state in the same
+    # ownership window.  Leaving contact frozen while editing the planted lower
+    # chain creates an internally inconsistent repair target.
+    contact_mask = np.max(
+        joint_mask[:, [7, 8, 10, 11]],
+        axis=1,
+    ).astype(np.float32)
 
     peak_values = jerk_norm[risky]
     return {

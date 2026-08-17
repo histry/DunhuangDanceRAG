@@ -359,9 +359,12 @@ def project_rot6d_torch(x):
 def fk_24_torch(motion, parents=None, offsets=None):
     parents = torch.as_tensor(PARENTS if parents is None else parents, device=motion.device, dtype=torch.long)
     offsets = torch.as_tensor(OFFSETS if offsets is None else offsets, device=motion.device, dtype=motion.dtype)
-    T = motion.shape[0]
-    root = motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
-    rot6d = motion[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)
+    if motion.ndim < 2 or motion.shape[-1] != EDGE_DIM:
+        raise ValueError(f"Expected [...,{EDGE_DIM}], got {tuple(motion.shape)}")
+    leading = motion.shape[:-1]
+    flat = motion.reshape(-1, EDGE_DIM)
+    root = flat[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+    rot6d = flat[:, ROT6D_START:ROT6D_END].reshape(-1, NUM_JOINTS, 6)
     local_r = rot6d_to_matrix_torch(rot6d)
     global_r = []
     joints = []
@@ -376,7 +379,7 @@ def fk_24_torch(motion, parents=None, offsets=None):
             pos = joints[p] + torch.matmul(global_r[p], off).squeeze(-1)
         global_r.append(gr)
         joints.append(pos)
-    return torch.stack(joints, dim=1)
+    return torch.stack(joints, dim=1).reshape(*leading, NUM_JOINTS, 3)
 
 
 def root_yaw_np(motion: np.ndarray) -> np.ndarray:
@@ -563,6 +566,16 @@ class V46Config:
     product_refiner_rotation_cap_rad: float = 0.35
     product_refiner_root_cap_m: float = 0.08
     product_refiner_outside_weight: float = 0.25
+    # Differentiable world-space supervision shared by V45 and V46.  The
+    # acceleration/jerk residuals are normalized inside the loss, so these
+    # weights are comparable to the product-manifold reconstruction term.
+    physics_fk_loss_weight: float = 0.08
+    physics_foot_loss_weight: float = 0.12
+    physics_support_loss_weight: float = 0.10
+    physics_penetration_loss_weight: float = 0.08
+    physics_acceleration_loss_weight: float = 0.02
+    physics_jerk_loss_weight: float = 0.01
+    physics_static_support_speed_mps: float = 0.18
     tangent_diffusion_enable: bool = True
     tangent_diffusion_rotation_cap_rad: float = 0.45
     tangent_diffusion_root_cap_m: float = 0.10
@@ -613,6 +626,14 @@ class V46Config:
             "V46_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
             "V46_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
             "V46_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
+            "V46_PHYSICS_FK_LOSS_WEIGHT": ("physics_fk_loss_weight", float),
+            "V46_PHYSICS_FOOT_LOSS_WEIGHT": ("physics_foot_loss_weight", float),
+            "V46_PHYSICS_SUPPORT_LOSS_WEIGHT": ("physics_support_loss_weight", float),
+            "V46_PHYSICS_PENETRATION_LOSS_WEIGHT": ("physics_penetration_loss_weight", float),
+            "V46_PHYSICS_ACCELERATION_LOSS_WEIGHT": ("physics_acceleration_loss_weight", float),
+            "V46_PHYSICS_JERK_LOSS_WEIGHT": ("physics_jerk_loss_weight", float),
+            "V46_PHYSICS_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
+            "CONTACT_STATIC_SUPPORT_SPEED_MPS": ("physics_static_support_speed_mps", float),
             "V46_TANGENT_DIFFUSION_ENABLE": ("tangent_diffusion_enable", lambda x: bool(int(x))),
             "V46_TANGENT_DIFFUSION_ROTATION_CAP_RAD": ("tangent_diffusion_rotation_cap_rad", float),
             "V46_TANGENT_DIFFUSION_ROOT_CAP_M": ("tangent_diffusion_root_cap_m", float),
@@ -661,6 +682,7 @@ class V46Config:
             "V46_IK_CONTACT_HIGH": ("ik_contact_high", float),
             "V46_IK_CONTACT_LOW": ("ik_contact_low", float),
             "V46_IK_SPEED_GATE_MPS": ("ik_speed_gate_mps", float),
+            "CONTACT_IK_LOCK_SPEED_MPS": ("ik_speed_gate_mps", float),
             "V46_IK_CONTACT_BREAK_SPEED_MPS": ("ik_contact_break_speed_mps", float),
             "V46_IK_HARD_CONTACT_LOCK": ("ik_hard_contact_lock", lambda x: bool(int(x))),
             "V46_IK_HARD_CONTACT_MIN_CONFIDENCE": ("ik_hard_contact_min_confidence", float),
@@ -3697,6 +3719,101 @@ def _decode_product_refiner_output(
     return torch.cat([contacts, geometry[..., 4:]], dim=-1)
 
 
+def _world_space_physics_losses(prediction, clean, cfg: V46Config):
+    """Differentiable FK/foot/dynamics losses for EDGE-151D batches.
+
+    Static support is defined from the clean target's contact and world-space
+    speed. This avoids forcing a legitimate moving/cloud-step support to zero
+    velocity while still supervising planted feet and penetration explicitly.
+    """
+    if prediction.ndim != 3 or clean.shape != prediction.shape:
+        raise ValueError(
+            "physics loss expects matching [B,T,151] tensors, got "
+            f"{tuple(prediction.shape)} and {tuple(clean.shape)}"
+        )
+    predicted_joints = fk_24_torch(prediction)
+    clean_joints = fk_24_torch(clean)
+    foot_ids = list(DEFAULT_FOOT_JOINTS)
+    predicted_feet = predicted_joints[:, :, foot_ids]
+    clean_feet = clean_joints[:, :, foot_ids]
+
+    fk_loss = F.smooth_l1_loss(predicted_joints, clean_joints)
+    foot_loss = F.smooth_l1_loss(predicted_feet, clean_feet)
+
+    if prediction.shape[1] > 1:
+        fps = float(cfg.fps)
+        predicted_velocity = (
+            predicted_feet[:, 1:] - predicted_feet[:, :-1]
+        ) * fps
+        clean_velocity = (clean_feet[:, 1:] - clean_feet[:, :-1]) * fps
+        clean_horizontal_speed = torch.linalg.vector_norm(
+            clean_velocity[..., (0, 2)], dim=-1
+        )
+        clean_contact = clean[:, 1:, :4].clamp(0.0, 1.0)
+        static_support = (
+            clean_horizontal_speed
+            <= float(cfg.physics_static_support_speed_mps)
+        ).to(clean.dtype) * clean_contact
+        support_error = F.smooth_l1_loss(
+            predicted_velocity,
+            clean_velocity,
+            reduction="none",
+        ).mean(dim=-1)
+        support_loss = (
+            (support_error * static_support).sum()
+            / static_support.sum().clamp_min(1.0)
+        )
+    else:
+        support_loss = fk_loss.new_zeros(())
+
+    clean_floor = torch.quantile(
+        clean_feet[..., 1].detach().reshape(clean.shape[0], -1),
+        0.05,
+        dim=1,
+    )
+    predicted_penetration = torch.relu(
+        clean_floor[:, None, None] - predicted_feet[..., 1] - 0.008
+    )
+    clean_penetration = torch.relu(
+        clean_floor[:, None, None] - clean_feet[..., 1].detach() - 0.008
+    )
+    penetration_loss = F.smooth_l1_loss(
+        predicted_penetration,
+        clean_penetration,
+    )
+
+    def derivative_loss(order: int, scale: float):
+        if prediction.shape[1] <= order:
+            return fk_loss.new_zeros(())
+        predicted_delta = torch.diff(
+            predicted_joints, n=order, dim=1
+        ) * (float(cfg.fps) ** order / scale)
+        clean_delta = torch.diff(
+            clean_joints, n=order, dim=1
+        ) * (float(cfg.fps) ** order / scale)
+        return F.smooth_l1_loss(predicted_delta, clean_delta)
+
+    acceleration_loss = derivative_loss(2, 10.0)
+    jerk_loss = derivative_loss(3, 1000.0)
+    terms = {
+        "fk": fk_loss,
+        "foot": foot_loss,
+        "support": support_loss,
+        "penetration": penetration_loss,
+        "acceleration": acceleration_loss,
+        "jerk": jerk_loss,
+    }
+    total = (
+        float(cfg.physics_fk_loss_weight) * fk_loss
+        + float(cfg.physics_foot_loss_weight) * foot_loss
+        + float(cfg.physics_support_loss_weight) * support_loss
+        + float(cfg.physics_penetration_loss_weight) * penetration_loss
+        + float(cfg.physics_acceleration_loss_weight) * acceleration_loss
+        + float(cfg.physics_jerk_loss_weight) * jerk_loss
+    )
+    return total, terms
+
+
 def _product_motion_losses(
     prediction,
     clean,
@@ -3748,18 +3865,27 @@ def _product_motion_losses(
         )
         * (1.0 - product_mask)
     ).mean()
+    physics_loss, physics_terms = _world_space_physics_losses(
+        prediction,
+        clean,
+        cfg,
+    )
     total = (
         reconstruction_loss
         + 0.25 * velocity_loss
         + 0.20 * contact_loss
         + float(cfg.product_refiner_outside_weight) * outside_loss
+        + physics_loss
     )
-    return total, {
+    terms = {
         "reconstruction": reconstruction_loss,
         "velocity": velocity_loss,
         "contact": contact_loss,
         "outside": outside_loss,
+        "physics": physics_loss,
     }
+    terms.update({f"physics_{key}": value for key, value in physics_terms.items()})
+    return total, terms
 
 
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[V46Config] = None) -> np.ndarray:
@@ -4462,13 +4588,24 @@ def train_diffusion(args: argparse.Namespace) -> int:
                 x0_hat[:, 1:] - x0_hat[:, :-1],
                 x0[:, 1:] - x0[:, :-1],
             )
-        loss = loss_noise + 0.10 * loss_vel
+            decoded = x0_hat
+        loss_physics, physics_terms = _world_space_physics_losses(
+            decoded,
+            x0,
+            cfg,
+        )
+        loss = loss_noise + 0.10 * loss_vel + loss_physics
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % 250 == 0 or step == steps - 1:
-            print(f"[V46 diffusion] step={step} loss={loss.item():.6f} noise={loss_noise.item():.6f}")
+            print(
+                f"[V46 diffusion] step={step} loss={loss.item():.6f} "
+                f"noise={loss_noise.item():.6f} "
+                f"physics={loss_physics.item():.6f} "
+                f"jerk={physics_terms['jerk'].item():.6f}"
+            )
     if validation_db is not None:
         validation_report["metrics"] = _evaluate_diffusion_validation(
             model, validation_db, db, cfg, device, abar, Tdiff
@@ -6528,14 +6665,23 @@ def true_lower_body_ik(motion: np.ndarray, cfg: V46Config) -> Tuple[np.ndarray, 
     return final.astype(np.float32), report
 
 
-def audit_motion_np(motion: np.ndarray, cfg: Optional[V46Config] = None) -> dict:
+def audit_motion_np(
+    motion: np.ndarray,
+    cfg: Optional[V46Config] = None,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
+) -> dict:
     cfg = cfg or V46Config()
     contacts, _, _, _ = derive_contacts_np(motion, cfg)
     audited_motion = np.asarray(motion, dtype=np.float32).copy()
     audited_motion[:, :4] = contacts.astype(np.float32)
     from motion_geometry.physical import motion_physical_metrics_np
 
-    report = motion_physical_metrics_np(audited_motion, fps=float(cfg.fps))
+    report = motion_physical_metrics_np(
+        audited_motion,
+        fps=float(cfg.fps),
+        sliding_support_eligible=sliding_support_eligible,
+    )
     report["root_y_range_m"] = float(
         np.max(audited_motion[:, ROOT_Y_IDX]) - np.min(audited_motion[:, ROOT_Y_IDX])
     )

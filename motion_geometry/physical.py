@@ -1,6 +1,8 @@
 """FPS-invariant contact and kinematic metrics in SI units."""
 from __future__ import annotations
 
+import os
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -22,8 +24,62 @@ from motion_geometry.rotations import (
     so3_geodesic_np,
 )
 
-PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v4_so3_quality"
+PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v5_contact_states"
 EXTREMITY_JOINTS = (7, 8, 10, 11, 20, 21, 22, 23)
+SWING = 0
+STATIC_SUPPORT = 1
+SLIDING_SUPPORT = 2
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if np.isfinite(value) else float(default)
+
+
+@dataclass(frozen=True)
+class ContactStateThresholds:
+    """One role-labelled contact contract; values are intentionally distinct."""
+
+    observation_speed_mps: float = 0.75
+    ik_lock_speed_mps: float = 0.36
+    static_support_speed_mps: float = 0.18
+    slide_min_speed_mps: float = 0.15
+    slide_min_foot_travel_m: float = 0.05
+    slide_min_root_travel_m: float = 0.045
+    slide_direction_cos_min: float = 0.35
+    slide_root_foot_relative_max_m: float = 0.18
+
+    @classmethod
+    def from_environment(cls) -> "ContactStateThresholds":
+        return cls(
+            observation_speed_mps=_env_float(
+                "CONTACT_OBSERVATION_SPEED_MPS", 0.75
+            ),
+            ik_lock_speed_mps=_env_float(
+                "CONTACT_IK_LOCK_SPEED_MPS", 0.36
+            ),
+            static_support_speed_mps=_env_float(
+                "CONTACT_STATIC_SUPPORT_SPEED_MPS", 0.18
+            ),
+            slide_min_speed_mps=_env_float(
+                "CONTACT_SLIDING_MIN_SPEED_MPS", 0.15
+            ),
+            slide_min_foot_travel_m=_env_float(
+                "CONTACT_SLIDING_MIN_FOOT_TRAVEL_M", 0.05
+            ),
+            slide_min_root_travel_m=_env_float(
+                "CONTACT_SLIDING_MIN_ROOT_TRAVEL_M", 0.045
+            ),
+            slide_direction_cos_min=_env_float(
+                "CONTACT_SLIDING_DIRECTION_COS_MIN", 0.35
+            ),
+            slide_root_foot_relative_max_m=_env_float(
+                "CONTACT_SLIDING_ROOT_FOOT_RELATIVE_MAX_M", 0.18
+            ),
+        )
 
 
 def _odd_window(seconds: float, fps: float) -> int:
@@ -119,7 +175,7 @@ def contact_from_joints_np(
     fps: float,
     floor_y: float | None = None,
     height_margin_m: float = 0.055,
-    speed_gate_mps: float = 0.75,
+    speed_gate_mps: float | None = None,
     median_seconds: float = 1.0 / 6.0,
 ) -> np.ndarray:
     if fps <= 0.0:
@@ -134,8 +190,13 @@ def contact_from_joints_np(
             np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
             * float(fps)
         )
+    observation_speed = (
+        ContactStateThresholds.from_environment().observation_speed_mps
+        if speed_gate_mps is None
+        else float(speed_gate_mps)
+    )
     contact = (feet[..., 1] <= float(floor_y) + float(height_margin_m)) & (
-        speed_mps <= float(speed_gate_mps)
+        speed_mps <= observation_speed
     )
     return median_filter_bool_np(contact, _odd_window(median_seconds, fps))
 
@@ -145,7 +206,7 @@ def recompute_contacts_np(
     *,
     fps: float,
     height_margin_m: float = 0.055,
-    speed_gate_mps: float = 0.75,
+    speed_gate_mps: float | None = None,
     median_seconds: float = 1.0 / 6.0,
 ) -> np.ndarray:
     x = np.asarray(motion, dtype=np.float32).copy()
@@ -165,7 +226,106 @@ def recompute_contacts_np(
     return x
 
 
-def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, Any]:
+def classify_support_states_np(
+    joints: np.ndarray,
+    declared_contacts: np.ndarray,
+    *,
+    fps: float,
+    sliding_support_eligible: np.ndarray | None = None,
+    thresholds: ContactStateThresholds | None = None,
+    height_support: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return SWING/STATIC_SUPPORT/SLIDING_SUPPORT per frame and foot.
+
+    Sliding support is fail-closed: kinematics alone never grant an exemption.
+    The caller must provide semantic eligibility, and the eligible segment must
+    also move consistently with the root. This preserves the anti-label-bypass
+    foot-skate check for ordinary generated motion.
+    """
+    limits = thresholds or ContactStateThresholds.from_environment()
+    positions = np.asarray(joints, dtype=np.float32)
+    contacts = np.asarray(declared_contacts, dtype=bool)
+    if positions.ndim != 3 or positions.shape[1:] != (24, 3):
+        raise ValueError(f"Expected joints [T,24,3], got {positions.shape}")
+    if contacts.shape != (len(positions), 4):
+        raise ValueError(f"Expected contacts [T,4], got {contacts.shape}")
+    feet = positions[:, list(FOOT_JOINTS)]
+    if height_support is None:
+        floor_y = float(np.percentile(feet[..., 1], 5))
+        height_support = median_filter_bool_np(
+            feet[..., 1] <= floor_y + 0.055,
+            _odd_window(1.0 / 12.0, fps),
+        )
+    else:
+        height_support = np.asarray(height_support, dtype=bool)
+        if height_support.shape != contacts.shape:
+            raise ValueError(
+                f"Expected height support [T,4], got {height_support.shape}"
+            )
+    support = contacts | height_support
+    states = np.where(support, STATIC_SUPPORT, SWING).astype(np.uint8)
+    if sliding_support_eligible is None:
+        return states
+    eligible = np.asarray(sliding_support_eligible, dtype=bool)
+    if eligible.ndim == 1:
+        eligible = np.repeat(eligible[:, None], 4, axis=1)
+    if eligible.shape != support.shape:
+        raise ValueError(
+            f"Expected sliding eligibility [T] or [T,4], got {eligible.shape}"
+        )
+
+    root_xz = positions[:, 0][:, (0, 2)]
+    feet_xz = feet[..., (0, 2)]
+    for foot_index in range(4):
+        active = support[:, foot_index] & eligible[:, foot_index]
+        start: int | None = None
+        for frame in range(len(active) + 1):
+            is_active = frame < len(active) and bool(active[frame])
+            if is_active and start is None:
+                start = frame
+            if start is not None and not is_active:
+                end = frame
+                if end - start >= 4:
+                    foot_segment = feet_xz[start:end, foot_index]
+                    root_segment = root_xz[start:end]
+                    foot_delta = foot_segment[-1] - foot_segment[0]
+                    root_delta = root_segment[-1] - root_segment[0]
+                    foot_travel = float(np.linalg.norm(foot_delta))
+                    root_travel = float(np.linalg.norm(root_delta))
+                    step_speed = np.linalg.norm(
+                        np.diff(foot_segment, axis=0), axis=-1
+                    ) * float(fps)
+                    median_speed = (
+                        float(np.median(step_speed)) if step_speed.size else 0.0
+                    )
+                    direction_cos = float(
+                        np.dot(foot_delta, root_delta)
+                        / max(foot_travel * root_travel, 1.0e-8)
+                    )
+                    relative = foot_segment - root_segment
+                    relative_span = float(
+                        np.max(np.linalg.norm(relative - relative[:1], axis=-1))
+                    )
+                    is_sliding = (
+                        foot_travel >= limits.slide_min_foot_travel_m
+                        and root_travel >= limits.slide_min_root_travel_m
+                        and median_speed >= limits.slide_min_speed_mps
+                        and direction_cos >= limits.slide_direction_cos_min
+                        and relative_span
+                        <= limits.slide_root_foot_relative_max_m
+                    )
+                    if is_sliding:
+                        states[start:end, foot_index] = SLIDING_SUPPORT
+                start = None
+    return states
+
+
+def motion_physical_metrics_np(
+    motion: np.ndarray,
+    *,
+    fps: float,
+    sliding_support_eligible: np.ndarray | None = None,
+) -> dict[str, Any]:
     """Report FK physical metrics plus raw/temporal SO(3) rotation quality."""
     if fps <= 0.0:
         raise ValueError("fps must be positive")
@@ -244,12 +404,30 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
         height_support,
         _odd_window(1.0 / 12.0, fps),
     )
-    support = declared_contacts | height_support
-    skate = foot_speed_mps[support]
+    support_states = classify_support_states_np(
+        joints,
+        declared_contacts,
+        fps=fps,
+        sliding_support_eligible=sliding_support_eligible,
+        height_support=height_support,
+    )
+    support = support_states != SWING
+    static_support = support_states == STATIC_SUPPORT
+    sliding_support = support_states == SLIDING_SUPPORT
+    skate = foot_speed_mps[static_support]
     support_drift, support_segment_count = _support_segment_drift_values(
         feet[..., (0, 2)],
-        support,
+        static_support,
     )
+    root_relative_feet_xz = (
+        feet[..., (0, 2)]
+        - joints[:, 0][:, (0, 2)][:, None, :]
+    )
+    sliding_relative_speed = np.zeros(feet.shape[:2], dtype=np.float32)
+    if len(feet) > 1:
+        sliding_relative_speed[1:] = np.linalg.norm(
+            np.diff(root_relative_feet_xz, axis=0), axis=-1
+        ) * float(fps)
     contact_height = np.maximum(feet[..., 1] - floor_y, 0.0)[declared_contacts]
     contact_mismatch = np.logical_xor(declared_contacts, height_support)
 
@@ -309,6 +487,17 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
         "foot_penetration_min_m": float(np.min(feet[..., 1] - floor_y)),
         "contact_ratio": float(np.mean(declared_contacts)),
         "foot_support_ratio": float(np.mean(support)),
+        "static_support_ratio": float(np.mean(static_support)),
+        "sliding_support_ratio": float(np.mean(sliding_support)),
+        "support_state_contract": {
+            "states": {
+                "swing": SWING,
+                "static_support": STATIC_SUPPORT,
+                "sliding_support": SLIDING_SUPPORT,
+            },
+            "thresholds": asdict(ContactStateThresholds.from_environment()),
+            "sliding_requires_explicit_semantic_eligibility": True,
+        },
         "foot_contact_mismatch_ratio": float(np.mean(contact_mismatch)),
         "foot_support_segment_count": int(support_segment_count),
         "rot6d_nonfinite_ratio": float(np.mean(~finite_rot6d)),
@@ -370,6 +559,12 @@ def motion_physical_metrics_np(motion: np.ndarray, *, fps: float) -> dict[str, A
         ),
     }
     result.update(distribution(skate, "foot_skate_mps"))
+    result.update(
+        distribution(
+            sliding_relative_speed[sliding_support],
+            "sliding_support_relative_speed_mps",
+        )
+    )
     result.update(distribution(support_drift, "foot_support_drift_m"))
     result.update(distribution(contact_height, "foot_contact_height_m"))
     result.update(distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))

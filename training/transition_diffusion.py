@@ -402,30 +402,6 @@ def sample_transition_diffusion(
         max_jerk_ratio=1.0,
         max_foot_ratio=1.0,
         max_penetration_ratio=1.0,
-        max_rotation_step_rad=float(
-            os.getenv("V32_MAX_ROTATION_STEP_RAD", "0.20")
-        ),
-        max_boundary_jerk_abs=float(
-            os.getenv("V34_MAX_BOUNDARY_JERK", "5000")
-        ),
-        max_boundary_angular_jerk_abs=float(
-            os.getenv("V34_MAX_BOUNDARY_ANGULAR_JERK", "5000")
-        ),
-        max_entry_rotation_step_rad=float(
-            os.getenv("V34_MAX_ENTRY_ROTATION_STEP_RAD", "0.16")
-        ),
-        max_exit_rotation_step_rad=float(
-            os.getenv("V34_MAX_EXIT_ROTATION_STEP_RAD", "0.12")
-        ),
-        max_entry_fk_jump=float(
-            os.getenv("V34_MAX_ENTRY_FK_JUMP", "0.060")
-        ),
-        max_exit_fk_jump=float(
-            os.getenv("V34_MAX_EXIT_FK_JUMP", "0.040")
-        ),
-        max_exit_acceleration=float(
-            os.getenv("V34_MAX_EXIT_ACCELERATION", "12.0")
-        ),
     )
     candidate_count = max(
         1, int(os.getenv("V32_CANDIDATES", "8"))
@@ -488,30 +464,6 @@ def sample_transition_diffusion(
             max_penetration_ratio=float(
                 os.getenv("V32_MAX_PENETRATION_RATIO", "1.02")
             ),
-            max_rotation_step_rad=float(
-                os.getenv("V32_MAX_ROTATION_STEP_RAD", "0.20")
-            ),
-            max_boundary_jerk_abs=float(
-                os.getenv("V34_MAX_BOUNDARY_JERK", "5000")
-            ),
-            max_boundary_angular_jerk_abs=float(
-                os.getenv("V34_MAX_BOUNDARY_ANGULAR_JERK", "5000")
-            ),
-            max_entry_rotation_step_rad=float(
-                os.getenv("V34_MAX_ENTRY_ROTATION_STEP_RAD", "0.16")
-            ),
-            max_exit_rotation_step_rad=float(
-                os.getenv("V34_MAX_EXIT_ROTATION_STEP_RAD", "0.12")
-            ),
-            max_entry_fk_jump=float(
-                os.getenv("V34_MAX_ENTRY_FK_JUMP", "0.060")
-            ),
-            max_exit_fk_jump=float(
-                os.getenv("V34_MAX_EXIT_FK_JUMP", "0.040")
-            ),
-            max_exit_acceleration=float(
-                os.getenv("V34_MAX_EXIT_ACCELERATION", "12.0")
-            ),
         )
         row = {
             "index": candidate_index,
@@ -527,9 +479,6 @@ def sample_transition_diffusion(
                 latent.detach().clone(),
             ))
 
-    force_model = os.getenv(
-        "V32_FORCE_MODEL", "0"
-    ).lower() in {"1", "true", "yes", "on"}
     latent_blend_meta: Dict[str, Any] = {
         "enabled": os.getenv(
             "V34_LATENT_SNIPPET_BLEND", "0"
@@ -601,30 +550,6 @@ def sample_transition_diffusion(
                 max_penetration_ratio=float(
                     os.getenv("V32_MAX_PENETRATION_RATIO", "1.02")
                 ),
-                max_rotation_step_rad=float(
-                    os.getenv("V32_MAX_ROTATION_STEP_RAD", "0.20")
-                ),
-                max_boundary_jerk_abs=float(
-                    os.getenv("V34_MAX_BOUNDARY_JERK", "5000")
-                ),
-                max_boundary_angular_jerk_abs=float(
-                    os.getenv("V34_MAX_BOUNDARY_ANGULAR_JERK", "5000")
-                ),
-                max_entry_rotation_step_rad=float(
-                    os.getenv("V34_MAX_ENTRY_ROTATION_STEP_RAD", "0.16")
-                ),
-                max_exit_rotation_step_rad=float(
-                    os.getenv("V34_MAX_EXIT_ROTATION_STEP_RAD", "0.12")
-                ),
-                max_entry_fk_jump=float(
-                    os.getenv("V34_MAX_ENTRY_FK_JUMP", "0.060")
-                ),
-                max_exit_fk_jump=float(
-                    os.getenv("V34_MAX_EXIT_FK_JUMP", "0.040")
-                ),
-                max_exit_acceleration=float(
-                    os.getenv("V34_MAX_EXIT_ACCELERATION", "12.0")
-                ),
             )
             keep_ratio = float(os.getenv("V34_LATENT_BLEND_KEEP_RATIO", "1.01"))
             use_blend = bool(
@@ -646,34 +571,6 @@ def sample_transition_diffusion(
                 result = blended_candidate
                 selected_index = -2
                 latent_blend_meta["applied"] = True
-    elif force_model and candidates:
-        best_index = int(np.argmin([
-            row["risk"]["total"] for row in candidates
-        ]))
-        # Re-sample selected deterministic seed to avoid storing all arrays.
-        generator = torch.Generator(device=device)
-        generator.manual_seed(
-            _seed(start_np, end_np, k, best_index)
-        )
-        normalised = _sample_latent(
-            bundle, condition, steps, generator
-        )
-        latent = (
-            normalised * bundle["latent_std"]
-            + bundle["latent_mean"]
-        )
-        with torch.no_grad():
-            generated = system.decode(
-                latent, start, end,
-                start_velocity, end_velocity,
-                condition, coordinate, length_frames,
-                boundary_state=boundary_state,
-            )[0].cpu().numpy().astype(np.float32)
-        result = _geodesic_blend(
-            baseline, generated, trust
-        )
-        selected_index = best_index
-        fallback = False
     else:
         result = baseline
         selected_index = -1
@@ -681,7 +578,7 @@ def sample_transition_diffusion(
 
     unsafe_fallback = bool(fallback and not baseline_absolute_safe)
     if unsafe_fallback and os.getenv(
-        "V34_FAIL_ON_UNSAFE_BOUNDARY", "0"
+        "V34_FAIL_ON_UNSAFE_BOUNDARY", "1"
     ).lower() in {"1", "true", "yes", "on"}:
         raise RuntimeError(
             "V34 absolute boundary gate rejected every learned candidate and "

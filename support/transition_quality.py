@@ -9,9 +9,13 @@ both relative improvement and absolute physical safety.
 """
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
+from contracts.boundary_continuity import (
+    BoundaryContinuityLimits,
+    boundary_risk_reasons,
+)
 from contracts.gravity import fk24_np
 from motion_geometry.rotations import (
     angular_velocity_np,
@@ -330,14 +334,7 @@ def accept_candidate(
     max_jerk_ratio: float = 1.03,
     max_foot_ratio: float = 1.02,
     max_penetration_ratio: float = 1.02,
-    max_rotation_step_rad: float = 0.20,
-    max_boundary_jerk_abs: float = 5000.0,
-    max_boundary_angular_jerk_abs: float = 5000.0,
-    max_entry_rotation_step_rad: float = 0.16,
-    max_exit_rotation_step_rad: float = 0.12,
-    max_entry_fk_jump: float = 0.060,
-    max_exit_fk_jump: float = 0.040,
-    max_exit_acceleration: float = 12.0,
+    boundary_limits: Optional[BoundaryContinuityLimits] = None,
 ) -> Tuple[bool, Dict[str, object]]:
     finite = all(np.isfinite(float(v)) for v in candidate.values())
     ratios = {
@@ -362,6 +359,13 @@ def accept_candidate(
             baseline["foot_penetration"], 1e-7,
         ),
     }
+    # Relative improvement decides whether the learned bridge is better than
+    # its baseline.  Absolute safety is owned by the same fail-closed contract
+    # used at final output; it must not have a second, looser set of numbers.
+    absolute_reasons = boundary_risk_reasons(
+        candidate,
+        limits=boundary_limits,
+    )
     checks = {
         "finite": finite,
         "total_relative": ratios["total"] <= max_total_ratio,
@@ -373,40 +377,15 @@ def accept_candidate(
         "penetration_relative": (
             ratios["foot_penetration"] <= max_penetration_ratio
         ),
-        "rotation_step_absolute": (
-            candidate["max_rotation_step_rad"] <= max_rotation_step_rad
-        ),
-        "entry_rotation_absolute": (
-            candidate["entry_rotation_step_rad"] <= max_entry_rotation_step_rad
-        ),
-        "exit_rotation_absolute": (
-            candidate["exit_rotation_step_rad"] <= max_exit_rotation_step_rad
-        ),
-        "entry_fk_absolute": candidate["entry_fk_jump"] <= max_entry_fk_jump,
-        "exit_fk_absolute": candidate["exit_fk_jump"] <= max_exit_fk_jump,
-        "exit_acceleration_absolute": (
-            candidate["exit_acceleration"] <= max_exit_acceleration
-        ),
-        "boundary_jerk_absolute": (
-            candidate["boundary_joint_jerk_max"] <= max_boundary_jerk_abs
-        ),
-        "boundary_angular_jerk_absolute": (
-            candidate["boundary_angular_jerk_max"]
-            <= max_boundary_angular_jerk_abs
-        ),
+        "absolute_boundary_continuity": not absolute_reasons,
     }
     accepted = bool(all(checks.values()))
     return accepted, {
         "accepted": accepted,
         "checks": checks,
         "ratios": ratios,
-        "absolute_thresholds": {
-            "max_boundary_jerk_abs": max_boundary_jerk_abs,
-            "max_boundary_angular_jerk_abs": max_boundary_angular_jerk_abs,
-            "max_entry_rotation_step_rad": max_entry_rotation_step_rad,
-            "max_exit_rotation_step_rad": max_exit_rotation_step_rad,
-            "max_entry_fk_jump": max_entry_fk_jump,
-            "max_exit_fk_jump": max_exit_fk_jump,
-            "max_exit_acceleration": max_exit_acceleration,
-        },
+        "absolute_reasons": absolute_reasons,
+        "absolute_thresholds": (
+            boundary_limits or BoundaryContinuityLimits.from_environment()
+        ).__dict__,
     }

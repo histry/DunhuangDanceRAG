@@ -25,7 +25,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -978,10 +978,11 @@ def stabilize_source_heading_positions(
     positions: np.ndarray,
     mapping: Dict[int, int],
     fps: float,
+    source_semantics: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[np.ndarray, dict]:
     x = np.asarray(positions, dtype=np.float32).copy()
     mode = str(
-        os.environ.get("V46_49_HEADING_MODE", "stabilize")
+        os.environ.get("V46_49_HEADING_MODE", "raw")
     ).strip().lower()
     if mode not in {"stabilize", "raw", "lock"}:
         raise ValueError(
@@ -990,6 +991,22 @@ def stabilize_source_heading_positions(
         )
 
     raw_yaw = _v46_49_3_body_yaw(x, mapping)
+    semantic_text = " ".join(
+        str(value).strip().lower()
+        for value in (source_semantics or {}).values()
+        if value is not None
+    )
+    preserve_tokens = {
+        token.strip().lower()
+        for token in os.environ.get(
+            "V46_49_PRESERVE_TURN_TOKENS",
+            "sogdian_whirl,sogdian,whirl,turning_climax,turning_flow,explicit_spin",
+        ).split(",")
+        if token.strip()
+    }
+    preserve_semantic_turn = any(
+        token in semantic_text for token in preserve_tokens
+    )
 
     smooth_seconds = _v46_49_3_env_float(
         "V46_49_HEADING_SMOOTH_SECONDS", 0.45
@@ -1044,6 +1061,12 @@ def stabilize_source_heading_positions(
         if b - a >= min_persist_n:
             persistent[a:b] = True
 
+    # Smooth, same-sign yaw is evidence for both global drift and intentional
+    # whirling.  Before event segmentation, source semantics are the only
+    # available disambiguation signal; known turning motion must be preserved.
+    if preserve_semantic_turn:
+        persistent[:] = False
+
     if mode == "raw":
         correction = np.zeros_like(raw_yaw)
         drift_rate = np.zeros_like(raw_yaw)
@@ -1081,6 +1104,8 @@ def stabilize_source_heading_positions(
     report = {
         "version": "v46_49_3_absolute_heading_contract",
         "mode": mode,
+        "semantic_turn_preserved": bool(preserve_semantic_turn),
+        "source_semantics": dict(source_semantics or {}),
         "persistent_drift_ratio": float(persistent.mean()),
         "longest_candidate_drift_seconds": float(
             longest_candidate / max(float(fps), 1e-8)
@@ -1297,6 +1322,7 @@ def retarget_bvh(path: str | Path, cfg: Optional[RetargetConfig] = None):
         aligned,
         mapping,
         float(cfg.target_fps),
+        source_timebase.get("entry", {}),
     )
     motion, fit_report = fit_target_motion(aligned, mapping, cfg)
     fit_report["heading_contract"] = heading_report

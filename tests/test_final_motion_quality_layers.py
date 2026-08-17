@@ -158,6 +158,28 @@ def test_fast_low_foot_slide_cannot_hide_by_clearing_contact_labels():
     assert decision["layers"]["foot_contact"]["ok"] is False
 
 
+def test_explicit_chang_e_slide_requires_semantics_and_root_consistency():
+    fps = 30.0
+    motion = _identity_motion(61)
+    motion[:, :4] = 1.0
+    motion[:, 4] = 0.20 * np.arange(len(motion), dtype=np.float32) / fps
+
+    conservative = motion_physical_metrics_np(motion, fps=fps)
+    semantic = motion_physical_metrics_np(
+        motion,
+        fps=fps,
+        sliding_support_eligible=np.ones(len(motion), dtype=bool),
+    )
+
+    assert conservative["sliding_support_ratio"] == 0.0
+    assert conservative["foot_skate_mps_p95"] > 0.18
+    assert semantic["sliding_support_ratio"] > 0.0
+    assert semantic["foot_skate_mps_p95"] == 0.0
+    assert semantic["support_state_contract"][
+        "sliding_requires_explicit_semantic_eligibility"
+    ] is True
+
+
 def test_boundary_foot_slip_proxy_is_also_speed_independent():
     fps = 30.0
     motion = _identity_motion(16)

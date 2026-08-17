@@ -310,6 +310,10 @@ def build_frame_joint_risk_mask(
         contact_score * seam_f,
         seam_f.astype(np.float32) * 0.25,
     )
+    contact_score = np.maximum(
+        contact_score,
+        np.asarray(peak["contact"], dtype=np.float32),
+    )
 
     return {
         "joint": np.clip(risk, 0.0, 1.0).astype(np.float32),
