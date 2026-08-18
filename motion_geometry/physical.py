@@ -43,7 +43,7 @@ from motion_geometry.rotations import (
 )
 
 PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v5_contact_states"
-SOURCE_REFERENCE_KINEMATICS_SCHEMA = "source_reference_kinematics_si_v1"
+SOURCE_REFERENCE_KINEMATICS_SCHEMA = "source_reference_kinematics_body_normalized_v2"
 
 EXTREMITY_JOINTS = (7, 8, 10, 11, 20, 21, 22, 23)
 SWING = 0
@@ -396,91 +396,120 @@ def classify_support_states_np(
     return states
 
 
-def source_reference_kinematic_metrics_np(
+def _max_true_run_frames(mask: np.ndarray) -> int:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    best = run = 0
+    for value in values:
+        if value:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return int(best)
+
+
+def _body_normalized_root_relative_jerk_metrics(
     joints: np.ndarray,
     *,
     fps: float,
 ) -> dict[str, Any]:
-    """Kinematic reference metrics for the *recorded* pre-retarget trajectory.
+    """Skeleton-proportion-invariant source-dynamics metrics in s^-3.
 
-    The input must already be expressed in the target metric coordinate system,
-    at the target FPS, and arranged as the target 24-joint observation layout.
-    The function intentionally contains no final-generation acceptance logic;
-    it only supplies a baseline against which Retarget Clean is judged.
+    Each trajectory is first made pelvis-root-relative, then every non-root
+    joint is normalized by its own robust median distance to the pelvis.  This
+    removes source-vs-EDGE bone-length / lever-arm bias while preserving the
+    temporal angular/radial dynamics that Retarget Clean is expected to keep.
+    These metrics are source-contract diagnostics only; final SI jerk remains
+    the original world-space m/s^3 contract.
     """
     positions = np.asarray(joints, dtype=np.float64)
     if positions.ndim != 3 or positions.shape[1:] != (24, 3):
-        raise ValueError(f"Expected source reference joints [T,24,3], got {positions.shape}")
-    if not np.isfinite(positions).all():
-        raise ValueError("source reference joints contain NaN or Inf")
-    if not np.isfinite(float(fps)) or float(fps) <= 0.0:
-        raise ValueError(f"fps must be finite and positive, got {fps!r}")
+        raise ValueError(f"Expected joints [T,24,3], got {positions.shape}")
+    relative = positions - positions[:, :1, :]
+    radius = np.linalg.norm(relative, axis=-1)
+    joint_radius = np.median(radius, axis=0) if len(radius) else np.zeros(24)
+    nonroot = joint_radius[1:]
+    reference_radius = float(np.percentile(nonroot, 75)) if nonroot.size else 1.0
+    radius_floor = max(1.0e-4, 0.08 * max(reference_radius, 1.0e-4))
+    denom = np.maximum(joint_radius, radius_floor)
+    denom[0] = 1.0
+    normalized = relative / denom[None, :, None]
+    normalized[:, 0] = 0.0
+    jerk = np.diff(normalized, n=3, axis=0) * float(fps) ** 3
+    jerk_norm = np.linalg.norm(jerk, axis=-1)
+    joint_jerk = jerk_norm[:, 1:] if jerk_norm.size else np.zeros((0, 23))
+    extremity_jerk = (
+        jerk_norm[:, list(EXTREMITY_JOINTS)]
+        if jerk_norm.size else np.zeros((0, len(EXTREMITY_JOINTS)))
+    )
+    out: dict[str, Any] = {
+        "body_normalization_reference_radius_m": reference_radius,
+        "body_normalization_radius_floor_m": radius_floor,
+        "body_normalization_joint_radius_m": joint_radius.astype(float).tolist(),
+        "body_normalized_joint_jerk_s3_p99": float(np.percentile(joint_jerk, 99)) if joint_jerk.size else 0.0,
+        "body_normalized_joint_jerk_window_p95_max_s3": _window_percentile_max(joint_jerk, fps=fps, seconds=1.0),
+        "body_normalized_extremity_jerk_s3_p99": float(np.percentile(extremity_jerk, 99)) if extremity_jerk.size else 0.0,
+        "body_normalized_extremity_jerk_window_p95_max_s3": _window_percentile_max(extremity_jerk, fps=fps, seconds=1.0),
+    }
+    out.update(_distribution(joint_jerk, "body_normalized_joint_jerk_s3"))
+    out.update(_distribution(extremity_jerk, "body_normalized_extremity_jerk_s3"))
+    return out
 
+
+def _penetration_robust_metrics(relative_height: np.ndarray, *, fps: float) -> dict[str, Any]:
+    h = np.asarray(relative_height, dtype=np.float64)
+    flat = h.reshape(-1)
+    per_frame_min = np.min(h, axis=1) if h.size else np.zeros((0,), dtype=np.float64)
+    threshold = _env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", -0.18)
+    catastrophic = per_frame_min < float(threshold)
+    run_frames = _max_true_run_frames(catastrophic)
+    return {
+        "foot_penetration_p001_m": float(np.percentile(flat, 0.1)) if flat.size else 0.0,
+        "foot_penetration_p005_m": float(np.percentile(flat, 0.5)) if flat.size else 0.0,
+        "foot_penetration_catastrophic_threshold_m": float(threshold),
+        "foot_penetration_catastrophic_frame_ratio": float(np.mean(catastrophic)) if catastrophic.size else 0.0,
+        "foot_penetration_catastrophic_run_max_frames": int(run_frames),
+        "foot_penetration_catastrophic_run_max_seconds": float(run_frames / float(fps)) if fps > 0 else float("inf"),
+    }
+
+
+def source_reference_kinematic_metrics_np(joints: np.ndarray, *, fps: float) -> dict[str, Any]:
+    """Recorded pre-retarget reference metrics in target coordinates/FPS."""
+    positions = np.asarray(joints, dtype=np.float64)
+    if positions.ndim != 3 or positions.shape[1:] != (24, 3):
+        raise ValueError(f"Expected source reference joints [T,24,3], got {positions.shape}")
+    if not np.isfinite(positions).all() or not np.isfinite(float(fps)) or float(fps) <= 0.0:
+        raise ValueError("invalid source reference trajectory or fps")
     velocity = np.diff(positions, n=1, axis=0) * float(fps)
     acceleration = np.diff(positions, n=2, axis=0) * float(fps) ** 2
     jerk = np.diff(positions, n=3, axis=0) * float(fps) ** 3
     jerk_norm = np.linalg.norm(jerk, axis=-1)
-    extremity_jerk = (
-        jerk_norm[:, list(EXTREMITY_JOINTS)]
-        if jerk_norm.size
-        else np.zeros((0, len(EXTREMITY_JOINTS)), dtype=np.float64)
-    )
-
-    # Source-reference foot semantics are observation-only: a low foot is
-    # considered planted only when it is also slow.  Fast low-foot sweeps are
-    # genuine motion evidence, not static support.
+    extremity_jerk = jerk_norm[:, list(EXTREMITY_JOINTS)] if jerk_norm.size else np.zeros((0, len(EXTREMITY_JOINTS)))
     feet = positions[:, list(FOOT_JOINTS)]
     foot_speed = _foot_speed_mps(feet.astype(np.float32), float(fps)).astype(np.float64)
     floor_y = float(np.percentile(feet[..., 1], 5))
-    height_support = median_filter_bool_np(
-        feet[..., 1] <= floor_y + 0.055,
-        _odd_window(1.0 / 12.0, fps),
-    )
+    height_support = median_filter_bool_np(feet[..., 1] <= floor_y + 0.055, _odd_window(1.0 / 12.0, fps))
     contact_limits = ContactStateThresholds.from_environment()
-    static_support = height_support & (
-        foot_speed <= float(contact_limits.static_support_speed_mps)
-    )
-    support_drift, support_segment_count = _support_segment_drift_values(
-        feet[..., (0, 2)], static_support
-    )
+    static_support = height_support & (foot_speed <= float(contact_limits.static_support_speed_mps))
+    support_drift, support_segment_count = _support_segment_drift_values(feet[..., (0, 2)], static_support)
     penetration = feet[..., 1] - floor_y
-
     root_y = positions[:, 0, 1]
-    root_vertical_speed = (
-        np.abs(np.diff(root_y)) * float(fps)
-        if len(root_y) > 1
-        else np.zeros((0,), dtype=np.float64)
-    )
-
+    root_vertical_speed = np.abs(np.diff(root_y)) * float(fps) if len(root_y) > 1 else np.zeros((0,))
     result: dict[str, Any] = {
         "schema": SOURCE_REFERENCE_KINEMATICS_SCHEMA,
-        "frames": int(len(positions)),
-        "fps": float(fps),
-        "joint_jerk_window_p95_max_mps3": _window_percentile_max(
-            jerk_norm, fps=fps, seconds=1.0
-        ),
-        "extremity_jerk_window_p95_max_mps3": _window_percentile_max(
-            extremity_jerk, fps=fps, seconds=1.0
-        ),
-        "joint_jerk_mps3_p99": (
-            float(np.percentile(jerk_norm, 99)) if jerk_norm.size else 0.0
-        ),
-        "extremity_jerk_mps3_p99": (
-            float(np.percentile(extremity_jerk, 99))
-            if extremity_jerk.size
-            else 0.0
-        ),
-        "floor_y_m": floor_y,
+        "frames": int(len(positions)), "fps": float(fps), "floor_y_m": floor_y,
+        "joint_jerk_window_p95_max_mps3": _window_percentile_max(jerk_norm, fps=fps, seconds=1.0),
+        "extremity_jerk_window_p95_max_mps3": _window_percentile_max(extremity_jerk, fps=fps, seconds=1.0),
+        "joint_jerk_mps3_p99": float(np.percentile(jerk_norm, 99)) if jerk_norm.size else 0.0,
+        "extremity_jerk_mps3_p99": float(np.percentile(extremity_jerk, 99)) if extremity_jerk.size else 0.0,
         "source_static_support_ratio": float(np.mean(static_support)),
         "source_support_segment_count": int(support_segment_count),
         "foot_penetration_min_m": float(np.min(penetration)),
         "foot_penetration_p01_m": float(np.percentile(penetration, 1)),
-        "root_y_robust_range_m": (
-            float(np.percentile(root_y, 99) - np.percentile(root_y, 1))
-            if root_y.size
-            else 0.0
-        ),
+        "root_y_robust_range_m": float(np.percentile(root_y, 99) - np.percentile(root_y, 1)) if root_y.size else 0.0,
     }
+    result.update(_penetration_robust_metrics(penetration, fps=fps))
+    result.update(_body_normalized_root_relative_jerk_metrics(positions, fps=fps))
     result.update(_distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
     result.update(_distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
     result.update(_distribution(jerk_norm, "joint_jerk_mps3"))
@@ -492,270 +521,87 @@ def source_reference_kinematic_metrics_np(
 
 
 def motion_physical_metrics_np(
-    motion: np.ndarray,
-    *,
-    fps: float,
+    motion: np.ndarray, *, fps: float,
     sliding_support_eligible: np.ndarray | None = None,
     support_policy: str = SUPPORT_POLICY_FINAL,
 ) -> dict[str, Any]:
-    """Report FK physical metrics plus raw/temporal SO(3) rotation quality.
+    """Report final SI metrics plus source-only normalized diagnostics.
 
-    The default ``support_policy`` is the strict final-generation policy for
-    backward compatibility.  Pre-training source qualification must explicitly
-    pass ``SUPPORT_POLICY_SOURCE``.
+    Existing SI metric definitions are intentionally unchanged.  Extra
+    body-normalized and robust-penetration fields are ignored by the final gate
+    and are consumed only by the source-retarget contract.
     """
-    if fps <= 0.0:
-        raise ValueError("fps must be positive")
+    if fps <= 0.0: raise ValueError("fps must be positive")
     policy = str(support_policy).strip().lower()
-    if policy not in _SUPPORT_POLICIES:
-        raise ValueError(
-            f"support_policy must be one of {sorted(_SUPPORT_POLICIES)}, got {support_policy!r}"
-        )
-
+    if policy not in _SUPPORT_POLICIES: raise ValueError(f"support_policy must be one of {sorted(_SUPPORT_POLICIES)}, got {support_policy!r}")
     x = np.asarray(motion, dtype=np.float32)
-    if x.ndim == 3 and x.shape[0] == 1:
-        x = x[0]
-    if x.ndim != 2 or x.shape[1] != MOTION_DIM:
-        raise ValueError(f"Expected [T,{MOTION_DIM}], got {x.shape}")
-
-    raw_rot6d = np.asarray(
-        x[:, ROT6D_START:ROT6D_END].reshape(len(x), 24, 6),
-        dtype=np.float64,
-    )
+    if x.ndim == 3 and x.shape[0] == 1: x = x[0]
+    if x.ndim != 2 or x.shape[1] != MOTION_DIM: raise ValueError(f"Expected [T,{MOTION_DIM}], got {x.shape}")
+    raw_rot6d = np.asarray(x[:, ROT6D_START:ROT6D_END].reshape(len(x), 24, 6), dtype=np.float64)
     finite_rot6d = np.isfinite(raw_rot6d).all(axis=-1)
-    safe_rot6d = np.nan_to_num(
-        raw_rot6d,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    first = safe_rot6d[..., :3]
-    second = safe_rot6d[..., 3:]
-    first_norm = np.linalg.norm(first, axis=-1)
-    second_norm = np.linalg.norm(second, axis=-1)
-    first_unit = first / np.maximum(first_norm[..., None], 1.0e-12)
-    second_orthogonal = second - (
-        np.sum(first_unit * second, axis=-1, keepdims=True) * first_unit
-    )
+    safe_rot6d = np.nan_to_num(raw_rot6d, nan=0.0, posinf=0.0, neginf=0.0)
+    first, second = safe_rot6d[..., :3], safe_rot6d[..., 3:]
+    first_norm, second_norm = np.linalg.norm(first, axis=-1), np.linalg.norm(second, axis=-1)
+    first_unit = first / np.maximum(first_norm[..., None], 1e-12)
+    second_orthogonal = second - np.sum(first_unit * second, axis=-1, keepdims=True) * first_unit
     second_orthogonal_norm = np.linalg.norm(second_orthogonal, axis=-1)
-    collinearity = np.abs(np.sum(first * second, axis=-1)) / np.maximum(
-        first_norm * second_norm,
-        1.0e-12,
-    )
-    degenerate = (
-        ~finite_rot6d
-        | (first_norm < 1.0e-5)
-        | (second_norm < 1.0e-5)
-        | (second_orthogonal_norm < 1.0e-5)
-    )
+    collinearity = np.abs(np.sum(first * second, axis=-1)) / np.maximum(first_norm * second_norm, 1e-12)
+    degenerate = ~finite_rot6d | (first_norm < 1e-5) | (second_norm < 1e-5) | (second_orthogonal_norm < 1e-5)
     rotation_matrices = rot6d_to_matrix_np(safe_rot6d.astype(np.float32))
-    rotation_steps = (
-        so3_geodesic_np(rotation_matrices[:-1], rotation_matrices[1:])
-        if len(rotation_matrices) > 1
-        else np.zeros((0, 24), dtype=np.float32)
-    )
-    extremity_rotation_steps = (
-        rotation_steps[:, list(EXTREMITY_JOINTS)]
-        if rotation_steps.size
-        else np.zeros((0, len(EXTREMITY_JOINTS)), dtype=np.float32)
-    )
-    angular_acceleration = angular_acceleration_np(
-        rotation_matrices,
-        fps=float(fps),
-    )
-    angular_acceleration_norm = np.linalg.norm(angular_acceleration, axis=-1)
-
+    rotation_steps = so3_geodesic_np(rotation_matrices[:-1], rotation_matrices[1:]) if len(rotation_matrices) > 1 else np.zeros((0,24), dtype=np.float32)
+    extremity_rotation_steps = rotation_steps[:, list(EXTREMITY_JOINTS)] if rotation_steps.size else np.zeros((0,len(EXTREMITY_JOINTS)), dtype=np.float32)
+    angular_acceleration_norm = np.linalg.norm(angular_acceleration_np(rotation_matrices, fps=float(fps)), axis=-1)
     safe_motion = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     joints = fk24_np(safe_motion)
     velocity = np.diff(joints, axis=0) * float(fps)
-    acceleration = np.diff(joints, n=2, axis=0) * float(fps) ** 2
-    jerk = np.diff(joints, n=3, axis=0) * float(fps) ** 3
-
+    acceleration = np.diff(joints, n=2, axis=0) * float(fps)**2
+    jerk = np.diff(joints, n=3, axis=0) * float(fps)**3
     feet = joints[:, list(FOOT_JOINTS)]
     foot_speed_mps = _foot_speed_mps(feet, fps)
     declared_contacts = safe_motion[:, CONTACT] > 0.5
-    floor_y = float(np.percentile(feet[..., 1], 5))
-    height_support = feet[..., 1] <= floor_y + 0.055
-    height_support = median_filter_bool_np(
-        height_support,
-        _odd_window(1.0 / 12.0, fps),
-    )
-    support_states = classify_support_states_np(
-        joints,
-        declared_contacts,
-        fps=fps,
-        sliding_support_eligible=sliding_support_eligible,
-        height_support=height_support,
-        support_policy=policy,
-    )
-    support = support_states != SWING
-    static_support = support_states == STATIC_SUPPORT
-    sliding_support = support_states == SLIDING_SUPPORT
+    floor_y = float(np.percentile(feet[...,1],5))
+    height_support = median_filter_bool_np(feet[...,1] <= floor_y + 0.055, _odd_window(1.0/12.0,fps))
+    support_states = classify_support_states_np(joints, declared_contacts, fps=fps, sliding_support_eligible=sliding_support_eligible, height_support=height_support, support_policy=policy)
+    support = support_states != SWING; static_support = support_states == STATIC_SUPPORT; sliding_support = support_states == SLIDING_SUPPORT
     skate = foot_speed_mps[static_support]
-    support_drift, support_segment_count = _support_segment_drift_values(
-        feet[..., (0, 2)],
-        static_support,
-    )
-    root_relative_feet_xz = (
-        feet[..., (0, 2)]
-        - joints[:, 0][:, (0, 2)][:, None, :]
-    )
+    support_drift, support_segment_count = _support_segment_drift_values(feet[..., (0,2)], static_support)
+    root_relative_feet_xz = feet[..., (0,2)] - joints[:,0][:,(0,2)][:,None,:]
     sliding_relative_speed = np.zeros(feet.shape[:2], dtype=np.float32)
-    if len(feet) > 1:
-        sliding_relative_speed[1:] = np.linalg.norm(
-            np.diff(root_relative_feet_xz, axis=0), axis=-1
-        ) * float(fps)
-    contact_height = np.maximum(feet[..., 1] - floor_y, 0.0)[declared_contacts]
-    contact_mismatch = np.logical_xor(declared_contacts, height_support)
-    foot_relative_height = feet[..., 1] - floor_y
-
-    root_y = np.asarray(safe_motion[:, ROOT_Y_IDX], dtype=np.float32)
-    root_xz = np.asarray(
-        safe_motion[:, [ROOT_X_IDX, ROOT_Z_IDX]], dtype=np.float64
-    )
-    root_vertical_speed = (
-        np.abs(np.diff(root_y)) * float(fps)
-        if len(root_y) > 1
-        else np.zeros(0, dtype=np.float32)
-    )
-    duration = float((len(x) - 1) / fps) if len(x) > 1 else 0.0
-    root_center = (
-        np.median(root_xz, axis=0)
-        if len(root_xz)
-        else np.zeros((2,), dtype=np.float64)
-    )
-    root_radius = (
-        np.linalg.norm(root_xz - root_center[None], axis=-1)
-        if len(root_xz)
-        else np.zeros((0,), dtype=np.float64)
-    )
-    root_steps = (
-        np.linalg.norm(np.diff(root_xz, axis=0), axis=-1)
-        if len(root_xz) > 1
-        else np.zeros((0,), dtype=np.float64)
-    )
-    root_net_displacement = (
-        float(np.linalg.norm(root_xz[-1] - root_xz[0]))
-        if len(root_xz) > 1
-        else 0.0
-    )
-    jerk_norm = np.linalg.norm(jerk, axis=-1)
-    extremity_jerk = (
-        jerk_norm[:, list(EXTREMITY_JOINTS)]
-        if jerk_norm.size
-        else np.zeros((0, len(EXTREMITY_JOINTS)), dtype=np.float64)
-    )
-
-    result: dict[str, Any] = {
-        "schema": PHYSICAL_METRICS_SCHEMA,
-        "frames": int(len(x)),
-        "fps": float(fps),
-        "duration_seconds": duration,
-        "floor_y_m": floor_y,
-        # Keep the legacy raw minimum for the strict final gate.
+    if len(feet)>1: sliding_relative_speed[1:] = np.linalg.norm(np.diff(root_relative_feet_xz,axis=0),axis=-1)*float(fps)
+    contact_height = np.maximum(feet[...,1]-floor_y,0.0)[declared_contacts]
+    contact_mismatch = np.logical_xor(declared_contacts,height_support)
+    foot_relative_height = feet[...,1]-floor_y
+    root_y = np.asarray(safe_motion[:,ROOT_Y_IDX],dtype=np.float32)
+    root_xz = np.asarray(safe_motion[:,[ROOT_X_IDX,ROOT_Z_IDX]],dtype=np.float64)
+    root_vertical_speed = np.abs(np.diff(root_y))*float(fps) if len(root_y)>1 else np.zeros(0,dtype=np.float32)
+    duration = float((len(x)-1)/fps) if len(x)>1 else 0.0
+    root_center = np.median(root_xz,axis=0) if len(root_xz) else np.zeros((2,),dtype=np.float64)
+    root_radius = np.linalg.norm(root_xz-root_center[None],axis=-1) if len(root_xz) else np.zeros((0,),dtype=np.float64)
+    root_steps = np.linalg.norm(np.diff(root_xz,axis=0),axis=-1) if len(root_xz)>1 else np.zeros((0,),dtype=np.float64)
+    root_net_displacement = float(np.linalg.norm(root_xz[-1]-root_xz[0])) if len(root_xz)>1 else 0.0
+    jerk_norm = np.linalg.norm(jerk,axis=-1)
+    extremity_jerk = jerk_norm[:,list(EXTREMITY_JOINTS)] if jerk_norm.size else np.zeros((0,len(EXTREMITY_JOINTS)),dtype=np.float64)
+    result: dict[str,Any] = {
+        "schema": PHYSICAL_METRICS_SCHEMA, "frames": int(len(x)), "fps": float(fps), "duration_seconds": duration, "floor_y_m": floor_y,
         "foot_penetration_min_m": float(np.min(foot_relative_height)),
-        # Robust source-only statistic.  The source gate uses p01 plus a much
-        # wider catastrophic raw-min guard rather than treating one toe outlier
-        # below a percentile-derived floor as a final-generation failure.
-        "foot_penetration_p01_m": float(np.percentile(foot_relative_height, 1)),
-        "contact_ratio": float(np.mean(declared_contacts)),
-        "foot_support_ratio": float(np.mean(support)),
-        "static_support_ratio": float(np.mean(static_support)),
-        "sliding_support_ratio": float(np.mean(sliding_support)),
-        "support_state_contract": {
-            "policy": policy,
-            "states": {
-                "swing": SWING,
-                "static_support": STATIC_SUPPORT,
-                "sliding_support": SLIDING_SUPPORT,
-            },
-            "thresholds": asdict(ContactStateThresholds.from_environment()),
-            "sliding_requires_explicit_semantic_eligibility": True,
-            "final_fail_closed_low_height_union": policy == SUPPORT_POLICY_FINAL,
-            "source_fast_low_foot_remains_swing": policy == SUPPORT_POLICY_SOURCE,
-        },
-        "foot_contact_mismatch_ratio": float(np.mean(contact_mismatch)),
-        "foot_support_segment_count": int(support_segment_count),
-        "rot6d_nonfinite_ratio": float(np.mean(~finite_rot6d)),
-        "rot6d_degenerate_ratio": float(np.mean(degenerate)),
-        "rot6d_first_vector_norm_min": float(np.min(first_norm)),
-        "rot6d_second_vector_norm_min": float(np.min(second_norm)),
-        "rot6d_second_orthogonal_norm_min": float(
-            np.min(second_orthogonal_norm)
-        ),
-        "rot6d_collinearity_abs_p99": float(
-            np.percentile(collinearity, 99)
-        ),
-        "rotation_near_pi_step_ratio": float(
-            np.mean(rotation_steps >= (np.pi - 0.05))
-        ) if rotation_steps.size else 0.0,
-        "joint_rotation_step_window_p95_max_rad": _window_percentile_max(
-            rotation_steps,
-            fps=fps,
-            seconds=1.0,
-        ),
-        "joint_angular_acceleration_window_p95_max_rps2": _window_percentile_max(
-            angular_acceleration_norm,
-            fps=fps,
-            seconds=1.0,
-        ),
+        "foot_penetration_p01_m": float(np.percentile(foot_relative_height,1)),
+        "contact_ratio": float(np.mean(declared_contacts)), "foot_support_ratio": float(np.mean(support)), "static_support_ratio": float(np.mean(static_support)), "sliding_support_ratio": float(np.mean(sliding_support)),
+        "support_state_contract": {"policy":policy,"states":{"swing":SWING,"static_support":STATIC_SUPPORT,"sliding_support":SLIDING_SUPPORT},"thresholds":asdict(ContactStateThresholds.from_environment()),"sliding_requires_explicit_semantic_eligibility":True,"final_fail_closed_low_height_union":policy==SUPPORT_POLICY_FINAL,"source_fast_low_foot_remains_swing":policy==SUPPORT_POLICY_SOURCE},
+        "foot_contact_mismatch_ratio": float(np.mean(contact_mismatch)), "foot_support_segment_count": int(support_segment_count),
+        "rot6d_nonfinite_ratio": float(np.mean(~finite_rot6d)), "rot6d_degenerate_ratio": float(np.mean(degenerate)), "rot6d_first_vector_norm_min": float(np.min(first_norm)), "rot6d_second_vector_norm_min": float(np.min(second_norm)), "rot6d_second_orthogonal_norm_min": float(np.min(second_orthogonal_norm)), "rot6d_collinearity_abs_p99": float(np.percentile(collinearity,99)),
+        "rotation_near_pi_step_ratio": float(np.mean(rotation_steps >= (np.pi-0.05))) if rotation_steps.size else 0.0,
+        "joint_rotation_step_window_p95_max_rad": _window_percentile_max(rotation_steps,fps=fps,seconds=1.0),
+        "joint_angular_acceleration_window_p95_max_rps2": _window_percentile_max(angular_acceleration_norm,fps=fps,seconds=1.0),
         "root_y_range_m": float(np.ptp(root_y)) if root_y.size else 0.0,
-        "root_y_robust_range_m": (
-            float(np.percentile(root_y, 99) - np.percentile(root_y, 1))
-            if root_y.size
-            else 0.0
-        ),
-        "joint_jerk_window_p95_max_mps3": _window_percentile_max(
-            jerk_norm,
-            fps=fps,
-            seconds=1.0,
-        ),
-        "extremity_jerk_window_p95_max_mps3": _window_percentile_max(
-            extremity_jerk,
-            fps=fps,
-            seconds=1.0,
-        ),
-        "root_horizontal_center_m": root_center.astype(float).tolist(),
-        "root_horizontal_radius_p95_m": (
-            float(np.percentile(root_radius, 95)) if root_radius.size else 0.0
-        ),
-        "root_horizontal_radius_max_m": (
-            float(np.max(root_radius)) if root_radius.size else 0.0
-        ),
-        "root_horizontal_net_displacement_m": root_net_displacement,
-        "root_horizontal_path_length_m": float(np.sum(root_steps)),
-        "root_horizontal_drift_speed_mps": (
-            root_net_displacement / max(duration, 1.0e-8) if duration > 0.0 else 0.0
-        ),
-        "root_horizontal_window_seconds": 10.0,
-        "root_horizontal_window_displacement_max_m": _root_window_displacement_max(
-            root_xz,
-            fps=fps,
-            seconds=10.0,
-        ),
+        "root_y_robust_range_m": float(np.percentile(root_y,99)-np.percentile(root_y,1)) if root_y.size else 0.0,
+        "joint_jerk_window_p95_max_mps3": _window_percentile_max(jerk_norm,fps=fps,seconds=1.0),
+        "extremity_jerk_window_p95_max_mps3": _window_percentile_max(extremity_jerk,fps=fps,seconds=1.0),
+        "root_horizontal_center_m": root_center.astype(float).tolist(), "root_horizontal_radius_p95_m": float(np.percentile(root_radius,95)) if root_radius.size else 0.0, "root_horizontal_radius_max_m": float(np.max(root_radius)) if root_radius.size else 0.0,
+        "root_horizontal_net_displacement_m": root_net_displacement, "root_horizontal_path_length_m": float(np.sum(root_steps)), "root_horizontal_drift_speed_mps": root_net_displacement/max(duration,1e-8) if duration>0 else 0.0, "root_horizontal_window_seconds":10.0,
+        "root_horizontal_window_displacement_max_m": _root_window_displacement_max(root_xz,fps=fps,seconds=10.0),
     }
-    result.update(_distribution(skate, "foot_skate_mps"))
-    result.update(
-        _distribution(
-            sliding_relative_speed[sliding_support],
-            "sliding_support_relative_speed_mps",
-        )
-    )
-    result.update(_distribution(support_drift, "foot_support_drift_m"))
-    result.update(_distribution(contact_height, "foot_contact_height_m"))
-    result.update(_distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
-    result.update(_distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
-    result.update(_distribution(jerk_norm, "joint_jerk_mps3"))
-    result.update(_distribution(extremity_jerk, "extremity_jerk_mps3"))
-    result.update(_distribution(root_vertical_speed, "root_vertical_speed_mps"))
-    result.update(_distribution(rotation_steps, "joint_rotation_step_rad"))
-    result.update(
-        _distribution(extremity_rotation_steps, "extremity_rotation_step_rad")
-    )
-    result.update(
-        _distribution(
-            angular_acceleration_norm,
-            "joint_angular_acceleration_rps2",
-        )
-    )
+    result.update(_penetration_robust_metrics(foot_relative_height, fps=fps))
+    result.update(_body_normalized_root_relative_jerk_metrics(joints, fps=fps))
+    result.update(_distribution(skate,"foot_skate_mps")); result.update(_distribution(sliding_relative_speed[sliding_support],"sliding_support_relative_speed_mps")); result.update(_distribution(support_drift,"foot_support_drift_m")); result.update(_distribution(contact_height,"foot_contact_height_m"))
+    result.update(_distribution(np.linalg.norm(velocity,axis=-1),"joint_velocity_mps")); result.update(_distribution(np.linalg.norm(acceleration,axis=-1),"joint_acceleration_mps2")); result.update(_distribution(jerk_norm,"joint_jerk_mps3")); result.update(_distribution(extremity_jerk,"extremity_jerk_mps3")); result.update(_distribution(root_vertical_speed,"root_vertical_speed_mps")); result.update(_distribution(rotation_steps,"joint_rotation_step_rad")); result.update(_distribution(extremity_rotation_steps,"extremity_rotation_step_rad")); result.update(_distribution(angular_acceleration_norm,"joint_angular_acceleration_rps2"))
     return result

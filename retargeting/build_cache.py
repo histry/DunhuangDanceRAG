@@ -53,7 +53,7 @@ from retargeting.legacy_anatomy_adapter import load_official_smpl_motion
 
 # Bump the cache schema because physical-clean semantics changed.  Old caches
 # are therefore rebuilt rather than silently reused under the new contract.
-SCHEMA = "retarget_clean_source_safe_retarget_cache_v2_source_final_split"
+SCHEMA = "retarget_clean_source_safe_retarget_cache_v3_body_normalized_source_dynamics"
 
 
 def _discover(in_dir: Path) -> List[Path]:
@@ -341,6 +341,39 @@ def _build_source_reference_audit(
     }
 
 
+def _rejected_paths(out_dir: Path, rel: Path) -> Tuple[Path, Path]:
+    configured = str(os.environ.get("RETARGET_REJECTED_DIR", "")).strip()
+    root = Path(configured).expanduser().resolve() if configured else (out_dir.parent / f"{out_dir.name}_rejected").resolve()
+    base = (root / rel).with_suffix("")
+    return (
+        base.with_name(base.name + ".rejected.npy"),
+        base.with_name(base.name + ".rejected.retarget.json"),
+    )
+
+
+def _persist_rejected_candidate(*, out_dir: Path, rel: Path, motion: Optional[np.ndarray], report: Optional[Dict[str, Any]], error: str, traceback_text: str) -> Dict[str, Optional[str]]:
+    motion_path, report_path = _rejected_paths(out_dir, rel)
+    motion_ref = report_ref = None
+    if motion is not None:
+        motion_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(motion_path, np.asarray(motion, dtype=np.float32))
+        motion_ref = str(motion_path)
+    if report is not None or motion is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(report or {})
+        payload["rejected_artifact"] = {
+            "accepted_for_training": False,
+            "motion": motion_ref,
+            "report": str(report_path),
+            "error": str(error),
+            "traceback": str(traceback_text),
+            "persistence_contract": "outside_accepted_cache_tree",
+        }
+        report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        report_ref = str(report_path)
+    return {"motion": motion_ref, "report": report_ref}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", default="change")
@@ -434,6 +467,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
 
+        motion = None
+        rep = None
+        source_used = None
+        physical_clean_gate = None
+        source_reference_audit = None
+        source_reference_contract = None
         try:
             expected_provenance = _expected_provenance(
                 src,
@@ -595,7 +634,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "physical_clean_ok": bool(physical_clean_gate["ok"]),
                     "retarget_clean_cache_contract": {
                         "schema": SCHEMA,
-                        "source_gate": "pretraining_source_relative_physical_clean_v2",
+                        "source_gate": "pretraining_body_normalized_source_physical_clean_v3",
                         "source_support_policy": SUPPORT_POLICY_SOURCE,
                         "final_generation_gate_reused": False,
                         "event_quality_gate_deferred": True,
@@ -630,17 +669,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reports.append(rep)
 
         except Exception as exc:
+            tb = traceback.format_exc()
+            rejected = _persist_rejected_candidate(
+                out_dir=out_dir, rel=rel,
+                motion=None if motion is None else np.asarray(motion, dtype=np.float32),
+                report=None if rep is None else dict(rep),
+                error=str(exc), traceback_text=tb,
+            )
             fail = {
-                "source": str(src),
-                "output": str(dst),
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
+                "source": str(src), "output": str(dst), "error": str(exc),
+                "traceback": tb,
+                "rejected_motion": rejected["motion"],
+                "rejected_report": rejected["report"],
+                "physical_clean_reasons": list(physical_clean_gate.get("reasons", [])) if isinstance(physical_clean_gate, dict) else [],
             }
             failures.append(fail)
-            print(f"[REJECTED SOURCE] {src}: {exc}", flush=True)
-            for p in (dst, rep_path):
+            print(f"[REJECTED SOURCE] {src}: {exc}; rejected_motion={rejected['motion']} rejected_report={rejected['report']}", flush=True)
+            for accepted_path in (dst, rep_path):
                 try:
-                    p.unlink(missing_ok=True)
+                    accepted_path.unlink(missing_ok=True)
                 except Exception:
                     pass
             if not allow_partial:
@@ -667,12 +714,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "strict_source_manifest": bool(strict_manifest),
         "smpl_scaling_mode": str(args.smpl_scaling_mode),
         "all_ok": bool(all_ok),
+        "rejected_artifact_root": str((_rejected_paths(out_dir, Path("placeholder.bvh"))[0]).parent),
         "policy": {
             "source_gate": (
                 "pretraining anatomy/gravity/fit + reference-relative "
                 "source physical clean"
             ),
-            "source_anti_jitter": "relative_to_aligned_recorded_source",
+            "source_anti_jitter": "body_normalized_root_relative_to_recorded_source",
             "source_support": SUPPORT_POLICY_SOURCE,
             "final_generation_gate_reused": False,
             "style_quality": "deferred to event-level posture-aware gate",
