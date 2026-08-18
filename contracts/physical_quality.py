@@ -300,20 +300,26 @@ class PhysicalQualityLimits:
 
 @dataclass(frozen=True)
 class SourcePhysicalQualityPolicy:
-    """Pre-training Retarget Clean policy, never used by final generation."""
+    """Pre-training Retarget Clean policy, never used by final generation.
 
-    normalized_jerk_p95_ratio: float = 1.15
-    normalized_jerk_p95_margin_s3: float = 75.0
-    normalized_jerk_p99_ratio: float = 1.20
-    normalized_jerk_p99_margin_s3: float = 150.0
-    normalized_jerk_window_ratio: float = 1.20
-    normalized_jerk_window_margin_s3: float = 100.0
-    normalized_extremity_jerk_p95_ratio: float = 1.15
-    normalized_extremity_jerk_p95_margin_s3: float = 75.0
-    normalized_extremity_jerk_p99_ratio: float = 1.20
-    normalized_extremity_jerk_p99_margin_s3: float = 150.0
-    normalized_extremity_jerk_window_ratio: float = 1.20
-    normalized_extremity_jerk_window_margin_s3: float = 150.0
+    V2.2 source anti-jitter is measured on parent-relative unit-bone direction
+    trajectories over the direct common source/target mapped-bone set.  The
+    absolute SI final-generation contract is intentionally not represented in
+    these fields.
+    """
+
+    unit_bone_jerk_p95_ratio: float = 1.15
+    unit_bone_jerk_p95_margin_s3: float = 75.0
+    unit_bone_jerk_p99_ratio: float = 1.20
+    unit_bone_jerk_p99_margin_s3: float = 150.0
+    unit_bone_jerk_window_ratio: float = 1.20
+    unit_bone_jerk_window_margin_s3: float = 100.0
+    unit_bone_extremity_jerk_p95_ratio: float = 1.15
+    unit_bone_extremity_jerk_p95_margin_s3: float = 75.0
+    unit_bone_extremity_jerk_p99_ratio: float = 1.20
+    unit_bone_extremity_jerk_p99_margin_s3: float = 150.0
+    unit_bone_extremity_jerk_window_ratio: float = 1.20
+    unit_bone_extremity_jerk_window_margin_s3: float = 150.0
     foot_drift_p95_ratio: float = 1.25
     foot_drift_p95_margin_m: float = 0.03
     foot_drift_max_ratio: float = 1.35
@@ -336,36 +342,96 @@ class SourcePhysicalQualityPolicy:
     @classmethod
     def from_environment(cls) -> "SourcePhysicalQualityPolicy":
         return cls(
-            normalized_jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P95_RATIO", None, 1.15),
-            normalized_jerk_p95_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P95_MARGIN_S3", None, 75.0),
-            normalized_jerk_p99_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P99_RATIO", None, 1.20),
-            normalized_jerk_p99_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P99_MARGIN_S3", None, 150.0),
-            normalized_jerk_window_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_WINDOW_RATIO", None, 1.20),
-            normalized_jerk_window_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_WINDOW_MARGIN_S3", None, 100.0),
-            normalized_extremity_jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P95_RATIO", None, 1.15),
-            normalized_extremity_jerk_p95_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P95_MARGIN_S3", None, 75.0),
-            normalized_extremity_jerk_p99_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P99_RATIO", None, 1.20),
-            normalized_extremity_jerk_p99_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P99_MARGIN_S3", None, 150.0),
-            normalized_extremity_jerk_window_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20),
-            normalized_extremity_jerk_window_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0),
-            foot_drift_p95_ratio=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25),
-            foot_drift_p95_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03),
-            foot_drift_max_ratio=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35),
-            foot_drift_max_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08),
-            foot_contact_height_m_max=_env_float("SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10),
-            foot_penetration_p01_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04),
-            foot_penetration_p01_floor_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10),
-            foot_penetration_p001_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P001_MARGIN_M", None, 0.06),
-            foot_penetration_p001_floor_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14),
-            foot_penetration_catastrophic_threshold_m=_env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18),
-            foot_penetration_catastrophic_max_seconds=_env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS", None, 0.08),
-            root_range_ratio=_env_float("SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20),
-            root_range_margin_m=_env_float("SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08),
-            root_vertical_speed_p95_ratio=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20),
-            root_vertical_speed_p95_margin_mps=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15),
-            root_vertical_speed_max_ratio=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25),
-            root_vertical_speed_max_margin_mps=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40),
-            frame_count_tolerance=_env_int("SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1),
+            unit_bone_jerk_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_RATIO", None, 1.15
+            ),
+            unit_bone_jerk_p95_margin_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_MARGIN_S3", None, 75.0
+            ),
+            unit_bone_jerk_p99_ratio=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_RATIO", None, 1.20
+            ),
+            unit_bone_jerk_p99_margin_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_MARGIN_S3", None, 150.0
+            ),
+            unit_bone_jerk_window_ratio=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_RATIO", None, 1.20
+            ),
+            unit_bone_jerk_window_margin_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_MARGIN_S3", None, 100.0
+            ),
+            unit_bone_extremity_jerk_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_RATIO", None, 1.15
+            ),
+            unit_bone_extremity_jerk_p95_margin_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_MARGIN_S3", None, 75.0
+            ),
+            unit_bone_extremity_jerk_p99_ratio=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_RATIO", None, 1.20
+            ),
+            unit_bone_extremity_jerk_p99_margin_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_MARGIN_S3", None, 150.0
+            ),
+            unit_bone_extremity_jerk_window_ratio=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20
+            ),
+            unit_bone_extremity_jerk_window_margin_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0
+            ),
+            foot_drift_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25
+            ),
+            foot_drift_p95_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03
+            ),
+            foot_drift_max_ratio=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35
+            ),
+            foot_drift_max_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08
+            ),
+            foot_contact_height_m_max=_env_float(
+                "SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10
+            ),
+            foot_penetration_p01_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04
+            ),
+            foot_penetration_p01_floor_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10
+            ),
+            foot_penetration_p001_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_MARGIN_M", None, 0.06
+            ),
+            foot_penetration_p001_floor_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14
+            ),
+            foot_penetration_catastrophic_threshold_m=_env_float(
+                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18
+            ),
+            foot_penetration_catastrophic_max_seconds=_env_float(
+                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS", None, 0.08
+            ),
+            root_range_ratio=_env_float(
+                "SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20
+            ),
+            root_range_margin_m=_env_float(
+                "SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08
+            ),
+            root_vertical_speed_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20
+            ),
+            root_vertical_speed_p95_margin_mps=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15
+            ),
+            root_vertical_speed_max_ratio=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25
+            ),
+            root_vertical_speed_max_margin_mps=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40
+            ),
+            frame_count_tolerance=_env_int(
+                "SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1
+            ),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -609,6 +675,58 @@ def _append_required_low_relative(
         reasons.append(reason)
 
 
+def _append_required_low_relative_reference_aware_floor(
+    reasons: list[str],
+    detail: Dict[str, Any],
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    key: str,
+    margin: float,
+    absolute_floor: float,
+    reason: str,
+) -> None:
+    """Source-relative low metric with a floor only when the source is healthy.
+
+    For penetration-like metrics, larger/less-negative is better.  If the
+    recorded source already satisfies the normal floor, the candidate must both
+    stay close to the source and remain above that floor.  If the source itself
+    is below the floor, this relative gate no longer demands an artificial full
+    repair; it only rejects additional regression beyond ``margin``.  Sustained
+    catastrophic penetration is checked independently by its own hard gate.
+    """
+
+    ref_ok, ref = _required_metric(reference, key)
+    cand_ok, cand = _required_metric(candidate, key)
+    if not ref_ok:
+        reasons.append(f"reference_missing_or_nonfinite:{key}")
+        return
+    if not cand_ok:
+        reasons.append(f"candidate_missing_or_nonfinite:{key}")
+        return
+
+    floor = float(absolute_floor)
+    reference_healthy = float(ref) >= floor
+    if reference_healthy:
+        allowed = max(floor, float(ref) - float(margin))
+        semantics = "reference_healthy_enforce_floor_and_relative_margin"
+    else:
+        allowed = float(ref) - float(margin)
+        semantics = "reference_below_floor_relative_non_regression_only"
+
+    detail[key] = {
+        "reference": float(ref),
+        "candidate": float(cand),
+        "margin": float(margin),
+        "absolute_floor": floor,
+        "reference_satisfies_floor": bool(reference_healthy),
+        "semantics": semantics,
+        "allowed_minimum": float(allowed),
+    }
+    if cand < allowed:
+        reasons.append(reason)
+
+
 def _append_required_low_absolute(
     reasons: list[str],
     audit: Mapping[str, Any],
@@ -792,93 +910,334 @@ def _evaluate_source_reference_relative(
     policy: SourcePhysicalQualityPolicy,
 ) -> Dict[str, Any]:
     layer_reasons: Dict[str, list[str]] = {
-        "contract": [], "anti_jitter": [], "foot_contact": [],
-        "root_vertical": [], "rotation_quality": [],
+        "contract": [],
+        "anti_jitter": [],
+        "foot_contact": [],
+        "root_vertical": [],
+        "rotation_quality": [],
     }
     relative_checks: Dict[str, Any] = {}
+
     if str(audit.get("schema", "")) != PHYSICAL_METRICS_SCHEMA:
-        layer_reasons["contract"].append(f"missing_or_invalid_schema:{audit.get('schema','missing')}")
+        layer_reasons["contract"].append(
+            f"missing_or_invalid_schema:{audit.get('schema', 'missing')}"
+        )
     support_contract = audit.get("support_state_contract")
-    support_policy = str(support_contract.get("policy", "")) if isinstance(support_contract, Mapping) else ""
+    support_policy = (
+        str(support_contract.get("policy", ""))
+        if isinstance(support_contract, Mapping)
+        else ""
+    )
     if support_policy != SUPPORT_POLICY_SOURCE:
-        layer_reasons["contract"].append(f"source_support_policy_required:{support_policy or 'missing'}")
+        layer_reasons["contract"].append(
+            f"source_support_policy_required:{support_policy or 'missing'}"
+        )
     if str(source_reference_audit.get("schema", "")) != SOURCE_REFERENCE_KINEMATICS_SCHEMA:
-        layer_reasons["contract"].append("missing_or_invalid_source_reference_schema")
+        layer_reasons["contract"].append(
+            "missing_or_invalid_source_reference_schema"
+        )
+
     cand_fps_ok, cand_fps = _required_metric(audit, "fps")
     ref_fps_ok, ref_fps = _required_metric(source_reference_audit, "fps")
-    if not cand_fps_ok or not ref_fps_ok or abs(cand_fps-ref_fps) > 1e-6:
+    if (
+        not cand_fps_ok
+        or not ref_fps_ok
+        or abs(cand_fps - ref_fps) > 1.0e-6
+    ):
         layer_reasons["contract"].append("source_reference_fps_mismatch")
     try:
-        if abs(int(audit.get("frames")) - int(source_reference_audit.get("frames"))) > int(policy.frame_count_tolerance):
-            layer_reasons["contract"].append("source_reference_frame_count_mismatch")
+        if (
+            abs(int(audit.get("frames")) - int(source_reference_audit.get("frames")))
+            > int(policy.frame_count_tolerance)
+        ):
+            layer_reasons["contract"].append(
+                "source_reference_frame_count_mismatch"
+            )
     except (TypeError, ValueError):
-        layer_reasons["contract"].append("missing_source_reference_frame_count")
+        layer_reasons["contract"].append(
+            "missing_source_reference_frame_count"
+        )
 
-    # Source dynamics: compare root-relative, per-joint body-normalized jerk.
-    # Raw SI jerk stays diagnostic here and remains authoritative in final generation.
+    # V2.2 comparison set contract.  Candidate and reference must use exactly
+    # the same direct common mapped target bones; otherwise distribution-level
+    # source-relative jerk is not comparable and fails closed.
+    try:
+        cand_bones = tuple(int(v) for v in audit.get("unit_bone_comparison_bones", []))
+        ref_bones = tuple(
+            int(v) for v in source_reference_audit.get("unit_bone_comparison_bones", [])
+        )
+        cand_parents = tuple(
+            int(v) for v in audit.get("unit_bone_comparison_parents", [])
+        )
+        ref_parents = tuple(
+            int(v)
+            for v in source_reference_audit.get("unit_bone_comparison_parents", [])
+        )
+    except (TypeError, ValueError):
+        cand_bones = ref_bones = cand_parents = ref_parents = ()
+
+    if not ref_bones:
+        layer_reasons["contract"].append(
+            "missing_source_reference_common_mapped_bones"
+        )
+    if not cand_bones:
+        layer_reasons["contract"].append(
+            "missing_candidate_common_mapped_bones"
+        )
+    if cand_bones and ref_bones and cand_bones != ref_bones:
+        layer_reasons["contract"].append(
+            "source_candidate_comparison_bone_set_mismatch"
+        )
+    if not ref_parents:
+        layer_reasons["contract"].append(
+            "missing_source_reference_common_mapped_bone_parents"
+        )
+    if not cand_parents:
+        layer_reasons["contract"].append(
+            "missing_candidate_common_mapped_bone_parents"
+        )
+    if cand_parents and ref_parents and cand_parents != ref_parents:
+        layer_reasons["contract"].append(
+            "source_candidate_comparison_parent_set_mismatch"
+        )
+    try:
+        cand_extremity_bones = tuple(
+            int(v) for v in audit.get("unit_bone_extremity_comparison_bones", [])
+        )
+        ref_extremity_bones = tuple(
+            int(v)
+            for v in source_reference_audit.get(
+                "unit_bone_extremity_comparison_bones", []
+            )
+        )
+    except (TypeError, ValueError):
+        cand_extremity_bones = ref_extremity_bones = ()
+    if not ref_extremity_bones:
+        layer_reasons["contract"].append(
+            "missing_source_reference_common_mapped_extremity_bones"
+        )
+    if cand_extremity_bones != ref_extremity_bones:
+        layer_reasons["contract"].append(
+            "source_candidate_extremity_comparison_bone_set_mismatch"
+        )
+
+    relative_checks["unit_bone_comparison_contract"] = {
+        "reference_bones": list(ref_bones),
+        "candidate_bones": list(cand_bones),
+        "reference_parents": list(ref_parents),
+        "candidate_parents": list(cand_parents),
+        "reference_extremity_bones": list(ref_extremity_bones),
+        "candidate_extremity_bones": list(cand_extremity_bones),
+        "exact_match": bool(
+            cand_bones
+            and ref_bones
+            and cand_bones == ref_bones
+            and cand_parents == ref_parents
+            and cand_extremity_bones == ref_extremity_bones
+            and bool(ref_extremity_bones)
+        ),
+    }
+
+    # Source anti-jitter: parent-relative unit-bone direction dynamics over the
+    # common direct mapped-bone set only.  V2.1 pelvis-relative/radius-normalized
+    # fields and all raw SI jerk values stay diagnostic here.  The final gate
+    # continues to use the unchanged world-space m/s^3 contract.
     anti = layer_reasons["anti_jitter"]
-    normalized_specs = (
-        ("body_normalized_joint_jerk_s3_p95", policy.normalized_jerk_p95_ratio, policy.normalized_jerk_p95_margin_s3, "body_normalized_joint_jerk_p95_regressed_vs_source"),
-        ("body_normalized_joint_jerk_s3_p99", policy.normalized_jerk_p99_ratio, policy.normalized_jerk_p99_margin_s3, "body_normalized_joint_jerk_p99_regressed_vs_source"),
-        ("body_normalized_joint_jerk_window_p95_max_s3", policy.normalized_jerk_window_ratio, policy.normalized_jerk_window_margin_s3, "body_normalized_joint_jerk_window_regressed_vs_source"),
-        ("body_normalized_extremity_jerk_s3_p95", policy.normalized_extremity_jerk_p95_ratio, policy.normalized_extremity_jerk_p95_margin_s3, "body_normalized_extremity_jerk_p95_regressed_vs_source"),
-        ("body_normalized_extremity_jerk_s3_p99", policy.normalized_extremity_jerk_p99_ratio, policy.normalized_extremity_jerk_p99_margin_s3, "body_normalized_extremity_jerk_p99_regressed_vs_source"),
-        ("body_normalized_extremity_jerk_window_p95_max_s3", policy.normalized_extremity_jerk_window_ratio, policy.normalized_extremity_jerk_window_margin_s3, "body_normalized_extremity_jerk_window_regressed_vs_source"),
+    unit_bone_specs = (
+        (
+            "unit_bone_joint_jerk_s3_p95",
+            policy.unit_bone_jerk_p95_ratio,
+            policy.unit_bone_jerk_p95_margin_s3,
+            "unit_bone_joint_jerk_p95_regressed_vs_source",
+        ),
+        (
+            "unit_bone_joint_jerk_s3_p99",
+            policy.unit_bone_jerk_p99_ratio,
+            policy.unit_bone_jerk_p99_margin_s3,
+            "unit_bone_joint_jerk_p99_regressed_vs_source",
+        ),
+        (
+            "unit_bone_joint_jerk_window_p95_max_s3",
+            policy.unit_bone_jerk_window_ratio,
+            policy.unit_bone_jerk_window_margin_s3,
+            "unit_bone_joint_jerk_window_regressed_vs_source",
+        ),
+        (
+            "unit_bone_extremity_jerk_s3_p95",
+            policy.unit_bone_extremity_jerk_p95_ratio,
+            policy.unit_bone_extremity_jerk_p95_margin_s3,
+            "unit_bone_extremity_jerk_p95_regressed_vs_source",
+        ),
+        (
+            "unit_bone_extremity_jerk_s3_p99",
+            policy.unit_bone_extremity_jerk_p99_ratio,
+            policy.unit_bone_extremity_jerk_p99_margin_s3,
+            "unit_bone_extremity_jerk_p99_regressed_vs_source",
+        ),
+        (
+            "unit_bone_extremity_jerk_window_p95_max_s3",
+            policy.unit_bone_extremity_jerk_window_ratio,
+            policy.unit_bone_extremity_jerk_window_margin_s3,
+            "unit_bone_extremity_jerk_window_regressed_vs_source",
+        ),
     )
-    for key, ratio, margin, reason in normalized_specs:
-        _append_required_high(anti, relative_checks, audit, source_reference_audit, key=key, ratio=ratio, margin=margin, reason=reason)
+    for key, ratio, margin, reason in unit_bone_specs:
+        _append_required_high(
+            anti,
+            relative_checks,
+            audit,
+            source_reference_audit,
+            key=key,
+            ratio=ratio,
+            margin=margin,
+            reason=reason,
+        )
 
     foot = layer_reasons["foot_contact"]
-    _append_required_high(foot, relative_checks, audit, source_reference_audit, key="foot_support_drift_m_p95", ratio=policy.foot_drift_p95_ratio, margin=policy.foot_drift_p95_margin_m, reason="foot_support_drift_p95_regressed_vs_source")
-    _append_required_high(foot, relative_checks, audit, source_reference_audit, key="foot_support_drift_m_max", ratio=policy.foot_drift_max_ratio, margin=policy.foot_drift_max_margin_m, reason="foot_support_drift_max_regressed_vs_source")
-    _append_required_high_absolute(foot, audit, key="foot_contact_height_m_max", maximum=policy.foot_contact_height_m_max, reason="foot_contact_height_m_max_too_high")
-    _append_required_low_relative(foot, relative_checks, audit, source_reference_audit, key="foot_penetration_p01_m", margin=policy.foot_penetration_p01_margin_m, absolute_floor=policy.foot_penetration_p01_floor_m, reason="foot_penetration_p01_regressed_vs_source")
-    _append_required_low_relative(foot, relative_checks, audit, source_reference_audit, key="foot_penetration_p001_m", margin=policy.foot_penetration_p001_margin_m, absolute_floor=policy.foot_penetration_p001_floor_m, reason="foot_penetration_p001_regressed_vs_source")
-    threshold_ok, observed_threshold = _required_metric(audit, "foot_penetration_catastrophic_threshold_m")
-    if not threshold_ok or abs(observed_threshold - float(policy.foot_penetration_catastrophic_threshold_m)) > 1.0e-9:
-        layer_reasons["contract"].append("source_penetration_catastrophic_threshold_mismatch")
-    finite, run_seconds = _required_metric(audit, "foot_penetration_catastrophic_run_max_seconds")
+    _append_required_high(
+        foot, relative_checks, audit, source_reference_audit,
+        key="foot_support_drift_m_p95",
+        ratio=policy.foot_drift_p95_ratio,
+        margin=policy.foot_drift_p95_margin_m,
+        reason="foot_support_drift_p95_regressed_vs_source",
+    )
+    _append_required_high(
+        foot, relative_checks, audit, source_reference_audit,
+        key="foot_support_drift_m_max",
+        ratio=policy.foot_drift_max_ratio,
+        margin=policy.foot_drift_max_margin_m,
+        reason="foot_support_drift_max_regressed_vs_source",
+    )
+    _append_required_high_absolute(
+        foot, audit, key="foot_contact_height_m_max",
+        maximum=policy.foot_contact_height_m_max,
+        reason="foot_contact_height_m_max_too_high",
+    )
+
+    # Keep the V2.1 p01 rule.  Only p0.1% changes semantics in V2.2.
+    _append_required_low_relative(
+        foot, relative_checks, audit, source_reference_audit,
+        key="foot_penetration_p01_m",
+        margin=policy.foot_penetration_p01_margin_m,
+        absolute_floor=policy.foot_penetration_p01_floor_m,
+        reason="foot_penetration_p01_regressed_vs_source",
+    )
+    _append_required_low_relative_reference_aware_floor(
+        foot, relative_checks, audit, source_reference_audit,
+        key="foot_penetration_p001_m",
+        margin=policy.foot_penetration_p001_margin_m,
+        absolute_floor=policy.foot_penetration_p001_floor_m,
+        reason="foot_penetration_p001_regressed_vs_source",
+    )
+
+    # Sustained catastrophic penetration is an independent hard source gate.
+    # It is evaluated regardless of whether p0.1% improved versus a degraded
+    # reference; a single raw minimum is diagnostic only.
+    threshold_ok, observed_threshold = _required_metric(
+        audit, "foot_penetration_catastrophic_threshold_m"
+    )
+    if (
+        not threshold_ok
+        or abs(
+            observed_threshold
+            - float(policy.foot_penetration_catastrophic_threshold_m)
+        )
+        > 1.0e-9
+    ):
+        layer_reasons["contract"].append(
+            "source_penetration_catastrophic_threshold_mismatch"
+        )
+    finite, run_seconds = _required_metric(
+        audit, "foot_penetration_catastrophic_run_max_seconds"
+    )
     if not finite:
-        foot.append("missing_or_nonfinite:foot_penetration_catastrophic_run_max_seconds")
+        foot.append(
+            "missing_or_nonfinite:foot_penetration_catastrophic_run_max_seconds"
+        )
     elif run_seconds > float(policy.foot_penetration_catastrophic_max_seconds):
         foot.append("foot_penetration_sustained_catastrophic")
     relative_checks["foot_penetration_sustained_catastrophic"] = {
+        "independent_hard_gate": True,
         "threshold_m": float(policy.foot_penetration_catastrophic_threshold_m),
         "candidate_run_max_seconds": run_seconds,
-        "allowed_max_seconds": float(policy.foot_penetration_catastrophic_max_seconds),
+        "allowed_max_seconds": float(
+            policy.foot_penetration_catastrophic_max_seconds
+        ),
         "raw_min_diagnostic_only_m": audit.get("foot_penetration_min_m"),
     }
 
     root = layer_reasons["root_vertical"]
-    _append_required_high(root, relative_checks, audit, source_reference_audit, key="root_y_robust_range_m", ratio=policy.root_range_ratio, margin=policy.root_range_margin_m, reason="root_y_robust_range_regressed_vs_source")
-    _append_required_high(root, relative_checks, audit, source_reference_audit, key="root_vertical_speed_mps_p95", ratio=policy.root_vertical_speed_p95_ratio, margin=policy.root_vertical_speed_p95_margin_mps, reason="root_vertical_speed_p95_regressed_vs_source")
-    _append_required_high(root, relative_checks, audit, source_reference_audit, key="root_vertical_speed_mps_max", ratio=policy.root_vertical_speed_max_ratio, margin=policy.root_vertical_speed_max_margin_mps, reason="root_vertical_speed_max_regressed_vs_source")
+    _append_required_high(
+        root, relative_checks, audit, source_reference_audit,
+        key="root_y_robust_range_m",
+        ratio=policy.root_range_ratio,
+        margin=policy.root_range_margin_m,
+        reason="root_y_robust_range_regressed_vs_source",
+    )
+    _append_required_high(
+        root, relative_checks, audit, source_reference_audit,
+        key="root_vertical_speed_mps_p95",
+        ratio=policy.root_vertical_speed_p95_ratio,
+        margin=policy.root_vertical_speed_p95_margin_mps,
+        reason="root_vertical_speed_p95_regressed_vs_source",
+    )
+    _append_required_high(
+        root, relative_checks, audit, source_reference_audit,
+        key="root_vertical_speed_mps_max",
+        ratio=policy.root_vertical_speed_max_ratio,
+        margin=policy.root_vertical_speed_max_margin_mps,
+        reason="root_vertical_speed_max_regressed_vs_source",
+    )
 
     # Keep final SO(3)/Rot6D integrity absolutely strict for source qualification.
-    # This deliberately preserves male_pipa_2 joint_rotation_step_rad_max failures.
+    # In particular, male_pipa_2 joint_rotation_step_rad_max remains governed
+    # by the unchanged final limit (1.20 rad by default).
     rotation = layer_reasons["rotation_quality"]
     for spec in physical_metric_specs(final_limits):
         if spec.layer != "rotation_quality":
             continue
         finite, value = _required_metric(audit, spec.key)
-        if not finite: rotation.append(f"missing_or_nonfinite:{spec.key}")
-        elif spec.direction == "high" and value > spec.absolute_limit: rotation.append(f"{spec.key}_too_high")
-        elif spec.direction == "low" and value < spec.absolute_limit: rotation.append(f"{spec.key}_too_low")
+        if not finite:
+            rotation.append(f"missing_or_nonfinite:{spec.key}")
+        elif spec.direction == "high" and value > spec.absolute_limit:
+            rotation.append(f"{spec.key}_too_high")
+        elif spec.direction == "low" and value < spec.absolute_limit:
+            rotation.append(f"{spec.key}_too_low")
 
-    order=("contract","anti_jitter","foot_contact","root_vertical","rotation_quality")
-    reasons=list(dict.fromkeys(reason for layer in order for reason in layer_reasons[layer]))
+    order = (
+        "contract",
+        "anti_jitter",
+        "foot_contact",
+        "root_vertical",
+        "rotation_quality",
+    )
+    reasons = list(
+        dict.fromkeys(
+            reason for layer in order for reason in layer_reasons[layer]
+        )
+    )
     return {
-        "schema":"source_physical_clean_gate_v3_body_normalized",
-        "contract_role":"pretraining_source_retarget",
-        "mode":"body_normalized_reference_relative_source_contract",
-        "ok":not reasons, "reasons":reasons,
-        "excluded_final_only_layers":["long_horizon_root_drift","absolute_final_si_anti_jitter","final_fail_closed_foot_skate"],
-        "source_policy":policy.to_dict(),
-        "final_rotation_integrity_limits":final_limits.as_audit_limits(),
-        "source_si_jerk_diagnostic_only":True,
-        "relative_checks":relative_checks,
-        "audit":dict(audit), "source_reference_audit":dict(source_reference_audit),
-        "layers":{name:{"ok":not values,"reasons":list(values)} for name,values in layer_reasons.items()},
+        "schema": "source_physical_clean_gate_v4_unit_bone",
+        "contract_role": "pretraining_source_retarget",
+        "mode": "unit_bone_common_mapped_reference_relative_source_contract",
+        "ok": not reasons,
+        "reasons": reasons,
+        "excluded_final_only_layers": [
+            "long_horizon_root_drift",
+            "absolute_final_si_anti_jitter",
+            "final_fail_closed_foot_skate",
+        ],
+        "source_policy": policy.to_dict(),
+        "final_rotation_integrity_limits": final_limits.as_audit_limits(),
+        "source_si_jerk_diagnostic_only": True,
+        "legacy_body_normalized_jerk_diagnostic_only": True,
+        "relative_checks": relative_checks,
+        "audit": dict(audit),
+        "source_reference_audit": dict(source_reference_audit),
+        "layers": {
+            name: {"ok": not values, "reasons": list(values)}
+            for name, values in layer_reasons.items()
+        },
     }
 
 
