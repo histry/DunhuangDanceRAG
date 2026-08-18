@@ -1,4 +1,22 @@
-"""FPS-invariant contact and kinematic metrics in SI units."""
+"""FPS-invariant contact and kinematic metrics in SI units.
+
+Two support policies are intentionally exposed:
+
+``final_fail_closed``
+    Used by generated-motion auditing.  Declared contact is unioned with a
+    low-foot proxy so a generator cannot evade foot-skate checks by clearing
+    contact labels.
+
+``source_observation``
+    Used only while qualifying trusted/recorded source motion for the training
+    database.  A low foot is *not* automatically a planted foot: only slow
+    support is static, semantically eligible coherent travel may be sliding,
+    and the remaining fast low-foot samples stay swing.  This prevents genuine
+    low sweeping/turning steps in Change-E from being mislabeled as foot skate.
+
+The default remains ``final_fail_closed`` so existing final-generation callers
+retain the strict fail-closed behaviour.
+"""
 from __future__ import annotations
 
 import os
@@ -25,10 +43,16 @@ from motion_geometry.rotations import (
 )
 
 PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v5_contact_states"
+SOURCE_REFERENCE_KINEMATICS_SCHEMA = "source_reference_kinematics_si_v1"
+
 EXTREMITY_JOINTS = (7, 8, 10, 11, 20, 21, 22, 23)
 SWING = 0
 STATIC_SUPPORT = 1
 SLIDING_SUPPORT = 2
+
+SUPPORT_POLICY_FINAL = "final_fail_closed"
+SUPPORT_POLICY_SOURCE = "source_observation"
+_SUPPORT_POLICIES = {SUPPORT_POLICY_FINAL, SUPPORT_POLICY_SOURCE}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -123,6 +147,21 @@ def _window_percentile_max(
             for start in starts
         )
     )
+
+
+def _distribution(values: np.ndarray, prefix: str) -> dict[str, float]:
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    if v.size == 0:
+        return {
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_p95": 0.0,
+            f"{prefix}_max": 0.0,
+        }
+    return {
+        f"{prefix}_mean": float(np.mean(v)),
+        f"{prefix}_p95": float(np.percentile(v, 95)),
+        f"{prefix}_max": float(np.max(v)),
+    }
 
 
 def _support_segment_drift_values(
@@ -226,6 +265,16 @@ def recompute_contacts_np(
     return x
 
 
+def _foot_speed_mps(feet: np.ndarray, fps: float) -> np.ndarray:
+    speed = np.zeros(feet.shape[:2], dtype=np.float32)
+    if len(feet) > 1:
+        speed[1:] = (
+            np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+            * float(fps)
+        )
+    return speed
+
+
 def classify_support_states_np(
     joints: np.ndarray,
     declared_contacts: np.ndarray,
@@ -234,21 +283,34 @@ def classify_support_states_np(
     sliding_support_eligible: np.ndarray | None = None,
     thresholds: ContactStateThresholds | None = None,
     height_support: np.ndarray | None = None,
+    support_policy: str = SUPPORT_POLICY_FINAL,
 ) -> np.ndarray:
     """Return SWING/STATIC_SUPPORT/SLIDING_SUPPORT per frame and foot.
 
-    Sliding support is fail-closed: kinematics alone never grant an exemption.
-    The caller must provide semantic eligibility, and the eligible segment must
-    also move consistently with the root. This preserves the anti-label-bypass
-    foot-skate check for ordinary generated motion.
+    ``final_fail_closed`` preserves the original anti-label-bypass behaviour:
+    declared contact OR low height is provisionally support, then semantically
+    eligible coherent travel may be upgraded to SLIDING_SUPPORT.
+
+    ``source_observation`` is deliberately different.  Recorded/retargeted
+    training sources may contain legitimate fast low-foot sweep/turn steps.
+    Only low-speed support is considered STATIC_SUPPORT; semantically eligible
+    coherent travel may be SLIDING_SUPPORT; other fast low-foot observations
+    remain SWING.  This policy must never be used for final generated motion.
     """
     limits = thresholds or ContactStateThresholds.from_environment()
+    policy = str(support_policy).strip().lower()
+    if policy not in _SUPPORT_POLICIES:
+        raise ValueError(
+            f"support_policy must be one of {sorted(_SUPPORT_POLICIES)}, got {support_policy!r}"
+        )
+
     positions = np.asarray(joints, dtype=np.float32)
     contacts = np.asarray(declared_contacts, dtype=bool)
     if positions.ndim != 3 or positions.shape[1:] != (24, 3):
         raise ValueError(f"Expected joints [T,24,3], got {positions.shape}")
     if contacts.shape != (len(positions), 4):
         raise ValueError(f"Expected contacts [T,4], got {contacts.shape}")
+
     feet = positions[:, list(FOOT_JOINTS)]
     if height_support is None:
         floor_y = float(np.percentile(feet[..., 1], 5))
@@ -262,14 +324,27 @@ def classify_support_states_np(
             raise ValueError(
                 f"Expected height support [T,4], got {height_support.shape}"
             )
-    support = contacts | height_support
-    states = np.where(support, STATIC_SUPPORT, SWING).astype(np.uint8)
+
+    support_observation = contacts | height_support
+    foot_speed = _foot_speed_mps(feet, fps)
+
+    if policy == SUPPORT_POLICY_FINAL:
+        states = np.where(
+            support_observation, STATIC_SUPPORT, SWING
+        ).astype(np.uint8)
+    else:
+        static = support_observation & (
+            foot_speed <= float(limits.static_support_speed_mps)
+        )
+        states = np.where(static, STATIC_SUPPORT, SWING).astype(np.uint8)
+
     if sliding_support_eligible is None:
         return states
+
     eligible = np.asarray(sliding_support_eligible, dtype=bool)
     if eligible.ndim == 1:
         eligible = np.repeat(eligible[:, None], 4, axis=1)
-    if eligible.shape != support.shape:
+    if eligible.shape != support_observation.shape:
         raise ValueError(
             f"Expected sliding eligibility [T] or [T,4], got {eligible.shape}"
         )
@@ -277,7 +352,9 @@ def classify_support_states_np(
     root_xz = positions[:, 0][:, (0, 2)]
     feet_xz = feet[..., (0, 2)]
     for foot_index in range(4):
-        active = support[:, foot_index] & eligible[:, foot_index]
+        # Sliding classification uses the observation mask rather than only the
+        # static subset, otherwise a fast legitimate slide can never be found.
+        active = support_observation[:, foot_index] & eligible[:, foot_index]
         start: int | None = None
         for frame in range(len(active) + 1):
             is_active = frame < len(active) and bool(active[frame])
@@ -311,8 +388,7 @@ def classify_support_states_np(
                         and root_travel >= limits.slide_min_root_travel_m
                         and median_speed >= limits.slide_min_speed_mps
                         and direction_cos >= limits.slide_direction_cos_min
-                        and relative_span
-                        <= limits.slide_root_foot_relative_max_m
+                        and relative_span <= limits.slide_root_foot_relative_max_m
                     )
                     if is_sliding:
                         states[start:end, foot_index] = SLIDING_SUPPORT
@@ -320,20 +396,128 @@ def classify_support_states_np(
     return states
 
 
+def source_reference_kinematic_metrics_np(
+    joints: np.ndarray,
+    *,
+    fps: float,
+) -> dict[str, Any]:
+    """Kinematic reference metrics for the *recorded* pre-retarget trajectory.
+
+    The input must already be expressed in the target metric coordinate system,
+    at the target FPS, and arranged as the target 24-joint observation layout.
+    The function intentionally contains no final-generation acceptance logic;
+    it only supplies a baseline against which Retarget Clean is judged.
+    """
+    positions = np.asarray(joints, dtype=np.float64)
+    if positions.ndim != 3 or positions.shape[1:] != (24, 3):
+        raise ValueError(f"Expected source reference joints [T,24,3], got {positions.shape}")
+    if not np.isfinite(positions).all():
+        raise ValueError("source reference joints contain NaN or Inf")
+    if not np.isfinite(float(fps)) or float(fps) <= 0.0:
+        raise ValueError(f"fps must be finite and positive, got {fps!r}")
+
+    velocity = np.diff(positions, n=1, axis=0) * float(fps)
+    acceleration = np.diff(positions, n=2, axis=0) * float(fps) ** 2
+    jerk = np.diff(positions, n=3, axis=0) * float(fps) ** 3
+    jerk_norm = np.linalg.norm(jerk, axis=-1)
+    extremity_jerk = (
+        jerk_norm[:, list(EXTREMITY_JOINTS)]
+        if jerk_norm.size
+        else np.zeros((0, len(EXTREMITY_JOINTS)), dtype=np.float64)
+    )
+
+    # Source-reference foot semantics are observation-only: a low foot is
+    # considered planted only when it is also slow.  Fast low-foot sweeps are
+    # genuine motion evidence, not static support.
+    feet = positions[:, list(FOOT_JOINTS)]
+    foot_speed = _foot_speed_mps(feet.astype(np.float32), float(fps)).astype(np.float64)
+    floor_y = float(np.percentile(feet[..., 1], 5))
+    height_support = median_filter_bool_np(
+        feet[..., 1] <= floor_y + 0.055,
+        _odd_window(1.0 / 12.0, fps),
+    )
+    contact_limits = ContactStateThresholds.from_environment()
+    static_support = height_support & (
+        foot_speed <= float(contact_limits.static_support_speed_mps)
+    )
+    support_drift, support_segment_count = _support_segment_drift_values(
+        feet[..., (0, 2)], static_support
+    )
+    penetration = feet[..., 1] - floor_y
+
+    root_y = positions[:, 0, 1]
+    root_vertical_speed = (
+        np.abs(np.diff(root_y)) * float(fps)
+        if len(root_y) > 1
+        else np.zeros((0,), dtype=np.float64)
+    )
+
+    result: dict[str, Any] = {
+        "schema": SOURCE_REFERENCE_KINEMATICS_SCHEMA,
+        "frames": int(len(positions)),
+        "fps": float(fps),
+        "joint_jerk_window_p95_max_mps3": _window_percentile_max(
+            jerk_norm, fps=fps, seconds=1.0
+        ),
+        "extremity_jerk_window_p95_max_mps3": _window_percentile_max(
+            extremity_jerk, fps=fps, seconds=1.0
+        ),
+        "joint_jerk_mps3_p99": (
+            float(np.percentile(jerk_norm, 99)) if jerk_norm.size else 0.0
+        ),
+        "extremity_jerk_mps3_p99": (
+            float(np.percentile(extremity_jerk, 99))
+            if extremity_jerk.size
+            else 0.0
+        ),
+        "floor_y_m": floor_y,
+        "source_static_support_ratio": float(np.mean(static_support)),
+        "source_support_segment_count": int(support_segment_count),
+        "foot_penetration_min_m": float(np.min(penetration)),
+        "foot_penetration_p01_m": float(np.percentile(penetration, 1)),
+        "root_y_robust_range_m": (
+            float(np.percentile(root_y, 99) - np.percentile(root_y, 1))
+            if root_y.size
+            else 0.0
+        ),
+    }
+    result.update(_distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
+    result.update(_distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
+    result.update(_distribution(jerk_norm, "joint_jerk_mps3"))
+    result.update(_distribution(extremity_jerk, "extremity_jerk_mps3"))
+    result.update(_distribution(foot_speed[static_support], "foot_skate_mps"))
+    result.update(_distribution(support_drift, "foot_support_drift_m"))
+    result.update(_distribution(root_vertical_speed, "root_vertical_speed_mps"))
+    return result
+
+
 def motion_physical_metrics_np(
     motion: np.ndarray,
     *,
     fps: float,
     sliding_support_eligible: np.ndarray | None = None,
+    support_policy: str = SUPPORT_POLICY_FINAL,
 ) -> dict[str, Any]:
-    """Report FK physical metrics plus raw/temporal SO(3) rotation quality."""
+    """Report FK physical metrics plus raw/temporal SO(3) rotation quality.
+
+    The default ``support_policy`` is the strict final-generation policy for
+    backward compatibility.  Pre-training source qualification must explicitly
+    pass ``SUPPORT_POLICY_SOURCE``.
+    """
     if fps <= 0.0:
         raise ValueError("fps must be positive")
+    policy = str(support_policy).strip().lower()
+    if policy not in _SUPPORT_POLICIES:
+        raise ValueError(
+            f"support_policy must be one of {sorted(_SUPPORT_POLICIES)}, got {support_policy!r}"
+        )
+
     x = np.asarray(motion, dtype=np.float32)
     if x.ndim == 3 and x.shape[0] == 1:
         x = x[0]
     if x.ndim != 2 or x.shape[1] != MOTION_DIM:
         raise ValueError(f"Expected [T,{MOTION_DIM}], got {x.shape}")
+
     raw_rot6d = np.asarray(
         x[:, ROT6D_START:ROT6D_END].reshape(len(x), 24, 6),
         dtype=np.float64,
@@ -388,17 +572,9 @@ def motion_physical_metrics_np(
     jerk = np.diff(joints, n=3, axis=0) * float(fps) ** 3
 
     feet = joints[:, list(FOOT_JOINTS)]
-    foot_speed_mps = np.zeros(feet.shape[:2], dtype=np.float32)
-    if len(feet) > 1:
-        foot_speed_mps[1:] = (
-            np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
-            * float(fps)
-        )
+    foot_speed_mps = _foot_speed_mps(feet, fps)
     declared_contacts = safe_motion[:, CONTACT] > 0.5
     floor_y = float(np.percentile(feet[..., 1], 5))
-    # Contact auditing must not use a speed veto: doing so removes the fastest
-    # sliding samples from the very metric intended to reject them.  A low-foot
-    # support proxy is unioned with declared contact and temporally denoised.
     height_support = feet[..., 1] <= floor_y + 0.055
     height_support = median_filter_bool_np(
         height_support,
@@ -410,6 +586,7 @@ def motion_physical_metrics_np(
         fps=fps,
         sliding_support_eligible=sliding_support_eligible,
         height_support=height_support,
+        support_policy=policy,
     )
     support = support_states != SWING
     static_support = support_states == STATIC_SUPPORT
@@ -430,6 +607,7 @@ def motion_physical_metrics_np(
         ) * float(fps)
     contact_height = np.maximum(feet[..., 1] - floor_y, 0.0)[declared_contacts]
     contact_mismatch = np.logical_xor(declared_contacts, height_support)
+    foot_relative_height = feet[..., 1] - floor_y
 
     root_y = np.asarray(safe_motion[:, ROOT_Y_IDX], dtype=np.float32)
     root_xz = np.asarray(
@@ -468,28 +646,24 @@ def motion_physical_metrics_np(
         else np.zeros((0, len(EXTREMITY_JOINTS)), dtype=np.float64)
     )
 
-    def distribution(values: np.ndarray, prefix: str) -> dict[str, float]:
-        v = np.asarray(values, dtype=np.float64).reshape(-1)
-        if v.size == 0:
-            return {f"{prefix}_mean": 0.0, f"{prefix}_p95": 0.0, f"{prefix}_max": 0.0}
-        return {
-            f"{prefix}_mean": float(np.mean(v)),
-            f"{prefix}_p95": float(np.percentile(v, 95)),
-            f"{prefix}_max": float(np.max(v)),
-        }
-
     result: dict[str, Any] = {
         "schema": PHYSICAL_METRICS_SCHEMA,
         "frames": int(len(x)),
         "fps": float(fps),
         "duration_seconds": duration,
         "floor_y_m": floor_y,
-        "foot_penetration_min_m": float(np.min(feet[..., 1] - floor_y)),
+        # Keep the legacy raw minimum for the strict final gate.
+        "foot_penetration_min_m": float(np.min(foot_relative_height)),
+        # Robust source-only statistic.  The source gate uses p01 plus a much
+        # wider catastrophic raw-min guard rather than treating one toe outlier
+        # below a percentile-derived floor as a final-generation failure.
+        "foot_penetration_p01_m": float(np.percentile(foot_relative_height, 1)),
         "contact_ratio": float(np.mean(declared_contacts)),
         "foot_support_ratio": float(np.mean(support)),
         "static_support_ratio": float(np.mean(static_support)),
         "sliding_support_ratio": float(np.mean(sliding_support)),
         "support_state_contract": {
+            "policy": policy,
             "states": {
                 "swing": SWING,
                 "static_support": STATIC_SUPPORT,
@@ -497,6 +671,8 @@ def motion_physical_metrics_np(
             },
             "thresholds": asdict(ContactStateThresholds.from_environment()),
             "sliding_requires_explicit_semantic_eligibility": True,
+            "final_fail_closed_low_height_union": policy == SUPPORT_POLICY_FINAL,
+            "source_fast_low_foot_remains_swing": policy == SUPPORT_POLICY_SOURCE,
         },
         "foot_contact_mismatch_ratio": float(np.mean(contact_mismatch)),
         "foot_support_segment_count": int(support_segment_count),
@@ -558,26 +734,26 @@ def motion_physical_metrics_np(
             seconds=10.0,
         ),
     }
-    result.update(distribution(skate, "foot_skate_mps"))
+    result.update(_distribution(skate, "foot_skate_mps"))
     result.update(
-        distribution(
+        _distribution(
             sliding_relative_speed[sliding_support],
             "sliding_support_relative_speed_mps",
         )
     )
-    result.update(distribution(support_drift, "foot_support_drift_m"))
-    result.update(distribution(contact_height, "foot_contact_height_m"))
-    result.update(distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
-    result.update(distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
-    result.update(distribution(jerk_norm, "joint_jerk_mps3"))
-    result.update(distribution(extremity_jerk, "extremity_jerk_mps3"))
-    result.update(distribution(root_vertical_speed, "root_vertical_speed_mps"))
-    result.update(distribution(rotation_steps, "joint_rotation_step_rad"))
+    result.update(_distribution(support_drift, "foot_support_drift_m"))
+    result.update(_distribution(contact_height, "foot_contact_height_m"))
+    result.update(_distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
+    result.update(_distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
+    result.update(_distribution(jerk_norm, "joint_jerk_mps3"))
+    result.update(_distribution(extremity_jerk, "extremity_jerk_mps3"))
+    result.update(_distribution(root_vertical_speed, "root_vertical_speed_mps"))
+    result.update(_distribution(rotation_steps, "joint_rotation_step_rad"))
     result.update(
-        distribution(extremity_rotation_steps, "extremity_rotation_step_rad")
+        _distribution(extremity_rotation_steps, "extremity_rotation_step_rad")
     )
     result.update(
-        distribution(
+        _distribution(
             angular_acceleration_norm,
             "joint_angular_acceleration_rps2",
         )

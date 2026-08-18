@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Unified SI physical-quality contracts for motion generation and repair.
+"""Physical-quality contracts for source qualification and final generation.
 
-The module centralizes three responsibilities that previously used different
-statistics and thresholds in separate pipeline stages:
+The two contracts intentionally have different semantics:
 
-1. final whole-motion physical acceptance;
-2. transactional acceptance of Refiner/Diffusion candidates;
-3. frame-joint Peak-Jerk localization for local repair masks.
+* Final-generation contract: strict absolute SI limits and fail-closed support
+  semantics.  This protects rendered/generated motion from jitter, foot skate,
+  penetration, drift, malformed Rot6D, and rotation discontinuities.
+* Source-retarget contract: qualification of recorded motion before Event-DB
+  construction.  Authentic high-frequency dance dynamics are judged relative
+  to the aligned pre-retarget recording; fast low-foot observations are not
+  automatically treated as planted support; robust penetration statistics are
+  used together with a catastrophic-minimum guard.
 
-All jerk values use world-space FK positions and SI units (m/s^3). The hard
-maximum is the true maximum over every frame-joint pair, not a frame-wise mean
-across joints.
+Neural-stage transactional acceptance and Peak-Jerk repair masks continue to
+use the strict final-generation contract.
 """
 from __future__ import annotations
 
@@ -22,7 +25,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from contracts.gravity import fk24_np
-from motion_geometry.physical import PHYSICAL_METRICS_SCHEMA
+from motion_geometry.physical import (
+    PHYSICAL_METRICS_SCHEMA,
+    SOURCE_REFERENCE_KINEMATICS_SCHEMA,
+    SUPPORT_POLICY_SOURCE,
+)
 from motion_geometry.smpl24 import NUM_JOINTS, PARENTS
 
 
@@ -31,9 +38,10 @@ def _env_float(primary: str, fallback: Optional[str], default: float) -> float:
     if raw is None and fallback:
         raw = os.environ.get(fallback)
     try:
-        return float(default if raw is None else raw)
+        value = float(default if raw is None else raw)
     except (TypeError, ValueError):
         return float(default)
+    return value if np.isfinite(value) else float(default)
 
 
 def _env_int(primary: str, fallback: Optional[str], default: int) -> int:
@@ -57,7 +65,7 @@ def _env_bool(primary: str, fallback: Optional[str], default: bool) -> bool:
 
 @dataclass(frozen=True)
 class PhysicalQualityLimits:
-    """Absolute whole-motion limits in SI units."""
+    """Strict absolute limits for final generated motion, in SI units."""
 
     foot_skate_mps_p95: float = 0.18
     foot_skate_mps_max: float = 0.60
@@ -262,18 +270,10 @@ class PhysicalQualityLimits:
             ),
             "rot6d_nonfinite_ratio": float(self.rot6d_nonfinite_ratio),
             "rot6d_degenerate_ratio": float(self.rot6d_degenerate_ratio),
-            "rot6d_collinearity_abs_p99": float(
-                self.rot6d_collinearity_abs_p99
-            ),
-            "rotation_near_pi_step_ratio": float(
-                self.rotation_near_pi_step_ratio
-            ),
-            "joint_rotation_step_rad_p95": float(
-                self.joint_rotation_step_rad_p95
-            ),
-            "joint_rotation_step_rad_max": float(
-                self.joint_rotation_step_rad_max
-            ),
+            "rot6d_collinearity_abs_p99": float(self.rot6d_collinearity_abs_p99),
+            "rotation_near_pi_step_ratio": float(self.rotation_near_pi_step_ratio),
+            "joint_rotation_step_rad_p95": float(self.joint_rotation_step_rad_p95),
+            "joint_rotation_step_rad_max": float(self.joint_rotation_step_rad_max),
             "joint_rotation_step_window_p95_max_rad": float(
                 self.joint_rotation_step_window_p95_max_rad
             ),
@@ -295,6 +295,116 @@ class PhysicalQualityLimits:
         }
 
     def to_dict(self) -> Dict[str, float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SourcePhysicalQualityPolicy:
+    """Source-retarget acceptance policy relative to recorded motion."""
+
+    jerk_p95_ratio: float = 1.15
+    jerk_p95_margin_mps3: float = 75.0
+    jerk_max_ratio: float = 1.20
+    jerk_max_margin_mps3: float = 250.0
+    jerk_window_ratio: float = 1.20
+    jerk_window_margin_mps3: float = 100.0
+    extremity_jerk_p95_ratio: float = 1.15
+    extremity_jerk_p95_margin_mps3: float = 75.0
+    extremity_jerk_window_ratio: float = 1.20
+    extremity_jerk_window_margin_mps3: float = 150.0
+    foot_drift_p95_ratio: float = 1.25
+    foot_drift_p95_margin_m: float = 0.03
+    foot_drift_max_ratio: float = 1.35
+    foot_drift_max_margin_m: float = 0.08
+    foot_contact_height_m_max: float = 0.10
+    foot_penetration_p01_margin_m: float = 0.04
+    foot_penetration_p01_floor_m: float = -0.10
+    foot_penetration_catastrophic_min_m: float = -0.18
+    root_range_ratio: float = 1.20
+    root_range_margin_m: float = 0.08
+    root_vertical_speed_p95_ratio: float = 1.20
+    root_vertical_speed_p95_margin_mps: float = 0.15
+    root_vertical_speed_max_ratio: float = 1.25
+    root_vertical_speed_max_margin_mps: float = 0.40
+    frame_count_tolerance: int = 1
+
+    @classmethod
+    def from_environment(cls) -> "SourcePhysicalQualityPolicy":
+        return cls(
+            jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_JERK_P95_RATIO", None, 1.15),
+            jerk_p95_margin_mps3=_env_float(
+                "SOURCE_PHYSICAL_JERK_P95_MARGIN_MPS3", None, 75.0
+            ),
+            jerk_max_ratio=_env_float("SOURCE_PHYSICAL_JERK_MAX_RATIO", None, 1.20),
+            jerk_max_margin_mps3=_env_float(
+                "SOURCE_PHYSICAL_JERK_MAX_MARGIN_MPS3", None, 250.0
+            ),
+            jerk_window_ratio=_env_float(
+                "SOURCE_PHYSICAL_JERK_WINDOW_RATIO", None, 1.20
+            ),
+            jerk_window_margin_mps3=_env_float(
+                "SOURCE_PHYSICAL_JERK_WINDOW_MARGIN_MPS3", None, 100.0
+            ),
+            extremity_jerk_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_EXTREMITY_JERK_P95_RATIO", None, 1.15
+            ),
+            extremity_jerk_p95_margin_mps3=_env_float(
+                "SOURCE_PHYSICAL_EXTREMITY_JERK_P95_MARGIN_MPS3", None, 75.0
+            ),
+            extremity_jerk_window_ratio=_env_float(
+                "SOURCE_PHYSICAL_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20
+            ),
+            extremity_jerk_window_margin_mps3=_env_float(
+                "SOURCE_PHYSICAL_EXTREMITY_JERK_WINDOW_MARGIN_MPS3", None, 150.0
+            ),
+            foot_drift_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25
+            ),
+            foot_drift_p95_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03
+            ),
+            foot_drift_max_ratio=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35
+            ),
+            foot_drift_max_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08
+            ),
+            foot_contact_height_m_max=_env_float(
+                "SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10
+            ),
+            foot_penetration_p01_margin_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04
+            ),
+            foot_penetration_p01_floor_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10
+            ),
+            foot_penetration_catastrophic_min_m=_env_float(
+                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18
+            ),
+            root_range_ratio=_env_float(
+                "SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20
+            ),
+            root_range_margin_m=_env_float(
+                "SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08
+            ),
+            root_vertical_speed_p95_ratio=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20
+            ),
+            root_vertical_speed_p95_margin_mps=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15
+            ),
+            root_vertical_speed_max_ratio=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25
+            ),
+            root_vertical_speed_max_margin_mps=_env_float(
+                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40
+            ),
+            frame_count_tolerance=_env_int(
+                "SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
@@ -328,36 +438,26 @@ class StageAcceptancePolicy:
     @classmethod
     def from_environment(cls) -> "StageAcceptancePolicy":
         return cls(
-            jerk_max_ratio=_env_float(
-                "PHYSICAL_STAGE_JERK_MAX_RATIO", None, 1.02
-            ),
+            jerk_max_ratio=_env_float("PHYSICAL_STAGE_JERK_MAX_RATIO", None, 1.02),
             jerk_max_margin_mps3=_env_float(
                 "PHYSICAL_STAGE_JERK_MAX_MARGIN_MPS3", None, 40.0
             ),
-            jerk_p95_ratio=_env_float(
-                "PHYSICAL_STAGE_JERK_P95_RATIO", None, 1.10
-            ),
+            jerk_p95_ratio=_env_float("PHYSICAL_STAGE_JERK_P95_RATIO", None, 1.10),
             jerk_p95_margin_mps3=_env_float(
                 "PHYSICAL_STAGE_JERK_P95_MARGIN_MPS3", None, 25.0
             ),
-            skate_p95_ratio=_env_float(
-                "PHYSICAL_STAGE_SKATE_P95_RATIO", None, 1.10
-            ),
+            skate_p95_ratio=_env_float("PHYSICAL_STAGE_SKATE_P95_RATIO", None, 1.10),
             skate_p95_margin_mps=_env_float(
                 "PHYSICAL_STAGE_SKATE_P95_MARGIN_MPS", None, 0.01
             ),
-            skate_max_ratio=_env_float(
-                "PHYSICAL_STAGE_SKATE_MAX_RATIO", None, 1.10
-            ),
+            skate_max_ratio=_env_float("PHYSICAL_STAGE_SKATE_MAX_RATIO", None, 1.10),
             skate_max_margin_mps=_env_float(
                 "PHYSICAL_STAGE_SKATE_MAX_MARGIN_MPS", None, 0.03
             ),
             penetration_margin_m=_env_float(
                 "PHYSICAL_STAGE_PENETRATION_MARGIN_M", None, 0.012
             ),
-            root_range_ratio=_env_float(
-                "PHYSICAL_STAGE_ROOT_RANGE_RATIO", None, 1.10
-            ),
+            root_range_ratio=_env_float("PHYSICAL_STAGE_ROOT_RANGE_RATIO", None, 1.10),
             root_range_margin_m=_env_float(
                 "PHYSICAL_STAGE_ROOT_RANGE_MARGIN_M", None, 0.02
             ),
@@ -370,12 +470,8 @@ class StageAcceptancePolicy:
             root_vertical_speed_max_margin_mps=_env_float(
                 "PHYSICAL_STAGE_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.10
             ),
-            secondary_metric_ratio=_env_float(
-                "PHYSICAL_STAGE_SECONDARY_RATIO", None, 1.10
-            ),
-            root_drift_ratio=_env_float(
-                "PHYSICAL_STAGE_ROOT_DRIFT_RATIO", None, 1.10
-            ),
+            secondary_metric_ratio=_env_float("PHYSICAL_STAGE_SECONDARY_RATIO", None, 1.10),
+            root_drift_ratio=_env_float("PHYSICAL_STAGE_ROOT_DRIFT_RATIO", None, 1.10),
             root_drift_margin_m=_env_float(
                 "PHYSICAL_STAGE_ROOT_DRIFT_MARGIN_M", None, 0.02
             ),
@@ -399,7 +495,7 @@ class StageAcceptancePolicy:
 
 @dataclass(frozen=True)
 class PhysicalMetricSpec:
-    """One required metric shared by final and stage acceptance."""
+    """One required metric shared by final and neural-stage acceptance."""
 
     key: str
     layer: str
@@ -414,7 +510,11 @@ def physical_metric_specs(
     limits: PhysicalQualityLimits,
     policy: Optional[StageAcceptancePolicy] = None,
 ) -> Tuple[PhysicalMetricSpec, ...]:
-    """Return the single metric registry used by every physical gate."""
+    """Return the strict final/stage metric registry.
+
+    Source qualification deliberately does not consume this registry wholesale;
+    it has a separate reference-relative contract below.
+    """
 
     pol = policy or StageAcceptancePolicy.from_environment()
 
@@ -483,6 +583,98 @@ def _required_metric(
     return bool(np.isfinite(value)), value
 
 
+def _append_required_high(
+    reasons: list[str],
+    detail: Dict[str, Any],
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    key: str,
+    ratio: float,
+    margin: float,
+    reason: str,
+) -> None:
+    ref_ok, ref = _required_metric(reference, key)
+    cand_ok, cand = _required_metric(candidate, key)
+    if not ref_ok:
+        reasons.append(f"reference_missing_or_nonfinite:{key}")
+        return
+    if not cand_ok:
+        reasons.append(f"candidate_missing_or_nonfinite:{key}")
+        return
+    allowed = ref * float(ratio) + float(margin)
+    detail[key] = {
+        "reference": float(ref),
+        "candidate": float(cand),
+        "ratio": float(ratio),
+        "margin": float(margin),
+        "allowed": float(allowed),
+    }
+    if cand > allowed:
+        reasons.append(reason)
+
+
+def _append_required_low_relative(
+    reasons: list[str],
+    detail: Dict[str, Any],
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    key: str,
+    margin: float,
+    absolute_floor: float,
+    reason: str,
+) -> None:
+    ref_ok, ref = _required_metric(reference, key)
+    cand_ok, cand = _required_metric(candidate, key)
+    if not ref_ok:
+        reasons.append(f"reference_missing_or_nonfinite:{key}")
+        return
+    if not cand_ok:
+        reasons.append(f"candidate_missing_or_nonfinite:{key}")
+        return
+    allowed = max(float(absolute_floor), float(ref) - float(margin))
+    detail[key] = {
+        "reference": float(ref),
+        "candidate": float(cand),
+        "margin": float(margin),
+        "absolute_floor": float(absolute_floor),
+        "allowed_minimum": float(allowed),
+    }
+    if cand < allowed:
+        reasons.append(reason)
+
+
+def _append_required_low_absolute(
+    reasons: list[str],
+    audit: Mapping[str, Any],
+    *,
+    key: str,
+    minimum: float,
+    reason: str,
+) -> None:
+    finite, value = _required_metric(audit, key)
+    if not finite:
+        reasons.append(f"missing_or_nonfinite:{key}")
+    elif value < float(minimum):
+        reasons.append(reason)
+
+
+def _append_required_high_absolute(
+    reasons: list[str],
+    audit: Mapping[str, Any],
+    *,
+    key: str,
+    maximum: float,
+    reason: str,
+) -> None:
+    finite, value = _required_metric(audit, key)
+    if not finite:
+        reasons.append(f"missing_or_nonfinite:{key}")
+    elif value > float(maximum):
+        reasons.append(reason)
+
+
 @dataclass(frozen=True)
 class PeakJerkMaskConfig:
     """Configuration for localized frame-joint Peak-Jerk repair masks."""
@@ -496,21 +688,15 @@ class PeakJerkMaskConfig:
     @classmethod
     def from_environment(cls) -> "PeakJerkMaskConfig":
         return cls(
-            enabled=_env_bool(
-                "PHYSICAL_PEAK_JERK_MASK_ENABLE", None, True
-            ),
+            enabled=_env_bool("PHYSICAL_PEAK_JERK_MASK_ENABLE", None, True),
             absolute_threshold_mps3=_env_float(
                 "PHYSICAL_PEAK_JERK_THRESHOLD_MPS3", None, 1400.0
             ),
-            percentile=_env_float(
-                "PHYSICAL_PEAK_JERK_PERCENTILE", None, 99.5
-            ),
+            percentile=_env_float("PHYSICAL_PEAK_JERK_PERCENTILE", None, 99.5),
             radius_frames_at_30fps=_env_int(
                 "PHYSICAL_PEAK_JERK_RADIUS_FRAMES", None, 4
             ),
-            parent_depth=_env_int(
-                "PHYSICAL_PEAK_JERK_PARENT_DEPTH", None, 2
-            ),
+            parent_depth=_env_int("PHYSICAL_PEAK_JERK_PARENT_DEPTH", None, 2),
         )
 
 
@@ -577,7 +763,7 @@ def evaluate_physical_audit(
     audit: Mapping[str, Any],
     limits: Optional[PhysicalQualityLimits] = None,
 ) -> Dict[str, Any]:
-    """Apply the single authoritative whole-motion physical gate."""
+    """Apply the strict final-generation whole-motion physical gate."""
 
     lim = limits or PhysicalQualityLimits.from_environment()
     limit_map = lim.as_audit_limits()
@@ -608,20 +794,21 @@ def evaluate_physical_audit(
         elif spec.direction == "low" and value < spec.absolute_limit:
             layer_reasons[spec.layer].append(f"{spec.key}_too_low")
 
+    layer_order = (
+        "contract",
+        "anti_jitter",
+        "foot_contact",
+        "root_vertical",
+        "long_horizon_root_drift",
+        "rotation_quality",
+    )
     reasons = [
-        reason
-        for layer in (
-            "contract",
-            "anti_jitter",
-            "foot_contact",
-            "root_vertical",
-            "long_horizon_root_drift",
-            "rotation_quality",
-        )
-        for reason in layer_reasons[layer]
+        reason for layer in layer_order for reason in layer_reasons[layer]
     ]
 
     return {
+        "schema": "final_generation_physical_gate_v1",
+        "contract_role": "final_generation",
         "ok": not reasons,
         "reasons": reasons,
         "limits": limit_map,
@@ -633,16 +820,233 @@ def evaluate_physical_audit(
     }
 
 
+def _evaluate_source_reference_relative(
+    audit: Mapping[str, Any],
+    source_reference_audit: Mapping[str, Any],
+    *,
+    final_limits: PhysicalQualityLimits,
+    policy: SourcePhysicalQualityPolicy,
+) -> Dict[str, Any]:
+    layer_reasons: Dict[str, list[str]] = {
+        "contract": [],
+        "anti_jitter": [],
+        "foot_contact": [],
+        "root_vertical": [],
+        "rotation_quality": [],
+    }
+    relative_checks: Dict[str, Any] = {}
+
+    if str(audit.get("schema", "")) != PHYSICAL_METRICS_SCHEMA:
+        layer_reasons["contract"].append(
+            f"missing_or_invalid_schema:{audit.get('schema', 'missing')}"
+        )
+    support_contract = audit.get("support_state_contract")
+    support_policy = (
+        str(support_contract.get("policy", ""))
+        if isinstance(support_contract, Mapping)
+        else ""
+    )
+    if support_policy != SUPPORT_POLICY_SOURCE:
+        layer_reasons["contract"].append(
+            f"source_support_policy_required:{support_policy or 'missing'}"
+        )
+
+    if str(source_reference_audit.get("schema", "")) != SOURCE_REFERENCE_KINEMATICS_SCHEMA:
+        layer_reasons["contract"].append(
+            "missing_or_invalid_source_reference_schema"
+        )
+
+    cand_fps_ok, cand_fps = _required_metric(audit, "fps")
+    ref_fps_ok, ref_fps = _required_metric(source_reference_audit, "fps")
+    if not cand_fps_ok or not ref_fps_ok or abs(cand_fps - ref_fps) > 1.0e-6:
+        layer_reasons["contract"].append("source_reference_fps_mismatch")
+
+    try:
+        cand_frames = int(audit.get("frames"))
+        ref_frames = int(source_reference_audit.get("frames"))
+        if abs(cand_frames - ref_frames) > int(policy.frame_count_tolerance):
+            layer_reasons["contract"].append("source_reference_frame_count_mismatch")
+    except (TypeError, ValueError):
+        layer_reasons["contract"].append("missing_source_reference_frame_count")
+
+    anti = layer_reasons["anti_jitter"]
+    _append_required_high(
+        anti, relative_checks, audit, source_reference_audit,
+        key="joint_jerk_mps3_p95",
+        ratio=policy.jerk_p95_ratio,
+        margin=policy.jerk_p95_margin_mps3,
+        reason="joint_jerk_p95_regressed_vs_source",
+    )
+    _append_required_high(
+        anti, relative_checks, audit, source_reference_audit,
+        key="joint_jerk_mps3_max",
+        ratio=policy.jerk_max_ratio,
+        margin=policy.jerk_max_margin_mps3,
+        reason="joint_jerk_max_regressed_vs_source",
+    )
+    _append_required_high(
+        anti, relative_checks, audit, source_reference_audit,
+        key="joint_jerk_window_p95_max_mps3",
+        ratio=policy.jerk_window_ratio,
+        margin=policy.jerk_window_margin_mps3,
+        reason="joint_jerk_window_regressed_vs_source",
+    )
+    _append_required_high(
+        anti, relative_checks, audit, source_reference_audit,
+        key="extremity_jerk_mps3_p95",
+        ratio=policy.extremity_jerk_p95_ratio,
+        margin=policy.extremity_jerk_p95_margin_mps3,
+        reason="extremity_jerk_p95_regressed_vs_source",
+    )
+    _append_required_high(
+        anti, relative_checks, audit, source_reference_audit,
+        key="extremity_jerk_window_p95_max_mps3",
+        ratio=policy.extremity_jerk_window_ratio,
+        margin=policy.extremity_jerk_window_margin_mps3,
+        reason="extremity_jerk_window_regressed_vs_source",
+    )
+
+    foot = layer_reasons["foot_contact"]
+    # Under source_observation, STATIC_SUPPORT is already speed-capped at the
+    # contact-state static threshold.  Do not apply final-generation skate
+    # maxima to authentic low-foot swing/slide observations.
+    _append_required_high(
+        foot, relative_checks, audit, source_reference_audit,
+        key="foot_support_drift_m_p95",
+        ratio=policy.foot_drift_p95_ratio,
+        margin=policy.foot_drift_p95_margin_m,
+        reason="foot_support_drift_p95_regressed_vs_source",
+    )
+    _append_required_high(
+        foot, relative_checks, audit, source_reference_audit,
+        key="foot_support_drift_m_max",
+        ratio=policy.foot_drift_max_ratio,
+        margin=policy.foot_drift_max_margin_m,
+        reason="foot_support_drift_max_regressed_vs_source",
+    )
+    _append_required_high_absolute(
+        foot,
+        audit,
+        key="foot_contact_height_m_max",
+        maximum=policy.foot_contact_height_m_max,
+        reason="foot_contact_height_m_max_too_high",
+    )
+    _append_required_low_relative(
+        foot,
+        relative_checks,
+        audit,
+        source_reference_audit,
+        key="foot_penetration_p01_m",
+        margin=policy.foot_penetration_p01_margin_m,
+        absolute_floor=policy.foot_penetration_p01_floor_m,
+        reason="foot_penetration_p01_regressed_vs_source",
+    )
+    _append_required_low_absolute(
+        foot,
+        audit,
+        key="foot_penetration_min_m",
+        minimum=policy.foot_penetration_catastrophic_min_m,
+        reason="foot_penetration_catastrophic_min_too_low",
+    )
+
+    root = layer_reasons["root_vertical"]
+    _append_required_high(
+        root, relative_checks, audit, source_reference_audit,
+        key="root_y_robust_range_m",
+        ratio=policy.root_range_ratio,
+        margin=policy.root_range_margin_m,
+        reason="root_y_robust_range_regressed_vs_source",
+    )
+    _append_required_high(
+        root, relative_checks, audit, source_reference_audit,
+        key="root_vertical_speed_mps_p95",
+        ratio=policy.root_vertical_speed_p95_ratio,
+        margin=policy.root_vertical_speed_p95_margin_mps,
+        reason="root_vertical_speed_p95_regressed_vs_source",
+    )
+    _append_required_high(
+        root, relative_checks, audit, source_reference_audit,
+        key="root_vertical_speed_mps_max",
+        ratio=policy.root_vertical_speed_max_ratio,
+        margin=policy.root_vertical_speed_max_margin_mps,
+        reason="root_vertical_speed_max_regressed_vs_source",
+    )
+
+    # Rotation representation integrity is not expressive-style filtering and
+    # remains an absolute source-safety requirement.
+    rotation = layer_reasons["rotation_quality"]
+    for spec in physical_metric_specs(final_limits):
+        if spec.layer != "rotation_quality":
+            continue
+        finite, value = _required_metric(audit, spec.key)
+        if not finite:
+            rotation.append(f"missing_or_nonfinite:{spec.key}")
+        elif spec.direction == "high" and value > spec.absolute_limit:
+            rotation.append(f"{spec.key}_too_high")
+        elif spec.direction == "low" and value < spec.absolute_limit:
+            rotation.append(f"{spec.key}_too_low")
+
+    layer_order = (
+        "contract",
+        "anti_jitter",
+        "foot_contact",
+        "root_vertical",
+        "rotation_quality",
+    )
+    reasons = [
+        reason for layer in layer_order for reason in layer_reasons[layer]
+    ]
+    reasons = list(dict.fromkeys(reasons))
+
+    return {
+        "schema": "source_physical_clean_gate_v2_reference_relative",
+        "contract_role": "pretraining_source_retarget",
+        "mode": "reference_relative_source_contract",
+        "ok": not reasons,
+        "reasons": reasons,
+        "excluded_final_only_layers": [
+            "long_horizon_root_drift",
+            "absolute_final_anti_jitter",
+            "final_fail_closed_foot_skate",
+        ],
+        "source_policy": policy.to_dict(),
+        "final_rotation_integrity_limits": final_limits.as_audit_limits(),
+        "relative_checks": relative_checks,
+        "audit": dict(audit),
+        "source_reference_audit": dict(source_reference_audit),
+        "layers": {
+            name: {"ok": not values, "reasons": list(values)}
+            for name, values in layer_reasons.items()
+        },
+    }
+
+
 def evaluate_source_physical_clean_audit(
     audit: Mapping[str, Any],
     limits: Optional[PhysicalQualityLimits] = None,
+    *,
+    source_reference_audit: Optional[Mapping[str, Any]] = None,
+    policy: Optional[SourcePhysicalQualityPolicy] = None,
 ) -> Dict[str, Any]:
-    """Fail-closed pre-training clean gate for full source recordings.
+    """Fail-closed pre-training gate, distinct from final-generation quality.
 
-    Intentional source travel is allowed, so long-horizon root displacement is
-    not a source-cleanliness failure. All remaining layers use the exact same
-    metric registry and thresholds as final output.
+    Formal Retarget Clean callers should provide ``source_reference_audit``
+    computed from aligned/resampled pre-retarget recorded keypoints.  In that
+    mode authentic dynamics are preserved and only *regression versus source*
+    is rejected.  A legacy fallback is retained for older external callers that
+    do not yet supply a reference; the formal cache builder never uses it.
     """
+
+    if source_reference_audit is not None:
+        return _evaluate_source_reference_relative(
+            audit,
+            source_reference_audit,
+            final_limits=limits or PhysicalQualityLimits.from_environment(),
+            policy=policy or SourcePhysicalQualityPolicy.from_environment(),
+        )
+
+    # Backward-compatible legacy mode.  This is intentionally marked so formal
+    # pipeline reports can reject/identify it if desired.
     full = evaluate_physical_audit(audit, limits=limits)
     required_layers = (
         "contract",
@@ -651,17 +1055,14 @@ def evaluate_source_physical_clean_audit(
         "root_vertical",
         "rotation_quality",
     )
-    layers = {
-        name: dict(full["layers"][name])
-        for name in required_layers
-    }
+    layers = {name: dict(full["layers"][name]) for name in required_layers}
     reasons = [
-        reason
-        for name in required_layers
-        for reason in layers[name]["reasons"]
+        reason for name in required_layers for reason in layers[name]["reasons"]
     ]
     return {
-        "schema": "source_physical_clean_gate_v1",
+        "schema": "source_physical_clean_gate_v1_legacy_absolute",
+        "contract_role": "pretraining_source_retarget",
+        "mode": "legacy_absolute_no_source_reference",
         "ok": not reasons,
         "reasons": reasons,
         "excluded_final_only_layers": ["long_horizon_root_drift"],
@@ -679,9 +1080,6 @@ def _allowed_after_stage(
 ) -> float:
     if before <= absolute_limit:
         return min(absolute_limit, before * ratio + margin)
-    # A stage may incrementally repair an already-invalid input, but it must
-    # never make that metric worse.  The previous `before * ratio` branch
-    # silently allowed up to 10% additional degradation on a failing baseline.
     return before
 
 
@@ -692,8 +1090,6 @@ def _minimum_after_stage(
 ) -> float:
     if before >= absolute_limit:
         return max(absolute_limit, before - margin)
-    # Symmetric fail-safe rule for lower-bounded metrics such as penetration:
-    # incremental improvement is valid, further degradation is not.
     return before
 
 
@@ -705,17 +1101,14 @@ def evaluate_stage_candidate(
     policy: Optional[StageAcceptancePolicy] = None,
     require_repair_gain: bool = False,
 ) -> Dict[str, Any]:
-    """Evaluate a neural-stage candidate against absolute and relative safety."""
+    """Evaluate a neural-stage candidate against strict final safety."""
 
     lim = limits or PhysicalQualityLimits.from_environment()
     pol = policy or StageAcceptancePolicy.from_environment()
-    reasons = []
+    reasons: list[str] = []
     detail: Dict[str, float] = {}
 
-    for label, audit in (
-        ("before", before_audit),
-        ("candidate", candidate_audit),
-    ):
+    for label, audit in (("before", before_audit), ("candidate", candidate_audit)):
         schema = str(audit.get("schema", ""))
         if schema != PHYSICAL_METRICS_SCHEMA:
             reasons.append(f"{label}_missing_or_invalid_schema")
@@ -772,7 +1165,6 @@ def evaluate_stage_candidate(
         if repair_gain < pol.minimum_repair_gain:
             reasons.append("no_meaningful_repair_gain")
 
-    # Preserve reason order while removing duplicates.
     reasons = list(dict.fromkeys(reasons))
     return {
         "accepted": not reasons,
@@ -905,7 +1297,7 @@ def build_peak_jerk_risk_mask(
     config: Optional[PeakJerkMaskConfig] = None,
     parents: Sequence[int] = PARENTS,
 ) -> Dict[str, Any]:
-    """Build localized frame-joint masks from true world-space Peak Jerk."""
+    """Build localized frame-joint masks from strict world-space Peak Jerk."""
 
     cfg = config or PeakJerkMaskConfig.from_environment()
     x = np.asarray(motion, dtype=np.float32)
@@ -949,7 +1341,6 @@ def build_peak_jerk_risk_mask(
     for derivative_frame, joint_id in np.argwhere(risky):
         derivative_frame = int(derivative_frame)
         joint_id = int(joint_id)
-        # A third-order difference at k depends on original frames k..k+3.
         start = max(0, derivative_frame - radius)
         end = min(frames, derivative_frame + 4 + radius)
         chain_joint = joint_id
@@ -960,14 +1351,9 @@ def build_peak_jerk_risk_mask(
             chain_joint = int(parents[chain_joint])
         frame_mask[start:end] = 1.0
 
-    # Root translation is editable only when the pelvis/root chain is implicated.
     root_mask = joint_mask[:, 0].copy()
-    # A foot/ankle Peak-Jerk repair must update the contact state in the same
-    # ownership window.  Leaving contact frozen while editing the planted lower
-    # chain creates an internally inconsistent repair target.
     contact_mask = np.max(
-        joint_mask[:, [7, 8, 10, 11]],
-        axis=1,
+        joint_mask[:, [7, 8, 10, 11]], axis=1
     ).astype(np.float32)
 
     peak_values = jerk_norm[risky]
@@ -999,7 +1385,7 @@ def build_repair_mask(
     fps: float,
     config: Optional[PeakJerkMaskConfig] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Union the original seam mask with the localized core Peak-Jerk mask."""
+    """Union the original seam mask with the localized Peak-Jerk mask."""
 
     x = np.asarray(motion, dtype=np.float32)
     seam = np.asarray(seam_mask, dtype=np.float32)
