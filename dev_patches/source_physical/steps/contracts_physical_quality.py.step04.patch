@@ -1,0 +1,190 @@
+--- a/contracts/physical_quality.py
++++ b/contracts/physical_quality.py
+@@ -1128,45 +1128,163 @@
+     # fields and all raw SI jerk values stay diagnostic here.  The final gate
+     # continues to use the unchanged world-space m/s^3 contract.
+     anti = layer_reasons["anti_jitter"]
+-    normalized_specs = (
+-        ("body_normalized_joint_jerk_s3_p95", policy.normalized_jerk_p95_ratio, policy.normalized_jerk_p95_margin_s3, "body_normalized_joint_jerk_p95_regressed_vs_source"),
+-        ("body_normalized_joint_jerk_s3_p99", policy.normalized_jerk_p99_ratio, policy.normalized_jerk_p99_margin_s3, "body_normalized_joint_jerk_p99_regressed_vs_source"),
+-        ("body_normalized_joint_jerk_window_p95_max_s3", policy.normalized_jerk_window_ratio, policy.normalized_jerk_window_margin_s3, "body_normalized_joint_jerk_window_regressed_vs_source"),
+-        ("body_normalized_extremity_jerk_s3_p95", policy.normalized_extremity_jerk_p95_ratio, policy.normalized_extremity_jerk_p95_margin_s3, "body_normalized_extremity_jerk_p95_regressed_vs_source"),
+-        ("body_normalized_extremity_jerk_s3_p99", policy.normalized_extremity_jerk_p99_ratio, policy.normalized_extremity_jerk_p99_margin_s3, "body_normalized_extremity_jerk_p99_regressed_vs_source"),
+-        ("body_normalized_extremity_jerk_window_p95_max_s3", policy.normalized_extremity_jerk_window_ratio, policy.normalized_extremity_jerk_window_margin_s3, "body_normalized_extremity_jerk_window_regressed_vs_source"),
++    unit_bone_specs = (
++        (
++            "unit_bone_joint_jerk_s3_p95",
++            policy.unit_bone_jerk_p95_ratio,
++            policy.unit_bone_jerk_p95_margin_s3,
++            policy.unit_bone_jerk_p95_floor_s3,
++            "unit_bone_joint_jerk_p95_regressed_vs_source",
++        ),
++        (
++            "unit_bone_joint_jerk_s3_p99",
++            policy.unit_bone_jerk_p99_ratio,
++            policy.unit_bone_jerk_p99_margin_s3,
++            policy.unit_bone_jerk_p99_floor_s3,
++            "unit_bone_joint_jerk_p99_regressed_vs_source",
++        ),
++        (
++            "unit_bone_joint_jerk_window_p95_max_s3",
++            policy.unit_bone_jerk_window_ratio,
++            policy.unit_bone_jerk_window_margin_s3,
++            policy.unit_bone_jerk_window_floor_s3,
++            "unit_bone_joint_jerk_window_regressed_vs_source",
++        ),
++        (
++            "unit_bone_extremity_jerk_s3_p95",
++            policy.unit_bone_extremity_jerk_p95_ratio,
++            policy.unit_bone_extremity_jerk_p95_margin_s3,
++            policy.unit_bone_extremity_jerk_p95_floor_s3,
++            "unit_bone_extremity_jerk_p95_regressed_vs_source",
++        ),
++        (
++            "unit_bone_extremity_jerk_s3_p99",
++            policy.unit_bone_extremity_jerk_p99_ratio,
++            policy.unit_bone_extremity_jerk_p99_margin_s3,
++            policy.unit_bone_extremity_jerk_p99_floor_s3,
++            "unit_bone_extremity_jerk_p99_regressed_vs_source",
++        ),
++        (
++            "unit_bone_extremity_jerk_window_p95_max_s3",
++            policy.unit_bone_extremity_jerk_window_ratio,
++            policy.unit_bone_extremity_jerk_window_margin_s3,
++            policy.unit_bone_extremity_jerk_window_floor_s3,
++            "unit_bone_extremity_jerk_window_regressed_vs_source",
++        ),
+     )
+-    for key, ratio, margin, reason in normalized_specs:
+-        _append_required_high(anti, relative_checks, audit, source_reference_audit, key=key, ratio=ratio, margin=margin, reason=reason)
++    for key, ratio, margin, source_floor, reason in unit_bone_specs:
++        _append_required_high_with_source_floor(
++            anti,
++            relative_checks,
++            audit,
++            source_reference_audit,
++            key=key,
++            ratio=ratio,
++            margin=margin,
++            source_only_noise_floor=source_floor,
++            reason=reason,
++        )
+ 
+     foot = layer_reasons["foot_contact"]
+-    _append_required_high(foot, relative_checks, audit, source_reference_audit, key="foot_support_drift_m_p95", ratio=policy.foot_drift_p95_ratio, margin=policy.foot_drift_p95_margin_m, reason="foot_support_drift_p95_regressed_vs_source")
+-    _append_required_high(foot, relative_checks, audit, source_reference_audit, key="foot_support_drift_m_max", ratio=policy.foot_drift_max_ratio, margin=policy.foot_drift_max_margin_m, reason="foot_support_drift_max_regressed_vs_source")
+-    _append_required_high_absolute(foot, audit, key="foot_contact_height_m_max", maximum=policy.foot_contact_height_m_max, reason="foot_contact_height_m_max_too_high")
+-    _append_required_low_relative(foot, relative_checks, audit, source_reference_audit, key="foot_penetration_p01_m", margin=policy.foot_penetration_p01_margin_m, absolute_floor=policy.foot_penetration_p01_floor_m, reason="foot_penetration_p01_regressed_vs_source")
+-    _append_required_low_relative(foot, relative_checks, audit, source_reference_audit, key="foot_penetration_p001_m", margin=policy.foot_penetration_p001_margin_m, absolute_floor=policy.foot_penetration_p001_floor_m, reason="foot_penetration_p001_regressed_vs_source")
+-    threshold_ok, observed_threshold = _required_metric(audit, "foot_penetration_catastrophic_threshold_m")
+-    if not threshold_ok or abs(observed_threshold - float(policy.foot_penetration_catastrophic_threshold_m)) > 1.0e-9:
+-        layer_reasons["contract"].append("source_penetration_catastrophic_threshold_mismatch")
+-    finite, run_seconds = _required_metric(audit, "foot_penetration_catastrophic_run_max_seconds")
++    _append_required_high(
++        foot, relative_checks, audit, source_reference_audit,
++        key="foot_support_drift_m_p95",
++        ratio=policy.foot_drift_p95_ratio,
++        margin=policy.foot_drift_p95_margin_m,
++        reason="foot_support_drift_p95_regressed_vs_source",
++    )
++    _append_required_high(
++        foot, relative_checks, audit, source_reference_audit,
++        key="foot_support_drift_m_max",
++        ratio=policy.foot_drift_max_ratio,
++        margin=policy.foot_drift_max_margin_m,
++        reason="foot_support_drift_max_regressed_vs_source",
++    )
++    _append_required_high_absolute(
++        foot, audit, key="foot_contact_height_m_max",
++        maximum=policy.foot_contact_height_m_max,
++        reason="foot_contact_height_m_max_too_high",
++    )
++
++    # Keep the V2.1 p01 rule.  Only p0.1% changes semantics in V2.2.
++    _append_required_low_relative(
++        foot, relative_checks, audit, source_reference_audit,
++        key="foot_penetration_p01_m",
++        margin=policy.foot_penetration_p01_margin_m,
++        absolute_floor=policy.foot_penetration_p01_floor_m,
++        reason="foot_penetration_p01_regressed_vs_source",
++    )
++    _append_required_low_relative_reference_aware_floor(
++        foot, relative_checks, audit, source_reference_audit,
++        key="foot_penetration_p001_m",
++        margin=policy.foot_penetration_p001_margin_m,
++        absolute_floor=policy.foot_penetration_p001_floor_m,
++        comparison_epsilon=policy.foot_penetration_p001_comparison_epsilon_m,
++        reason="foot_penetration_p001_regressed_vs_source",
++    )
++
++    # Sustained catastrophic penetration is an independent hard source gate.
++    # It is evaluated regardless of whether p0.1% improved versus a degraded
++    # reference; a single raw minimum is diagnostic only.
++    threshold_ok, observed_threshold = _required_metric(
++        audit, "foot_penetration_catastrophic_threshold_m"
++    )
++    if (
++        not threshold_ok
++        or abs(
++            observed_threshold
++            - float(policy.foot_penetration_catastrophic_threshold_m)
++        )
++        > 1.0e-9
++    ):
++        layer_reasons["contract"].append(
++            "source_penetration_catastrophic_threshold_mismatch"
++        )
++    finite, run_seconds = _required_metric(
++        audit, "foot_penetration_catastrophic_run_max_seconds"
++    )
+     if not finite:
+-        foot.append("missing_or_nonfinite:foot_penetration_catastrophic_run_max_seconds")
++        foot.append(
++            "missing_or_nonfinite:foot_penetration_catastrophic_run_max_seconds"
++        )
+     elif run_seconds > float(policy.foot_penetration_catastrophic_max_seconds):
+         foot.append("foot_penetration_sustained_catastrophic")
+     relative_checks["foot_penetration_sustained_catastrophic"] = {
++        "independent_hard_gate": True,
+         "threshold_m": float(policy.foot_penetration_catastrophic_threshold_m),
+         "candidate_run_max_seconds": run_seconds,
+-        "allowed_max_seconds": float(policy.foot_penetration_catastrophic_max_seconds),
++        "allowed_max_seconds": float(
++            policy.foot_penetration_catastrophic_max_seconds
++        ),
+         "raw_min_diagnostic_only_m": audit.get("foot_penetration_min_m"),
+     }
+ 
+     root = layer_reasons["root_vertical"]
+-    _append_required_high(root, relative_checks, audit, source_reference_audit, key="root_y_robust_range_m", ratio=policy.root_range_ratio, margin=policy.root_range_margin_m, reason="root_y_robust_range_regressed_vs_source")
+-    _append_required_high(root, relative_checks, audit, source_reference_audit, key="root_vertical_speed_mps_p95", ratio=policy.root_vertical_speed_p95_ratio, margin=policy.root_vertical_speed_p95_margin_mps, reason="root_vertical_speed_p95_regressed_vs_source")
+-    _append_required_high(root, relative_checks, audit, source_reference_audit, key="root_vertical_speed_mps_max", ratio=policy.root_vertical_speed_max_ratio, margin=policy.root_vertical_speed_max_margin_mps, reason="root_vertical_speed_max_regressed_vs_source")
++    _append_required_high(
++        root, relative_checks, audit, source_reference_audit,
++        key="root_y_robust_range_m",
++        ratio=policy.root_range_ratio,
++        margin=policy.root_range_margin_m,
++        reason="root_y_robust_range_regressed_vs_source",
++    )
++    _append_required_high(
++        root, relative_checks, audit, source_reference_audit,
++        key="root_vertical_speed_mps_p95",
++        ratio=policy.root_vertical_speed_p95_ratio,
++        margin=policy.root_vertical_speed_p95_margin_mps,
++        reason="root_vertical_speed_p95_regressed_vs_source",
++    )
++    _append_required_high(
++        root, relative_checks, audit, source_reference_audit,
++        key="root_vertical_speed_mps_max",
++        ratio=policy.root_vertical_speed_max_ratio,
++        margin=policy.root_vertical_speed_max_margin_mps,
++        reason="root_vertical_speed_max_regressed_vs_source",
++    )
+ 
+     # Keep final SO(3)/Rot6D integrity absolutely strict for source qualification.
+-    # This deliberately preserves male_pipa_2 joint_rotation_step_rad_max failures.
++    # In particular, male_pipa_2 joint_rotation_step_rad_max remains governed
++    # by the unchanged final limit (1.20 rad by default).
+     rotation = layer_reasons["rotation_quality"]
+     for spec in physical_metric_specs(final_limits):
+         if spec.layer != "rotation_quality":
