@@ -1,0 +1,144 @@
+name: Apply source physical calibration burst fix
+
+on:
+  push:
+    branches:
+      - agent/source-physical-calibration-burst-fix
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply reviewed production patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          patches=(
+            dev_patches/source_physical/steps/contracts_physical_quality.py.step01.patch
+            dev_patches/source_physical/steps/contracts_physical_quality.py.step02.patch
+            dev_patches/source_physical/steps/contracts_physical_quality.py.step03.patch
+            dev_patches/source_physical/steps/contracts_physical_quality.py.step04.patch
+            dev_patches/source_physical/steps/contracts_physical_quality.py.step05.patch
+            dev_patches/source_physical/steps/motion_geometry_physical.py.step01.patch
+            dev_patches/source_physical/steps/motion_geometry_physical.py.step02.patch
+            dev_patches/source_physical/steps/retargeting_build_cache.py.step01.patch
+            dev_patches/source_physical/steps/reevaluate_rejected.py.step01.patch
+          )
+          for patch in "${patches[@]}"; do
+            echo "Applying ${patch}"
+            git apply --check "${patch}"
+            git apply "${patch}"
+          done
+          git diff --check
+
+      - name: Verify complete-file SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/expected.sha256 <<'EOF'
+          4a65567b4c8b2a3f61c092a89e9cf4852048133941a26121741c75d6a689bca0  contracts/physical_quality.py
+          633578ba95c5dd7ab941b7b90c7098a63cfae19fb27bb436f81c1275f0a6dfd7  motion_geometry/physical.py
+          f4fda1a0ce3c20a241c38e80e32ee29466fd9f66f577afe05840329aef850736  retargeting/build_cache.py
+          07eb7689382203dcdd0718608abb3107a21479e830582cba551e599c3149f619  reevaluate_rejected.py
+          b4fc317bab9615b9ab38e1f7e100c4afbfead40e6b23a1e7bcb88e580da25b25  retargeting/source_regularized_solver.py
+          2ca033fb5dbbb02a9e4947d15d3252afc7c14fe8ecd03ca44b7393923bd20d12  tests/test_source_physical_contract_v22.py
+          ad480bc7bb10f2a95dcc77581f9de12fe20006d5e9c97a2ea228b50d4dbf98a1  tests/test_source_physical_calibration.py
+          9fd8aa6ddbf3bca0095acbaacd0e203bfc5036fdcdedd95782afc562013a6db8  tests/test_source_regularized_solver.py
+          b8cdd412c1a6284ac35a4e02cd4585e8c53af83f290bdf05ba10a4a1176dfe40  calibrate_source_physical_v23.py
+          0a0f0025a429b6f840ccc4d01e82648fa5d7c0e351baed53f5fcdb15882fbf1f  diagnose_unit_bone_bursts_v23.py
+          EOF
+          sha256sum --check /tmp/expected.sha256
+
+      - name: Compile changed Python files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            contracts/physical_quality.py \
+            motion_geometry/physical.py \
+            retargeting/build_cache.py \
+            retargeting/source_regularized_solver.py \
+            reevaluate_rejected.py \
+            calibrate_source_physical_v23.py \
+            diagnose_unit_bone_bursts_v23.py \
+            tests/test_source_physical_contract_v22.py \
+            tests/test_source_physical_calibration.py \
+            tests/test_source_regularized_solver.py
+
+      - name: Prove final-generation contract code is unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast
+          import hashlib
+          import subprocess
+          from pathlib import Path
+
+          base_sha = "5d795a6ec9d65ccdfd4d983ee24f5fb2d3dd985a"
+          base = subprocess.check_output(
+              ["git", "show", f"{base_sha}:contracts/physical_quality.py"],
+              text=True,
+          )
+          current = Path("contracts/physical_quality.py").read_text(encoding="utf-8")
+          names = {
+              "PhysicalQualityLimits",
+              "StageAcceptancePolicy",
+              "PhysicalMetricSpec",
+              "physical_metric_specs",
+              "evaluate_physical_audit",
+          }
+
+          def hashes(source):
+              tree = ast.parse(source)
+              out = {}
+              for node in tree.body:
+                  if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+                      text = ast.get_source_segment(source, node)
+                      out[node.name] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+              return out
+
+          a = hashes(base)
+          b = hashes(current)
+          missing = names - set(a) | names - set(b)
+          if missing:
+              raise SystemExit(f"missing invariant definitions: {sorted(missing)}")
+          for name in sorted(names):
+              if a[name] != b[name]:
+                  raise SystemExit(f"final-generation invariant changed: {name}")
+              print(f"UNCHANGED {name} {a[name]}")
+          PY
+
+      - name: Verify V2.4 remains explicit opt-in
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'bone_direction_velocity_weight: float = 0.0' retargeting/source_regularized_solver.py
+          grep -q 'bone_direction_acceleration_weight: float = 0.0' retargeting/source_regularized_solver.py
+          grep -q 'SOURCE_RETARGET_BONE_DIR_VEL_W' retargeting/source_regularized_solver.py
+          grep -q 'SOURCE_RETARGET_BONE_DIR_ACC_W' retargeting/source_regularized_solver.py
+
+      - name: Replace staging files with final production commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dev_patches/source_physical
+          git rm --ignore-unmatch .github/workflows/apply-source-physical-calibration-burst-fix.yml
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "No final changes to commit"
+            exit 0
+          fi
+          git commit -m "Calibrate source physics and add burst-aware retarget regularization"
+          git push origin HEAD:agent/source-physical-calibration-burst-fix
