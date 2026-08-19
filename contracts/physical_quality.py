@@ -302,8 +302,10 @@ class PhysicalQualityLimits:
 class SourcePhysicalQualityPolicy:
     """Pre-training Retarget Clean policy, never used by final generation.
 
-    V2.2 source anti-jitter is measured on parent-relative unit-bone direction
-    trajectories over the direct common source/target mapped-bone set.  The
+    Source anti-jitter is measured on parent-relative unit-bone direction
+    trajectories over the direct common source/target mapped-bone set.  A
+    source-only absolute noise floor prevents very-low-dynamic recordings from
+    turning harmless optimizer residuals into arbitrarily large ratios.  The
     absolute SI final-generation contract is intentionally not represented in
     these fields.
     """
@@ -320,6 +322,15 @@ class SourcePhysicalQualityPolicy:
     unit_bone_extremity_jerk_p99_margin_s3: float = 150.0
     unit_bone_extremity_jerk_window_ratio: float = 1.20
     unit_bone_extremity_jerk_window_margin_s3: float = 150.0
+    # Source-only calibration floors.  These never participate in final
+    # generation auditing; they only stop low-dynamic reference clips from
+    # producing unstable candidate/reference ratios.
+    unit_bone_jerk_p95_floor_s3: float = 1900.0
+    unit_bone_jerk_p99_floor_s3: float = 4500.0
+    unit_bone_jerk_window_floor_s3: float = 11000.0
+    unit_bone_extremity_jerk_p95_floor_s3: float = 2800.0
+    unit_bone_extremity_jerk_p99_floor_s3: float = 7500.0
+    unit_bone_extremity_jerk_window_floor_s3: float = 22000.0
     foot_drift_p95_ratio: float = 1.25
     foot_drift_p95_margin_m: float = 0.03
     foot_drift_max_ratio: float = 1.35
@@ -329,6 +340,9 @@ class SourcePhysicalQualityPolicy:
     foot_penetration_p01_floor_m: float = -0.10
     foot_penetration_p001_margin_m: float = 0.06
     foot_penetration_p001_floor_m: float = -0.14
+    # Quantile comparison epsilon only.  Catastrophic penetration remains
+    # governed independently by threshold/run-duration hard gates.
+    foot_penetration_p001_comparison_epsilon_m: float = 0.002
     foot_penetration_catastrophic_threshold_m: float = -0.18
     foot_penetration_catastrophic_max_seconds: float = 0.08
     root_range_ratio: float = 1.20
@@ -378,6 +392,24 @@ class SourcePhysicalQualityPolicy:
             unit_bone_extremity_jerk_window_margin_s3=_env_float(
                 "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0
             ),
+            unit_bone_jerk_p95_floor_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_FLOOR_S3", None, 1900.0
+            ),
+            unit_bone_jerk_p99_floor_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_FLOOR_S3", None, 4500.0
+            ),
+            unit_bone_jerk_window_floor_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_FLOOR_S3", None, 11000.0
+            ),
+            unit_bone_extremity_jerk_p95_floor_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_FLOOR_S3", None, 2800.0
+            ),
+            unit_bone_extremity_jerk_p99_floor_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_FLOOR_S3", None, 7500.0
+            ),
+            unit_bone_extremity_jerk_window_floor_s3=_env_float(
+                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_FLOOR_S3", None, 22000.0
+            ),
             foot_drift_p95_ratio=_env_float(
                 "SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25
             ),
@@ -404,6 +436,9 @@ class SourcePhysicalQualityPolicy:
             ),
             foot_penetration_p001_floor_m=_env_float(
                 "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14
+            ),
+            foot_penetration_p001_comparison_epsilon_m=_env_float(
+                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_EPS_M", None, 0.002
             ),
             foot_penetration_catastrophic_threshold_m=_env_float(
                 "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18
@@ -644,6 +679,53 @@ def _append_required_high(
         reasons.append(reason)
 
 
+
+def _append_required_high_with_source_floor(
+    reasons: list[str],
+    detail: Dict[str, Any],
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+    *,
+    key: str,
+    ratio: float,
+    margin: float,
+    source_only_noise_floor: float,
+    reason: str,
+) -> None:
+    """Relative high-is-bad source check with a source-only absolute noise floor.
+
+    The floor is deliberately *not* a final-generation safety limit.  It only
+    stabilizes the pre-training source comparison when the recorded reference
+    is exceptionally low dynamic.  Above the floor the original relative
+    regression rule remains authoritative.
+    """
+
+    ref_ok, ref = _required_metric(reference, key)
+    cand_ok, cand = _required_metric(candidate, key)
+    if not ref_ok:
+        reasons.append(f"reference_missing_or_nonfinite:{key}")
+        return
+    if not cand_ok:
+        reasons.append(f"candidate_missing_or_nonfinite:{key}")
+        return
+
+    relative_allowed = float(ref) * float(ratio) + float(margin)
+    floor = float(source_only_noise_floor)
+    allowed = max(relative_allowed, floor)
+    detail[key] = {
+        "reference": float(ref),
+        "candidate": float(cand),
+        "ratio": float(ratio),
+        "margin": float(margin),
+        "relative_allowed": float(relative_allowed),
+        "source_only_noise_floor_s3": floor,
+        "allowed": float(allowed),
+        "semantics": "source_relative_plus_source_only_noise_floor",
+    }
+    if cand > allowed:
+        reasons.append(reason)
+
+
 def _append_required_low_relative(
     reasons: list[str],
     detail: Dict[str, Any],
@@ -684,6 +766,7 @@ def _append_required_low_relative_reference_aware_floor(
     key: str,
     margin: float,
     absolute_floor: float,
+    comparison_epsilon: float = 0.0,
     reason: str,
 ) -> None:
     """Source-relative low metric with a floor only when the source is healthy.
@@ -722,8 +805,10 @@ def _append_required_low_relative_reference_aware_floor(
         "reference_satisfies_floor": bool(reference_healthy),
         "semantics": semantics,
         "allowed_minimum": float(allowed),
+        "comparison_epsilon_m": float(comparison_epsilon),
+        "effective_allowed_minimum": float(allowed) - float(comparison_epsilon),
     }
-    if cand < allowed:
+    if cand < float(allowed) - float(comparison_epsilon):
         reasons.append(reason)
 
 
@@ -1048,41 +1133,47 @@ def _evaluate_source_reference_relative(
             "unit_bone_joint_jerk_s3_p95",
             policy.unit_bone_jerk_p95_ratio,
             policy.unit_bone_jerk_p95_margin_s3,
+            policy.unit_bone_jerk_p95_floor_s3,
             "unit_bone_joint_jerk_p95_regressed_vs_source",
         ),
         (
             "unit_bone_joint_jerk_s3_p99",
             policy.unit_bone_jerk_p99_ratio,
             policy.unit_bone_jerk_p99_margin_s3,
+            policy.unit_bone_jerk_p99_floor_s3,
             "unit_bone_joint_jerk_p99_regressed_vs_source",
         ),
         (
             "unit_bone_joint_jerk_window_p95_max_s3",
             policy.unit_bone_jerk_window_ratio,
             policy.unit_bone_jerk_window_margin_s3,
+            policy.unit_bone_jerk_window_floor_s3,
             "unit_bone_joint_jerk_window_regressed_vs_source",
         ),
         (
             "unit_bone_extremity_jerk_s3_p95",
             policy.unit_bone_extremity_jerk_p95_ratio,
             policy.unit_bone_extremity_jerk_p95_margin_s3,
+            policy.unit_bone_extremity_jerk_p95_floor_s3,
             "unit_bone_extremity_jerk_p95_regressed_vs_source",
         ),
         (
             "unit_bone_extremity_jerk_s3_p99",
             policy.unit_bone_extremity_jerk_p99_ratio,
             policy.unit_bone_extremity_jerk_p99_margin_s3,
+            policy.unit_bone_extremity_jerk_p99_floor_s3,
             "unit_bone_extremity_jerk_p99_regressed_vs_source",
         ),
         (
             "unit_bone_extremity_jerk_window_p95_max_s3",
             policy.unit_bone_extremity_jerk_window_ratio,
             policy.unit_bone_extremity_jerk_window_margin_s3,
+            policy.unit_bone_extremity_jerk_window_floor_s3,
             "unit_bone_extremity_jerk_window_regressed_vs_source",
         ),
     )
-    for key, ratio, margin, reason in unit_bone_specs:
-        _append_required_high(
+    for key, ratio, margin, source_floor, reason in unit_bone_specs:
+        _append_required_high_with_source_floor(
             anti,
             relative_checks,
             audit,
@@ -1090,6 +1181,7 @@ def _evaluate_source_reference_relative(
             key=key,
             ratio=ratio,
             margin=margin,
+            source_only_noise_floor=source_floor,
             reason=reason,
         )
 
@@ -1127,6 +1219,7 @@ def _evaluate_source_reference_relative(
         key="foot_penetration_p001_m",
         margin=policy.foot_penetration_p001_margin_m,
         absolute_floor=policy.foot_penetration_p001_floor_m,
+        comparison_epsilon=policy.foot_penetration_p001_comparison_epsilon_m,
         reason="foot_penetration_p001_regressed_vs_source",
     )
 
@@ -1217,9 +1310,9 @@ def _evaluate_source_reference_relative(
         )
     )
     return {
-        "schema": "source_physical_clean_gate_v4_unit_bone",
+        "schema": "source_physical_clean_gate_v5_calibrated_unit_bone",
         "contract_role": "pretraining_source_retarget",
-        "mode": "unit_bone_common_mapped_reference_relative_source_contract",
+        "mode": "calibrated_unit_bone_common_mapped_reference_relative_source_contract",
         "ok": not reasons,
         "reasons": reasons,
         "excluded_final_only_layers": [

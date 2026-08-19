@@ -47,7 +47,7 @@ REJECTED_ROOT = Path(
 OUT = Path(
     os.environ.get(
         "RETARGET_REQUALIFY_OUT",
-        str(VALIDATION_ROOT / "requalified_gate_v2_2.json"),
+        str(VALIDATION_ROOT / "requalified_gate_v2_3.json"),
     )
 ).resolve()
 FPS = float(os.environ.get("RETARGET_REQUALIFY_FPS", "30.0"))
@@ -155,7 +155,7 @@ def main() -> int:
             counter[reason] += 1
 
     summary = {
-        "schema": "retarget_clean_v2_2_requalification_diagnostic",
+        "schema": "retarget_clean_v2_3_requalification_diagnostic",
         "validation_root": str(VALIDATION_ROOT),
         "rejected_root": str(REJECTED_ROOT),
         "fps": float(FPS),
@@ -172,7 +172,7 @@ def main() -> int:
     )
 
     print("=" * 88)
-    print("V2.2 REJECTED-MOTION REQUALIFICATION")
+    print("V2.3 REJECTED-MOTION REQUALIFICATION")
     print("=" * 88)
     print("num_inputs =", summary["num_inputs"])
     print("num_ok     =", summary["num_ok"])

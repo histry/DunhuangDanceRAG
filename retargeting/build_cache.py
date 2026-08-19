@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import retargeting.bvh_solver as legacy
+import retargeting.source_regularized_solver as legacy
 from contracts.anatomy import env_bool, env_int
 from contracts.gravity import fk24_np
 from contracts.physical_quality import evaluate_source_physical_clean_audit
@@ -55,7 +55,7 @@ from retargeting.legacy_anatomy_adapter import load_official_smpl_motion
 
 # Bump the cache schema because physical-clean semantics changed.  Old caches
 # are therefore rebuilt rather than silently reused under the new contract.
-SCHEMA = "retarget_clean_source_safe_retarget_cache_v4_unit_bone_source_dynamics"
+SCHEMA = "retarget_clean_source_safe_retarget_cache_v5_calibrated_unit_bone_temporal_regularization"
 
 
 def _discover(in_dir: Path) -> List[Path]:
@@ -795,7 +795,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "physical_clean_ok": bool(physical_clean_gate["ok"]),
                     "retarget_clean_cache_contract": {
                         "schema": SCHEMA,
-                        "source_gate": "pretraining_unit_bone_source_physical_clean_v4",
+                        "source_gate": "pretraining_calibrated_unit_bone_source_physical_clean_v5",
                         "source_support_policy": SUPPORT_POLICY_SOURCE,
                         "final_generation_gate_reused": False,
                         "event_quality_gate_deferred": True,
@@ -881,7 +881,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "pretraining anatomy/gravity/fit + reference-relative "
                 "source physical clean"
             ),
-            "source_anti_jitter": "parent_relative_unit_bone_on_common_direct_mapped_bones",
+            "source_anti_jitter": "calibrated_parent_relative_unit_bone_on_common_direct_mapped_bones",
             "source_support": SUPPORT_POLICY_SOURCE,
             "final_generation_gate_reused": False,
             "style_quality": "deferred to event-level posture-aware gate",
