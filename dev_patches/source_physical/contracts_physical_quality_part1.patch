@@ -1,0 +1,327 @@
+--- a/contracts/physical_quality.py
++++ b/contracts/physical_quality.py
+@@ -300,20 +300,37 @@
+ 
+ @dataclass(frozen=True)
+ class SourcePhysicalQualityPolicy:
+-    """Pre-training Retarget Clean policy, never used by final generation."""
++    """Pre-training Retarget Clean policy, never used by final generation.
+ 
+-    normalized_jerk_p95_ratio: float = 1.15
+-    normalized_jerk_p95_margin_s3: float = 75.0
+-    normalized_jerk_p99_ratio: float = 1.20
+-    normalized_jerk_p99_margin_s3: float = 150.0
+-    normalized_jerk_window_ratio: float = 1.20
+-    normalized_jerk_window_margin_s3: float = 100.0
+-    normalized_extremity_jerk_p95_ratio: float = 1.15
+-    normalized_extremity_jerk_p95_margin_s3: float = 75.0
+-    normalized_extremity_jerk_p99_ratio: float = 1.20
+-    normalized_extremity_jerk_p99_margin_s3: float = 150.0
+-    normalized_extremity_jerk_window_ratio: float = 1.20
+-    normalized_extremity_jerk_window_margin_s3: float = 150.0
++    Source anti-jitter is measured on parent-relative unit-bone direction
++    trajectories over the direct common source/target mapped-bone set.  A
++    source-only absolute noise floor prevents very-low-dynamic recordings from
++    turning harmless optimizer residuals into arbitrarily large ratios.  The
++    absolute SI final-generation contract is intentionally not represented in
++    these fields.
++    """
++
++    unit_bone_jerk_p95_ratio: float = 1.15
++    unit_bone_jerk_p95_margin_s3: float = 75.0
++    unit_bone_jerk_p99_ratio: float = 1.20
++    unit_bone_jerk_p99_margin_s3: float = 150.0
++    unit_bone_jerk_window_ratio: float = 1.20
++    unit_bone_jerk_window_margin_s3: float = 100.0
++    unit_bone_extremity_jerk_p95_ratio: float = 1.15
++    unit_bone_extremity_jerk_p95_margin_s3: float = 75.0
++    unit_bone_extremity_jerk_p99_ratio: float = 1.20
++    unit_bone_extremity_jerk_p99_margin_s3: float = 150.0
++    unit_bone_extremity_jerk_window_ratio: float = 1.20
++    unit_bone_extremity_jerk_window_margin_s3: float = 150.0
++    # Source-only calibration floors.  These never participate in final
++    # generation auditing; they only stop low-dynamic reference clips from
++    # producing unstable candidate/reference ratios.
++    unit_bone_jerk_p95_floor_s3: float = 1900.0
++    unit_bone_jerk_p99_floor_s3: float = 4500.0
++    unit_bone_jerk_window_floor_s3: float = 11000.0
++    unit_bone_extremity_jerk_p95_floor_s3: float = 2800.0
++    unit_bone_extremity_jerk_p99_floor_s3: float = 7500.0
++    unit_bone_extremity_jerk_window_floor_s3: float = 22000.0
+     foot_drift_p95_ratio: float = 1.25
+     foot_drift_p95_margin_m: float = 0.03
+     foot_drift_max_ratio: float = 1.35
+@@ -323,6 +340,9 @@
+     foot_penetration_p01_floor_m: float = -0.10
+     foot_penetration_p001_margin_m: float = 0.06
+     foot_penetration_p001_floor_m: float = -0.14
++    # Quantile comparison epsilon only.  Catastrophic penetration remains
++    # governed independently by threshold/run-duration hard gates.
++    foot_penetration_p001_comparison_epsilon_m: float = 0.002
+     foot_penetration_catastrophic_threshold_m: float = -0.18
+     foot_penetration_catastrophic_max_seconds: float = 0.08
+     root_range_ratio: float = 1.20
+@@ -336,36 +356,117 @@
+     @classmethod
+     def from_environment(cls) -> "SourcePhysicalQualityPolicy":
+         return cls(
+-            normalized_jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P95_RATIO", None, 1.15),
+-            normalized_jerk_p95_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P95_MARGIN_S3", None, 75.0),
+-            normalized_jerk_p99_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P99_RATIO", None, 1.20),
+-            normalized_jerk_p99_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P99_MARGIN_S3", None, 150.0),
+-            normalized_jerk_window_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_WINDOW_RATIO", None, 1.20),
+-            normalized_jerk_window_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_WINDOW_MARGIN_S3", None, 100.0),
+-            normalized_extremity_jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P95_RATIO", None, 1.15),
+-            normalized_extremity_jerk_p95_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P95_MARGIN_S3", None, 75.0),
+-            normalized_extremity_jerk_p99_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P99_RATIO", None, 1.20),
+-            normalized_extremity_jerk_p99_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P99_MARGIN_S3", None, 150.0),
+-            normalized_extremity_jerk_window_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20),
+-            normalized_extremity_jerk_window_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0),
+-            foot_drift_p95_ratio=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25),
+-            foot_drift_p95_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03),
+-            foot_drift_max_ratio=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35),
+-            foot_drift_max_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08),
+-            foot_contact_height_m_max=_env_float("SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10),
+-            foot_penetration_p01_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04),
+-            foot_penetration_p01_floor_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10),
+-            foot_penetration_p001_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P001_MARGIN_M", None, 0.06),
+-            foot_penetration_p001_floor_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14),
+-            foot_penetration_catastrophic_threshold_m=_env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18),
+-            foot_penetration_catastrophic_max_seconds=_env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS", None, 0.08),
+-            root_range_ratio=_env_float("SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20),
+-            root_range_margin_m=_env_float("SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08),
+-            root_vertical_speed_p95_ratio=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20),
+-            root_vertical_speed_p95_margin_mps=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15),
+-            root_vertical_speed_max_ratio=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25),
+-            root_vertical_speed_max_margin_mps=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40),
+-            frame_count_tolerance=_env_int("SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1),
++            unit_bone_jerk_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_RATIO", None, 1.15
++            ),
++            unit_bone_jerk_p95_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_MARGIN_S3", None, 75.0
++            ),
++            unit_bone_jerk_p99_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_RATIO", None, 1.20
++            ),
++            unit_bone_jerk_p99_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_MARGIN_S3", None, 150.0
++            ),
++            unit_bone_jerk_window_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_RATIO", None, 1.20
++            ),
++            unit_bone_jerk_window_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_MARGIN_S3", None, 100.0
++            ),
++            unit_bone_extremity_jerk_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_RATIO", None, 1.15
++            ),
++            unit_bone_extremity_jerk_p95_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_MARGIN_S3", None, 75.0
++            ),
++            unit_bone_extremity_jerk_p99_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_RATIO", None, 1.20
++            ),
++            unit_bone_extremity_jerk_p99_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_MARGIN_S3", None, 150.0
++            ),
++            unit_bone_extremity_jerk_window_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20
++            ),
++            unit_bone_extremity_jerk_window_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0
++            ),
++            unit_bone_jerk_p95_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_FLOOR_S3", None, 1900.0
++            ),
++            unit_bone_jerk_p99_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_FLOOR_S3", None, 4500.0
++            ),
++            unit_bone_jerk_window_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_FLOOR_S3", None, 11000.0
++            ),
++            unit_bone_extremity_jerk_p95_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_FLOOR_S3", None, 2800.0
++            ),
++            unit_bone_extremity_jerk_p99_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_FLOOR_S3", None, 7500.0
++            ),
++            unit_bone_extremity_jerk_window_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_FLOOR_S3", None, 22000.0
++            ),
++            foot_drift_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25
++            ),
++            foot_drift_p95_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03
++            ),
++            foot_drift_max_ratio=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35
++            ),
++            foot_drift_max_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08
++            ),
++            foot_contact_height_m_max=_env_float(
++                "SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10
++            ),
++            foot_penetration_p01_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04
++            ),
++            foot_penetration_p01_floor_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10
++            ),
++            foot_penetration_p001_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_MARGIN_M", None, 0.06
++            ),
++            foot_penetration_p001_floor_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14
++            ),
++            foot_penetration_p001_comparison_epsilon_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_EPS_M", None, 0.002
++            ),
++            foot_penetration_catastrophic_threshold_m=_env_float(
++                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18
++            ),
++            foot_penetration_catastrophic_max_seconds=_env_float(
++                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS", None, 0.08
++            ),
++            root_range_ratio=_env_float(
++                "SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20
++            ),
++            root_range_margin_m=_env_float(
++                "SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08
++            ),
++            root_vertical_speed_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20
++            ),
++            root_vertical_speed_p95_margin_mps=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15
++            ),
++            root_vertical_speed_max_ratio=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25
++            ),
++            root_vertical_speed_max_margin_mps=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40
++            ),
++            frame_count_tolerance=_env_int(
++                "SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1
++            ),
+         )
+ 
+     def to_dict(self) -> Dict[str, Any]:
+@@ -578,6 +679,53 @@
+         reasons.append(reason)
+ 
+ 
++
++def _append_required_high_with_source_floor(
++    reasons: list[str],
++    detail: Dict[str, Any],
++    candidate: Mapping[str, Any],
++    reference: Mapping[str, Any],
++    *,
++    key: str,
++    ratio: float,
++    margin: float,
++    source_only_noise_floor: float,
++    reason: str,
++) -> None:
++    """Relative high-is-bad source check with a source-only absolute noise floor.
++
++    The floor is deliberately *not* a final-generation safety limit.  It only
++    stabilizes the pre-training source comparison when the recorded reference
++    is exceptionally low dynamic.  Above the floor the original relative
++    regression rule remains authoritative.
++    """
++
++    ref_ok, ref = _required_metric(reference, key)
++    cand_ok, cand = _required_metric(candidate, key)
++    if not ref_ok:
++        reasons.append(f"reference_missing_or_nonfinite:{key}")
++        return
++    if not cand_ok:
++        reasons.append(f"candidate_missing_or_nonfinite:{key}")
++        return
++
++    relative_allowed = float(ref) * float(ratio) + float(margin)
++    floor = float(source_only_noise_floor)
++    allowed = max(relative_allowed, floor)
++    detail[key] = {
++        "reference": float(ref),
++        "candidate": float(cand),
++        "ratio": float(ratio),
++        "margin": float(margin),
++        "relative_allowed": float(relative_allowed),
++        "source_only_noise_floor_s3": floor,
++        "allowed": float(allowed),
++        "semantics": "source_relative_plus_source_only_noise_floor",
++    }
++    if cand > allowed:
++        reasons.append(reason)
++
++
+ def _append_required_low_relative(
+     reasons: list[str],
+     detail: Dict[str, Any],
+@@ -609,6 +757,61 @@
+         reasons.append(reason)
+ 
+ 
++def _append_required_low_relative_reference_aware_floor(
++    reasons: list[str],
++    detail: Dict[str, Any],
++    candidate: Mapping[str, Any],
++    reference: Mapping[str, Any],
++    *,
++    key: str,
++    margin: float,
++    absolute_floor: float,
++    comparison_epsilon: float = 0.0,
++    reason: str,
++) -> None:
++    """Source-relative low metric with a floor only when the source is healthy.
++
++    For penetration-like metrics, larger/less-negative is better.  If the
++    recorded source already satisfies the normal floor, the candidate must both
++    stay close to the source and remain above that floor.  If the source itself
++    is below the floor, this relative gate no longer demands an artificial full
++    repair; it only rejects additional regression beyond ``margin``.  Sustained
++    catastrophic penetration is checked independently by its own hard gate.
++    """
++
++    ref_ok, ref = _required_metric(reference, key)
++    cand_ok, cand = _required_metric(candidate, key)
++    if not ref_ok:
++        reasons.append(f"reference_missing_or_nonfinite:{key}")
++        return
++    if not cand_ok:
++        reasons.append(f"candidate_missing_or_nonfinite:{key}")
++        return
++
++    floor = float(absolute_floor)
++    reference_healthy = float(ref) >= floor
++    if reference_healthy:
++        allowed = max(floor, float(ref) - float(margin))
++        semantics = "reference_healthy_enforce_floor_and_relative_margin"
++    else:
++        allowed = float(ref) - float(margin)
++        semantics = "reference_below_floor_relative_non_regression_only"
++
++    detail[key] = {
++        "reference": float(ref),
++        "candidate": float(cand),
++        "margin": float(margin),
++        "absolute_floor": floor,
++        "reference_satisfies_floor": bool(reference_healthy),
++        "semantics": semantics,
++        "allowed_minimum": float(allowed),
++        "comparison_epsilon_m": float(comparison_epsilon),
++        "effective_allowed_minimum": float(allowed) - float(comparison_epsilon),
++    }
++    if cand < float(allowed) - float(comparison_epsilon):
++        reasons.append(reason)
++
++
+ def _append_required_low_absolute(
+     reasons: list[str],
+     audit: Mapping[str, Any],
