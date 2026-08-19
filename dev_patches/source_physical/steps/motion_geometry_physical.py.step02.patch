@@ -1,0 +1,17 @@
+--- a/motion_geometry/physical.py
++++ b/motion_geometry/physical.py
+@@ -762,6 +762,14 @@
+     # Preserve the exact V2.1 diagnostic on both source/final reports.  The final
+     # gate ignores it; changing/removing it would create unnecessary report drift.
+     result.update(_body_normalized_root_relative_jerk_metrics(joints, fps=fps))
++    if policy == SUPPORT_POLICY_SOURCE:
++        result.update(
++            _unit_bone_direction_jerk_metrics(
++                joints,
++                fps=fps,
++                source_comparison_bones=source_comparison_bones,
++            )
++        )
+     result.update(_distribution(skate,"foot_skate_mps")); result.update(_distribution(sliding_relative_speed[sliding_support],"sliding_support_relative_speed_mps")); result.update(_distribution(support_drift,"foot_support_drift_m")); result.update(_distribution(contact_height,"foot_contact_height_m"))
+     result.update(_distribution(np.linalg.norm(velocity,axis=-1),"joint_velocity_mps")); result.update(_distribution(np.linalg.norm(acceleration,axis=-1),"joint_acceleration_mps2")); result.update(_distribution(jerk_norm,"joint_jerk_mps3")); result.update(_distribution(extremity_jerk,"extremity_jerk_mps3")); result.update(_distribution(root_vertical_speed,"root_vertical_speed_mps")); result.update(_distribution(rotation_steps,"joint_rotation_step_rad")); result.update(_distribution(extremity_rotation_steps,"extremity_rotation_step_rad")); result.update(_distribution(angular_acceleration_norm,"joint_angular_acceleration_rps2"))
+     return result
