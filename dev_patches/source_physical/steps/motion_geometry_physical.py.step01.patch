@@ -1,0 +1,248 @@
+--- a/motion_geometry/physical.py
++++ b/motion_geometry/physical.py
+@@ -21,7 +21,7 @@
+ 
+ import os
+ from dataclasses import asdict, dataclass
+-from typing import Any
++from typing import Any, Sequence
+ 
+ import numpy as np
+ 
+@@ -30,6 +30,8 @@
+     CONTACT,
+     FOOT_JOINTS,
+     MOTION_DIM,
++    NUM_JOINTS,
++    PARENTS,
+     ROOT_X_IDX,
+     ROOT_Y_IDX,
+     ROOT_Z_IDX,
+@@ -43,7 +45,7 @@
+ )
+ 
+ PHYSICAL_METRICS_SCHEMA = "dunhuang_physical_metrics_si_v5_contact_states"
+-SOURCE_REFERENCE_KINEMATICS_SCHEMA = "source_reference_kinematics_body_normalized_v2"
++SOURCE_REFERENCE_KINEMATICS_SCHEMA = "source_reference_kinematics_unit_bone_v3"
+ 
+ EXTREMITY_JOINTS = (7, 8, 10, 11, 20, 21, 22, 23)
+ SWING = 0
+@@ -413,14 +415,14 @@
+     *,
+     fps: float,
+ ) -> dict[str, Any]:
+-    """Skeleton-proportion-invariant source-dynamics metrics in s^-3.
+-
+-    Each trajectory is first made pelvis-root-relative, then every non-root
+-    joint is normalized by its own robust median distance to the pelvis.  This
+-    removes source-vs-EDGE bone-length / lever-arm bias while preserving the
+-    temporal angular/radial dynamics that Retarget Clean is expected to keep.
+-    These metrics are source-contract diagnostics only; final SI jerk remains
+-    the original world-space m/s^3 contract.
++    """Legacy V2.1 pelvis-relative diagnostic, no longer a source gate.
++
++    These values are retained in reports so V2.1/V2.2 runs remain directly
++    comparable.  They are intentionally *not* used for V2.2 source acceptance:
++    pelvis-relative Cartesian trajectories still mix articulated-chain bone
++    proportions.  The authoritative V2.2 source anti-jitter representation is
++    ``_unit_bone_direction_jerk_metrics`` below.  Final SI jerk remains the
++    original world-space m/s^3 contract.
+     """
+     positions = np.asarray(joints, dtype=np.float64)
+     if positions.ndim != 3 or positions.shape[1:] != (24, 3):
+@@ -456,6 +458,147 @@
+     return out
+ 
+ 
++def _normalize_source_comparison_bones(
++    source_comparison_bones: Sequence[int] | np.ndarray | None,
++) -> tuple[int, ...]:
++    """Return a validated, ordered set of target child-joint bone indices.
++
++    A target bone is identified by its child joint; its parent is read from the
++    canonical SMPL24/EDGE tree.  Formal BVH callers pass the direct common
++    source/target mapped-bone set produced by ``retargeting.build_cache``.
++    ``None`` is retained only for canonical/self-reference diagnostics and
++    means all non-root target bones.
++    """
++
++    if source_comparison_bones is None:
++        values = list(range(1, NUM_JOINTS))
++    else:
++        values = [int(v) for v in source_comparison_bones]
++
++    ordered: list[int] = []
++    seen: set[int] = set()
++    for child in values:
++        if child in seen:
++            continue
++        if child <= 0 or child >= NUM_JOINTS:
++            raise ValueError(
++                "source comparison bones must be non-root SMPL24 child indices; "
++                f"got {child}"
++            )
++        parent = int(PARENTS[child])
++        if parent < 0 or parent >= child:
++            raise ValueError(
++                f"invalid canonical parent for comparison bone {child}: {parent}"
++            )
++        seen.add(child)
++        ordered.append(child)
++
++    if not ordered:
++        raise ValueError("source comparison bone set must not be empty")
++    return tuple(ordered)
++
++
++def _unit_bone_direction_jerk_metrics(
++    joints: np.ndarray,
++    *,
++    fps: float,
++    source_comparison_bones: Sequence[int] | np.ndarray | None = None,
++) -> dict[str, Any]:
++    """Parent-relative unit-bone directional jerk for source qualification.
++
++    For each selected target bone ``parent(j) -> j`` we form
++
++        u_j(t) = (p_j(t) - p_parent(j)(t)) / ||p_j(t)-p_parent(j)(t)||
++
++    and measure the third finite difference of ``u_j`` in physical time.  Bone
++    length therefore cannot scale the statistic, and upstream chain lengths or
++    root translation cancel before differentiation.  Only the common direct
++    source/target mapped bones supplied by the cache builder are authoritative
++    for BVH source qualification.
++
++    Units are s^-3 because ``u_j`` is dimensionless.  This is a source-only
++    relative diagnostic/gate; final generated motion continues to use the
++    unchanged world-space SI jerk metrics in m/s^3.
++    """
++
++    positions = np.asarray(joints, dtype=np.float64)
++    if positions.ndim != 3 or positions.shape[1:] != (NUM_JOINTS, 3):
++        raise ValueError(
++            f"Expected joints [T,{NUM_JOINTS},3], got {positions.shape}"
++        )
++    if not np.isfinite(positions).all():
++        raise ValueError("unit-bone source trajectory contains NaN/Inf")
++    rate = float(fps)
++    if not np.isfinite(rate) or rate <= 0.0:
++        raise ValueError(f"fps must be finite and positive, got {fps!r}")
++
++    bones = _normalize_source_comparison_bones(source_comparison_bones)
++    children = np.asarray(bones, dtype=np.int64)
++    parents = np.asarray([int(PARENTS[j]) for j in bones], dtype=np.int64)
++
++    vectors = positions[:, children] - positions[:, parents]
++    lengths = np.linalg.norm(vectors, axis=-1)
++    median_lengths = (
++        np.median(lengths, axis=0)
++        if len(lengths)
++        else np.zeros((len(bones),), dtype=np.float64)
++    )
++    length_epsilon_m = max(
++        1.0e-8,
++        _env_float("SOURCE_PHYSICAL_UNIT_BONE_LENGTH_EPS_M", 1.0e-5),
++    )
++    degenerate = median_lengths <= float(length_epsilon_m)
++    if np.any(degenerate):
++        bad = [int(bones[i]) for i in np.flatnonzero(degenerate)]
++        raise ValueError(
++            "degenerate source comparison bones after mapping: "
++            f"children={bad}, epsilon_m={length_epsilon_m}"
++        )
++
++    unit = vectors / np.maximum(lengths[..., None], float(length_epsilon_m))
++    jerk = np.diff(unit, n=3, axis=0) * rate**3
++    jerk_norm = np.linalg.norm(jerk, axis=-1)
++
++    extremity_columns = [
++        i for i, child in enumerate(bones) if int(child) in EXTREMITY_JOINTS
++    ]
++    extremity_bones = [int(bones[i]) for i in extremity_columns]
++    extremity_jerk = (
++        jerk_norm[:, extremity_columns]
++        if jerk_norm.size and extremity_columns
++        else np.zeros((0, len(extremity_columns)), dtype=np.float64)
++    )
++
++    out: dict[str, Any] = {
++        "unit_bone_comparison_bones": [int(v) for v in bones],
++        "unit_bone_comparison_parents": [int(v) for v in parents],
++        "unit_bone_comparison_count": int(len(bones)),
++        "unit_bone_extremity_comparison_bones": extremity_bones,
++        "unit_bone_extremity_comparison_count": int(len(extremity_bones)),
++        "unit_bone_length_epsilon_m": float(length_epsilon_m),
++        "unit_bone_median_lengths_m": median_lengths.astype(float).tolist(),
++        "unit_bone_joint_jerk_s3_p99": (
++            float(np.percentile(jerk_norm, 99)) if jerk_norm.size else 0.0
++        ),
++        "unit_bone_joint_jerk_window_p95_max_s3": _window_percentile_max(
++            jerk_norm, fps=rate, seconds=1.0
++        ),
++        "unit_bone_extremity_jerk_s3_p99": (
++            float(np.percentile(extremity_jerk, 99))
++            if extremity_jerk.size
++            else 0.0
++        ),
++        "unit_bone_extremity_jerk_window_p95_max_s3": _window_percentile_max(
++            extremity_jerk, fps=rate, seconds=1.0
++        ),
++    }
++    out.update(_distribution(jerk_norm, "unit_bone_joint_jerk_s3"))
++    out.update(
++        _distribution(extremity_jerk, "unit_bone_extremity_jerk_s3")
++    )
++    return out
++
++
+ def _penetration_robust_metrics(relative_height: np.ndarray, *, fps: float) -> dict[str, Any]:
+     h = np.asarray(relative_height, dtype=np.float64)
+     flat = h.reshape(-1)
+@@ -473,7 +616,12 @@
+     }
+ 
+ 
+-def source_reference_kinematic_metrics_np(joints: np.ndarray, *, fps: float) -> dict[str, Any]:
++def source_reference_kinematic_metrics_np(
++    joints: np.ndarray,
++    *,
++    fps: float,
++    source_comparison_bones: Sequence[int] | np.ndarray | None = None,
++) -> dict[str, Any]:
+     """Recorded pre-retarget reference metrics in target coordinates/FPS."""
+     positions = np.asarray(joints, dtype=np.float64)
+     if positions.ndim != 3 or positions.shape[1:] != (24, 3):
+@@ -509,7 +657,16 @@
+         "root_y_robust_range_m": float(np.percentile(root_y, 99) - np.percentile(root_y, 1)) if root_y.size else 0.0,
+     }
+     result.update(_penetration_robust_metrics(penetration, fps=fps))
++    # V2.1 metric is retained for historical diagnostics only.
+     result.update(_body_normalized_root_relative_jerk_metrics(positions, fps=fps))
++    # V2.2 authoritative source anti-jitter representation.
++    result.update(
++        _unit_bone_direction_jerk_metrics(
++            positions,
++            fps=fps,
++            source_comparison_bones=source_comparison_bones,
++        )
++    )
+     result.update(_distribution(np.linalg.norm(velocity, axis=-1), "joint_velocity_mps"))
+     result.update(_distribution(np.linalg.norm(acceleration, axis=-1), "joint_acceleration_mps2"))
+     result.update(_distribution(jerk_norm, "joint_jerk_mps3"))
+@@ -524,6 +681,7 @@
+     motion: np.ndarray, *, fps: float,
+     sliding_support_eligible: np.ndarray | None = None,
+     support_policy: str = SUPPORT_POLICY_FINAL,
++    source_comparison_bones: Sequence[int] | np.ndarray | None = None,
+ ) -> dict[str, Any]:
+     """Report final SI metrics plus source-only normalized diagnostics.
+ 
+@@ -601,6 +759,8 @@
+         "root_horizontal_window_displacement_max_m": _root_window_displacement_max(root_xz,fps=fps,seconds=10.0),
+     }
+     result.update(_penetration_robust_metrics(foot_relative_height, fps=fps))
++    # Preserve the exact V2.1 diagnostic on both source/final reports.  The final
++    # gate ignores it; changing/removing it would create unnecessary report drift.
+     result.update(_body_normalized_root_relative_jerk_metrics(joints, fps=fps))
+     result.update(_distribution(skate,"foot_skate_mps")); result.update(_distribution(sliding_relative_speed[sliding_support],"sliding_support_relative_speed_mps")); result.update(_distribution(support_drift,"foot_support_drift_m")); result.update(_distribution(contact_height,"foot_contact_height_m"))
+     result.update(_distribution(np.linalg.norm(velocity,axis=-1),"joint_velocity_mps")); result.update(_distribution(np.linalg.norm(acceleration,axis=-1),"joint_acceleration_mps2")); result.update(_distribution(jerk_norm,"joint_jerk_mps3")); result.update(_distribution(extremity_jerk,"extremity_jerk_mps3")); result.update(_distribution(root_vertical_speed,"root_vertical_speed_mps")); result.update(_distribution(rotation_steps,"joint_rotation_step_rad")); result.update(_distribution(extremity_rotation_steps,"extremity_rotation_step_rad")); result.update(_distribution(angular_acceleration_norm,"joint_angular_acceleration_rps2"))
