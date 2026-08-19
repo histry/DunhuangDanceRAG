@@ -1,0 +1,150 @@
+--- a/contracts/physical_quality.py
++++ b/contracts/physical_quality.py
+@@ -356,36 +356,117 @@
+     @classmethod
+     def from_environment(cls) -> "SourcePhysicalQualityPolicy":
+         return cls(
+-            normalized_jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P95_RATIO", None, 1.15),
+-            normalized_jerk_p95_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P95_MARGIN_S3", None, 75.0),
+-            normalized_jerk_p99_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P99_RATIO", None, 1.20),
+-            normalized_jerk_p99_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_P99_MARGIN_S3", None, 150.0),
+-            normalized_jerk_window_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_WINDOW_RATIO", None, 1.20),
+-            normalized_jerk_window_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_JERK_WINDOW_MARGIN_S3", None, 100.0),
+-            normalized_extremity_jerk_p95_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P95_RATIO", None, 1.15),
+-            normalized_extremity_jerk_p95_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P95_MARGIN_S3", None, 75.0),
+-            normalized_extremity_jerk_p99_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P99_RATIO", None, 1.20),
+-            normalized_extremity_jerk_p99_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_P99_MARGIN_S3", None, 150.0),
+-            normalized_extremity_jerk_window_ratio=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20),
+-            normalized_extremity_jerk_window_margin_s3=_env_float("SOURCE_PHYSICAL_NORMALIZED_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0),
+-            foot_drift_p95_ratio=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25),
+-            foot_drift_p95_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03),
+-            foot_drift_max_ratio=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35),
+-            foot_drift_max_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08),
+-            foot_contact_height_m_max=_env_float("SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10),
+-            foot_penetration_p01_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04),
+-            foot_penetration_p01_floor_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10),
+-            foot_penetration_p001_margin_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P001_MARGIN_M", None, 0.06),
+-            foot_penetration_p001_floor_m=_env_float("SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14),
+-            foot_penetration_catastrophic_threshold_m=_env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18),
+-            foot_penetration_catastrophic_max_seconds=_env_float("SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS", None, 0.08),
+-            root_range_ratio=_env_float("SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20),
+-            root_range_margin_m=_env_float("SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08),
+-            root_vertical_speed_p95_ratio=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20),
+-            root_vertical_speed_p95_margin_mps=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15),
+-            root_vertical_speed_max_ratio=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25),
+-            root_vertical_speed_max_margin_mps=_env_float("SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40),
+-            frame_count_tolerance=_env_int("SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1),
++            unit_bone_jerk_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_RATIO", None, 1.15
++            ),
++            unit_bone_jerk_p95_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_MARGIN_S3", None, 75.0
++            ),
++            unit_bone_jerk_p99_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_RATIO", None, 1.20
++            ),
++            unit_bone_jerk_p99_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_MARGIN_S3", None, 150.0
++            ),
++            unit_bone_jerk_window_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_RATIO", None, 1.20
++            ),
++            unit_bone_jerk_window_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_MARGIN_S3", None, 100.0
++            ),
++            unit_bone_extremity_jerk_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_RATIO", None, 1.15
++            ),
++            unit_bone_extremity_jerk_p95_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_MARGIN_S3", None, 75.0
++            ),
++            unit_bone_extremity_jerk_p99_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_RATIO", None, 1.20
++            ),
++            unit_bone_extremity_jerk_p99_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_MARGIN_S3", None, 150.0
++            ),
++            unit_bone_extremity_jerk_window_ratio=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_RATIO", None, 1.20
++            ),
++            unit_bone_extremity_jerk_window_margin_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_MARGIN_S3", None, 150.0
++            ),
++            unit_bone_jerk_p95_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P95_FLOOR_S3", None, 1900.0
++            ),
++            unit_bone_jerk_p99_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_P99_FLOOR_S3", None, 4500.0
++            ),
++            unit_bone_jerk_window_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_JERK_WINDOW_FLOOR_S3", None, 11000.0
++            ),
++            unit_bone_extremity_jerk_p95_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P95_FLOOR_S3", None, 2800.0
++            ),
++            unit_bone_extremity_jerk_p99_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_P99_FLOOR_S3", None, 7500.0
++            ),
++            unit_bone_extremity_jerk_window_floor_s3=_env_float(
++                "SOURCE_PHYSICAL_UNIT_BONE_EXTREMITY_JERK_WINDOW_FLOOR_S3", None, 22000.0
++            ),
++            foot_drift_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_RATIO", None, 1.25
++            ),
++            foot_drift_p95_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_P95_MARGIN_M", None, 0.03
++            ),
++            foot_drift_max_ratio=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_RATIO", None, 1.35
++            ),
++            foot_drift_max_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_DRIFT_MAX_MARGIN_M", None, 0.08
++            ),
++            foot_contact_height_m_max=_env_float(
++                "SOURCE_PHYSICAL_MAX_FOOT_CONTACT_HEIGHT_M", None, 0.10
++            ),
++            foot_penetration_p01_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_MARGIN_M", None, 0.04
++            ),
++            foot_penetration_p01_floor_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P01_FLOOR_M", None, -0.10
++            ),
++            foot_penetration_p001_margin_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_MARGIN_M", None, 0.06
++            ),
++            foot_penetration_p001_floor_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_FLOOR_M", None, -0.14
++            ),
++            foot_penetration_p001_comparison_epsilon_m=_env_float(
++                "SOURCE_PHYSICAL_FOOT_PENETRATION_P001_EPS_M", None, 0.002
++            ),
++            foot_penetration_catastrophic_threshold_m=_env_float(
++                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MIN_M", None, -0.18
++            ),
++            foot_penetration_catastrophic_max_seconds=_env_float(
++                "SOURCE_PHYSICAL_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS", None, 0.08
++            ),
++            root_range_ratio=_env_float(
++                "SOURCE_PHYSICAL_ROOT_RANGE_RATIO", None, 1.20
++            ),
++            root_range_margin_m=_env_float(
++                "SOURCE_PHYSICAL_ROOT_RANGE_MARGIN_M", None, 0.08
++            ),
++            root_vertical_speed_p95_ratio=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_RATIO", None, 1.20
++            ),
++            root_vertical_speed_p95_margin_mps=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_P95_MARGIN_MPS", None, 0.15
++            ),
++            root_vertical_speed_max_ratio=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_RATIO", None, 1.25
++            ),
++            root_vertical_speed_max_margin_mps=_env_float(
++                "SOURCE_PHYSICAL_ROOT_VERTICAL_SPEED_MAX_MARGIN_MPS", None, 0.40
++            ),
++            frame_count_tolerance=_env_int(
++                "SOURCE_PHYSICAL_FRAME_COUNT_TOLERANCE", None, 1
++            ),
+         )
+ 
+     def to_dict(self) -> Dict[str, Any]:
