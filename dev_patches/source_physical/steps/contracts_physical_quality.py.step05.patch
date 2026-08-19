@@ -1,0 +1,67 @@
+--- a/contracts/physical_quality.py
++++ b/contracts/physical_quality.py
+@@ -1290,24 +1290,47 @@
+         if spec.layer != "rotation_quality":
+             continue
+         finite, value = _required_metric(audit, spec.key)
+-        if not finite: rotation.append(f"missing_or_nonfinite:{spec.key}")
+-        elif spec.direction == "high" and value > spec.absolute_limit: rotation.append(f"{spec.key}_too_high")
+-        elif spec.direction == "low" and value < spec.absolute_limit: rotation.append(f"{spec.key}_too_low")
+-
+-    order=("contract","anti_jitter","foot_contact","root_vertical","rotation_quality")
+-    reasons=list(dict.fromkeys(reason for layer in order for reason in layer_reasons[layer]))
++        if not finite:
++            rotation.append(f"missing_or_nonfinite:{spec.key}")
++        elif spec.direction == "high" and value > spec.absolute_limit:
++            rotation.append(f"{spec.key}_too_high")
++        elif spec.direction == "low" and value < spec.absolute_limit:
++            rotation.append(f"{spec.key}_too_low")
++
++    order = (
++        "contract",
++        "anti_jitter",
++        "foot_contact",
++        "root_vertical",
++        "rotation_quality",
++    )
++    reasons = list(
++        dict.fromkeys(
++            reason for layer in order for reason in layer_reasons[layer]
++        )
++    )
+     return {
+-        "schema":"source_physical_clean_gate_v3_body_normalized",
+-        "contract_role":"pretraining_source_retarget",
+-        "mode":"body_normalized_reference_relative_source_contract",
+-        "ok":not reasons, "reasons":reasons,
+-        "excluded_final_only_layers":["long_horizon_root_drift","absolute_final_si_anti_jitter","final_fail_closed_foot_skate"],
+-        "source_policy":policy.to_dict(),
+-        "final_rotation_integrity_limits":final_limits.as_audit_limits(),
+-        "source_si_jerk_diagnostic_only":True,
+-        "relative_checks":relative_checks,
+-        "audit":dict(audit), "source_reference_audit":dict(source_reference_audit),
+-        "layers":{name:{"ok":not values,"reasons":list(values)} for name,values in layer_reasons.items()},
++        "schema": "source_physical_clean_gate_v5_calibrated_unit_bone",
++        "contract_role": "pretraining_source_retarget",
++        "mode": "calibrated_unit_bone_common_mapped_reference_relative_source_contract",
++        "ok": not reasons,
++        "reasons": reasons,
++        "excluded_final_only_layers": [
++            "long_horizon_root_drift",
++            "absolute_final_si_anti_jitter",
++            "final_fail_closed_foot_skate",
++        ],
++        "source_policy": policy.to_dict(),
++        "final_rotation_integrity_limits": final_limits.as_audit_limits(),
++        "source_si_jerk_diagnostic_only": True,
++        "legacy_body_normalized_jerk_diagnostic_only": True,
++        "relative_checks": relative_checks,
++        "audit": dict(audit),
++        "source_reference_audit": dict(source_reference_audit),
++        "layers": {
++            name: {"ok": not values, "reasons": list(values)}
++            for name, values in layer_reasons.items()
++        },
+     }
+ 
+ 
