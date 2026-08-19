@@ -1,0 +1,266 @@
+--- a/retargeting/build_cache.py
++++ b/retargeting/build_cache.py
+@@ -32,7 +32,7 @@
+ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
+ 
+-import retargeting.bvh_solver as legacy
++import retargeting.source_regularized_solver as legacy
+ from contracts.anatomy import env_bool, env_int
+ from contracts.gravity import fk24_np
+ from contracts.physical_quality import evaluate_source_physical_clean_audit
+@@ -44,16 +44,18 @@
+     validate_source,
+ )
+ from motion_geometry.physical import (
++    EXTREMITY_JOINTS,
+     SUPPORT_POLICY_SOURCE,
+     motion_physical_metrics_np,
+     source_reference_kinematic_metrics_np,
+ )
++from motion_geometry.smpl24 import JOINT_NAMES, NUM_JOINTS, PARENTS
+ from retargeting.anatomy_retarget import retarget_bvh_research
+ from retargeting.legacy_anatomy_adapter import load_official_smpl_motion
+ 
+ # Bump the cache schema because physical-clean semantics changed.  Old caches
+ # are therefore rebuilt rather than silently reused under the new contract.
+-SCHEMA = "retarget_clean_source_safe_retarget_cache_v3_body_normalized_source_dynamics"
++SCHEMA = "retarget_clean_source_safe_retarget_cache_v5_calibrated_unit_bone_temporal_regularization"
+ 
+ 
+ def _discover(in_dir: Path) -> List[Path]:
+@@ -185,6 +187,137 @@
+     return int(num_sources) >= 3
+ 
+ 
++COMMON_MAPPED_BONE_SCHEMA = "source_target_common_valid_mapped_bones_v1"
++
++
++def _common_valid_mapped_bone_contract(
++    bvh: Any,
++    mapping: Dict[int, int],
++    aligned_source_positions: np.ndarray,
++    target_rest: np.ndarray,
++) -> Tuple[List[int], Dict[str, Any]]:
++    """Build the strict direct source/target common-bone comparison set.
++
++    A target bone is identified by its child index.  It is accepted only when:
++
++    1. child and target parent are both directly mapped from the BVH;
++    2. child and parent map to distinct source joints (no end-site proxy copy);
++    3. the mapped source child is directly parented by the mapped source parent;
++    4. both source and target bone lengths are finite and non-degenerate.
++
++    Virtual/interpolated target observations therefore cannot enter the V2.2
++    source anti-jitter distribution, and fuzzy mappings that span different
++    hierarchy levels fail closed for that bone rather than being treated as a
++    like-for-like directional trajectory.
++    """
++
++    positions = np.asarray(aligned_source_positions, dtype=np.float64)
++    rest = np.asarray(target_rest, dtype=np.float64)
++    if positions.ndim != 3 or positions.shape[-1] != 3:
++        raise ValueError(
++            f"Expected aligned source positions [T,J,3], got {positions.shape}"
++        )
++    if rest.shape != (NUM_JOINTS, 3):
++        raise ValueError(
++            f"Expected target rest [{NUM_JOINTS},3], got {rest.shape}"
++        )
++
++    try:
++        length_epsilon_m = float(
++            os.environ.get("SOURCE_PHYSICAL_UNIT_BONE_LENGTH_EPS_M", "1e-5")
++        )
++    except (TypeError, ValueError):
++        length_epsilon_m = 1.0e-5
++    if not np.isfinite(length_epsilon_m) or length_epsilon_m <= 0.0:
++        length_epsilon_m = 1.0e-5
++
++    valid: List[int] = []
++    excluded: List[Dict[str, Any]] = []
++    source_lengths: Dict[str, float] = {}
++    target_lengths: Dict[str, float] = {}
++
++    for child in range(1, NUM_JOINTS):
++        parent = int(PARENTS[child])
++        reason: Optional[str] = None
++        src_child = mapping.get(child)
++        src_parent = mapping.get(parent)
++
++        if src_child is None:
++            reason = "child_not_directly_mapped"
++        elif src_parent is None:
++            reason = "parent_not_directly_mapped"
++        elif int(src_child) == int(src_parent):
++            reason = "child_parent_share_source_proxy"
++        elif int(bvh.joints[int(src_child)].parent) != int(src_parent):
++            reason = "source_hierarchy_not_direct_parent_match"
++        else:
++            source_vector = (
++                positions[:, int(src_child)] - positions[:, int(src_parent)]
++            )
++            source_len = np.linalg.norm(source_vector, axis=-1)
++            source_median = (
++                float(np.median(source_len)) if source_len.size else 0.0
++            )
++            target_len = float(np.linalg.norm(rest[child] - rest[parent]))
++            source_lengths[str(child)] = source_median
++            target_lengths[str(child)] = target_len
++            if (
++                not np.isfinite(source_median)
++                or source_median <= length_epsilon_m
++            ):
++                reason = "source_bone_degenerate"
++            elif not np.isfinite(target_len) or target_len <= length_epsilon_m:
++                reason = "target_bone_degenerate"
++
++        if reason is None:
++            valid.append(int(child))
++        else:
++            excluded.append(
++                {
++                    "child": int(child),
++                    "child_name": str(JOINT_NAMES[child]),
++                    "parent": int(parent),
++                    "parent_name": str(JOINT_NAMES[parent]),
++                    "source_child": (
++                        int(src_child) if src_child is not None else None
++                    ),
++                    "source_parent": (
++                        int(src_parent) if src_parent is not None else None
++                    ),
++                    "reason": reason,
++                }
++            )
++
++    if not valid:
++        raise RuntimeError(
++            "No direct common source/target mapped bones remain for the V2.2 "
++            "source anti-jitter contract"
++        )
++
++    extremity = [int(j) for j in valid if int(j) in EXTREMITY_JOINTS]
++    if not extremity:
++        raise RuntimeError(
++            "Common mapped-bone set contains no extremity bones; source "
++            "anti-jitter extremity contract cannot be evaluated"
++        )
++
++    contract = {
++        "schema": COMMON_MAPPED_BONE_SCHEMA,
++        "definition": "direct_child_and_parent_mapping_with_matching_source_hierarchy",
++        "valid_child_indices": list(valid),
++        "valid_parent_indices": [int(PARENTS[j]) for j in valid],
++        "valid_child_names": [str(JOINT_NAMES[j]) for j in valid],
++        "extremity_child_indices": extremity,
++        "num_valid_bones": int(len(valid)),
++        "num_extremity_bones": int(len(extremity)),
++        "length_epsilon_m": float(length_epsilon_m),
++        "source_median_bone_lengths_m": source_lengths,
++        "target_rest_bone_lengths_m": target_lengths,
++        "excluded": excluded,
++    }
++    return valid, contract
++
++
+ def _build_bvh_source_reference_audit(
+     source: Path,
+     *,
+@@ -253,6 +386,15 @@
+         mapping,
+         float(cfg.target_fps),
+         timebase.get("entry", {}),
++    )
++
++    comparison_bones, comparison_bone_contract = (
++        _common_valid_mapped_bone_contract(
++            bvh,
++            mapping,
++            aligned,
++            target_rest,
++        )
+     )
+ 
+     T = int(len(aligned))
+@@ -283,6 +425,7 @@
+     audit = source_reference_kinematic_metrics_np(
+         target_pos,
+         fps=float(cfg.target_fps),
++        source_comparison_bones=comparison_bones,
+     )
+     metadata = {
+         "mode": "native_bvh_aligned_pre_retarget",
+@@ -305,6 +448,7 @@
+             }
+             for tgt, src in mapping.items()
+         },
++        "common_mapped_bone_contract": comparison_bone_contract,
+     }
+     return audit, metadata
+ 
+@@ -329,15 +473,28 @@
+     # no separate BVH observation skeleton to compare against, so its canonical
+     # motion is its own dynamic reference.  Source-specific contact/penetration
+     # and rotation-integrity checks still remain active.
++    canonical_bones = list(range(1, NUM_JOINTS))
+     reference = source_reference_kinematic_metrics_np(
+         fk24_np(np.asarray(motion, dtype=np.float32)),
+         fps=float(cfg.target_fps),
++        source_comparison_bones=canonical_bones,
+     )
+     return reference, {
+         "mode": "official_smpl_canonical_self_reference",
+         "source": str(source_used),
+         "reference_frames": int(len(motion)),
+         "target_fps": float(cfg.target_fps),
++        "common_mapped_bone_contract": {
++            "schema": COMMON_MAPPED_BONE_SCHEMA,
++            "definition": "canonical_self_reference_all_nonroot_target_bones",
++            "valid_child_indices": canonical_bones,
++            "valid_parent_indices": [int(PARENTS[j]) for j in canonical_bones],
++            "valid_child_names": [str(JOINT_NAMES[j]) for j in canonical_bones],
++            "extremity_child_indices": [
++                int(j) for j in canonical_bones if j in EXTREMITY_JOINTS
++            ],
++            "num_valid_bones": int(len(canonical_bones)),
++        },
+     }
+ 
+ 
+@@ -595,6 +752,9 @@
+                 )
+             )
+ 
++            comparison_bones = source_reference_audit.get(
++                "unit_bone_comparison_bones"
++            )
+             physical_audit = motion_physical_metrics_np(
+                 motion,
+                 fps=float(cfg.target_fps),
+@@ -604,6 +764,7 @@
+                     else None
+                 ),
+                 support_policy=SUPPORT_POLICY_SOURCE,
++                source_comparison_bones=comparison_bones,
+             )
+             physical_clean_gate = evaluate_source_physical_clean_audit(
+                 physical_audit,
+@@ -634,7 +795,7 @@
+                     "physical_clean_ok": bool(physical_clean_gate["ok"]),
+                     "retarget_clean_cache_contract": {
+                         "schema": SCHEMA,
+-                        "source_gate": "pretraining_body_normalized_source_physical_clean_v3",
++                        "source_gate": "pretraining_unit_bone_source_physical_clean_v4",
+                         "source_support_policy": SUPPORT_POLICY_SOURCE,
+                         "final_generation_gate_reused": False,
+                         "event_quality_gate_deferred": True,
+@@ -720,7 +881,7 @@
+                 "pretraining anatomy/gravity/fit + reference-relative "
+                 "source physical clean"
+             ),
+-            "source_anti_jitter": "body_normalized_root_relative_to_recorded_source",
++            "source_anti_jitter": "parent_relative_unit_bone_on_common_direct_mapped_bones",
+             "source_support": SUPPORT_POLICY_SOURCE,
+             "final_generation_gate_reused": False,
+             "style_quality": "deferred to event-level posture-aware gate",
