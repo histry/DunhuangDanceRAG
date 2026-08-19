@@ -1,0 +1,269 @@
+--- a/contracts/physical_quality.py
++++ b/contracts/physical_quality.py
+@@ -679,6 +679,53 @@
+         reasons.append(reason)
+ 
+ 
++
++def _append_required_high_with_source_floor(
++    reasons: list[str],
++    detail: Dict[str, Any],
++    candidate: Mapping[str, Any],
++    reference: Mapping[str, Any],
++    *,
++    key: str,
++    ratio: float,
++    margin: float,
++    source_only_noise_floor: float,
++    reason: str,
++) -> None:
++    """Relative high-is-bad source check with a source-only absolute noise floor.
++
++    The floor is deliberately *not* a final-generation safety limit.  It only
++    stabilizes the pre-training source comparison when the recorded reference
++    is exceptionally low dynamic.  Above the floor the original relative
++    regression rule remains authoritative.
++    """
++
++    ref_ok, ref = _required_metric(reference, key)
++    cand_ok, cand = _required_metric(candidate, key)
++    if not ref_ok:
++        reasons.append(f"reference_missing_or_nonfinite:{key}")
++        return
++    if not cand_ok:
++        reasons.append(f"candidate_missing_or_nonfinite:{key}")
++        return
++
++    relative_allowed = float(ref) * float(ratio) + float(margin)
++    floor = float(source_only_noise_floor)
++    allowed = max(relative_allowed, floor)
++    detail[key] = {
++        "reference": float(ref),
++        "candidate": float(cand),
++        "ratio": float(ratio),
++        "margin": float(margin),
++        "relative_allowed": float(relative_allowed),
++        "source_only_noise_floor_s3": floor,
++        "allowed": float(allowed),
++        "semantics": "source_relative_plus_source_only_noise_floor",
++    }
++    if cand > allowed:
++        reasons.append(reason)
++
++
+ def _append_required_low_relative(
+     reasons: list[str],
+     detail: Dict[str, Any],
+@@ -710,6 +757,61 @@
+         reasons.append(reason)
+ 
+ 
++def _append_required_low_relative_reference_aware_floor(
++    reasons: list[str],
++    detail: Dict[str, Any],
++    candidate: Mapping[str, Any],
++    reference: Mapping[str, Any],
++    *,
++    key: str,
++    margin: float,
++    absolute_floor: float,
++    comparison_epsilon: float = 0.0,
++    reason: str,
++) -> None:
++    """Source-relative low metric with a floor only when the source is healthy.
++
++    For penetration-like metrics, larger/less-negative is better.  If the
++    recorded source already satisfies the normal floor, the candidate must both
++    stay close to the source and remain above that floor.  If the source itself
++    is below the floor, this relative gate no longer demands an artificial full
++    repair; it only rejects additional regression beyond ``margin``.  Sustained
++    catastrophic penetration is checked independently by its own hard gate.
++    """
++
++    ref_ok, ref = _required_metric(reference, key)
++    cand_ok, cand = _required_metric(candidate, key)
++    if not ref_ok:
++        reasons.append(f"reference_missing_or_nonfinite:{key}")
++        return
++    if not cand_ok:
++        reasons.append(f"candidate_missing_or_nonfinite:{key}")
++        return
++
++    floor = float(absolute_floor)
++    reference_healthy = float(ref) >= floor
++    if reference_healthy:
++        allowed = max(floor, float(ref) - float(margin))
++        semantics = "reference_healthy_enforce_floor_and_relative_margin"
++    else:
++        allowed = float(ref) - float(margin)
++        semantics = "reference_below_floor_relative_non_regression_only"
++
++    detail[key] = {
++        "reference": float(ref),
++        "candidate": float(cand),
++        "margin": float(margin),
++        "absolute_floor": floor,
++        "reference_satisfies_floor": bool(reference_healthy),
++        "semantics": semantics,
++        "allowed_minimum": float(allowed),
++        "comparison_epsilon_m": float(comparison_epsilon),
++        "effective_allowed_minimum": float(allowed) - float(comparison_epsilon),
++    }
++    if cand < float(allowed) - float(comparison_epsilon):
++        reasons.append(reason)
++
++
+ def _append_required_low_absolute(
+     reasons: list[str],
+     audit: Mapping[str, Any],
+@@ -893,30 +995,138 @@
+     policy: SourcePhysicalQualityPolicy,
+ ) -> Dict[str, Any]:
+     layer_reasons: Dict[str, list[str]] = {
+-        "contract": [], "anti_jitter": [], "foot_contact": [],
+-        "root_vertical": [], "rotation_quality": [],
++        "contract": [],
++        "anti_jitter": [],
++        "foot_contact": [],
++        "root_vertical": [],
++        "rotation_quality": [],
+     }
+     relative_checks: Dict[str, Any] = {}
++
+     if str(audit.get("schema", "")) != PHYSICAL_METRICS_SCHEMA:
+-        layer_reasons["contract"].append(f"missing_or_invalid_schema:{audit.get('schema','missing')}")
++        layer_reasons["contract"].append(
++            f"missing_or_invalid_schema:{audit.get('schema', 'missing')}"
++        )
+     support_contract = audit.get("support_state_contract")
+-    support_policy = str(support_contract.get("policy", "")) if isinstance(support_contract, Mapping) else ""
++    support_policy = (
++        str(support_contract.get("policy", ""))
++        if isinstance(support_contract, Mapping)
++        else ""
++    )
+     if support_policy != SUPPORT_POLICY_SOURCE:
+-        layer_reasons["contract"].append(f"source_support_policy_required:{support_policy or 'missing'}")
++        layer_reasons["contract"].append(
++            f"source_support_policy_required:{support_policy or 'missing'}"
++        )
+     if str(source_reference_audit.get("schema", "")) != SOURCE_REFERENCE_KINEMATICS_SCHEMA:
+-        layer_reasons["contract"].append("missing_or_invalid_source_reference_schema")
++        layer_reasons["contract"].append(
++            "missing_or_invalid_source_reference_schema"
++        )
++
+     cand_fps_ok, cand_fps = _required_metric(audit, "fps")
+     ref_fps_ok, ref_fps = _required_metric(source_reference_audit, "fps")
+-    if not cand_fps_ok or not ref_fps_ok or abs(cand_fps-ref_fps) > 1e-6:
++    if (
++        not cand_fps_ok
++        or not ref_fps_ok
++        or abs(cand_fps - ref_fps) > 1.0e-6
++    ):
+         layer_reasons["contract"].append("source_reference_fps_mismatch")
+     try:
+-        if abs(int(audit.get("frames")) - int(source_reference_audit.get("frames"))) > int(policy.frame_count_tolerance):
+-            layer_reasons["contract"].append("source_reference_frame_count_mismatch")
++        if (
++            abs(int(audit.get("frames")) - int(source_reference_audit.get("frames")))
++            > int(policy.frame_count_tolerance)
++        ):
++            layer_reasons["contract"].append(
++                "source_reference_frame_count_mismatch"
++            )
+     except (TypeError, ValueError):
+-        layer_reasons["contract"].append("missing_source_reference_frame_count")
+-
+-    # Source dynamics: compare root-relative, per-joint body-normalized jerk.
+-    # Raw SI jerk stays diagnostic here and remains authoritative in final generation.
++        layer_reasons["contract"].append(
++            "missing_source_reference_frame_count"
++        )
++
++    # V2.2 comparison set contract.  Candidate and reference must use exactly
++    # the same direct common mapped target bones; otherwise distribution-level
++    # source-relative jerk is not comparable and fails closed.
++    try:
++        cand_bones = tuple(int(v) for v in audit.get("unit_bone_comparison_bones", []))
++        ref_bones = tuple(
++            int(v) for v in source_reference_audit.get("unit_bone_comparison_bones", [])
++        )
++        cand_parents = tuple(
++            int(v) for v in audit.get("unit_bone_comparison_parents", [])
++        )
++        ref_parents = tuple(
++            int(v) for v in source_reference_audit.get("unit_bone_comparison_parents", [])
++        )
++    except (TypeError, ValueError):
++        cand_bones = ref_bones = cand_parents = ref_parents = ()
++
++    if not ref_bones:
++        layer_reasons["contract"].append(
++            "missing_source_reference_common_mapped_bones"
++        )
++    if not cand_bones:
++        layer_reasons["contract"].append(
++            "missing_candidate_common_mapped_bones"
++        )
++    if cand_bones and ref_bones and cand_bones != ref_bones:
++        layer_reasons["contract"].append(
++            "source_candidate_comparison_bone_set_mismatch"
++        )
++    if not ref_parents:
++        layer_reasons["contract"].append(
++            "missing_source_reference_common_mapped_bone_parents"
++        )
++    if not cand_parents:
++        layer_reasons["contract"].append(
++            "missing_candidate_common_mapped_bone_parents"
++        )
++    if cand_parents and ref_parents and cand_parents != ref_parents:
++        layer_reasons["contract"].append(
++            "source_candidate_comparison_parent_set_mismatch"
++        )
++    try:
++        cand_extremity_bones = tuple(
++            int(v) for v in audit.get("unit_bone_extremity_comparison_bones", [])
++        )
++        ref_extremity_bones = tuple(
++            int(v)
++            for v in source_reference_audit.get(
++                "unit_bone_extremity_comparison_bones", []
++            )
++        )
++    except (TypeError, ValueError):
++        cand_extremity_bones = ref_extremity_bones = ()
++    if not ref_extremity_bones:
++        layer_reasons["contract"].append(
++            "missing_source_reference_common_mapped_extremity_bones"
++        )
++    if cand_extremity_bones != ref_extremity_bones:
++        layer_reasons["contract"].append(
++            "source_candidate_extremity_comparison_bone_set_mismatch"
++        )
++
++    relative_checks["unit_bone_comparison_contract"] = {
++        "reference_bones": list(ref_bones),
++        "candidate_bones": list(cand_bones),
++        "reference_parents": list(ref_parents),
++        "candidate_parents": list(cand_parents),
++        "reference_extremity_bones": list(ref_extremity_bones),
++        "candidate_extremity_bones": list(cand_extremity_bones),
++        "exact_match": bool(
++            cand_bones
++            and ref_bones
++            and cand_bones == ref_bones
++            and cand_parents == ref_parents
++            and cand_extremity_bones == ref_extremity_bones
++            and bool(ref_extremity_bones)
++        ),
++    }
++
++    # Source anti-jitter: parent-relative unit-bone direction dynamics over the
++    # common direct mapped-bone set only.  V2.1 pelvis-relative/radius-normalized
++    # fields and all raw SI jerk values stay diagnostic here.  The final gate
++    # continues to use the unchanged world-space m/s^3 contract.
+     anti = layer_reasons["anti_jitter"]
+     normalized_specs = (
+         ("body_normalized_joint_jerk_s3_p95", policy.normalized_jerk_p95_ratio, policy.normalized_jerk_p95_margin_s3, "body_normalized_joint_jerk_p95_regressed_vs_source"),
