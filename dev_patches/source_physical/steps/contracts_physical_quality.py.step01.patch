@@ -1,0 +1,64 @@
+--- a/contracts/physical_quality.py
++++ b/contracts/physical_quality.py
+@@ -300,20 +300,37 @@
+ 
+ @dataclass(frozen=True)
+ class SourcePhysicalQualityPolicy:
+-    """Pre-training Retarget Clean policy, never used by final generation."""
+-
+-    normalized_jerk_p95_ratio: float = 1.15
+-    normalized_jerk_p95_margin_s3: float = 75.0
+-    normalized_jerk_p99_ratio: float = 1.20
+-    normalized_jerk_p99_margin_s3: float = 150.0
+-    normalized_jerk_window_ratio: float = 1.20
+-    normalized_jerk_window_margin_s3: float = 100.0
+-    normalized_extremity_jerk_p95_ratio: float = 1.15
+-    normalized_extremity_jerk_p95_margin_s3: float = 75.0
+-    normalized_extremity_jerk_p99_ratio: float = 1.20
+-    normalized_extremity_jerk_p99_margin_s3: float = 150.0
+-    normalized_extremity_jerk_window_ratio: float = 1.20
+-    normalized_extremity_jerk_window_margin_s3: float = 150.0
++    """Pre-training Retarget Clean policy, never used by final generation.
++
++    Source anti-jitter is measured on parent-relative unit-bone direction
++    trajectories over the direct common source/target mapped-bone set.  A
++    source-only absolute noise floor prevents very-low-dynamic recordings from
++    turning harmless optimizer residuals into arbitrarily large ratios.  The
++    absolute SI final-generation contract is intentionally not represented in
++    these fields.
++    """
++
++    unit_bone_jerk_p95_ratio: float = 1.15
++    unit_bone_jerk_p95_margin_s3: float = 75.0
++    unit_bone_jerk_p99_ratio: float = 1.20
++    unit_bone_jerk_p99_margin_s3: float = 150.0
++    unit_bone_jerk_window_ratio: float = 1.20
++    unit_bone_jerk_window_margin_s3: float = 100.0
++    unit_bone_extremity_jerk_p95_ratio: float = 1.15
++    unit_bone_extremity_jerk_p95_margin_s3: float = 75.0
++    unit_bone_extremity_jerk_p99_ratio: float = 1.20
++    unit_bone_extremity_jerk_p99_margin_s3: float = 150.0
++    unit_bone_extremity_jerk_window_ratio: float = 1.20
++    unit_bone_extremity_jerk_window_margin_s3: float = 150.0
++    # Source-only calibration floors.  These never participate in final
++    # generation auditing; they only stop low-dynamic reference clips from
++    # producing unstable candidate/reference ratios.
++    unit_bone_jerk_p95_floor_s3: float = 1900.0
++    unit_bone_jerk_p99_floor_s3: float = 4500.0
++    unit_bone_jerk_window_floor_s3: float = 11000.0
++    unit_bone_extremity_jerk_p95_floor_s3: float = 2800.0
++    unit_bone_extremity_jerk_p99_floor_s3: float = 7500.0
++    unit_bone_extremity_jerk_window_floor_s3: float = 22000.0
+     foot_drift_p95_ratio: float = 1.25
+     foot_drift_p95_margin_m: float = 0.03
+     foot_drift_max_ratio: float = 1.35
+@@ -323,6 +340,9 @@
+     foot_penetration_p01_floor_m: float = -0.10
+     foot_penetration_p001_margin_m: float = 0.06
+     foot_penetration_p001_floor_m: float = -0.14
++    # Quantile comparison epsilon only.  Catastrophic penetration remains
++    # governed independently by threshold/run-duration hard gates.
++    foot_penetration_p001_comparison_epsilon_m: float = 0.002
+     foot_penetration_catastrophic_threshold_m: float = -0.18
+     foot_penetration_catastrophic_max_seconds: float = 0.08
+     root_range_ratio: float = 1.20
