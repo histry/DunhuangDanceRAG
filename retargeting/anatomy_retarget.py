@@ -8,7 +8,12 @@ Key corrections:
 - source-structure-guided upright/order targets;
 - nonlinear loss scheduling;
 - matrix-space overlap fusion followed by SVD projection;
-- catastrophic source gate separated from event-level quality filtering.
+- catastrophic source gate separated from event-level quality filtering;
+- optional V2.4.1 source-relative unit-bone direction matching on the strict
+  common direct source/target mapped-bone set.
+
+The V2.4.1 term is deliberately opt-in.  With both direction weights at zero,
+this module retains the research objective used by Retarget Clean V2.3.
 """
 from __future__ import annotations
 
@@ -16,8 +21,10 @@ import copy
 import json
 import math
 import os
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -81,6 +88,165 @@ def _smoothstep01(x: float) -> float:
     return y * y * (3.0 - 2.0 * y)
 
 
+@dataclass(frozen=True)
+class SourceDirectionRegularization:
+    """V2.4.1 source-relative direction matching for the research solver.
+
+    The field names intentionally preserve the V2.4 diagnostic vocabulary, but
+    the authoritative environment variables live in the Retarget Clean research
+    namespace.  Zero weights are the production/default contract.
+    """
+
+    bone_direction_velocity_weight: float = 0.0
+    bone_direction_acceleration_weight: float = 0.0
+    velocity_beta: float = 0.02
+    acceleration_beta: float = 0.01
+    normalized_reference_fps: float = 30.0
+
+    @classmethod
+    def from_environment(cls) -> "SourceDirectionRegularization":
+        return cls(
+            bone_direction_velocity_weight=env_float(
+                "RETARGET_CLEAN_BONE_DIR_VEL_W", 0.0
+            ),
+            bone_direction_acceleration_weight=env_float(
+                "RETARGET_CLEAN_BONE_DIR_ACC_W", 0.0
+            ),
+            velocity_beta=max(
+                1.0e-8,
+                env_float("RETARGET_CLEAN_BONE_DIR_VEL_BETA", 0.02),
+            ),
+            acceleration_beta=max(
+                1.0e-8,
+                env_float("RETARGET_CLEAN_BONE_DIR_ACC_BETA", 0.01),
+            ),
+            normalized_reference_fps=max(
+                1.0e-6,
+                env_float("RETARGET_CLEAN_BONE_DIR_REFERENCE_FPS", 30.0),
+            ),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.bone_direction_velocity_weight > 0.0
+            or self.bone_direction_acceleration_weight > 0.0
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["enabled"] = bool(self.enabled)
+        return payload
+
+
+@dataclass(frozen=True)
+class _SourceDirectionContext:
+    settings: SourceDirectionRegularization
+    common_bone_children: Tuple[int, ...]
+
+
+_SOURCE_DIRECTION_CONTEXT: ContextVar[Optional[_SourceDirectionContext]] = ContextVar(
+    "retarget_clean_source_direction_context",
+    default=None,
+)
+
+
+def common_direct_mapped_bone_children(
+    bvh: Any,
+    mapping: Dict[int, int],
+) -> Tuple[int, ...]:
+    """Strict source/target-common target bone children used by V2.4.1.
+
+    Child and parent must both be direct mappings, must not collapse to the same
+    source proxy, and the source child's direct parent must equal the mapped
+    target parent.  This excludes target virtual belly/interpolation edges and
+    EndSite fallbacks exactly as the V2.2 source physical contract requires.
+    """
+
+    children = []
+    for child in range(1, int(NUM_JOINTS)):
+        parent = int(legacy.PARENTS[child])
+        if child not in mapping or parent not in mapping:
+            continue
+        src_child = int(mapping[child])
+        src_parent = int(mapping[parent])
+        if src_child == src_parent:
+            continue
+        if src_child < 0 or src_child >= len(bvh.joints):
+            continue
+        if src_parent < 0 or src_parent >= len(bvh.joints):
+            continue
+        if int(bvh.joints[src_child].parent) != src_parent:
+            continue
+        children.append(int(child))
+    return tuple(children)
+
+
+def _bone_direction_derivative_losses(
+    candidate_joints: torch.Tensor,
+    source_target_positions: torch.Tensor,
+    *,
+    children: Iterable[int],
+    target_fps: float,
+    settings: SourceDirectionRegularization,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Match source/candidate parent-relative unit-bone temporal derivatives.
+
+    This is *not* smoothing toward zero.  Authentic fast source dynamics remain
+    the target; only extra candidate directional oscillation is penalised.
+    """
+
+    child_ids = tuple(int(v) for v in children)
+    zero = candidate_joints.new_zeros(())
+    if not child_ids or len(candidate_joints) < 2:
+        return zero, zero
+
+    child = torch.as_tensor(
+        child_ids,
+        dtype=torch.long,
+        device=candidate_joints.device,
+    )
+    parent = torch.as_tensor(
+        [int(legacy.PARENTS[idx]) for idx in child_ids],
+        dtype=torch.long,
+        device=candidate_joints.device,
+    )
+
+    source_vec = source_target_positions[:, child] - source_target_positions[:, parent]
+    candidate_vec = candidate_joints[:, child] - candidate_joints[:, parent]
+    source_dir = F.normalize(source_vec, dim=-1, eps=1.0e-6)
+    candidate_dir = F.normalize(candidate_vec, dim=-1, eps=1.0e-6)
+
+    # Express discrete differences at a 30-fps-equivalent time base so the
+    # regulariser has comparable numerical scale when target FPS changes.
+    rate = float(target_fps) / float(settings.normalized_reference_fps)
+    source_d1 = (source_dir[1:] - source_dir[:-1]) * rate
+    candidate_d1 = (candidate_dir[1:] - candidate_dir[:-1]) * rate
+    velocity = F.smooth_l1_loss(
+        candidate_d1,
+        source_d1,
+        beta=float(settings.velocity_beta),
+    )
+
+    if len(candidate_dir) < 3:
+        return velocity, zero
+
+    source_d2 = (
+        source_dir[2:] - 2.0 * source_dir[1:-1] + source_dir[:-2]
+    ) * (rate * rate)
+    candidate_d2 = (
+        candidate_dir[2:]
+        - 2.0 * candidate_dir[1:-1]
+        + candidate_dir[:-2]
+    ) * (rate * rate)
+    acceleration = F.smooth_l1_loss(
+        candidate_d2,
+        source_d2,
+        beta=float(settings.acceleration_beta),
+    )
+    return velocity, acceleration
+
+
 def _fit_chunk_research(
     source_target_pos: np.ndarray,
     source_mask: np.ndarray,
@@ -89,14 +255,22 @@ def _fit_chunk_research(
     floor_y: float,
     cfg: Any,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
-    device = torch.device(cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu")
+    device = torch.device(
+        cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu"
+    )
     target = torch.as_tensor(source_target_pos, dtype=torch.float32, device=device)
     mask = torch.as_tensor(source_mask, dtype=torch.float32, device=device)
-    weights = torch.as_tensor(legacy.TARGET_JOINT_WEIGHTS, dtype=torch.float32, device=device)
+    weights = torch.as_tensor(
+        legacy.TARGET_JOINT_WEIGHTS, dtype=torch.float32, device=device
+    )
     weighted_mask = mask * weights.view(1, -1)
 
-    root = torch.tensor(init_root, dtype=torch.float32, device=device, requires_grad=True)
-    rot = torch.tensor(init_rot6d, dtype=torch.float32, device=device, requires_grad=True)
+    root = torch.tensor(
+        init_root, dtype=torch.float32, device=device, requires_grad=True
+    )
+    rot = torch.tensor(
+        init_rot6d, dtype=torch.float32, device=device, requires_grad=True
+    )
     init_rot = torch.tensor(init_rot6d, dtype=torch.float32, device=device)
     init_projected = legacy._project6d_torch(init_rot).detach()
     init_mats = legacy._rot6d_to_matrix_torch(init_projected).detach()
@@ -112,9 +286,21 @@ def _fit_chunk_research(
     target_pelvis = target[:, 0]
     target_head = target[:, 15]
     target_feet = target[:, list(FOOT_JOINTS)]
-    target_torso_cos = F.normalize(target_head - target_pelvis, dim=-1, eps=1e-8)[:, 1].detach()
+    target_torso_cos = F.normalize(
+        target_head - target_pelvis, dim=-1, eps=1e-8
+    )[:, 1].detach()
     target_head_margin = (target_head[:, 1] - target_pelvis[:, 1]).detach()
-    target_feet_margin = (target_pelvis[:, 1] - target_feet[..., 1].mean(dim=1)).detach()
+    target_feet_margin = (
+        target_pelvis[:, 1] - target_feet[..., 1].mean(dim=1)
+    ).detach()
+
+    direction_context = _SOURCE_DIRECTION_CONTEXT.get()
+    if direction_context is None:
+        direction_settings = SourceDirectionRegularization()
+        direction_bones: Tuple[int, ...] = ()
+    else:
+        direction_settings = direction_context.settings
+        direction_bones = direction_context.common_bone_children
 
     last: Dict[str, float] = {}
     fps = float(getattr(cfg, "target_fps", 30.0))
@@ -124,7 +310,9 @@ def _fit_chunk_research(
         local_mats = legacy._rot6d_to_matrix_torch(projected)
         joints = legacy._fk_target_torch(root, projected)
 
-        diff = F.smooth_l1_loss(joints, target, reduction="none", beta=0.025).sum(dim=-1)
+        diff = F.smooth_l1_loss(
+            joints, target, reduction="none", beta=0.025
+        ).sum(dim=-1)
         key = (diff * weighted_mask).sum() / weighted_mask.sum().clamp_min(1.0)
         root_loss = F.smooth_l1_loss(root, source_root, beta=0.025)
 
@@ -159,7 +347,9 @@ def _fit_chunk_research(
             device=root_delta.device,
         )
         root_anchor = (root_delta.square() * root_axis_w).mean()
-        pose_prior = so3_geodesic_torch(local_mats[:, 1:], init_mats[:, 1:]).square().mean()
+        pose_prior = so3_geodesic_torch(
+            local_mats[:, 1:], init_mats[:, 1:]
+        ).square().mean()
 
         pelvis = joints[:, 0]
         head = joints[:, 15]
@@ -169,19 +359,43 @@ def _fit_chunk_research(
         target_floor = (target_torso_cos - source_margin).clamp_min(0.10)
         upright = F.relu(target_floor - torso_cos).square().mean()
 
-        head_floor = (target_head_margin - env_float("RETARGET_CLEAN_HEAD_SOURCE_MARGIN_M", 0.06)).clamp_min(0.06)
-        feet_floor = (target_feet_margin - env_float("RETARGET_CLEAN_FEET_SOURCE_MARGIN_M", 0.08)).clamp_min(0.12)
-        head_order = F.relu(head_floor - (head[:, 1] - pelvis[:, 1])).square().mean()
-        feet_order = F.relu(feet_floor - (pelvis[:, 1] - feet[..., 1].mean(dim=1))).square().mean()
+        head_floor = (
+            target_head_margin
+            - env_float("RETARGET_CLEAN_HEAD_SOURCE_MARGIN_M", 0.06)
+        ).clamp_min(0.06)
+        feet_floor = (
+            target_feet_margin
+            - env_float("RETARGET_CLEAN_FEET_SOURCE_MARGIN_M", 0.08)
+        ).clamp_min(0.12)
+        head_order = F.relu(
+            head_floor - (head[:, 1] - pelvis[:, 1])
+        ).square().mean()
+        feet_order = F.relu(
+            feet_floor - (pelvis[:, 1] - feet[..., 1].mean(dim=1))
+        ).square().mean()
         penetration = F.relu(floor + 0.003 - feet[..., 1]).square().mean()
 
         anatomy = anatomy_losses_torch(joints, local_mats, anatomy_w)
 
         # Paper-inspired nonlinear schedule: structure priors dominate early,
-        # anatomy constraints rise smoothly after coarse alignment.
+        # anatomy constraints rise smoothly after coarse alignment.  V2.4.1
+        # direction matching starts only after coarse pose alignment is present.
         anatomy_scale = _smoothstep01((progress - 0.08) / 0.55)
         prior_scale = 0.20 + 0.80 * math.exp(-2.8 * progress)
         key_scale = 1.0 + 0.20 * math.exp(-3.0 * progress)
+        direction_scale = _smoothstep01((progress - 0.15) / 0.50)
+
+        if direction_settings.enabled and direction_bones:
+            bone_dir_vel, bone_dir_acc = _bone_direction_derivative_losses(
+                joints,
+                target,
+                children=direction_bones,
+                target_fps=fps,
+                settings=direction_settings,
+            )
+        else:
+            bone_dir_vel = root.new_zeros(())
+            bone_dir_acc = root.new_zeros(())
 
         loss = (
             key_scale * env_float("RETARGET_KEYPOINT_W", 24.0) * key
@@ -196,11 +410,19 @@ def _fit_chunk_research(
             + env_float("RETARGET_FEET_ORDER_W", 1.5) * feet_order
             + env_float("RETARGET_FLOOR_W", 8.0) * penetration
             + anatomy_scale * anatomy["total"]
+            + direction_scale
+            * float(direction_settings.bone_direction_velocity_weight)
+            * bone_dir_vel
+            + direction_scale
+            * float(direction_settings.bone_direction_acceleration_weight)
+            * bone_dir_acc
         )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([root, rot], env_float("RETARGET_GRAD_CLIP", 1.5))
+        torch.nn.utils.clip_grad_norm_(
+            [root, rot], env_float("RETARGET_GRAD_CLIP", 1.5)
+        )
         optimizer.step()
 
         every = max(1, env_int("RETARGET_PROGRESS_EVERY", 25))
@@ -219,6 +441,14 @@ def _fit_chunk_research(
                 "anatomy_torso": float(anatomy["torso"].detach().cpu()),
                 "anatomy_collision": float(anatomy["collision"].detach().cpu()),
                 "style_gate_mean": float(anatomy["style_gate_mean"].detach().cpu()),
+                "bone_direction_velocity_match": float(
+                    bone_dir_vel.detach().cpu()
+                ),
+                "bone_direction_acceleration_match": float(
+                    bone_dir_acc.detach().cpu()
+                ),
+                "bone_direction_schedule_scale": float(direction_scale),
+                "bone_direction_common_bone_count": int(len(direction_bones)),
                 "iterations": int(iters),
                 "learning_rate": float(lr),
             }
@@ -228,6 +458,8 @@ def _fit_chunk_research(
                     f"device={device} frames={len(root)} step={step + 1}/{iters} "
                     f"loss={last['loss']:.6f} key={last['key']:.6f} "
                     f"so3v={last['so3_velocity']:.6f} anatomy={last['anatomy_total']:.6f} "
+                    f"bonev={last['bone_direction_velocity_match']:.6f} "
+                    f"bonea={last['bone_direction_acceleration_match']:.6f} "
                     f"floor_loss={last['penetration']:.6f}",
                     flush=True,
                 )
@@ -266,8 +498,10 @@ def _fit_target_motion_research(
     init_rot[:, 0] = legacy.matrix_to_rot6d_np(root_R)
 
     source_foot_ids = [mapping[t] for t in FOOT_JOINTS if t in mapping]
-    floor_y = float(np.percentile(aligned_source_positions[:, source_foot_ids, 1], 5)) if source_foot_ids else float(
-        np.percentile(target_pos[:, [7, 8], 1], 5)
+    floor_y = (
+        float(np.percentile(aligned_source_positions[:, source_foot_ids, 1], 5))
+        if source_foot_ids
+        else float(np.percentile(target_pos[:, [7, 8], 1], 5))
     )
 
     chunk = max(32, int(cfg.chunk_frames))
@@ -283,7 +517,12 @@ def _fit_target_motion_research(
         if ed - st < 4:
             continue
         r, q, rep = _fit_chunk_research(
-            target_pos[st:ed], mask[st:ed], init_root[st:ed], init_rot[st:ed], floor_y, cfg
+            target_pos[st:ed],
+            mask[st:ed],
+            init_root[st:ed],
+            init_rot[st:ed],
+            floor_y,
+            cfg,
         )
         mats = rot6d_to_matrix_np(q)
         L = ed - st
@@ -326,12 +565,18 @@ def _fit_target_motion_research(
     speed = np.zeros(feet.shape[:2], dtype=np.float32)
     if T > 1:
         speed[1:] = (
-            np.linalg.norm(feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1)
+            np.linalg.norm(
+                feet[1:, :, [0, 2]] - feet[:-1, :, [0, 2]], axis=-1
+            )
             * float(cfg.target_fps)
         )
     height = feet[..., 1] - fitted_floor
-    contacts = (height <= float(cfg.contact_height_m)) & (speed <= float(cfg.contact_speed_mps))
-    contact_median_size = max(1, int(round(float(cfg.contact_median_seconds) * float(cfg.target_fps))))
+    contacts = (height <= float(cfg.contact_height_m)) & (
+        speed <= float(cfg.contact_speed_mps)
+    )
+    contact_median_size = max(
+        1, int(round(float(cfg.contact_median_seconds) * float(cfg.target_fps)))
+    )
     if contact_median_size % 2 == 0:
         contact_median_size += 1
     if legacy.median_filter is not None and contact_median_size > 1:
@@ -349,20 +594,26 @@ def _fit_target_motion_research(
     if cfg.floor_to_zero:
         floor_ids = [t for t in FOOT_JOINTS if t in mapping]
         if floor_ids:
-            target_eval[..., 1] -= float(np.percentile(target_eval[:, floor_ids, 1], 5))
+            target_eval[..., 1] -= float(
+                np.percentile(target_eval[:, floor_ids, 1], 5)
+            )
     pred = fk24_np(motion)
     per_frame = []
     for t in range(T):
         ids = np.where(mask[t] > 0.5)[0]
         if len(ids):
-            per_frame.append(float(np.sqrt(np.mean((pred[t, ids] - target_eval[t, ids]) ** 2))))
+            per_frame.append(
+                float(np.sqrt(np.mean((pred[t, ids] - target_eval[t, ids]) ** 2)))
+            )
     fit_arr = np.asarray(per_frame, dtype=np.float32)
 
     return motion, {
         "floor_y_after": float(fitted_floor),
         "contact_ratio": float(contacts.mean()),
         "fit_rmse_mean_m": float(fit_arr.mean()) if fit_arr.size else 0.0,
-        "fit_rmse_p95_m": float(np.percentile(fit_arr, 95)) if fit_arr.size else 0.0,
+        "fit_rmse_p95_m": (
+            float(np.percentile(fit_arr, 95)) if fit_arr.size else 0.0
+        ),
         "root_orientation_contract": {
             "version": "retarget_clean_soft_source_body_frame_contract",
             "mode": "soft_geodesic_anchor",
@@ -375,13 +626,31 @@ def _fit_target_motion_research(
     }
 
 
-def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+def retarget_bvh_research(
+    path: str | Path,
+    cfg: Optional[Any] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     cfg = copy.deepcopy(cfg or legacy.RetargetConfig.from_env())
-    cfg.iterations = env_int("RETARGET_CLEAN_ITERATIONS", env_int("RETARGET_ITERS", 280))
-    cfg.learning_rate = env_float("RETARGET_CLEAN_LEARNING_RATE", env_float("RETARGET_LR", 0.018))
+    cfg.iterations = env_int(
+        "RETARGET_CLEAN_ITERATIONS", env_int("RETARGET_ITERS", 280)
+    )
+    cfg.learning_rate = env_float(
+        "RETARGET_CLEAN_LEARNING_RATE", env_float("RETARGET_LR", 0.018)
+    )
     cfg.fit_rmse_p95_max_m = env_float("RETARGET_FIT_RMSE_P95_MAX_M", 0.14)
     cfg.root_orientation_lock = False
     cfg.hard_gravity_gate = False
+
+    settings = SourceDirectionRegularization.from_environment()
+    source_bvh = legacy.parse_bvh(path)
+    source_mapping = legacy.build_joint_mapping(source_bvh.joints)
+    common_bones = common_direct_mapped_bone_children(source_bvh, source_mapping)
+    direction_token = _SOURCE_DIRECTION_CONTEXT.set(
+        _SourceDirectionContext(
+            settings=settings,
+            common_bone_children=common_bones,
+        )
+    )
 
     old_fit = legacy._fit_chunk
     old_target = legacy.fit_target_motion
@@ -392,19 +661,31 @@ def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[
     finally:
         legacy._fit_chunk = old_fit
         legacy.fit_target_motion = old_target
+        _SOURCE_DIRECTION_CONTEXT.reset(direction_token)
 
     anatomy = anatomy_metrics_np(motion, fps=float(cfg.target_fps))
     source_th = SourceAnatomyThresholds.from_env()
     anatomy_ok, anatomy_reasons = evaluate_source_anatomy_contract(anatomy, source_th)
 
     from contracts.gravity import gravity_metrics_np
+
     gravity = gravity_metrics_np(motion, float(cfg.target_fps))
     gravity_th = GravityThresholds(
-        torso_up_cos_p05_min=env_float("RETARGET_SOURCE_GRAVITY_TORSO_P05_MIN", 0.30),
-        torso_up_cos_median_min=env_float("RETARGET_SOURCE_GRAVITY_TORSO_MEDIAN_MIN", 0.55),
-        head_above_pelvis_ratio_min=env_float("RETARGET_SOURCE_HEAD_ABOVE_RATIO_MIN", 0.85),
-        feet_below_pelvis_ratio_min=env_float("RETARGET_SOURCE_FEET_BELOW_RATIO_MIN", 0.85),
-        horizontal_body_ratio_max=env_float("RETARGET_SOURCE_HORIZONTAL_BODY_RATIO_MAX", 0.20),
+        torso_up_cos_p05_min=env_float(
+            "RETARGET_SOURCE_GRAVITY_TORSO_P05_MIN", 0.30
+        ),
+        torso_up_cos_median_min=env_float(
+            "RETARGET_SOURCE_GRAVITY_TORSO_MEDIAN_MIN", 0.55
+        ),
+        head_above_pelvis_ratio_min=env_float(
+            "RETARGET_SOURCE_HEAD_ABOVE_RATIO_MIN", 0.85
+        ),
+        feet_below_pelvis_ratio_min=env_float(
+            "RETARGET_SOURCE_FEET_BELOW_RATIO_MIN", 0.85
+        ),
+        horizontal_body_ratio_max=env_float(
+            "RETARGET_SOURCE_HORIZONTAL_BODY_RATIO_MAX", 0.20
+        ),
     )
     gravity_ok, gravity_reasons = evaluate_gravity_contract(gravity, gravity_th)
 
@@ -436,13 +717,24 @@ def retarget_bvh_research(path: str | Path, cfg: Optional[Any] = None) -> Tuple[
             "source_gate_ok": bool(anatomy_ok and gravity_ok and fit_ok),
             "source_gate_reasons": reasons,
             "event_gate_required": True,
+            "source_direction_regularization": {
+                **settings.to_dict(),
+                "common_direct_mapped_bone_children": list(common_bones),
+                "common_direct_mapped_bone_count": int(len(common_bones)),
+                "solver": "anatomy_retarget_research_so3",
+                "activation_contract": "explicit_opt_in",
+                "baseline_contract": (
+                    "zero_weights_preserve_v2_3_research_objective"
+                ),
+            },
             "ok": bool(anatomy_ok and gravity_ok and fit_ok),
         }
     )
 
     if env_bool("RETARGET_HARD_RETARGET_GATE", True) and not report["ok"]:
         raise RuntimeError(
-            f"Retarget Clean source safety contract failed for {path}: " + " | ".join(reasons)
+            f"Retarget Clean source safety contract failed for {path}: "
+            + " | ".join(reasons)
         )
     return motion.astype(np.float32), report
 
@@ -469,8 +761,23 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     np.save(out, motion)
     rp = Path(args.report) if args.report else out.with_suffix(".retarget.json")
-    rp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"motion": str(out), "report": str(rp), "frames": len(motion), "ok": report["ok"]}, indent=2))
+    rp.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "motion": str(out),
+                "report": str(rp),
+                "frames": len(motion),
+                "ok": report["ok"],
+                "source_direction_regularization": report.get(
+                    "source_direction_regularization", {}
+                ),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

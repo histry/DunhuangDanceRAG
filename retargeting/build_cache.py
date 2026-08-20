@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import retargeting.source_regularized_solver as legacy
+import retargeting.bvh_solver as legacy
 from contracts.anatomy import env_bool, env_int
 from contracts.gravity import fk24_np
 from contracts.physical_quality import evaluate_source_physical_clean_audit
