@@ -23,6 +23,8 @@ PY="${GENERATION_PYTHON}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUT_ROOT="${OUT_ROOT:-output/fresh_audio_fresh_wav_${RUN_TAG}}"
 RETARGET_CACHE="${RETARGET_CACHE:-$OUT_ROOT/retarget_cache}"
+SOURCE_MODE="${RETARGET_CLEAN_SOURCE_MODE:-chang_e_official_smpl}"
+OFFICIAL_SMPL_DIR="${CHANG_E_OFFICIAL_SMPL_DIR:-$ROOT_DIR/assets/motion/smpl}"
 CACHE_SPLIT_ROOT="${CACHE_SPLIT_ROOT:-$OUT_ROOT/retarget_cache_split}"
 DB_SPLIT_ROOT="${DB_SPLIT_ROOT:-$OUT_ROOT/event_db_split}"
 ALL_DB_DIR="${ALL_DB_DIR:-$OUT_ROOT/all_change_demo_db}"
@@ -67,29 +69,58 @@ require_file() {
 }
 
 echo "========== Fresh-Audio Generation FORMAL PATHS =========="
-printf "PY=%s\nOUT_ROOT=%s\nAUDIO=%s\nCHANGE_BVH_DIR=%s\nCONFIG=%s\nDB_MODE=%s\n" \
-  "$PY" "$OUT_ROOT" "$AUDIO" "$CHANGE_BVH_DIR" "$CONFIG" "$GENERATION_DB_MODE"
+printf "PY=%s\nOUT_ROOT=%s\nAUDIO=%s\nSOURCE_MODE=%s\nCHANGE_BVH_DIR=%s\nOFFICIAL_SMPL_DIR=%s\nCONFIG=%s\nDB_MODE=%s\n" \
+  "$PY" "$OUT_ROOT" "$AUDIO" "$SOURCE_MODE" "$CHANGE_BVH_DIR" "$OFFICIAL_SMPL_DIR" "$CONFIG" "$GENERATION_DB_MODE"
 
 require_file "$AUDIO" "current WAV"
 require_file "$CONFIG" "Motion Generation config"
 
-echo "========== 1. STRICT Source-Motion RETARGET CACHE =========="
+echo "========== 1. SOURCE-AWARE SOURCE CACHE =========="
 if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" ]]; then
-  "$PY" retargeting/build_retarget_cache.py \
-    --in_dir "$CHANGE_BVH_DIR" \
-    --out_dir "$RETARGET_CACHE" \
-    --overwrite
+  case "$SOURCE_MODE" in
+    chang_e_official_smpl)
+      "$PY" retargeting/official_smpl_source_preprocess.py \
+        --in_dir "$OFFICIAL_SMPL_DIR" \
+        --out_dir "$RETARGET_CACHE" \
+        --source_manifest "$CHANG_E_SOURCE_MANIFEST" \
+        --target_fps "$GENERATION_FPS" \
+        --min_ok_sources "$RETARGET_MIN_OK_SOURCES" \
+        --overwrite
+      ;;
+    bvh_retarget)
+      "$PY" retargeting/build_retarget_cache.py \
+        --in_dir "$CHANGE_BVH_DIR" \
+        --out_dir "$RETARGET_CACHE" \
+        --overwrite
+      ;;
+    *)
+      echo "[FATAL] Unknown source mode: $SOURCE_MODE" >&2
+      exit 2
+      ;;
+  esac
 else
   require_file "$RETARGET_CACHE/event_heading_retarget_cache_report.json" \
-    "existing retarget cache report"
+    "existing source cache report"
 fi
 
-echo "========== 2. RETARGET GRAVITY AUDIT =========="
-"$PY" evaluation/audit_gravity.py \
-  --motion_dir "$RETARGET_CACHE" \
-  --fps "$GENERATION_FPS" \
-  --out "$OUT_ROOT/retarget_cache.gravity.json" \
-  --csv "$OUT_ROOT/retarget_cache.gravity.csv"
+echo "========== 2. SOURCE GRAVITY DIAGNOSTIC =========="
+if [[ "$SOURCE_MODE" == "chang_e_official_smpl" ]]; then
+  # Direct official SMPL is not rejected at whole-source level for a
+  # posture-style gravity statistic. Event-level anatomy remains strict.
+  "$PY" evaluation/audit_gravity.py \
+    --motion_dir "$RETARGET_CACHE" \
+    --profile source \
+    --allow_failed \
+    --fps "$GENERATION_FPS" \
+    --out "$OUT_ROOT/retarget_cache.gravity.json" \
+    --csv "$OUT_ROOT/retarget_cache.gravity.csv"
+else
+  "$PY" evaluation/audit_gravity.py \
+    --motion_dir "$RETARGET_CACHE" \
+    --fps "$GENERATION_FPS" \
+    --out "$OUT_ROOT/retarget_cache.gravity.json" \
+    --csv "$OUT_ROOT/retarget_cache.gravity.csv"
+fi
 
 echo "========== 3. SOURCE SPLIT BEFORE EVENT SLICING =========="
 "$PY" data_pipeline/split_sources.py \

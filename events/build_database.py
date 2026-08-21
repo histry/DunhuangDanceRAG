@@ -127,6 +127,23 @@ def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool
     if not bool(report.get("ok", False)):
         reasons.append("retarget_report_not_ok")
 
+    source_preprocess = report.get("source_preprocess_contract", {})
+    if str(source_preprocess.get("schema", "")) == "chang_e_official_smpl_source_aware_preprocess_v1":
+        if not bool(report.get("source_gate_ok", False)):
+            reasons.append("source_aware_source_gate_not_ok")
+        if not bool(report.get("source_preprocess_ok", False)):
+            reasons.append("source_aware_preprocess_not_ok")
+        if bool(report.get("retargeting_applied", True)):
+            reasons.append("source_aware_unexpected_retargeting")
+        if not bool(source_preprocess.get("direct_official_smpl", False)):
+            reasons.append("source_aware_not_direct_official_smpl")
+        if bool(source_preprocess.get("retargeting_applied", True)):
+            reasons.append("source_aware_contract_retargeting_applied")
+        segment = report.get("preprocess_segment", {})
+        if not bool(segment.get("clean", False)):
+            reasons.append("source_aware_segment_not_clean")
+        return not reasons, reasons
+
     pos = report.get("source_position_contract", {})
     if str(pos.get("nonroot_position_mode", "")) != "ignore":
         reasons.append("nonroot_position_mode_not_ignore")
@@ -463,11 +480,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             or path
         )
         sem = motion_runtime.parse_change_bvh_semantics(original_source)
+        report_metadata = rep.get("source_metadata")
+        if isinstance(report_metadata, dict):
+            sem = dict(sem)
+            sem.update({
+                "source_uid": report_metadata.get("source_id", sem.get("source_uid")),
+                "recording_uid": report_metadata.get("recording_uid", sem.get("recording_uid")),
+                "performer_track_id": report_metadata.get("performer_track_id", sem.get("performer_track_id", -1)),
+                "sequence_index": report_metadata.get("sequence_index", sem.get("sequence_index", -1)),
+                "performer_group": report_metadata.get("performer_group", sem.get("performer_group")),
+                "dance_key": report_metadata.get("dance_category", sem.get("dance_key")),
+                "dance_category": report_metadata.get("dance_category", sem.get("dance_category")),
+            })
         strong_base = motion_runtime.strong_action_semantics_from_meta(sem)
         semantic_meta = {**sem, **strong_base}
         source_uid = str(sem.get("source_uid") or Path(original_source).stem)
+        preprocess_segment = rep.get("preprocess_segment", {})
+        source_segment_index = int(preprocess_segment.get("segment_index", 0))
+        source_segment_start_seconds = float(preprocess_segment.get("source_start_seconds", 0.0))
+        source_duration_seconds = float(rep.get("source_duration_seconds", 0.0) or 0.0)
 
-        for seq_id, seq0 in enumerate(seqs):
+        for local_seq_id, seq0 in enumerate(seqs):
+            seq_id = source_segment_index + int(local_seq_id)
             seq, contract = motion_runtime.enforce_edge151_contract_np(
                 seq0,
                 cfg,
@@ -558,12 +592,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 identity_start_seconds = (
                     float(canonical_row["start_seconds"])
                     if canonical_row is not None
-                    else float(st) / float(cfg.fps)
+                    else source_segment_start_seconds + float(st) / float(cfg.fps)
                 )
                 identity_end_seconds = (
                     float(canonical_row["end_seconds"])
                     if canonical_row is not None
-                    else float(ed) / float(cfg.fps)
+                    else source_segment_start_seconds + float(ed) / float(cfg.fps)
                 )
                 base_meta = {
                     **sem,
@@ -577,7 +611,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "label": sem.get("label", Path(original_source).stem),
                     "parent_label": sem.get("parent_label", sem.get("label", "unknown")),
                     "fragment_index": int(seg_idx),
-                    "input_mode": "event_heading_source_motion_retarget_cache",
+                    "source_segment_index": int(source_segment_index),
+                    "source_segment_start_seconds": float(source_segment_start_seconds),
+                    "input_mode": (
+                        "chang_e_official_smpl_source_aware_cache"
+                        if str(rep.get("schema", "")) == "chang_e_official_smpl_source_aware_preprocess_v1"
+                        else "event_heading_source_motion_retarget_cache"
+                    ),
                     "event_start": int(st),
                     "event_end": int(ed),
                     "event_source_frames": int(len(seq)),
@@ -587,7 +627,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "source_start_seconds": identity_start_seconds,
                     "source_end_seconds": identity_end_seconds,
                     "canonical_fps": float(cfg.fps),
-                    "event_position_mid": float((st + ed) * 0.5 / max(len(seq), 1)),
+                    "event_position_mid": float(
+                        np.clip(
+                            (
+                                source_segment_start_seconds
+                                + (st + ed) * 0.5 / float(cfg.fps)
+                            ) / source_duration_seconds,
+                            0.0,
+                            1.0,
+                        )
+                        if source_duration_seconds > 0.0
+                        else (st + ed) * 0.5 / max(len(seq), 1)
+                    ),
                     "resample_report": {
                         "resampled": False,
                         "native_fps": float(cfg.fps),

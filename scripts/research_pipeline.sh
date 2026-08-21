@@ -34,6 +34,8 @@ OUT_ROOT="${OUT_ROOT:-$ROOT_DIR/output/retarget_clean_research_${RUN_TAG}}"
 export OUT_ROOT
 export ROOT_DIR
 export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
+export CHANG_E_OFFICIAL_SMPL_DIR="${CHANG_E_OFFICIAL_SMPL_DIR:-$ROOT_DIR/assets/motion/smpl}"
+export RETARGET_CLEAN_SOURCE_MODE="${RETARGET_CLEAN_SOURCE_MODE:-chang_e_official_smpl}"
 export GROUNDING_GROUNDER_CKPT="${GROUNDING_GROUNDER_CKPT:-$OUT_ROOT/event_geometry_dual_branch_grounder.pt}"
 PY="${GENERATION_PYTHON:-${PYTHON_BIN:-python}}"
 export GENERATION_PYTHON="$PY"
@@ -47,7 +49,9 @@ ROOT_DIR=$ROOT_DIR
 OUT_ROOT=$OUT_ROOT
 AUDIO=$AUDIO
 MUSIC_DIRS=$MUSIC_DIRS
+SOURCE_MODE=$RETARGET_CLEAN_SOURCE_MODE
 CHANGE_BVH_DIR=$CHANGE_BVH_DIR
+CHANG_E_OFFICIAL_SMPL_DIR=$CHANG_E_OFFICIAL_SMPL_DIR
 MIN_OK_SOURCES=$RETARGET_MIN_OK_SOURCES
 SPLIT=$GENERATION_TRAIN_RATIO/$GENERATION_VAL_RATIO/$GENERATION_TEST_RATIO
 REBUILD_RETARGET=$GENERATION_REBUILD_RETARGET_CACHE
@@ -59,12 +63,29 @@ GROUNDER_CKPT=$GROUNDING_GROUNDER_CKPT
 EOF
 
 echo "========== 0A. REAL-DATA PREFLIGHT =========="
-"$PY" evaluation/preflight.py \
-  --root "$ROOT_DIR" \
-  --audio "$AUDIO" \
-  --music_dir "$MUSIC_DIRS" \
-  --change_dir "$CHANGE_BVH_DIR" \
-  --out "$OUT_ROOT/preflight/preflight.json"
+case "$RETARGET_CLEAN_SOURCE_MODE" in
+  chang_e_official_smpl)
+    "$PY" evaluation/preflight_official_smpl.py \
+      --root "$ROOT_DIR" \
+      --audio "$AUDIO" \
+      --music_dir "$MUSIC_DIRS" \
+      --smpl_dir "$CHANG_E_OFFICIAL_SMPL_DIR" \
+      --source_manifest "$CHANG_E_SOURCE_MANIFEST" \
+      --out "$OUT_ROOT/preflight/preflight.json"
+    ;;
+  bvh_retarget)
+    "$PY" evaluation/preflight.py \
+      --root "$ROOT_DIR" \
+      --audio "$AUDIO" \
+      --music_dir "$MUSIC_DIRS" \
+      --change_dir "$CHANGE_BVH_DIR" \
+      --out "$OUT_ROOT/preflight/preflight.json"
+    ;;
+  *)
+    echo "[FATAL] Unknown RETARGET_CLEAN_SOURCE_MODE=$RETARGET_CLEAN_SOURCE_MODE" >&2
+    exit 2
+    ;;
+esac
 
 echo "========== 0B. Geometry-Aware Routing + Retarget Clean CONTRACT TESTS =========="
 "$PY" -m unittest discover -s tests -p 'test_*.py' -v

@@ -287,8 +287,9 @@ def recording_group_records(
             "recording_uid": recording_uid,
             "performer_group": next(iter(performers)),
             "dance_key": next(iter(categories)),
-            "source_uids": sorted(str(row["source_uid"]) for row in rows),
-            "num_performer_tracks": len(rows),
+            "source_uids": sorted({str(row["source_uid"]) for row in rows}),
+            "num_performer_tracks": len({str(row["source_uid"]) for row in rows}),
+            "num_segments": len(rows),
         })
     return units
 
@@ -446,14 +447,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise RuntimeError("No retarget-cache motions in %s" % cache_root)
 
     records = [source_record(cache_root, path) for path in motions]
+    # Source-aware official-SMPL preprocessing may hard-cut one source
+    # into multiple clean segment files. source_uid therefore identifies
+    # one original recording track, not one cache artifact.
     uid_counts = Counter(row["source_uid"] for row in records)
-    duplicates = sorted(
-        uid for uid, count in uid_counts.items() if count > 1
-    )
-    if duplicates:
-        raise RuntimeError(
-            "source_uid must identify one complete source: %s" % duplicates
-        )
+    segments_per_source = {
+        str(uid): int(count) for uid, count in sorted(uid_counts.items())
+    }
     unknown = [
         row["source_uid"]
         for row in records
@@ -579,7 +579,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         "materialization_requested": args.mode,
         "materialization_actual": dict(materialization),
-        "num_sources": len(records),
+        "num_sources": len(uid_counts),
+        "num_segments": len(records),
+        "segments_per_source": segments_per_source,
         "num_recording_groups": len(recording_units),
         "recording_groups": recording_units,
         "unknown_performer_group_allowed": bool(
@@ -588,9 +590,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "unknown_performer_group_sources": sorted(unknown),
         "splits": {
             split: {
-                "sources": len(rows),
+                "sources": len({row["source_uid"] for row in rows}),
+                "segments": len(rows),
                 "source_uids": sorted(
-                    row["source_uid"] for row in rows
+                    {row["source_uid"] for row in rows}
                 ),
                 "recording_uids": sorted(
                     {row["recording_uid"] for row in rows}
