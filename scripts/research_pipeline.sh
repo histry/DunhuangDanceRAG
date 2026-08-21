@@ -70,7 +70,7 @@ case "$RETARGET_CLEAN_SOURCE_MODE" in
       --audio "$AUDIO" \
       --music_dir "$MUSIC_DIRS" \
       --smpl_dir "$CHANG_E_OFFICIAL_SMPL_DIR" \
-      --source_manifest "$CHANG_E_SOURCE_MANIFEST" \
+      --smpl_manifest "$CHANG_E_OFFICIAL_SMPL_MANIFEST" \
       --out "$OUT_ROOT/preflight/preflight.json"
     ;;
   bvh_retarget)
