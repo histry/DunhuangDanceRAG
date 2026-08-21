@@ -38,10 +38,12 @@ import numpy as np
 
 from contracts.anatomy import anatomy_metrics_np
 from contracts.gravity import FOOT_JOINTS, fk24_np, gravity_metrics_np
-from data_pipeline.chang_e_manifest import (
+from data_pipeline.chang_e_smpl_manifest import (
     file_sha256,
-    load_manifest,
-    manifest_sha256,
+    load_manifest as load_smpl_manifest,
+    manifest_sha256 as smpl_manifest_sha256,
+    match_manifest_entry as match_smpl_manifest_entry,
+    validate_source as validate_smpl_source,
 )
 from motion_geometry.physical import (
     SUPPORT_POLICY_SOURCE,
@@ -172,61 +174,6 @@ def discover_official_smpl_files(root: Path) -> List[Path]:
         paths.append(path)
     return sorted(paths)
 
-
-def _manifest_rows(manifest: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    rows = manifest.get("sources", [])
-    if not isinstance(rows, list):
-        raise ValueError("Chang-E manifest has no sources list")
-    return [dict(row) for row in rows]
-
-
-def match_manifest_entry(
-    source: Path,
-    manifest: Mapping[str, Any],
-    *,
-    explicit_source_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Resolve an official SMPL file to one authoritative Chang-E source row."""
-
-    rows = _manifest_rows(manifest)
-    stem = source.stem.lower()
-
-    if explicit_source_id:
-        exact = [
-            row
-            for row in rows
-            if str(row.get("source_id", "")).lower() == explicit_source_id.lower()
-        ]
-        if len(exact) != 1:
-            raise RuntimeError(
-                f"Explicit source_id {explicit_source_id!r} does not resolve uniquely"
-            )
-        return exact[0]
-
-    exact = []
-    for row in rows:
-        source_id = str(row.get("source_id", "")).lower()
-        bvh_stem = Path(str(row.get("file", ""))).stem.lower()
-        if stem in {source_id, bvh_stem}:
-            exact.append(row)
-    if len(exact) == 1:
-        return exact[0]
-
-    # Official releases are sometimes wrapped in a directory/prefix. Only use
-    # a contained source_id when it is unique; ambiguous matches fail closed.
-    contained = [
-        row
-        for row in rows
-        if str(row.get("source_id", "")).lower()
-        and str(row.get("source_id", "")).lower() in stem
-    ]
-    if len(contained) == 1:
-        return contained[0]
-
-    raise RuntimeError(
-        f"Cannot uniquely map official SMPL file {source.name!r} to Chang-E "
-        f"manifest source_id; exact={len(exact)} contained={len(contained)}"
-    )
 
 
 def load_name_map(path: Optional[Path]) -> Dict[str, str]:
@@ -529,12 +476,22 @@ def build_source(
     overwrite: bool,
 ) -> Dict[str, Any]:
     explicit = name_map.get(source.name) or name_map.get(str(source.relative_to(in_dir)))
-    row = match_manifest_entry(source, manifest, explicit_source_id=explicit)
+    row = match_smpl_manifest_entry(source, manifest, explicit_source_id=explicit)
     metadata = _source_metadata(row)
     source_id = str(metadata["source_id"])
-    source_fps = float(row.get("effective_fps", 60.0))
-    if source_fps <= 0.0:
-        raise ValueError(f"Invalid effective_fps for {source_id}: {source_fps}")
+    # Formal timebase/provenance comes only from the official-SMPL
+    # manifest. The historical BVH manifest is not consulted.
+    source_contract = validate_smpl_source(
+        source,
+        manifest=manifest,
+        manifest_file=manifest_path,
+        explicit_source_id=source_id,
+        verify_hash=True,
+    )
+
+    source_fps = float(
+        source_contract["source_fps"]
+    )
 
     native_motion, adapter = load_smpl24_parameters(
         source,
@@ -542,37 +499,39 @@ def build_source(
         source_fps=source_fps,
         scaling_mode=scaling_mode,
         localize_root_xz=False,
-        contact_height_m=_env_float("RETARGET_CONTACT_HEIGHT_M", 0.055),
-        contact_speed_mps=_env_float("RETARGET_CONTACT_SPEED_MPS", 0.75),
+        contact_height_m=_env_float(
+            "RETARGET_CONTACT_HEIGHT_M",
+            0.055,
+        ),
+        contact_speed_mps=_env_float(
+            "RETARGET_CONTACT_SPEED_MPS",
+            0.75,
+        ),
         contact_median_seconds=_env_float(
-            "RETARGET_CONTACT_MEDIAN_SECONDS", 1.0 / 6.0
+            "RETARGET_CONTACT_MEDIAN_SECONDS",
+            1.0 / 6.0,
         ),
     )
-    native_motion = np.asarray(native_motion, dtype=np.float32)
 
-    source_duration = (
-        float((len(native_motion) - 1) / source_fps)
-        if len(native_motion) > 1
-        else 0.0
+    native_motion = np.asarray(
+        native_motion,
+        dtype=np.float32,
     )
-    published = row.get("published_duration_seconds")
-    if isinstance(published, list):
-        duration_error = min(
-            abs(source_duration - float(value)) for value in published
-        )
-    elif published is not None:
-        duration_error = abs(source_duration - float(published))
-    else:
-        duration_error = 0.0
-    duration_tolerance = float(
-        row.get("published_duration_tolerance_seconds", 3.0)
+
+    expected_frames = int(
+        source_contract["frames"]
     )
-    if duration_error > duration_tolerance:
+
+    if len(native_motion) != expected_frames:
         raise RuntimeError(
-            f"Official SMPL duration mismatch for {source_id}: "
-            f"{source_duration:.3f}s, error={duration_error:.3f}s, "
-            f"tolerance={duration_tolerance:.3f}s"
+            f"Official SMPL adapter frame mismatch "
+            f"for {source_id}: "
+            f"{len(native_motion)}!={expected_frames}"
         )
+
+    source_duration = float(
+        source_contract["duration_seconds"]
+    )
 
     analysis = hard_cut_analysis(native_motion, fps=source_fps, policy=policy)
     min_native = max(2, int(math.ceil(policy.min_segment_seconds * source_fps)))
@@ -648,8 +607,9 @@ def build_source(
                 "preferred_source": str(source.resolve()),
                 "output": str(dst.resolve()),
                 "source_sha256": file_sha256(source),
+                "smpl_manifest": str(manifest_path.resolve()),
                 "source_manifest": str(manifest_path.resolve()),
-                "source_manifest_sha256": manifest_sha256(manifest_path),
+                "source_manifest_sha256": smpl_manifest_sha256(manifest_path),
                 "source_metadata": metadata,
                 "source_fps": float(source_fps),
                 "target_fps": float(target_fps),
@@ -741,7 +701,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dir", required=True)
     ap.add_argument("--out_dir", required=True)
-    ap.add_argument("--source_manifest", required=True)
+    ap.add_argument(
+        "--smpl_manifest",
+        default=None,
+        help="Authoritative Chang-E official-SMPL manifest",
+    )
+    # Compatibility alias only; formal launchers use --smpl_manifest.
+    ap.add_argument(
+        "--source_manifest",
+        dest="legacy_source_manifest",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--target_fps", type=float, default=30.0, choices=(30.0, 60.0))
     ap.add_argument(
         "--scaling_mode",
@@ -755,10 +726,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     in_dir = Path(args.in_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
-    manifest_path = Path(args.source_manifest).expanduser().resolve()
+    raw_manifest = (
+        args.smpl_manifest
+        or args.legacy_source_manifest
+    )
+
+    if not raw_manifest:
+        ap.error("--smpl_manifest is required")
+
+    manifest_path = Path(
+        raw_manifest
+    ).expanduser().resolve()
     if not in_dir.is_dir():
         raise FileNotFoundError(f"Official SMPL directory does not exist: {in_dir}")
-    manifest = load_manifest(manifest_path, required=True)
+    manifest = load_smpl_manifest(manifest_path, required=True)
     if manifest is None:
         raise RuntimeError("Chang-E manifest could not be loaded")
 
@@ -778,7 +759,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             explicit = name_map.get(source.name) or name_map.get(
                 str(source.relative_to(in_dir))
             )
-            row = match_manifest_entry(
+            row = match_smpl_manifest_entry(
                 source, manifest, explicit_source_id=explicit
             )
             source_id = str(row["source_id"])
@@ -846,8 +827,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "source_mode": "chang_e_official_smpl_source_aware",
         "in_dir": str(in_dir),
         "out_dir": str(out_dir),
+        "smpl_manifest": str(manifest_path),
         "source_manifest": str(manifest_path),
-        "source_manifest_sha256": manifest_sha256(manifest_path),
+        "source_manifest_sha256": smpl_manifest_sha256(manifest_path),
         "target_fps": float(args.target_fps),
         "scaling_mode": str(args.scaling_mode),
         "hard_cut_policy": asdict(policy),

@@ -82,7 +82,7 @@ if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" ]]; then
       "$PY" retargeting/official_smpl_source_preprocess.py \
         --in_dir "$OFFICIAL_SMPL_DIR" \
         --out_dir "$RETARGET_CACHE" \
-        --source_manifest "$CHANG_E_SOURCE_MANIFEST" \
+        --smpl_manifest "$CHANG_E_OFFICIAL_SMPL_MANIFEST" \
         --target_fps "$GENERATION_FPS" \
         --min_ok_sources "$RETARGET_MIN_OK_SOURCES" \
         --overwrite

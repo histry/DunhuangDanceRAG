@@ -8,7 +8,7 @@ Priority order for the local Chang-E subset:
 3. female and male coverage in validation and test when feasible;
 4. dance-category balance within each performer group.
 
-The 12 BVH files form 9 recording groups because three two-person recordings
+The 12 official SMPL performer tracks form 9 recording groups because three two-person recordings
 are exported as separate performer tracks.  Exact split counts therefore apply
 to recording groups rather than files.
 """
@@ -300,78 +300,200 @@ def report_path_for_motion(path: Path) -> Path:
 
 def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
     report_path = report_path_for_motion(motion_path)
+
     if not report_path.is_file():
         raise FileNotFoundError(report_path)
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    report = json.loads(
+        report_path.read_text(encoding="utf-8")
+    )
+
     if not bool(report.get("ok", False)):
-        raise RuntimeError("Retarget report is not OK: %s" % motion_path)
+        raise RuntimeError(
+            "Source preprocess report is not OK: "
+            f"{motion_path}"
+        )
+
     if not bool(
         report.get(
             "source_gate_ok",
             report.get("anatomy_ok", False),
         )
     ):
-        raise RuntimeError("Source-safety gate failed: %s" % motion_path)
+        raise RuntimeError(
+            f"Source-safety gate failed: {motion_path}"
+        )
 
-    relative_motion = motion_path.relative_to(cache_root)
+    relative_motion = motion_path.relative_to(
+        cache_root
+    )
+
+    report_metadata = report.get(
+        "source_metadata"
+    )
+
     original = str(
         report.get("source_used")
         or report.get("source")
         or report.get("source_relative")
-        or relative_motion.with_suffix(".bvh")
+        or relative_motion
     )
-    semantic = motion_api.parse_change_bvh_semantics(original)
-    report_metadata = report.get("source_metadata")
-    if isinstance(report_metadata, Mapping):
-        semantic = dict(semantic)
-        semantic.update({
-            "source_uid": report_metadata.get(
-                "source_id", semantic.get("source_uid")
+
+    # Formal SMPL path: authoritative metadata comes directly from
+    # official_smpl_source_preprocess.py.  No BVH-name parser is involved.
+    if (
+        isinstance(report_metadata, Mapping)
+        and report_metadata.get("source_id")
+    ):
+        semantic = {
+            "source_uid": str(
+                report_metadata["source_id"]
             ),
-            "recording_uid": report_metadata.get(
-                "recording_uid", semantic.get("recording_uid")
+            "recording_uid": str(
+                report_metadata.get(
+                    "recording_uid",
+                    report_metadata["source_id"],
+                )
             ),
-            "performer_track_id": report_metadata.get(
-                "performer_track_id", semantic.get("performer_track_id", -1)
+            "performer_track_id": (
+                report_metadata.get(
+                    "performer_track_id",
+                    -1,
+                )
             ),
-            "sequence_index": report_metadata.get(
-                "sequence_index", semantic.get("sequence_index", -1)
+            "sequence_index": (
+                report_metadata.get(
+                    "sequence_index",
+                    -1,
+                )
             ),
-            "performer_group": report_metadata.get(
-                "performer_group", semantic.get("performer_group")
+            "performer_group": (
+                report_metadata.get(
+                    "performer_group",
+                    "unknown",
+                )
             ),
-            "dance_key": report_metadata.get(
-                "dance_category", semantic.get("dance_key")
+            "dance_key": (
+                report_metadata.get(
+                    "dance_category",
+                    "unknown",
+                )
             ),
-        })
+            "dance_category": (
+                report_metadata.get(
+                    "dance_category",
+                    "unknown",
+                )
+            ),
+            "take_id": report_metadata.get(
+                "take_id"
+            ),
+            "skeleton_id": (
+                report_metadata.get(
+                    "skeleton_id",
+                    "chang_e_official_smpl",
+                )
+            ),
+            "source_format": (
+                "chang_e_official_smpl"
+            ),
+        }
+
+    else:
+        # Legacy / ablation-only BVH compatibility.
+        legacy_original = str(
+            report.get("source_used")
+            or report.get("source")
+            or report.get("source_relative")
+            or relative_motion.with_suffix(".bvh")
+        )
+
+        original = legacy_original
+
+        semantic = (
+            motion_api.parse_change_bvh_semantics(
+                legacy_original
+            )
+        )
+
     source_uid = str(
-        semantic.get("source_uid") or Path(original).stem
+        semantic.get("source_uid")
+        or Path(original).stem
     )
+
     dance_key = str(
         semantic.get("dance_key")
         or semantic.get("dance_category")
         or "unknown"
     )
-    performer = infer_performer_group(semantic, original)
+
+    performer = infer_performer_group(
+        semantic,
+        original,
+    )
+
+    anatomy_payload = report.get(
+        "anatomy_diagnostic"
+    )
+
+    if not isinstance(
+        anatomy_payload,
+        Mapping,
+    ):
+        anatomy_payload = report.get(
+            "anatomy",
+            {},
+        )
+
     return {
-        "motion": str(motion_path.resolve()),
-        "report": str(report_path.resolve()),
-        "relative_motion": str(relative_motion),
-        "relative_report": str(report_path.relative_to(cache_root)),
+        "motion": str(
+            motion_path.resolve()
+        ),
+        "report": str(
+            report_path.resolve()
+        ),
+        "relative_motion": str(
+            relative_motion
+        ),
+        "relative_report": str(
+            report_path.relative_to(
+                cache_root
+            )
+        ),
         "original_source": original,
         "source_uid": source_uid,
         "recording_uid": str(
-            semantic.get("recording_uid") or source_uid
+            semantic.get(
+                "recording_uid",
+                source_uid,
+            )
+            or source_uid
         ),
-        "performer_track_id": semantic.get("performer_track_id", -1),
-        "sequence_index": semantic.get("sequence_index", -1),
+        "performer_track_id": (
+            semantic.get(
+                "performer_track_id",
+                -1,
+            )
+        ),
+        "sequence_index": (
+            semantic.get(
+                "sequence_index",
+                -1,
+            )
+        ),
         "dance_key": dance_key,
         "performer_group": performer,
         "source_anatomy_quality": float(
-            report.get("anatomy", {}).get("anatomy_quality", 0.0)
+            anatomy_payload.get(
+                "anatomy_quality",
+                0.0,
+            )
         ),
         "source_gate_reasons": list(
-            report.get("source_gate_reasons", [])
+            report.get(
+                "source_gate_reasons",
+                [],
+            )
         ),
         "semantic": semantic,
     }

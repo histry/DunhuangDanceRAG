@@ -85,7 +85,30 @@ def _joint_rotation_motion(
 
 class MotionActivityAnalysisTest(unittest.TestCase):
     def setUp(self) -> None:
+        # Unit tests must exercise code defaults independently from
+        # the formal research shell profile.  research_pipeline.sh
+        # intentionally sources configs/experiment.env before unittest,
+        # so preserve and temporarily remove activity-policy overrides.
+        self._saved_activity_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("MOTION_ACTIVITY_")
+        }
+
+        for key in list(os.environ):
+            if key.startswith("MOTION_ACTIVITY_"):
+                os.environ.pop(key, None)
+
         self.thresholds = ActivityThresholds()
+
+    def tearDown(self) -> None:
+        for key in list(os.environ):
+            if key.startswith("MOTION_ACTIVITY_"):
+                os.environ.pop(key, None)
+
+        os.environ.update(
+            self._saved_activity_environment
+        )
 
     def test_static_and_dynamic_sequences_are_separated(self) -> None:
         static = motion_activity_metrics(
