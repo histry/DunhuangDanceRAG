@@ -1,4 +1,4 @@
-"""SMPL24 parameter adapter with first-class AIST++ support."""
+"""Explicit SMPL/SMPL-X pose-layout adapter for canonical SMPL24."""
 from __future__ import annotations
 
 import pickle
@@ -23,7 +23,11 @@ from motion_geometry.smpl24 import (
 )
 
 AISTPLUSPLUS_SOURCE_FPS = 60.0
-AISTPLUSPLUS_ADAPTER_SCHEMA = "dunhuang_aistplusplus_smpl24_adapter_v1"
+AISTPLUSPLUS_ADAPTER_SCHEMA = "dunhuang_smpl24_adapter_v2"
+CHANG_E_POSE_LAYOUT = "smplx55_axis_angle_body22_to_smpl24_hands_zero_v1"
+SMPL24_POSE_LAYOUT = "smpl24_axis_angle_v1"
+CHANG_E_SOURCE_JOINTS = 55
+CHANG_E_OBSERVED_BODY_JOINTS = 22
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
@@ -50,11 +54,83 @@ def _scalar(value: Any, default: float) -> float:
     return float(np.asarray(value).reshape(-1)[0])
 
 
+def _map_axis_angle_to_smpl24(
+    poses: np.ndarray,
+    *,
+    pose_layout: str | None,
+    path: Path,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Map a declared source layout without silently truncating coordinates."""
+
+    x = np.asarray(poses, dtype=np.float32)
+    declared = str(pose_layout or "").strip()
+
+    if x.ndim == 2 and x.shape[1] == CHANG_E_SOURCE_JOINTS * 3:
+        inferred = CHANG_E_POSE_LAYOUT
+        source = x.reshape(len(x), CHANG_E_SOURCE_JOINTS, 3)
+        ignored = source[:, CHANG_E_OBSERVED_BODY_JOINTS:]
+        ignored_max = float(np.max(np.abs(ignored))) if ignored.size else 0.0
+        if declared and declared != inferred:
+            raise ValueError(
+                f"Pose-layout mismatch in {path}: declared={declared!r}, "
+                f"shape={x.shape} implies {inferred!r}"
+            )
+        if ignored_max > 1.0e-6:
+            raise ValueError(
+                f"Chang-E 165D layout has non-zero unobserved hand/face joints "
+                f"in {path}: max_abs={ignored_max:.6g}"
+            )
+        mapped = np.zeros((len(x), NUM_JOINTS, 3), dtype=np.float32)
+        mapped[:, :CHANG_E_OBSERVED_BODY_JOINTS] = source[
+            :, :CHANG_E_OBSERVED_BODY_JOINTS
+        ]
+        return mapped, {
+            "pose_layout": inferred,
+            "source_pose_shape": [int(v) for v in x.shape],
+            "source_joint_count": CHANG_E_SOURCE_JOINTS,
+            "observed_body_joint_count": CHANG_E_OBSERVED_BODY_JOINTS,
+            "canonical_joint_count": NUM_JOINTS,
+            "canonical_hand_joint_indices": [22, 23],
+            "hand_rotation_policy": "zero_unobserved",
+            "unobserved_joint_max_abs": ignored_max,
+        }
+
+    if (
+        (x.ndim == 2 and x.shape[1] == NUM_JOINTS * 3)
+        or (x.ndim == 3 and x.shape[1:] == (NUM_JOINTS, 3))
+    ):
+        inferred = SMPL24_POSE_LAYOUT
+        if declared and declared != inferred:
+            raise ValueError(
+                f"Pose-layout mismatch in {path}: declared={declared!r}, "
+                f"shape={x.shape} implies {inferred!r}"
+            )
+        mapped = x.reshape(len(x), NUM_JOINTS, 3)
+        return mapped, {
+            "pose_layout": inferred,
+            "source_pose_shape": [int(v) for v in x.shape],
+            "source_joint_count": NUM_JOINTS,
+            "observed_body_joint_count": NUM_JOINTS,
+            "canonical_joint_count": NUM_JOINTS,
+            "canonical_hand_joint_indices": [22, 23],
+            "hand_rotation_policy": "observed",
+            "unobserved_joint_max_abs": 0.0,
+        }
+
+    raise ValueError(
+        f"Unsupported SMPL pose shape/layout in {path}: "
+        f"shape={x.shape}, declared_layout={declared or None!r}"
+    )
+
+
 def load_smpl24_parameters(
     path: str | Path,
     *,
     target_fps: float = 30.0,
     source_fps: float | None = None,
+    pose_layout: str | None = None,
+    coordinate_system: str = "y_up",
+    translation_units: str = "m",
     scaling_mode: str = "canonical_body",
     localize_root_xz: bool = True,
     contact_height_m: float = 0.055,
@@ -78,12 +154,23 @@ def load_smpl24_parameters(
     if poses_value is None:
         raise ValueError(f"No SMPL pose field in {p}; keys={sorted(data.keys())}")
     poses = np.asarray(poses_value, dtype=np.float32)
-    if poses.ndim == 2 and poses.shape[1] >= NUM_JOINTS * 3:
-        rotvec = poses[:, : NUM_JOINTS * 3].reshape(len(poses), NUM_JOINTS, 3)
-    elif poses.ndim == 3 and poses.shape[1:] == (NUM_JOINTS, 3):
-        rotvec = poses
-    else:
-        raise ValueError(f"Unsupported SMPL pose shape in {p}: {poses.shape}")
+    rotvec, pose_contract = _map_axis_angle_to_smpl24(
+        poses,
+        pose_layout=pose_layout,
+        path=p,
+    )
+    normalized_coordinate_system = str(coordinate_system).strip().lower()
+    if normalized_coordinate_system != "y_up":
+        raise ValueError(
+            f"Unsupported coordinate_system={coordinate_system!r} in {p}; "
+            "convert explicitly to y_up before canonical EDGE151 adaptation"
+        )
+    normalized_translation_units = str(translation_units).strip().lower()
+    if normalized_translation_units != "m":
+        raise ValueError(
+            f"Unsupported translation_units={translation_units!r} in {p}; "
+            "convert explicitly to metres before canonical EDGE151 adaptation"
+        )
     if trans_value is None:
         translation = np.zeros((len(rotvec), 3), dtype=np.float32)
     else:
@@ -148,6 +235,9 @@ def load_smpl24_parameters(
         "smpl_scaling_mode": normalized_mode,
         "gender": str(data.get("gender", "neutral")),
         "betas_present": bool(_first(data, ("smpl_betas", "betas", "shape")) is not None),
+        **pose_contract,
+        "coordinate_system": normalized_coordinate_system,
+        "translation_units": normalized_translation_units,
         "skeleton_contract": skeleton_contract(),
         "contact_units": {"height": "m", "speed": "m/s", "median_window": "s"},
     }

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Performer-aware, exact-cardinality, recording-disjoint cache split.
+"""Category-covered, exact-cardinality, recording-disjoint cache split.
 
 Priority order for the local Chang-E subset:
 1. no source or synchronized-recording leakage;
 2. non-empty train/validation/test;
-3. female and male coverage in validation and test when feasible;
-4. dance-category balance within each performer group.
+3. every confirmed held-out dance theme is represented in training;
+4. gender-group coverage in validation and test when feasible.
 
-The 12 official SMPL performer tracks form 9 recording groups because three two-person recordings
+The 14 official SMPL performer tracks form 11 recording groups because three two-person recordings
 are exported as separate performer tracks.  Exact split counts therefore apply
 to recording groups rather than files.
 """
@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 from collections import Counter
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -49,7 +50,7 @@ except Exception:  # package self-test fallback; real projects provide this modu
     motion_api = _MotionApiFallback()
 
 SPLITS = ("train", "val", "test")
-SCHEMA = "performer_aware_recording_disjoint_cache_split_v2"
+SCHEMA = "category_covered_recording_disjoint_cache_split_v3"
 
 
 def save_json(obj: Any, path: Path) -> None:
@@ -231,6 +232,144 @@ def assign_records(
     return assignment
 
 
+def assign_records_category_covered(
+    records: Sequence[Mapping[str, Any]],
+    target: Mapping[str, int],
+    seed: int,
+) -> Dict[str, str]:
+    """Assign recording units under a hard confirmed-theme coverage contract."""
+
+    rows = [dict(row) for row in records]
+    n = len(rows)
+    if n > 20:
+        raise RuntimeError(
+            "Category-covered exhaustive split currently supports at most 20 "
+            f"recording groups; got {n}"
+        )
+    val_n = int(target["val"])
+    test_n = int(target["test"])
+    all_indices = set(range(n))
+    confirmed_categories = {
+        str(row["dance_key"])
+        for row in rows
+        if str(row.get("theme_label_status", "confirmed")) == "confirmed"
+        and str(row.get("dance_key", "unknown")) != "unknown"
+    }
+
+    best: Optional[Tuple[float, Tuple[str, ...], Dict[str, str]]] = None
+    for val_indices_tuple in combinations(range(n), val_n):
+        val_indices = set(val_indices_tuple)
+        remaining = sorted(all_indices - val_indices)
+        for test_indices_tuple in combinations(remaining, test_n):
+            test_indices = set(test_indices_tuple)
+            train_indices = all_indices - val_indices - test_indices
+            split_indices = {
+                "train": train_indices,
+                "val": val_indices,
+                "test": test_indices,
+            }
+            train_categories = {
+                str(rows[index]["dance_key"])
+                for index in train_indices
+                if str(rows[index].get("theme_label_status", "confirmed")) == "confirmed"
+                and str(rows[index].get("dance_key", "unknown")) != "unknown"
+            }
+            if not confirmed_categories.issubset(train_categories):
+                continue
+            heldout_confirmed = {
+                str(rows[index]["dance_key"])
+                for index in val_indices | test_indices
+                if str(rows[index].get("theme_label_status", "confirmed")) == "confirmed"
+                and str(rows[index].get("dance_key", "unknown")) != "unknown"
+            }
+            if not heldout_confirmed.issubset(train_categories):
+                continue
+
+            score = 0.0
+            # Gender is a reporting stratum, not a dancer identity. Reward its
+            # held-out coverage only where both groups have enough recordings.
+            for split in ("val", "test"):
+                groups = {
+                    str(rows[index].get("performer_group", "unknown"))
+                    for index in split_indices[split]
+                }
+                for group in ("female", "male"):
+                    total = sum(
+                        str(row.get("performer_group", "unknown")) == group
+                        for row in rows
+                    )
+                    if total >= 3 and group not in groups:
+                        score += 5.0
+
+            # Prefer distribution of repeatable themes across both held-out
+            # sets, without forcing single-recording themes out of training.
+            category_counts = Counter(
+                str(row["dance_key"])
+                for row in rows
+                if str(row.get("theme_label_status", "confirmed")) == "confirmed"
+            )
+            for category, count in category_counts.items():
+                if category == "unknown" or count < 2:
+                    continue
+                split_presence = sum(
+                    any(str(rows[index]["dance_key"]) == category for index in split_indices[split])
+                    for split in SPLITS
+                )
+                score += float(3 - split_presence)
+
+            signature = tuple(
+                sorted(
+                    f"{rows[index]['source_uid']}::{split}"
+                    for split, indices in split_indices.items()
+                    for index in indices
+                )
+            )
+            tie = stable_int("|".join(signature), seed) / float(2**64)
+            assignment = {
+                str(rows[index]["source_uid"]): split
+                for split, indices in split_indices.items()
+                for index in indices
+            }
+            candidate = (score + tie * 1.0e-6, signature, assignment)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+
+    if best is None:
+        raise RuntimeError(
+            "No exact recording-disjoint split satisfies confirmed-theme "
+            "training coverage. Use leave_one_theme_out for a unique held-out theme."
+        )
+    return best[2]
+
+
+def leave_one_theme_out_assignment(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    heldout_theme: str,
+    seed: int,
+) -> Dict[str, str]:
+    """Isolate one confirmed theme as a zero-shot test protocol."""
+
+    heldout = str(heldout_theme).strip()
+    test_rows = [row for row in records if str(row.get("dance_key")) == heldout]
+    if not test_rows:
+        raise ValueError(f"No recording group for heldout_theme={heldout!r}")
+    if any(str(row.get("theme_label_status", "")) != "confirmed" for row in test_rows):
+        raise ValueError("leave-one-theme-out requires a confirmed theme")
+    remaining = [row for row in records if str(row.get("dance_key")) != heldout]
+    if len(remaining) < 2:
+        raise RuntimeError("leave-one-theme-out requires at least two non-heldout groups")
+    val_row = min(
+        remaining,
+        key=lambda row: stable_int(str(row["source_uid"]), seed),
+    )
+    assignment = {str(row["source_uid"]): "train" for row in remaining}
+    assignment[str(val_row["source_uid"])] = "val"
+    for row in test_rows:
+        assignment[str(row["source_uid"])] = "test"
+    return assignment
+
+
 def assign_sources(
     source_to_label: Mapping[str, str],
     *,
@@ -273,6 +412,9 @@ def recording_group_records(
     for recording_uid, rows in sorted(grouped.items()):
         performers = {str(row["performer_group"]) for row in rows}
         categories = {str(row["dance_key"]) for row in rows}
+        theme_statuses = {
+            str(row.get("theme_label_status", "confirmed")) for row in rows
+        }
         if len(performers) != 1:
             raise RuntimeError(
                 f"recording_uid {recording_uid!r} mixes performer groups: {performers}"
@@ -281,12 +423,30 @@ def recording_group_records(
             raise RuntimeError(
                 f"recording_uid {recording_uid!r} mixes dance categories: {categories}"
             )
+        if len(theme_statuses) != 1:
+            raise RuntimeError(
+                f"recording_uid {recording_uid!r} mixes theme statuses: {theme_statuses}"
+            )
         units.append({
             # assign_records uses source_uid as its generic assignment key.
             "source_uid": recording_uid,
             "recording_uid": recording_uid,
             "performer_group": next(iter(performers)),
             "dance_key": next(iter(categories)),
+            "theme_label_status": next(iter(theme_statuses)),
+            "dancer_ids": sorted(
+                {
+                    str(row["dancer_id"])
+                    for row in rows
+                    if row.get("dancer_id")
+                    and str(row.get("dancer_id_status")) == "verified"
+                }
+            ),
+            "dancer_identity_verified": bool(rows) and all(
+                bool(row.get("dancer_id"))
+                and str(row.get("dancer_id_status")) == "verified"
+                for row in rows
+            ),
             "source_uids": sorted({str(row["source_uid"]) for row in rows}),
             "num_performer_tracks": len({str(row["source_uid"]) for row in rows}),
             "num_segments": len(rows),
@@ -332,6 +492,30 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
         "source_metadata"
     )
 
+    source_format = str(
+        report.get("source_format")
+        or (
+            report_metadata.get("source_format", "")
+            if isinstance(report_metadata, Mapping)
+            else ""
+        )
+    ).strip()
+
+    preprocess_contract = report.get(
+        "source_preprocess_contract"
+    )
+
+    if (
+        isinstance(preprocess_contract, Mapping)
+        and bool(preprocess_contract.get("direct_official_smpl", False))
+        and source_format != "chang_e_official_smpl"
+    ):
+        raise RuntimeError(
+            "Direct official-SMPL report must declare "
+            "source_format=chang_e_official_smpl: "
+            f"{report_path}"
+        )
+
     original = str(
         report.get("source_used")
         or report.get("source")
@@ -341,10 +525,16 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
 
     # Formal SMPL path: authoritative metadata comes directly from
     # official_smpl_source_preprocess.py.  No BVH-name parser is involved.
-    if (
-        isinstance(report_metadata, Mapping)
-        and report_metadata.get("source_id")
-    ):
+    if source_format == "chang_e_official_smpl":
+        if not (
+            isinstance(report_metadata, Mapping)
+            and report_metadata.get("source_id")
+        ):
+            raise RuntimeError(
+                "Official SMPL report is missing source_metadata.source_id: "
+                f"{report_path}"
+            )
+
         semantic = {
             "source_uid": str(
                 report_metadata["source_id"]
@@ -354,6 +544,13 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
                     "recording_uid",
                     report_metadata["source_id"],
                 )
+            ),
+            "sequence_id": str(
+                report_metadata.get("sequence_id", report_metadata["source_id"])
+            ),
+            "dancer_id": report_metadata.get("dancer_id"),
+            "dancer_id_status": report_metadata.get(
+                "dancer_id_status", "unverified"
             ),
             "performer_track_id": (
                 report_metadata.get(
@@ -385,6 +582,14 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
                     "unknown",
                 )
             ),
+            "candidate_dance_category": report_metadata.get(
+                "candidate_dance_category"
+            ),
+            "theme_label_status": report_metadata.get(
+                "theme_label_status", "confirmed"
+            ),
+            "source_context": list(report_metadata.get("source_context", [])),
+            "manifest_sha256": report.get("source_manifest_sha256"),
             "take_id": report_metadata.get(
                 "take_id"
             ),
@@ -469,6 +674,12 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
             )
             or source_uid
         ),
+        "sequence_id": str(
+            semantic.get("sequence_id", semantic.get("recording_uid", source_uid))
+            or source_uid
+        ),
+        "dancer_id": semantic.get("dancer_id"),
+        "dancer_id_status": semantic.get("dancer_id_status", "unverified"),
         "performer_track_id": (
             semantic.get(
                 "performer_track_id",
@@ -482,6 +693,10 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
             )
         ),
         "dance_key": dance_key,
+        "theme_label_status": semantic.get("theme_label_status", "legacy_or_unknown"),
+        "candidate_dance_category": semantic.get("candidate_dance_category"),
+        "source_context": semantic.get("source_context", []),
+        "manifest_sha256": semantic.get("manifest_sha256"),
         "performer_group": performer,
         "source_anatomy_quality": float(
             anatomy_payload.get(
@@ -529,6 +744,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--train_ratio", type=float, default=0.67)
     parser.add_argument("--val_ratio", type=float, default=0.165)
     parser.add_argument("--test_ratio", type=float, default=0.165)
+    parser.add_argument(
+        "--protocol",
+        choices=(
+            "category_covered_source_disjoint",
+            "leave_one_theme_out",
+        ),
+        default="category_covered_source_disjoint",
+    )
+    parser.add_argument(
+        "--heldout_theme",
+        default=None,
+        help="Required only for --protocol leave_one_theme_out",
+    )
     parser.add_argument(
         "--mode",
         choices=["symlink", "hardlink", "copy"],
@@ -589,14 +817,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     recording_units = recording_group_records(records)
-    target = exact_split_counts(
-        len(recording_units),
-        args.train_ratio,
-        args.val_ratio,
-        args.test_ratio,
-    )
+    if args.protocol == "leave_one_theme_out":
+        if not args.heldout_theme:
+            parser.error("--heldout_theme is required for leave_one_theme_out")
+        assignment = leave_one_theme_out_assignment(
+            recording_units,
+            heldout_theme=str(args.heldout_theme),
+            seed=int(args.seed),
+        )
+        target = {
+            split: sum(value == split for value in assignment.values())
+            for split in SPLITS
+        }
+    else:
+        target = exact_split_counts(
+            len(recording_units),
+            args.train_ratio,
+            args.val_ratio,
+            args.test_ratio,
+        )
+        assignment = assign_records_category_covered(
+            recording_units, target, args.seed
+        )
     capacities = performer_capacities(recording_units, target)
-    assignment = assign_records(recording_units, target, args.seed)
 
     split_records: Dict[str, List[Dict[str, Any]]] = {
         split: [] for split in SPLITS
@@ -632,6 +875,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         split: {row["recording_uid"] for row in rows}
         for split, rows in split_records.items()
     }
+    dancer_identity_available = all(
+        bool(row.get("dancer_id"))
+        and str(row.get("dancer_id_status")) == "verified"
+        for row in records
+    )
+    dancer_sets = {
+        split: {
+            str(row["dancer_id"])
+            for row in rows
+            if row.get("dancer_id")
+            and str(row.get("dancer_id_status")) == "verified"
+        }
+        for split, rows in split_records.items()
+    }
     overlap = {
         "train_val": sorted(source_sets["train"] & source_sets["val"]),
         "train_test": sorted(source_sets["train"] & source_sets["test"]),
@@ -645,6 +902,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "recording_val_test": sorted(
             recording_sets["val"] & recording_sets["test"]
         ),
+        "dancer_train_val": sorted(dancer_sets["train"] & dancer_sets["val"]),
+        "dancer_train_test": sorted(dancer_sets["train"] & dancer_sets["test"]),
+        "dancer_val_test": sorted(dancer_sets["val"] & dancer_sets["test"]),
     }
     reasons: List[str] = []
     if any(overlap[key] for key in ("train_val", "train_test", "val_test")):
@@ -663,6 +923,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reasons.append("count_mismatch_%s" % split)
         if not split_records[split]:
             reasons.append("empty_%s" % split)
+    confirmed_categories = {
+        row["dance_key"]
+        for row in recording_units
+        if row.get("theme_label_status") == "confirmed"
+        and row["dance_key"] != "unknown"
+    }
+    train_confirmed_categories = {
+        row["dance_key"]
+        for row in split_records["train"]
+        if row.get("theme_label_status") == "confirmed"
+        and row["dance_key"] != "unknown"
+    }
+    if args.protocol == "category_covered_source_disjoint" and not confirmed_categories.issubset(
+        train_confirmed_categories
+    ):
+        reasons.append("confirmed_theme_missing_from_train")
     for group in ("female", "male"):
         count = sum(
             row["performer_group"] == group for row in recording_units
@@ -687,17 +963,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "cache_root": str(cache_root),
         "out_root": str(out_root),
         "seed": int(args.seed),
+        "split_protocol": args.protocol,
+        "heldout_theme": args.heldout_theme,
         "split_ratios": {
             "train": args.train_ratio,
             "val": args.val_ratio,
             "test": args.test_ratio,
         },
         "target_counts": target,
-        "performer_capacities": capacities,
+        "gender_group_capacities": capacities,
         "assignment_unit": "recording_uid_before_event_slicing",
         "assignment_algorithm": (
-            "exact_global_capacity_performer_stratified_"
-            "dance_category_aware_deterministic"
+            "exact_recording_disjoint_confirmed_theme_covered_exhaustive"
+            if args.protocol == "category_covered_source_disjoint"
+            else "leave_one_confirmed_theme_out_zero_shot"
         ),
         "materialization_requested": args.mode,
         "materialization_actual": dict(materialization),
@@ -706,6 +985,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "segments_per_source": segments_per_source,
         "num_recording_groups": len(recording_units),
         "recording_groups": recording_units,
+        "dancer_identity_available": dancer_identity_available,
+        "performer_disjoint_claim": bool(
+            dancer_identity_available
+            and not any(overlap[key] for key in (
+                "dancer_train_val", "dancer_train_test", "dancer_val_test"
+            ))
+        ),
+        "performer_disjoint_unavailable_reason": (
+            None
+            if dancer_identity_available
+            else "global dancer_id is not verified in the released filenames/metadata"
+        ),
+        "confirmed_theme_coverage": {
+            "all_confirmed_themes": sorted(confirmed_categories),
+            "train_confirmed_themes": sorted(train_confirmed_categories),
+            "all_confirmed_themes_in_train": confirmed_categories.issubset(
+                train_confirmed_categories
+            ),
+        },
+        "theme_evaluation_contract": {
+            "standard_metrics_include_status": ["confirmed"],
+            "pending_theme_labels_excluded": True,
+            "pending_source_uids": sorted(
+                {
+                    row["source_uid"]
+                    for row in records
+                    if row.get("theme_label_status")
+                    == "pending_official_confirmation"
+                }
+            ),
+            "leave_one_theme_out_reported_separately": True,
+            "all_data_training_allowed_for_qualitative_generation_only": True,
+        },
         "unknown_performer_group_allowed": bool(
             args.allow_unknown_performer_group
         ),
@@ -728,6 +1040,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "dance_key_histogram": dict(
                     Counter(row["dance_key"] for row in rows)
                 ),
+                "recording_group_dance_key_histogram": dict(
+                    Counter(
+                        row["dance_key"]
+                        for row in recording_units
+                        if assignment[row["source_uid"]] == split
+                    )
+                ),
                 "records": rows,
             }
             for split, rows in split_records.items()
@@ -736,7 +1055,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "policy": {
             "split_before_event_slicing": True,
             "synchronized_performer_tracks_are_indivisible": True,
-            "validation_and_test_cover_both_known_performer_groups": True,
+            "gender_group_is_not_dancer_identity": True,
+            "validation_and_test_gender_coverage_is_optimized_when_feasible": True,
+            "confirmed_theme_coverage_required_in_train": (
+                args.protocol == "category_covered_source_disjoint"
+            ),
+            "unique_theme_heldout_only_in_leave_one_theme_out": True,
             "training_retrieval_uses_train_motion_only": True,
         },
     }
@@ -747,7 +1071,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "ok": report["ok"],
         "reasons": reasons,
         "target_counts": target,
-        "performer_capacities": capacities,
+        "gender_group_capacities": capacities,
     }, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 2
 

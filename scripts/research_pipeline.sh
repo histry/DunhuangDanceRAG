@@ -34,7 +34,8 @@ OUT_ROOT="${OUT_ROOT:-$ROOT_DIR/output/retarget_clean_research_${RUN_TAG}}"
 export OUT_ROOT
 export ROOT_DIR
 export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
-export CHANG_E_OFFICIAL_SMPL_DIR="${CHANG_E_OFFICIAL_SMPL_DIR:-$ROOT_DIR/assets/motion/smpl}"
+: "${CHANG_E_OFFICIAL_SMPL_DIR:?configs/experiment.env must define the official SMPL directory}"
+: "${CHANG_E_OFFICIAL_SMPL_MANIFEST:?configs/experiment.env must define the official SMPL manifest}"
 export RETARGET_CLEAN_SOURCE_MODE="${RETARGET_CLEAN_SOURCE_MODE:-chang_e_official_smpl}"
 export GROUNDING_GROUNDER_CKPT="${GROUNDING_GROUNDER_CKPT:-$OUT_ROOT/event_geometry_dual_branch_grounder.pt}"
 PY="${GENERATION_PYTHON:-${PYTHON_BIN:-python}}"

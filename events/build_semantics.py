@@ -159,6 +159,34 @@ def _soft_mass(matrix: np.ndarray) -> Dict[str, float]:
     }
 
 
+def _formal_compatibility_vector(raw: Any) -> np.ndarray:
+    """Convert formal weak compatibility JSON without theme reconstruction."""
+
+    try:
+        payload = json.loads(str(raw)) if not isinstance(raw, Mapping) else raw
+    except Exception:
+        payload = {}
+    vector = np.zeros((len(MUSIC_SEMANTIC_LABELS),), dtype=np.float32)
+    unknown_mass = 0.0
+    if isinstance(payload, Mapping):
+        for label, value in payload.items():
+            try:
+                weight = max(0.0, float(value))
+            except Exception:
+                continue
+            if str(label) == "unknown":
+                unknown_mass += weight
+            elif str(label) in MUSIC_SEMANTIC_LABELS:
+                vector[MUSIC_SEMANTIC_LABELS.index(str(label))] += weight
+    if unknown_mass > 0.0:
+        vector += unknown_mass / float(len(vector))
+    if float(vector.sum()) <= 1.0e-8:
+        vector[:] = 1.0 / float(len(vector))
+    else:
+        vector /= float(vector.sum())
+    return vector
+
+
 def build_semantics(
     db_path: Path,
     out_path: Path,
@@ -208,25 +236,43 @@ def build_semantics(
     natural_max = _farr(db, "natural_duration_max", n, 4.0)
     quality = _farr(db, "event_quality_scores", n, 0.5)
     semantic_confidence = _farr(db, "semantic_confidence", n, 0.5)
+    semantics_schema = str(
+        np.asarray(db.get("event_semantics_schema_version", "")).reshape(-1)[0]
+    )
+    formal_compatibility = _arr(
+        db, "music_compatibility_scores_json", n, "{}", object
+    )
+    use_formal_compatibility = (
+        semantics_schema == "chang_e_five_layer_event_semantics_v2"
+        and "music_compatibility_scores_json" in db
+    )
 
-    raw_probabilities = np.stack(
-        [
-            event_probs_from_fields(
-                dance_key=dance[index],
-                event_family=families[index],
-                music_alignment_label=alignment[index],
-                energy_label=energy[index],
-                rhythm_label=rhythm[index],
-                locomotion_label=locomotion[index],
-                support_label=support[index],
-                quality=float(quality[index]),
-                semantic_confidence=float(semantic_confidence[index]),
-                desc=desc[index],
-            )
-            for index in range(n)
-        ],
-        axis=0,
-    ).astype(np.float32)
+    if use_formal_compatibility:
+        raw_probabilities = np.stack(
+            [_formal_compatibility_vector(value) for value in formal_compatibility],
+            axis=0,
+        ).astype(np.float32)
+        semantic_evidence_source = "formal_local_kinematic_weak_compatibility"
+    else:
+        raw_probabilities = np.stack(
+            [
+                event_probs_from_fields(
+                    dance_key=dance[index],
+                    event_family=families[index],
+                    music_alignment_label=alignment[index],
+                    energy_label=energy[index],
+                    rhythm_label=rhythm[index],
+                    locomotion_label=locomotion[index],
+                    support_label=support[index],
+                    quality=float(quality[index]),
+                    semantic_confidence=float(semantic_confidence[index]),
+                    desc=desc[index],
+                )
+                for index in range(n)
+            ],
+            axis=0,
+        ).astype(np.float32)
+        semantic_evidence_source = "legacy_grouped_theme_and_motion_evidence"
 
     external_prior = _load_prior(class_prior_path)
     empirical_prior = np.maximum(raw_probabilities.mean(axis=0), 0.02)
@@ -297,6 +343,12 @@ def build_semantics(
             "semantic_top2_margin": float(diagnostics["top2_margin"]),
             "semantic_ambiguous": bool(diagnostics["ambiguous"]),
             "music_alignment_label": str(alignment[index]),
+            "music_compatibility_supervision": (
+                "weak_kinematic_heuristic"
+                if use_formal_compatibility
+                else "legacy_grouped_weak_evidence"
+            ),
+            "dance_theme_used_as_local_action_truth": False,
             "music_alignment_probs": vector_to_prob_dict(probs),
             "raw_music_alignment_probs": vector_to_prob_dict(raw_probs),
             "route_affordance": affordances,
@@ -347,6 +399,9 @@ def build_semantics(
         json.dumps(event_contract, sort_keys=True), dtype=object
     )
     out["aesd_schema_version"] = np.asarray(AESD_SCHEMA_VERSION, dtype=object)
+    out["aesd_semantic_evidence_source"] = np.asarray(
+        semantic_evidence_source, dtype=object
+    )
     out["aesd_label_names"] = np.asarray(MUSIC_SEMANTIC_LABELS, dtype=object)
     out["aesd_semantics"] = np.asarray(aesd_rows, dtype=object)
     out["aesd_raw_music_alignment_probs"] = raw_probabilities
@@ -407,6 +462,8 @@ def build_semantics(
         "input_db": str(db_path.resolve()),
         "output_db": str(out_path.resolve()),
         "num_events": int(n),
+        "semantic_evidence_source": semantic_evidence_source,
+        "dance_theme_used_as_local_action_truth": False,
         "event_db_contract": event_contract,
         "label_names": MUSIC_SEMANTIC_LABELS,
         "raw_event_semantic_histogram": raw_histogram,

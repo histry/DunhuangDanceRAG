@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -200,6 +201,45 @@ def main() -> int:
             errors,
         )
 
+    router_prior = Path(
+        os.environ.get("ROUTING_SAFETY_MUSIC_ENCODER_PRIOR_CKPT")
+        or os.environ.get("MUSIC_ROUTER_WEIGHT")
+        or root / "assets/weights/music/router.pt"
+    ).expanduser().resolve()
+    require_file(
+        router_prior,
+        "project-trained Librosa Router music-encoder prior",
+        errors,
+    )
+
+    music_contract = {
+        "deep_music_features": os.environ.get(
+            "GENERATION_DEEP_MUSIC_FEATURES", "0"
+        ),
+        "require_deep_music": os.environ.get(
+            "GENERATION_REQUIRE_DEEP_MUSIC", "0"
+        ),
+        "feature_model": os.environ.get(
+            "GENERATION_DEEP_MUSIC_MODEL", "librosa_12d"
+        ),
+        "semantic_ot_enable": os.environ.get("SEMANTIC_OT_ENABLE", "0"),
+        "grounder_architecture": os.environ.get(
+            "GROUNDING_GROUNDER_ARCHITECTURE", "legacy"
+        ),
+    }
+    expected_music_contract = {
+        "deep_music_features": "0",
+        "require_deep_music": "0",
+        "feature_model": "librosa_12d",
+        "semantic_ot_enable": "0",
+        "grounder_architecture": "legacy",
+    }
+    if music_contract != expected_music_contract:
+        errors.append(
+            "formal music contract must be Librosa 12D + project-trained "
+            f"Router with no external pretrained model: {music_contract}"
+        )
+
     discovered = (
         discover_official_smpl_files(
             smpl_dir
@@ -320,6 +360,9 @@ def main() -> int:
                             "recording_uid"
                         ]
                     ),
+                    "sequence_id": contract["sequence_id"],
+                    "dancer_id": contract["dancer_id"],
+                    "dancer_id_status": contract["dancer_id_status"],
                     "performer_group": (
                         contract[
                             "performer_group"
@@ -330,6 +373,14 @@ def main() -> int:
                             "dance_category"
                         ]
                     ),
+                    "candidate_dance_category": contract.get(
+                        "candidate_dance_category"
+                    ),
+                    "theme_label_status": contract["theme_label_status"],
+                    "source_context": contract["source_context"],
+                    "coordinate_system": contract["coordinate_system"],
+                    "translation_units": contract["translation_units"],
+                    "pose_layout": contract["pose_layout"],
                     "frames": contract[
                         "frames"
                     ],
@@ -448,6 +499,27 @@ def main() -> int:
         )
 
     try:
+        import librosa
+
+        runtime["librosa"] = str(librosa.__version__)
+    except Exception as exc:
+        errors.append(f"Librosa import failed: {exc}")
+
+    try:
+        import pytorch3d
+
+        runtime["pytorch3d"] = str(
+            getattr(pytorch3d, "__version__", "installed")
+        )
+    except Exception as exc:
+        errors.append(f"PyTorch3D import failed: {exc}")
+
+    ffmpeg = shutil.which("ffmpeg")
+    runtime["ffmpeg"] = ffmpeg
+    if not ffmpeg:
+        errors.append("ffmpeg executable is unavailable on PATH")
+
+    try:
         from data_pipeline.split_sources import (
             exact_split_counts,
         )
@@ -520,6 +592,16 @@ def main() -> int:
         "num_recording_groups": (
             len(recording_uids)
         ),
+        "coordinate_system": (
+            manifest.get("coordinate_system") if manifest else None
+        ),
+        "translation_units": (
+            manifest.get("translation_units") if manifest else None
+        ),
+        "pose_layout": manifest.get("pose_layout") if manifest else None,
+        "unique_recording_duration_minutes": (
+            manifest.get("unique_recording_duration_minutes") if manifest else None
+        ),
         "recording_uids": sorted(
             recording_uids
         ),
@@ -529,6 +611,8 @@ def main() -> int:
         "expected_training_music_count": (
             expected_music
         ),
+        "music_router_prior": str(router_prior),
+        "formal_music_contract": music_contract,
         "runtime": runtime,
         "warnings": warnings,
         "errors": errors,

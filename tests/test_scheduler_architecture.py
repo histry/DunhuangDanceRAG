@@ -424,6 +424,36 @@ class SchedulerArchitectureTests(unittest.TestCase):
             self.assertIn('--db "$TRAIN_AESD"', block)
             self.assertIn('--val_db "$VAL_AESD"', block)
 
+    def test_formal_grounder_is_trained_only_after_five_layer_aesd(self):
+        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        profile = (ROOT / "configs" / "research.env").read_text(
+            encoding="utf-8"
+        )
+        semantics = pipeline.index("events/build_semantics.py")
+        grounder = pipeline.index("-m grounding.model train", semantics)
+        scheduler_index = pipeline.index("scheduling/build_generation_index.py")
+        self.assertLess(semantics, grounder)
+        self.assertLess(grounder, scheduler_index)
+        block = pipeline[grounder : grounder + 1200]
+        self.assertIn('--db "$TRAIN_AESD"', block)
+        self.assertIn('AESD_EMBED_TARGETS=("$VAL_AESD" "$TEST_AESD")', block)
+        raw_build = pipeline.index("events/build_database_entry.py")
+        raw_guard = pipeline.rindex(
+            "export GROUNDING_GROUNDER_ENABLE=0", 0, raw_build
+        )
+        self.assertLess(raw_guard, raw_build)
+        self.assertIn("export GROUNDING_TRAIN_GROUNDER_ON_BUILD=0", profile)
+        self.assertIn("export GROUNDING_TRAIN_GROUNDER_AFTER_AESD=1", profile)
+
+    def test_grounder_cli_can_embed_source_disjoint_splits(self):
+        source = (ROOT / "grounding" / "model.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('sub.add_parser("embed")', source)
+        self.assertIn("embed_database(Path(args.db), Path(args.checkpoint))", source)
+
     def test_scheduler_passes_physical_rate_to_deep_music_features(self):
         source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
             encoding="utf-8"
@@ -432,6 +462,54 @@ class SchedulerArchitectureTests(unittest.TestCase):
         start = source.index(marker)
         block = source[start : start + 600]
         self.assertIn("fps=float(args.fps)", block)
+
+    def test_formal_music_semantics_use_only_librosa_and_project_router(self):
+        profile = (ROOT / "configs" / "research.env").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export GENERATION_DEEP_MUSIC_FEATURES=0", profile)
+        self.assertIn(
+            'export GENERATION_DEEP_MUSIC_MODEL="librosa_12d"', profile
+        )
+        self.assertIn("export GENERATION_REQUIRE_DEEP_MUSIC=0", profile)
+        self.assertIn(
+            'export GROUNDING_GROUNDER_ARCHITECTURE="legacy"', profile
+        )
+        self.assertIn("export SEMANTIC_OT_ENABLE=0", profile)
+
+        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "Formal music semantics must use Librosa 12D features", pipeline
+        )
+        self.assertIn(
+            '"${GENERATION_DEEP_MUSIC_MODEL:-librosa_12d}" != "librosa_12d"',
+            pipeline,
+        )
+        self.assertIn('"${SEMANTIC_OT_ENABLE:-0}" != "0"', pipeline)
+
+        router = (ROOT / "training" / "music_router.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "from scheduling.audio_features import extract_audio_features",
+            router,
+        )
+        requirements = (ROOT / "requirements-core.txt").read_text(
+            encoding="utf-8"
+        ).lower()
+        self.assertNotIn("laion-clap", requirements)
+
+    def test_official_preflight_checks_training_and_final_render_dependencies(self):
+        source = (ROOT / "evaluation" / "preflight_official_smpl.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("project-trained Librosa Router music-encoder prior", source)
+        self.assertIn('import librosa', source)
+        self.assertIn('import pytorch3d', source)
+        self.assertIn('shutil.which("ffmpeg")', source)
+        self.assertIn('"formal_music_contract": music_contract', source)
 
     def test_optional_transition_models_receive_runtime_fps(self):
         source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(

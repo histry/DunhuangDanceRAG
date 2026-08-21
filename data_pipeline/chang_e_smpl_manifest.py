@@ -31,11 +31,35 @@ DEFAULT_MANIFEST = (
     ROOT
     / "assets"
     / "motion"
-    / "smpl_official_12"
+    / "smpl_official_14"
     / "sources.json"
 )
 
-MANIFEST_SCHEMA = "chang_e_official_smpl_manifest_v1"
+MANIFEST_SCHEMA = "chang_e_official_smpl_manifest_v2"
+POSE_LAYOUT = "smplx55_axis_angle_body22_to_smpl24_hands_zero_v1"
+COORDINATE_SYSTEM = "y_up"
+TRANSLATION_UNITS = "m"
+CANONICAL_SKELETON = "smpl24"
+HAND_ROTATION_POLICY = "zero_unobserved"
+SOURCE_FORMAT = "official_smpl_npz"
+OFFICIAL_RELEASE_ID = "chang_e_aligned_smpl_14_v1"
+TEST_RELEASE_ID = "unit_test_fixture"
+OFFICIAL_SOURCE_IDS = {
+    "female_36pose_1",
+    "female_36pose_2",
+    "female_FeiTian",
+    "female_lotus",
+    "female_meditation",
+    "male_36pose_1",
+    "male_36pose_2",
+    "male_drum_1",
+    "male_drum_2",
+    "male_meditation",
+    "male_pipa_1",
+    "male_pipa_2",
+    "male_ribbon",
+    "male_ribbon_FenHe",
+}
 
 POSE_KEYS: Sequence[str] = (
     "smpl_poses",
@@ -51,6 +75,15 @@ FPS_KEYS: Sequence[str] = (
     "fps",
     "frame_rate",
     "framerate",
+)
+
+TRANS_KEYS: Sequence[str] = (
+    "smpl_trans",
+    "trans",
+    "transl",
+    "translations",
+    "root_translation",
+    "root_trans",
 )
 
 
@@ -158,10 +191,44 @@ def inspect_smpl_source(
             else None
         )
 
+        trans_key = next(
+            (key for key in TRANS_KEYS if key in payload.files),
+            None,
+        )
+        if trans_key is None:
+            raise ValueError(f"No SMPL translation array in {path.name}")
+        translation = np.asarray(payload[trans_key])
+        if translation.shape != (frames, 3):
+            raise ValueError(
+                f"Invalid translation shape in {path.name}: {translation.shape}"
+            )
+
+        if poses.ndim != 2 or poses.shape[1] != 165:
+            raise ValueError(
+                f"Chang-E Aligned SMPL must use [T,165] poses: "
+                f"{path.name} has {poses.shape}"
+            )
+        pose55 = poses.reshape(frames, 55, 3)
+        unobserved_max_abs = float(
+            np.max(np.abs(pose55[:, 22:])) if frames else 0.0
+        )
+        if unobserved_max_abs > 1.0e-6:
+            raise ValueError(
+                f"Unobserved hand/face joints are non-zero in {path.name}: "
+                f"max_abs={unobserved_max_abs:.6g}"
+            )
+
     return {
         "source": str(path),
         "file": path.name,
         "pose_key": pose_key,
+        "pose_shape": [int(value) for value in poses.shape],
+        "pose_dim": int(poses.shape[1]),
+        "source_joint_count": 55,
+        "observed_body_joint_count": 22,
+        "unobserved_joint_max_abs": unobserved_max_abs,
+        "translation_key": trans_key,
+        "translation_shape": [int(value) for value in translation.shape],
         "frames": frames,
         "source_fps": float(source_fps),
         "duration_seconds": float((frames - 1) / source_fps),
@@ -202,6 +269,27 @@ def load_manifest(
             f"expected {MANIFEST_SCHEMA!r}"
         )
 
+    release_id = str(payload.get("dataset_release_id", ""))
+    if release_id not in {OFFICIAL_RELEASE_ID, TEST_RELEASE_ID}:
+        raise ValueError(
+            f"Unsupported official SMPL dataset_release_id={release_id!r}"
+        )
+
+    required_contract = {
+        "source_format": SOURCE_FORMAT,
+        "coordinate_system": COORDINATE_SYSTEM,
+        "translation_units": TRANSLATION_UNITS,
+        "pose_layout": POSE_LAYOUT,
+        "canonical_skeleton": CANONICAL_SKELETON,
+        "hand_rotation_policy": HAND_ROTATION_POLICY,
+    }
+    for field, expected in required_contract.items():
+        if payload.get(field) != expected:
+            raise ValueError(
+                f"Official SMPL manifest {field}={payload.get(field)!r}; "
+                f"expected {expected!r}"
+            )
+
     rows = payload.get("sources")
 
     if not isinstance(rows, list) or not rows:
@@ -236,6 +324,8 @@ def load_manifest(
             raw.get("recording_uid", "")
         ).strip()
 
+        sequence_id = str(raw.get("sequence_id", "")).strip()
+
         if not source_id:
             raise ValueError(
                 f"SMPL manifest row {index} missing source_id"
@@ -252,6 +342,42 @@ def load_manifest(
                 f"SMPL manifest row {source_id} "
                 "missing recording_uid"
             )
+
+        if not sequence_id:
+            raise ValueError(
+                f"SMPL manifest row {source_id} missing sequence_id"
+            )
+
+        if raw.get("dancer_id_status") not in {"verified", "unverified"}:
+            raise ValueError(
+                f"SMPL manifest row {source_id} has invalid dancer_id_status"
+            )
+        if raw.get("dancer_id_status") == "verified" and not raw.get("dancer_id"):
+            raise ValueError(
+                f"SMPL manifest row {source_id} marks an empty dancer_id verified"
+            )
+
+        theme_status = str(raw.get("theme_label_status", ""))
+        if theme_status not in {"confirmed", "pending_official_confirmation"}:
+            raise ValueError(
+                f"SMPL manifest row {source_id} has invalid theme_label_status"
+            )
+        if theme_status != "confirmed" and raw.get("dance_category") != "unknown":
+            raise ValueError(
+                f"Unconfirmed theme for {source_id} must use dance_category=unknown"
+            )
+
+        row_contract = {
+            "coordinate_system": COORDINATE_SYSTEM,
+            "translation_units": TRANSLATION_UNITS,
+            "pose_layout": POSE_LAYOUT,
+        }
+        for field, expected in row_contract.items():
+            if raw.get(field, payload.get(field)) != expected:
+                raise ValueError(
+                    f"SMPL manifest row {source_id} has unsupported "
+                    f"{field}={raw.get(field)!r}"
+                )
 
         if source_id in source_ids:
             raise ValueError(
@@ -332,6 +458,19 @@ def load_manifest(
             "SMPL manifest num_recording_groups mismatch: "
             f"{declared_groups}!={len(recording_uids)}"
         )
+
+    if release_id == OFFICIAL_RELEASE_ID:
+        if source_ids != OFFICIAL_SOURCE_IDS:
+            raise ValueError(
+                "Official Chang-E Aligned SMPL release must contain exactly "
+                f"14 sources: missing={sorted(OFFICIAL_SOURCE_IDS - source_ids)}, "
+                f"extra={sorted(source_ids - OFFICIAL_SOURCE_IDS)}"
+            )
+        if declared_groups != 11:
+            raise ValueError(
+                f"Official Chang-E Aligned SMPL release requires 11 recording groups; "
+                f"got {declared_groups}"
+            )
 
     return payload
 
@@ -450,6 +589,9 @@ def validate_source(
         **actual,
         "source_id": str(row["source_id"]),
         "recording_uid": str(row["recording_uid"]),
+        "sequence_id": str(row["sequence_id"]),
+        "dancer_id": row.get("dancer_id"),
+        "dancer_id_status": row.get("dancer_id_status", "unverified"),
         "performer_track_id": row.get(
             "performer_track_id",
             -1,
@@ -466,6 +608,18 @@ def validate_source(
             "dance_category",
             "unknown",
         ),
+        "candidate_dance_category": row.get("candidate_dance_category"),
+        "theme_label_status": row.get("theme_label_status"),
+        "source_context": row.get("source_context", []),
+        "coordinate_system": row.get(
+            "coordinate_system", manifest["coordinate_system"]
+        ),
+        "translation_units": row.get(
+            "translation_units", manifest["translation_units"]
+        ),
+        "pose_layout": row.get("pose_layout", manifest["pose_layout"]),
+        "canonical_skeleton": manifest["canonical_skeleton"],
+        "hand_rotation_policy": manifest["hand_rotation_policy"],
         "take_id": row.get("take_id"),
         "skeleton_id": (
             "chang_e_official_smpl"
@@ -521,6 +675,9 @@ def semantic_metadata(
         "recording_uid": row.get(
             "recording_uid"
         ),
+        "sequence_id": row.get("sequence_id"),
+        "dancer_id": row.get("dancer_id"),
+        "dancer_id_status": row.get("dancer_id_status"),
         "performer_track_id": row.get(
             "performer_track_id"
         ),
@@ -533,6 +690,16 @@ def semantic_metadata(
         "dance_category": row.get(
             "dance_category"
         ),
+        "candidate_dance_category": row.get("candidate_dance_category"),
+        "theme_label_status": row.get("theme_label_status"),
+        "source_context": row.get("source_context", []),
+        "coordinate_system": row.get(
+            "coordinate_system", manifest.get("coordinate_system")
+        ),
+        "translation_units": row.get(
+            "translation_units", manifest.get("translation_units")
+        ),
+        "pose_layout": row.get("pose_layout", manifest.get("pose_layout")),
         "take_id": row.get("take_id"),
         "skeleton_id": (
             "chang_e_official_smpl"

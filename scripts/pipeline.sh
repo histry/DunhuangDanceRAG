@@ -24,7 +24,7 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUT_ROOT="${OUT_ROOT:-output/fresh_audio_fresh_wav_${RUN_TAG}}"
 RETARGET_CACHE="${RETARGET_CACHE:-$OUT_ROOT/retarget_cache}"
 SOURCE_MODE="${RETARGET_CLEAN_SOURCE_MODE:-chang_e_official_smpl}"
-OFFICIAL_SMPL_DIR="${CHANG_E_OFFICIAL_SMPL_DIR:-$ROOT_DIR/assets/motion/smpl}"
+OFFICIAL_SMPL_DIR="${CHANG_E_OFFICIAL_SMPL_DIR:?configs/experiment.env must define the official SMPL directory}"
 CACHE_SPLIT_ROOT="${CACHE_SPLIT_ROOT:-$OUT_ROOT/retarget_cache_split}"
 DB_SPLIT_ROOT="${DB_SPLIT_ROOT:-$OUT_ROOT/event_db_split}"
 ALL_DB_DIR="${ALL_DB_DIR:-$OUT_ROOT/all_change_demo_db}"
@@ -67,6 +67,26 @@ require_file() {
     exit 2
   }
 }
+
+# Formal music semantics must remain independent of externally pretrained
+# feature extractors.  The research profile pins these values; keep this guard
+# so a stale caller environment or manual override cannot silently enable CLAP.
+if [[ "${GENERATION_DEEP_MUSIC_FEATURES:-0}" != "0" \
+   || "${GENERATION_REQUIRE_DEEP_MUSIC:-0}" != "0" \
+   || "${GENERATION_DEEP_MUSIC_MODEL:-librosa_12d}" != "librosa_12d" ]]; then
+  echo "[FATAL] Formal music semantics must use Librosa 12D features and the project-trained Router; external deep-music models are disabled." >&2
+  exit 2
+fi
+
+if [[ "${GROUNDING_GROUNDER_ARCHITECTURE:-legacy}" != "legacy" ]]; then
+  echo "[FATAL] Formal no-external-pretraining mode requires GROUNDING_GROUNDER_ARCHITECTURE=legacy." >&2
+  exit 2
+fi
+
+if [[ "${SEMANTIC_OT_ENABLE:-0}" != "0" ]]; then
+  echo "[FATAL] Formal no-external-pretraining mode excludes the mixed semantic-OT/CLAP route." >&2
+  exit 2
+fi
 
 echo "========== Fresh-Audio Generation FORMAL PATHS =========="
 printf "PY=%s\nOUT_ROOT=%s\nAUDIO=%s\nSOURCE_MODE=%s\nCHANGE_BVH_DIR=%s\nOFFICIAL_SMPL_DIR=%s\nCONFIG=%s\nDB_MODE=%s\n" \
@@ -134,6 +154,11 @@ echo "========== 3. SOURCE SPLIT BEFORE EVENT SLICING =========="
   --overwrite
 
 echo "========== 4. BUILD SPLIT-SPECIFIC HEADING EVENT DATABASES =========="
+FORMAL_AESD_GROUNDER_ENABLE="${GROUNDING_GROUNDER_ENABLE:-1}"
+# Raw Event-DBs contain provenance, geometry and local-action fields, but AESD
+# probabilities do not exist yet.  Never train or embed the formal Grounder at
+# this stage, even when a stale checkpoint is present in a resumed OUT_ROOT.
+export GROUNDING_GROUNDER_ENABLE=0
 if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
   for split in train val test; do
     cache_dir="$CACHE_SPLIT_ROOT/$split"
@@ -187,6 +212,41 @@ if [[ "$GENERATION_DB_MODE" == "qualitative_all_change" ]]; then
   GENERATION_DB="$ALL_AESD"
 else
   GENERATION_DB="$TRAIN_AESD"
+fi
+
+export GROUNDING_GROUNDER_ENABLE="$FORMAL_AESD_GROUNDER_ENABLE"
+unset FORMAL_AESD_GROUNDER_ENABLE
+
+echo "========== 6A. TRAIN GROUNDER ON TRAIN AESD; EMBED DISJOINT SPLITS =========="
+if [[ "${GROUNDING_GROUNDER_ENABLE:-1}" == "1" ]]; then
+  if [[ "${GROUNDING_GROUNDER_ARCHITECTURE:-legacy}" != "legacy" ]]; then
+    echo "[FATAL] The formal AESD-first Grounder stage supports only the project-owned legacy architecture." >&2
+    exit 2
+  fi
+  if [[ "${GROUNDING_TRAIN_GROUNDER_AFTER_AESD:-1}" == "1" ]]; then
+    "$PY" -m grounding.model train \
+      --db "$TRAIN_AESD" \
+      --out "$GROUNDING_GROUNDER_CKPT" \
+      --steps "$GROUNDING_GROUNDER_STEPS" \
+      --batch_size "$GROUNDING_GROUNDER_BATCH" \
+      --seed "${GROUNDING_SEED:-20260717}"
+  else
+    require_file "$GROUNDING_GROUNDER_CKPT" \
+      "train-AESD Grounder checkpoint"
+    "$PY" -m grounding.model embed \
+      --db "$TRAIN_AESD" \
+      --checkpoint "$GROUNDING_GROUNDER_CKPT"
+  fi
+  AESD_EMBED_TARGETS=("$VAL_AESD" "$TEST_AESD")
+  if [[ "$GENERATION_DB_MODE" == "qualitative_all_change" ]]; then
+    AESD_EMBED_TARGETS+=("$ALL_AESD")
+  fi
+  for aesd in "${AESD_EMBED_TARGETS[@]}"; do
+    "$PY" -m grounding.model embed \
+      --db "$aesd" \
+      --checkpoint "$GROUNDING_GROUNDER_CKPT"
+  done
+  unset AESD_EMBED_TARGETS
 fi
 
 if [[ "${SEMANTIC_OT_ENABLE:-0}" == "1" ]]; then

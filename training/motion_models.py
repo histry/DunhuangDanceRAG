@@ -121,7 +121,6 @@ from support.legacy_compatibility import (
     normalize_motion_checkpoint_version,
 )
 from motion_geometry.resampling import blend_edge151_geodesic_np
-from data_pipeline.chang_e_manifest import semantic_metadata as chang_e_semantic_metadata
 from retargeting.bvh_solver import load_bvh_as_edge151
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
@@ -895,6 +894,39 @@ def event_descriptor(motion: np.ndarray, fps: float = 30.0) -> np.ndarray:
     desc = np.concatenate([desc, np.asarray(stats, dtype=np.float32)], axis=0)
     if desc.shape[0] < 32:
         desc = np.pad(desc, (0, 32 - desc.shape[0]))
+    # v2 local-action features occupy previously unused descriptor channels.
+    # They are computed from the window itself, never from its dance theme.
+    pelvis_height = joints[:, 0, 1] - float(floor)
+    floorwork_ratio = float(np.mean(pelvis_height < 0.55))
+    airborne_ratio = float(np.mean(np.sum(contact, axis=1) == 0))
+    joint_speed = np.linalg.norm(joint_v.reshape(T, -1, 3), axis=-1)
+    mean_speed = float(np.mean(joint_speed))
+    burstiness = float(
+        np.clip(
+            (float(np.percentile(joint_speed, 95)) / max(mean_speed, 1.0e-6) - 1.0)
+            / 4.0,
+            0.0,
+            1.0,
+        )
+    )
+    midpoint = max(1, T // 2)
+    first_energy = float(np.mean(joint_speed[:midpoint]))
+    second_energy = float(np.mean(joint_speed[midpoint:])) if midpoint < T else first_energy
+    transition_contrast = float(
+        np.clip(
+            abs(second_energy - first_energy)
+            / max(first_energy + second_energy, 1.0e-6),
+            0.0,
+            1.0,
+        )
+    )
+    desc[25] = floorwork_ratio
+    desc[26] = airborne_ratio
+    desc[27] = burstiness
+    desc[28] = float(np.percentile(pelvis_height, 10))
+    desc[29] = float(upper_energy / max(lower_energy + upper_energy, 1.0e-6))
+    desc[30] = transition_contrast
+    desc[31] = 2.0  # descriptor schema marker: local_action_v2
     return desc[:32].astype(np.float32)
 
 
@@ -1498,7 +1530,10 @@ def _clean_stem(path: str | Path) -> str:
 
 
 
-CHANG_E_CATEGORY_PROFILES = {
+# Historical filename/category priors are retained only for BVH ablation
+# compatibility.  They are never used as local-action truth in the formal
+# official-SMPL path.
+LEGACY_BVH_CATEGORY_PROFILES = {
     "flying_apsaras": {"aliases": {"flying", "apsaras", "flying_apsara", "flying_apsaras", "feitian", "fei_tian", "sky_dance"}, "energy": 0.52, "onset": 0.28, "travel": 0.32, "turn": 0.38, "lower": 0.38, "upper": 0.72, "floorwork": 0.10, "jump": 0.35, "spin": 0.35, "pose_hold": 0.25, "instrument": 0.0, "prop": 0.85, "display": "Flying Apsaras", "semantic_role": "aerial_graceful_flow", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "upper_body", "spatial_label": "aerial_leaning", "music_alignment_label": "lyrical_flow", "music_alignment_tags": ["lyrical_flow", "turning_climax", "calm_meditative", "aerial_curve"], "preferred_music_roles": ["intro", "build_up", "climax"], "preferred_dance_keys": ["flying_apsaras", "sogdian_whirl", "lotus_steps"], "cultural_motif": "flying_apsara", "prop_proxy_label": "sash_ribbon_proxy", "locomotion_label": "floating_leaning", "support_label": "low_contact_flight_like", "event_family": "aerial_curve", "motion_stage_role": "opening_or_climax", "natural_duration_range_sec": [2.0, 5.5]},
     "lotus_steps": {"aliases": {"lotus", "lotussteps", "lotus_step", "lotus_steps"}, "energy": 0.48, "onset": 0.35, "travel": 0.62, "turn": 0.20, "lower": 0.78, "upper": 0.38, "floorwork": 0.05, "jump": 0.12, "spin": 0.10, "pose_hold": 0.20, "instrument": 0.0, "prop": 0.0, "display": "Lotus Steps", "semantic_role": "flowing_footwork", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "lower_body", "spatial_label": "traveling", "music_alignment_label": "footwork_flow", "music_alignment_tags": ["footwork_flow", "lyrical_flow", "calm_meditative"], "preferred_music_roles": ["normal", "development"], "preferred_dance_keys": ["lotus_steps", "flying_apsaras", "sogdian_whirl"], "cultural_motif": "lotus_step", "prop_proxy_label": "none", "locomotion_label": "traveling_steps", "support_label": "alternating_foot_support", "event_family": "footwork_flow", "motion_stage_role": "development", "natural_duration_range_sec": [1.5, 4.0]},
     "thirty_six_postures": {"aliases": {"36pose", "36posture", "36postures", "thirtysix", "thirty_six", "thirty_six_postures", "jiyuetian"}, "energy": 0.36, "onset": 0.18, "travel": 0.12, "turn": 0.12, "lower": 0.28, "upper": 0.42, "floorwork": 0.18, "jump": 0.02, "spin": 0.05, "pose_hold": 0.90, "instrument": 0.0, "prop": 0.0, "display": "Ji Yue Tian Thirty-Six Postures", "semantic_role": "iconic_pose_sequence", "energy_label": "moderate", "rhythm_label": "sustained", "body_focus_label": "pose", "spatial_label": "in_place", "music_alignment_label": "pose_hold", "music_alignment_tags": ["pose_hold", "calm_meditative", "lyrical_flow"], "preferred_music_roles": ["intro", "release", "resolution"], "preferred_dance_keys": ["thirty_six_postures", "revelation_meditation", "lotus_steps"], "cultural_motif": "jiyuetian_pose", "prop_proxy_label": "none", "locomotion_label": "in_place_pose", "support_label": "static_or_low_motion_support", "event_family": "pose_motif", "motion_stage_role": "anchor_or_resolution", "natural_duration_range_sec": [1.2, 3.8]},
@@ -1509,12 +1544,58 @@ CHANG_E_CATEGORY_PROFILES = {
     "unknown": {"aliases": set(), "energy": 0.45, "onset": 0.30, "travel": 0.30, "turn": 0.20, "lower": 0.45, "upper": 0.45, "floorwork": 0.0, "jump": 0.0, "spin": 0.0, "pose_hold": 0.25, "instrument": 0.0, "prop": 0.0, "display": "Unknown Chang-E Motion", "semantic_role": "unknown_motion", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "full_body", "spatial_label": "in_place", "music_alignment_label": "lyrical_flow", "music_alignment_tags": ["lyrical_flow"], "preferred_music_roles": ["normal"], "preferred_dance_keys": ["lotus_steps", "thirty_six_postures"], "cultural_motif": "unknown", "prop_proxy_label": "unknown", "locomotion_label": "unknown", "support_label": "unknown", "event_family": "unknown", "motion_stage_role": "development", "natural_duration_range_sec": [1.5, 4.0]},
 }
 
+# Formal theme profiles contain context only.  In particular, names such as
+# Pipa, Drum, Ribbon, or Sogdian Whirl do not inject motion energy, rotation,
+# footwork, prop visibility, or percussive action into local SMPL windows.
+CHANG_E_CATEGORY_PROFILES = {
+    "flying_apsaras": {
+        "aliases": {"flying", "apsaras", "flying_apsara", "flying_apsaras", "feitian", "fei_tian"},
+        "display": "Flying Apsaras",
+        "cultural_context": ["dunhuang_flying_apsaras_theme"],
+    },
+    "lotus_steps": {
+        "aliases": {"lotus", "lotussteps", "lotus_step", "lotus_steps"},
+        "display": "Lotus Steps",
+        "cultural_context": ["lotus_steps_theme"],
+    },
+    "thirty_six_postures": {
+        "aliases": {"36pose", "36posture", "36postures", "thirtysix", "thirty_six", "thirty_six_postures", "jiyuetian"},
+        "display": "Ji Yue Tian Thirty-Six Postures",
+        "cultural_context": ["thirty_six_postures_theme"],
+    },
+    "revelation_meditation": {
+        "aliases": {"meditation", "mediation", "revelation", "revelation_meditation", "revelation_mediation"},
+        "display": "Revelation Meditation",
+        "cultural_context": ["revelation_meditation_theme"],
+    },
+    "sogdian_whirl": {
+        "aliases": {"sogdian", "sogdian_whirl", "whirl"},
+        "display": "Sogdian Whirl",
+        "cultural_context": ["sogdian_whirl_theme"],
+    },
+    "pipa_behind_back": {
+        "aliases": {"pipa", "pipa1", "pipa2", "playing_pipa", "playing_the_pipa", "pipa_behind_back"},
+        "display": "Playing the Pipa Behind the Back",
+        "cultural_context": ["pipa_source_context"],
+    },
+    "lei_gong_drum": {
+        "aliases": {"drum", "lei_gong", "leigong", "lei_gong_drum"},
+        "display": "Lei Gong Drum",
+        "cultural_context": ["drum_source_context"],
+    },
+    "unknown": {
+        "aliases": set(),
+        "display": "Unknown Chang-E Theme",
+        "cultural_context": [],
+    },
+}
+
 ENERGY_LABELS = ["calm", "moderate", "high", "percussive"]
 RHYTHM_LABELS = ["sustained", "lyrical", "accented", "percussive"]
 BODY_FOCUS_LABELS = ["pose", "lower_body", "upper_body", "full_body", "turning_flow"]
 SPATIAL_LABELS = ["in_place", "traveling", "turning", "aerial_leaning"]
-MUSIC_ALIGNMENT_LABELS = ["calm_meditative", "lyrical_flow", "pose_hold", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow", "aerial_curve"]
-EVENT_FAMILY_LABELS = ["calm_flow", "pose_motif", "footwork_flow", "turning_flow", "instrument_motif", "percussive_accent", "aerial_curve", "unknown"]
+MUSIC_ALIGNMENT_LABELS = ["unknown", "calm_meditative", "lyrical_flow", "pose_hold", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow", "aerial_curve"]
+EVENT_FAMILY_LABELS = ["pose_hold", "locomotion", "turn_spin", "jump_aerial", "floorwork", "upper_body_gesture", "rhythmic_accent", "transition", "unknown"]
 STAGE_ROLE_LABELS = ["intro", "development", "build_up", "motif_recall", "anchor_or_resolution", "intro_or_resolution", "opening_or_climax", "accent_or_climax", "climax", "resolution"]
 CATEGORY_CLASS_OVERRIDES = {}
 
@@ -1525,7 +1606,7 @@ def canonicalize_chang_e_key(key: object) -> str:
         key_s = re.sub(r"_take\d+$", "", key_s)
     except Exception:
         pass
-    aliases = {"mediation": "revelation_meditation", "female_mediation": "revelation_meditation", "male_mediation": "revelation_meditation", "meditation": "revelation_meditation", "36pose": "thirty_six_postures", "36postures": "thirty_six_postures", "thirtysix": "thirty_six_postures", "lotus": "lotus_steps", "pipa": "pipa_behind_back", "drum": "lei_gong_drum", "leigong": "lei_gong_drum", "ribbon": "sogdian_whirl", "ribbon_flow": "sogdian_whirl", "sogdian": "sogdian_whirl", "whirl": "sogdian_whirl", "flying": "flying_apsaras", "apsaras": "flying_apsaras", "feitian": "flying_apsaras"}
+    aliases = {"mediation": "revelation_meditation", "female_mediation": "revelation_meditation", "male_mediation": "revelation_meditation", "meditation": "revelation_meditation", "36pose": "thirty_six_postures", "36postures": "thirty_six_postures", "thirtysix": "thirty_six_postures", "lotus": "lotus_steps", "pipa": "pipa_behind_back", "drum": "lei_gong_drum", "leigong": "lei_gong_drum", "sogdian": "sogdian_whirl", "whirl": "sogdian_whirl", "flying": "flying_apsaras", "apsaras": "flying_apsaras", "feitian": "flying_apsaras"}
     if key_s in aliases:
         return aliases[key_s]
     for k, prof in CHANG_E_CATEGORY_PROFILES.items():
@@ -1557,32 +1638,58 @@ def _parse_numeric_semantic(meta: dict) -> Dict[str, float]:
 
 def strong_action_semantics_from_meta(meta: dict, desc: Optional[np.ndarray] = None) -> Dict[str, object]:
     key = _safe_profile_key(meta)
-    base_prof = dict(CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"]))
-    numeric = {k: float(base_prof.get(k, 0.0)) for k in ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]}
-    numeric.update(_parse_numeric_semantic(meta))
-    if desc is not None and len(desc) >= 20:
-        numeric["travel"] = max(numeric["travel"], float(np.clip(desc[1] / 1.2, 0.0, 1.0)))
-        numeric["energy"] = max(numeric["energy"], float(np.clip(desc[5] / 0.14, 0.0, 1.0)))
-        numeric["lower"] = max(numeric["lower"], float(np.clip(desc[7] / 0.10, 0.0, 1.0)))
-        numeric["upper"] = max(numeric["upper"], float(np.clip(desc[8] / 0.10, 0.0, 1.0)))
-        numeric["turn"] = max(numeric["turn"], float(np.clip(abs(desc[17]) / 0.22, 0.0, 1.0)))
-        numeric["jump"] = max(numeric["jump"], float(np.clip(desc[18] / 0.20, 0.0, 1.0)))
-        numeric["pose_hold"] = max(numeric["pose_hold"], float(np.clip(1.0 - desc[5] / 0.12, 0.0, 1.0)))
-    prof = dict(base_prof)
-    for field in ["energy_label", "rhythm_label", "body_focus_label", "spatial_label", "music_alignment_label", "semantic_role", "cultural_motif", "prop_proxy_label", "locomotion_label", "support_label", "event_family", "motion_stage_role"]:
-        if meta.get(field):
-            prof[field] = str(meta.get(field))
-    if meta.get("music_alignment_tags"):
-        prof["music_alignment_tags"] = [x for x in re.split(r"[;|,]", str(meta.get("music_alignment_tags"))) if x]
-    if meta.get("preferred_dance_keys"):
-        prof["preferred_dance_keys"] = [canonicalize_chang_e_key(x) for x in re.split(r"[;|,]", str(meta.get("preferred_dance_keys"))) if x]
-    tags = list(dict.fromkeys([str(prof.get("music_alignment_label"))] + [str(x) for x in prof.get("music_alignment_tags", [])]))
-    prof["music_alignment_tags"] = tags
-    prof.setdefault("preferred_music_roles", base_prof.get("preferred_music_roles", ["normal"]))
-    prof.setdefault("preferred_dance_keys", base_prof.get("preferred_dance_keys", [key]))
-    prof["semantic_numeric"] = ";".join(str(float(numeric[k])) for k in ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"])
-    prof["classification_text"] = f"action={key}; motif={prof.get('cultural_motif')}; family={prof.get('event_family')}; stage={prof.get('motion_stage_role')}; music_align={prof.get('music_alignment_label')}; numeric={prof['semantic_numeric']}"
-    return refine_chang_e_event_semantics(meta, desc, prof)
+    is_legacy_bvh = (
+        str(meta.get("source_format", "")).startswith("legacy_bvh")
+        or bool(meta.get("raw_stem"))
+    )
+    if is_legacy_bvh:
+        legacy = dict(
+            LEGACY_BVH_CATEGORY_PROFILES.get(
+                key, LEGACY_BVH_CATEGORY_PROFILES["unknown"]
+            )
+        )
+        numeric_keys = [
+            "energy", "onset", "travel", "turn", "lower", "upper",
+            "floorwork", "jump", "spin", "pose_hold", "instrument", "prop",
+        ]
+        numeric = {name: float(legacy.get(name, 0.0)) for name in numeric_keys}
+        if desc is not None and len(desc) >= 20:
+            numeric["travel"] = max(numeric["travel"], _bounded01(desc[1] / 1.2))
+            numeric["energy"] = max(numeric["energy"], _bounded01(desc[5] / 0.14))
+            numeric["lower"] = max(numeric["lower"], _bounded01(desc[7] / 0.10))
+            numeric["upper"] = max(numeric["upper"], _bounded01(desc[8] / 0.10))
+            numeric["turn"] = max(numeric["turn"], _bounded01(abs(desc[17]) / 0.22))
+            numeric["jump"] = max(numeric["jump"], _bounded01(desc[18] / 0.20))
+            numeric["pose_hold"] = max(
+                numeric["pose_hold"], _bounded01(1.0 - desc[5] / 0.12)
+            )
+        legacy["semantic_numeric"] = ";".join(
+            str(float(numeric[name])) for name in numeric_keys
+        )
+        return legacy_bvh_refine_chang_e_event_semantics(meta, desc, legacy)
+
+    theme = dict(
+        CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"])
+    )
+    context = meta.get("source_context", [])
+    if isinstance(context, str):
+        context = [value for value in re.split(r"[;,|]", context) if value]
+    out: Dict[str, object] = {
+        "semantics_schema": "chang_e_five_layer_event_semantics_v2",
+        "dance_theme": key,
+        "theme_display": theme.get("display", key),
+        "theme_label_status": meta.get("theme_label_status", "legacy_or_unknown"),
+        "candidate_dance_category": meta.get("candidate_dance_category"),
+        "cultural_context": list(theme.get("cultural_context", [])),
+        "source_context": [str(value) for value in context],
+        "source_context_is_local_action_truth": False,
+        "prop_observation_available": False,
+        "hand_capture_available": False,
+        "preferred_dance_keys": [],
+        "preferred_music_roles": [],
+        "natural_duration_range_sec": [1.5, 4.0],
+    }
+    return refine_chang_e_event_semantics(meta, desc, out)
 
 
 def _float_meta(meta: dict, key: str, default: float = 0.0) -> float:
@@ -1619,17 +1726,17 @@ def chang_e_event_quality_from_numbers(nums: Dict[str, float], family: str, dura
     center = max(1e-3, 0.5 * (lo + hi))
     dur_score = 1.0 if (lo <= dur <= hi) else float(np.exp(-abs(np.log(dur / center))))
     content = max(energy, travel, turn, lower, upper, onset, jump)
-    if family in {"pose_motif", "calm_flow"}:
+    if family in {"pose_motif", "calm_flow", "pose_hold", "floorwork"}:
         content = max(content * 0.65, pose_hold)
     # Event Semantics: stationary Dunhuang postures / meditation motifs are supposed to
     # have long stable support. Do not score contact_ratio=1.0 as bad gait.
-    if family in {"pose_motif", "calm_flow"} or pose_hold > 0.70:
+    if family in {"pose_motif", "calm_flow", "pose_hold", "floorwork"} or pose_hold > 0.70:
         contact_score = 1.0 if contact_ratio >= 0.70 else float(contact_ratio / 0.70)
     else:
         contact_score = 1.0 - min(1.0, abs(contact_ratio - 0.46) / 0.54)
     root_y_penalty = max(0.0, min(0.25, (root_y - 0.35) * 0.35))
     dead_penalty = 0.0
-    if family not in {"pose_motif", "calm_flow"} and content < 0.20 and pose_hold < 0.45:
+    if family not in {"pose_motif", "calm_flow", "pose_hold", "floorwork"} and content < 0.20 and pose_hold < 0.45:
         dead_penalty = 0.25
     q = 0.42 * content + 0.22 * pose_hold + 0.20 * dur_score + 0.16 * contact_score - root_y_penalty - dead_penalty
     return float(np.clip(q, 0.02, 1.0))
@@ -1738,7 +1845,7 @@ def chang_e_semantic_event_starts(seq: np.ndarray, cfg: MotionGenerationConfig) 
     return sorted(set(int(x) for x in merged))
 
 
-def refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof: Dict[str, object]) -> Dict[str, object]:
+def legacy_bvh_refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof: Dict[str, object]) -> Dict[str, object]:
     # Event Semantics window-level semantics for Chang-E event slicing.
     # Chang-E is a long, category-complete MoCap corpus; each local window is
     # converted into a curated event with explicit recording provenance.
@@ -1832,6 +1939,195 @@ def refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof:
         f"stage={out.get('motion_stage_role')}; support={out.get('support_label')}; "
         f"locomotion={out.get('locomotion_label')}; music_align={out.get('music_alignment_label')}; "
         f"event_mid={float(frac_mid):.3f}; quality={q:.3f}; semantic_conf={out['semantic_confidence']:.3f}; numeric={out['semantic_numeric']}"
+    )
+    return out
+
+
+def refine_chang_e_event_semantics(
+    meta: dict,
+    desc: Optional[np.ndarray],
+    prof: Dict[str, object],
+) -> Dict[str, object]:
+    """Build five-layer semantics from provenance, theme context, and motion.
+
+    The dance theme never contributes a numeric local-action score.  The local
+    layer is multi-label and is computed only from the current motion window.
+    Music compatibility is explicitly weak/probabilistic and is not copied from
+    the selected local-action family.
+    """
+
+    out = dict(prof)
+    scores = {label: 0.0 for label in EVENT_FAMILY_LABELS if label != "unknown"}
+    nums = {
+        "energy": 0.0,
+        "onset": 0.0,
+        "travel": 0.0,
+        "turn": 0.0,
+        "lower": 0.0,
+        "upper": 0.0,
+        "floorwork": 0.0,
+        "jump": 0.0,
+        "spin": 0.0,
+        "pose_hold": 0.0,
+        "instrument": 0.0,
+        "prop": 0.0,
+    }
+
+    descriptor_available = desc is not None and len(desc) >= 31
+    if descriptor_available:
+        x = np.asarray(desc, dtype=np.float32)
+        energy = _bounded01(float(x[5]) / 0.35)
+        lower = _bounded01(float(x[7]) / 0.30)
+        upper = _bounded01(float(x[8]) / 0.30)
+        travel = max(
+            _bounded01(float(x[1]) / 1.20),
+            _bounded01(float(x[2]) / 0.45),
+        )
+        turn = max(
+            _bounded01(abs(float(x[15])) / 1.40),
+            _bounded01(abs(float(x[17])) / 1.20),
+        )
+        floorwork = _bounded01(float(x[25]))
+        airborne = _bounded01(float(x[26]))
+        burst = _bounded01(float(x[27]))
+        upper_fraction = _bounded01(float(x[29]))
+        transition = _bounded01(float(x[30]))
+        contact_ratio = _bounded01(float(x[10]))
+        root_y_range = max(0.0, float(x[18]))
+        jump = max(
+            _bounded01((root_y_range - 0.05) / 0.25),
+            airborne,
+        )
+        pose_hold = _bounded01(1.0 - energy) * _bounded01(
+            0.35 + 0.65 * contact_ratio
+        )
+        upper_gesture = _bounded01(upper * (0.55 + 0.90 * upper_fraction))
+        rhythmic = _bounded01(0.65 * burst + 0.35 * _bounded01(float(x[6]) / 1.2))
+
+        scores.update(
+            {
+                "pose_hold": pose_hold,
+                "locomotion": travel,
+                "turn_spin": turn,
+                "jump_aerial": jump,
+                "floorwork": floorwork,
+                "upper_body_gesture": upper_gesture,
+                "rhythmic_accent": rhythmic,
+                "transition": transition,
+            }
+        )
+        nums.update(
+            {
+                "energy": energy,
+                "onset": rhythmic,
+                "travel": travel,
+                "turn": turn,
+                "lower": lower,
+                "upper": upper,
+                "floorwork": floorwork,
+                "jump": jump,
+                "spin": turn,
+                "pose_hold": pose_hold,
+                "contact_ratio": contact_ratio,
+                "root_y_range": root_y_range,
+            }
+        )
+
+    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    primary, primary_score = ordered[0] if ordered else ("unknown", 0.0)
+    if not descriptor_available or primary_score < 0.40:
+        primary = "unknown"
+    local_labels = [name for name, score in ordered if score >= 0.50]
+    if not local_labels:
+        local_labels = [primary]
+
+    frac_mid = _float_meta(
+        meta,
+        "event_position_mid",
+        _float_meta(meta, "event_position_fraction", 0.5),
+    )
+    if frac_mid < 0.12:
+        stage = "intro"
+    elif frac_mid > 0.88:
+        stage = "resolution"
+    elif primary in {"turn_spin", "jump_aerial", "rhythmic_accent"}:
+        stage = "climax"
+    elif primary == "transition":
+        stage = "development"
+    else:
+        stage = "development"
+
+    compatibility_by_action = {
+        "pose_hold": {"pose_hold": 0.45, "calm_meditative": 0.40, "lyrical_flow": 0.15},
+        "locomotion": {"footwork_flow": 0.55, "lyrical_flow": 0.30, "percussive_accent": 0.15},
+        "turn_spin": {"turning_climax": 0.60, "lyrical_flow": 0.25, "footwork_flow": 0.15},
+        "jump_aerial": {"aerial_curve": 0.55, "lyrical_flow": 0.30, "turning_climax": 0.15},
+        "floorwork": {"calm_meditative": 0.35, "lyrical_flow": 0.35, "pose_hold": 0.30},
+        "upper_body_gesture": {"lyrical_flow": 0.50, "instrument_phrase": 0.20, "unknown": 0.30},
+        "rhythmic_accent": {"percussive_accent": 0.60, "footwork_flow": 0.25, "lyrical_flow": 0.15},
+        "transition": {"lyrical_flow": 0.50, "unknown": 0.50},
+        "unknown": {"unknown": 1.0},
+    }
+    compatibility = dict(compatibility_by_action[primary])
+    compatibility_top = max(
+        compatibility.items(), key=lambda item: (item[1], item[0])
+    )[0]
+
+    duration = float(
+        desc[0] if descriptor_available else _float_meta(meta, "duration", 0.0)
+    )
+    q = chang_e_event_quality_from_numbers(
+        nums, primary, duration, [1.5, 4.0]
+    )
+    out.update(
+        {
+            "local_action_labels": local_labels,
+            "local_action_scores": scores,
+            "local_action_scores_json": json.dumps(scores, sort_keys=True),
+            "local_action_descriptor_available": bool(descriptor_available),
+            "event_family": primary,
+            "motion_stage_role": stage,
+            "music_alignment_label": "unknown",
+            "music_alignment_tags": list(compatibility),
+            "music_compatibility_top_label": compatibility_top,
+            "music_compatibility_scores": compatibility,
+            "music_compatibility_scores_json": json.dumps(
+                compatibility, sort_keys=True
+            ),
+            "music_compatibility_supervision": "weak_kinematic_heuristic",
+            "music_compatibility_is_ground_truth": False,
+            "cultural_context_is_source_only": True,
+            "prop_proxy_label": "not_observed_in_smpl",
+            "event_position_mid": float(frac_mid),
+            "event_quality_score": float(q),
+            "semantic_confidence": float(
+                np.clip(0.20 + 0.55 * q + 0.25 * primary_score, 0.10, 1.0)
+            ),
+        }
+    )
+    if primary == "turn_spin":
+        out.update({"locomotion_label": "turning", "spatial_label": "turning"})
+    elif primary == "locomotion":
+        out.update({"locomotion_label": "traveling", "spatial_label": "traveling"})
+    elif primary == "jump_aerial":
+        out.update({"locomotion_label": "aerial", "spatial_label": "aerial"})
+    elif primary == "floorwork":
+        out.update({"locomotion_label": "floor_level", "spatial_label": "in_place"})
+    elif primary == "pose_hold":
+        out.update({"locomotion_label": "in_place_pose", "spatial_label": "in_place"})
+    else:
+        out.update({"locomotion_label": "unknown", "spatial_label": "unknown"})
+
+    keys = ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]
+    out["semantic_numeric"] = ";".join(
+        str(float(nums.get(name, 0.0))) for name in keys
+    )
+    out["classification_text"] = (
+        f"theme={out.get('dance_theme', 'unknown')}"
+        f"[{out.get('theme_label_status', 'unknown')}]; "
+        f"local_actions={','.join(local_labels)}; primary={primary}; "
+        f"music_compatibility={compatibility_top}[weak]; "
+        f"source_context={','.join(out.get('source_context', [])) or 'none'}"
     )
     return out
 
@@ -2173,7 +2469,7 @@ def semantic_label_match_bonus(slot: dict, db: dict, cfg: MotionGenerationConfig
     preferred_roles = [str(x) for x in slot.get("preferred_semantic_roles", [])]
     slot_align = str(slot.get("music_alignment_label", slot.get("music_semantic_top_label", "")))
     slot_energy = str(slot.get("energy_label", "")); slot_rhythm = str(slot.get("rhythm_label", "")); slot_role = str(slot.get("role", "normal"))
-    route_family_map = {"calm_meditative": ["calm_flow", "pose_motif", "aerial_curve"], "pose_hold": ["pose_motif", "calm_flow", "instrument_motif"], "lyrical_flow": ["aerial_curve", "footwork_flow", "instrument_motif", "calm_flow"], "footwork_flow": ["footwork_flow", "turning_flow", "aerial_curve"], "instrument_phrase": ["instrument_motif", "aerial_curve", "pose_motif"], "percussive_accent": ["percussive_accent", "turning_flow", "instrument_motif"], "turning_climax": ["turning_flow", "aerial_curve", "percussive_accent"], "aerial_curve": ["aerial_curve", "turning_flow", "footwork_flow"]}
+    route_family_map = {"calm_meditative": ["pose_hold", "floorwork", "upper_body_gesture"], "pose_hold": ["pose_hold", "floorwork", "upper_body_gesture"], "lyrical_flow": ["upper_body_gesture", "jump_aerial", "locomotion", "floorwork", "transition"], "footwork_flow": ["locomotion", "turn_spin", "rhythmic_accent"], "instrument_phrase": ["upper_body_gesture", "pose_hold"], "percussive_accent": ["rhythmic_accent", "locomotion", "turn_spin"], "turning_climax": ["turn_spin", "jump_aerial", "rhythmic_accent"], "aerial_curve": ["jump_aerial", "turn_spin", "upper_body_gesture"]}
     route_stage_map = {"intro": ["intro", "intro_or_resolution", "anchor_or_resolution"], "calm": ["intro", "intro_or_resolution", "resolution", "anchor_or_resolution"], "normal": ["development", "build_up", "motif_recall"], "development": ["development", "build_up"], "build_up": ["build_up", "development", "opening_or_climax"], "motif": ["motif_recall", "development"], "motif_recall": ["motif_recall", "anchor_or_resolution"], "accent": ["accent_or_climax", "climax", "build_up"], "climax": ["climax", "accent_or_climax", "opening_or_climax"], "release": ["resolution", "anchor_or_resolution", "intro_or_resolution"], "resolution": ["resolution", "anchor_or_resolution", "intro_or_resolution"]}
     route_support_map = {"calm_meditative": ["stable_support", "static_or_low_motion_support"], "pose_hold": ["stable_support", "static_or_low_motion_support"], "footwork_flow": ["alternating_foot_support", "alternating_or_pivot_support"], "turning_climax": ["alternating_or_pivot_support", "low_contact_flight_like"], "percussive_accent": ["strong_foot_contact", "alternating_foot_support"], "lyrical_flow": ["alternating_foot_support", "low_contact_flight_like", "stable_support"], "instrument_phrase": ["stable_support", "alternating_foot_support"]}
     route_loco_map = {"calm_meditative": ["slow_weight_shift", "in_place_pose", "floating_leaning"], "pose_hold": ["in_place_pose", "slow_weight_shift"], "footwork_flow": ["traveling_steps", "turning_travel"], "turning_climax": ["turning_travel", "floating_leaning"], "percussive_accent": ["accented_travel", "turning_travel", "traveling_steps"], "lyrical_flow": ["floating_leaning", "traveling_steps", "upper_body_phrase"], "instrument_phrase": ["upper_body_phrase", "in_place_pose"]}
@@ -2223,6 +2519,12 @@ def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
     synchronized performer tracks so train/validation/test splitting cannot
     leak one choreography through another dancer file.
     """
+    # This dependency is deliberately lazy: the historical BVH manifest must
+    # not be loaded or consulted by the formal official-SMPL Event-DB path.
+    from data_pipeline.chang_e_manifest import (
+        semantic_metadata as chang_e_semantic_metadata,
+    )
+
     stem = _clean_stem(path)
     manifest_meta = chang_e_semantic_metadata(path)
     tokens = [t for t in stem.split("_") if t]
@@ -2257,7 +2559,7 @@ def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
         raw_take = manifest_meta.get("take_id")
         take_id = int(raw_take) if raw_take is not None else None
 
-    prof = CHANG_E_CATEGORY_PROFILES.get(category_key, {})
+    prof = LEGACY_BVH_CATEGORY_PROFILES.get(category_key, {})
     display = str(prof.get("display", category_key.replace("_", " ").title()))
     semantic_role = str(prof.get("semantic_role", "unknown_motion"))
     source_uid = str(
@@ -2301,6 +2603,77 @@ def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
     }
 
 
+def official_smpl_semantics_from_metadata(meta: Mapping[str, Any]) -> Dict[str, object]:
+    """Resolve formal source/theme context without filenames or BVH metadata."""
+
+    if str(meta.get("source_format", "")).strip() != "chang_e_official_smpl":
+        raise ValueError(
+            "Official SMPL semantics require "
+            "source_format=chang_e_official_smpl"
+        )
+    source_id = str(meta.get("source_id") or meta.get("source_uid") or "").strip()
+    recording_uid = str(meta.get("recording_uid") or "").strip()
+    sequence_id = str(meta.get("sequence_id") or "").strip()
+    if not source_id or not recording_uid or not sequence_id:
+        raise ValueError(
+            "Official SMPL semantics require source_id, recording_uid, and sequence_id"
+        )
+
+    theme_status = str(meta.get("theme_label_status") or "").strip()
+    dance_category = str(meta.get("dance_category") or "unknown").strip()
+    if theme_status not in {"confirmed", "pending_official_confirmation"}:
+        raise ValueError(f"Invalid official theme_label_status={theme_status!r}")
+    if theme_status != "confirmed" and dance_category != "unknown":
+        raise ValueError(
+            "Unconfirmed official themes must remain dance_category=unknown"
+        )
+
+    performer_group = str(meta.get("performer_group") or "unknown").strip().lower()
+    context = meta.get("source_context", [])
+    if isinstance(context, str):
+        context = [value for value in re.split(r"[;,|]", context) if value]
+    context = [str(value) for value in context]
+    display = str(
+        CHANG_E_CATEGORY_PROFILES.get(
+            dance_category, CHANG_E_CATEGORY_PROFILES["unknown"]
+        ).get("display", dance_category)
+    )
+    theme_label = dance_category if theme_status == "confirmed" else "unknown_theme"
+    return {
+        "source_format": "chang_e_official_smpl",
+        "source_uid": source_id,
+        "source_group": source_id,
+        "source_id": source_id,
+        "recording_uid": recording_uid,
+        "sequence_id": sequence_id,
+        "dancer_id": meta.get("dancer_id"),
+        "dancer_id_status": meta.get("dancer_id_status", "unverified"),
+        "performer_track_id": meta.get("performer_track_id", -1),
+        "sequence_index": meta.get("sequence_index", -1),
+        "performer_group": performer_group,
+        "gender": performer_group,
+        "dance_key": dance_category,
+        "dance_category": dance_category,
+        "dance_theme": dance_category,
+        "candidate_dance_category": meta.get("candidate_dance_category"),
+        "theme_label_status": theme_status,
+        "source_context": context,
+        "take_id": meta.get("take_id"),
+        "source_take": meta.get("take_id"),
+        "manifest_sha256": meta.get("manifest_sha256"),
+        "coordinate_system": meta.get("coordinate_system"),
+        "translation_units": meta.get("translation_units"),
+        "pose_layout": meta.get("pose_layout"),
+        "label": theme_label,
+        "parent_label": theme_label,
+        "semantic_role": "dance_theme_context",
+        "semantic_text": (
+            f"theme={display}; theme_status={theme_status}; "
+            f"source_context={','.join(context) if context else 'none'}"
+        ),
+    }
+
+
 def source_group_from_path(path: str | Path) -> str:
     # File-level identity remains distinct from recording_uid.  Both are saved
     # in the Event-DB and audited independently.
@@ -2321,8 +2694,15 @@ def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[MotionGeneratio
     that e.g. drum should prefer onset-rich slots and meditation should prefer
     calm slots.
     """
+    if str(meta.get("source_format", "")) == "chang_e_official_smpl":
+        # Formal SMPL filenames/themes are provenance context, not local motion
+        # features.  Local kinematics are encoded by class_semantic_vector.
+        v = np.zeros(32, dtype=np.float32)
+        v[0] = float(meta.get("duration", 0.0) or 0.0)
+        return v
+
     key = canonicalize_chang_e_key(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or "unknown")
-    prof = CHANG_E_CATEGORY_PROFILES.get(key, {})
+    prof = LEGACY_BVH_CATEGORY_PROFILES.get(key, {})
     duration = float(meta.get("duration", 0.0) or 0.0)
     energy = float(prof.get("energy", 0.40))
     onset = float(prof.get("onset", 0.20))
@@ -2655,7 +3035,18 @@ def add_event_to_db_lists(
         "event_id": event_idx,
         "path": str(out_path),
         "source_file": str(base_meta.get("source_file", base_meta.get("load_path", ""))),
-        "source_bvh": str(base_meta.get("source_bvh", Path(str(base_meta.get("source_file", "source"))).name)),
+        "source_format": str(base_meta.get("source_format", "legacy_bvh")),
+        "source_asset": str(base_meta.get("source_asset", base_meta.get("source_file", ""))),
+        "source_bvh": (
+            ""
+            if str(base_meta.get("source_format", "")) == "chang_e_official_smpl"
+            else str(
+                base_meta.get(
+                    "source_bvh",
+                    Path(str(base_meta.get("source_file", "source"))).name,
+                )
+            )
+        ),
         "source_group": source,
         "matched_audio": matched_audio,
         "has_real_audio_feature": bool(music_mask > 0.5),
@@ -2674,7 +3065,14 @@ def add_event_to_db_lists(
             )
         ),
         "canonical_fps": float(base_meta.get("canonical_fps", cfg.fps)),
-        "label": str(base_meta.get("label", infer_label_from_filename(base_meta.get("source_file", out_path)))),
+        "label": str(
+            base_meta.get("label")
+            or (
+                "unknown_theme"
+                if str(base_meta.get("source_format", "")) == "chang_e_official_smpl"
+                else infer_label_from_filename(base_meta.get("source_file", out_path))
+            )
+        ),
         "parent_label": str(base_meta.get("parent_label", base_meta.get("label", "unknown"))),
         "fragment_index": int(base_meta.get("fragment_index", 0) or 0),
         "manifest_id": base_meta.get("manifest_id"),
@@ -2682,12 +3080,17 @@ def add_event_to_db_lists(
         "input_mode": base_meta.get("input_mode", "direct_files"),
         "edge151_contract_report": contract_report,
     }
-    sem = parse_change_bvh_semantics(base_meta.get("source_file", base_meta.get("source_bvh", out_path)))
+    if item["source_format"] == "chang_e_official_smpl":
+        sem = official_smpl_semantics_from_metadata(base_meta)
+    else:
+        sem = parse_change_bvh_semantics(
+            base_meta.get("source_file", base_meta.get("source_bvh", out_path))
+        )
     item.update(strong_action_semantics_from_meta({**sem, **item}, desc))
     # Keep source_uid/source_group from filename unless a manifest-specific source
     # explicitly supplied them.  Keep manifest label if present; otherwise use
     # filename category/take label.
-    for k in ["source_uid", "recording_uid", "performer_track_id", "sequence_index", "gender", "dance_key", "dance_category", "semantic_role", "semantic_text", "take_id", "source_take", "raw_stem"]:
+    for k in ["source_uid", "source_id", "recording_uid", "sequence_id", "dancer_id", "dancer_id_status", "performer_track_id", "sequence_index", "performer_group", "gender", "dance_key", "dance_category", "dance_theme", "candidate_dance_category", "theme_label_status", "source_context", "manifest_sha256", "coordinate_system", "translation_units", "pose_layout", "semantic_role", "semantic_text", "take_id", "source_take", "raw_stem"]:
         item[k] = base_meta.get(k, sem.get(k))
     strong_sem = strong_action_semantics_from_meta(item, desc)
     item.update(strong_sem)
@@ -2811,6 +3214,12 @@ def build_db(args: argparse.Namespace) -> int:
     db_path = out_dir / "events.npz"
     np.savez_compressed(
         db_path,
+        event_semantics_schema_version=np.asarray(
+            "chang_e_five_layer_event_semantics_v2", dtype=object
+        ),
+        event_descriptor_schema_version=np.asarray(
+            "edge151_local_action_descriptor_v2", dtype=object
+        ),
         desc=desc.astype(np.float32),
         desc_z=desc_z.astype(np.float32),
         desc_mean=mean.astype(np.float32),
@@ -2824,13 +3233,23 @@ def build_db(args: argparse.Namespace) -> int:
         labels=np.array([m.get("label", "unknown") for m in meta], dtype=object),
         parent_labels=np.array([m.get("parent_label", m.get("label", "unknown")) for m in meta], dtype=object),
         source_bvh=np.array([m.get("source_bvh", "") for m in meta], dtype=object),
+        source_assets=np.array([m.get("source_asset", "") for m in meta], dtype=object),
+        source_formats=np.array([m.get("source_format", "unknown") for m in meta], dtype=object),
         source_uids=np.array([m.get("source_uid", m.get("source_group", "")) for m in meta], dtype=object),
         recording_uids=np.array([m.get("recording_uid", m.get("source_uid", m.get("source_group", ""))) for m in meta], dtype=object),
+        sequence_ids=np.array([m.get("sequence_id", "unknown") for m in meta], dtype=object),
+        dancer_ids=np.array([m.get("dancer_id") or "" for m in meta], dtype=object),
+        dancer_id_statuses=np.array([m.get("dancer_id_status", "unverified") for m in meta], dtype=object),
+        manifest_sha256=np.array([m.get("manifest_sha256") or "" for m in meta], dtype=object),
         performer_track_ids=np.array([int(m.get("performer_track_id", -1) if m.get("performer_track_id", -1) is not None else -1) for m in meta], dtype=np.int32),
         sequence_indices=np.array([int(m.get("sequence_index", -1) if m.get("sequence_index", -1) is not None else -1) for m in meta], dtype=np.int32),
         genders=np.array([m.get("gender", "unknown") for m in meta], dtype=object),
         dance_keys=np.array([m.get("dance_key", "unknown") for m in meta], dtype=object),
         dance_categories=np.array([m.get("dance_category", "unknown") for m in meta], dtype=object),
+        dance_themes=np.array([m.get("dance_theme", "unknown") for m in meta], dtype=object),
+        candidate_dance_categories=np.array([m.get("candidate_dance_category") or "" for m in meta], dtype=object),
+        theme_label_statuses=np.array([m.get("theme_label_status", "unknown") for m in meta], dtype=object),
+        source_context_json=np.array([json.dumps(m.get("source_context", []), sort_keys=True) for m in meta], dtype=object),
         semantic_roles=np.array([m.get("semantic_role", "unknown") for m in meta], dtype=object),
         semantic_texts=np.array([m.get("semantic_text", "") for m in meta], dtype=object),
         energy_labels=np.array([m.get("energy_label", "unknown") for m in meta], dtype=object),
@@ -2838,6 +3257,11 @@ def build_db(args: argparse.Namespace) -> int:
         body_focus_labels=np.array([m.get("body_focus_label", "unknown") for m in meta], dtype=object),
         spatial_labels=np.array([m.get("spatial_label", "unknown") for m in meta], dtype=object),
         music_alignment_labels=np.array([m.get("music_alignment_label", "unknown") for m in meta], dtype=object),
+        local_action_labels_json=np.array([json.dumps(m.get("local_action_labels", ["unknown"])) for m in meta], dtype=object),
+        local_action_scores_json=np.array([m.get("local_action_scores_json", "{}") for m in meta], dtype=object),
+        music_compatibility_top_labels=np.array([m.get("music_compatibility_top_label", "unknown") for m in meta], dtype=object),
+        music_compatibility_scores_json=np.array([m.get("music_compatibility_scores_json", "{}") for m in meta], dtype=object),
+        music_compatibility_is_ground_truth=np.array([bool(m.get("music_compatibility_is_ground_truth", False)) for m in meta], dtype=np.bool_),
         classification_texts=np.array([m.get("classification_text", "") for m in meta], dtype=object),
         event_families=np.array([m.get("event_family", "unknown") for m in meta], dtype=object),
         motion_stage_roles=np.array([m.get("motion_stage_role", "unknown") for m in meta], dtype=object),

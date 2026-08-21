@@ -238,6 +238,12 @@ def save_db(
     event_uids = event_uids_from_generation_db(identity_seed)
     identity_contract = make_event_db_contract(event_uids)
     payload: Dict[str, Any] = {
+        "event_semantics_schema_version": np.asarray(
+            "chang_e_five_layer_event_semantics_v2", dtype=object
+        ),
+        "event_descriptor_schema_version": np.asarray(
+            "edge151_local_action_descriptor_v2", dtype=object
+        ),
         "event_uid_schema_version": np.asarray(
             EVENT_UID_SCHEMA, dtype=object
         ),
@@ -262,9 +268,15 @@ def save_db(
         "paths": _field_array(meta, "path", "", object),
         "source_groups": _field_array(meta, "source_group", "unknown", object),
         "source_files": _field_array(meta, "source_file", "", object),
+        "source_assets": _field_array(meta, "source_asset", "", object),
+        "source_formats": _field_array(meta, "source_format", "unknown", object),
         "source_bvh": _field_array(meta, "source_bvh", "", object),
         "source_uids": _field_array(meta, "source_uid", "unknown", object),
         "recording_uids": _field_array(meta, "recording_uid", "unknown", object),
+        "sequence_ids": _field_array(meta, "sequence_id", "unknown", object),
+        "dancer_ids": _field_array(meta, "dancer_id", "", object),
+        "dancer_id_statuses": _field_array(meta, "dancer_id_status", "unverified", object),
+        "manifest_sha256": _field_array(meta, "manifest_sha256", "", object),
         "performer_track_ids": _field_array(meta, "performer_track_id", -1, np.int32),
         "sequence_indices": _field_array(meta, "sequence_index", -1, np.int32),
         "genders": _field_array(meta, "gender", "unknown", object),
@@ -272,6 +284,17 @@ def save_db(
         "parent_labels": _field_array(meta, "parent_label", "unknown", object),
         "dance_keys": _field_array(meta, "dance_key", "unknown", object),
         "dance_categories": _field_array(meta, "dance_category", "unknown", object),
+        "dance_themes": _field_array(meta, "dance_theme", "unknown", object),
+        "candidate_dance_categories": _field_array(
+            meta, "candidate_dance_category", "", object
+        ),
+        "theme_label_statuses": _field_array(
+            meta, "theme_label_status", "unknown", object
+        ),
+        "source_context_json": np.asarray(
+            [json.dumps(m.get("source_context", []), sort_keys=True) for m in meta],
+            dtype=object,
+        ),
         "semantic_roles": _field_array(meta, "semantic_role", "unknown", object),
         "semantic_texts": _field_array(meta, "semantic_text", "", object),
         "energy_labels": _field_array(meta, "energy_label", "unknown", object),
@@ -283,6 +306,22 @@ def save_db(
         ),
         "classification_texts": _field_array(meta, "classification_text", "", object),
         "event_families": _field_array(meta, "event_family", "unknown", object),
+        "local_action_labels_json": np.asarray(
+            [json.dumps(m.get("local_action_labels", ["unknown"])) for m in meta],
+            dtype=object,
+        ),
+        "local_action_scores_json": _field_array(
+            meta, "local_action_scores_json", "{}", object
+        ),
+        "music_compatibility_top_labels": _field_array(
+            meta, "music_compatibility_top_label", "unknown", object
+        ),
+        "music_compatibility_scores_json": _field_array(
+            meta, "music_compatibility_scores_json", "{}", object
+        ),
+        "music_compatibility_is_ground_truth": _field_array(
+            meta, "music_compatibility_is_ground_truth", False, np.bool_
+        ),
         "motion_stage_roles": _field_array(
             meta, "motion_stage_role", "unknown", object
         ),
@@ -479,19 +518,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             or rep.get("source_relative")
             or path
         )
-        sem = motion_runtime.parse_change_bvh_semantics(original_source)
         report_metadata = rep.get("source_metadata")
-        if isinstance(report_metadata, dict):
-            sem = dict(sem)
-            sem.update({
-                "source_uid": report_metadata.get("source_id", sem.get("source_uid")),
-                "recording_uid": report_metadata.get("recording_uid", sem.get("recording_uid")),
-                "performer_track_id": report_metadata.get("performer_track_id", sem.get("performer_track_id", -1)),
-                "sequence_index": report_metadata.get("sequence_index", sem.get("sequence_index", -1)),
-                "performer_group": report_metadata.get("performer_group", sem.get("performer_group")),
-                "dance_key": report_metadata.get("dance_category", sem.get("dance_key")),
-                "dance_category": report_metadata.get("dance_category", sem.get("dance_category")),
-            })
+        source_format = str(
+            rep.get("source_format")
+            or (
+                report_metadata.get("source_format", "")
+                if isinstance(report_metadata, dict)
+                else ""
+            )
+        )
+        if source_format == "chang_e_official_smpl":
+            if not isinstance(report_metadata, dict):
+                raise RuntimeError(
+                    f"Formal SMPL report lacks source_metadata: {path}"
+                )
+            formal_metadata = dict(report_metadata)
+            formal_metadata["source_format"] = "chang_e_official_smpl"
+            formal_metadata["manifest_sha256"] = rep.get(
+                "source_manifest_sha256"
+            )
+            sem = motion_runtime.official_smpl_semantics_from_metadata(
+                formal_metadata
+            )
+        else:
+            sem = motion_runtime.parse_change_bvh_semantics(original_source)
         strong_base = motion_runtime.strong_action_semantics_from_meta(sem)
         semantic_meta = {**sem, **strong_base}
         source_uid = str(sem.get("source_uid") or Path(original_source).stem)
@@ -602,7 +652,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 base_meta = {
                     **sem,
                     "source_file": original_source,
-                    "source_bvh": Path(original_source).name,
+                    "source_asset": original_source,
+                    "source_bvh": (
+                        ""
+                        if source_format == "chang_e_official_smpl"
+                        else Path(original_source).name
+                    ),
+                    "source_format": source_format or "legacy_bvh",
                     "load_path": str(path),
                     "source_uid": source_uid,
                     "source_group": source_uid,

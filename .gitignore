@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 logs/
 outputs/
+output/
 *.pt
 *.npy
 *.npz

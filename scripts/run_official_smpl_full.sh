@@ -8,6 +8,24 @@ ROOT_DIR="$(
 
 REPO="${REPO:-$ROOT_DIR}"
 
+SMPL_ARG="${1:-}"
+AUDIO_ARG="${2:-${AUDIO:-}}"
+
+[[ -d "$REPO" ]] || {
+  echo "[FATAL] repo missing: $REPO" >&2
+  exit 2
+}
+
+cd "$REPO"
+
+# This launcher is the formal path, so always refresh the public research
+# configuration before resolving SMPL paths.  It must not inherit a shell that
+# previously loaded the legacy BVH profile.
+unset EXPERIMENT_CONFIG_LOADED EXPERIMENT_ACTIVE_PROFILE
+export EXPERIMENT_PROFILE="research"
+# shellcheck disable=SC1091
+source configs/experiment.env
+
 PY="${
   PY:-${GENERATION_PYTHON:-${PYTHON_BIN:-python}}
 }"
@@ -16,23 +34,12 @@ if [[ "$PY" != */* ]]; then
   PY="$(command -v "$PY")"
 fi
 
-SMPL_DIR="${
-  1:-${CHANG_E_OFFICIAL_SMPL_DIR:-$REPO/assets/motion/smpl_official_12}
-}"
-
-AUDIO_ARG="${
-  2:-${AUDIO:-}
-}"
-
-[[ -d "$REPO" ]] || {
-  echo "[FATAL] repo missing: $REPO" >&2
-  exit 2
-}
-
 [[ -x "$PY" ]] || {
   echo "[FATAL] python missing: $PY" >&2
   exit 2
 }
+
+SMPL_DIR="${SMPL_ARG:-$CHANG_E_OFFICIAL_SMPL_DIR}"
 
 [[ -d "$SMPL_DIR" ]] || {
   echo "[FATAL] Official SMPL directory missing: $SMPL_DIR" >&2
@@ -41,9 +48,11 @@ AUDIO_ARG="${
 
 SMPL_DIR="$(realpath "$SMPL_DIR")"
 
-SMPL_MANIFEST="${
-  CHANG_E_OFFICIAL_SMPL_MANIFEST:-$SMPL_DIR/sources.json
-}"
+if [[ -n "$SMPL_ARG" ]]; then
+  SMPL_MANIFEST="$SMPL_DIR/sources.json"
+else
+  SMPL_MANIFEST="$CHANG_E_OFFICIAL_SMPL_MANIFEST"
+fi
 
 [[ -s "$SMPL_MANIFEST" ]] || {
   echo "[FATAL] Official SMPL manifest missing: $SMPL_MANIFEST" >&2
@@ -54,8 +63,6 @@ SMPL_MANIFEST="${
   echo "    --source_fps 30 --overwrite" >&2
   exit 2
 }
-
-cd "$REPO"
 
 export ROOT_DIR="$REPO"
 export GENERATION_PYTHON="$PY"

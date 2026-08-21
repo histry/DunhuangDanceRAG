@@ -717,9 +717,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     tr.add_argument("--steps", type=int, default=1200)
     tr.add_argument("--batch_size", type=int, default=128)
     tr.add_argument("--seed", type=int, default=20260717)
+    em = sub.add_parser("embed")
+    em.add_argument("--db", required=True)
+    em.add_argument("--checkpoint", required=True)
     args = ap.parse_args(argv)
     if args.cmd == "train":
         report = train_grounder(Path(args.db), Path(args.out), args.steps, args.batch_size, args.seed)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    elif args.cmd == "embed":
+        report = embed_database(Path(args.db), Path(args.checkpoint))
         print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

@@ -636,6 +636,15 @@ EVENT_FAMILY_TO_MUSIC_LABEL = {
     "percussive_accent": "percussive_accent",
     "turning_flow": "turning_climax",
     "footwork_flow": "footwork_flow",
+    # Formal Chang-E local-action schema v2.
+    "pose_hold": "pose_hold",
+    "locomotion": "footwork_flow",
+    "turn_spin": "turning_climax",
+    "jump_aerial": "aerial_curve",
+    "floorwork": "lyrical_flow",
+    "upper_body_gesture": "lyrical_flow",
+    "rhythmic_accent": "percussive_accent",
+    "transition": "lyrical_flow",
 }
 ENERGY_TO_MUSIC_HINT = {
     "calm": ["calm_meditative", "pose_hold"],

@@ -11,7 +11,7 @@ from motion_geometry.physical import motion_physical_metrics_np
 from motion_geometry.resampling import resample_edge151_np
 from motion_geometry.rotations import matrix_to_rot6d_np, rot6d_to_matrix_np, so3_exp_np
 from motion_geometry.smpl24 import MOTION_DIM, OFFSETS, PARENTS, skeleton_contract
-from retargeting.smpl_adapter import load_smpl24_parameters
+from retargeting.smpl_adapter import CHANG_E_POSE_LAYOUT, load_smpl24_parameters
 from routing.boundary_closed_loop import risk_safe
 from support.common import motion_descriptor_raw
 
@@ -71,6 +71,50 @@ class MultirateMotionContractTests(unittest.TestCase):
         self.assertEqual(report["source_fps"], 60.0)
         self.assertAlmostEqual(report["smpl_scaling"], 1.15, places=5)
         self.assertEqual(report["smpl_scaling_mode"], "canonical_body")
+
+    def test_change_e_165d_layout_maps_body22_and_zero_fills_smpl24_hands(self):
+        poses = np.zeros((3, 165), dtype=np.float32)
+        poses[:, 21 * 3 + 1] = 0.25
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "aligned.npz"
+            np.savez(
+                path,
+                poses=poses,
+                trans=np.zeros((3, 3), dtype=np.float32),
+                mocap_framerate=np.asarray([30.0], dtype=np.float32),
+            )
+            motion, report = load_smpl24_parameters(
+                path,
+                target_fps=30.0,
+                source_fps=30.0,
+                pose_layout=CHANG_E_POSE_LAYOUT,
+                coordinate_system="y_up",
+                translation_units="m",
+            )
+        rotations = rot6d_to_matrix_np(motion[:, 7:151].reshape(3, 24, 6))
+        self.assertGreater(float(np.max(np.abs(rotations[:, 21] - np.eye(3)))), 0.1)
+        expected_identity = np.broadcast_to(np.eye(3), (3, 3, 3))
+        np.testing.assert_allclose(rotations[:, 22], expected_identity, atol=1.0e-6)
+        np.testing.assert_allclose(rotations[:, 23], expected_identity, atol=1.0e-6)
+        self.assertEqual(report["source_joint_count"], 55)
+        self.assertEqual(report["observed_body_joint_count"], 22)
+        self.assertEqual(report["hand_rotation_policy"], "zero_unobserved")
+
+    def test_change_e_165d_layout_rejects_nonzero_unobserved_joints(self):
+        poses = np.zeros((3, 165), dtype=np.float32)
+        poses[:, 22 * 3] = 0.1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad_aligned.npz"
+            np.savez(
+                path,
+                poses=poses,
+                trans=np.zeros((3, 3), dtype=np.float32),
+            )
+            with self.assertRaisesRegex(ValueError, "non-zero unobserved"):
+                load_smpl24_parameters(
+                    path,
+                    pose_layout=CHANG_E_POSE_LAYOUT,
+                )
 
     def test_physical_speed_is_stable_between_30_and_60_fps(self):
         motion30 = identity_motion(61, 30.0)

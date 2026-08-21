@@ -8,7 +8,6 @@ PyYAML
 tqdm
 accelerate
 einops
-laion-clap==1.1.7
 smplx
 trimesh
 wandb

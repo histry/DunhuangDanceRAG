@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Attach explicit performer-group metadata to an Event database."""
+"""Attach female/male gender strata without claiming global dancer identity."""
 from __future__ import annotations
 
 import argparse
@@ -61,11 +61,14 @@ def augment_events_npz(path: str, require_known: bool = True) -> Dict[str, Any]:
     os.replace(str(tmp), str(target))
 
     report = {
-        "schema": "event_performer_metadata",
+        "schema": "event_gender_group_metadata_v2",
         "event_db": str(target),
         "num_events": int(len(groups)),
         "performer_group_histogram": dict(histogram),
         "unknown_is_error": bool(require_known),
+        "global_dancer_identity_inferred": False,
+        "performer_disjoint_supported": False,
+        "note": "female/male is a gender stratum, not a global dancer_id",
     }
     report_path = target.with_suffix(target.suffix + ".performer.json")
     report_path.write_text(

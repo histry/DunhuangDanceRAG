@@ -29,12 +29,17 @@ import argparse
 import json
 import math
 import os
+import sys
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from contracts.anatomy import anatomy_metrics_np
 from contracts.gravity import FOOT_JOINTS, fk24_np, gravity_metrics_np
@@ -451,12 +456,22 @@ def segment_integrity(motion: np.ndarray) -> Tuple[bool, List[str], Dict[str, An
 
 def _source_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
     return {
+        "source_format": "chang_e_official_smpl",
         "source_id": str(row["source_id"]),
         "recording_uid": str(row["recording_uid"]),
+        "sequence_id": str(row["sequence_id"]),
+        "dancer_id": row.get("dancer_id"),
+        "dancer_id_status": row.get("dancer_id_status", "unverified"),
         "performer_track_id": row.get("performer_track_id", -1),
         "sequence_index": row.get("sequence_index", -1),
         "performer_group": row.get("performer_group", "unknown"),
         "dance_category": row.get("dance_category", "unknown"),
+        "candidate_dance_category": row.get("candidate_dance_category"),
+        "theme_label_status": row.get("theme_label_status"),
+        "source_context": list(row.get("source_context", [])),
+        "coordinate_system": row.get("coordinate_system", "y_up"),
+        "translation_units": row.get("translation_units", "m"),
+        "pose_layout": row.get("pose_layout"),
         "take_id": row.get("take_id"),
         "skeleton_id": "chang_e_official_smpl",
     }
@@ -497,6 +512,9 @@ def build_source(
         source,
         target_fps=source_fps,
         source_fps=source_fps,
+        pose_layout=str(source_contract["pose_layout"]),
+        coordinate_system=str(source_contract["coordinate_system"]),
+        translation_units=str(source_contract["translation_units"]),
         scaling_mode=scaling_mode,
         localize_root_xz=False,
         contact_height_m=_env_float(
@@ -595,6 +613,7 @@ def build_source(
             report: Dict[str, Any] = {
                 "schema": SEGMENT_REPORT_SCHEMA,
                 "version": VERSION,
+                "source_format": "chang_e_official_smpl",
                 "ok": True,
                 "source_gate_ok": True,
                 "source_preprocess_ok": True,
@@ -772,12 +791,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:
             resolution_errors.append({"source": str(source), "error": str(exc)})
 
+    declared_sources = len(manifest.get("sources", []))
     min_ok = (
         int(args.min_ok_sources)
         if args.min_ok_sources is not None
-        else _env_int("RETARGET_MIN_OK_SOURCES", min(8, len(resolved)))
+        else _env_int("RETARGET_MIN_OK_SOURCES", declared_sources)
     )
-    min_ok = max(3, min(min_ok, max(3, len(resolved))))
+    min_ok = max(3, min(min_ok, max(3, declared_sources)))
 
     source_reports: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = list(resolution_errors)
@@ -819,7 +839,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     num_segments = sum(
         int(row.get("num_retained_segments", 0)) for row in ok_sources
     )
-    all_ok = len(ok_sources) >= min_ok and len(recording_uids) >= 3 and num_segments >= 3
+    complete_file_set = (
+        len(files) == declared_sources
+        and len(resolved) == declared_sources
+        and not resolution_errors
+    )
+    # Formal training is fail-closed on the complete authoritative manifest.
+    # Partial source sets belong to explicit ablations, not this entry point.
+    all_ok = (
+        complete_file_set
+        and len(ok_sources) == declared_sources
+        and not failures
+        and len(recording_uids) >= 3
+        and num_segments >= 3
+    )
 
     summary = {
         "schema": SCHEMA,
@@ -834,16 +867,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "scaling_mode": str(args.scaling_mode),
         "hard_cut_policy": asdict(policy),
         "num_discovered_files": len(files),
+        "num_manifest_sources": int(declared_sources),
         "num_resolved_sources": len(resolved),
         "num_ok_sources": len(ok_sources),
         "num_failed_sources": len(failures),
         "num_retained_segments": int(num_segments),
         "num_recording_groups": len(recording_uids),
         "minimum_ok_sources": int(min_ok),
+        "complete_manifest_file_set": bool(complete_file_set),
         "split_feasible": bool(len(recording_uids) >= 3),
         "all_ok": bool(all_ok),
         "policy": {
             "official_smpl_is_authoritative": True,
+            "complete_manifest_required_for_formal_training": True,
             "bvh_retarget_optimizer_used": False,
             "v241_direction_regularizer_used": False,
             "whole_source_event_style_anatomy_gate_used": False,
