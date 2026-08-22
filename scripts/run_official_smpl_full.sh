@@ -26,9 +26,7 @@ export EXPERIMENT_PROFILE="research"
 # shellcheck disable=SC1091
 source configs/experiment.env
 
-PY="${
-  PY:-${GENERATION_PYTHON:-${PYTHON_BIN:-python}}
-}"
+PY="${PY:-${GENERATION_PYTHON:-${PYTHON_BIN:-python}}}"
 
 if [[ "$PY" != */* ]]; then
   PY="$(command -v "$PY")"

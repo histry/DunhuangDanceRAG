@@ -386,6 +386,16 @@ class SchedulerArchitectureTests(unittest.TestCase):
                     failures.append(f"{path.relative_to(ROOT)}:{line_number}:{line.strip()}")
         self.assertEqual([], failures)
 
+    def test_official_launcher_python_fallback_is_one_valid_expansion(self):
+        source = (
+            ROOT / "scripts" / "run_official_smpl_full.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'PY="${PY:-${GENERATION_PYTHON:-${PYTHON_BIN:-python}}}"',
+            source,
+        )
+        self.assertNotIn('PY="${\n', source)
+
     def test_config_variables_have_one_internal_owner(self):
         owners = {}
         pattern = re.compile(
