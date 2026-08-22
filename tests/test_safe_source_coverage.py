@@ -25,8 +25,8 @@ def _db():
 
 
 def test_source_reservoir_targets_uncovered_performer_compatible_sources(monkeypatch):
-    monkeypatch.setenv("BR_HPR_SOURCE_COVERAGE_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_SOURCE_RESERVOIR_MAXIMUM_PER_SLOT", "6")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_COVERAGE_ENABLE", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_RESERVOIR_MAXIMUM_PER_SLOT", "6")
     config = SafeSourceCoverageConfig.from_environment()
     layers, report = build_source_reservoir_layers(
         slots=[{"role": "build_up"}],

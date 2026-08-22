@@ -98,87 +98,87 @@ class ReachabilityConfig:
     def from_environment(cls) -> "ReachabilityConfig":
         return cls(
             hierarchy_weight=max(
-                0.0, _env_float("BR_HPR_REACHABILITY_HIERARCHY_WEIGHT", 0.55)
+                0.0, _env_float("ROUTING_BUDGET_REACHABILITY_HIERARCHY_WEIGHT", 0.55)
             ),
             same_event_penalty=max(
-                0.0, _env_float("BR_HPR_REACHABILITY_SAME_EVENT_PENALTY", 1.20)
+                0.0, _env_float("ROUTING_BUDGET_REACHABILITY_SAME_EVENT_PENALTY", 1.20)
             ),
             same_source_penalty=max(
-                0.0, _env_float("BR_HPR_REACHABILITY_SAME_SOURCE_PENALTY", 0.30)
+                0.0, _env_float("ROUTING_BUDGET_REACHABILITY_SAME_SOURCE_PENALTY", 0.30)
             ),
             same_family_penalty=max(
-                0.0, _env_float("BR_HPR_REACHABILITY_SAME_FAMILY_PENALTY", 0.20)
+                0.0, _env_float("ROUTING_BUDGET_REACHABILITY_SAME_FAMILY_PENALTY", 0.20)
             ),
             source_transition_weight=max(
                 0.0,
-                _env_float("BR_HPR_REACHABILITY_SOURCE_TRANSITION_WEIGHT", 0.35),
+                _env_float("ROUTING_BUDGET_REACHABILITY_SOURCE_TRANSITION_WEIGHT", 0.35),
             ),
             candidate_rank_weight=max(
-                0.0, _env_float("BR_HPR_REACHABILITY_RANK_WEIGHT", 0.02)
+                0.0, _env_float("ROUTING_BUDGET_REACHABILITY_RANK_WEIGHT", 0.02)
             ),
             maximum_edge_cost=max(
-                0.1, _env_float("BR_HPR_REACHABILITY_MAXIMUM_EDGE_COST", 8.0)
+                0.1, _env_float("ROUTING_BUDGET_REACHABILITY_MAXIMUM_EDGE_COST", 8.0)
             ),
             anatomy_quality_minimum=float(
                 np.clip(
-                    _env_float("BR_HPR_REACHABILITY_ANATOMY_QUALITY_MIN", 0.30),
+                    _env_float("ROUTING_BUDGET_REACHABILITY_ANATOMY_QUALITY_MIN", 0.30),
                     0.0,
                     1.0,
                 )
             ),
             successor_probability_floor=float(
                 np.clip(
-                    _env_float("BR_HPR_REACHABILITY_PROBABILITY_FLOOR", 1.0e-6),
+                    _env_float("ROUTING_BUDGET_REACHABILITY_PROBABILITY_FLOOR", 1.0e-6),
                     1.0e-12,
                     1.0,
                 )
             ),
             state_horizon=max(
-                1, _env_int("BR_HPR_STATE_REACHABILITY_HORIZON", 4)
+                1, _env_int("ROUTING_BUDGET_STATE_REACHABILITY_HORIZON", 4)
             ),
             state_branch_topk=max(
-                1, _env_int("BR_HPR_STATE_REACHABILITY_BRANCH_TOPK", 6)
+                1, _env_int("ROUTING_BUDGET_STATE_REACHABILITY_BRANCH_TOPK", 6)
             ),
             state_history_window=max(
-                1, _env_int("BR_HPR_STATE_REACHABILITY_HISTORY_WINDOW", 8)
+                1, _env_int("ROUTING_BUDGET_STATE_REACHABILITY_HISTORY_WINDOW", 8)
             ),
             state_usage_quantization=max(
                 1.0e-4,
-                _env_float("BR_HPR_STATE_REACHABILITY_USAGE_QUANTIZATION", 0.05),
+                _env_float("ROUTING_BUDGET_STATE_REACHABILITY_USAGE_QUANTIZATION", 0.05),
             ),
             state_recovery_quantization=max(
                 1.0e-4,
-                _env_float("BR_HPR_STATE_REACHABILITY_RECOVERY_QUANTIZATION", 0.05),
+                _env_float("ROUTING_BUDGET_STATE_REACHABILITY_RECOVERY_QUANTIZATION", 0.05),
             ),
             state_surrogate_observability=float(
                 np.clip(
-                    _env_float("BR_HPR_STATE_REACHABILITY_OBSERVABILITY", 0.70),
+                    _env_float("ROUTING_BUDGET_STATE_REACHABILITY_OBSERVABILITY", 0.70),
                     0.0,
                     1.0,
                 )
             ),
             state_cache_maximum_entries=max(
                 128,
-                _env_int("BR_HPR_STATE_REACHABILITY_CACHE_MAXIMUM_ENTRIES", 20000),
+                _env_int("ROUTING_BUDGET_STATE_REACHABILITY_CACHE_MAXIMUM_ENTRIES", 20000),
             ),
             viability_depth_weight=max(
-                0.0, _env_float("BR_HPR_VIABILITY_DEPTH_WEIGHT", 1.0)
+                0.0, _env_float("ROUTING_BUDGET_VIABILITY_DEPTH_WEIGHT", 1.0)
             ),
             viability_successor_weight=max(
-                0.0, _env_float("BR_HPR_VIABILITY_SUCCESSOR_WEIGHT", 0.35)
+                0.0, _env_float("ROUTING_BUDGET_VIABILITY_SUCCESSOR_WEIGHT", 0.35)
             ),
             viability_terminal_weight=max(
-                0.0, _env_float("BR_HPR_VIABILITY_TERMINAL_WEIGHT", 2.0)
+                0.0, _env_float("ROUTING_BUDGET_VIABILITY_TERMINAL_WEIGHT", 2.0)
             ),
             viability_probability_floor=float(
                 np.clip(
-                    _env_float("BR_HPR_VIABILITY_PROBABILITY_FLOOR", 0.02),
+                    _env_float("ROUTING_BUDGET_VIABILITY_PROBABILITY_FLOOR", 0.02),
                     1.0e-6,
                     1.0,
                 )
             ),
             bottleneck_activation_maximum=max(
-                0, _env_int("BR_HPR_BOTTLENECK_ACTIVATION_MAXIMUM", 12)
+                0, _env_int("ROUTING_BUDGET_BOTTLENECK_ACTIVATION_MAXIMUM", 12)
             ),
         )
 

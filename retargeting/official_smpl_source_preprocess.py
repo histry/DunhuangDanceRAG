@@ -5,8 +5,8 @@
 This is the formal source path for direct official fitted SMPL parameters.
 
 Design:
-1. Official SMPL is already the authoritative articulated representation, so no
-   BVH->SMPL24 optimization/retargeting is performed.
+1. Official SMPL is already the authoritative articulated representation; its
+   declared 165D pose layout is mapped directly to the project SMPL24 contract.
 2. The source is first loaded at its authoritative/native Chang-E timebase.
 3. Only catastrophic discontinuities are hard-cut in canonical Cartesian FK24
    space (plus a near-pi local-rotation integrity guard).
@@ -76,7 +76,7 @@ from retargeting.smpl_adapter import load_smpl24_parameters
 
 SCHEMA = "chang_e_official_smpl_source_aware_cache_v1"
 SEGMENT_REPORT_SCHEMA = "chang_e_official_smpl_source_aware_preprocess_v1"
-VERSION = "chang_e_official_smpl_source_aware_preprocess_event_geometry_2"
+VERSION = "chang_e_official_smpl_source_aware_preprocess_event_geometry_3_solo_aware"
 
 SMPL_EXTENSIONS = {".npz", ".pkl", ".pickle"}
 _SKIP_TOKENS = ("event", "index", "feature", "cache", "split", "checkpoint")
@@ -463,6 +463,10 @@ def _source_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
         "dancer_id": row.get("dancer_id"),
         "dancer_id_status": row.get("dancer_id_status", "unverified"),
         "performer_track_id": row.get("performer_track_id", -1),
+        "recording_performer_count": int(row["recording_performer_count"]),
+        "solo_compatibility": row["solo_compatibility"],
+        "solo_compatible": bool(row["solo_compatible"]),
+        "solo_review_status": row.get("solo_review_status", "unknown"),
         "sequence_index": row.get("sequence_index", -1),
         "performer_group": row.get("performer_group", "unknown"),
         "dance_category": row.get("dance_category", "unknown"),
@@ -495,7 +499,7 @@ def build_source(
     metadata = _source_metadata(row)
     source_id = str(metadata["source_id"])
     # Formal timebase/provenance comes only from the official-SMPL
-    # manifest. The historical BVH manifest is not consulted.
+    # manifest. No filename-derived source catalog is consulted.
     source_contract = validate_smpl_source(
         source,
         manifest=manifest,
@@ -722,15 +726,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument(
         "--smpl_manifest",
-        default=None,
+        required=True,
         help="Authoritative Chang-E official-SMPL manifest",
-    )
-    # Compatibility alias only; formal launchers use --smpl_manifest.
-    ap.add_argument(
-        "--source_manifest",
-        dest="legacy_source_manifest",
-        default=None,
-        help=argparse.SUPPRESS,
     )
     ap.add_argument("--target_fps", type=float, default=30.0, choices=(30.0, 60.0))
     ap.add_argument(
@@ -745,16 +742,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     in_dir = Path(args.in_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
-    raw_manifest = (
-        args.smpl_manifest
-        or args.legacy_source_manifest
-    )
-
-    if not raw_manifest:
-        ap.error("--smpl_manifest is required")
-
     manifest_path = Path(
-        raw_manifest
+        args.smpl_manifest
     ).expanduser().resolve()
     if not in_dir.is_dir():
         raise FileNotFoundError(f"Official SMPL directory does not exist: {in_dir}")
@@ -880,7 +869,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "policy": {
             "official_smpl_is_authoritative": True,
             "complete_manifest_required_for_formal_training": True,
-            "bvh_retarget_optimizer_used": False,
+            "direct_official_smpl_adapter_used": True,
             "v241_direction_regularizer_used": False,
             "whole_source_event_style_anatomy_gate_used": False,
             "cartesian_catastrophic_hard_cut_before_event_slicing": True,

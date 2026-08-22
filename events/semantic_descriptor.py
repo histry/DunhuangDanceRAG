@@ -4,34 +4,18 @@
 Semantic Descriptor Unified Music Semantic Slot Descriptor (MSSD)
 =====================================================
 
-This module unifies two formerly separated JSON concepts:
-
-1) external music semantic sidecar for unpaired-audio Contrastive Retriever training;
-2) final Music Router, Whole-Song Planner, and Duration Model slot plan for Motion Generation whole-song generation.
-
-The format is intentionally backward compatible with existing `slots`,
-`segments`, and Whole-Song Planner `schedule` JSON files.  The important distinction is kept
-explicit through:
-
-- usage:                train_semantic | generate_schedule
-- is_final_schedule:    false | true
-- slot_source:          external_sidecar | music_router_whole_song_planner | ...
-
-Training may consume weak descriptors without final timing.  Generation in
-scientific/strict mode must consume a final schedule descriptor.
+This module owns the final CTSR Router, continuous Planner and Duration Model
+schedule descriptor. Generation consumes only a final, FPS-bound JSON
+descriptor; it does not discover external semantic sidecars.
 """
 from __future__ import annotations
 
 import json
 import math
-import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-
-from support.legacy_compatibility import has_scheduler_provenance
 
 MSSD_SCHEMA_VERSION = "semantic_routing_mssd_aesd_routing_descriptor"
 
@@ -48,17 +32,6 @@ MUSIC_SEMANTIC_LABELS: List[str] = [
     "footwork_flow",
     "aerial_curve",
 ]
-
-MUSIC_LABEL_TO_ACTION: Dict[str, List[str]] = {
-    "calm_meditative": ["revelation_meditation", "thirty_six_postures", "lotus_steps"],
-    "pose_hold": ["thirty_six_postures", "revelation_meditation", "lotus_steps"],
-    "lyrical_flow": ["lotus_steps", "ribbon_flow", "revelation_meditation", "thirty_six_postures"],
-    "instrument_phrase": ["pipa_behind_back", "ribbon_flow", "thirty_six_postures"],
-    "percussive_accent": ["lei_gong_drum", "pipa_behind_back", "ribbon_flow"],
-    "turning_climax": ["ribbon_flow", "lei_gong_drum", "pipa_behind_back", "sogdian_whirl"],
-    "footwork_flow": ["lotus_steps", "ribbon_flow", "lei_gong_drum"],
-    "aerial_curve": ["ribbon_flow", "lotus_steps", "thirty_six_postures"],
-}
 
 ROLE_MAP: Dict[str, str] = {
     "calm_meditative": "calm",
@@ -81,27 +54,6 @@ ENERGY_RHYTHM_MAP: Dict[str, Tuple[str, str]] = {
     "footwork_flow": ("moderate", "lyrical"),
     "aerial_curve": ("moderate", "lyrical"),
 }
-
-# 32D pseudo feature follows Motion Generation descriptor layout sufficiently for Contrastive Retriever OT and
-# Motion Generation retrieval.  It deliberately reserves class channels around 22/23/26/28-30.
-LABEL_PROTOTYPES: Dict[str, Tuple[float, float, float, float]] = {
-    "calm_meditative": (0.020, 0.010, 0.012, 0.85),
-    "pose_hold": (0.030, 0.012, 0.010, 0.78),
-    "lyrical_flow": (0.055, 0.035, 0.040, 0.42),
-    "instrument_phrase": (0.070, 0.065, 0.055, 0.30),
-    "percussive_accent": (0.105, 0.125, 0.100, 0.12),
-    "turning_climax": (0.095, 0.080, 0.110, 0.08),
-    "footwork_flow": (0.065, 0.045, 0.070, 0.34),
-    "aerial_curve": (0.060, 0.040, 0.080, 0.36),
-}
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    try:
-        return bool(int(os.environ.get(name, "1" if default else "0")))
-    except Exception:
-        return bool(default)
-
 
 def json_load(path: str | Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
@@ -232,7 +184,6 @@ def semantic_fields_from_probs(probs: Dict[str, float], source: str = "", role_h
     top = top_label_from_probs(probs)
     energy, rhythm = ENERGY_RHYTHM_MAP.get(top, ("moderate", "lyrical"))
     role = str(role_hint or ROLE_MAP.get(top, "normal"))
-    preferred = MUSIC_LABEL_TO_ACTION.get(top, MUSIC_LABEL_TO_ACTION["lyrical_flow"])
     return {
         "role": role,
         "slot_role": role,
@@ -241,58 +192,20 @@ def semantic_fields_from_probs(probs: Dict[str, float], source: str = "", role_h
         "music_semantic_probs": {k: float(v) for k, v in probs.items()},
         "energy_label": energy,
         "rhythm_label": rhythm,
-        "preferred_dance_keys": list(preferred),
-        "slot_preferred_dance_keys": list(preferred),
+        "preferred_dance_keys": [],
+        "slot_preferred_dance_keys": [],
         "preferred_semantic_roles": [],
         "external_music_semantic_source": str(source),
+        "dance_theme_used_as_local_action_truth": False,
+        "categorical_music_label_used_as_body_semantics": False,
     }
-
-
-def pseudo_feature_from_probs(probs: Dict[str, float], duration: float) -> np.ndarray:
-    energy = onset = dyn = calm = 0.0
-    for label, p in probs.items():
-        e, o, d, c = LABEL_PROTOTYPES.get(label, LABEL_PROTOTYPES["lyrical_flow"])
-        energy += float(p) * e
-        onset += float(p) * o
-        dyn += float(p) * d
-        calm += float(p) * c
-    feat = np.zeros(32, dtype=np.float32)
-    feat[0] = float(duration)
-    feat[1] = energy * 2.0
-    feat[2] = energy
-    feat[3] = max(energy, dyn)
-    feat[4] = dyn
-    feat[5] = energy + onset
-    feat[6] = onset + dyn
-    feat[7] = energy + 0.5 * onset
-    feat[8] = energy
-    feat[9] = 1.0 + onset
-    feat[10] = calm
-    feat[13] = max(0.02, onset)
-    feat[14] = onset
-    feat[16] = onset
-    feat[17] = dyn
-    feat[18] = dyn
-    top = top_label_from_probs(probs)
-    # These are normalized categorical channels aligned with Motion Generation semantic dims.
-    feat[22] = 0.0 if top in {"calm_meditative", "pose_hold"} else (1.0 if top == "percussive_accent" else 0.5)
-    feat[23] = 1.0 if top == "percussive_accent" else (0.75 if top in {"turning_climax", "instrument_phrase"} else 0.35)
-    feat[26] = MUSIC_SEMANTIC_LABELS.index(top) / max(1, len(MUSIC_SEMANTIC_LABELS) - 1)
-    feat[28] = float(probs.get("calm_meditative", 0.0) + 0.5 * probs.get("pose_hold", 0.0))
-    feat[29] = float(probs.get("percussive_accent", 0.0) + 0.4 * probs.get("instrument_phrase", 0.0))
-    feat[30] = float(probs.get("turning_climax", 0.0) + 0.3 * probs.get("footwork_flow", 0.0))
-    feat[31] = 1.0
-    return feat.astype(np.float32)
 
 
 def is_final_schedule_meta(meta: Dict[str, Any]) -> bool:
     usage = str(meta.get("usage", "")).lower()
-    src = str(meta.get("slot_source", meta.get("source", ""))).lower()
     if bool(meta.get("is_final_schedule", False)):
         return True
     if usage in {"generate", "generate_schedule", "final_schedule", "router_schedule"}:
-        return True
-    if has_scheduler_provenance(src):
         return True
     return False
 
@@ -316,24 +229,6 @@ def _extract_raw_slots(obj: Any) -> Tuple[List[dict], Dict[str, Any]]:
             val = next(iter(results.values()))
             if isinstance(val, dict) and val.get("report") and Path(str(val["report"])).exists():
                 return _extract_raw_slots(json_load(str(val["report"])))
-        # Generated Motion Generation report fallback.
-        sr = obj.get("stage_reports")
-        if isinstance(sr, dict) and isinstance(sr.get("retrieval"), list):
-            slots = []
-            for r in sr["retrieval"]:
-                if isinstance(r, dict):
-                    slots.append({
-                        "slot_id": r.get("slot", r.get("slot_id", len(slots))),
-                        "duration": r.get("duration", 4.0),
-                        "music_alignment_label": r.get("slot_music_alignment_label", r.get("music_alignment_label", "lyrical_flow")),
-                        "music_semantic_top_label": r.get("slot_music_semantic_top_label", r.get("slot_music_alignment_label", "lyrical_flow")),
-                        "music_semantic_probs": r.get("slot_music_semantic_probs", {}),
-                        "preferred_dance_keys": r.get("slot_preferred_dance_keys", []),
-                    })
-            if slots:
-                return slots, dict(obj)
-    if isinstance(obj, list) and all(isinstance(x, dict) for x in obj):
-        return list(obj), {"usage": "train_semantic", "is_final_schedule": False, "slot_source": "list_slots"}
     return [], {}
 
 
@@ -392,8 +287,8 @@ def normalize_slot(slot0: dict, meta: Dict[str, Any], index: int, fps: float, so
     probs = normalize_probs(probs_obj, top, temperature=temperature)
     sem = semantic_fields_from_probs(probs, source=slot.get("external_music_semantic_source", source_path), role_hint=slot.get("slot_role", slot.get("role", None)))
     feature = np.asarray(slot.get("feature", []), dtype=np.float32).reshape(-1)
-    if feature.size < 32 or not np.isfinite(feature[:32]).all() or float(np.max(np.abs(feature[:32]))) == 0.0:
-        feature = pseudo_feature_from_probs(probs, dur)
+    if feature.size < 32 or not np.isfinite(feature[:32]).all():
+        feature = np.zeros(32, dtype=np.float32)
     if feature.size < 32:
         feature = np.pad(feature, (0, 32 - feature.size))
 
@@ -414,6 +309,7 @@ def normalize_slot(slot0: dict, meta: Dict[str, Any], index: int, fps: float, so
         "slot_source": str(slot.get("slot_source", meta.get("slot_source", "external_sidecar"))),
         "slot_plan_source": str(slot.get("slot_plan_source", meta.get("slot_source", "external_sidecar"))),
         "feature": feature[:32].astype(float).tolist(),
+        "feature_contract": "unused_zero_placeholder_formal_motion_conditioning_uses_selected_event_descriptor",
         **sem,
     }
     # Preserve Whole-Song Planner raw fields in a predictable namespace for auditing.
@@ -441,23 +337,12 @@ def parse_descriptor_file(path: str | Path, *, require_final_schedule: bool = Fa
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(str(p))
-    if p.suffix.lower() == ".npz":
-        data = np.load(p, allow_pickle=True)
-        label_names = data["label_names"].tolist() if "label_names" in data.files else MUSIC_SEMANTIC_LABELS
-        probs_arr = np.asarray(data["slot_probs"] if "slot_probs" in data.files else data["probs"], dtype=np.float32)
-        starts = np.asarray(data["slot_start"] if "slot_start" in data.files else (data["start"] if "start" in data.files else np.arange(len(probs_arr)) * 4.0), dtype=np.float32)
-        ends = np.asarray(data["slot_end"] if "slot_end" in data.files else (data["end"] if "end" in data.files else starts + 4.0), dtype=np.float32)
-        labels = data["slot_label"].tolist() if "slot_label" in data.files else [label_names[int(np.argmax(r))] for r in probs_arr]
-        raw_slots = []
-        for i in range(len(probs_arr)):
-            probs = {str(label_names[j]): float(probs_arr[i, j]) for j in range(min(len(label_names), probs_arr.shape[1]))}
-            raw_slots.append({"slot_id": i, "start": float(starts[i]), "end": float(ends[i]), "top_label": labels[i], "probs": probs})
-        meta: Dict[str, Any] = {"usage": "train_semantic", "is_final_schedule": False, "slot_source": "external_npz", "descriptor_type": "music_semantic_slot_descriptor"}
-    else:
-        obj = json_load(p)
-        raw_slots, meta = _extract_raw_slots(obj)
-        if not raw_slots:
-            raise RuntimeError(f"MSSD has no slots/segments/schedule: {p}")
+    if p.suffix.lower() != ".json":
+        raise RuntimeError(f"Formal MSSD must be JSON, got: {p}")
+    obj = json_load(p)
+    raw_slots, meta = _extract_raw_slots(obj)
+    if not raw_slots:
+        raise RuntimeError(f"MSSD has no slots/segments/schedule: {p}")
     meta = dict(meta)
     meta.setdefault("descriptor_type", "music_semantic_slot_descriptor")
     meta.setdefault("descriptor_schema_version", MSSD_SCHEMA_VERSION)
@@ -516,64 +401,6 @@ def parse_descriptor_file(path: str | Path, *, require_final_schedule: bool = Fa
     return slots, np.stack(feats).astype(np.float32), meta
 
 
-def sidecar_candidate_names(stem: str) -> List[str]:
-    return [
-        f"{stem}.mssd.json", f"{stem}_mssd.json",
-        f"{stem}.music_semantic_slot.json", f"{stem}_music_semantic_slot.json",
-        f"{stem}.music_semantic.json", f"{stem}_music_semantic.json",
-        f"{stem}.semantic.json", f"{stem}_semantic.json",
-        f"{stem}.mssd.npz", f"{stem}_mssd.npz",
-        f"{stem}.music_semantic.npz", f"{stem}_music_semantic.npz",
-        f"{stem}.semantic.npz", f"{stem}_semantic.npz",
-        f"{stem}.json", f"{stem}.npz",
-    ]
-
-
-def split_path_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(x) for x in value if str(x).strip()]
-    text = str(value).strip()
-    if not text:
-        return []
-    out = []
-    for chunk in text.replace(";", os.pathsep).split(os.pathsep):
-        chunk = chunk.strip()
-        if chunk:
-            out.append(chunk)
-    return out
-
-
-def descriptor_candidates_for_audio(audio_path: str | Path, descriptor_dirs: Any = None) -> List[Path]:
-    p = Path(audio_path)
-    names = sidecar_candidate_names(p.stem)
-    cands = [p.with_name(n) for n in names]
-    for d in split_path_list(descriptor_dirs):
-        dp = Path(d)
-        for n in names:
-            cands.append(dp / n)
-    # Preserve order and remove duplicates.
-    seen = set()
-    uniq = []
-    for c in cands:
-        s = str(c)
-        if s not in seen:
-            seen.add(s)
-            uniq.append(c)
-    return uniq
-
-
-def load_descriptor_for_audio(audio_path: str | Path, *, descriptor_dirs: Any = None, require_final_schedule: bool = False, fps: float = 30.0, temperature: float = 0.65, usage: str = "auto") -> Optional[Tuple[List[dict], np.ndarray, Dict[str, Any]]]:
-    for cand in descriptor_candidates_for_audio(audio_path, descriptor_dirs):
-        if cand.exists() and cand.is_file():
-            try:
-                return parse_descriptor_file(cand, require_final_schedule=require_final_schedule, fps=fps, temperature=temperature, usage=usage)
-            except Exception as exc:
-                print(f"[Semantic Descriptor MSSD WARN] failed descriptor {cand}: {exc}", file=sys.stderr)
-    if require_final_schedule:
-        raise RuntimeError(f"No final MSSD descriptor found for {audio_path}; searched dirs={descriptor_dirs}")
-    return None
 
 
 def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -619,63 +446,6 @@ def build_descriptor_object(audio: str, slots: List[dict], meta: Dict[str, Any])
 # -----------------------------------------------------------------------------
 AESD_SCHEMA_VERSION = "semantic_routing_action_event_semantic_descriptor"
 
-DANCE_KEY_TO_MUSIC_LABEL = {
-    "revelation_meditation": "calm_meditative",
-    "thirty_six_postures": "pose_hold",
-    "pipa_behind_back": "instrument_phrase",
-    "lei_gong_drum": "percussive_accent",
-    "lotus_steps": "footwork_flow",
-    "sogdian_whirl": "turning_climax",
-    "ribbon_flow": "lyrical_flow",
-}
-EVENT_FAMILY_TO_MUSIC_LABEL = {
-    "calm_flow": "calm_meditative",
-    "pose_motif": "pose_hold",
-    "aerial_curve": "aerial_curve",
-    "instrument_motif": "instrument_phrase",
-    "percussive_accent": "percussive_accent",
-    "turning_flow": "turning_climax",
-    "footwork_flow": "footwork_flow",
-    # Formal Chang-E local-action schema v2.
-    "pose_hold": "pose_hold",
-    "locomotion": "footwork_flow",
-    "turn_spin": "turning_climax",
-    "jump_aerial": "aerial_curve",
-    "floorwork": "lyrical_flow",
-    "upper_body_gesture": "lyrical_flow",
-    "rhythmic_accent": "percussive_accent",
-    "transition": "lyrical_flow",
-}
-ENERGY_TO_MUSIC_HINT = {
-    "calm": ["calm_meditative", "pose_hold"],
-    "low": ["calm_meditative", "pose_hold"],
-    "moderate": ["lyrical_flow", "footwork_flow", "instrument_phrase"],
-    "high": ["turning_climax", "percussive_accent", "footwork_flow"],
-    "percussive": ["percussive_accent", "turning_climax"],
-}
-RHYTHM_TO_MUSIC_HINT = {
-    "sustained": ["calm_meditative", "pose_hold"],
-    "lyrical": ["lyrical_flow", "footwork_flow"],
-    "accented": ["instrument_phrase", "turning_climax", "percussive_accent"],
-    "percussive": ["percussive_accent"],
-}
-LOCO_TO_MUSIC_HINT = {
-    "in_place_pose": ["pose_hold", "calm_meditative"],
-    "slow_weight_shift": ["calm_meditative", "lyrical_flow"],
-    "floating_leaning": ["lyrical_flow", "aerial_curve"],
-    "upper_body_phrase": ["instrument_phrase", "lyrical_flow"],
-    "traveling_steps": ["footwork_flow", "lyrical_flow"],
-    "turning_travel": ["turning_climax", "footwork_flow"],
-    "accented_travel": ["percussive_accent", "footwork_flow"],
-}
-SUPPORT_TO_MUSIC_HINT = {
-    "stable_support": ["calm_meditative", "pose_hold", "instrument_phrase"],
-    "static_or_low_motion_support": ["calm_meditative", "pose_hold"],
-    "strong_foot_contact": ["percussive_accent", "footwork_flow"],
-    "alternating_foot_support": ["footwork_flow", "lyrical_flow"],
-    "alternating_or_pivot_support": ["turning_climax", "footwork_flow"],
-    "low_contact_flight_like": ["turning_climax", "aerial_curve"],
-}
 STAGE_AFFORDANCE_BY_LABEL = {
     "calm_meditative": ["intro", "calm", "release", "resolution"],
     "pose_hold": ["intro", "release", "resolution", "motif_recall"],
@@ -733,62 +503,6 @@ def normalize_vector(vec: np.ndarray, default: str = "lyrical_flow") -> np.ndarr
 
 
 
-AESD_EVIDENCE_WEIGHTS: Dict[str, float] = {
-    "explicit_alignment": 0.25,
-    "dance_key": 0.20,
-    "event_family": 0.25,
-    "dynamic_attributes": 0.20,
-    "low_level_descriptor": 0.10,
-}
-
-
-def _normalized_hint_vector(labels: Any, weight: float) -> np.ndarray:
-    if labels is None:
-        labels = []
-    if not isinstance(labels, (list, tuple, set)):
-        labels = [labels]
-    canonical = []
-    for label in labels:
-        text = str(label or "").strip()
-        if not text or text == "unknown":
-            continue
-        value = canonical_music_label(text)
-        if value in MUSIC_SEMANTIC_LABELS and value not in canonical:
-            canonical.append(value)
-    vector = np.zeros((len(MUSIC_SEMANTIC_LABELS),), dtype=np.float32)
-    if not canonical:
-        return vector
-    share = float(weight) / len(canonical)
-    for label in canonical:
-        vector[MUSIC_SEMANTIC_LABELS.index(label)] += share
-    return vector
-
-
-def _descriptor_semantic_hint(desc: Optional[np.ndarray]) -> np.ndarray:
-    vector = np.zeros((len(MUSIC_SEMANTIC_LABELS),), dtype=np.float32)
-    if desc is None:
-        return vector
-    value = np.asarray(desc, dtype=np.float32).reshape(-1)
-    if value.size > 30:
-        calm = max(0.0, float(value[28]))
-        percussive = max(0.0, float(value[29]))
-        turning = max(0.0, float(value[30]))
-        vector += _normalized_hint_vector(
-            ["calm_meditative", "pose_hold"], calm
-        )
-        vector += _normalized_hint_vector(
-            ["percussive_accent", "instrument_phrase"], percussive
-        )
-        vector += _normalized_hint_vector(
-            ["turning_climax", "footwork_flow"], turning
-        )
-    if value.size > 18 and (float(value[16]) > 0.08 or float(value[17]) > 0.08):
-        vector += _normalized_hint_vector(
-            ["percussive_accent", "turning_climax"], 0.25
-        )
-    if float(vector.sum()) > 1.0e-8:
-        vector /= float(vector.sum())
-    return vector
 
 
 def semantic_distribution_diagnostics(
@@ -827,82 +541,6 @@ def class_prior_adjustment(
     return normalize_vector(adjusted)
 
 
-def event_probs_from_fields(
-    *,
-    dance_key: Any = "unknown",
-    event_family: Any = "unknown",
-    music_alignment_label: Any = "unknown",
-    energy_label: Any = "unknown",
-    rhythm_label: Any = "unknown",
-    locomotion_label: Any = "unknown",
-    support_label: Any = "unknown",
-    quality: float = 0.5,
-    semantic_confidence: float = 0.5,
-    desc: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Grouped-evidence action-to-music response distribution for AESD.
-
-    Correlated dynamic fields are normalized inside one evidence group instead
-    of being added as independent votes.  This prevents turning/high-energy
-    metadata from receiving the same physical evidence four or five times.
-    """
-    groups: List[np.ndarray] = []
-
-    alignment = str(music_alignment_label or "unknown")
-    if alignment != "unknown":
-        groups.append(
-            _normalized_hint_vector(
-                [alignment], AESD_EVIDENCE_WEIGHTS["explicit_alignment"]
-            )
-        )
-
-    dance = str(dance_key or "unknown")
-    dance_label = DANCE_KEY_TO_MUSIC_LABEL.get(dance, dance)
-    if dance != "unknown":
-        groups.append(
-            _normalized_hint_vector(
-                [dance_label], AESD_EVIDENCE_WEIGHTS["dance_key"]
-            )
-        )
-
-    family = str(event_family or "unknown")
-    family_label = EVENT_FAMILY_TO_MUSIC_LABEL.get(family, family)
-    if family != "unknown":
-        groups.append(
-            _normalized_hint_vector(
-                [family_label], AESD_EVIDENCE_WEIGHTS["event_family"]
-            )
-        )
-
-    dynamic_hints: List[str] = []
-    dynamic_hints.extend(ENERGY_TO_MUSIC_HINT.get(str(energy_label or ""), []))
-    dynamic_hints.extend(RHYTHM_TO_MUSIC_HINT.get(str(rhythm_label or ""), []))
-    dynamic_hints.extend(LOCO_TO_MUSIC_HINT.get(str(locomotion_label or ""), []))
-    dynamic_hints.extend(SUPPORT_TO_MUSIC_HINT.get(str(support_label or ""), []))
-    if dynamic_hints:
-        groups.append(
-            _normalized_hint_vector(
-                dynamic_hints, AESD_EVIDENCE_WEIGHTS["dynamic_attributes"]
-            )
-        )
-
-    descriptor = _descriptor_semantic_hint(desc)
-    if float(descriptor.sum()) > 1.0e-8:
-        groups.append(
-            descriptor * AESD_EVIDENCE_WEIGHTS["low_level_descriptor"]
-        )
-
-    if groups:
-        vector = np.sum(groups, axis=0)
-    else:
-        vector = one_hot_music("lyrical_flow")
-    vector = normalize_vector(vector)
-
-    q = float(np.clip(float(quality), 0.0, 1.0))
-    confidence = float(np.clip(float(semantic_confidence), 0.0, 1.0))
-    reliability = float(np.clip(0.55 + 0.30 * q + 0.15 * confidence, 0.55, 1.0))
-    uniform = np.full_like(vector, 1.0 / len(vector))
-    return normalize_vector(reliability * vector + (1.0 - reliability) * uniform)
 
 
 def vector_to_prob_dict(vec: np.ndarray) -> Dict[str, float]:
@@ -973,75 +611,3 @@ def intrinsic_transition_prior_from_arrays(
     else:
         profile = "high"
     return risk, profile
-
-
-def boundary_risk_from_arrays(
-    entry: Optional[np.ndarray],
-    exit_: Optional[np.ndarray],
-    contact_entry: Optional[np.ndarray],
-    contact_exit: Optional[np.ndarray],
-    duration: float,
-    quality: float,
-    locomotion_label: Any = "unknown",
-    support_label: Any = "unknown",
-) -> Tuple[float, str]:
-    """Backward-compatible alias for the intrinsic event-local prior."""
-    return intrinsic_transition_prior_from_arrays(
-        entry,
-        exit_,
-        contact_entry,
-        contact_exit,
-        duration,
-        quality,
-        locomotion_label=locomotion_label,
-        support_label=support_label,
-    )
-
-
-def get_db_array(db: Dict[str, Any], key: str, n: int, default: Any, dtype: Any = object) -> np.ndarray:
-    if key in db:
-        return np.asarray(db[key], dtype=dtype)
-    return np.asarray([default] * n, dtype=dtype)
-
-
-def get_aesd_prob_matrix(db: Dict[str, Any], n: Optional[int] = None) -> np.ndarray:
-    if n is None:
-        n = len(db.get("paths", []))
-    if "aesd_music_alignment_probs" in db:
-        arr = np.asarray(db["aesd_music_alignment_probs"], dtype=np.float32)
-        if arr.ndim == 2 and arr.shape[0] == n:
-            if arr.shape[1] < len(MUSIC_SEMANTIC_LABELS):
-                pad = np.zeros((n, len(MUSIC_SEMANTIC_LABELS) - arr.shape[1]), dtype=np.float32)
-                arr = np.concatenate([arr, pad], axis=1)
-            return np.stack([normalize_vector(r) for r in arr[:, : len(MUSIC_SEMANTIC_LABELS)]], axis=0).astype(np.float32)
-    desc = np.asarray(db.get("desc", np.zeros((n, 32), dtype=np.float32)), dtype=np.float32)
-    dance = get_db_array(db, "dance_keys", n, "unknown", object)
-    fam = get_db_array(db, "event_families", n, "unknown", object)
-    align = get_db_array(db, "music_alignment_labels", n, "unknown", object)
-    energy = get_db_array(db, "energy_labels", n, "unknown", object)
-    rhythm = get_db_array(db, "rhythm_labels", n, "unknown", object)
-    loco = get_db_array(db, "locomotion_labels", n, "unknown", object)
-    support = get_db_array(db, "support_labels", n, "unknown", object)
-    qual = np.asarray(db.get("event_quality_scores", np.ones(n, dtype=np.float32) * 0.5), dtype=np.float32)
-    conf = np.asarray(db.get("semantic_confidence", np.ones(n, dtype=np.float32) * 0.5), dtype=np.float32)
-    rows = []
-    for i in range(n):
-        rows.append(event_probs_from_fields(
-            dance_key=dance[i], event_family=fam[i], music_alignment_label=align[i],
-            energy_label=energy[i], rhythm_label=rhythm[i], locomotion_label=loco[i], support_label=support[i],
-            quality=float(qual[i]) if i < len(qual) else 0.5,
-            semantic_confidence=float(conf[i]) if i < len(conf) else 0.5,
-            desc=desc[i] if desc.ndim == 2 and i < desc.shape[0] else None,
-        ))
-    return np.stack(rows).astype(np.float32)
-
-
-def slot_prob_vector(slot: Dict[str, Any]) -> np.ndarray:
-    return probs_to_vector(slot.get("music_semantic_probs", None), slot.get("music_semantic_top_label", slot.get("music_alignment_label", None)), temperature=1.0)
-
-
-def dot_compat(slot_vec: np.ndarray, aesd_matrix: np.ndarray) -> np.ndarray:
-    s = normalize_vector(slot_vec)
-    a = np.asarray(aesd_matrix, dtype=np.float32)
-    a = np.stack([normalize_vector(row) for row in a], axis=0)
-    return np.clip(a @ s, 0.0, 1.0).astype(np.float32)

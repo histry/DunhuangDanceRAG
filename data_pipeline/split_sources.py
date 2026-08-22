@@ -29,28 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-try:
-    import training.motion_models as motion_api
-except Exception:  # package self-test fallback; real projects provide this module
-    class _MotionApiFallback:
-        @staticmethod
-        def parse_change_bvh_semantics(source: str):
-            stem = Path(str(source)).stem
-            lower = stem.lower()
-            performer = (
-                "female" if "female" in lower
-                else "male" if "male" in lower
-                else "unknown"
-            )
-            return {
-                "source_uid": stem,
-                "dance_key": stem,
-                "performer_group": performer,
-            }
-    motion_api = _MotionApiFallback()
-
 SPLITS = ("train", "val", "test")
-SCHEMA = "category_covered_recording_disjoint_cache_split_v3"
+SCHEMA = "category_covered_recording_disjoint_cache_split_v4_solo_aware"
 
 
 def save_json(obj: Any, path: Path) -> None:
@@ -523,19 +503,35 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
         or relative_motion
     )
 
-    # Formal SMPL path: authoritative metadata comes directly from
-    # official_smpl_source_preprocess.py.  No BVH-name parser is involved.
-    if source_format == "chang_e_official_smpl":
-        if not (
-            isinstance(report_metadata, Mapping)
-            and report_metadata.get("source_id")
-        ):
-            raise RuntimeError(
-                "Official SMPL report is missing source_metadata.source_id: "
-                f"{report_path}"
-            )
+    if source_format != "chang_e_official_smpl":
+        raise RuntimeError(
+            "Current split protocol accepts only source_format="
+            f"chang_e_official_smpl, got {source_format!r}: {report_path}"
+        )
+    if not (
+        isinstance(report_metadata, Mapping)
+        and report_metadata.get("source_id")
+    ):
+        raise RuntimeError(
+            "Official SMPL report is missing source_metadata.source_id: "
+            f"{report_path}"
+        )
+    missing_solo_fields = sorted(
+            {
+                "recording_performer_count",
+                "solo_compatibility",
+                "solo_compatible",
+                "solo_review_status",
+            }
+            - set(report_metadata)
+        )
+    if missing_solo_fields:
+        raise RuntimeError(
+            "Official SMPL cache predates the formal solo-routing contract; "
+            f"rebuild the source cache, missing={missing_solo_fields}: {report_path}"
+        )
 
-        semantic = {
+    semantic = {
             "source_uid": str(
                 report_metadata["source_id"]
             ),
@@ -557,6 +553,16 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
                     "performer_track_id",
                     -1,
                 )
+            ),
+            "recording_performer_count": int(
+                report_metadata.get("recording_performer_count", 1)
+            ),
+            "solo_compatibility": report_metadata.get(
+                "solo_compatibility", "unknown"
+            ),
+            "solo_compatible": bool(report_metadata.get("solo_compatible", False)),
+            "solo_review_status": report_metadata.get(
+                "solo_review_status", "unknown"
             ),
             "sequence_index": (
                 report_metadata.get(
@@ -602,24 +608,7 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
             "source_format": (
                 "chang_e_official_smpl"
             ),
-        }
-
-    else:
-        # Legacy / ablation-only BVH compatibility.
-        legacy_original = str(
-            report.get("source_used")
-            or report.get("source")
-            or report.get("source_relative")
-            or relative_motion.with_suffix(".bvh")
-        )
-
-        original = legacy_original
-
-        semantic = (
-            motion_api.parse_change_bvh_semantics(
-                legacy_original
-            )
-        )
+    }
 
     source_uid = str(
         semantic.get("source_uid")
@@ -666,6 +655,7 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
             )
         ),
         "original_source": original,
+        "source_format": "chang_e_official_smpl",
         "source_uid": source_uid,
         "recording_uid": str(
             semantic.get(
@@ -686,6 +676,12 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
                 -1,
             )
         ),
+        "recording_performer_count": int(
+            semantic.get("recording_performer_count", 1)
+        ),
+        "solo_compatibility": semantic.get("solo_compatibility", "unknown"),
+        "solo_compatible": bool(semantic.get("solo_compatible", False)),
+        "solo_review_status": semantic.get("solo_review_status", "unknown"),
         "sequence_index": (
             semantic.get(
                 "sequence_index",
@@ -693,7 +689,7 @@ def source_record(cache_root: Path, motion_path: Path) -> Dict[str, Any]:
             )
         ),
         "dance_key": dance_key,
-        "theme_label_status": semantic.get("theme_label_status", "legacy_or_unknown"),
+        "theme_label_status": semantic.get("theme_label_status", "unverified"),
         "candidate_dance_category": semantic.get("candidate_dance_category"),
         "source_context": semantic.get("source_context", []),
         "manifest_sha256": semantic.get("manifest_sha256"),
@@ -796,7 +792,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not motions:
         raise RuntimeError("No retarget-cache motions in %s" % cache_root)
 
-    records = [source_record(cache_root, path) for path in motions]
+    all_records = [source_record(cache_root, path) for path in motions]
+    require_solo = str(
+        os.environ.get("PERFORMER_REQUIRE_SOLO_COMPATIBLE", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    excluded_non_solo_records = [
+        row
+        for row in all_records
+        if row.get("source_format") == "chang_e_official_smpl"
+        and require_solo
+        and not bool(row.get("solo_compatible", False))
+    ]
+    records = [row for row in all_records if row not in excluded_non_solo_records]
+    if not records:
+        raise RuntimeError(
+            "No source records remain after the formal solo-compatibility filter"
+        )
     # Source-aware official-SMPL preprocessing may hard-cut one source
     # into multiple clean segment files. source_uid therefore identifies
     # one original recording track, not one cache artifact.
@@ -939,22 +950,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         train_confirmed_categories
     ):
         reasons.append("confirmed_theme_missing_from_train")
-    for group in ("female", "male"):
-        count = sum(
-            row["performer_group"] == group for row in recording_units
-        )
-        if count >= 3:
-            for split in ("val", "test"):
-                # Exact cardinality can make both performer groups impossible
-                # in a one-recording split.  Require coverage only when the
-                # optimized capacity allocated this performer to that split.
-                if capacities[group][split] > 0 and not any(
-                    row["performer_group"] == group
-                    for row in split_records[split]
-                ):
-                    reasons.append(
-                        "missing_%s_in_%s" % (group, split)
-                    )
+    # female/male is only a reporting stratum in this release, not a verified
+    # dancer identity. Exact category coverage and recording disjointness are
+    # hard; sex coverage is deliberately not promoted to a scientific gate.
 
     report = {
         "schema": SCHEMA,
@@ -972,6 +970,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         "target_counts": target,
         "gender_group_capacities": capacities,
+        "performer_group_coverage_is_hard_constraint": False,
         "assignment_unit": "recording_uid_before_event_slicing",
         "assignment_algorithm": (
             "exact_recording_disjoint_confirmed_theme_covered_exhaustive"
@@ -981,6 +980,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "materialization_requested": args.mode,
         "materialization_actual": dict(materialization),
         "num_sources": len(uid_counts),
+        "num_input_sources": len({row["source_uid"] for row in all_records}),
+        "num_excluded_non_solo_sources": len(
+            {row["source_uid"] for row in excluded_non_solo_records}
+        ),
+        "excluded_non_solo_source_uids": sorted(
+            {row["source_uid"] for row in excluded_non_solo_records}
+        ),
+        "formal_solo_filter_enabled": require_solo,
         "num_segments": len(records),
         "segments_per_source": segments_per_source,
         "num_recording_groups": len(recording_units),

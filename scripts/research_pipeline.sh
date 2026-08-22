@@ -33,11 +33,9 @@ export RUN_TAG
 OUT_ROOT="${OUT_ROOT:-$ROOT_DIR/output/retarget_clean_research_${RUN_TAG}}"
 export OUT_ROOT
 export ROOT_DIR
-export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
 : "${CHANG_E_OFFICIAL_SMPL_DIR:?configs/experiment.env must define the official SMPL directory}"
 : "${CHANG_E_OFFICIAL_SMPL_MANIFEST:?configs/experiment.env must define the official SMPL manifest}"
 export RETARGET_CLEAN_SOURCE_MODE="${RETARGET_CLEAN_SOURCE_MODE:-chang_e_official_smpl}"
-export GROUNDING_GROUNDER_CKPT="${GROUNDING_GROUNDER_CKPT:-$OUT_ROOT/event_geometry_dual_branch_grounder.pt}"
 PY="${GENERATION_PYTHON:-${PYTHON_BIN:-python}}"
 export GENERATION_PYTHON="$PY"
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -51,45 +49,30 @@ OUT_ROOT=$OUT_ROOT
 AUDIO=$AUDIO
 MUSIC_DIRS=$MUSIC_DIRS
 SOURCE_MODE=$RETARGET_CLEAN_SOURCE_MODE
-CHANGE_BVH_DIR=$CHANGE_BVH_DIR
 CHANG_E_OFFICIAL_SMPL_DIR=$CHANG_E_OFFICIAL_SMPL_DIR
 MIN_OK_SOURCES=$RETARGET_MIN_OK_SOURCES
 SPLIT=$GENERATION_TRAIN_RATIO/$GENERATION_VAL_RATIO/$GENERATION_TEST_RATIO
 REBUILD_RETARGET=$GENERATION_REBUILD_RETARGET_CACHE
 REBUILD_DB=$GENERATION_REBUILD_EVENT_DB
 RETRAIN_ROUTER/DURATION/PLANNER=$GENERATION_RETRAIN_ROUTER/$GENERATION_RETRAIN_DURATION/$GENERATION_RETRAIN_PLANNER
-RETRAIN_CONTRASTIVE/REFINER/DIFFUSION=$GENERATION_RETRAIN_CONTRASTIVE/$GENERATION_RETRAIN_REFINER/$GENERATION_RETRAIN_DIFFUSION
-GROUNDER_CKPT=$GROUNDING_GROUNDER_CKPT
+RETRAIN_REFINER/DIFFUSION=$GENERATION_RETRAIN_REFINER/$GENERATION_RETRAIN_DIFFUSION
 ========================================================
 EOF
 
 echo "========== 0A. REAL-DATA PREFLIGHT =========="
-case "$RETARGET_CLEAN_SOURCE_MODE" in
-  chang_e_official_smpl)
-    "$PY" evaluation/preflight_official_smpl.py \
-      --root "$ROOT_DIR" \
-      --audio "$AUDIO" \
-      --music_dir "$MUSIC_DIRS" \
-      --smpl_dir "$CHANG_E_OFFICIAL_SMPL_DIR" \
-      --smpl_manifest "$CHANG_E_OFFICIAL_SMPL_MANIFEST" \
-      --out "$OUT_ROOT/preflight/preflight.json"
-    ;;
-  bvh_retarget)
-    "$PY" evaluation/preflight.py \
-      --root "$ROOT_DIR" \
-      --audio "$AUDIO" \
-      --music_dir "$MUSIC_DIRS" \
-      --change_dir "$CHANGE_BVH_DIR" \
-      --out "$OUT_ROOT/preflight/preflight.json"
-    ;;
-  *)
-    echo "[FATAL] Unknown RETARGET_CLEAN_SOURCE_MODE=$RETARGET_CLEAN_SOURCE_MODE" >&2
-    exit 2
-    ;;
-esac
+[[ "$RETARGET_CLEAN_SOURCE_MODE" == "chang_e_official_smpl" ]] || {
+  echo "[FATAL] main supports only chang_e_official_smpl" >&2; exit 2;
+}
+"$PY" evaluation/preflight_official_smpl.py \
+  --root "$ROOT_DIR" \
+  --audio "$AUDIO" \
+  --music_dir "$MUSIC_DIRS" \
+  --smpl_dir "$CHANG_E_OFFICIAL_SMPL_DIR" \
+  --smpl_manifest "$CHANG_E_OFFICIAL_SMPL_MANIFEST" \
+  --out "$OUT_ROOT/preflight/preflight.json"
 
 echo "========== 0B. Geometry-Aware Routing + Retarget Clean CONTRACT TESTS =========="
-"$PY" -m unittest discover -s tests -p 'test_*.py' -v
+"$PY" -m pytest -q
 
 echo "========== 1. PRESERVED TRAINING/GENERATION PIPELINE =========="
 bash scripts/pipeline.sh
@@ -116,6 +99,5 @@ FINAL_NPY=$FINAL_NPY
 ANATOMY_AUDIT=$OUT_ROOT/final.retarget_clean_anatomy.json
 INTRINSIC_AUDIT=$OUT_ROOT/final.event_geometry_intrinsic.json
 DURATION_AUDIT=$FINAL_NPY.event_geometry_duration.json
-GROUNDER_CKPT=$GROUNDING_GROUNDER_CKPT
 ========================================
 EOF

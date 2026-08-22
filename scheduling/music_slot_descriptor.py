@@ -29,10 +29,6 @@ from scheduling.descriptor_schema import (  # noqa: E402
     json_save,
     normalize_slot,
 )
-from support.legacy_compatibility import (  # noqa: E402
-    historical_whole_song_reports,
-    historical_whole_song_summary,
-)
 
 
 def _find_report_from_summary(summary_path: Path, audio: Path) -> Optional[Path]:
@@ -66,17 +62,6 @@ def find_existing_report(schedule_dir: Path, audio: Path) -> Optional[Path]:
     hits = sorted(schedule_dir.glob("*.whole_song.schedule_report.json"))
     if len(hits) == 1:
         return hits[0]
-    legacy_summary = historical_whole_song_summary(schedule_dir)
-    rp = _find_report_from_summary(legacy_summary, audio)
-    if rp and rp.exists():
-        return rp
-    legacy_hits = [
-        path
-        for path in historical_whole_song_reports(schedule_dir, audio.stem)
-        if path.exists()
-    ]
-    if legacy_hits:
-        return legacy_hits[0]
     return None
 
 
@@ -100,8 +85,7 @@ def run_whole_song_schedule(args: argparse.Namespace) -> None:
         "--lock_music_boundaries", "1",
         "--music_dominant_timing", "1",
     ]
-    if args.planner_ckpt:
-        cmd += ["--planner_ckpt", args.planner_ckpt]
+    cmd += ["--planner_ckpt", args.planner_ckpt]
     if args.hierarchy_index_npz:
         cmd += ["--hierarchy_index_npz", args.hierarchy_index_npz]
     print("[Semantic Routing MSSD SCHEDULE]", " ".join(cmd), flush=True)
@@ -180,7 +164,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--audio", required=True)
     ap.add_argument("--out_json", required=True)
     ap.add_argument("--router_ckpt", required=True)
-    ap.add_argument("--planner_ckpt", default="")
+    ap.add_argument("--planner_ckpt", required=True)
     ap.add_argument("--duration_model_ckpt", required=True)
     ap.add_argument("--index_json", required=True)
     ap.add_argument("--duration_index_npz", required=True)

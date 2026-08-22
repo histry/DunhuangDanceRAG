@@ -23,7 +23,7 @@ def _text(value: Any, default: str = "unknown") -> str:
 
 
 def portable_source_name(value: Any) -> str:
-    """Return a root-independent source name for legacy absolute paths."""
+    """Return a root-independent source name for portable provenance."""
     text = _text(value)
     name = PurePosixPath(text).name
     return name or text

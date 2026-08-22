@@ -14,18 +14,12 @@ fi
 
 export ROOT_DIR
 export GENERATION_PYTHON="${GENERATION_PYTHON:-${PYTHON_BIN:-python}}"
-export CHANGE_BVH_DIR="${CHANGE_BVH_DIR:-$ROOT_DIR/change}"
 export MUSIC_DIRS="${MUSIC_DIRS:-$ROOT_DIR/data/music_router_music_999/splits/train}"
 export AUDIO="${1:-${AUDIO:-$TEST_AUDIO}}"
 export RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 export OUT_ROOT="${OUT_ROOT:-$ROOT_DIR/output/retarget_clean_research_${RUN_TAG}}"
-export CONTRASTIVE_CKPT="${CONTRASTIVE_CKPT:-$OUT_ROOT/checkpoints/semantic_retriever.pt}"
 export REFINER_CKPT="${REFINER_CKPT:-$OUT_ROOT/checkpoints/boundary_refiner.pt}"
 export MOTION_CKPT="${MOTION_CKPT:-$OUT_ROOT/checkpoints/local_diffusion.pt}"
-export GROUNDING_GROUNDER_CKPT="${GROUNDING_GROUNDER_CKPT:-$OUT_ROOT/checkpoints/grounder.pt}"
-# Historical music-domain knowledge is transferred only into the formal
-# Router's music branch.  The Event-DB-specific motion branch is retrained.
-export ROUTING_SAFETY_MUSIC_ENCODER_PRIOR_CKPT="${ROUTING_SAFETY_MUSIC_ENCODER_PRIOR_CKPT:-${MUSIC_ROUTER_WEIGHT:-$ROOT_DIR/assets/weights/music/router.pt}}"
 export FINAL_NPY="${FINAL_NPY:-$OUT_ROOT/results/motion.npy}"
 export FINAL_REPORT="${FINAL_REPORT:-$OUT_ROOT/results/report.json}"
 export FINAL_MP4="${FINAL_MP4:-$OUT_ROOT/results/video.mp4}"

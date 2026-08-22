@@ -4,12 +4,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 
 from events.build_semantics import build_semantics
-from grounding.model import event_semantic_matrix
 from motion_geometry.rotations import matrix_to_rot6d_np
 from training import motion_models
 
@@ -24,6 +22,10 @@ def formal_meta(theme: str) -> dict:
         "dancer_id": None,
         "dancer_id_status": "unverified",
         "performer_track_id": 1,
+        "recording_performer_count": 1,
+        "solo_compatibility": "single_track_recording",
+        "solo_compatible": True,
+        "solo_review_status": "not_required_single_track",
         "sequence_index": 1,
         "performer_group": "female",
         "dance_key": theme,
@@ -35,6 +37,14 @@ def formal_meta(theme: str) -> dict:
 
 
 class ChangeEFiveLayerSemanticsTests(unittest.TestCase):
+    def test_formal_solo_metadata_survives_semantic_resolution(self):
+        resolved = motion_models.official_smpl_semantics_from_metadata(
+            formal_meta("lotus_steps")
+        )
+        self.assertTrue(resolved["solo_compatible"])
+        self.assertEqual(resolved["recording_performer_count"], 1)
+        self.assertEqual(resolved["solo_compatibility"], "single_track_recording")
+
     def test_theme_never_creates_a_local_action_without_descriptor(self):
         meditation = motion_models.strong_action_semantics_from_meta(
             formal_meta("revelation_meditation")
@@ -47,19 +57,11 @@ class ChangeEFiveLayerSemanticsTests(unittest.TestCase):
         self.assertEqual(drum["local_action_labels"], ["unknown"])
         self.assertFalse(drum["source_context_is_local_action_truth"])
 
-    def test_category_priors_are_confined_to_legacy_bvh_ablation(self):
-        legacy = motion_models.strong_action_semantics_from_meta(
-            {
-                "source_format": "legacy_bvh",
-                "raw_stem": "male_drum_1",
-                "dance_key": "lei_gong_drum",
-            }
-        )
-        formal = motion_models.strong_action_semantics_from_meta(
-            formal_meta("lei_gong_drum")
-        )
-        self.assertEqual(legacy["event_family"], "percussive_accent")
-        self.assertEqual(formal["event_family"], "unknown")
+    def test_non_official_source_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "official SMPL"):
+            motion_models.strong_action_semantics_from_meta(
+                {"source_format": "legacy_bvh", "dance_key": "lei_gong_drum"}
+            )
 
     def test_same_window_has_same_local_semantics_across_themes(self):
         desc = np.zeros(32, dtype=np.float32)
@@ -111,7 +113,6 @@ class ChangeEFiveLayerSemanticsTests(unittest.TestCase):
             {
                 "source_file": "C:/authoritative/female_lotus.npz",
                 "source_asset": "C:/authoritative/female_lotus.npz",
-                "source_bvh": "",
                 "source_start_seconds": 0.0,
                 "source_end_seconds": frames / float(cfg.fps),
                 "label": "lotus_steps",
@@ -122,11 +123,8 @@ class ChangeEFiveLayerSemanticsTests(unittest.TestCase):
             "descs", "entries", "exits", "c0s", "c1s",
             "music_feats", "music_masks", "meta",
         )}
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            motion_models,
-            "parse_change_bvh_semantics",
-            side_effect=AssertionError("formal writer reached BVH parser"),
-        ):
+        self.assertFalse(hasattr(motion_models, "parse_change_bvh_semantics"))
+        with tempfile.TemporaryDirectory() as directory:
             motion_models.add_event_to_db_lists(
                 clip=clip,
                 event_idx=0,
@@ -138,10 +136,10 @@ class ChangeEFiveLayerSemanticsTests(unittest.TestCase):
                 base_meta=meta,
                 **lists,
             )
-        self.assertEqual(lists["meta"][0]["source_bvh"], "")
         self.assertEqual(
             lists["meta"][0]["source_format"], "chang_e_official_smpl"
         )
+        self.assertTrue(lists["meta"][0]["solo_compatible"])
 
     def test_formal_aesd_reads_weak_compatibility_instead_of_theme_votes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -180,12 +178,7 @@ class ChangeEFiveLayerSemanticsTests(unittest.TestCase):
             report = build_semantics(source, target, prior_alpha=0.0)
             with np.load(target, allow_pickle=True) as data:
                 probabilities = data["aesd_raw_music_alignment_probs"]
-                grounder_semantics, grounder_top, _, _ = event_semantic_matrix(
-                    {key: data[key] for key in data.files}
-                )
         np.testing.assert_allclose(probabilities[0], probabilities[1])
-        np.testing.assert_allclose(grounder_semantics[0], grounder_semantics[1])
-        np.testing.assert_array_equal(grounder_top, np.asarray([2, 2]))
         self.assertEqual(
             report["semantic_evidence_source"],
             "formal_local_kinematic_weak_compatibility",

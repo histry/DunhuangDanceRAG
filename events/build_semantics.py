@@ -5,7 +5,7 @@
 The builder enriches an existing Event-RAG ``events.npz`` without modifying
 motion arrays.  It performs two passes:
 
-1. construct grouped-evidence action-to-music semantic distributions;
+1. read the SMPL14 five-layer local-kinematic compatibility distribution;
 2. optionally apply mild empirical-prior correction and write uncertainty
    diagnostics (top-2 label, entropy, margin and ambiguity flag).
 
@@ -32,7 +32,6 @@ from events.semantic_descriptor import (  # noqa: E402
     AESD_SCHEMA_VERSION,
     MUSIC_SEMANTIC_LABELS,
     class_prior_adjustment,
-    event_probs_from_fields,
     intrinsic_transition_prior_from_arrays,
     semantic_distribution_diagnostics,
     stage_affordance_from_probs,
@@ -214,7 +213,6 @@ def build_semantics(
     else:
         n = int(len(next(value for value in db.values() if np.asarray(value).ndim > 0)))
 
-    desc = _matrix(db, "desc", n, 32)
     entry = _matrix(db, "entry", n, 144)
     exit_ = _matrix(db, "exit", n, 144)
     contact_entry = _matrix(db, "contact_entry", n, 4)
@@ -247,32 +245,17 @@ def build_semantics(
         and "music_compatibility_scores_json" in db
     )
 
-    if use_formal_compatibility:
-        raw_probabilities = np.stack(
-            [_formal_compatibility_vector(value) for value in formal_compatibility],
-            axis=0,
-        ).astype(np.float32)
-        semantic_evidence_source = "formal_local_kinematic_weak_compatibility"
-    else:
-        raw_probabilities = np.stack(
-            [
-                event_probs_from_fields(
-                    dance_key=dance[index],
-                    event_family=families[index],
-                    music_alignment_label=alignment[index],
-                    energy_label=energy[index],
-                    rhythm_label=rhythm[index],
-                    locomotion_label=locomotion[index],
-                    support_label=support[index],
-                    quality=float(quality[index]),
-                    semantic_confidence=float(semantic_confidence[index]),
-                    desc=desc[index],
-                )
-                for index in range(n)
-            ],
-            axis=0,
-        ).astype(np.float32)
-        semantic_evidence_source = "legacy_grouped_theme_and_motion_evidence"
+    if not use_formal_compatibility:
+        raise RuntimeError(
+            "Formal AESD construction requires "
+            "event_semantics_schema_version=chang_e_five_layer_event_semantics_v2 "
+            "and music_compatibility_scores_json; theme/name-derived labels are forbidden"
+        )
+    raw_probabilities = np.stack(
+        [_formal_compatibility_vector(value) for value in formal_compatibility],
+        axis=0,
+    ).astype(np.float32)
+    semantic_evidence_source = "formal_local_kinematic_weak_compatibility"
 
     external_prior = _load_prior(class_prior_path)
     empirical_prior = np.maximum(raw_probabilities.mean(axis=0), 0.02)
@@ -343,11 +326,7 @@ def build_semantics(
             "semantic_top2_margin": float(diagnostics["top2_margin"]),
             "semantic_ambiguous": bool(diagnostics["ambiguous"]),
             "music_alignment_label": str(alignment[index]),
-            "music_compatibility_supervision": (
-                "weak_kinematic_heuristic"
-                if use_formal_compatibility
-                else "legacy_grouped_weak_evidence"
-            ),
+            "music_compatibility_supervision": "weak_kinematic_heuristic",
             "dance_theme_used_as_local_action_truth": False,
             "music_alignment_probs": vector_to_prob_dict(probs),
             "raw_music_alignment_probs": vector_to_prob_dict(raw_probs),

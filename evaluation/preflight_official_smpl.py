@@ -27,6 +27,10 @@ from retargeting.official_smpl_source_preprocess import (
     discover_official_smpl_files,
     load_name_map,
 )
+from training.music_corpus import (
+    assert_content_disjoint,
+    discover_training_audio,
+)
 
 
 AUDIO_EXT = {
@@ -88,15 +92,7 @@ def main() -> int:
 
     parser.add_argument(
         "--smpl_manifest",
-        default=None,
-    )
-
-    # Historical CLI compatibility only.
-    parser.add_argument(
-        "--source_manifest",
-        dest="legacy_source_manifest",
-        default=None,
-        help=argparse.SUPPRESS,
+        required=True,
     )
 
     parser.add_argument(
@@ -107,6 +103,11 @@ def main() -> int:
     parser.add_argument(
         "--out",
         required=True,
+    )
+    parser.add_argument(
+        "--router_provenance",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     args = parser.parse_args()
@@ -127,18 +128,8 @@ def main() -> int:
         args.smpl_dir
     ).expanduser().resolve()
 
-    raw_manifest = (
-        args.smpl_manifest
-        or args.legacy_source_manifest
-    )
-
-    if not raw_manifest:
-        parser.error(
-            "--smpl_manifest is required"
-        )
-
     manifest_path = Path(
-        raw_manifest
+        args.smpl_manifest
     ).expanduser().resolve()
 
     errors: List[str] = []
@@ -185,12 +176,20 @@ def main() -> int:
         "events/build_database.py",
         "events/filter_anatomy.py",
         "training/motion_models.py",
-        "training/music_router.py",
+        "training/temporal_music_router.py",
+        "training/current_protocol_router_baseline.py",
+        "training/weak_semantic_ot.py",
+        "model/temporal_music_motion_router.py",
+        "scheduling/temporal_router_contract.py",
         "training/duration_model.py",
         "training/whole_song_planner.py",
-        "routing/closed_loop.py",
+        "routing/boundary_closed_loop.py",
         "rendering/render_motion.py",
         "scripts/pipeline.sh",
+        "scripts/run_official_smpl_loto_full.sh",
+        "evaluation/validate_formal_route.py",
+        "evaluation/audit_formal_single_person_db.py",
+        "scripts/evaluate_current_protocol_baselines.py",
         "configs/experiment.env",
     ]
 
@@ -201,43 +200,48 @@ def main() -> int:
             errors,
         )
 
-    router_prior = Path(
-        os.environ.get("ROUTING_SAFETY_MUSIC_ENCODER_PRIOR_CKPT")
-        or os.environ.get("MUSIC_ROUTER_WEIGHT")
-        or root / "assets/weights/music/router.pt"
-    ).expanduser().resolve()
-    require_file(
-        router_prior,
-        "project-trained Librosa Router music-encoder prior",
-        errors,
-    )
-
     music_contract = {
-        "deep_music_features": os.environ.get(
-            "GENERATION_DEEP_MUSIC_FEATURES", "0"
+        "feature_model": "librosa_12d",
+        "require_librosa_backend": os.environ.get(
+            "REQUIRE_LIBROSA_BACKEND", "0"
         ),
-        "require_deep_music": os.environ.get(
-            "GENERATION_REQUIRE_DEEP_MUSIC", "0"
+        "router_architecture": os.environ.get(
+            "ROUTING_FORMAL_ROUTER_ARCHITECTURE", ""
         ),
-        "feature_model": os.environ.get(
-            "GENERATION_DEEP_MUSIC_MODEL", "librosa_12d"
+        "router_supervision_source": os.environ.get(
+            "ROUTING_FORMAL_SUPERVISION_SOURCE", ""
         ),
-        "semantic_ot_enable": os.environ.get("SEMANTIC_OT_ENABLE", "0"),
-        "grounder_architecture": os.environ.get(
-            "GROUNDING_GROUNDER_ARCHITECTURE", "legacy"
+        "freeze_music_encoder": os.environ.get(
+            "ROUTING_SAFETY_FREEZE_MUSIC_ENCODER", "1"
         ),
     }
     expected_music_contract = {
-        "deep_music_features": "0",
-        "require_deep_music": "0",
         "feature_model": "librosa_12d",
-        "semantic_ot_enable": "0",
-        "grounder_architecture": "legacy",
+        "require_librosa_backend": "1",
+        "router_architecture": "ctsr_weak_temporal_v1",
+        "router_supervision_source": "semantic_ot_teacher",
+        "freeze_music_encoder": "0",
     }
     if music_contract != expected_music_contract:
         errors.append(
-            "formal music contract must be Librosa 12D + project-trained "
-            f"Router with no external pretrained model: {music_contract}"
+            "formal music contract must be Librosa 12D + scratch-trained "
+            f"CTSR-Weak with no external pretrained model: {music_contract}"
+        )
+    graph_route_contract = {
+        "solver": os.environ.get("GRAPH_ROUTE_SOLVER", ""),
+    }
+    if graph_route_contract != {"solver": "fisher_rao_graph_sb"}:
+        errors.append(f"formal Graph-SB contract is not fail-closed: {graph_route_contract}")
+    performer_contract = {
+        "group": os.environ.get("PERFORMER_GROUP", "auto"),
+        "identity_mode": os.environ.get("PERFORMER_IDENTITY_MODE", "group"),
+        "require_solo_compatible": os.environ.get(
+            "PERFORMER_REQUIRE_SOLO_COMPATIBLE", "0"
+        ),
+    }
+    if performer_contract["require_solo_compatible"] != "1":
+        errors.append(
+            f"formal one-body routing does not exclude unreviewed pair tracks: {performer_contract}"
         )
 
     discovered = (
@@ -368,6 +372,12 @@ def main() -> int:
                             "performer_group"
                         ]
                     ),
+                    "recording_performer_count": contract[
+                        "recording_performer_count"
+                    ],
+                    "solo_compatibility": contract["solo_compatibility"],
+                    "solo_compatible": contract["solo_compatible"],
+                    "solo_review_status": contract["solo_review_status"],
                     "dance_category": (
                         contract[
                             "dance_category"
@@ -449,6 +459,24 @@ def main() -> int:
         if music_dir.is_dir()
         else 0
     )
+    content_disjoint_report: Dict[str, Any] = {
+        "schema": "music_content_disjoint_v1",
+        "ok": False,
+    }
+    if music_dir.is_dir() and audio.is_file():
+        try:
+            training_audio = discover_training_audio([music_dir])
+            if len(training_audio) != music_count:
+                errors.append(
+                    "training music contains byte-identical duplicates: "
+                    f"files={music_count}, unique_content={len(training_audio)}"
+                )
+            content_disjoint_report = assert_content_disjoint(
+                training_audio,
+                [audio],
+            )
+        except Exception as exc:
+            errors.append(f"training/target audio content-disjoint check failed: {exc}")
 
     expected_music = int(
         float(
@@ -487,7 +515,6 @@ def main() -> int:
             if torch.cuda.is_available()
             else None
         )
-
         if not torch.cuda.is_available():
             errors.append(
                 "CUDA is unavailable"
@@ -524,12 +551,22 @@ def main() -> int:
             exact_split_counts,
         )
 
+        split_recording_uids = {
+            str(row["recording_uid"])
+            for row in source_rows
+            if (
+                performer_contract["require_solo_compatible"] != "1"
+                or bool(row.get("solo_compatible", False))
+            )
+        }
+        runtime["formal_split_recording_groups"] = len(split_recording_uids)
+
         runtime[
             "split_counts_at_recording_groups"
         ] = exact_split_counts(
             max(
                 3,
-                len(recording_uids),
+                len(split_recording_uids),
             ),
             float(
                 os.environ.get(
@@ -559,7 +596,7 @@ def main() -> int:
 
     report = {
         "schema": (
-            "chang_e_official_smpl_preflight_v2"
+            "chang_e_official_smpl_preflight_v3_formal_fail_closed"
         ),
         "formal_motion_source": (
             "chang_e_official_smpl"
@@ -611,8 +648,37 @@ def main() -> int:
         "expected_training_music_count": (
             expected_music
         ),
-        "music_router_prior": str(router_prior),
+        "music_router_initialization": "from_scratch_no_checkpoint_prior",
+        "training_target_audio_content_disjoint": content_disjoint_report,
         "formal_music_contract": music_contract,
+        "formal_graph_route_contract": graph_route_contract,
+        "formal_performer_contract": performer_contract,
+        "scientific_limitations": {
+            "same_dancer_claim_supported": False,
+            "dancer_disjoint_claim_supported": False,
+            "reason": "global dancer_id is not verified in the released filenames/metadata",
+            "pending_theme_sources": sorted(
+                row["source_id"]
+                for row in source_rows
+                if row.get("theme_label_status") == "pending_official_confirmation"
+            ),
+            "excluded_unreviewed_multi_performer_sources": sorted(
+                row["source_id"]
+                for row in source_rows
+                if not bool(row.get("solo_compatible", False))
+            ),
+            "themes_removed_from_formal_single_person_training": sorted(
+                {
+                    str(row["dance_category"])
+                    for row in source_rows
+                    if not bool(row.get("solo_compatible", False))
+                }
+            ),
+            "leave_one_theme_out_launcher": str(
+                root / "scripts/run_official_smpl_loto_full.sh"
+            ),
+            "ordinary_source_disjoint_and_loto_reported_separately": True,
+        },
         "runtime": runtime,
         "warnings": warnings,
         "errors": errors,

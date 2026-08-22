@@ -11,8 +11,10 @@ Whole-Song Planner music-dominant revision:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -89,6 +91,16 @@ def audio_duration_seconds(path: str | Path) -> float:
     )
 
 
+def audio_content_sha256(path: str | Path) -> str:
+    """Return the content identity used by the formal feature cache."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def moving_average(values: np.ndarray, window: int) -> np.ndarray:
     x = np.asarray(values, dtype=np.float32).reshape(-1)
     if len(x) == 0 or window <= 1:
@@ -119,24 +131,49 @@ def whole_song_features(
     cache_dir: str | Path | None = None,
     max_seconds: float = 0.0,
     require_rhythm: bool = False,
+    require_librosa: bool | None = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    if require_librosa is None:
+        require_librosa = str(os.environ.get("REQUIRE_LIBROSA_BACKEND", "0")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+    require_librosa = bool(require_librosa)
     duration = audio_duration_seconds(audio_path)
     if max_seconds > 0:
         duration = min(duration, float(max_seconds))
     num_frames = max(2, int(round(duration * float(fps))))
     cache_path: Path | None = None
     meta_path: Path | None = None
+    audio_sha256: str | None = None
     if cache_dir:
         cache = Path(cache_dir)
         cache.mkdir(parents=True, exist_ok=True)
-        key = Path(audio_path).stem
+        audio_sha256 = audio_content_sha256(audio_path)
+        key = f"{Path(audio_path).stem}_{audio_sha256[:16]}"
         cache_path = cache / f"{key}_whole_song_fps{float(fps):g}_{num_frames}.npy"
         meta_path = cache_path.with_suffix(".json")
         if cache_path.is_file() and meta_path.is_file():
             features = np.load(cache_path).astype(np.float32)
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if features.shape == (num_frames, 12):
+            cache_identity_matches = (
+                str(meta.get("cache_schema", ""))
+                == "music_12d_content_addressed_cache_v2"
+                and str(meta.get("audio_sha256", "")) == audio_sha256
+            )
+            if features.shape == (num_frames, 12) and cache_identity_matches:
                 extractor_meta = meta.setdefault("extractor", {})
+                if require_librosa and str(extractor_meta.get("backend")) != "librosa":
+                    raise RuntimeError(
+                        "Formal whole-song cache is not proven to use Librosa: "
+                        f"cache={cache_path}, backend={extractor_meta.get('backend')!r}"
+                    )
+                if require_librosa and str(
+                    extractor_meta.get("backend_version") or ""
+                ).lower() in {"", "unknown", "none"}:
+                    raise RuntimeError(
+                        "Formal whole-song cache has no concrete Librosa version: "
+                        f"cache={cache_path}"
+                    )
                 validate_rhythm_features(
                     features,
                     extractor_meta,
@@ -149,15 +186,19 @@ def whole_song_features(
         audio_path,
         num_frames=num_frames,
         require_rhythm=require_rhythm,
+        require_librosa=require_librosa,
     )
     meta = {
+        "cache_schema": "music_12d_content_addressed_cache_v2",
         "audio": str(audio_path),
+        "audio_sha256": audio_sha256,
         "duration_sec": float(duration),
         "fps": float(fps),
         "num_frames": int(num_frames),
         "feature_dim": int(features.shape[1]),
         "extractor": extractor_meta,
         "require_rhythm_features": bool(require_rhythm),
+        "require_librosa_backend": bool(require_librosa),
     }
     if cache_path is not None and meta_path is not None:
         np.save(cache_path, features.astype(np.float32))

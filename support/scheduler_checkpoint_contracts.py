@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -38,6 +39,38 @@ def sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def repository_code_provenance() -> dict[str, Any]:
+    """Capture the exact Git revision and non-ignored worktree state."""
+
+    root = Path(__file__).resolve().parents[1]
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        return result.stdout
+
+    try:
+        commit = git("rev-parse", "HEAD").strip()
+        status = git("status", "--porcelain", "--untracked-files=normal")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"Formal Scheduler training requires Git code provenance: {exc}"
+        ) from exc
+    return {
+        "schema": "git_repository_code_provenance_v1",
+        "commit": commit,
+        "worktree_clean": not bool(status.strip()),
+        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "status_entries": int(len([line for line in status.splitlines() if line])),
+    }
 
 
 def assert_scheduler_dataset_contract(
@@ -178,6 +211,7 @@ def scheduler_training_contract(
         "music_prior": str(prior_path) if prior_path is not None else None,
         "music_prior_sha256": sha256_file(prior_path) if prior_path is not None else None,
         "upstream_checkpoints": upstream,
+        "code_provenance": repository_code_provenance(),
     }
 
 
@@ -190,9 +224,8 @@ def assert_scheduler_checkpoint_contract(
     index_json: str | Path | None = None,
     index_npz: str | Path | None = None,
     path: str = "",
-    allow_legacy_30fps: bool | None = None,
 ) -> dict[str, Any] | None:
-    """Validate a formal checkpoint, retaining an explicit legacy parity path."""
+    """Validate a current-protocol Scheduler checkpoint."""
 
     role = str(role).strip().lower()
     if role not in SCHEDULER_ROLES:
@@ -205,13 +238,6 @@ def assert_scheduler_checkpoint_contract(
     )
     contract = checkpoint.get("scheduler_contract")
     if contract is None:
-        legacy = (
-            bool(allow_legacy_30fps)
-            if allow_legacy_30fps is not None
-            else os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS", "0") == "1"
-        )
-        if legacy and abs(float(runtime_fps) - 30.0) <= 1.0e-6:
-            return None
         raise RuntimeError(
             f"{role} checkpoint {path} has no formal Scheduler training contract"
         )
@@ -240,6 +266,17 @@ def assert_scheduler_checkpoint_contract(
         if layout != ROT6D_LAYOUT_PYTORCH3D_ROW:
             raise RuntimeError(
                 f"Duration checkpoint must declare pytorch3d_row model layout: {path}"
+            )
+    expected_code = contract.get("code_provenance")
+    if not isinstance(expected_code, Mapping):
+        raise RuntimeError(f"{role} checkpoint has no Git code provenance: {path}")
+    runtime_code = repository_code_provenance()
+    for key in ("schema", "commit", "worktree_clean", "status_sha256"):
+        if expected_code.get(key) != runtime_code.get(key):
+            raise RuntimeError(
+                f"{role} checkpoint code provenance mismatch for {key}: "
+                f"checkpoint={expected_code.get(key)!r}, runtime={runtime_code.get(key)!r}, "
+                f"path={path}"
             )
     if event_db_contract is not None:
         assert_same_event_db_contract(

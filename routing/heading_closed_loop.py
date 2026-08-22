@@ -398,7 +398,7 @@ def assemble_event_heading_reference(
             "maximum_beam_width": int(search.maximum_beam_width),
             "branch_topk": int(search.branch_topk),
             "candidates_per_source": int(search.candidates_per_source),
-            "method": "viability-aware BR-HPR",
+            "method": "viability-aware Routing Budget",
             "source_targeted_expansion": bool(source_coverage_config.enabled),
             "continuous_recovery_budget": float(
                 constraint_config.recovery_budget_total
@@ -556,7 +556,7 @@ def assemble_event_heading_reference(
                     int(event_id),
                 ) in skip_pairs:
                     print(
-                        "[BR-HPR-CANDIDATE-SKIP] "
+                        "[Routing Budget-CANDIDATE-SKIP] "
                         + json.dumps(
                             {
                                 "slot": int(slot_idx),
@@ -1041,7 +1041,7 @@ def assemble_event_heading_reference(
                         motion_runtime,
                         proposal.event_path,
                         cfg,
-                        "state_aware_br_hpr_warp_probe",
+                        "state_aware_routing_budget_warp_probe",
                     ).shape[0]
                 recovery_budget_after = float(
                     state.recovery_budget_used + recovery_charge
@@ -1134,7 +1134,7 @@ def assemble_event_heading_reference(
                     "stage_heading_after_deg": float(np.degrees(stage_after)),
                     "slot_turn_policy": slot_turn_policy(slot),
                     "candidate_trials": trials,
-                    "method": "viability-aware BR-HPR",
+                    "method": "viability-aware Routing Budget",
                 }
                 source_exemption_used = bool(
                     scarcity_context.source_scarcity_exemption
@@ -1340,11 +1340,11 @@ def assemble_event_heading_reference(
         motion_runtime,
         np.asarray(best.motion, dtype=np.float32),
         cfg,
-        source_hint="viability_aware_br_hpr_dynamic_heading_reference_final",
+        source_hint="viability_aware_routing_budget_dynamic_heading_reference_final",
     )
     _LAST_HEADING_PLAN = {
         "schema": "viability_aware_bidirectional_hierarchical_probabilistic_route",
-        "method": "viability-aware BR-HPR",
+        "method": "viability-aware Routing Budget",
         "search": {
             "beam_width": int(search.beam_width),
             "maximum_beam_width": int(search.maximum_beam_width),

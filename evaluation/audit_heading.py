@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Audit a Event-Heading generated whole-song motion against the heading plan."""
+"""Audit formal whole-song motion against its boundary-aligned heading contract."""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,33 @@ from support.event_identity import (  # noqa: E402
     make_event_db_contract,
     normalize_event_db_contract,
 )
+
+
+FORMAL_HEADING_SCHEMA = "formal_boundary_aligned_heading_v1"
+
+
+def validate_formal_heading_contract(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Fail closed unless the report declares the current formal contract."""
+
+    contract = report.get("heading_contract")
+    reasons: List[str] = []
+    if not isinstance(contract, dict):
+        reasons.append("missing_formal_heading_contract")
+        contract = {}
+    if str(contract.get("schema", "")) != FORMAL_HEADING_SCHEMA:
+        reasons.append(
+            "invalid_formal_heading_schema="
+            f"{contract.get('schema')!r};expected={FORMAL_HEADING_SCHEMA!r}"
+        )
+    if str(contract.get("authoritative_reference", "")) != "motion_ref_path":
+        reasons.append("heading_reference_is_not_motion_ref_path")
+    if str(contract.get("event_turn_budget_source", "")) != "generation_event_db":
+        reasons.append("heading_budget_is_not_generation_event_db")
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "contract": contract,
+    }
 
 
 def _resolve_motion_ref_path(
@@ -89,6 +116,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if motion.ndim == 3:
         motion = motion[0]
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    heading_contract = validate_formal_heading_contract(report)
     with np.load(args.db, allow_pickle=True) as data:
         db = {k: data[k] for k in data.files}
 
@@ -199,7 +227,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
         })
 
-    reasons: List[str] = []
+    reasons: List[str] = list(heading_contract["reasons"])
     max_plan_err = float(
         os.environ.get("EVENT_HEADING_PLANNED_HEADING_ERROR_P95_MAX_DEG", 2.0)
     )
@@ -215,11 +243,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         reasons.append(
             f"invalid_event_reference_count={invalid_event_reference_count}"
         )
-    if not report.get("event_heading_planner"):
-        reasons.append("missing_event_heading_planner_report")
-
     result = {
-        "schema": "event_heading_generated_heading_audit",
+        "schema": "formal_boundary_aligned_heading_audit_v1",
         "ok": not reasons,
         "reasons": reasons,
         "motion": args.motion,
@@ -227,6 +252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "db": args.db,
         "fps": float(args.fps),
         "event_db_contract": computed_db_contract,
+        "heading_contract": heading_contract["contract"],
         "frames": int(len(motion)),
         "planned_heading_error_deg_p95": planned_error_p95,
         "planned_heading_error_deg_max": planned_error_max,

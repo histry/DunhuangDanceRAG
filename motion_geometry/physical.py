@@ -415,7 +415,7 @@ def _body_normalized_root_relative_jerk_metrics(
     *,
     fps: float,
 ) -> dict[str, Any]:
-    """Legacy V2.1 pelvis-relative diagnostic, no longer a source gate.
+    """Pelvis-relative diagnostic retained only for report continuity.
 
     These values are retained in reports so V2.1/V2.2 runs remain directly
     comparable.  They are intentionally *not* used for V2.2 source acceptance:
@@ -464,8 +464,8 @@ def _normalize_source_comparison_bones(
     """Return a validated, ordered set of target child-joint bone indices.
 
     A target bone is identified by its child joint; its parent is read from the
-    canonical SMPL24/EDGE tree.  Formal BVH callers pass the direct common
-    source/target mapped-bone set produced by ``retargeting.build_cache``.
+    canonical SMPL24/EDGE tree. The official-SMPL adapter supplies the direct
+    common source/target mapped-bone set.
     ``None`` is retained only for canonical/self-reference diagnostics and
     means all non-root target bones.
     """
@@ -514,7 +514,7 @@ def _unit_bone_direction_jerk_metrics(
     length therefore cannot scale the statistic, and upstream chain lengths or
     root translation cancel before differentiation.  Only the common direct
     source/target mapped bones supplied by the cache builder are authoritative
-    for BVH source qualification.
+    for official-SMPL source qualification.
 
     Units are s^-3 because ``u_j`` is dimensionless.  This is a source-only
     relative diagnostic/gate; final generated motion continues to use the

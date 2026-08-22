@@ -32,8 +32,6 @@ class SchedulerIndexPathTests(unittest.TestCase):
             "mmr_embed": np.zeros((1, 64), dtype=np.float32),
             "entry_pose": np.zeros((1, 151), dtype=np.float32),
             "exit_pose": np.zeros((1, 151), dtype=np.float32),
-            "entry_vel": np.zeros((1, 151), dtype=np.float32),
-            "exit_vel": np.zeros((1, 151), dtype=np.float32),
             "length": np.ones((1,), dtype=np.float32),
         }
         npz = root / "duration_index.npz"

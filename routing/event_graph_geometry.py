@@ -9,7 +9,6 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from grounding.manifold_ops import lorentz_distance_sq_np
 from motion_geometry.rotations import so3_geodesic_np
 
 
@@ -71,7 +70,6 @@ class EventGraphGeometryConfig:
     contact_weight: float = 0.45
     root_velocity_weight: float = 0.30
     so3_weight: float = 0.55
-    lorentz_weight: float = 0.15
     posture_hard: float = 2.0
     floor_hard_m: float = 0.20
     contact_hard: float = 0.75
@@ -91,7 +89,6 @@ class EventGraphGeometryConfig:
                 "GROUNDING_GLOBAL_ROOT_VEL_W", 0.30
             ),
             so3_weight=_env_float("GRAPH_ROUTE_SO3_W", 0.55),
-            lorentz_weight=_env_float("GRAPH_ROUTE_LORENTZ_W", 0.15),
             posture_hard=_env_float("GRAPH_ROUTE_POSTURE_HARD", 2.0),
             floor_hard_m=_env_float("GRAPH_ROUTE_FLOOR_HARD_M", 0.20),
             contact_hard=_env_float("GRAPH_ROUTE_CONTACT_HARD", 0.75),
@@ -158,37 +155,6 @@ def so3_product_endpoint_distance(
         return 0.0, False
 
 
-def lorentz_hierarchy_distance(
-    db: Mapping[str, Any],
-    previous_event: int,
-    current_event: int,
-) -> tuple[float, bool]:
-    """Distance between paper-one Lorentz factors when they are embedded."""
-
-    key = "event_geometry_mixed_lorentz"
-    if key not in db:
-        return 0.0, False
-    try:
-        points = np.asarray(db[key], dtype=np.float64)
-        left = points[int(previous_event)]
-        right = points[int(current_event)]
-        if left.ndim != 1 or left.shape != right.shape or left.size < 2:
-            return 0.0, False
-        curvature = float(
-            np.asarray(db.get("event_geometry_mixed_curvature", 1.0)).reshape(-1)[0]
-        )
-        distance_sq = float(
-            np.asarray(
-                lorentz_distance_sq_np(left, right, curvature=curvature)
-            ).reshape(-1)[0]
-        )
-        if not np.isfinite(distance_sq):
-            return 0.0, False
-        return float(np.sqrt(max(0.0, distance_sq))), True
-    except Exception:
-        return 0.0, False
-
-
 def manifold_edge_cost(
     db: Mapping[str, Any],
     previous_event: int,
@@ -240,12 +206,8 @@ def manifold_edge_cost(
     except Exception:
         pass
     so3, has_so3 = so3_product_endpoint_distance(db, previous, current)
-    lorentz, has_lorentz = lorentz_hierarchy_distance(
-        db, previous, current
-    )
-
     values = np.asarray(
-        [omega, alpha, root_velocity, posture, pelvis, floor, contact, so3, lorentz],
+        [omega, alpha, root_velocity, posture, pelvis, floor, contact, so3],
         dtype=np.float64,
     )
     hard_reasons: list[str] = []
@@ -275,11 +237,7 @@ def manifold_edge_cost(
         + cfg.contact_weight * contact
         + cfg.root_velocity_weight * root_velocity
     )
-    total = (
-        physical
-        + (cfg.so3_weight * so3 if has_so3 else 0.0)
-        + (cfg.lorentz_weight * lorentz if has_lorentz else 0.0)
-    )
+    total = physical + (cfg.so3_weight * so3 if has_so3 else 0.0)
     if not np.isfinite(total):
         hard_reasons.append("nonfinite_total")
         total = 1.0e6
@@ -295,8 +253,6 @@ def manifold_edge_cost(
         "contact_gap": float(contact),
         "so3_product_distance_rad": float(so3),
         "so3_available": bool(has_so3),
-        "lorentz_hierarchy_distance": float(lorentz),
-        "lorentz_available": bool(has_lorentz),
         "hard_feasible": not hard_reasons,
         "hard_reasons": tuple(dict.fromkeys(hard_reasons)),
         "boundary_reset": bool(boundary_reset),
@@ -306,7 +262,6 @@ def manifold_edge_cost(
 __all__ = [
     "EventGraphGeometryConfig",
     "event_node_feasibility",
-    "lorentz_hierarchy_distance",
     "manifold_edge_cost",
     "so3_product_endpoint_distance",
 ]

@@ -147,16 +147,9 @@ def main() -> None:
     bundle = load_duration_checkpoint(args.duration_model_checkpoint, device=device)
     declared_fps = bundle.get("config", {}).get("fps")
     if declared_fps is None:
-        legacy_ok = (
-            abs(float(args.fps) - 30.0) < 1.0e-6
-            and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS", "0") == "1"
+        raise RuntimeError(
+            "Duration checkpoint has no FPS contract; rebuild it under the current protocol"
         )
-        if not legacy_ok:
-            raise RuntimeError(
-                "Duration checkpoint has no FPS contract. Rebuild a rate-specific checkpoint; "
-                "legacy weights are allowed only for the explicit 30 FPS parity baseline."
-            )
-        declared_fps = 30.0
     checkpoint_fps = float(declared_fps)
     if abs(checkpoint_fps - float(args.fps)) > 1.0e-6:
         raise RuntimeError(

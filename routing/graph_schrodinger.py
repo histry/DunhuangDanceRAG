@@ -264,7 +264,7 @@ def multi_marginal_schrodinger(
 
     The cyclic IPF update is an information projection on one categorical
     marginal at a time.  A non-converged result is returned explicitly; callers
-    decide whether to fall back to a deterministic legacy solver.
+    reject the formal run if convergence is not achieved.
     """
 
     targets = _validate_targets(target_marginals)

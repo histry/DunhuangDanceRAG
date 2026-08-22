@@ -28,11 +28,10 @@ def test_hyperbolic_hierarchy_preserves_identity_and_separation():
 
 
 def test_safe_source_scarcity_scales_only_non_safety_source_preferences(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_SOURCE_SCARCITY_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_MINIMUM_SAFE_SOURCE_COUNT", "2")
-    monkeypatch.setenv("BR_HPR_SOURCE_SCARCITY_MINIMUM_SCALE", "0.10")
-    monkeypatch.setenv("BR_HPR_MAX_SOURCE_RUN", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_SCARCITY_ENABLE", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_MINIMUM_SAFE_SOURCE_COUNT", "2")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_SCARCITY_MINIMUM_SCALE", "0.10")
+    monkeypatch.setenv("ROUTING_BUDGET_MAX_SOURCE_RUN", "1")
     config = ConstraintBudgetConfig.from_environment(total_slots=5)
     context = build_source_scarcity_context(
         db=_db(),

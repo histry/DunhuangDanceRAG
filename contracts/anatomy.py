@@ -3,7 +3,7 @@
 """Retarget Clean posture-aware anatomy and source/event safety contracts.
 
 This module is API-compatible with ``tools.anatomy_heading_anatomy_contract`` while
-separating two decisions that must not be conflated in a 12-source low-resource
+separating two decisions that must not be conflated in a 14-source low-resource
 project:
 
 1. source safety: reject only catastrophic numerical/kinematic failures;

@@ -18,11 +18,10 @@ def _db():
 
 
 def test_state_history_can_invalidate_a_statically_reachable_node(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_SOURCE_SCARCITY_ENABLE", "0")
-    monkeypatch.setenv("BR_HPR_EVENT_REPEAT_BUDGET", "0")
-    monkeypatch.setenv("BR_HPR_RECOVERY_BUDGET_TOTAL", "0")
-    monkeypatch.setenv("BR_HPR_STATE_REACHABILITY_HORIZON", "3")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_SCARCITY_ENABLE", "0")
+    monkeypatch.setenv("ROUTING_BUDGET_EVENT_REPEAT_BUDGET", "0")
+    monkeypatch.setenv("ROUTING_BUDGET_RECOVERY_BUDGET_TOTAL", "0")
+    monkeypatch.setenv("ROUTING_BUDGET_STATE_REACHABILITY_HORIZON", "3")
     config = ConstraintBudgetConfig.from_environment(total_slots=3)
     model = BackwardReachabilityModel.build(
         [[0], [1], [2]],

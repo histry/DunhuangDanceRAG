@@ -141,7 +141,8 @@ def _preflight_rate_specific_checkpoints(args: argparse.Namespace) -> dict[str, 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source_dirs", nargs="+", required=True, help="BVH/AIST++ roots; each root gets an isolated retarget cache.")
+    parser.add_argument("--smpl_dir", required=True)
+    parser.add_argument("--smpl_manifest", required=True)
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--base_config", default="configs/motion_model.json")
     parser.add_argument("--duration_ckpt_30")
@@ -187,8 +188,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     python = sys.executable
     intervals_root = output_root / "canonical_intervals"
     plan: dict[str, Any] = {
-        "schema": "dunhuang_multirate_build_plan_v2_source_disjoint",
-        "source_dirs": [str(Path(p).resolve()) for p in args.source_dirs],
+        "schema": "dunhuang_multirate_build_plan_v3_official_smpl14",
+        "smpl_dir": str(Path(args.smpl_dir).resolve()),
+        "smpl_manifest": str(Path(args.smpl_manifest).resolve()),
         "base_config": str(base_config_path),
         "skeleton_contract": skeleton_contract(),
         "checkpoint_preflight": checkpoint_preflight,
@@ -205,30 +207,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "MOTION_FPS": str(float(fps)),
             "GENERATION_FPS": str(float(fps)),
             "SOURCE_RETARGET_FPS": str(float(fps)),
-            "GROUNDING_GROUNDER_CKPT": str(
-                branch / "checkpoints" / "dual_branch_grounder.pt"
-            ),
         })
-        cache_dirs: list[Path] = []
         commands: list[list[str]] = []
-        for index, raw in enumerate(args.source_dirs):
-            source = Path(raw).resolve()
-            cache = branch / "retarget_cache" / f"source_{index:02d}_{source.name}"
-            cache_dirs.append(cache)
-            command = [
-                python, "-m", "retargeting.build_cache",
-                "--in_dir", str(source),
-                "--out_dir", str(cache),
-                "--target_fps", str(fps),
-                "--device", args.device,
-                "--smpl_scaling_mode", args.smpl_scaling_mode,
-                "--allow_partial",
-            ]
-            if args.overwrite:
-                command.append("--overwrite")
-            commands.append(command)
-
         cache_root = branch / "retarget_cache"
+        preprocess_command = [
+            python, "-m", "retargeting.official_smpl_source_preprocess",
+            "--in_dir", str(Path(args.smpl_dir).resolve()),
+            "--out_dir", str(cache_root),
+            "--smpl_manifest", str(Path(args.smpl_manifest).resolve()),
+            "--target_fps", str(fps),
+            "--scaling_mode", args.smpl_scaling_mode,
+        ]
+        if args.overwrite:
+            preprocess_command.append("--overwrite")
+        commands.append(preprocess_command)
         split_root = branch / "retarget_cache_split"
         split_command = [
             python, "-m", "data_pipeline.split_sources",
@@ -251,7 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             event_db = event_db_root / split
             intervals = intervals_root / f"{split}.json"
             event_command = [
-                python, "-m", "events.build_pipeline",
+                python, "-m", "events.build_database",
                 "--motion_dirs", str(split_root / split),
                 "--out_db", str(event_db),
                 "--config", str(config),

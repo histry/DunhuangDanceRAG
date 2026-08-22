@@ -260,6 +260,16 @@ def main() -> int:
         )
 
         metadata = SOURCE_METADATA[source_id]
+        recording_performer_count = sum(
+            1
+            for candidate in SOURCE_METADATA.values()
+            if candidate["recording_uid"] == metadata["recording_uid"]
+        )
+        solo_compatibility = (
+            "single_track_recording"
+            if recording_performer_count == 1
+            else "requires_manual_review"
+        )
 
         rows.append({
             "source_id": source_id,
@@ -287,6 +297,14 @@ def main() -> int:
             "dancer_id_status": "unverified",
             "performer_track_id": (
                 metadata["performer_track_id"]
+            ),
+            "recording_performer_count": recording_performer_count,
+            "solo_compatibility": solo_compatibility,
+            "solo_compatible": recording_performer_count == 1,
+            "solo_review_status": (
+                "not_required_single_track"
+                if recording_performer_count == 1
+                else "pending_manual_review"
             ),
             "sequence_index": (
                 metadata["sequence_index"]
@@ -341,6 +359,11 @@ def main() -> int:
         "canonical_skeleton": CANONICAL_SKELETON,
         "hand_rotation_policy": HAND_ROTATION_POLICY,
         "dancer_identity_status": "unverified_in_release_filenames",
+        "solo_identity_contract": (
+            "single-track recordings are eligible for a one-body output; "
+            "multi-track recordings require manual review and no cross-sequence "
+            "dancer identity is claimed"
+        ),
         "num_dancers_declared_by_dataset": 4,
         "timebase_authority": (
             "manifest_source_fps"

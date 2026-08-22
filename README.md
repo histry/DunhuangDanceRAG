@@ -1,17 +1,15 @@
 # DunhuangDanceRAG
 
-A clean research release for low-resource whole-song Dunhuang dance generation.
-The project uses anatomy-safe real motion events, unpaired music-semantic
-grounding, global route planning and risk-masked local refinement.
-
-## Run
+Music-led single-person Dunhuang dance generation under the Chang-E official
+SMPL14 protocol. The formal path trains from scratch with local Librosa 12D
+features and project-trained models; it does not load an external pretrained
+music model.
 
 ```bash
-conda env create -f environment.yml
-conda activate dunhuang-dance-rag
+source configs/experiment.env
 bash scripts/preflight.sh
 bash run.sh assets/music/test/audio/dunhuangwu2.wav
 ```
 
-See `docs/ARCHITECTURE.md`, `docs/DATA_CONTRACT.md` and
-`docs/REPRODUCIBILITY.md`.
+See `docs/ARCHITECTURE.md`, `docs/DATA_CONTRACT.md`,
+`docs/BASELINES.md`, and `docs/REPRODUCIBILITY.md`.

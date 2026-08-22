@@ -17,7 +17,11 @@ export PERFORMER_GROUP="${3:-${PERFORMER_GROUP:-auto}}"
 if [[ -z "$TRAINED_RUN" ]]; then
   TRAINED_RUN="$(
     find "$ROOT_DIR/outputs" -maxdepth 1 -type d -name 'run_*' \
-      -exec test -s '{}/checkpoints/grounder.pt' ';' -print 2>/dev/null \
+      -exec test -s '{}/checkpoints/ctsr_weak_temporal_router.pt' ';' \
+      -exec test -s '{}/checkpoints/duration_predictor.pt' ';' \
+      -exec test -s '{}/checkpoints/whole_song_planner.pt' ';' \
+      -exec test -s '{}/motion_refiner_train_only_refiner.pt' ';' \
+      -exec test -s '{}/motion_train_only_diffusion.pt' ';' -print 2>/dev/null \
       | sort | tail -1
   )"
 fi
@@ -35,24 +39,28 @@ export AUDIO="$(realpath "$AUDIO")"
 # because the preserved internal pipeline still reads them.
 export REBUILD_RETARGET_CACHE=0
 export REBUILD_EVENT_DB=0
-export RETRAIN_CONTRASTIVE=0
 export RETRAIN_REFINER=0
 export RETRAIN_DIFFUSION=0
 export GENERATION_REBUILD_RETARGET_CACHE=0
 export GENERATION_REBUILD_EVENT_DB=0
-export GENERATION_RETRAIN_CONTRASTIVE=0
 export GENERATION_RETRAIN_REFINER=0
 export GENERATION_RETRAIN_DIFFUSION=0
+export GENERATION_RETRAIN_ROUTER=0
+export GENERATION_RETRAIN_DURATION=0
+export GENERATION_RETRAIN_PLANNER=0
 export RETARGET_CLEAN_FULL_REBUILD=0
 export RETARGET_CLEAN_REBUILD_RETARGET_CACHE=0
 export RETARGET_CLEAN_REBUILD_EVENT_DB=0
-export RETARGET_CLEAN_RETRAIN_CONTRASTIVE=0
 export RETARGET_CLEAN_RETRAIN_REFINER=0
 export RETARGET_CLEAN_RETRAIN_DIFFUSION=0
-export GROUNDING_GROUNDER_CKPT="${GROUNDING_GROUNDER_CKPT:-$TRAINED_RUN/checkpoints/grounder.pt}"
-export CONTRASTIVE_CKPT="${CONTRASTIVE_CKPT:-$TRAINED_RUN/checkpoints/semantic_retriever.pt}"
-export REFINER_CKPT="${REFINER_CKPT:-$TRAINED_RUN/checkpoints/boundary_refiner.pt}"
-export MOTION_CKPT="${MOTION_CKPT:-$TRAINED_RUN/checkpoints/local_diffusion.pt}"
+export RETARGET_CLEAN_RETRAIN_ROUTER=0
+export RETARGET_CLEAN_RETRAIN_DURATION=0
+export RETARGET_CLEAN_RETRAIN_PLANNER=0
+export FORMAL_ROUTER_CKPT="${FORMAL_ROUTER_CKPT:-$TRAINED_RUN/checkpoints/ctsr_weak_temporal_router.pt}"
+export FORMAL_DURATION_CKPT="${FORMAL_DURATION_CKPT:-$TRAINED_RUN/checkpoints/duration_predictor.pt}"
+export FORMAL_PLANNER_CKPT="${FORMAL_PLANNER_CKPT:-$TRAINED_RUN/checkpoints/whole_song_planner.pt}"
+export REFINER_CKPT="${REFINER_CKPT:-$TRAINED_RUN/motion_refiner_train_only_refiner.pt}"
+export MOTION_CKPT="${MOTION_CKPT:-$TRAINED_RUN/motion_train_only_diffusion.pt}"
 
 TRACK_ID="$(basename "${AUDIO%.*}")"
 RESULT_ROOT="$TRAINED_RUN/test_results/$TRACK_ID/$PERFORMER_GROUP"
@@ -68,7 +76,7 @@ echo "[GENERATE] RESULT_ROOT=$RESULT_ROOT"
 
 bash scripts/research_pipeline.sh "$AUDIO"
 
-# The preserved pipeline writes final products under OUT_ROOT. Archive only files
+# The formal pipeline writes final products under OUT_ROOT. Archive only files
 # created or modified by this generation call so the next test track cannot
 # overwrite the previous result.
 while IFS= read -r -d '' file; do

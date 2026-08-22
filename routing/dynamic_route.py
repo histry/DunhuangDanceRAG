@@ -38,13 +38,6 @@ def _env_float(name: str, default: float) -> float:
 
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(
-        os.environ.get(name, "1" if default else "0")
-    ).strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
-
 def _db_value(
     db: Mapping[str, Any],
     key: str,
@@ -484,9 +477,9 @@ def _constraint_state_signature(
     total = max(1, len(identities))
     source_share = sum(row["source"] == current["source"] for row in identities) / total
     family_share = sum(row["family"] == current["family"] for row in identities) / total
-    share_step = max(0.01, _env_float("BR_HPR_BEAM_SHARE_BIN", 0.10))
-    recovery_step = max(0.01, _env_float("BR_HPR_BEAM_RECOVERY_BIN", 0.25))
-    viability_step = max(1, _env_int("BR_HPR_BEAM_VIABILITY_BIN", 1))
+    share_step = max(0.01, _env_float("ROUTING_BUDGET_BEAM_SHARE_BIN", 0.10))
+    recovery_step = max(0.01, _env_float("ROUTING_BUDGET_BEAM_RECOVERY_BIN", 0.25))
+    viability_step = max(1, _env_int("ROUTING_BUDGET_BEAM_VIABILITY_BIN", 1))
     return (
         current["source"],
         current["family"],
@@ -504,60 +497,9 @@ def prune_states(
     *,
     width: int,
 ) -> list[DynamicBeamState]:
-    """Prune exact-simulation prefixes with mode-isolated semantics.
-
-    Legacy routing preserves at least one branch per current source. This
-    reproduces the original diversity contract when ``BR_HPR_ENABLE=0``.
-
-    Viability-aware BR-HPR preserves constraint-state signatures involving
-    source, family, concentration, recovery resource and future viability.
-    Physical, anatomical and severe-heading safety decisions are not changed
-    by either pruning policy.
-    """
+    """Preserve viability-distinct constraint states during beam pruning."""
     ordered = sorted(states, key=lambda state: float(state.score))
     cap = max(1, min(int(width), len(ordered)))
-
-    if not _env_bool("BR_HPR_ENABLE", False):
-        # Legacy behavior: preserve the lowest-score branch from every
-        # represented current source before filling the remaining capacity.
-        selected: list[DynamicBeamState] = []
-        selected_ids: set[int] = set()
-        best_by_source: dict[str, DynamicBeamState] = {}
-
-        for state in ordered:
-            if not state.selected_event_ids:
-                source = "initial"
-            else:
-                source = str(
-                    _db_value(
-                        db,
-                        "source_uids",
-                        int(state.selected_event_ids[-1]),
-                        "unknown",
-                    )
-                )
-            best_by_source.setdefault(source, state)
-
-        for state in sorted(
-            best_by_source.values(),
-            key=lambda item: float(item.score),
-        ):
-            if len(selected) >= cap:
-                break
-            selected.append(state)
-            selected_ids.add(id(state))
-
-        for state in ordered:
-            if len(selected) >= cap:
-                break
-            if id(state) not in selected_ids:
-                selected.append(state)
-                selected_ids.add(id(state))
-
-        return selected
-
-    # Viability-aware BR-HPR behavior: retain one representative for each
-    # constraint-relevant state signature before filling by global score.
     selected = []
     selected_ids: set[int] = set()
     best_by_signature: dict[tuple[Any, ...], DynamicBeamState] = {}

@@ -37,6 +37,17 @@ class GenerationIndexTests(unittest.TestCase):
                 frames=np.asarray([24, 30]),
                 event_families=np.asarray(["pose", "turn"], dtype=object),
                 dance_keys=np.asarray(["d0", "d1"], dtype=object),
+                dancer_ids=np.asarray(["dancer_a", "dancer_b"], dtype=object),
+                dancer_id_statuses=np.asarray(["verified", "verified"], dtype=object),
+                performer_track_ids=np.asarray([1, 1], dtype=np.int32),
+                recording_performer_counts=np.asarray([1, 1], dtype=np.int32),
+                solo_compatibilities=np.asarray(
+                    ["single_track_recording", "single_track_recording"], dtype=object
+                ),
+                solo_compatible=np.asarray([True, True]),
+                solo_review_statuses=np.asarray(
+                    ["not_required_single_track", "not_required_single_track"], dtype=object
+                ),
                 posture_entry=np.asarray(["standing", "half_squat"], dtype=object),
                 posture_exit=np.asarray(["standing", "standing"], dtype=object),
                 posture_mode=np.asarray(["standing", "half_squat"], dtype=object),
@@ -54,6 +65,8 @@ class GenerationIndexTests(unittest.TestCase):
                 self.assertEqual(report["num_events"], 2)
                 self.assertEqual(len(set(arrays["event_uids"].tolist())), 2)
                 self.assertEqual(items[0]["source_uid"], "source_a")
+                self.assertTrue(items[0]["solo_compatible"])
+                self.assertEqual(items[0]["dancer_id"], "dancer_a")
                 self.assertEqual(metadata["event_db_contract"], report["event_db_contract"])
                 self.assertEqual(metadata["canonical_fps_values"], [30.0])
                 self.assertEqual(

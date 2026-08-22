@@ -104,6 +104,10 @@ class OfficialSmplManifestTests(unittest.TestCase):
                     "dancer_id": None,
                     "dancer_id_status": "unverified",
                     "performer_track_id": 1,
+                    "recording_performer_count": 1,
+                    "solo_compatibility": "single_track_recording",
+                    "solo_compatible": True,
+                    "solo_review_status": "not_required_single_track",
                     "sequence_index": 1,
                     "performer_group": (
                         "female"

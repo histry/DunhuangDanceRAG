@@ -62,6 +62,28 @@ VALID_POSTURE_STATES = {
     "aerial",
 }
 
+LOCAL_ACTION_LABELS = (
+    "pose_hold",
+    "locomotion",
+    "turn_spin",
+    "jump_aerial",
+    "floorwork",
+    "upper_body_gesture",
+    "rhythmic_accent",
+    "transition",
+    "unknown",
+)
+
+
+def _json_object(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+    return parsed if isinstance(parsed, type(default)) else default
+
 
 def _db_dict(path: Path) -> dict[str, Any]:
     source = np.load(path, allow_pickle=True)
@@ -78,7 +100,7 @@ def _array(db: Mapping[str, Any], key: str, count: int, default: Any) -> np.ndar
 
 
 def resolve_generation_motion(raw_value: Any, db_path: Path) -> Path:
-    """Resolve legacy Linux paths after a project is moved to another host."""
+    """Resolve portable current-run paths after a project moves to another host."""
     text = str(raw_value).strip().replace("\\", "/")
     raw = Path(text)
     candidates = [raw] if raw.is_absolute() else []
@@ -154,10 +176,27 @@ def build_generation_index(
     families = _array(db, "event_families", count, "unknown")
     dance_keys = _array(db, "dance_keys", count, "unknown")
     performers = _array(db, "performer_groups", count, "unknown")
+    if np.all(np.asarray(performers, dtype=object) == "unknown") and "genders" in db:
+        performers = _array(db, "genders", count, "unknown")
+    dancer_ids = _array(db, "dancer_ids", count, "")
+    dancer_id_statuses = _array(db, "dancer_id_statuses", count, "unverified")
+    performer_track_ids = _array(db, "performer_track_ids", count, -1).astype(np.int32)
+    recording_performer_counts = _array(
+        db, "recording_performer_counts", count, 1
+    ).astype(np.int32)
+    solo_compatibilities = _array(db, "solo_compatibilities", count, "unknown")
+    solo_compatible = _array(db, "solo_compatible", count, False).astype(bool)
+    solo_review_statuses = _array(db, "solo_review_statuses", count, "unknown")
     posture_entry = _array(db, "posture_entry", count, "unknown")
     posture_exit = _array(db, "posture_exit", count, "unknown")
     posture_mode = _array(db, "posture_mode", count, "unknown")
     semantics = _array(db, "aesd_event_semantics", count, "neutral_flow")
+    local_action_labels_json = _array(
+        db, "local_action_labels_json", count, '["unknown"]'
+    )
+    local_action_scores_json = _array(
+        db, "local_action_scores_json", count, '{"unknown": 1.0}'
+    )
     quality = _array(db, "event_geometry_combined_quality", count, 0.5).astype(np.float32)
     anatomy_quality = _array(db, "anatomy_quality", count, 0.5).astype(np.float32)
     hard_valid = _array(db, "anatomy_hard_valid", count, True).astype(bool)
@@ -223,8 +262,6 @@ def build_generation_index(
     embeddings: list[np.ndarray] = []
     entry_pose: list[np.ndarray] = []
     exit_pose: list[np.ndarray] = []
-    entry_vel: list[np.ndarray] = []
-    exit_vel: list[np.ndarray] = []
     entry_angular_velocity: list[np.ndarray] = []
     exit_angular_velocity: list[np.ndarray] = []
     entry_root_velocity: list[np.ndarray] = []
@@ -257,8 +294,6 @@ def build_generation_index(
             motion[max(0, len(motion) - edge_frames) :],
             axis=0,
         )
-        entry_vel.append(((first.mean(axis=0) * fps) if len(first) else np.zeros(151)).astype(np.float32))
-        exit_vel.append(((last.mean(axis=0) * fps) if len(last) else np.zeros(151)).astype(np.float32))
         rotation_matrices = rot6d_to_matrix_np(
             motion[:, ROT6D_START:ROT6D_END].reshape(len(motion), 24, 6)
         )
@@ -311,6 +346,26 @@ def build_generation_index(
         exit_root_height.append(float(endpoint_geometry["exit_root_height_m"]))
         resolved_motions.append(path)
         uid = str(event_uids[index])
+        local_action_labels = [
+            str(value)
+            for value in _json_object(local_action_labels_json[index], ["unknown"])
+            if str(value) in LOCAL_ACTION_LABELS
+        ] or ["unknown"]
+        raw_action_scores = _json_object(
+            local_action_scores_json[index], {"unknown": 1.0}
+        )
+        local_action_scores: dict[str, float] = {}
+        for label, raw_score in raw_action_scores.items():
+            if str(label) not in LOCAL_ACTION_LABELS:
+                continue
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(score) and score >= 0.0:
+                local_action_scores[str(label)] = score
+        if not local_action_scores:
+            local_action_scores = {"unknown": 1.0}
         items.append(
             {
                 "event_uid": uid,
@@ -330,7 +385,18 @@ def build_generation_index(
                 "family_id": str(families[index]),
                 "dance_key": str(dance_keys[index]),
                 "performer_group": str(performers[index]),
+                "dancer_id": str(dancer_ids[index]),
+                "dancer_id_status": str(dancer_id_statuses[index]),
+                "performer_track_id": int(performer_track_ids[index]),
+                "recording_performer_count": int(recording_performer_counts[index]),
+                "solo_compatibility": str(solo_compatibilities[index]),
+                "solo_compatible": bool(solo_compatible[index]),
+                "solo_review_status": str(solo_review_statuses[index]),
                 "event_type": _semantic_event_type(semantics[index]),
+                "local_action_labels": local_action_labels,
+                "local_action_scores": local_action_scores,
+                "local_action_supervision": "weak_motion_kinematics",
+                "local_action_is_ground_truth": False,
                 "posture_entry": str(posture_entry[index]),
                 "posture_exit": str(posture_exit[index]),
                 "posture_mode": str(posture_mode[index]),
@@ -356,7 +422,6 @@ def build_generation_index(
         "canonical_fps_values": fps_values,
         "natural_duration_units": "frames_at_canonical_fps",
         "velocity_units": {
-            "entry_vel": "legacy_mixed_channel_units/s_not_for_routing",
             "angular_velocity": "rad/s",
             "root_velocity": "m/s",
         },
@@ -369,6 +434,25 @@ def build_generation_index(
         },
         "generation_db": str(db_path),
         "event_db_contract": contract,
+        "performer_identity_contract": {
+            "dancer_identity_verified": bool(
+                count > 0
+                and np.all(np.asarray(dancer_id_statuses, dtype=object) == "verified")
+                and np.all(np.asarray([bool(str(value).strip()) for value in dancer_ids]))
+            ),
+            "solo_compatible_events": int(np.count_nonzero(solo_compatible)),
+            "manual_review_required_events": int(
+                np.count_nonzero(~solo_compatible)
+            ),
+            "same_dancer_claim_supported": False,
+        },
+        "local_action_contract": {
+            "labels": list(LOCAL_ACTION_LABELS),
+            "supervision": "weak_motion_kinematics",
+            "is_ground_truth": False,
+            "dance_theme_used_as_local_action_truth": False,
+            "multi_label": True,
+        },
         "items": items,
     }
     out_json.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -382,8 +466,6 @@ def build_generation_index(
         mmr_embed=np.stack(embeddings).astype(np.float32),
         entry_pose=np.stack(entry_pose).astype(np.float32),
         exit_pose=np.stack(exit_pose).astype(np.float32),
-        entry_vel=np.stack(entry_vel).astype(np.float32),
-        exit_vel=np.stack(exit_vel).astype(np.float32),
         entry_angular_velocity_radps=np.stack(entry_angular_velocity).astype(np.float32),
         exit_angular_velocity_radps=np.stack(exit_angular_velocity).astype(np.float32),
         entry_root_velocity_mps=np.stack(entry_root_velocity).astype(np.float32),

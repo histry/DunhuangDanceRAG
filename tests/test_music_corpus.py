@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from training.music_corpus import discover_training_audio
+from training.music_corpus import assert_content_disjoint, discover_training_audio
 
 
 class MusicCorpusTests(unittest.TestCase):
@@ -27,6 +27,16 @@ class MusicCorpusTests(unittest.TestCase):
             (test_root / "held_out.wav").write_bytes(b"test")
             paths = discover_training_audio([root])
             self.assertEqual([path.name for path in paths], ["safe.wav"])
+
+    def test_heldout_content_collision_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train = root / "train.wav"
+            heldout = root / "target.wav"
+            train.write_bytes(b"identical-content")
+            heldout.write_bytes(b"identical-content")
+            with self.assertRaisesRegex(RuntimeError, "content-identical"):
+                assert_content_disjoint([train], [heldout])
 
 
 if __name__ == "__main__":

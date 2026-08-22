@@ -23,7 +23,6 @@ class SchedulerArchitectureTests(unittest.TestCase):
         paths = (
             "support/contact_inr.py",
             "training/boundary_dynamics.py",
-            "training/transition_diffusion.py",
         )
         forbidden = (
             "root[..., ROOT_X - ROOT.start] = 0.0",
@@ -134,12 +133,11 @@ class SchedulerArchitectureTests(unittest.TestCase):
             "scheduling/event_resampling.py",
             "scheduling/duration_features.py",
             "scheduling/duration_alignment.py",
-            "scheduling/transition_diffusion.py",
             "motion_geometry/heading.py",
             "support/scheduler_common.py",
             "support/scheduler_checkpoint_contracts.py",
             "training/music_corpus.py",
-            "training/music_router.py",
+            "training/temporal_music_router.py",
             "training/duration_model.py",
             "training/whole_song_planner.py",
         ]
@@ -193,18 +191,6 @@ class SchedulerArchitectureTests(unittest.TestCase):
                                 )
         self.assertEqual([], failures)
 
-    def test_migration_manifest_is_valid_json(self):
-        path = ROOT / "docs" / "development" / "path_migration.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            "scheduling/whole_song_scheduler.py",
-            data["tools/schedule_v26_whole_song.py"],
-        )
-        self.assertEqual(
-            "motion_geometry/heading.py",
-            data["tools/v22_turn_utils.py"],
-        )
-
     def test_pipeline_supplies_asset_bundle_fps_contract(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
         marker = 'scheduling/build_asset_bundle.py'
@@ -212,23 +198,10 @@ class SchedulerArchitectureTests(unittest.TestCase):
         block = source[start : start + 700]
         self.assertIn('--fps "$GENERATION_FPS"', block)
 
-    def test_pipeline_enriches_mixed_schedule_before_generation(self):
-        source = (ROOT / "scripts" / "pipeline.sh").read_text(
-            encoding="utf-8"
-        )
-        enrich = source.index("-m grounding.audio_query")
-        generate = source.index("routing/closed_loop.py", enrich)
-        self.assertLess(enrich, generate)
-        block = source[enrich:generate]
-        self.assertIn('--checkpoint "$MIXED_GROUNDER_CKPT"', block)
-        self.assertIn('ROUTING_MSSD="$MIXED_MSSD"', block)
-        generation_block = source[generate : generate + 500]
-        self.assertIn('--slots_json "$ROUTING_MSSD"', generation_block)
-
     def test_pipeline_trains_scheduler_models_before_motion_refinement(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
         markers = [
-            "training/music_router.py train",
+            "training/temporal_music_router.py train",
             "training/duration_model.py train",
             "training/whole_song_planner.py train",
             "scheduling/build_asset_bundle.py",
@@ -239,6 +212,36 @@ class SchedulerArchitectureTests(unittest.TestCase):
         positions = [source.index(marker) for marker in markers]
         self.assertEqual(sorted(positions), positions)
         self.assertNotIn("scheduling/resolve_assets.py", source)
+
+    def test_formal_pipeline_does_not_retrieve_again_with_legacy_contrastive(self):
+        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("train-contrastive", pipeline)
+        generation = pipeline[pipeline.index("routing/boundary_closed_loop.py") :]
+        self.assertNotIn("--contrastive", generation)
+
+    def test_formal_shell_gate_is_complete_and_optional_assets_are_nounset_safe(self):
+        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
+        launcher = (ROOT / "scripts" / "research_pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"$PY" -m pytest -q', launcher)
+        self.assertNotIn("unittest discover", launcher)
+        self.assertIn('${GENERATION_RESOLVED_HIERARCHY_INDEX_NPZ:-}', pipeline)
+        self.assertIn('${GENERATION_RESOLVED_START_POSE:-}', pipeline)
+        validation = pipeline.index('scheduling/validate_schedule.py')
+        baselines = pipeline.index('scripts/evaluate_current_protocol_baselines.py')
+        self.assertLess(validation, baselines)
+        scheduler = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        closed_loop = (ROOT / "routing" / "boundary_closed_loop.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("formal_candidate_event_uids", scheduler)
+        self.assertIn("formal_ctsr_scheduler_locked_candidates", closed_loop)
+        self.assertIn("selected_event_motion_descriptor_v1", closed_loop)
 
     def test_planner_duration_clamp_is_physical_time_aware(self):
         source = (ROOT / "model" / "whole_song_planner.py").read_text(
@@ -352,15 +355,6 @@ class SchedulerArchitectureTests(unittest.TestCase):
             self.assertNotIn("Path.cwd() / raw", source)
             self.assertNotIn("candidates = [raw]\n", source)
 
-    def test_aist_dataset_exposes_rate_and_physical_contact_contracts(self):
-        source = (ROOT / "dataset" / "dance_dataset.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("data_fps: int = 30", source)
-        self.assertIn("raw_fps: int = 60", source)
-        self.assertIn("contact_speed_threshold_mps", source)
-        self.assertIn("* float(self.data_fps)", source)
-
     def test_scheduler_profiles_preserve_external_fps(self):
         source = (ROOT / "configs" / "scheduler.env").read_text(encoding="utf-8")
         entry = (ROOT / "configs" / "experiment.env").read_text(encoding="utf-8")
@@ -434,78 +428,34 @@ class SchedulerArchitectureTests(unittest.TestCase):
             self.assertIn('--db "$TRAIN_AESD"', block)
             self.assertIn('--val_db "$VAL_AESD"', block)
 
-    def test_formal_grounder_is_trained_only_after_five_layer_aesd(self):
-        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
-            encoding="utf-8"
-        )
-        profile = (ROOT / "configs" / "research.env").read_text(
-            encoding="utf-8"
-        )
-        semantics = pipeline.index("events/build_semantics.py")
-        grounder = pipeline.index("-m grounding.model train", semantics)
-        scheduler_index = pipeline.index("scheduling/build_generation_index.py")
-        self.assertLess(semantics, grounder)
-        self.assertLess(grounder, scheduler_index)
-        block = pipeline[grounder : grounder + 1200]
-        self.assertIn('--db "$TRAIN_AESD"', block)
-        self.assertIn('AESD_EMBED_TARGETS=("$VAL_AESD" "$TEST_AESD")', block)
-        raw_build = pipeline.index("events/build_database_entry.py")
-        raw_guard = pipeline.rindex(
-            "export GROUNDING_GROUNDER_ENABLE=0", 0, raw_build
-        )
-        self.assertLess(raw_guard, raw_build)
-        self.assertIn("export GROUNDING_TRAIN_GROUNDER_ON_BUILD=0", profile)
-        self.assertIn("export GROUNDING_TRAIN_GROUNDER_AFTER_AESD=1", profile)
-
-    def test_grounder_cli_can_embed_source_disjoint_splits(self):
-        source = (ROOT / "grounding" / "model.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn('sub.add_parser("embed")', source)
-        self.assertIn("embed_database(Path(args.db), Path(args.checkpoint))", source)
-
-    def test_scheduler_passes_physical_rate_to_deep_music_features(self):
-        source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
-            encoding="utf-8"
-        )
-        marker = "phrase_semantic_matrix("
-        start = source.index(marker)
-        block = source[start : start + 600]
-        self.assertIn("fps=float(args.fps)", block)
-
     def test_formal_music_semantics_use_only_librosa_and_project_router(self):
         profile = (ROOT / "configs" / "research.env").read_text(
             encoding="utf-8"
         )
-        self.assertIn("export GENERATION_DEEP_MUSIC_FEATURES=0", profile)
-        self.assertIn(
-            'export GENERATION_DEEP_MUSIC_MODEL="librosa_12d"', profile
-        )
-        self.assertIn("export GENERATION_REQUIRE_DEEP_MUSIC=0", profile)
-        self.assertIn(
-            'export GROUNDING_GROUNDER_ARCHITECTURE="legacy"', profile
-        )
-        self.assertIn("export SEMANTIC_OT_ENABLE=0", profile)
+        self.assertIn("export REQUIRE_LIBROSA_BACKEND=1", profile)
+        self.assertNotIn("GENERATION_DEEP_MUSIC", profile)
+        self.assertNotIn("GROUNDING_GROUNDER_ARCHITECTURE", profile)
 
         pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            "Formal music semantics must use Librosa 12D features", pipeline
-        )
-        self.assertIn(
-            '"${GENERATION_DEEP_MUSIC_MODEL:-librosa_12d}" != "librosa_12d"',
-            pipeline,
-        )
-        self.assertIn('"${SEMANTIC_OT_ENABLE:-0}" != "0"', pipeline)
+        self.assertIn('"${REQUIRE_LIBROSA_BACKEND:-0}" != "1"', pipeline)
+        self.assertNotIn("GENERATION_DEEP_MUSIC", pipeline)
+        self.assertNotIn("grounding.model", pipeline)
 
-        router = (ROOT / "training" / "music_router.py").read_text(
+        router = (ROOT / "training" / "temporal_music_router.py").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            "from scheduling.audio_features import extract_audio_features",
+            "from training.weak_semantic_ot import",
             router,
         )
+        self.assertIn("scientific_supervision_contract", router)
+        contract = (ROOT / "scheduling" / "temporal_router_contract.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('TEMPORAL_ROUTER_SUPERVISION_SOURCE = "semantic_ot_teacher"', contract)
+        self.assertNotIn("music_prior_ckpt", router)
         requirements = (ROOT / "requirements-core.txt").read_text(
             encoding="utf-8"
         ).lower()
@@ -515,39 +465,21 @@ class SchedulerArchitectureTests(unittest.TestCase):
         source = (ROOT / "evaluation" / "preflight_official_smpl.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("project-trained Librosa Router music-encoder prior", source)
+        self.assertIn("training/temporal_music_router.py", source)
+        self.assertIn("ROUTING_FORMAL_ROUTER_ARCHITECTURE", source)
         self.assertIn('import librosa', source)
         self.assertIn('import pytorch3d', source)
         self.assertIn('shutil.which("ffmpeg")', source)
         self.assertIn('"formal_music_contract": music_contract', source)
 
-    def test_optional_transition_models_receive_runtime_fps(self):
+    def test_optional_transition_model_receives_runtime_fps(self):
         source = (ROOT / "scheduling" / "whole_song_scheduler.py").read_text(
             encoding="utf-8"
         )
         transition_start = source.index("transition_bundle = load_optional_transition(")
         transition_block = source[transition_start : transition_start + 260]
         self.assertIn("fps=float(args.fps)", transition_block)
-        diffusion_start = source.index(
-            "args.transition_diffusion_bundle = ("
-        )
-        diffusion_block = source[diffusion_start : diffusion_start + 360]
-        self.assertIn("fps=float(args.fps)", diffusion_block)
-        sample_start = source.index("transition, diffusion_meta = sample_transition_diffusion(")
-        sample_block = source[sample_start : sample_start + 700]
-        self.assertIn("previous_context=contents[slot - 1]", sample_block)
-        self.assertIn("next_context=content", sample_block)
-        self.assertIn("fps=float(args.fps)", sample_block)
-
-    def test_legacy_row_transition_model_has_explicit_layout_boundary(self):
-        diffusion = (
-            ROOT / "training" / "transition_diffusion.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("def _native_transition_risk(", diffusion)
-        self.assertIn("ROT6D_LAYOUT_PYTORCH3D_ROW", diffusion)
-        self.assertIn("ROT6D_LAYOUT_COLUMN", diffusion)
-        self.assertNotIn("project_motion_rotations_np", diffusion)
-
+    def test_native_row_transition_models_have_explicit_layout_boundary(self):
         for relative in (
             "support/contact_inr.py",
             "training/boundary_dynamics.py",
@@ -585,6 +517,19 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertIn('"BOUNDARY_REQUIRE_FINAL_BOUNDARY_GATE"', source)
         self.assertIn("expected_boundaries=max(", source)
         self.assertIn("if args.render_output and not required_failures", source)
+
+    def test_formal_generator_emits_current_heading_and_stage_activity_contracts(self):
+        generator = (ROOT / "routing" / "boundary_closed_loop.py").read_text(
+            encoding="utf-8"
+        )
+        heading_audit = (ROOT / "evaluation" / "audit_heading.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"formal_boundary_aligned_heading_v1"', generator)
+        self.assertIn("validate_formal_heading_contract(report)", heading_audit)
+        self.assertNotIn("missing_event_heading_planner_report", heading_audit)
+        for stage in ("retrieval", "refiner", "diffusion", "full_ik"):
+            self.assertIn(f'"{stage}",', generator)
 
 
 if __name__ == "__main__":

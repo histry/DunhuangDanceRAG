@@ -5,10 +5,9 @@
 This module keeps the public Anatomy-Heading Fresh-WAV/Heading/Anatomy transaction and
 adds the strongest low-resource-safe parts of the research reconstruction:
 
-- dual-branch semantic + intrinsic-geometry candidate grounding;
+- CTSR candidate evidence + intrinsic-geometry routing;
 - opt-in Fisher--Rao categorical marginals and a finite discrete
   multi-marginal Schrödinger path solver on the hard-feasible Event graph;
-- legacy entropy-inspired beam routing retained as an auditable fallback;
 - bidirectional tangent-space transition risk;
 - observability-aware hard rejection;
 - frame x joint risk masks;
@@ -57,7 +56,6 @@ from contracts.boundary import (
     tangent_masked_merge,
     transition_multiscale_risk,
 )
-from grounding.model import GroundingRuntime
 from contracts.duration import audit_dynamic_duration, save_duration_report
 from contracts.physical_quality import (
     PhysicalQualityLimits,
@@ -86,8 +84,6 @@ ROUTE_EDGE_CONTRACT_FIELDS = (
     "graph_route_exit_rotation_matrix",
 )
 _INSTALLED = False
-_RUNTIME: Optional[GroundingRuntime] = None
-_RUNTIME_DB_ID: Optional[int] = None
 _GLOBAL_ROUTE_REPORT: Dict[str, Any] = {}
 
 
@@ -120,28 +116,44 @@ def _db_value(db: Mapping[str, Any], key: str, event_id: int, default: Any) -> A
         return default
 
 
-def _runtime(db: Mapping[str, Any]) -> GroundingRuntime:
-    global _RUNTIME, _RUNTIME_DB_ID
-    identity = id(db)
-    if _RUNTIME is None or _RUNTIME_DB_ID != identity:
-        ckpt = str(os.environ.get("GROUNDING_GROUNDER_CKPT", "")).strip()
-        if not ckpt:
-            out_root = str(os.environ.get("OUT_ROOT", "")).strip()
-            if out_root:
-                architecture = str(
-                    os.environ.get(
-                        "GROUNDING_GROUNDER_ARCHITECTURE", "legacy"
-                    )
-                ).strip().lower()
-                name = (
-                    "event_geometry_mixed_curvature_grounder.pt"
-                    if architecture == "mixed"
-                    else "event_geometry_dual_branch_grounder.pt"
-                )
-                ckpt = str(Path(out_root) / name)
-        _RUNTIME = GroundingRuntime(db, ckpt)
-        _RUNTIME_DB_ID = identity
-    return _RUNTIME
+def _slot_event_association(
+    slot: Mapping[str, Any],
+    db: Mapping[str, Any],
+    event_id: int,
+) -> tuple[float, str]:
+    """Resolve the CTSR probability assigned to one formal candidate."""
+
+    if str(slot.get("router_architecture", "")) == "ctsr_weak_temporal_v1":
+        event_uids = slot.get("formal_candidate_event_uids")
+        probabilities = slot.get("formal_candidate_router_probabilities")
+        if (
+            not isinstance(event_uids, list)
+            or not isinstance(probabilities, list)
+            or len(event_uids) != len(probabilities)
+        ):
+            raise RuntimeError("Formal Graph-SB slot has no CTSR candidate probabilities")
+        uid = event_identity(db, int(event_id))["event_uid"]
+        try:
+            position = [str(value) for value in event_uids].index(str(uid))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Graph-SB event_uid={uid!r} is outside the formal CTSR candidate set"
+            ) from exc
+        values = np.asarray(probabilities, dtype=np.float64)
+        if (
+            not np.isfinite(values).all()
+            or np.any(values < 0.0)
+            or float(values.max(initial=0.0)) <= 0.0
+        ):
+            raise RuntimeError("Formal Graph-SB CTSR probabilities are invalid")
+        # Candidate probabilities are event-level soft evidence.  Normalize by
+        # the best candidate only to keep the route-unary scale in [0,1]; do
+        # not reinterpret them as labels or calibrated ground truth.
+        return (
+            float(values[position] / max(float(values.max()), 1.0e-12)),
+            "ctsr_candidate_probability",
+        )
+    raise RuntimeError("Graph-SB accepts only CTSR-Weak formal slots")
 
 
 def _posture_gap(db: Mapping[str, Any], a: int, b: int) -> float:
@@ -164,118 +176,16 @@ def _global_transition_energy(db: Mapping[str, Any], a: int, b: int) -> float:
     return float(manifold_edge_cost(db, a, b)["total"])
 
 
-def _legacy_global_route_preorder(
-    slots: Sequence[Mapping[str, Any]],
-    candidate_lists: Sequence[Sequence[int]],
-    db: Mapping[str, Any],
-    banned: Optional[Dict[int, set]] = None,
-) -> List[List[int]]:
-    """Entropy-regularised global beam path used only to pre-order candidates.
-
-    The existing Anatomy-Heading simulator still performs the authoritative physical and
-    anatomy check.  This layer prevents local top-1 choices from creating an
-    obviously poor long-range family/posture path.
-    """
-    global _GLOBAL_ROUTE_REPORT
-    if not _env_bool("GROUNDING_GLOBAL_ROUTE_ENABLE", True):
-        return [list(map(int, x)) for x in candidate_lists]
-    banned = banned or {}
-    candidate_lists, performer_policy = resolve_candidate_policy(candidate_lists, db)
-    runtime = _runtime(db)
-    beam_size = max(1, _env_int("GROUNDING_GLOBAL_ROUTE_BEAM", 32))
-    topk = max(1, _env_int("GROUNDING_GLOBAL_ROUTE_TOPK", 20))
-    entropy_eps = _env_float("GROUNDING_GLOBAL_ROUTE_ENTROPY", 0.08)
-    repeat_w = _env_float("GROUNDING_GLOBAL_REPEAT_W", 0.16)
-
-    beams: List[Tuple[float, List[int], Dict[str, int]]] = [(0.0, [], {})]
-    trace: List[Dict[str, Any]] = []
-    for i, slot in enumerate(slots):
-        candidates = [
-            int(e) for e in candidate_lists[i]
-            if int(e) not in banned.get(i, set()) and 0 <= int(e) < len(np.asarray(db["paths"]))
-        ][:topk]
-        if not candidates:
-            raise RuntimeError(f"Geometry-Aware Routing global route has no candidates for slot {i}")
-        new: List[Tuple[float, List[int], Dict[str, int]]] = []
-        unary_rows = []
-        for rank, event_id in enumerate(candidates):
-            association = runtime.score(slot, event_id)
-            quality = float(_db_value(db, "event_geometry_combined_quality", event_id, _db_value(db, "event_quality_scores", event_id, 0.5)))
-            anatomy = float(_db_value(db, "anatomy_quality", event_id, 0.5))
-            prior = math.exp(-rank / max(1.0, topk / 4.0))
-            unary = (
-                _env_float("GROUNDING_GLOBAL_GROUND_W", 1.05) * association
-                + _env_float("GROUNDING_GLOBAL_QUALITY_W", 0.35) * quality
-                + _env_float("GROUNDING_GLOBAL_ANATOMY_W", 0.25) * anatomy
-                + entropy_eps * math.log(max(prior, 1e-8))
-            )
-            unary_rows.append({"event_id": event_id, "rank": rank, "association": association, "unary": unary})
-            family = str(_db_value(db, "event_families", event_id, "unknown"))
-            source = str(_db_value(db, "source_uids", event_id, "unknown"))
-            for score, path, usage in beams:
-                diversity = diversity_assessment(db, event_id, path)
-                if not bool(diversity["hard_valid"]):
-                    continue
-                step_score = unary
-                if path:
-                    step_score -= _global_transition_energy(db, path[-1], event_id)
-                    if family == str(_db_value(db, "event_families", path[-1], "unknown")):
-                        step_score -= repeat_w
-                    if source == str(_db_value(db, "source_uids", path[-1], "unknown")):
-                        step_score -= 0.5 * repeat_w
-                    step_score -= performer_switch_penalty(db, path[-1], event_id, slot)
-                # Capped run-local diversity rather than an unbounded global ban.
-                step_score -= min(0.30, 0.04 * usage.get("family::" + family, 0))
-                step_score -= float(diversity["penalty"])
-                ns = dict(usage)
-                ns["family::" + family] = ns.get("family::" + family, 0) + 1
-                ns["source::" + source] = ns.get("source::" + source, 0) + 1
-                new.append((score + step_score, path + [event_id], ns))
-        if not new:
-            raise RuntimeError(
-                "Geometry-Aware Routing global route diversity/cooldown contract exhausted "
-                f"all candidates for slot {i}"
-            )
-        new.sort(key=lambda row: row[0], reverse=True)
-        beams = new[:beam_size]
-        trace.append({"slot": i, "candidates": unary_rows, "best_prefix_score": float(beams[0][0])})
-
-    chosen = beams[0][1]
-    reordered: List[List[int]] = []
-    for i, candidates in enumerate(candidate_lists):
-        ordered = [chosen[i]] + [int(x) for x in candidates if int(x) != chosen[i]]
-        reordered.append(ordered)
-    register_route_prior(
-        [list(map(int, layer[:topk])) for layer in candidate_lists],
-        chosen_path=chosen,
-        source="legacy_beam",
-    )
-    _GLOBAL_ROUTE_REPORT = {
-        "schema": "event_geometry_entropy_regularised_global_event_path",
-        "solver": "legacy_beam",
-        "exact_solver_claim": False,
-        "description": "Schroedinger-inspired entropic discrete path prior followed by Anatomy-Heading simulated physical reselection",
-        "beam_size": beam_size,
-        "candidate_topk": topk,
-        "chosen_event_path": chosen,
-        "chosen_event_uids": [event_identity(db, event_id)["event_uid"] for event_id in chosen],
-        "chosen_source_uids": [event_identity(db, event_id)["source_uid"] for event_id in chosen],
-        "performer_policy": performer_policy,
-        "best_score": float(beams[0][0]),
-        "trace": trace,
-    }
-    return reordered
-
-
 def _route_unary(
-    runtime: GroundingRuntime,
     db: Mapping[str, Any],
     slot: Mapping[str, Any],
     event_id: int,
     rank: int,
     topk: int,
 ) -> tuple[float, Dict[str, Any]]:
-    association = float(runtime.score(slot, int(event_id)))
+    association, association_source = _slot_event_association(
+        slot, db, int(event_id)
+    )
     quality = float(
         _db_value(
             db,
@@ -302,6 +212,7 @@ def _route_unary(
         "event_uid": event_identity(db, int(event_id))["event_uid"],
         "rank": int(rank),
         "association": float(association),
+        "association_source": association_source,
         "quality": float(quality),
         "anatomy_quality": float(anatomy),
         "rank_prior": float(rank_prior),
@@ -325,7 +236,12 @@ def _prepare_graph_layers(
     filtered_lists, performer_policy = resolve_candidate_policy(
         candidate_lists, db
     )
-    runtime = _runtime(db)
+    formal_slots = bool(slots) and all(
+        str(slot.get("router_architecture", "")) == "ctsr_weak_temporal_v1"
+        for slot in slots
+    )
+    if not formal_slots:
+        raise RuntimeError("Graph-SB accepts only CTSR-Weak formal slots")
     count = len(np.asarray(db["paths"]))
     layers: List[List[int]] = []
     target_marginals: List[np.ndarray] = []
@@ -369,7 +285,7 @@ def _prepare_graph_layers(
         unary_values: List[float] = []
         for rank, event_id in enumerate(candidates):
             unary, detail = _route_unary(
-                runtime, db, slot, event_id, rank, topk
+                db, slot, event_id, rank, topk
             )
             unary_values.append(unary)
             unary_rows.append(detail)
@@ -416,7 +332,6 @@ def _build_graph_edges(
         support = np.ones(matrix.shape, dtype=bool)
         hard_reason_counts: Dict[str, int] = {}
         so3_available = 0
-        lorentz_available = 0
         boundary_strength = float(
             slots[time + 1].get(
                 "boundary_accent_strength",
@@ -465,7 +380,6 @@ def _build_graph_edges(
                 support[left_index, right_index] = feasible
                 matrix[left_index, right_index] = edge_cost
                 so3_available += int(bool(detail["so3_available"]))
-                lorentz_available += int(bool(detail["lorentz_available"]))
                 for reason in hard_reasons:
                     token = str(reason)
                     hard_reason_counts[token] = (
@@ -483,7 +397,6 @@ def _build_graph_edges(
                 "feasible_ratio": float(support.mean()),
                 "hard_reason_counts": hard_reason_counts,
                 "so3_available_edges": int(so3_available),
-                "lorentz_available_edges": int(lorentz_available),
                 "cost_min": (
                     float(active_cost.min()) if active_cost.size else None
                 ),
@@ -616,9 +529,6 @@ def _graph_sb_global_route_preorder(
     so3_edges = int(
         sum(row["so3_available_edges"] for row in edge_reports)
     )
-    lorentz_edges = int(
-        sum(row["lorentz_available_edges"] for row in edge_reports)
-    )
     if (
         total_edges > 0
         and _env_bool("GRAPH_ROUTE_REQUIRE_SO3_EDGE", False)
@@ -627,16 +537,6 @@ def _graph_sb_global_route_preorder(
         raise RuntimeError(
             "Graph Route strict route requires SO(3) endpoint geometry for every "
             f"edge, available={so3_edges}/{total_edges}; rebuild Event-DB"
-        )
-    if (
-        total_edges > 0
-        and _env_bool("GRAPH_ROUTE_REQUIRE_LORENTZ_EDGE", False)
-        and lorentz_edges != total_edges
-    ):
-        raise RuntimeError(
-            "Graph Route strict route requires paper-one Lorentz factors for every "
-            f"edge, available={lorentz_edges}/{total_edges}; embed Event-DB "
-            "with the mixed-curvature Grounder"
         )
     result = multi_marginal_schrodinger(
         targets,
@@ -705,6 +605,8 @@ def _graph_sb_global_route_preorder(
     _GLOBAL_ROUTE_REPORT = {
         "schema": "graph_route_fisher_rao_discrete_graph_schrodinger_route_v1",
         "solver": "fisher_rao_graph_sb",
+        "fallback_used": False,
+        "unary_semantic_contract": "ctsr_candidate_probability",
         "formal_path_measure": True,
         "continuous_sde_bridge_claim": False,
         "multi_marginal_constraints": "all music slots",
@@ -736,11 +638,7 @@ def _graph_sb_global_route_preorder(
         "manifold_edge_coverage": {
             "total_edges": int(total_edges),
             "so3_edges": int(so3_edges),
-            "lorentz_edges": int(lorentz_edges),
             "require_so3": _env_bool("GRAPH_ROUTE_REQUIRE_SO3_EDGE", False),
-            "require_lorentz": _env_bool(
-                "GRAPH_ROUTE_REQUIRE_LORENTZ_EDGE", False
-            ),
         },
         "candidate_topk": int(topk),
         "chosen_event_path": chosen,
@@ -763,7 +661,7 @@ def _global_route_preorder(
     db: Mapping[str, Any],
     banned: Optional[Dict[int, set]] = None,
 ) -> List[List[int]]:
-    """Choose and pre-order one whole-song Event path with safe fallback."""
+    """Choose one whole-song path with strict Fisher--Rao Graph-SB."""
 
     global _GLOBAL_ROUTE_REPORT
     # One process may generate more than one song.  Never allow a disabled or
@@ -773,49 +671,16 @@ def _global_route_preorder(
     if not _env_bool("GROUNDING_GLOBAL_ROUTE_ENABLE", True):
         return [list(map(int, values)) for values in candidate_lists]
     solver = str(
-        os.environ.get("GRAPH_ROUTE_SOLVER", "legacy_beam")
+        os.environ.get("GRAPH_ROUTE_SOLVER", "fisher_rao_graph_sb")
     ).strip().lower()
-    if solver in {"legacy", "beam", "legacy_beam"}:
-        return _legacy_global_route_preorder(
-            slots, candidate_lists, db, banned=banned
-        )
-    if solver not in {
-        "graph_sb",
-        "fisher_rao_graph_sb",
-        "fisher-rao-graph-sb",
-    }:
+    if solver not in {"fisher_rao_graph_sb", "fisher-rao-graph-sb"}:
         raise ValueError(
-            "GRAPH_ROUTE_SOLVER must be legacy_beam or "
-            f"fisher_rao_graph_sb, got {solver!r}"
+            "Formal GRAPH_ROUTE_SOLVER must be fisher_rao_graph_sb, "
+            f"got {solver!r}; current-protocol baselines use a separate runner"
         )
-    try:
-        return _graph_sb_global_route_preorder(
-            slots, candidate_lists, db, banned=banned
-        )
-    except (FloatingPointError, RuntimeError, ValueError) as exc:
-        if not _env_bool("GRAPH_ROUTE_SB_ALLOW_LEGACY_FALLBACK", True):
-            raise
-        fallback_reason = f"{type(exc).__name__}: {exc}"
-        graph_attempt_report = dict(_GLOBAL_ROUTE_REPORT)
-        reordered = _legacy_global_route_preorder(
-            slots, candidate_lists, db, banned=banned
-        )
-        legacy_report = dict(_GLOBAL_ROUTE_REPORT)
-        _GLOBAL_ROUTE_REPORT = {
-            **legacy_report,
-            "schema": "graph_route_fisher_rao_graph_sb_fallback_v1",
-            "solver": "legacy_beam",
-            "requested_solver": "fisher_rao_graph_sb",
-            "fallback_used": True,
-            "fallback_reason": fallback_reason,
-            "fallback_is_auditable": True,
-            "graph_sb_attempt": {
-                "error": fallback_reason,
-                "partial_report": graph_attempt_report or None,
-            },
-            "fallback_route": legacy_report,
-        }
-        return reordered
+    return _graph_sb_global_route_preorder(
+        slots, candidate_lists, db, banned=banned
+    )
 
 
 def _install_global_path_patches() -> None:
@@ -838,7 +703,9 @@ def _install_global_path_patches() -> None:
         if db is None:
             return proposal, extra
 
-        association = _runtime(db).score(slot, event_id)
+        association, association_source = _slot_event_association(
+            slot, db, event_id
+        )
         quality = float(_db_value(db, "event_geometry_combined_quality", event_id, _db_value(db, "event_quality_scores", event_id, 0.5)))
         structure_q = float(_db_value(db, "event_geometry_structure_quality", event_id, 0.5))
         boundary = None
@@ -850,11 +717,15 @@ def _install_global_path_patches() -> None:
                 fps=float(getattr(cfg, "fps", 30.0)),
             )
 
-        observability = float(np.clip(
-            0.45 * association + 0.25 * quality + 0.20 * structure_q
-            + 0.10 * float(_db_value(db, "semantic_confidence", event_id, 0.5)),
-            0.0, 1.0,
-        ))
+        observability = float(
+            np.clip(
+                0.50 * association
+                + 0.28 * quality
+                + 0.22 * structure_q,
+                0.0,
+                1.0,
+            )
+        )
         reward = (
             _env_float("GROUNDING_ASSOCIATION_REWARD_W", 0.75) * association
             + _env_float("GROUNDING_STRUCTURE_REWARD_W", 0.25) * structure_q
@@ -868,6 +739,8 @@ def _install_global_path_patches() -> None:
         proposal.safe = bool(proposal.safe and not hard)
         proposal.risk["event_geometry_grounding"] = {
             "association": association,
+            "association_source": association_source,
+            "categorical_theme_semantics_used": False,
             "quality": quality,
             "structure_quality": structure_q,
             "observability": observability,
@@ -1000,7 +873,7 @@ def _install_global_path_patches() -> None:
                 trust_region_report = {
                     "algorithm": "masked_product_manifold_adaptive_trust_region",
                     "enabled": True,
-                    "fallback": "legacy_tangent_masked_merge",
+                    "fallback": "reference_tangent_masked_merge",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
         else:
@@ -1010,7 +883,7 @@ def _install_global_path_patches() -> None:
             trust_region_report = {
                 "algorithm": "disabled",
                 "enabled": False,
-                "fallback": "legacy_tangent_masked_merge",
+                "fallback": "reference_tangent_masked_merge",
             }
         merged = anatomy_heading_runtime.base.enforce_contract(
             motion_runtime,

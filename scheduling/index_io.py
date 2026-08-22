@@ -23,8 +23,6 @@ REQUIRED_EVENT_ARRAYS = (
     "mmr_embed",
     "entry_pose",
     "exit_pose",
-    "entry_vel",
-    "exit_vel",
     "length",
 )
 OPTIONAL_ENDPOINT_GEOMETRY_ARRAYS = (
@@ -166,8 +164,6 @@ def load_shared_index(
         "exit_pose": (count, MOTION_DIM),
         # Retained only for checkpoint compatibility; routing uses the
         # intrinsic physical endpoint arrays below.
-        "entry_vel": (count, MOTION_DIM),
-        "exit_vel": (count, MOTION_DIM),
     }
     for name, expected in expected_motion_shapes.items():
         if tuple(np.asarray(arrays[name]).shape) != expected:

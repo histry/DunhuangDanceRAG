@@ -4,8 +4,7 @@ from routing.dynamic_route import DynamicBeamState, prune_states
 
 
 def test_pruning_preserves_distinct_constraint_state_signatures(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_BEAM_SHARE_BIN", "0.10")
+    monkeypatch.setenv("ROUTING_BUDGET_BEAM_SHARE_BIN", "0.10")
     db = {
         "source_uids": np.asarray(["s0", "s0", "s1"], dtype=object),
         "event_families": np.asarray(["f0", "f0", "f1"], dtype=object),

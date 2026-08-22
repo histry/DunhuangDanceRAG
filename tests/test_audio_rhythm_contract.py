@@ -44,6 +44,26 @@ def fake_librosa(*, tempo_bpm: float = 0.0, beat_frames=(), beat_error=None):
 
 
 class AudioRhythmContractTests(unittest.TestCase):
+    def test_required_librosa_backend_never_enters_wave_fallback(self):
+        broken = SimpleNamespace(
+            __version__="test",
+            load=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("synthetic librosa failure")
+            ),
+        )
+        with patch.dict(sys.modules, {"librosa": broken}):
+            with patch.object(audio_features, "_fallback_features") as fallback:
+                with self.assertRaisesRegex(
+                    audio_features.AudioFeatureBackendError,
+                    "wave_fallback is forbidden",
+                ):
+                    audio_features.extract_audio_features(
+                        "synthetic.wav",
+                        num_frames=8,
+                        require_librosa=True,
+                    )
+                fallback.assert_not_called()
+
     def test_beat_exception_is_logged_and_recorded_in_metadata(self):
         fake = fake_librosa(beat_error=ValueError("synthetic beat failure"))
         with patch.dict(sys.modules, {"librosa": fake}):
@@ -55,6 +75,7 @@ class AudioRhythmContractTests(unittest.TestCase):
         self.assertTrue(any("Beat extraction failed" in line for line in captured.output))
         self.assertEqual(features.shape, (8, 12))
         self.assertEqual(meta["backend"], "librosa")
+        self.assertEqual(meta["backend_version"], "unknown")
         self.assertFalse(meta["beat_tracking"]["ok"])
         self.assertEqual(meta["beat_tracking"]["error_type"], "ValueError")
         self.assertEqual(
@@ -103,12 +124,20 @@ class AudioRhythmContractTests(unittest.TestCase):
     def test_strict_mode_rejects_zero_rhythm_from_existing_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
-            cache_path = cache / "cached_song_whole_song_fps2_2.npy"
+            audio_path = cache / "cached_song.wav"
+            audio_path.write_bytes(b"formal-cache-content")
+            digest = music_phrase_segmentation.audio_content_sha256(audio_path)
+            cache_path = (
+                cache
+                / f"cached_song_{digest[:16]}_whole_song_fps2_2.npy"
+            )
             np.save(cache_path, np.zeros((2, 12), dtype=np.float32))
             cache_path.with_suffix(".json").write_text(
                 json.dumps(
                     {
-                        "audio": "cached_song.wav",
+                        "cache_schema": "music_12d_content_addressed_cache_v2",
+                        "audio": str(audio_path),
+                        "audio_sha256": digest,
                         "extractor": {"backend": "librosa", "tempo_bpm": 0.0},
                     }
                 ),
@@ -124,11 +153,59 @@ class AudioRhythmContractTests(unittest.TestCase):
                     "beat pulse and tempo are both zero",
                 ):
                     music_phrase_segmentation.whole_song_features(
-                        "cached_song.wav",
+                        audio_path,
                         fps=2.0,
                         cache_dir=cache,
                         require_rhythm=True,
                     )
+
+    def test_whole_song_cache_is_content_addressed_for_same_stem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a" / "song.wav"
+            second = root / "b" / "song.wav"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_bytes(b"first-audio-content")
+            second.write_bytes(b"second-audio-content")
+            cache = root / "cache"
+
+            def synthetic_features(path, num_frames, **_kwargs):
+                value = 0.25 if Path(path) == first else 0.75
+                return (
+                    np.full((num_frames, 12), value, dtype=np.float32),
+                    {
+                        "backend": "librosa",
+                        "backend_version": "test",
+                        "tempo_bpm": 120.0,
+                    },
+                )
+
+            with patch.object(
+                music_phrase_segmentation,
+                "audio_duration_seconds",
+                return_value=1.0,
+            ), patch.object(
+                music_phrase_segmentation,
+                "extract_audio_features",
+                side_effect=synthetic_features,
+            ):
+                first_features, first_meta = (
+                    music_phrase_segmentation.whole_song_features(
+                        first, fps=2.0, cache_dir=cache
+                    )
+                )
+                second_features, second_meta = (
+                    music_phrase_segmentation.whole_song_features(
+                        second, fps=2.0, cache_dir=cache
+                    )
+                )
+
+            self.assertNotEqual(
+                first_meta["audio_sha256"], second_meta["audio_sha256"]
+            )
+            self.assertFalse(np.array_equal(first_features, second_features))
+            self.assertEqual(len(list(cache.glob("*.npy"))), 2)
 
 
 if __name__ == "__main__":

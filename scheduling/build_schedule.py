@@ -80,7 +80,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--duration_index_npz", required=True)
     ap.add_argument("--hierarchy_index_npz", default="")
     ap.add_argument("--transition_ckpt", default="")
-    ap.add_argument("--transition_diffusion_ckpt", default="")
     ap.add_argument("--start_pose", default="")
     ap.add_argument("--hyperbolic_ckpt", default="")
 
@@ -148,17 +147,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--root_velocity_jump_hard_mps", type=float, default=2.0)
     ap.add_argument("--contact_gap_hard", type=float, default=0.75)
 
-    ap.add_argument("--deep_music_features", action="store_true")
-    ap.add_argument("--deep_music_model", default="clap")
-    ap.add_argument("--deep_music_weight", type=float, default=0.25)
-    ap.add_argument("--require_deep_music", action="store_true")
     ap.add_argument("--require_rhythm_features", action="store_true")
-    ap.add_argument("--deep_music_min_success", type=float, default=0.80)
-    ap.add_argument("--deep_music_cache", default="")
 
-    ap.add_argument("--transition_diffusion", action="store_true")
-    ap.add_argument("--transition_diffusion_blend", type=float, default=0.18)
-    ap.add_argument("--transition_diffusion_steps", type=int, default=32)
     ap.add_argument("--stage_floor_y", type=float, default=0.0)
     ap.add_argument("--event_floor_quantile", type=float, default=5.0)
     ap.add_argument("--event_max_floor_penetration_m", type=float, default=0.005)
@@ -203,14 +193,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.transition_ckpt
         else None
     )
-    transition_diffusion_ckpt = (
-        require_file(
-            args.transition_diffusion_ckpt,
-            "transition diffusion checkpoint",
-        )
-        if args.transition_diffusion_ckpt
-        else None
-    )
     start_pose = (
         require_file(args.start_pose, "start pose")
         if args.start_pose
@@ -234,14 +216,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     raw_schedule_dir = run_dir / "raw_whole_song_schedule"
     feature_dir = run_dir / "music_features"
-    deep_cache = (
-        Path(args.deep_music_cache).expanduser().resolve()
-        if args.deep_music_cache
-        else run_dir / "deep_music_cache"
-    )
     raw_schedule_dir.mkdir(parents=True, exist_ok=True)
     feature_dir.mkdir(parents=True, exist_ok=True)
-    deep_cache.mkdir(parents=True, exist_ok=True)
 
     scheduler_cmd: List[str] = [
         sys.executable,
@@ -263,8 +239,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(duration_model_ckpt),
         "--feature_dir",
         str(feature_dir),
-        "--deep_music_cache",
-        str(deep_cache),
         "--fps",
         str(args.fps),
         "--max_seconds",
@@ -355,24 +329,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         str(args.root_velocity_jump_hard_mps),
         "--contact_gap_hard",
         str(args.contact_gap_hard),
-        "--deep_music_features",
-        bool_text(args.deep_music_features),
-        "--deep_music_model",
-        str(args.deep_music_model),
-        "--deep_music_weight",
-        str(args.deep_music_weight),
-        "--require_deep_music",
-        bool_text(args.require_deep_music),
         "--require_rhythm_features",
         bool_text(args.require_rhythm_features),
-        "--deep_music_min_success",
-        str(args.deep_music_min_success),
-        "--transition_diffusion",
-        bool_text(args.transition_diffusion),
-        "--transition_diffusion_blend",
-        str(args.transition_diffusion_blend),
-        "--transition_diffusion_steps",
-        str(args.transition_diffusion_steps),
         "--stage_floor_y",
         str(args.stage_floor_y),
         "--event_floor_quantile",
@@ -405,11 +363,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         scheduler_cmd += ["--hierarchy_index_npz", str(hierarchy)]
     if transition_ckpt is not None:
         scheduler_cmd += ["--transition_ckpt", str(transition_ckpt)]
-    if transition_diffusion_ckpt is not None:
-        scheduler_cmd += [
-            "--transition_diffusion_ckpt",
-            str(transition_diffusion_ckpt),
-        ]
     if start_pose is not None:
         scheduler_cmd += ["--start_pose", str(start_pose)]
     if hyperbolic_ckpt is not None:
@@ -486,7 +439,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "duration_index_npz": duration_npz,
         "hierarchy_index_npz": hierarchy,
         "transition_ckpt": transition_ckpt,
-        "transition_diffusion_ckpt": transition_diffusion_ckpt,
         "start_pose": start_pose,
         "hyperbolic_ckpt": hyperbolic_ckpt,
     }
@@ -510,8 +462,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "lock_music_boundaries": True,
         "hierarchical_retrieval": True,
         "graph_scheduler": True,
-        "deep_music_features": bool(args.deep_music_features),
-        "require_deep_music": bool(args.require_deep_music),
         "require_rhythm_features": bool(args.require_rhythm_features),
         "music_independent_hard_constraints": {
             "max_pose_hold_ratio": float(args.max_pose_hold_ratio),
@@ -572,8 +522,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "total_target_frames": contract_report[
             "total_target_frames"
         ],
-        "deep_music_features": bool(args.deep_music_features),
-        "require_deep_music": bool(args.require_deep_music),
         "require_rhythm_features": bool(args.require_rhythm_features),
         "music_independent_hard_constraints": contract_report[
             "music_independent_hard_constraints"

@@ -21,27 +21,7 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import numpy as np
 
-
-EVENT_GROUPS = {
-    "pose_hold": 0,
-    "calm_flow": 1,
-    "release": 1,
-    "neutral_flow": 2,
-    "build_up": 3,
-    "high_tension": 3,
-    "arm_flourish": 4,
-    "support_shift": 5,
-}
-
-MUSIC_TO_GROUP = {
-    "calm_flow": 1,
-    "release": 1,
-    "neutral_flow": 2,
-    "build_up": 3,
-    "climax": 3,
-    "accent": 4,
-    "section_change": 5,
-}
+from scheduling.retrieval import LOCAL_ACTION_LABELS
 
 
 def _array_names(arrays: Any) -> set[str]:
@@ -64,16 +44,6 @@ def _normalize01(x: np.ndarray, lo: float | None = None, hi: float | None = None
     if hi <= lo + 1e-8:
         return np.zeros_like(arr, dtype=np.float32)
     return np.clip((arr - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
-
-
-def _event_group(event_type: str) -> int:
-    return int(EVENT_GROUPS.get(str(event_type), 2))
-
-
-def _one_hot(indices: np.ndarray, depth: int) -> np.ndarray:
-    out = np.zeros((len(indices), depth), dtype=np.float32)
-    out[np.arange(len(indices)), np.clip(indices.astype(np.int64), 0, depth - 1)] = 1.0
-    return out
 
 
 def _l2_unit(vectors: np.ndarray) -> np.ndarray:
@@ -230,24 +200,48 @@ def build_hierarchy_features(
     turn01 = np.clip(0.55 * _normalize01(turn_peak, 0.0, 720.0) + 0.45 * _normalize01(turn_angle, 0.0, 420.0), 0.0, 1.0)
     duration01 = _normalize01(natural, 24.0, 96.0)
 
-    event_types = [str(item.get("event_type", "neutral_flow")) for item in items]
-    body_code = np.asarray([_event_group(x) for x in event_types], dtype=np.int32)
+    formal_local_actions = all(
+        isinstance(item.get("local_action_scores"), Mapping) for item in items
+    )
+    if not formal_local_actions:
+        raise RuntimeError(
+            "Current hierarchy requires per-event SMPL local_action_scores"
+        )
+    coarse = np.zeros((n, len(LOCAL_ACTION_LABELS)), dtype=np.float32)
+    for event_index, item in enumerate(items):
+        scores = item.get("local_action_scores", {})
+        for label, raw_score in scores.items():
+            if str(label) not in LOCAL_ACTION_LABELS:
+                continue
+            try:
+                score = max(0.0, float(raw_score))
+            except (TypeError, ValueError):
+                continue
+            coarse[event_index, LOCAL_ACTION_LABELS.index(str(label))] += score
+        if float(coarse[event_index].sum()) <= 0.0:
+            coarse[event_index, LOCAL_ACTION_LABELS.index("unknown")] = 1.0
+        coarse[event_index] /= max(float(coarse[event_index].sum()), 1.0e-12)
+    body_code = np.argmax(coarse, axis=1).astype(np.int32)
     center_code = np.asarray(
         [
-            2 if event_types[i] == "support_shift" else (1 if turn01[i] > 0.35 else 0)
+            2
+            if coarse[i, LOCAL_ACTION_LABELS.index("locomotion")] >= 0.35
+            else (1 if turn01[i] > 0.35 else 0)
             for i in range(n)
         ],
         dtype=np.int32,
     )
     gesture_code = np.asarray(
         [
-            2 if event_types[i] == "arm_flourish" else (1 if activity01[i] > 0.55 else 0)
+            2
+            if coarse[i, LOCAL_ACTION_LABELS.index("upper_body_gesture")] >= 0.35
+            else (1 if activity01[i] > 0.55 else 0)
             for i in range(n)
         ],
         dtype=np.int32,
     )
-
-    coarse = _one_hot(body_code, 6)
+    hierarchy_semantic_contract = "weak_motion_local_action_multilabel_v1"
+    action_probs = coarse.copy()
     continuous = np.stack([activity01, turn01, duration01, style, quality, safety], axis=1).astype(np.float32)
     raw = np.concatenate([coarse, continuous], axis=1)
     semantic_proxy = _normalize_rows(raw)
@@ -276,6 +270,13 @@ def build_hierarchy_features(
         "turn01": turn01.astype(np.float32),
         "duration01": duration01.astype(np.float32),
         "specificity": specificity.astype(np.float32),
+        "hierarchy_semantic_contract": np.asarray(
+            [hierarchy_semantic_contract], dtype=object
+        ),
+        "action_labels": np.asarray(
+            list(LOCAL_ACTION_LABELS), dtype=object
+        ),
+        "action_probs": action_probs.astype(np.float32),
     }
 
 
@@ -297,49 +298,52 @@ def load_or_build_hierarchy(
             raise RuntimeError(
                 f"Hierarchy index length {len(out['hierarchy_embed'])} does not match event index length {len(items)}"
             )
+        contract = str(
+            np.asarray(
+                out.get("hierarchy_semantic_contract", np.asarray([""]))
+            ).reshape(-1)[0]
+        )
+        action_probs = np.asarray(
+            out.get("action_probs", np.empty((0, 0), dtype=np.float32))
+        )
+        if (
+            contract != "weak_motion_local_action_multilabel_v1"
+            or action_probs.shape != (len(items), len(LOCAL_ACTION_LABELS))
+        ):
+            raise RuntimeError(
+                "Hierarchy index does not satisfy the current SMPL local-action contract"
+            )
         return out
     return build_hierarchy_features(arrays, items, hyperbolic_ckpt=hyperbolic_ckpt)
 
 
 def build_slot_query(
     phrase: Any,
-    predicted_event: str,
     target_natural: float,
     desired_activity: float,
-    music_semantic: np.ndarray | None = None,
-    deep_music_weight: float = 0.0,
+    action_compatibility: np.ndarray,
 ) -> Dict[str, Any]:
     music_event = str(getattr(phrase, "music_event", "neutral_flow"))
-    group = int(MUSIC_TO_GROUP.get(music_event, EVENT_GROUPS.get(str(predicted_event), 2)))
+    candidate = np.asarray(action_compatibility, dtype=np.float32).reshape(-1)
+    if candidate.shape != (len(LOCAL_ACTION_LABELS),) or not np.isfinite(candidate).all():
+        raise ValueError(
+            f"Invalid local-action compatibility for hierarchy: {candidate.shape}"
+        )
+    candidate = np.maximum(candidate, 0.0)
+    action_probability = candidate / max(float(candidate.sum()), 1.0e-12)
+    group = int(np.argmax(action_probability))
     energy = float(getattr(phrase, "energy", 0.5))
     onset = float(getattr(phrase, "onset", 0.0))
     beat = float(getattr(phrase, "beat_density", 0.0))
     tension = float(getattr(phrase, "tension", 0.0))
     calm = float(getattr(phrase, "calmness", 0.0))
     boundary = float(getattr(phrase, "boundary_accent_strength", 0.0))
-    semantic = None
-    semantic_activity = 0.0
-    semantic_turn = 0.0
-    semantic_group_bias = np.zeros((6,), dtype=np.float32)
-    if music_semantic is not None:
-        semantic = np.asarray(music_semantic, dtype=np.float32).reshape(-1)
-        if semantic.size >= 12:
-            semantic_group_bias = semantic[:6].astype(np.float32)
-            semantic_activity = float(semantic[6])
-            semantic_turn = float(semantic[7])
-    deep_w = float(np.clip(deep_music_weight, 0.0, 1.0))
     activity_rule = float(np.clip(0.45 * desired_activity + 0.25 * energy + 0.18 * beat + 0.12 * onset - 0.20 * calm, 0.0, 1.0))
     turn_rule = float(np.clip(0.45 * tension + 0.25 * boundary + 0.20 * beat + (0.22 if music_event in {"climax", "section_change"} else 0.0), 0.0, 1.0))
-    activity = float(np.clip((1.0 - deep_w) * activity_rule + deep_w * semantic_activity, 0.0, 1.0))
-    turn = float(np.clip((1.0 - deep_w) * turn_rule + deep_w * semantic_turn, 0.0, 1.0))
+    activity = activity_rule
+    turn = turn_rule
     duration01 = float(np.clip((target_natural - 24.0) / 72.0, 0.0, 1.0))
-    coarse = np.zeros((6,), dtype=np.float32)
-    coarse[np.clip(group, 0, 5)] = 1.0
-    if deep_w > 0.0 and np.linalg.norm(semantic_group_bias) > 1e-6:
-        semantic_group_bias = semantic_group_bias / max(float(np.sum(np.abs(semantic_group_bias))), 1e-6)
-        coarse = (1.0 - deep_w) * coarse + deep_w * np.clip(semantic_group_bias, 0.0, 1.0)
-        if float(coarse.sum()) > 1e-6:
-            coarse = coarse / float(coarse.sum())
+    coarse = action_probability.astype(np.float32)
     raw = np.concatenate(
         [
             coarse,
@@ -362,7 +366,8 @@ def build_slot_query(
         "radius": float(radius),
         "curvature": float(curvature),
         "semantic_proxy": semantic_proxy.astype(np.float32),
-        "deep_music_weight": float(deep_w),
+        "action_compatibility": action_probability.astype(np.float32),
+        "semantic_contract": "semantic_ot_teacher_x_weak_motion_local_action",
     }
 
 
@@ -380,8 +385,38 @@ def hierarchical_node_scores(
     # Convert distance to a bounded positive score.  Very close hierarchical
     # matches approach 1; distant points approach 0.
     hyper_score = np.exp(-0.55 * dist).astype(np.float32)
-    group_gap = np.abs(body.astype(np.float32) - float(query["group"])) / 5.0
-    coarse_score = (1.0 - np.clip(group_gap, 0.0, 1.0)).astype(np.float32)
+    query_actions = query.get("action_compatibility")
+    event_actions = np.asarray(
+        hierarchy.get("action_probs", np.empty((len(body), 0), dtype=np.float32)),
+        dtype=np.float32,
+    )
+    if (
+        query_actions is not None
+        and event_actions.shape == (len(body), len(LOCAL_ACTION_LABELS))
+    ):
+        query_distribution = np.maximum(
+            np.asarray(query_actions, dtype=np.float32).reshape(-1), 0.0
+        )
+        query_distribution /= max(float(query_distribution.sum()), 1.0e-12)
+        event_distribution = np.maximum(event_actions, 0.0)
+        event_distribution /= np.maximum(
+            event_distribution.sum(axis=1, keepdims=True), 1.0e-12
+        )
+        # Local-action labels are nominal, not ordinal.  Bhattacharyya
+        # affinity respects the full multi-label probability vectors without
+        # inventing a distance between adjacent integer class identifiers.
+        coarse_score = np.sum(
+            np.sqrt(event_distribution * query_distribution[None, :]), axis=1
+        ).astype(np.float32)
+    else:
+        group_scale = max(
+            1.0,
+            float(max(int(np.max(body)) if len(body) else 0, int(query["group"]))),
+        )
+        group_gap = (
+            np.abs(body.astype(np.float32) - float(query["group"])) / group_scale
+        )
+        coarse_score = (1.0 - np.clip(group_gap, 0.0, 1.0)).astype(np.float32)
     exact_group = (body == int(query["group"])).astype(np.float32)
     activity_score = (1.0 - np.minimum(np.abs(activity - float(query["activity"])), 1.0)).astype(np.float32)
     turn_score = (1.0 - np.minimum(np.abs(turn - float(query["turn"])), 1.0)).astype(np.float32)

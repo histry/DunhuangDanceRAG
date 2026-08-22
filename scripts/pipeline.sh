@@ -24,6 +24,10 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 OUT_ROOT="${OUT_ROOT:-output/fresh_audio_fresh_wav_${RUN_TAG}}"
 RETARGET_CACHE="${RETARGET_CACHE:-$OUT_ROOT/retarget_cache}"
 SOURCE_MODE="${RETARGET_CLEAN_SOURCE_MODE:-chang_e_official_smpl}"
+if [[ "$SOURCE_MODE" != "chang_e_official_smpl" ]]; then
+  echo "[FATAL] main supports only Chang-E official SMPL14. Historical BVH code is archived in Git." >&2
+  exit 2
+fi
 OFFICIAL_SMPL_DIR="${CHANG_E_OFFICIAL_SMPL_DIR:?configs/experiment.env must define the official SMPL directory}"
 CACHE_SPLIT_ROOT="${CACHE_SPLIT_ROOT:-$OUT_ROOT/retarget_cache_split}"
 DB_SPLIT_ROOT="${DB_SPLIT_ROOT:-$OUT_ROOT/event_db_split}"
@@ -38,26 +42,23 @@ TEST_AESD="$DB_SPLIT_ROOT/test/events_aesd.npz"
 ALL_DB="$ALL_DB_DIR/events.npz"
 ALL_AESD="$ALL_DB_DIR/events_aesd.npz"
 
-CONTRASTIVE_CKPT="${CONTRASTIVE_CKPT:-$OUT_ROOT/contrastive_retrieval_train_only_contrastive.pt}"
 REFINER_CKPT="${REFINER_CKPT:-$OUT_ROOT/motion_refiner_train_only_refiner.pt}"
 MOTION_CKPT="${MOTION_CKPT:-$OUT_ROOT/motion_train_only_diffusion.pt}"
 
 SCHEDULER_CHECKPOINT_DIR="${SCHEDULER_CHECKPOINT_DIR:-$OUT_ROOT/checkpoints}"
 SCHEDULER_TRAIN_DIR="${SCHEDULER_TRAIN_DIR:-$OUT_ROOT/scheduler_training}"
-FORMAL_ROUTER_CKPT="${FORMAL_ROUTER_CKPT:-$SCHEDULER_CHECKPOINT_DIR/music_motion_router.pt}"
+FORMAL_ROUTER_CKPT="${FORMAL_ROUTER_CKPT:-$SCHEDULER_CHECKPOINT_DIR/ctsr_weak_temporal_router.pt}"
+BASELINE_DIR="${BASELINE_DIR:-$OUT_ROOT/baselines}"
+CURRENT_ROUTER_BASELINE_CKPT="${CURRENT_ROUTER_BASELINE_CKPT:-$BASELINE_DIR/ctsr_mean_pool_mlp.pt}"
 FORMAL_DURATION_CKPT="${FORMAL_DURATION_CKPT:-$SCHEDULER_CHECKPOINT_DIR/duration_predictor.pt}"
 FORMAL_PLANNER_CKPT="${FORMAL_PLANNER_CKPT:-$SCHEDULER_CHECKPOINT_DIR/whole_song_planner.pt}"
-# The historical 985-song Router contributes only its music encoder.  Its
-# motion encoder is tied to the old Event-DB and is never reused.
-MUSIC_ENCODER_PRIOR_CKPT="${ROUTING_SAFETY_MUSIC_ENCODER_PRIOR_CKPT:-${GENERATION_ROUTER_CKPT:-}}"
-
 SCHEDULE_ROOT="${SCHEDULE_ROOT:-$OUT_ROOT/fresh_schedule}"
 FRESH_MSSD="${FRESH_MSSD:-$SCHEDULE_ROOT/current_wav.final.mssd.json}"
 FINAL_NPY="${FINAL_NPY:-$OUT_ROOT/fresh_audio_final.npy}"
 FINAL_REPORT="${FINAL_REPORT:-$OUT_ROOT/fresh_audio_final.report.json}"
 FINAL_MP4="${FINAL_MP4:-$OUT_ROOT/fresh_audio_final.scientific_fixed.mp4}"
 
-mkdir -p "$OUT_ROOT" "$SCHEDULER_CHECKPOINT_DIR" "$SCHEDULER_TRAIN_DIR"
+mkdir -p "$OUT_ROOT" "$SCHEDULER_CHECKPOINT_DIR" "$SCHEDULER_TRAIN_DIR" "$BASELINE_DIR"
 
 require_file() {
   local p="$1"
@@ -68,79 +69,70 @@ require_file() {
   }
 }
 
-# Formal music semantics must remain independent of externally pretrained
-# feature extractors.  The research profile pins these values; keep this guard
-# so a stale caller environment or manual override cannot silently enable CLAP.
-if [[ "${GENERATION_DEEP_MUSIC_FEATURES:-0}" != "0" \
-   || "${GENERATION_REQUIRE_DEEP_MUSIC:-0}" != "0" \
-   || "${GENERATION_DEEP_MUSIC_MODEL:-librosa_12d}" != "librosa_12d" ]]; then
-  echo "[FATAL] Formal music semantics must use Librosa 12D features and the project-trained Router; external deep-music models are disabled." >&2
+# Formal music semantics fail closed on the only supported feature backend.
+if [[ "${REQUIRE_LIBROSA_BACKEND:-0}" != "1" ]]; then
+  echo "[FATAL] Formal music semantics require Librosa 12D." >&2
   exit 2
 fi
 
-if [[ "${GROUNDING_GROUNDER_ARCHITECTURE:-legacy}" != "legacy" ]]; then
-  echo "[FATAL] Formal no-external-pretraining mode requires GROUNDING_GROUNDER_ARCHITECTURE=legacy." >&2
+if [[ "${ROUTING_FORMAL_ROUTER_ARCHITECTURE:-}" != "ctsr_weak_temporal_v1" \
+   || "${ROUTING_FORMAL_SUPERVISION_SOURCE:-}" != "semantic_ot_teacher" \
+   || "${ROUTING_SAFETY_FREEZE_MUSIC_ENCODER:-1}" != "0" ]]; then
+  echo "[FATAL] Formal routing must use scratch-trained CTSR-Weak only." >&2
   exit 2
 fi
 
-if [[ "${SEMANTIC_OT_ENABLE:-0}" != "0" ]]; then
-  echo "[FATAL] Formal no-external-pretraining mode excludes the mixed semantic-OT/CLAP route." >&2
+if [[ "${FORMAL_REQUIRE_CLEAN_GIT:-1}" != "1" ]]; then
+  echo "[FATAL] Formal training requires FORMAL_REQUIRE_CLEAN_GIT=1." >&2
+  exit 2
+fi
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+  echo "[FATAL] Formal training requires a clean Git worktree so every checkpoint has reproducible code provenance." >&2
+  git status --short >&2
+  exit 2
+fi
+
+if [[ "${GRAPH_ROUTE_SOLVER:-}" != "fisher_rao_graph_sb" ]]; then
+  echo "[FATAL] Formal routing requires solver=fisher_rao_graph_sb." >&2
+  exit 2
+fi
+
+if [[ "${PERFORMER_REQUIRE_SOLO_COMPATIBLE:-0}" != "1" ]]; then
+  echo "[FATAL] Formal one-body generation must exclude unreviewed multi-performer recordings." >&2
   exit 2
 fi
 
 echo "========== Fresh-Audio Generation FORMAL PATHS =========="
-printf "PY=%s\nOUT_ROOT=%s\nAUDIO=%s\nSOURCE_MODE=%s\nCHANGE_BVH_DIR=%s\nOFFICIAL_SMPL_DIR=%s\nCONFIG=%s\nDB_MODE=%s\n" \
-  "$PY" "$OUT_ROOT" "$AUDIO" "$SOURCE_MODE" "$CHANGE_BVH_DIR" "$OFFICIAL_SMPL_DIR" "$CONFIG" "$GENERATION_DB_MODE"
+printf "PY=%s\nOUT_ROOT=%s\nAUDIO=%s\nSOURCE_MODE=%s\nOFFICIAL_SMPL_DIR=%s\nCONFIG=%s\nDB_MODE=%s\n" \
+  "$PY" "$OUT_ROOT" "$AUDIO" "$SOURCE_MODE" "$OFFICIAL_SMPL_DIR" "$CONFIG" "$GENERATION_DB_MODE"
 
 require_file "$AUDIO" "current WAV"
 require_file "$CONFIG" "Motion Generation config"
 
 echo "========== 1. SOURCE-AWARE SOURCE CACHE =========="
 if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" ]]; then
-  case "$SOURCE_MODE" in
-    chang_e_official_smpl)
-      "$PY" retargeting/official_smpl_source_preprocess.py \
-        --in_dir "$OFFICIAL_SMPL_DIR" \
-        --out_dir "$RETARGET_CACHE" \
-        --smpl_manifest "$CHANG_E_OFFICIAL_SMPL_MANIFEST" \
-        --target_fps "$GENERATION_FPS" \
-        --min_ok_sources "$RETARGET_MIN_OK_SOURCES" \
-        --overwrite
-      ;;
-    bvh_retarget)
-      "$PY" retargeting/build_retarget_cache.py \
-        --in_dir "$CHANGE_BVH_DIR" \
-        --out_dir "$RETARGET_CACHE" \
-        --overwrite
-      ;;
-    *)
-      echo "[FATAL] Unknown source mode: $SOURCE_MODE" >&2
-      exit 2
-      ;;
-  esac
+  "$PY" retargeting/official_smpl_source_preprocess.py \
+    --in_dir "$OFFICIAL_SMPL_DIR" \
+    --out_dir "$RETARGET_CACHE" \
+    --smpl_manifest "$CHANG_E_OFFICIAL_SMPL_MANIFEST" \
+    --target_fps "$GENERATION_FPS" \
+    --min_ok_sources "$RETARGET_MIN_OK_SOURCES" \
+    --overwrite
 else
   require_file "$RETARGET_CACHE/event_heading_retarget_cache_report.json" \
     "existing source cache report"
 fi
 
 echo "========== 2. SOURCE GRAVITY DIAGNOSTIC =========="
-if [[ "$SOURCE_MODE" == "chang_e_official_smpl" ]]; then
-  # Direct official SMPL is not rejected at whole-source level for a
-  # posture-style gravity statistic. Event-level anatomy remains strict.
-  "$PY" evaluation/audit_gravity.py \
-    --motion_dir "$RETARGET_CACHE" \
-    --profile source \
-    --allow_failed \
-    --fps "$GENERATION_FPS" \
-    --out "$OUT_ROOT/retarget_cache.gravity.json" \
-    --csv "$OUT_ROOT/retarget_cache.gravity.csv"
-else
-  "$PY" evaluation/audit_gravity.py \
-    --motion_dir "$RETARGET_CACHE" \
-    --fps "$GENERATION_FPS" \
-    --out "$OUT_ROOT/retarget_cache.gravity.json" \
-    --csv "$OUT_ROOT/retarget_cache.gravity.csv"
-fi
+# Direct official SMPL is not rejected at whole-source level for a
+# posture-style gravity statistic. Event-level anatomy remains strict.
+"$PY" evaluation/audit_gravity.py \
+  --motion_dir "$RETARGET_CACHE" \
+  --profile source \
+  --allow_failed \
+  --fps "$GENERATION_FPS" \
+  --out "$OUT_ROOT/retarget_cache.gravity.json" \
+  --csv "$OUT_ROOT/retarget_cache.gravity.csv"
 
 echo "========== 3. SOURCE SPLIT BEFORE EVENT SLICING =========="
 "$PY" data_pipeline/split_sources.py \
@@ -150,15 +142,12 @@ echo "========== 3. SOURCE SPLIT BEFORE EVENT SLICING =========="
   --train_ratio "$GENERATION_TRAIN_RATIO" \
   --val_ratio "$GENERATION_VAL_RATIO" \
   --test_ratio "$GENERATION_TEST_RATIO" \
+  --protocol "$GENERATION_SPLIT_PROTOCOL" \
+  --heldout_theme "$GENERATION_HELDOUT_THEME" \
   --mode copy \
   --overwrite
 
 echo "========== 4. BUILD SPLIT-SPECIFIC HEADING EVENT DATABASES =========="
-FORMAL_AESD_GROUNDER_ENABLE="${GROUNDING_GROUNDER_ENABLE:-1}"
-# Raw Event-DBs contain provenance, geometry and local-action fields, but AESD
-# probabilities do not exist yet.  Never train or embed the formal Grounder at
-# this stage, even when a stale checkpoint is present in a resumed OUT_ROOT.
-export GROUNDING_GROUNDER_ENABLE=0
 if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
   for split in train val test; do
     cache_dir="$CACHE_SPLIT_ROOT/$split"
@@ -182,6 +171,9 @@ for split in train val test; do
     --db "$db" \
     --out "$OUT_ROOT/${split}.event_heading.audit.json" \
     --csv "$OUT_ROOT/${split}.event_heading.audit.csv"
+  "$PY" evaluation/audit_formal_single_person_db.py \
+    --db "$db" \
+    --out "$OUT_ROOT/${split}.single_person.audit.json"
 done
 
 echo "========== 6. AESD ENRICHMENT PER SPLIT =========="
@@ -214,55 +206,7 @@ else
   GENERATION_DB="$TRAIN_AESD"
 fi
 
-export GROUNDING_GROUNDER_ENABLE="$FORMAL_AESD_GROUNDER_ENABLE"
-unset FORMAL_AESD_GROUNDER_ENABLE
-
-echo "========== 6A. TRAIN GROUNDER ON TRAIN AESD; EMBED DISJOINT SPLITS =========="
-if [[ "${GROUNDING_GROUNDER_ENABLE:-1}" == "1" ]]; then
-  if [[ "${GROUNDING_GROUNDER_ARCHITECTURE:-legacy}" != "legacy" ]]; then
-    echo "[FATAL] The formal AESD-first Grounder stage supports only the project-owned legacy architecture." >&2
-    exit 2
-  fi
-  if [[ "${GROUNDING_TRAIN_GROUNDER_AFTER_AESD:-1}" == "1" ]]; then
-    "$PY" -m grounding.model train \
-      --db "$TRAIN_AESD" \
-      --out "$GROUNDING_GROUNDER_CKPT" \
-      --steps "$GROUNDING_GROUNDER_STEPS" \
-      --batch_size "$GROUNDING_GROUNDER_BATCH" \
-      --seed "${GROUNDING_SEED:-20260717}"
-  else
-    require_file "$GROUNDING_GROUNDER_CKPT" \
-      "train-AESD Grounder checkpoint"
-    "$PY" -m grounding.model embed \
-      --db "$TRAIN_AESD" \
-      --checkpoint "$GROUNDING_GROUNDER_CKPT"
-  fi
-  AESD_EMBED_TARGETS=("$VAL_AESD" "$TEST_AESD")
-  if [[ "$GENERATION_DB_MODE" == "qualitative_all_change" ]]; then
-    AESD_EMBED_TARGETS+=("$ALL_AESD")
-  fi
-  for aesd in "${AESD_EMBED_TARGETS[@]}"; do
-    "$PY" -m grounding.model embed \
-      --db "$aesd" \
-      --checkpoint "$GROUNDING_GROUNDER_CKPT"
-  done
-  unset AESD_EMBED_TARGETS
-fi
-
-if [[ "${SEMANTIC_OT_ENABLE:-0}" == "1" ]]; then
-  SEMANTIC_OT_GENERATION_DB="${SEMANTIC_OT_GENERATION_DB:-}"
-  SEMANTIC_OT_GROUNDER_CKPT="${SEMANTIC_OT_GROUNDER_CKPT:-}"
-  require_file "$SEMANTIC_OT_GENERATION_DB"     "semantic-OT embedded generation Event-DB"
-  require_file "$SEMANTIC_OT_GROUNDER_CKPT"     "semantic-OT mixed-curvature Grounder checkpoint"
-  GENERATION_DB="$SEMANTIC_OT_GENERATION_DB"
-  export GROUNDING_GROUNDER_ARCHITECTURE="mixed"
-  export GROUNDING_GROUNDER_CKPT="$SEMANTIC_OT_GROUNDER_CKPT"
-  export GROUNDING_MIXED_REQUIRE_RUNTIME_AUDIO="1"
-  echo "[SEMANTIC OT] Generation DB: $GENERATION_DB"
-  echo "[SEMANTIC OT] Grounder: $GROUNDING_GROUNDER_CKPT"
-fi
-
-echo "========== 6C. BUILD GENERATION-ALIGNED SCHEDULER INDEX =========="
+echo "========== 6A. BUILD GENERATION-ALIGNED SCHEDULER INDEX =========="
 ALIGNED_SCHEDULER_DIR="$OUT_ROOT/scheduler_generation_assets"
 ALIGNED_INDEX_JSON="$ALIGNED_SCHEDULER_DIR/event_index.json"
 ALIGNED_INDEX_NPZ="$ALIGNED_SCHEDULER_DIR/duration_index.npz"
@@ -290,32 +234,66 @@ ROUTER_DATA="$SCHEDULER_TRAIN_DIR/router_training.npz"
 DURATION_DATA="$SCHEDULER_TRAIN_DIR/duration_training.npz"
 PLANNER_DATA="$SCHEDULER_TRAIN_DIR/planner_training.npz"
 
-echo "========== 7. BUILD + TRAIN FORMAL MUSIC-MOTION ROUTER =========="
+echo "========== 7. BUILD + TRAIN ZERO-LABEL CTSR-WEAK TEMPORAL ROUTER =========="
 if [[ "$GENERATION_RETRAIN_ROUTER" == "1" ]]; then
-  require_file "$MUSIC_ENCODER_PRIOR_CKPT" \
-    "historical music-semantic Router prior"
-  "$PY" training/music_router.py build-dataset \
+  "$PY" training/temporal_music_router.py build-dataset \
     --index_json "$ALIGNED_INDEX_JSON" \
     --index_npz "$ALIGNED_INDEX_NPZ" \
     --music_dirs "${MUSIC_DIR_ARRAY[@]}" \
+    --heldout_audio "$AUDIO" \
     --cache_dir "$SCHEDULER_TRAIN_DIR/music_feature_cache" \
     --out "$ROUTER_DATA" \
     --fps "$GENERATION_FPS" \
-    --phrases "$ROUTING_SAFETY_ROUTER_PHRASES_PER_SONG" \
-    --positives_per_phrase "$ROUTING_SAFETY_ROUTER_POSITIVES_PER_PHRASE" \
-    --negatives_per_positive "$ROUTING_SAFETY_ROUTER_NEGATIVES_PER_POSITIVE"
-  "$PY" training/music_router.py train \
+    --expected_num_songs "$RETARGET_CLEAN_EXPECTED_TRAIN_MUSIC" \
+    --min_phrase_seconds "$GENERATION_MIN_PHRASE_SECONDS" \
+    --max_phrase_seconds "$GENERATION_MAX_PHRASE_SECONDS" \
+    --boundary_quantile "$GENERATION_BOUNDARY_QUANTILE" \
+    --beat_snap_seconds "$GENERATION_BEAT_SNAP_SECONDS" \
+    --max_slot_seconds "$GENERATION_MAX_SINGLE_EVENT_SECONDS" \
+    --calm_max_slot_seconds "$GENERATION_CALM_MAX_SINGLE_EVENT_SECONDS" \
+    --min_slot_seconds "$GENERATION_MIN_SUBPHRASE_SECONDS" \
+    --max_events_per_phrase "$GENERATION_MAX_EVENTS_PER_PHRASE" \
+    --slot_beat_snap_seconds "$GENERATION_SLOT_BEAT_SNAP_SECONDS" \
+    --sequence_frames "$ROUTING_TEMPORAL_SEQUENCE_FRAMES" \
+    --teacher_top_k "$ROUTING_WEAK_OT_TOP_K" \
+    --teacher_epsilon "$ROUTING_WEAK_OT_EPSILON" \
+    --teacher_max_iterations "$ROUTING_WEAK_OT_MAX_ITER" \
+    --teacher_tolerance "$ROUTING_WEAK_OT_TOLERANCE" \
+    --teacher_balance_key "$ROUTING_WEAK_OT_BALANCE_KEY" \
+    --require_librosa_backend "$REQUIRE_LIBROSA_BACKEND"
+  "$PY" training/temporal_music_router.py train \
     --data "$ROUTER_DATA" \
     --index_json "$ALIGNED_INDEX_JSON" \
     --index_npz "$ALIGNED_INDEX_NPZ" \
-    --music_prior_ckpt "$MUSIC_ENCODER_PRIOR_CKPT" \
-    --freeze_music_encoder "$ROUTING_SAFETY_FREEZE_MUSIC_ENCODER" \
     --out "$FORMAL_ROUTER_CKPT" \
     --fps "$GENERATION_FPS" \
+    --sequence_frames "$ROUTING_TEMPORAL_SEQUENCE_FRAMES" \
+    --hidden_dim "$ROUTING_TEMPORAL_HIDDEN_DIM" \
+    --latent_dim "$ROUTING_TEMPORAL_LATENT_DIM" \
+    --transformer_layers "$ROUTING_TEMPORAL_TRANSFORMER_LAYERS" \
+    --transformer_heads "$ROUTING_TEMPORAL_TRANSFORMER_HEADS" \
+    --mask_ratio "$ROUTING_TEMPORAL_MASK_RATIO" \
     --epochs "$ROUTING_SAFETY_ROUTER_EPOCHS" \
     --batch_size "$ROUTING_SAFETY_ROUTER_BATCH"
 else
   require_file "$FORMAL_ROUTER_CKPT" "formal Router checkpoint"
+fi
+
+if [[ "$CURRENT_PROTOCOL_BASELINES_ENABLE" == "1" ]]; then
+  echo "========== 7A-B. TRAIN CURRENT-PROTOCOL NON-TEMPORAL ROUTER BASELINE =========="
+  if [[ "$GENERATION_RETRAIN_ROUTER" == "1" ]]; then
+    "$PY" training/current_protocol_router_baseline.py \
+      --data "$ROUTER_DATA" \
+      --index_json "$ALIGNED_INDEX_JSON" \
+      --index_npz "$ALIGNED_INDEX_NPZ" \
+      --out "$CURRENT_ROUTER_BASELINE_CKPT" \
+      --fps "$GENERATION_FPS" \
+      --epochs "$CURRENT_PROTOCOL_BASELINE_EPOCHS" \
+      --batch_size "$ROUTING_SAFETY_ROUTER_BATCH"
+  else
+    require_file "$CURRENT_ROUTER_BASELINE_CKPT" \
+      "current-protocol non-temporal Router baseline checkpoint"
+  fi
 fi
 
 echo "========== 7B. BUILD + TRAIN FORMAL DURATION MODEL =========="
@@ -347,9 +325,21 @@ if [[ "$GENERATION_RETRAIN_PLANNER" == "1" ]]; then
     --router_ckpt "$FORMAL_ROUTER_CKPT" \
     --duration_ckpt "$FORMAL_DURATION_CKPT" \
     --music_dirs "${MUSIC_DIR_ARRAY[@]}" \
+    --heldout_audio "$AUDIO" \
+    --expected_num_songs "$RETARGET_CLEAN_EXPECTED_TRAIN_MUSIC" \
     --cache_dir "$SCHEDULER_TRAIN_DIR/whole_song_feature_cache" \
     --out "$PLANNER_DATA" \
     --fps "$GENERATION_FPS" \
+    --min_phrase_seconds "$GENERATION_MIN_PHRASE_SECONDS" \
+    --max_phrase_seconds "$GENERATION_MAX_PHRASE_SECONDS" \
+    --boundary_quantile "$GENERATION_BOUNDARY_QUANTILE" \
+    --beat_snap_seconds "$GENERATION_BEAT_SNAP_SECONDS" \
+    --max_slot_seconds "$GENERATION_MAX_SINGLE_EVENT_SECONDS" \
+    --calm_max_slot_seconds "$GENERATION_CALM_MAX_SINGLE_EVENT_SECONDS" \
+    --min_slot_seconds "$GENERATION_MIN_SUBPHRASE_SECONDS" \
+    --max_events_per_phrase "$GENERATION_MAX_EVENTS_PER_PHRASE" \
+    --slot_beat_snap_seconds "$GENERATION_SLOT_BEAT_SNAP_SECONDS" \
+    --require_rhythm_features \
     --cooldown_slots "$ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS"
   "$PY" training/whole_song_planner.py train \
     --data "$PLANNER_DATA" \
@@ -399,19 +389,6 @@ if [[ "$ROUTING_SAFETY_RUN_PRETRAIN_REGRESSION" == "1" ]]; then
     --max_transition_fraction "$GENERATION_MAX_TRANSITION_FRACTION"
   require_file "$PRETRAIN_REGRESSION_DIR/regression_gate.json" \
     "same-WAV regression gate"
-fi
-
-echo "========== 7F. TRAIN Contrastive Retriever ON TRAIN SOURCES + NON-TEST MUSIC =========="
-if [[ "$GENERATION_RETRAIN_CONTRASTIVE" == "1" ]]; then
-  "$PY" training/motion_models.py \
-    --config "$CONFIG" \
-    train-contrastive \
-    --db "$TRAIN_AESD" \
-    --out "$CONTRASTIVE_CKPT" \
-    --unpaired_audio_dirs "${MUSIC_DIR_ARRAY[@]}" \
-    --epochs "$CONTRASTIVE_EPOCHS"
-else
-  require_file "$CONTRASTIVE_CKPT" "Contrastive Retriever checkpoint"
 fi
 
 echo "========== 8. TRAIN Motion Refiner ON TRAIN-SOURCE CANONICAL EVENTS =========="
@@ -513,29 +490,12 @@ else
   FRESH_ARGS+=(--no-physical_edge_hard_prune)
 fi
 
-[[ -n "$GENERATION_RESOLVED_HIERARCHY_INDEX_NPZ" ]] && \
+[[ -n "${GENERATION_RESOLVED_HIERARCHY_INDEX_NPZ:-}" ]] && \
   FRESH_ARGS+=(--hierarchy_index_npz "$GENERATION_RESOLVED_HIERARCHY_INDEX_NPZ")
-[[ -n "$GENERATION_RESOLVED_START_POSE" ]] && \
+[[ -n "${GENERATION_RESOLVED_START_POSE:-}" ]] && \
   FRESH_ARGS+=(--start_pose "$GENERATION_RESOLVED_START_POSE")
-[[ "$GENERATION_DEEP_MUSIC_FEATURES" == "1" ]] && \
-  FRESH_ARGS+=(--deep_music_features)
-[[ "$GENERATION_REQUIRE_DEEP_MUSIC" == "1" ]] && \
-  FRESH_ARGS+=(--require_deep_music)
 [[ "$GENERATION_REQUIRE_RHYTHM_FEATURES" == "1" ]] && \
   FRESH_ARGS+=(--require_rhythm_features)
-FRESH_ARGS+=(--deep_music_model "$GENERATION_DEEP_MUSIC_MODEL")
-FRESH_ARGS+=(--deep_music_min_success "$GENERATION_DEEP_MUSIC_MIN_SUCCESS")
-
-if [[ "$GENERATION_TRANSITION_DIFFUSION" == "1" ]]; then
-  require_file "$GENERATION_TRANSITION_DIFFUSION_CKPT" \
-    "Whole-Song Planner transition diffusion checkpoint"
-  FRESH_ARGS+=(
-    --transition_diffusion
-    --transition_diffusion_ckpt "$GENERATION_TRANSITION_DIFFUSION_CKPT"
-    --transition_diffusion_blend "$GENERATION_TRANSITION_DIFFUSION_BLEND"
-    --transition_diffusion_steps "$GENERATION_TRANSITION_DIFFUSION_STEPS"
-  )
-fi
 
 "$PY" scheduling/build_schedule.py "${FRESH_ARGS[@]}"
 
@@ -555,53 +515,33 @@ echo "========== 12. FRESH-WAV CONTRACT RECHECK =========="
   --out "$OUT_ROOT/fresh_schedule.contract.json" \
   --csv "$OUT_ROOT/fresh_schedule.contract.csv"
 
-ROUTING_MSSD="$FRESH_MSSD"
-if [[ "${GROUNDING_GROUNDER_ARCHITECTURE:-legacy}" == "mixed" ]]; then
-  echo "========== 12B. MIXED-GROUNDER REAL-AUDIO SLOT FEATURES =========="
-  MIXED_GROUNDER_CKPT="${GROUNDING_GROUNDER_CKPT:-}"
-  require_file "$MIXED_GROUNDER_CKPT" \
-    "mixed-curvature Grounder checkpoint"
-  MIXED_MSSD="$SCHEDULE_ROOT/current_wav.final.mixed_grounding.json"
-  "$PY" -m grounding.audio_query \
-    --audio "$AUDIO" \
+if [[ "$CURRENT_PROTOCOL_BASELINES_ENABLE" == "1" ]]; then
+  echo "========== 12B. EVALUATE CURRENT-PROTOCOL GREEDY + BEAM BASELINES =========="
+  "$PY" scripts/evaluate_current_protocol_baselines.py \
     --schedule "$FRESH_MSSD" \
-    --out "$MIXED_MSSD" \
-    --checkpoint "$MIXED_GROUNDER_CKPT" \
-    --model_name "$GENERATION_DEEP_MUSIC_MODEL" \
-    --cache_dir "$OUT_ROOT/mixed_audio_cache" \
-    --temporal_frames "${GROUNDING_MIXED_TEMPORAL_FRAMES:-64}" \
-    --temporal_source_frames "${GROUNDING_MIXED_TEMPORAL_SOURCE_FRAMES:-2048}" \
-    --phrase_fps "$GENERATION_FPS"
-  require_file "$MIXED_MSSD" "mixed-grounding enriched schedule"
-  "$PY" scheduling/validate_schedule.py \
-    --audio "$AUDIO" \
-    --schedule "$MIXED_MSSD" \
-    --required_run_id "$GENERATION_SCHEDULE_RUN_ID" \
-    --fps "$GENERATION_FPS" \
-    --max_frame_error "$GENERATION_MAX_FRAME_ERROR" \
-    --max_seconds_error "$GENERATION_MAX_SECONDS_ERROR" \
-    --max_pose_hold_ratio "$GENERATION_MAX_POSE_HOLD_RATIO" \
-    --max_single_source_ratio "$ROUTING_SAFETY_MAX_SOURCE_SHARE" \
-    --max_single_recording_ratio "$ROUTING_SAFETY_MAX_RECORDING_SHARE" \
-    --min_unique_events "$GENERATION_MIN_UNIQUE_EVENTS" \
-    --min_core_frame_ratio "$GENERATION_MIN_CORE_FRAME_RATIO" \
-    --out "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.json" \
-    --csv "$OUT_ROOT/fresh_schedule.mixed_grounding.contract.csv"
-  ROUTING_MSSD="$MIXED_MSSD"
+    --db "$GENERATION_DB" \
+    --out "$BASELINE_DIR/current_protocol_routes.json" \
+    --candidate_top_k "$BOUNDARY_RESELECT_TOPK" \
+    --beam_size "$CURRENT_PROTOCOL_BASELINE_BEAM_SIZE"
 fi
 
+ROUTING_MSSD="$FRESH_MSSD"
 echo "========== 13. Fresh-Audio Generation HEADING/BOUNDARY CLOSED-LOOP GENERATION =========="
-"$PY" routing/closed_loop.py \
+"$PY" routing/boundary_closed_loop.py \
   generate \
   --config "$CONFIG" \
   --audio "$AUDIO" \
   --slots_json "$ROUTING_MSSD" \
   --db "$GENERATION_DB" \
-  --contrastive "$CONTRASTIVE_CKPT" \
   --refiner "$REFINER_CKPT" \
   --diffusion "$MOTION_CKPT" \
   --out "$FINAL_NPY" \
   --json "$FINAL_REPORT"
+
+echo "========== 13B. FORMAL GRAPH-SB FAIL-CLOSED ACCEPTANCE =========="
+"$PY" evaluation/validate_formal_route.py \
+  --report "$FINAL_REPORT" \
+  --out "$OUT_ROOT/final.graph_sb.acceptance.json"
 
 echo "========== 14. FINAL GRAVITY AUDIT =========="
 "$PY" evaluation/audit_gravity.py \
@@ -664,7 +604,6 @@ ls -lh \
   "$TRAIN_AESD" \
   "$VAL_AESD" \
   "$TEST_AESD" \
-  "$CONTRASTIVE_CKPT" \
   "$REFINER_CKPT" \
   "$MOTION_CKPT" \
   "$FRESH_MSSD" \

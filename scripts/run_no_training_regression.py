@@ -36,11 +36,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max_source_share", type=float, default=0.40)
     parser.add_argument("--max_transition_fraction", type=float, default=0.20)
     parser.add_argument("--skip_ik", action="store_true")
-    parser.add_argument(
-        "--allow_legacy_30fps_checkpoints",
-        action="store_true",
-        help="Parity baseline only: permit old Scheduler checkpoints that predate FPS metadata.",
-    )
     args = parser.parse_args(argv)
 
     out_dir = Path(args.out_dir).resolve()
@@ -58,8 +53,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--planner_ckpt", args.planner_ckpt,
         "--duration_model_ckpt", args.duration_ckpt,
         "--fps", str(args.fps),
-        "--deep_music_features", "0",
-        "--require_deep_music", "0",
         "--max_single_event_seconds", "5.0",
         "--calm_max_single_event_seconds", "4.5",
         "--min_subphrase_seconds", "2.5",
@@ -69,10 +62,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--max_transition_fraction", str(args.max_transition_fraction),
     ]
     env = os.environ.copy()
-    if args.allow_legacy_30fps_checkpoints:
-        if abs(float(args.fps) - 30.0) > 1.0e-6:
-            raise RuntimeError("Legacy checkpoint compatibility is restricted to 30 FPS")
-        env["DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS"] = "1"
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     subprocess.run(command, cwd=str(ROOT), env=env, check=True)
 

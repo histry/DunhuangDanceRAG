@@ -1,12 +1,13 @@
 # Reproducibility
 
-1. Create the environment: `conda env create -f environment.yml`.
-2. Use `configs/experiment.env` as the only configuration entry; override paths
-   with environment variables before sourcing it when assets live elsewhere.
+1. Use `configs/experiment.env` as the only profile entry.
+2. Keep the worktree clean; checkpoint provenance records the Git revision.
 3. Run `bash scripts/preflight.sh`.
-4. Run `bash run.sh` for a full rebuild, retraining and whole-song generation.
-5. Use `bash scripts/resume_after_retarget.sh` only after a successful retarget cache.
-6. Use `bash scripts/generate_only.sh <audio.wav>` with a trained run directory.
+4. Run `bash scripts/run_official_smpl_full.sh "$CHANG_E_OFFICIAL_SMPL_DIR" <audio.wav>`.
+5. Preserve the source manifest hash, music-corpus report, split report,
+   Event-DB fingerprints, checkpoint contracts, final MSSD, route acceptance,
+   physical audits, and rendered MP4.
 
-Every release contains `PROJECT_MANIFEST.json`, `ASSET_MANIFEST.json`,
-`PATH_MIGRATION.json` and `SHA256SUMS`.
+Code presence and passing tests mean `IMPLEMENTED`, not `EXECUTED`.
+Formal metrics become `VERIFIED` only after a complete run and reconciliation
+against the paper tables.

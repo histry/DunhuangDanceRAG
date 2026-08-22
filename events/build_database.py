@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Build a Event-Heading heading-aware Event-RAG database from Source-Motion caches.
+"""Build the current SMPL14 heading-aware Event-RAG database.
 
-Input must be retargeted EDGE151D NPY, not raw BVH.  This guarantees that
-bind-pose, gravity, absolute source heading and root-orientation contracts were
-resolved before event extraction.
-
-The output preserves the existing Motion Generation/Contrastive Retriever/Motion Refiner and Motion Diffusion 32D schema and appends
-heading metadata arrays.  Existing AESD enrichment remains compatible because
-events/build_semantics.py copies all input NPZ arrays.
+Input must be a direct official-SMPL EDGE151D cache with an accepted source
+preprocess report.  Raw BVH and historical retarget-cache contracts are not
+accepted by this business path.
 """
 from __future__ import annotations
 
@@ -105,22 +101,8 @@ def sibling_retarget_report(path: Path) -> Dict[str, Any]:
 
 
 def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate legacy Source-Motion caches and Retarget Clean soft-root caches.
-
-    Retarget Clean intentionally replaces the complete root-orientation lock with a
-    source-body-frame SO(3) soft geodesic anchor.  The Event-DB builder must not
-    reject that newer contract merely because its mode string differs from the
-    legacy ``absolute_reference_lock`` contract.  Acceptance remains strict:
-    the report must be produced by the Retarget Clean source-safety retargeter and all
-    source-level anatomy, gravity and fit gates must have passed.
-    """
+    """Validate only the direct official-SMPL source-cache contract."""
     reasons: List[str] = []
-    strict = str(os.environ.get("EVENT_HEADING_REQUIRE_SOURCE_MOTION_CACHE", "1")).strip().lower() not in {
-        "0", "false", "no", "off"
-    }
-    if not strict:
-        return True, reasons
-
     if not report:
         reasons.append("missing_retarget_report")
         return False, reasons
@@ -128,60 +110,22 @@ def validate_retarget_contract(path: Path, report: Dict[str, Any]) -> Tuple[bool
         reasons.append("retarget_report_not_ok")
 
     source_preprocess = report.get("source_preprocess_contract", {})
-    if str(source_preprocess.get("schema", "")) == "chang_e_official_smpl_source_aware_preprocess_v1":
-        if not bool(report.get("source_gate_ok", False)):
-            reasons.append("source_aware_source_gate_not_ok")
-        if not bool(report.get("source_preprocess_ok", False)):
-            reasons.append("source_aware_preprocess_not_ok")
-        if bool(report.get("retargeting_applied", True)):
-            reasons.append("source_aware_unexpected_retargeting")
-        if not bool(source_preprocess.get("direct_official_smpl", False)):
-            reasons.append("source_aware_not_direct_official_smpl")
-        if bool(source_preprocess.get("retargeting_applied", True)):
-            reasons.append("source_aware_contract_retargeting_applied")
-        segment = report.get("preprocess_segment", {})
-        if not bool(segment.get("clean", False)):
-            reasons.append("source_aware_segment_not_clean")
-        return not reasons, reasons
-
-    pos = report.get("source_position_contract", {})
-    if str(pos.get("nonroot_position_mode", "")) != "ignore":
-        reasons.append("nonroot_position_mode_not_ignore")
-
-    fit = report.get("fit", {})
-    heading = fit.get("heading_contract", {})
-    if str(heading.get("mode", "")) != "stabilize":
-        reasons.append("heading_contract_not_stabilize")
-
-    root_contract = fit.get("root_orientation_contract", {})
-    root_mode = str(root_contract.get("mode", "")).strip()
-
-    if root_mode == "absolute_reference_lock":
-        # Preserved Source-Motion/Anatomy-Heading contract.
-        pass
-    elif root_mode == "soft_geodesic_anchor":
-        allow_soft = str(
-            os.environ.get("RETARGET_CLEAN_ALLOW_SOFT_ROOT_CONTRACT", "1")
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-        if not allow_soft:
-            reasons.append("retarget_clean_soft_root_contract_disabled")
-
-        if str(report.get("schema", "")) != "retarget_clean_source_safety_retarget":
-            reasons.append("soft_root_missing_retarget_clean_source_safety_schema")
-        if str(root_contract.get("version", "")) != "retarget_clean_soft_source_body_frame_contract":
-            reasons.append("soft_root_contract_version_mismatch")
-        if str(root_contract.get("root_orientation", "")) != "optimized_with_source_body_frame_prior":
-            reasons.append("soft_root_orientation_prior_missing")
-
-        # Do not weaken the source gate while adding compatibility.
-        for key in ("source_gate_ok", "anatomy_ok", "gravity_ok", "fit_ok"):
-            if not bool(report.get(key, False)):
-                reasons.append(f"soft_root_{key}_false")
-    else:
-        reasons.append(
-            "unsupported_root_orientation_contract_mode="
-            + (root_mode if root_mode else "missing")
-        )
+    if str(source_preprocess.get("schema", "")) != "chang_e_official_smpl_source_aware_preprocess_v1":
+        reasons.append("not_official_smpl_source_preprocess")
+        return False, reasons
+    if not bool(report.get("source_gate_ok", False)):
+        reasons.append("source_aware_source_gate_not_ok")
+    if not bool(report.get("source_preprocess_ok", False)):
+        reasons.append("source_aware_preprocess_not_ok")
+    if bool(report.get("retargeting_applied", True)):
+        reasons.append("source_aware_unexpected_retargeting")
+    if not bool(source_preprocess.get("direct_official_smpl", False)):
+        reasons.append("source_aware_not_direct_official_smpl")
+    if bool(source_preprocess.get("retargeting_applied", True)):
+        reasons.append("source_aware_contract_retargeting_applied")
+    segment = report.get("preprocess_segment", {})
+    if not bool(segment.get("clean", False)):
+        reasons.append("source_aware_segment_not_clean")
 
     return not reasons, reasons
 
@@ -215,12 +159,6 @@ def save_db(
     std = desc.std(axis=0, keepdims=True) + 1e-6
     desc_z = ((desc - mean) / std).astype(np.float32)
 
-    name_semantic = np.stack(
-        [motion_runtime.filename_semantic_vector_from_meta(m, cfg) for m in meta]
-    ).astype(np.float32)
-    class_semantic = np.stack(
-        [motion_runtime.class_semantic_vector_from_meta(m, cfg) for m in meta]
-    ).astype(np.float32)
 
     db_path = out_dir / "events.npz"
     identity_seed = {
@@ -270,7 +208,6 @@ def save_db(
         "source_files": _field_array(meta, "source_file", "", object),
         "source_assets": _field_array(meta, "source_asset", "", object),
         "source_formats": _field_array(meta, "source_format", "unknown", object),
-        "source_bvh": _field_array(meta, "source_bvh", "", object),
         "source_uids": _field_array(meta, "source_uid", "unknown", object),
         "recording_uids": _field_array(meta, "recording_uid", "unknown", object),
         "sequence_ids": _field_array(meta, "sequence_id", "unknown", object),
@@ -278,8 +215,19 @@ def save_db(
         "dancer_id_statuses": _field_array(meta, "dancer_id_status", "unverified", object),
         "manifest_sha256": _field_array(meta, "manifest_sha256", "", object),
         "performer_track_ids": _field_array(meta, "performer_track_id", -1, np.int32),
+        "recording_performer_counts": _field_array(
+            meta, "recording_performer_count", 1, np.int32
+        ),
+        "solo_compatibilities": _field_array(
+            meta, "solo_compatibility", "unknown", object
+        ),
+        "solo_compatible": _field_array(meta, "solo_compatible", False, np.bool_),
+        "solo_review_statuses": _field_array(
+            meta, "solo_review_status", "unknown", object
+        ),
         "sequence_indices": _field_array(meta, "sequence_index", -1, np.int32),
         "genders": _field_array(meta, "gender", "unknown", object),
+        "performer_groups": _field_array(meta, "performer_group", "unknown", object),
         "labels": _field_array(meta, "label", "unknown", object),
         "parent_labels": _field_array(meta, "parent_label", "unknown", object),
         "dance_keys": _field_array(meta, "dance_key", "unknown", object),
@@ -357,8 +305,6 @@ def save_db(
         "take_ids": np.asarray(
             [_safe_take(m.get("take_id", -1)) for m in meta], dtype=np.int32
         ),
-        "name_semantic": name_semantic,
-        "class_semantic": class_semantic,
         "durations": _field_array(meta, "duration", 0.0, np.float32),
         "frames": _field_array(meta, "frames", 0, np.int32),
         "starts": _field_array(meta, "start", 0, np.int32),
@@ -498,6 +444,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source_reports: List[dict] = []
     dropped_events: List[dict] = []
     rejected_sources: List[dict] = []
+    excluded_non_solo_sources: List[dict] = []
     event_idx = 0
 
     for file_idx, path in enumerate(files, 1):
@@ -527,24 +474,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else ""
             )
         )
-        if source_format == "chang_e_official_smpl":
-            if not isinstance(report_metadata, dict):
-                raise RuntimeError(
-                    f"Formal SMPL report lacks source_metadata: {path}"
-                )
-            formal_metadata = dict(report_metadata)
-            formal_metadata["source_format"] = "chang_e_official_smpl"
-            formal_metadata["manifest_sha256"] = rep.get(
-                "source_manifest_sha256"
+        if source_format != "chang_e_official_smpl":
+            raise RuntimeError(
+                "Current Event-DB protocol accepts only official SMPL caches; "
+                f"got source_format={source_format!r}: {path}"
             )
-            sem = motion_runtime.official_smpl_semantics_from_metadata(
-                formal_metadata
+        if not isinstance(report_metadata, dict):
+            raise RuntimeError(f"Formal SMPL report lacks source_metadata: {path}")
+        missing_solo_fields = sorted(
+                {
+                    "recording_performer_count",
+                    "solo_compatibility",
+                    "solo_compatible",
+                    "solo_review_status",
+                }
+                - set(report_metadata)
             )
-        else:
-            sem = motion_runtime.parse_change_bvh_semantics(original_source)
+        if missing_solo_fields:
+            raise RuntimeError(
+                "Formal SMPL cache predates the solo-routing metadata contract; "
+                f"rebuild it, missing={missing_solo_fields}: {path}"
+            )
+        formal_metadata = dict(report_metadata)
+        formal_metadata["source_format"] = "chang_e_official_smpl"
+        formal_metadata["manifest_sha256"] = rep.get("source_manifest_sha256")
+        sem = motion_runtime.official_smpl_semantics_from_metadata(formal_metadata)
         strong_base = motion_runtime.strong_action_semantics_from_meta(sem)
         semantic_meta = {**sem, **strong_base}
         source_uid = str(sem.get("source_uid") or Path(original_source).stem)
+        require_solo = str(
+            os.environ.get("PERFORMER_REQUIRE_SOLO_COMPATIBLE", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if (
+            require_solo
+            and not bool(sem.get("solo_compatible", False))
+        ):
+            excluded_non_solo_sources.append(
+                {
+                    "source_uid": source_uid,
+                    "recording_uid": sem.get("recording_uid"),
+                    "recording_performer_count": sem.get(
+                        "recording_performer_count"
+                    ),
+                    "solo_compatibility": sem.get("solo_compatibility"),
+                    "solo_review_status": sem.get("solo_review_status"),
+                    "reason": "unreviewed_multi_performer_recording_excluded_from_formal_single_person_db",
+                }
+            )
+            continue
         preprocess_segment = rep.get("preprocess_segment", {})
         source_segment_index = int(preprocess_segment.get("segment_index", 0))
         source_segment_start_seconds = float(preprocess_segment.get("source_start_seconds", 0.0))
@@ -653,12 +630,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     **sem,
                     "source_file": original_source,
                     "source_asset": original_source,
-                    "source_bvh": (
-                        ""
-                        if source_format == "chang_e_official_smpl"
-                        else Path(original_source).name
-                    ),
-                    "source_format": source_format or "legacy_bvh",
+                    "source_format": "chang_e_official_smpl",
                     "load_path": str(path),
                     "source_uid": source_uid,
                     "source_group": source_uid,
@@ -669,11 +641,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "fragment_index": int(seg_idx),
                     "source_segment_index": int(source_segment_index),
                     "source_segment_start_seconds": float(source_segment_start_seconds),
-                    "input_mode": (
-                        "chang_e_official_smpl_source_aware_cache"
-                        if str(rep.get("schema", "")) == "chang_e_official_smpl_source_aware_preprocess_v1"
-                        else "event_heading_source_motion_retarget_cache"
-                    ),
+                    "input_mode": "chang_e_official_smpl_source_aware_cache",
                     "event_start": int(st),
                     "event_end": int(ed),
                     "event_source_frames": int(len(seq)),
@@ -827,6 +795,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "output_db": str(db_path),
         "num_input_files": int(len(files)),
         "num_rejected_sources": int(len(rejected_sources)),
+        "num_excluded_non_solo_sources": int(len(excluded_non_solo_sources)),
         "num_events": int(len(meta)),
         "num_dropped_events": int(len(dropped_events)),
         "num_source_uids": int(len(set(source_uids))),
@@ -856,6 +825,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
         "source_reports": source_reports,
         "rejected_sources": rejected_sources,
+        "excluded_non_solo_sources": excluded_non_solo_sources,
         "dropped_events": dropped_events,
     }
     report_path = out_dir / "event_heading_db_report.json"

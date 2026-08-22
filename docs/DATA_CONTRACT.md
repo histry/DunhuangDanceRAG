@@ -1,39 +1,34 @@
-# Data and Asset Contract
+# Data and asset contract
 
-## Motion data
+## Motion
 
-Place the 12 Chang-E/Dunhuang BVH sources in `assets/motion/bvh/`. Source split
-is performed before event slicing. The canonical output representation is:
+Formal input is exactly the 14 manifest-authorized Chang-E aligned SMPL NPZ
+sequences in `assets/motion/smpl_official_14/`. Each record declares
+`coordinate_system`, `translation_units`, and `pose_layout`.
 
-`151D = 4 foot contacts + root XYZ + 24 x Rot6D`.
+The adapter explicitly maps `poses[T,165]` to 22 body joints, expands to
+SMPL24, and zero-fills unavailable hand joints. The canonical downstream tensor
+is `151D = 4 contacts + root XYZ + 24 x Rot6D`.
 
-## Music data
+Splits are recording-group-disjoint and category-covered when feasible.
+Verified dancer-disjoint claims are forbidden unless authoritative dancer IDs
+exist. Single-recording themes belong in leave-one-theme-out evaluation, not
+ordinary category-internal metrics.
 
-- `assets/music/train/`: 788 training songs from the 985-song **multi-genre**
-  music-structure corpus. It must not be described as 985 classical songs.
-- `assets/music/classical_eval/`: independent classical-music evaluation set.
-- `assets/music/test/audio/dunhuangwu2.wav`: current whole-song demonstration input.
+## Event semantics
 
-Evaluation and test music must never be passed to unpaired music training.
+The Event-DB separates source identity, dance theme, multi-label local action,
+source-only cultural context, and weak music compatibility. Local actions are:
+`pose_hold`, `locomotion`, `turn_spin`, `jump_aerial`, `floorwork`,
+`upper_body_gesture`, `rhythmic_accent`, `transition`, and `unknown`.
 
-## Bootstrap music prior and formal Scheduler assets
+## Music
 
-`assets/weights/music/router.pt` is a historical music-domain prior.  A formal
-run may import only its `music_encoder` branch (frozen by default).  Its motion
-encoder, the historical Planner and the historical Duration model are not
-valid after the Generation Event-DB or FPS changes.
+The formal feature contract is strict Librosa 12D. Any extraction fallback
+terminates corpus preparation. Chang-E has no paired audio, so Router
+supervision is an explicitly non-ground-truth local semantic-OT teacher.
+`paired_audio_motion=false`, `human_training_labels=0`, and
+`external_pretrained_model=false` are embedded in checkpoints.
 
-Every full run therefore performs this ordered chain:
-
-1. rebuild the source-disjoint Event-DB and Generation-aligned Scheduler index;
-2. train a new Router motion branch against that exact ordered index;
-3. train a new Duration model with explicit `pytorch3d_row` native layout and
-   canonical-column boundary conversion;
-4. train a new whole-song Planner from song-disjoint weak labels produced by
-   the new Router;
-5. validate FPS, SMPL24, ordered `event_uid` fingerprint, Rot6D layout and file
-   hashes before same-WAV regression;
-6. only after that gate, train the semantic retriever, boundary refiner, and motion diffusion.
-
-Motion-side retriever/refiner/diffusion and the grounding model are trained into
-each run's `checkpoints/` directory.
+No trained checkpoint or generated index is bundled as a formal asset. Every
+formal run rebuilds them from the current Event-DB and music corpus.

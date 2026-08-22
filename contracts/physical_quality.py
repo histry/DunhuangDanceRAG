@@ -1323,7 +1323,7 @@ def _evaluate_source_reference_relative(
         "source_policy": policy.to_dict(),
         "final_rotation_integrity_limits": final_limits.as_audit_limits(),
         "source_si_jerk_diagnostic_only": True,
-        "legacy_body_normalized_jerk_diagnostic_only": True,
+        "body_normalized_jerk_diagnostic_only": True,
         "relative_checks": relative_checks,
         "audit": dict(audit),
         "source_reference_audit": dict(source_reference_audit),
@@ -1343,46 +1343,22 @@ def evaluate_source_physical_clean_audit(
 ) -> Dict[str, Any]:
     """Fail-closed pre-training gate, distinct from final-generation quality.
 
-    Formal Retarget Clean callers should provide ``source_reference_audit``
+    Formal Retarget Clean callers must provide ``source_reference_audit``
     computed from aligned/resampled pre-retarget recorded keypoints.  In that
     mode authentic dynamics are preserved and only *regression versus source*
-    is rejected.  A legacy fallback is retained for older external callers that
-    do not yet supply a reference; the formal cache builder never uses it.
+    is rejected. Missing source evidence is a contract error.
     """
 
-    if source_reference_audit is not None:
-        return _evaluate_source_reference_relative(
-            audit,
-            source_reference_audit,
-            final_limits=limits or PhysicalQualityLimits.from_environment(),
-            policy=policy or SourcePhysicalQualityPolicy.from_environment(),
+    if source_reference_audit is None:
+        raise RuntimeError(
+            "source_reference_audit is required for the formal pre-training source gate"
         )
-
-    # Backward-compatible legacy mode.  This is intentionally marked so formal
-    # pipeline reports can reject/identify it if desired.
-    full = evaluate_physical_audit(audit, limits=limits)
-    required_layers = (
-        "contract",
-        "anti_jitter",
-        "foot_contact",
-        "root_vertical",
-        "rotation_quality",
+    return _evaluate_source_reference_relative(
+        audit,
+        source_reference_audit,
+        final_limits=limits or PhysicalQualityLimits.from_environment(),
+        policy=policy or SourcePhysicalQualityPolicy.from_environment(),
     )
-    layers = {name: dict(full["layers"][name]) for name in required_layers}
-    reasons = [
-        reason for name in required_layers for reason in layers[name]["reasons"]
-    ]
-    return {
-        "schema": "source_physical_clean_gate_v1_legacy_absolute",
-        "contract_role": "pretraining_source_retarget",
-        "mode": "legacy_absolute_no_source_reference",
-        "ok": not reasons,
-        "reasons": reasons,
-        "excluded_final_only_layers": ["long_horizon_root_drift"],
-        "limits": dict(full["limits"]),
-        "audit": dict(audit),
-        "layers": layers,
-    }
 
 
 def _allowed_after_stage(

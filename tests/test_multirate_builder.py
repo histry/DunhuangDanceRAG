@@ -35,11 +35,15 @@ class MultirateBuilderTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "source"
             source.mkdir()
+            manifest_path = source / "sources.json"
+            manifest_path.write_text("{}", encoding="utf-8")
             output = root / "output"
             result = main(
                 [
-                    "--source_dirs",
+                    "--smpl_dir",
                     str(source),
+                    "--smpl_manifest",
+                    str(manifest_path),
                     "--output_root",
                     str(output),
                     "--base_config",
@@ -54,7 +58,7 @@ class MultirateBuilderTests(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["schema"],
-                "dunhuang_multirate_build_plan_v2_source_disjoint",
+                "dunhuang_multirate_build_plan_v3_official_smpl14",
             )
             for branch in manifest["branches"].values():
                 commands = branch["commands"]
@@ -64,8 +68,9 @@ class MultirateBuilderTests(unittest.TestCase):
                     if "-m" in command
                 ]
                 self.assertIn("data_pipeline.split_sources", modules)
-                self.assertEqual(modules.count("events.build_pipeline"), 3)
-                self.assertNotIn("events.build_database", modules)
+                self.assertIn("retargeting.official_smpl_source_preprocess", modules)
+                self.assertEqual(modules.count("events.build_database"), 3)
+                self.assertNotIn("events.build_pipeline", modules)
                 self.assertIn("train", branch["event_dbs"])
                 self.assertIn("val", branch["event_dbs"])
                 self.assertIn("test", branch["event_dbs"])

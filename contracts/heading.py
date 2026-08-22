@@ -362,11 +362,26 @@ def infer_turn_intent(
     monotonic = float(metrics["monotonicity"])
     p95 = float(metrics["yaw_speed_deg_s_p95"])
     duration = float(metrics["duration_seconds"])
+    longest_same_sign = float(metrics["longest_same_sign_turn_seconds"])
 
     local_e = local_rotation_energy_np(motion, fps=fps)
     local_p95 = float(np.percentile(local_e, 95)) if local_e.size else 0.0
     root_dominance = float(
         np.radians(p95) / max(local_p95, 1e-5)
+    )
+    # Chang-E local events do not carry hand-authored per-window turn labels.
+    # A sustained, directionally coherent root rotation is therefore positive
+    # local motion evidence, not a capture reset merely because source-level
+    # semantics are silent.  Reset/drift is considered only after this test.
+    motion_turn_evidence = bool(
+        duration >= env_float("EVENT_HEADING_MOTION_TURN_MIN_SECONDS", 0.75)
+        and net >= env_float("EVENT_HEADING_MOTION_TURN_MIN_NET_DEG", 45.0)
+        and p95 >= env_float("EVENT_HEADING_MOTION_TURN_MIN_P95_DEG_S", 20.0)
+        and (
+            monotonic >= env_float("EVENT_HEADING_MOTION_TURN_MIN_MONOTONICITY", 0.35)
+            or longest_same_sign
+            >= env_float("EVENT_HEADING_MOTION_TURN_MIN_SAME_SIGN_SECONDS", 0.60)
+        )
     )
 
     if strength >= 0.80 and (net >= 270.0 or absolute >= 360.0):
@@ -375,6 +390,14 @@ def infer_turn_intent(
     elif strength >= 0.55 and (net >= 45.0 or p95 >= 25.0):
         intent = "turn"
         confidence = min(1.0, 0.55 + 0.30 * strength + 0.15 * monotonic)
+    elif motion_turn_evidence:
+        intent = "turn"
+        confidence = min(
+            0.90,
+            0.55
+            + 0.20 * monotonic
+            + 0.15 * min(1.0, longest_same_sign / max(duration, 1.0e-6)),
+        )
     else:
         provisional_budget = default_yaw_budget_deg(meta, "none")
         reset_like = bool(
@@ -399,6 +422,7 @@ def infer_turn_intent(
         "semantic_turn_strength": strength,
         "local_rotation_energy_p95_rad_s": local_p95,
         "root_rotation_dominance": root_dominance,
+        "motion_turn_evidence": motion_turn_evidence,
         "metrics": metrics,
     }
 
@@ -482,6 +506,7 @@ def enforce_event_heading_contract(
             inferred["local_rotation_energy_p95_rad_s"]
         ),
         "root_rotation_dominance": float(inferred["root_rotation_dominance"]),
+        "motion_turn_evidence": bool(inferred["motion_turn_evidence"]),
     }
     return corrected.astype(np.float32), report
 

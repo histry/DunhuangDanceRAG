@@ -40,19 +40,21 @@ from model.music_motion_router import load_router_checkpoint
 from model.duration_predictor import load_duration_checkpoint
 from model.whole_song_planner import load_planner_checkpoint
 from scheduling.index_io import load_shared_index, resolve_event_motion_path
-from scheduling.retrieval import precompute_music_similarity
+from scheduling.retrieval import (
+    LOCAL_ACTION_LABELS,
+    aggregate_action_compatibility,
+    precompute_music_routing,
+)
 from scheduling.transition_builder import (
     load_optional_transition,
     refine_transition,
 )
 from support.scheduler_common import (
     CONTACT,
-    EVENT_TYPES,
     ROOT_X,
     ROOT_Z,
     ROT,
     apply_start_anchor,
-    event_compatibility,
     intrinsic_transition_cost_from_arrays,
     posture_state_distance,
     json_safe,
@@ -82,7 +84,11 @@ from scheduling.music_phrase_segmentation import (
     split_music_phrases_for_events,
     whole_song_features,
 )
-from scheduling.deep_music_features import phrase_semantic_matrix
+from scheduling.temporal_router_contract import (
+    assert_formal_planner_scientific_contract,
+    assert_formal_router_scientific_contract,
+    phrase_feature_sequences,
+)
 from scheduling.schedule_hard_constraints import (
     DEFAULT_MAX_POSE_HOLD_RATIO,
     DEFAULT_MAX_SINGLE_SOURCE_RATIO,
@@ -90,7 +96,6 @@ from scheduling.schedule_hard_constraints import (
     DEFAULT_MIN_UNIQUE_EVENTS,
     assert_schedule_hard_constraints,
 )
-from scheduling.transition_diffusion import load_transition_diffusion, sample_transition_diffusion
 from support.scheduler_checkpoint_contracts import assert_scheduler_checkpoint_contract
 from motion_geometry.heading import ROOT_ROT6D
 
@@ -117,41 +122,14 @@ def planner_predictions(
     device: torch.device,
     fps: float,
 ) -> Dict[str, np.ndarray]:
-    k = len(phrases)
     if planner_bundle is None:
-        event_map = {
-            "calm_flow": "calm_flow",
-            "release": "release",
-            "build_up": "build_up",
-            "climax": "high_tension",
-            "accent": "arm_flourish",
-            "section_change": "support_shift",
-            "neutral_flow": "neutral_flow",
-        }
-        event_ids = np.asarray(
-            [EVENT_TYPES.index(event_map.get(p.music_event, "neutral_flow")) for p in phrases],
-            dtype=np.int64,
-        )
-        # Music-dominant fallback: phrase length is the first duration prior;
-        # natural duration will constrain this later in the global allocator.
-        minimum = max(1, int(round(0.4 * float(fps))))
-        durations = np.asarray([max(minimum, p.length - (0 if i == 0 else p.transition_base_frames)) for i, p in enumerate(phrases)], dtype=np.float32)
-        transitions = np.asarray([0] + [2] * max(0, k - 1), dtype=np.int64)
-        activity = np.asarray([float(np.asarray(p.query)[0]) for p in phrases], dtype=np.float32)
-        return {
-            "event_ids": event_ids,
-            "durations": durations,
-            "transition_class": transitions,
-            "activity": activity,
-            "mode": np.asarray(["music_rule"], dtype=object),
-        }
+        raise RuntimeError("Current-protocol scheduling requires a Planner checkpoint")
 
     model = planner_bundle["model"]
     features = np.stack([np.asarray(p.planner_feature, dtype=np.float32) for p in phrases])[None]
     with torch.no_grad():
         output = model(torch.from_numpy(features).to(device))
     return {
-        "event_ids": output["event_logits"][0].argmax(-1).cpu().numpy().astype(np.int64),
         "durations": output["duration_frames"][0].cpu().numpy().astype(np.float32),
         "transition_class": output["transition_logits"][0].argmax(-1).cpu().numpy().astype(np.int64),
         "activity": output["activity"][0].cpu().numpy().astype(np.float32),
@@ -377,21 +355,13 @@ def dynamic_transition_len(
 
 
 def planner_bundle_lengths(path: str, fps: float) -> Tuple[int, ...]:
-    if not path:
-        return tuple(int(round(x * float(fps) / 30.0)) for x in (12, 16, 20, 24, 30, 36, 42, 48))
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
     checkpoint_fps = config.get("fps")
     if checkpoint_fps is None:
-        legacy_ok = (
-            abs(float(fps) - 30.0) < 1.0e-6
-            and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS", "0") == "1"
+        raise RuntimeError(
+            f"Planner checkpoint {path} has no FPS contract. Rebuild it for {fps} FPS."
         )
-        if not legacy_ok:
-            raise RuntimeError(
-                f"Planner checkpoint {path} has no FPS contract. Rebuild it for {fps} FPS. "
-                "Legacy weights are allowed only for the explicit 30 FPS parity baseline."
-            )
     elif abs(float(checkpoint_fps) - float(fps)) > 1.0e-6:
         raise RuntimeError(
             f"Planner checkpoint FPS mismatch: checkpoint={checkpoint_fps}, runtime={fps}"
@@ -423,7 +393,7 @@ def validate_scheduler_checkpoint(
 
 def choose_events(
     phrases: Sequence[MusicPhrase],
-    phrase_semantics: np.ndarray,
+    phrase_sequences: np.ndarray,
     predictions: Dict[str, np.ndarray],
     arrays,
     hierarchy,
@@ -493,22 +463,26 @@ def choose_events(
     event_types = [str(item.get("event_type", "neutral_flow")) for item in items]
     families = [str(item.get("family_id", "")) for item in items]
     queries = [np.asarray(p.query, dtype=np.float32) for p in phrases]
-    similarities = precompute_music_similarity(router, queries, motion_desc, device)
+    routing = precompute_music_routing(
+        router,
+        queries,
+        motion_desc,
+        device,
+        phrase_sequences=phrase_sequences,
+    )
+    similarities = np.asarray(routing["similarity"], dtype=np.float32)
+    compatibility_probabilities = np.asarray(
+        routing["probabilities"], dtype=np.float32
+    )
+    action_compatibility = aggregate_action_compatibility(
+        compatibility_probabilities, items
+    )
     transition_choices = planner_bundle_lengths(args.planner_ckpt, fps=float(args.fps))
 
     beam = [CandidateState(0.0, [], [], [])]
     for slot, phrase in enumerate(phrases):
-        predicted_event = EVENT_TYPES[int(predictions["event_ids"][slot])]
         predicted_duration = float(predictions["durations"][slot])
         desired_activity = float(predictions["activity"][slot])
-        compat = np.asarray(
-            [
-                0.60 * event_compatibility(phrase.music_event, event)
-                + 0.40 * (1.0 if event == predicted_event else event_compatibility(predicted_event, event))
-                for event in event_types
-            ],
-            dtype=np.float32,
-        )
         transition_guess = 0 if slot == 0 else int(phrase.transition_base_frames)
         slot_content_target = max(
             float(args.min_content_frames),
@@ -560,11 +534,9 @@ def choose_events(
         if args.hierarchical_retrieval:
             hierarchy_query = build_slot_query(
                 phrase,
-                predicted_event=predicted_event,
                 target_natural=target_natural,
                 desired_activity=desired_activity,
-                music_semantic=phrase_semantics[slot] if len(phrase_semantics) > slot else None,
-                deep_music_weight=args.deep_music_weight if args.deep_music_features else 0.0,
+                action_compatibility=action_compatibility[slot],
             )
             hierarchy_score, hierarchy_components = hierarchical_node_scores(hierarchy, hierarchy_query)
         base = (
@@ -572,7 +544,6 @@ def choose_events(
             + args.quality_weight * quality
             + args.safety_weight * safety
             + args.music_weight * similarities[slot]
-            + args.event_weight * compat
             + args.duration_weight * duration_match
             + args.planner_duration_weight * planner_duration_match
             + args.activity_weight * activity_match
@@ -807,7 +778,6 @@ def choose_events(
                     "target_motion_density_source": str(
                         phrase.target_motion_density_source
                     ),
-                    "predicted_motion_event": predicted_event,
                     "predicted_duration": predicted_duration,
                     "event_index": idx,
                     "event_uid": str(items[idx]["event_uid"]),
@@ -825,7 +795,28 @@ def choose_events(
                     "quality": float(quality[idx]),
                     "safety": float(safety[idx]),
                     "music_similarity": float(similarities[slot, idx]),
-                    "event_compatibility": float(compat[idx]),
+                    "router_compatibility_probability": float(
+                        compatibility_probabilities[slot, idx]
+                    ),
+                    "router_uncertainty": float(routing["entropy"][slot]),
+                    "router_confidence": float(routing["confidence"][slot]),
+                    "router_ood": float(routing["ood"][slot]),
+                    "router_architecture": str(routing["architecture"]),
+                    "router_supervision_source": str(
+                        routing["supervision_source"]
+                    ),
+                    "router_compatibility_is_ground_truth": False,
+                    "action_compatibility_probs": {
+                        label: float(action_compatibility[slot, action_index])
+                        for action_index, label in enumerate(LOCAL_ACTION_LABELS)
+                    },
+                    "action_compatibility_top": str(
+                        LOCAL_ACTION_LABELS[
+                            int(np.argmax(action_compatibility[slot]))
+                        ]
+                    ),
+                    "action_compatibility_supervision": "semantic_ot_teacher_x_weak_motion_kinematics",
+                    "action_compatibility_is_ground_truth": False,
                     "duration_match": float(duration_match[idx]),
                     "planner_duration_match": float(planner_duration_match[idx]),
                     "activity_match": float(activity_match[idx]),
@@ -836,6 +827,9 @@ def choose_events(
                     "candidate_top_k": int(args.candidate_top_k),
                     "graph_node_top_k": int(node_top_k),
                     "hierarchy_enabled": bool(args.hierarchical_retrieval),
+                    "hierarchy_semantic_contract": str(
+                        hierarchy_query.get("semantic_contract", "disabled")
+                    ),
                     "hierarchy_query_group": int(hierarchy_query.get("group", -1)) if hierarchy_query else -1,
                     "hierarchy_score": float(hierarchy_score[idx]) if args.hierarchical_retrieval else 0.0,
                     "hierarchy_hyper_score": float(hierarchy_components.get("hierarchy_hyper_score", np.zeros_like(style))[idx]) if args.hierarchical_retrieval else 0.0,
@@ -865,6 +859,48 @@ def choose_events(
         if not expanded:
             raise RuntimeError(
                 f"No Whole-Song Planner candidate for phrase {slot}. Increase candidate_top_k/graph_node_top_k or relax hard pruning."
+            )
+        # Preserve formal alternatives from the same beam prefix.  Boundary
+        # closed-loop repair may reselect only among these siblings, which have
+        # already passed this Scheduler's semantic, identity, source-share and
+        # physical-edge constraints.  It must never rebuild alternatives with
+        # the historical MSSD/AESD categorical retriever.
+        siblings: Dict[tuple[int, ...], List[CandidateState]] = {}
+        for candidate_state in expanded:
+            prefix = tuple(candidate_state.selected[:-1])
+            siblings.setdefault(prefix, []).append(candidate_state)
+        formal_candidate_limit = max(
+            1, int(getattr(args, "formal_candidate_top_k", 48))
+        )
+        for candidate_state in expanded:
+            prefix = tuple(candidate_state.selected[:-1])
+            ranked = sorted(
+                siblings[prefix], key=lambda value: value.score, reverse=True
+            )
+            selected_index = int(candidate_state.selected[-1])
+            ordered_states = [candidate_state] + [
+                value
+                for value in ranked
+                if int(value.selected[-1]) != selected_index
+            ]
+            ordered_states = ordered_states[:formal_candidate_limit]
+            candidate_state.parts[-1]["formal_candidate_event_uids"] = [
+                str(items[int(value.selected[-1])]["event_uid"])
+                for value in ordered_states
+            ]
+            candidate_state.parts[-1][
+                "formal_candidate_router_probabilities"
+            ] = [
+                float(
+                    value.parts[-1]["router_compatibility_probability"]
+                )
+                for value in ordered_states
+            ]
+            candidate_state.parts[-1]["formal_candidate_scheduler_scores"] = [
+                float(value.score) for value in ordered_states
+            ]
+            candidate_state.parts[-1]["formal_candidate_contract"] = (
+                "ctsr_weak_scheduler_siblings_v1"
             )
         expanded.sort(key=lambda state: state.score, reverse=True)
         beam = expanded[: args.beam_size]
@@ -944,25 +980,28 @@ def generate_one(
         beat_snap_seconds=args.slot_beat_snap_seconds,
         calm_max_slot_seconds=args.calm_max_single_event_seconds,
     )
+    router_sequence_frames = int(getattr(router, "sequence_frames", 0))
+    if router_sequence_frames < 2:
+        raise RuntimeError("CTSR-Weak checkpoint has no valid sequence_frames contract")
+    temporal_sequences = phrase_feature_sequences(
+        features, phrases, router_sequence_frames
+    )
     if len(phrases) > args.max_phrases:
         raise RuntimeError(
             f"{audio_path}: detected {len(phrases)} event slots, above --max_phrases={args.max_phrases}. "
             "Increase max_phrases or max_single_event_seconds."
         )
-    phrase_semantics, semantic_meta = phrase_semantic_matrix(
-        audio_path,
-        phrases,
-        enabled=bool(args.deep_music_features),
-        model_name=str(args.deep_music_model),
-        cache_dir=args.deep_music_cache or args.feature_dir,
-        require_deep=bool(args.require_deep_music),
-        min_deep_success=float(args.deep_music_min_success),
-        fps=float(args.fps),
-    )
+    # CTSR probabilities are the only music--motion semantic evidence.  The
+    # hierarchy receives no second externally pretrained embedding.
+    semantic_meta = {
+        "schema": "librosa12d_ctsr_router_only_v1",
+        "external_pretrained_model": False,
+        "used_for_routing": False,
+    }
     predictions = planner_predictions(phrases, planner_bundle, device, fps=float(args.fps))
     selected_state = choose_events(
         phrases,
-        phrase_semantics,
+        temporal_sequences,
         predictions,
         arrays,
         hierarchy,
@@ -1129,29 +1168,6 @@ def generate_one(
                 content,
                 canonical_root=rough,
             )
-            if args.transition_diffusion and args.transition_diffusion_ckpt:
-                transition, diffusion_meta = sample_transition_diffusion(
-                    args.transition_diffusion_bundle,
-                    contents[slot - 1][-1],
-                    content[0],
-                    k,
-                    np.asarray(phrases[slot].query, dtype=np.float32),
-                    rough=transition,
-                    device=device,
-                    blend=args.transition_diffusion_blend,
-                    steps=args.transition_diffusion_steps,
-                    previous_context=contents[slot - 1],
-                    next_context=content,
-                    fps=float(args.fps),
-                )
-                transition = enforce_yaw_safe_transition(
-                    transition,
-                    contents[slot - 1],
-                    content,
-                    canonical_root=rough,
-                )
-            else:
-                diffusion_meta = {"enabled": False}
             # Learned transition heads operate in Euclidean 6D coordinates.
             # Canonicalize every joint once before FK floor/contact audits so
             # the saved bridge and the audited bridge are the same rotations.
@@ -1175,7 +1191,6 @@ def generate_one(
             )
             metrics["transition_len"] = k
             metrics["transition_meta"] = selected_state.parts[slot].get("transition_meta", {})
-            metrics["transition_diffusion"] = diffusion_meta
             metrics["transition_root_contract"] = {
                 "mode": "endpoint_velocity_aware_so3_root_hermite",
                 "preserves_root_xz": True,
@@ -1215,11 +1230,6 @@ def generate_one(
                 if transition_bundle is not None
                 else None
             ),
-            "transition_diffusion_checkpoint_rot6d_layout": (
-                args.transition_diffusion_bundle.get("rot6d_layout")
-                if args.transition_diffusion_bundle is not None
-                else None
-            ),
         },
         "planner_mode": str(predictions["mode"][0]),
         "music_semantic": semantic_meta,
@@ -1242,13 +1252,11 @@ def generate_one(
             "hierarchical_retrieval": bool(args.hierarchical_retrieval),
             "graph_scheduler": bool(args.graph_scheduler),
             "hierarchy_index_npz": str(args.hierarchy_index_npz),
+            "hierarchy_semantic_contract": str(
+                getattr(args, "hierarchy_semantic_contract", "unspecified")
+            ),
             "hierarchy_weight": float(args.hierarchy_weight),
-            "deep_music_features": bool(args.deep_music_features),
-            "deep_music_model": str(args.deep_music_model),
-            "deep_music_weight": float(args.deep_music_weight),
-            "require_deep_music": bool(args.require_deep_music),
             "require_rhythm_features": bool(args.require_rhythm_features),
-            "deep_music_min_success": float(args.deep_music_min_success),
             "graph_node_top_k": int(args.graph_node_top_k),
             "graph_edge_weight": float(args.graph_edge_weight),
             "graph_hard_prune": bool(args.graph_hard_prune),
@@ -1299,10 +1307,6 @@ def generate_one(
             "max_single_recording_ratio": float(args.max_recording_share),
             "min_unique_events": int(args.min_unique_events),
             "min_core_frame_ratio": float(args.min_core_frame_ratio),
-            "transition_diffusion": bool(args.transition_diffusion),
-            "transition_diffusion_ckpt": str(args.transition_diffusion_ckpt),
-            "transition_diffusion_blend": float(args.transition_diffusion_blend),
-            "transition_diffusion_steps": int(args.transition_diffusion_steps),
         },
     }
     for slot, resampling in enumerate(resampling_reports):
@@ -1319,13 +1323,11 @@ def main() -> None:
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--router_ckpt", required=True)
     parser.add_argument("--duration_model_ckpt", required=True)
-    parser.add_argument("--planner_ckpt", default="")
+    parser.add_argument("--planner_ckpt", required=True)
     parser.add_argument("--transition_ckpt", default="")
-    parser.add_argument("--transition_diffusion_ckpt", default="")
     parser.add_argument("--hierarchy_index_npz", default="")
     parser.add_argument("--hyperbolic_ckpt", default="")
     parser.add_argument("--feature_dir", default="")
-    parser.add_argument("--deep_music_cache", default="")
     parser.add_argument("--start_pose", default="")
     parser.add_argument("--start_anchor_blend", type=int, default=8)
     parser.add_argument("--fps", type=float, default=30.0)
@@ -1350,22 +1352,22 @@ def main() -> None:
     parser.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
     parser.add_argument("--beam_size", type=int, default=24)
     parser.add_argument("--candidate_top_k", type=int, default=256)
+    parser.add_argument(
+        "--formal_candidate_top_k",
+        type=int,
+        default=48,
+        help="Audited CTSR Scheduler sibling candidates retained for boundary repair.",
+    )
     parser.add_argument("--style_weight", type=float, default=1.35)
     parser.add_argument("--quality_weight", type=float, default=0.65)
     parser.add_argument("--safety_weight", type=float, default=0.35)
     parser.add_argument("--music_weight", type=float, default=0.90)
-    parser.add_argument("--event_weight", type=float, default=0.70)
     parser.add_argument("--duration_weight", type=float, default=0.45)
     parser.add_argument("--planner_duration_weight", type=float, default=0.15)
     parser.add_argument("--activity_weight", type=float, default=0.25)
     parser.add_argument("--hierarchical_retrieval", type=_bool_arg, default=True)
     parser.add_argument("--hierarchy_weight", type=float, default=0.55)
-    parser.add_argument("--deep_music_features", type=_bool_arg, default=False)
-    parser.add_argument("--deep_music_model", default="clap")
-    parser.add_argument("--deep_music_weight", type=float, default=0.25)
-    parser.add_argument("--require_deep_music", type=_bool_arg, default=False)
     parser.add_argument("--require_rhythm_features", type=_bool_arg, default=False)
-    parser.add_argument("--deep_music_min_success", type=float, default=0.80)
     parser.add_argument("--graph_scheduler", type=_bool_arg, default=True)
     parser.add_argument("--graph_node_top_k", type=int, default=96)
     parser.add_argument("--graph_edge_weight", type=float, default=0.45)
@@ -1439,9 +1441,6 @@ def main() -> None:
     parser.add_argument("--transition_max_frames", type=int, default=24)
     parser.add_argument("--max_transition_fraction", type=float, default=0.20)
     parser.add_argument("--transition_budget_min_frames", type=int, default=6)
-    parser.add_argument("--transition_diffusion", type=_bool_arg, default=False)
-    parser.add_argument("--transition_diffusion_blend", type=float, default=0.45)
-    parser.add_argument("--transition_diffusion_steps", type=int, default=12)
     parser.add_argument("--stage_floor_y", type=float, default=0.0)
     parser.add_argument("--event_floor_quantile", type=float, default=5.0)
     parser.add_argument("--event_max_floor_penetration_m", type=float, default=0.005)
@@ -1518,12 +1517,7 @@ def main() -> None:
         Path(args.duration_index_npz),
     )
     index_rates = [float(value) for value in metadata.get("canonical_fps_values", [])]
-    legacy_30_ok = (
-        not index_rates
-        and abs(float(args.fps) - 30.0) < 1.0e-6
-        and os.environ.get("DUNHUANG_ALLOW_LEGACY_30FPS_INDEX", "0") == "1"
-    )
-    if not legacy_30_ok and index_rates != [float(args.fps)]:
+    if index_rates != [float(args.fps)]:
         raise RuntimeError(
             "Scheduler FPS contract mismatch: "
             f"index={index_rates!r}, runtime={[float(args.fps)]!r}. "
@@ -1534,7 +1528,19 @@ def main() -> None:
         raise RuntimeError(
             "duration_index_npz lacks natural_duration. Run scheduling/build_duration_index.py first."
         )
-    hierarchy = load_or_build_hierarchy(arrays, items, args.hierarchy_index_npz, hyperbolic_ckpt=args.hyperbolic_ckpt)
+    hierarchy = load_or_build_hierarchy(
+        arrays,
+        items,
+        args.hierarchy_index_npz,
+        hyperbolic_ckpt=args.hyperbolic_ckpt,
+    )
+    args.hierarchy_semantic_contract = str(
+        np.asarray(
+            hierarchy.get(
+                "hierarchy_semantic_contract", np.asarray(["unspecified"])
+            )
+        ).reshape(-1)[0]
+    )
     motions = [
         load_motion(resolve_event_motion_path(item, index_json, metadata=metadata))
         for item in items
@@ -1556,32 +1562,55 @@ def main() -> None:
         args.index_json,
         args.duration_index_npz,
     )
-    if args.planner_ckpt:
-        validate_scheduler_checkpoint(
-            args.planner_ckpt,
-            "Planner",
-            float(args.fps),
-            metadata["event_db_contract"],
-            args.index_json,
-            args.duration_index_npz,
-        )
+    validate_scheduler_checkpoint(
+        args.planner_ckpt,
+        "Planner",
+        float(args.fps),
+        metadata["event_db_contract"],
+        args.index_json,
+        args.duration_index_npz,
+    )
     router = load_router_checkpoint(args.router_ckpt, device=device)
+    if str(getattr(router, "architecture", "")) != "ctsr_weak_temporal_v1":
+        raise RuntimeError(
+            "Formal fresh-audio scheduling requires architecture=ctsr_weak_temporal_v1"
+        )
+    raw_router_checkpoint = torch.load(
+        args.router_ckpt, map_location="cpu", weights_only=False
+    )
+    if not isinstance(raw_router_checkpoint, dict):
+        raise RuntimeError("Formal Router checkpoint is not a mapping")
+    assert_formal_router_scientific_contract(raw_router_checkpoint)
+    raw_planner_checkpoint = torch.load(
+        args.planner_ckpt, map_location="cpu", weights_only=False
+    )
+    if not isinstance(raw_planner_checkpoint, dict):
+        raise RuntimeError("Formal Planner checkpoint is not a mapping")
+    assert_formal_planner_scientific_contract(raw_planner_checkpoint)
+    local_action_contract = metadata.get("local_action_contract")
+    if not isinstance(local_action_contract, dict):
+        raise RuntimeError(
+            "Formal CTSR-Weak requires a Generation index with local_action_contract"
+        )
+    if (
+        bool(local_action_contract.get("is_ground_truth", True))
+        or bool(
+            local_action_contract.get(
+                "dance_theme_used_as_local_action_truth", True
+            )
+        )
+        or not bool(local_action_contract.get("multi_label", False))
+    ):
+        raise RuntimeError(
+            f"Invalid formal local-action evidence contract: {local_action_contract}"
+        )
     transition_bundle = load_optional_transition(
         args.transition_ckpt,
         device,
         fps=float(args.fps),
     )
-    args.transition_diffusion_bundle = (
-        load_transition_diffusion(
-            args.transition_diffusion_ckpt,
-            device,
-            fps=float(args.fps),
-        )
-        if args.transition_diffusion and args.transition_diffusion_ckpt
-        else None
-    )
     duration_model_bundle = load_duration_checkpoint(args.duration_model_ckpt, device=device)
-    planner_bundle = load_planner_checkpoint(args.planner_ckpt, device=device) if args.planner_ckpt else None
+    planner_bundle = load_planner_checkpoint(args.planner_ckpt, device=device)
 
     summary = {
         "version": "whole_song_music_dominant_whole_song_choreorag",
@@ -1594,14 +1623,17 @@ def main() -> None:
                 if transition_bundle is not None
                 else None
             ),
-            "transition_diffusion_checkpoint_rot6d_layout": (
-                args.transition_diffusion_bundle.get("rot6d_layout")
-                if args.transition_diffusion_bundle is not None
-                else None
-            ),
         },
         "planner_ckpt": args.planner_ckpt,
         "router_ckpt": args.router_ckpt,
+        "router_contract": {
+            "architecture": str(getattr(router, "architecture", "")),
+            "supervision_source": str(
+                getattr(router, "supervision_source", "unknown")
+            ),
+            "is_ground_truth": False,
+            "categorical_event_compatibility": False,
+        },
         "duration_model_ckpt": args.duration_model_ckpt,
         "transition_ckpt": args.transition_ckpt,
         "event_db_contract": dict(metadata["event_db_contract"]),

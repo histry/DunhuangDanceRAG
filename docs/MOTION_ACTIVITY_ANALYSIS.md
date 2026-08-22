@@ -2,27 +2,18 @@
 
 ## Research objective
 
-The existing whole-song pipeline can produce an EDGE151 sequence that is finite,
+The whole-song pipeline can produce an EDGE151 sequence that is finite,
 boundary-safe, anatomy-safe and physically safe while remaining nearly static.
 This integration adds an independent motion-activity contract. It does not relax
 physical, anatomy, performer or severe-heading hard gates.
 
 ## Direct integration points
 
-The installer modifies the existing project files rather than introducing a
-parallel V-numbered pipeline:
+The current implementation uses the formal entrypoint directly:
 
-- `routing/heading_closed_loop.py`
-  - measures activity on the exact resampled and heading-aligned event core;
-  - adds an activity mismatch penalty to candidate selection;
-  - rejects strongly static candidates only when the music slot requires motion
-    and at least two independent collapse indicators agree;
-  - saves retrieval, refiner, diffusion and full-IK stage outputs.
-- `routing/feasibility_contract.py`
-  - prevents bounded feasibility recovery from clearing an activity hard reject;
-  - preserves all immutable safety gates.
 - `routing/boundary_closed_loop.py`
   - evaluates whole-song and per-slot activity after the physical gate;
+  - saves retrieval, refiner, diffusion and full-IK stage outputs;
   - writes the NPY and diagnostic JSON first, then fails the run when collapse is
     detected so a static result cannot be silently accepted.
 - `configs/experiment.env`
@@ -75,20 +66,11 @@ Interpretation:
 | full_ik | IK/contact correction or heading restoration |
 | all NPY files dynamic but video static | rendering |
 
-## Installation
-
-From the downloaded integration package:
-
-```bash
-python scripts/integrate_motion_activity.py --repo /path/to/DunhuangDanceRAG --check
-python scripts/integrate_motion_activity.py --repo /path/to/DunhuangDanceRAG
-```
-
-Then run:
+## Verification
 
 ```bash
 cd /path/to/DunhuangDanceRAG
-python -m unittest tests.test_motion_activity_analysis -v
+python -m pytest tests/test_motion_activity_analysis.py -v
 ```
 
 Use the normal project launcher afterwards. No alternate V-numbered entrypoint is
@@ -99,7 +81,8 @@ required.
 ```bash
 python evaluation/motion_activity_analysis.py \
   --input outputs/run/motion.npy \
-  --report outputs/run/report.json \
+  --report outputs/run/generation.report.json \
+  --output outputs/run/motion_activity.json \
   --fps 30 \
   --fail-on-collapse
 ```

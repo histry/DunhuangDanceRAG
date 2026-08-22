@@ -15,6 +15,10 @@ from motion_geometry.rotations import (
     normalize_rot6d_layout,
 )
 from scheduling.index_io import load_shared_index
+from scheduling.temporal_router_contract import (
+    assert_formal_planner_scientific_contract,
+    assert_formal_router_scientific_contract,
+)
 from support.scheduler_checkpoint_contracts import (
     assert_scheduler_checkpoint_contract,
 )
@@ -53,10 +57,14 @@ def checkpoint_summary(
         index_json=index_json,
         index_npz=index_npz,
         path=str(path),
-        allow_legacy_30fps=False,
     )
     if contract is None:  # pragma: no cover - prohibited above
         raise RuntimeError(f"Formal Scheduler contract missing: {path}")
+    scientific_contract = None
+    if role == "router":
+        scientific_contract = assert_formal_router_scientific_contract(raw)
+    elif role == "planner":
+        scientific_contract = assert_formal_planner_scientific_contract(raw)
     declared_fps = float(contract["fps"])
     declared_layout = raw.get(
         "rot6d_layout",
@@ -96,6 +104,7 @@ def checkpoint_summary(
         "rotation_contract_policy": rotation_policy,
         "num_state_tensors": len(state),
         "scheduler_contract": contract,
+        "scientific_contract": scientific_contract,
     }
 
 
@@ -116,6 +125,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError(
             f"Scheduler index FPS mismatch: index={index_rates}, requested={[float(args.fps)]}"
         )
+    local_action_contract = metadata.get("local_action_contract")
+    if not isinstance(local_action_contract, dict):
+        raise RuntimeError("Formal Scheduler index has no local_action_contract")
+    if (
+        bool(local_action_contract.get("is_ground_truth", True))
+        or bool(local_action_contract.get("dance_theme_used_as_local_action_truth", True))
+        or not bool(local_action_contract.get("multi_label", False))
+    ):
+        raise RuntimeError(
+            f"Formal Scheduler local-action contract is invalid: {local_action_contract}"
+        )
     paths = {
         "router": Path(args.router_ckpt),
         "planner": Path(args.planner_ckpt),
@@ -130,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fps": float(args.fps),
         "skeleton_contract": metadata["skeleton_contract"],
         "event_db_contract": metadata["event_db_contract"],
+        "local_action_contract": local_action_contract,
         "index_json": str(Path(args.index_json).resolve()),
         "index_npz": str(Path(args.index_npz).resolve()),
         "index_json_sha256": sha256_file(Path(args.index_json)),
@@ -148,13 +169,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "asset_bundle_rebuilt": True,
         "checkpoint_policy": (
             "Router/Duration/Planner are trained from the current ordered "
-            "Generation Event-DB. Only the historical Router music encoder "
-            "may be imported as a frozen semantic prior. A previously produced "
-            "formal checkpoint is accepted only when all content hashes match."
+            "Generation Event-DB. The formal Router is initialized from scratch, "
+            "uses Librosa 12D temporal sequences and a declared semantic_ot_teacher, "
+            "and contains neither external pretrained weights nor human labels. "
+            "A previous checkpoint is accepted only when all contracts and hashes match."
         ),
         "required_lifecycle": [
             "build_generation_aligned_scheduler_index",
-            "train_router_from_music_encoder_prior",
+            "train_ctsr_weak_temporal_router_from_scratch",
             "train_duration_with_explicit_native_rot6d_layout",
             "train_whole_song_planner",
             "validate_scheduler_asset_bundle",

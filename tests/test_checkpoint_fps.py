@@ -31,20 +31,18 @@ class CheckpointFpsContractTests(unittest.TestCase):
                     runtime_fps=30.0,
                 )
 
-    def test_legacy_override_is_restricted_to_30fps(self):
+    def test_historical_override_environment_is_ignored(self):
         with patch.dict(
             os.environ,
             {"DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS": "1"},
             clear=True,
         ):
-            self.assertEqual(
+            with self.assertRaisesRegex(RuntimeError, "has no FPS contract"):
                 assert_checkpoint_fps(
                     {"config": {}},
                     role="test",
                     runtime_fps=30.0,
-                ),
-                30.0,
-            )
+                )
             with self.assertRaisesRegex(RuntimeError, "has no FPS contract"):
                 assert_checkpoint_fps(
                     {"config": {}},

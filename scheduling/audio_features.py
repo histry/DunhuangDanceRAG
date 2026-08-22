@@ -37,6 +37,10 @@ class RhythmFeatureError(RuntimeError):
     """Raised when the strict beat/tempo extraction contract is violated."""
 
 
+class AudioFeatureBackendError(RuntimeError):
+    """Raised when the required Librosa backend cannot produce 12D features."""
+
+
 def validate_rhythm_features(
     features: np.ndarray,
     meta: Dict[str, Any],
@@ -168,6 +172,7 @@ def extract_audio_features(
     num_frames: int = 150,
     *,
     require_rhythm: bool = False,
+    require_librosa: bool = False,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     path = Path(audio_path)
     try:
@@ -217,6 +222,7 @@ def extract_audio_features(
         feat = np.stack([energy, onset_n, beat, tempo, arousal, delta, tension, calm, novelty, brightness, section, accent], axis=1).astype(np.float32)
         meta = {
             "backend": "librosa",
+            "backend_version": str(getattr(librosa, "__version__", "unknown")),
             "tempo_bpm": tempo_bpm,
             "sample_rate": int(sr),
             "duration_sec": float(len(y) / sr),
@@ -229,7 +235,13 @@ def extract_audio_features(
         }
     except Exception as exc:
         LOGGER.exception("Librosa audio feature extraction failed for audio=%s", path)
+        if require_librosa:
+            raise AudioFeatureBackendError(
+                "Required Librosa 12D extraction failed; wave_fallback is forbidden "
+                f"for formal training: audio={path}, error={type(exc).__name__}: {exc}"
+            ) from exc
         feat, meta = _fallback_features(path, num_frames)
+        meta["backend_version"] = None
         meta["librosa_error"] = str(exc)
         meta["librosa_error_type"] = type(exc).__name__
         meta["beat_tracking"] = {
@@ -270,12 +282,14 @@ def main() -> None:
     ap.add_argument("--out_json", default="")
     ap.add_argument("--num_frames", type=int, default=150)
     ap.add_argument("--require_rhythm_features", action="store_true")
+    ap.add_argument("--require_librosa_backend", action="store_true")
     args = ap.parse_args()
 
     feat, meta = extract_audio_features(
         args.audio,
         args.num_frames,
         require_rhythm=bool(args.require_rhythm_features),
+        require_librosa=bool(args.require_librosa_backend),
     )
     events = classify_frame_events(feat)
     out_npy = Path(args.out_npy)

@@ -33,19 +33,6 @@ ROOT_X = 4
 ROOT_Y = 5
 ROOT_Z = 6
 ROT = slice(7, 151)
-EVENT_TYPES = (
-    "pose_hold",
-    "calm_flow",
-    "neutral_flow",
-    "build_up",
-    "release",
-    "support_shift",
-    "high_tension",
-    "arm_flourish",
-)
-EVENT_TO_ID = {name: idx for idx, name in enumerate(EVENT_TYPES)}
-
-
 def json_safe(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): json_safe(v) for k, v in obj.items()}
@@ -267,23 +254,6 @@ def motion_mmr_embedding(motion: np.ndarray, out_dim: int = 64, fps: float = 30.
     proj = raw @ _fixed_projection(raw.size, out_dim)
     norm = float(np.linalg.norm(proj))
     return (proj / (norm + 1e-8)).astype(np.float32)
-
-
-def event_compatibility(music_event: str, motion_event: str) -> float:
-    m = str(music_event or "neutral_flow")
-    e = str(motion_event or "neutral_flow")
-    if m == e:
-        return 1.0
-    table: Dict[str, Dict[str, float]] = {
-        "accent": {"arm_flourish": 1.0, "high_tension": 0.95, "support_shift": 0.65, "build_up": 0.60, "neutral_flow": 0.20, "calm_flow": -0.15, "pose_hold": -0.25},
-        "climax": {"arm_flourish": 1.0, "high_tension": 1.0, "build_up": 0.75, "support_shift": 0.55, "neutral_flow": 0.10},
-        "section_change": {"support_shift": 1.0, "build_up": 0.85, "release": 0.75, "arm_flourish": 0.55, "high_tension": 0.45, "neutral_flow": 0.20},
-        "build_up": {"build_up": 1.0, "high_tension": 0.85, "arm_flourish": 0.70, "support_shift": 0.45, "neutral_flow": 0.20},
-        "release": {"release": 1.0, "calm_flow": 0.80, "pose_hold": 0.55, "neutral_flow": 0.30, "high_tension": -0.20},
-        "calm_flow": {"calm_flow": 1.0, "pose_hold": 0.65, "neutral_flow": 0.50, "release": 0.40, "high_tension": -0.30, "arm_flourish": -0.25},
-        "neutral_flow": {"neutral_flow": 0.80, "calm_flow": 0.55, "pose_hold": 0.30, "build_up": 0.25, "support_shift": 0.20},
-    }
-    return float(table.get(m, {}).get(e, 0.0))
 
 
 def family_id(item: Dict[str, Any], family_span: int = 600) -> str:

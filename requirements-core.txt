@@ -11,3 +11,4 @@ einops
 smplx
 trimesh
 wandb
+pytest

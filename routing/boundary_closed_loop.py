@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Boundary Closed-Loop Boundary-Simulated Closed-Loop Scheduler for EDGE 151D
-=============================================================
-
-This file is an additive research patch for the histry/EDGE Motion Generation.x codebase.
-It does not replace training/motion_models.py.  Instead, it imports the
-latest Semantic Routing/Stage Guard/Motion Refinement functions and wraps them into a closed-loop
-boundary-safe generation pipeline.
+"""Formal CTSR boundary-safe whole-song generator for EDGE151 motion.
 
 Research objective
 ------------------
@@ -34,17 +27,11 @@ Key properties
 4. All predicted and actual boundary signals are exported as JSON and CSV for
    paper tables.
 
-Expected location
------------------
-Copy this file to:
-    <EDGE_ROOT>/routing/boundary_closed_loop.py
-
-Run from EDGE root:
+Formal CTSR example:
     python routing/boundary_closed_loop.py generate \
         --config configs/motion_model.json \
         --audio dunhuangwu2.wav \
         --db output/.../db \
-        --contrastive output/.../semantic_retriever.pt \
         --refiner output/.../boundary_refiner.pt \
         --diffusion output/.../motion_runtime.pt \
         --out output/.../dunhuangwu2_boundary_closed_loop_closed_loop.npy \
@@ -70,6 +57,7 @@ import numpy as np
 # MOTION_ACTIVITY_INTEGRATION_BEGIN
 from evaluation.motion_activity_analysis import (
     evaluate_final_motion_activity,
+    save_stage_snapshot,
     write_activity_report,
 )
 # MOTION_ACTIVITY_INTEGRATION_END
@@ -369,7 +357,13 @@ def choose_transition_lengths(motion_runtime, prev: Optional[np.ndarray], source
     extra += env_float("BOUNDARY_TLEN_CONTACT_W", 8.0) * feats["contact_gap"]
     extra += env_float("BOUNDARY_TLEN_FK_W", 80.0) * feats["predicted_fk_gap"]
 
-    label = str(slot.get("music_alignment_label", slot.get("music_semantic_top_label", slot.get("role", "")))).lower()
+    if str(slot.get("router_architecture", "")) == "ctsr_weak_temporal_v1":
+        # Use the observable structure event directly.  MSSD's historical
+        # compatibility alias (for example build_up -> turning_climax) must
+        # not inject a body-action interpretation into transition timing.
+        label = str(slot.get("music_event", "neutral_flow")).lower()
+    else:
+        label = str(slot.get("music_alignment_label", slot.get("music_semantic_top_label", slot.get("role", "")))).lower()
     if any(k in label for k in ["calm", "lyrical", "pose", "release", "resolution"]):
         extra += env_float("BOUNDARY_TLEN_SMOOTH_MUSIC_BONUS", 3.0)
     if any(k in label for k in ["accent", "percussive", "climax"]):
@@ -608,6 +602,12 @@ def assemble_closed_loop_reference(
             "risk_score_predicted": float(selected_prop.risk_score),
             "safe_predicted": bool(selected_prop.safe),
             "decision": selected_prop.decision,
+            "conditioning_contract": str(
+                slot.get(
+                    "closed_loop_conditioning_contract",
+                    "legacy_music_slot_feature",
+                )
+            ),
             "length_policy": selected_prop.length_info,
             "contract_after_align": selected_prop.align_report,
             "candidate_trials": [
@@ -701,6 +701,29 @@ def compute_condition(
         )
 
     features = np.asarray(slot_feat, dtype=np.float32)
+    conditioning_contracts = {
+        str(row.get("conditioning_contract", "missing_conditioning_contract"))
+        for row in assembly_report
+    }
+    if conditioning_contracts == {"selected_event_motion_descriptor_v1"}:
+        descriptors = np.asarray(db.get("desc", []), dtype=np.float32)
+        selected = np.asarray(
+            [int(row.get("event_id", -1)) for row in assembly_report],
+            dtype=np.int64,
+        )
+        if (
+            descriptors.ndim != 2
+            or np.any(selected < 0)
+            or np.any(selected >= len(descriptors))
+        ):
+            raise RuntimeError(
+                "Formal closed-loop conditioning cannot resolve selected Event-DB descriptors"
+            )
+        # Music controls phrase timing and CTSR retrieval.  Refiner/diffusion
+        # conditioning describes the motion actually selected (including a
+        # boundary-safe reselection); it does not fabricate body semantics
+        # from an old categorical music label.
+        features = descriptors[selected].astype(np.float32)
     if features.ndim != 2:
         raise ValueError(f"slot_feat must be [S,C], got {features.shape}")
     if features.shape[0] != len(assembly_report):
@@ -818,6 +841,12 @@ def apply_generators(
         )
 
     stage["pre_refine_audit"] = audit_fn(motion)
+    stage["motion_activity_retrieval"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "retrieval",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
 
     if bool(getattr(cfg, "refiner_enable", False)) and env_bool(
         "BOUNDARY_USE_REFINER", True
@@ -845,6 +874,12 @@ def apply_generators(
         )
         stage["boundary_refiner_transaction"] = transaction
         stage["boundary_refiner_audit"] = audit_fn(motion)
+    stage["motion_activity_refiner"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "refiner",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
 
     if bool(getattr(cfg, "diffusion_enable", False)) and env_bool(
         "BOUNDARY_USE_DIFFUSION", True
@@ -872,6 +907,12 @@ def apply_generators(
         )
         stage["motion_diffusion_transaction"] = transaction
         stage["motion_diffusion_audit"] = audit_fn(motion)
+    stage["motion_activity_diffusion"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "diffusion",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
 
     ik_report = {"enabled": False}
     if bool(getattr(cfg, "ik_enable", False)) and env_bool(
@@ -882,6 +923,12 @@ def apply_generators(
     stage["final_audit"] = audit_fn(motion)
     stage["final_physical_gate"] = physical_quality_gate(
         stage["final_audit"]
+    )
+    stage["motion_activity_full_ik"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "full_ik",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
     )
     return motion.astype(np.float32), stage
 
@@ -1130,7 +1177,117 @@ def merge_short_terminal_slot(
     return out_slots, feat2.astype(np.float32)
 
 
-def load_slots_and_candidates(motion_runtime, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
+def formal_ctsr_schedule_contract(slots: Sequence[Dict[str, Any]]) -> bool:
+    """Validate and identify the fail-closed formal Scheduler hand-off."""
+
+    architectures = [str(slot.get("router_architecture", "")) for slot in slots]
+    has_ctsr = any(value == "ctsr_weak_temporal_v1" for value in architectures)
+    if not has_ctsr:
+        return False
+    if not slots or any(value != "ctsr_weak_temporal_v1" for value in architectures):
+        raise RuntimeError("Formal CTSR schedule mixes Router architectures")
+    for index, slot in enumerate(slots):
+        if str(slot.get("router_supervision_source", "")) != "semantic_ot_teacher":
+            raise RuntimeError(f"Formal slot {index} has invalid Router supervision")
+        if bool(slot.get("router_compatibility_is_ground_truth", True)):
+            raise RuntimeError(f"Formal slot {index} misdeclares Router evidence as ground truth")
+        if bool(slot.get("action_compatibility_is_ground_truth", True)):
+            raise RuntimeError(f"Formal slot {index} misdeclares action evidence as ground truth")
+        if (
+            str(slot.get("hierarchy_semantic_contract", ""))
+            != "semantic_ot_teacher_x_weak_motion_local_action"
+        ):
+            raise RuntimeError(f"Formal slot {index} has a legacy hierarchy contract")
+        if (
+            str(slot.get("formal_candidate_contract", ""))
+            != "ctsr_weak_scheduler_siblings_v1"
+        ):
+            raise RuntimeError(f"Formal slot {index} has no audited CTSR candidate set")
+        candidates = slot.get("formal_candidate_event_uids")
+        if not isinstance(candidates, list) or not candidates:
+            raise RuntimeError(f"Formal slot {index} has an empty CTSR candidate set")
+        probabilities = slot.get("formal_candidate_router_probabilities")
+        if (
+            not isinstance(probabilities, list)
+            or len(probabilities) != len(candidates)
+            or not np.isfinite(np.asarray(probabilities, dtype=np.float64)).all()
+            or np.any(np.asarray(probabilities, dtype=np.float64) < 0.0)
+        ):
+            raise RuntimeError(
+                f"Formal slot {index} has invalid candidate Router probabilities"
+            )
+    return True
+
+
+def formal_candidate_state_from_slots(
+    slots: Sequence[Dict[str, Any]],
+    event_uids: Sequence[Any],
+    *,
+    boundary_top_k: int,
+) -> Tuple[List[int], List[List[int]], List[Dict[str, Any]]]:
+    """Resolve only Scheduler-issued CTSR candidates to Generation-DB rows.
+
+    This function is intentionally shared with the feasibility slot splitter.
+    Splitting a music slot must preserve its CTSR sibling set; it must never
+    trigger a second retriever or construct new audio--motion pseudo-pairs.
+    """
+
+    formal_ctsr_schedule_contract(slots)
+    uid_to_index = {str(uid): index for index, uid in enumerate(event_uids)}
+    path_idx: List[int] = []
+    candidate_lists: List[List[int]] = []
+    retrieval_report: List[Dict[str, Any]] = []
+    top_k = max(1, int(boundary_top_k))
+    for slot_index, slot in enumerate(slots):
+        scheduled_uid = str(
+            slot.get("whole_song_event_uid", slot.get("event_uid", ""))
+        )
+        if scheduled_uid not in uid_to_index:
+            raise RuntimeError(
+                f"Formal slot {slot_index} references unknown event_uid={scheduled_uid!r}"
+            )
+        declared_uids = [str(value) for value in slot["formal_candidate_event_uids"]]
+        declared_probabilities = [
+            float(value) for value in slot["formal_candidate_router_probabilities"]
+        ]
+        probability_by_uid = dict(zip(declared_uids, declared_probabilities))
+        candidate_indices: List[int] = []
+        for uid in declared_uids:
+            if uid not in uid_to_index:
+                raise RuntimeError(
+                    f"Formal slot {slot_index} candidate event_uid={uid!r} "
+                    "is outside Generation DB"
+                )
+            event_index = int(uid_to_index[uid])
+            if event_index not in candidate_indices:
+                candidate_indices.append(event_index)
+        exact_index = int(uid_to_index[scheduled_uid])
+        candidate_indices = [exact_index] + [
+            value for value in candidate_indices if value != exact_index
+        ]
+        selected = candidate_indices[:top_k]
+        path_idx.append(exact_index)
+        candidate_lists.append(selected)
+        slot["closed_loop_conditioning_contract"] = (
+            "selected_event_motion_descriptor_v1"
+        )
+        retrieval_report.append(
+            {
+                "slot": int(slot_index),
+                "routing_policy": "formal_ctsr_scheduler_locked_candidates",
+                "candidate_contract": "ctsr_weak_scheduler_siblings_v1",
+                "candidate_event_uids": [str(event_uids[value]) for value in selected],
+                "candidate_event_indices": list(map(int, selected)),
+                "candidate_router_probabilities": [
+                    float(probability_by_uid[str(event_uids[value])])
+                    for value in selected
+                ],
+            }
+        )
+    return path_idx, candidate_lists, retrieval_report
+
+
+def load_slots_and_candidates(motion_runtime, args: argparse.Namespace, cfg: Any) -> Tuple[Dict[str, Any], List[Dict[str, Any]], np.ndarray, List[int], List[Dict[str, Any]], List[List[int]]]:
     db = motion_runtime.load_db(args.db)
     if hasattr(motion_runtime, "_training_db_contract"):
         motion_runtime._training_db_contract(db, cfg, "Closed-loop Generation")
@@ -1152,12 +1309,25 @@ def load_slots_and_candidates(motion_runtime, args: argparse.Namespace, cfg: Any
             descriptor_contract,
             context="Scheduler/Generation Event-DB alignment",
         )
-    contrastive = motion_runtime.load_contrastive(getattr(args, "contrastive", None), cfg)
     slots, slot_feat = motion_runtime.audio_slots(args.audio, cfg, args.slot_seconds, getattr(args, "slots_json", None))
     slots, slot_feat = merge_short_terminal_slot(slots, slot_feat, cfg)
-    path_idx, retrieval_report = motion_runtime.retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
-    candidate_lists = extract_candidate_lists(path_idx, retrieval_report, db, cfg)
     uid_to_index = {str(uid): index for index, uid in enumerate(event_uids)}
+    if not formal_ctsr_schedule_contract(slots):
+        raise RuntimeError(
+            "Closed-loop generation accepts only the formal CTSR-Weak schedule; "
+            "historical retrievers are available only from the archived Git tag"
+        )
+    path_idx, candidate_lists, retrieval_report = formal_candidate_state_from_slots(
+        slots,
+        event_uids,
+        boundary_top_k=max(1, env_int("BOUNDARY_RESELECT_TOPK", 32)),
+    )
+    descriptors = np.asarray(db.get("desc", []), dtype=np.float32)
+    if descriptors.ndim != 2 or descriptors.shape[1] != 32:
+        raise RuntimeError(
+            f"Formal closed loop requires Event-DB desc=[N,32], got {descriptors.shape}"
+        )
+    slot_feat = descriptors[np.asarray(path_idx, dtype=np.int64)]
     for slot_index, slot in enumerate(slots):
         scheduled_uid = slot.get("whole_song_event_uid", slot.get("event_uid"))
         if not scheduled_uid:
@@ -1177,16 +1347,13 @@ def load_slots_and_candidates(motion_runtime, args: argparse.Namespace, cfg: Any
         retrieval_report[slot_index]["scheduled_event_uid"] = scheduled_uid
         retrieval_report[slot_index]["scheduled_generation_event_index"] = exact_index
         retrieval_report[slot_index]["event_db_contract"] = db_contract
-    return db, contrastive, list(slots), np.asarray(slot_feat, dtype=np.float32), list(map(int, path_idx)), list(retrieval_report), candidate_lists
+        retrieval_report[slot_index]["formal_ctsr_schedule"] = True
+    return db, list(slots), np.asarray(slot_feat, dtype=np.float32), list(map(int, path_idx)), list(retrieval_report), candidate_lists
 
 
 def generate_closed_loop(args: argparse.Namespace) -> int:
     motion_runtime = import_motion_runtime()
     cfg = motion_runtime.MotionGenerationConfig.from_json(args.config).apply_env()
-    if getattr(args, "music_semantic_dirs", None):
-        cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in args.music_semantic_dirs])
-    if getattr(args, "external_music_semantic_cmd", None):
-        cfg.external_music_semantic_cmd = str(args.external_music_semantic_cmd)
     set_cfg_runtime_knobs(cfg)
 
     seed = int(getattr(cfg, "seed", 1234))
@@ -1198,7 +1365,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         except Exception:
             pass
 
-    db, _contrastive, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(motion_runtime, args, cfg)
+    db, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(motion_runtime, args, cfg)
 
     banned: Dict[int, set] = {}
     rounds: List[Dict[str, Any]] = []
@@ -1232,14 +1399,30 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             sliding_support_eligible=slide_eligible,
         )
         stage_reports["sliding_support_eligibility"] = slide_report
+        conditioning_contract = (
+            str(assembly_report[0].get("conditioning_contract", "unknown"))
+            if assembly_report
+            else "unknown"
+        )
         stage_reports["neural_music_conditioning"] = {
-            "mode": "frame_local_slot_conditioning",
+            "mode": (
+                "selected_event_motion_descriptor_repair_conditioning"
+                if conditioning_contract == "selected_event_motion_descriptor_v1"
+                else "invalid_non_event_descriptor_conditioning"
+            ),
+            "conditioning_contract": conditioning_contract,
             "shape": list(cond.shape),
             "slot_count": int(len(slots)),
             "recomputed_after_each_reselection": True,
             "transition_policy": "linear_previous_to_current_slot_descriptor",
             "normalization": "generation_event_db_descriptor_coordinates",
             "whole_song_mean_conditioning": False,
+            "music_controls_routing_and_timing": bool(
+                conditioning_contract == "selected_event_motion_descriptor_v1"
+            ),
+            "categorical_music_label_used_as_body_semantics": False
+            if conditioning_contract == "selected_event_motion_descriptor_v1"
+            else None,
         }
         boundary_rows = audit_boundaries(motion_runtime, motion, assembly_report, cfg)
         unsafe_rows = [r for r in boundary_rows if not bool(r.get("safe"))]
@@ -1427,6 +1610,14 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "boundary_audit_json": audit_json_path,
         "motion_activity_json": motion_activity_path,
         "motion_activity": final_motion_activity,
+        "heading_contract": {
+            "schema": "formal_boundary_aligned_heading_v1",
+            "authoritative_reference": "motion_ref_path",
+            "reference_construction": "selected_event_core_boundary_alignment",
+            "post_repair_heading_must_match_reference": True,
+            "event_turn_budget_source": "generation_event_db",
+            "legacy_event_heading_planner_required": False,
+        },
         "final_quality_gate": final_quality_gate,
         "closed_loop": {
             "enabled": True,
@@ -1526,11 +1717,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--config", default="configs/motion_model.json")
     p.add_argument("--audio", required=True)
     p.add_argument("--slots_json", default=None)
-    p.add_argument("--music_semantic_dirs", nargs="*", default=None)
-    p.add_argument("--external_music_semantic_cmd", default=None)
     p.add_argument("--slot_seconds", type=float, default=4.0)
     p.add_argument("--db", required=True)
-    p.add_argument("--contrastive", default=None)
     p.add_argument("--refiner", default=None)
     p.add_argument("--diffusion", default=None)
     p.add_argument("--out", required=True)

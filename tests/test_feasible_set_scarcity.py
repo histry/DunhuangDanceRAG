@@ -17,14 +17,13 @@ def _db():
 
 
 def test_family_scarcity_scales_family_and_hierarchy_preferences(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_SOURCE_SCARCITY_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_FAMILY_SCARCITY_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_MINIMUM_SAFE_SOURCE_COUNT", "2")
-    monkeypatch.setenv("BR_HPR_MINIMUM_SAFE_FAMILY_COUNT", "2")
-    monkeypatch.setenv("BR_HPR_FAMILY_SCARCITY_MINIMUM_SCALE", "0.10")
-    monkeypatch.setenv("BR_HPR_MIN_SHARE_HISTORY", "1")
-    monkeypatch.setenv("BR_HPR_MAX_FAMILY_SHARE", "0.20")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_SCARCITY_ENABLE", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_FAMILY_SCARCITY_ENABLE", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_MINIMUM_SAFE_SOURCE_COUNT", "2")
+    monkeypatch.setenv("ROUTING_BUDGET_MINIMUM_SAFE_FAMILY_COUNT", "2")
+    monkeypatch.setenv("ROUTING_BUDGET_FAMILY_SCARCITY_MINIMUM_SCALE", "0.10")
+    monkeypatch.setenv("ROUTING_BUDGET_MIN_SHARE_HISTORY", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_MAX_FAMILY_SHARE", "0.20")
     config = ConstraintBudgetConfig.from_environment(total_slots=5)
     context = build_feasible_set_scarcity_context(
         db=_db(),

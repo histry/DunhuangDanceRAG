@@ -54,10 +54,11 @@ def keyword_names(call: ast.Call) -> set[str]:
 
 
 class ClosedLoopIntegrationContracts(unittest.TestCase):
-    def test_research_entrypoint_installs_real_global_path_patch(self):
-        text = source("routing/research_closed_loop.py")
-        self.assertIn("latest._install_global_path_patches()", text)
-        self.assertNotIn("latest._install_global_route_patches()", text)
+    def test_formal_pipeline_calls_boundary_closed_loop_directly(self):
+        text = source("scripts/pipeline.sh")
+        self.assertIn("routing/boundary_closed_loop.py", text)
+        self.assertNotIn("routing/research_closed_loop.py", text)
+        self.assertNotIn("routing/closed_loop.py", text)
 
     def test_sliding_support_is_keyword_only_across_wrapper_chain(self):
         targets = (
@@ -128,7 +129,10 @@ class ClosedLoopIntegrationContracts(unittest.TestCase):
 
     def test_closed_loop_conditioning_report_disables_whole_song_mean(self):
         text = source("routing/boundary_closed_loop.py")
-        self.assertIn('"mode": "frame_local_slot_conditioning"', text)
+        self.assertIn(
+            '"selected_event_motion_descriptor_repair_conditioning"', text
+        )
+        self.assertIn('"selected_event_motion_descriptor_v1"', text)
         self.assertIn('"whole_song_mean_conditioning": False', text)
         self.assertIn('"recomputed_after_each_reselection": True', text)
 

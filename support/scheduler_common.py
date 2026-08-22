@@ -1,14 +1,11 @@
 """Scheduler-facing facade over the canonical EDGE151 support contract."""
 from support.common import (
     CONTACT,
-    EVENT_TO_ID,
-    EVENT_TYPES,
     ROOT_X,
     ROOT_Y,
     ROOT_Z,
     ROT,
     apply_start_anchor,
-    event_compatibility,
     intrinsic_transition_cost_from_arrays,
     json_safe,
     load_motion,
@@ -21,14 +18,11 @@ from support.common import (
 
 __all__ = [
     "CONTACT",
-    "EVENT_TO_ID",
-    "EVENT_TYPES",
     "ROOT_X",
     "ROOT_Y",
     "ROOT_Z",
     "ROT",
     "apply_start_anchor",
-    "event_compatibility",
     "intrinsic_transition_cost_from_arrays",
     "json_safe",
     "load_motion",

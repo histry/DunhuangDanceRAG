@@ -1,48 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-External Music Semantics MotionRAG-Diff for EDGE 151D Dunhuang whole-song generation
-==================================================================
+"""Shared SMPL14 motion geometry, training, refinement, diffusion, and IK.
 
-This file is designed as a drop-in research patch for an EDGE-style repository.
-It does not depend on README assumptions. It directly operates on EDGE 151D
-motion arrays and can rebuild a source-aware motion database from a new
-"change" dataset.
-
-Core components:
-- Lower-Body IK: true lower-body IK that writes lower-body rotation channels back into
-       EDGE 151D, rather than saving fake foot XYZ columns.
-- Contrastive Retriever: music-motion contrastive learning for retrieval alignment.
-- Boundary Refiner: residual temporal refinement to escape pure stitching.
-- Motion Generation: retrieval-augmented conditional residual diffusion with IK finalization.
-- External classical-music semantics plus canonical Chang-E semantics: manifest-authoritative Chang-E BVH loading, effective-FPS resampling, recording-aware RAG semantics, external slot-level music labels, unpaired semantic OT, true lower-body IK, residual refinement, conditional diffusion, capped root-Y physics, root-aware sliding anchors, weighted IK chunks, and strict rollback gates.
-
-Expected EDGE 151D convention
------------------------------
-root translation: motion[:, 4:7] = [x, y, z]
-rot6d local joints: motion[:, 7:151].reshape(T, 24, 6)
-foot FK ids: [7, 8, 10, 11]
-
-Typical commands
-----------------
-python -m training.motion_models build-db --motion_dirs change data/motions --out_db output/motion_db
-python -m training.motion_models train-contrastive --db output/motion_db/events.npz --out output/motion_db/semantic_retriever.pt
-python -m training.motion_models train-refiner --db output/motion_db/events.train.npz --val_db output/motion_db/events.val.npz --out output/motion_db/boundary_refiner.pt
-python -m training.motion_models train-diffusion --db output/motion_db/events.train.npz --val_db output/motion_db/events.val.npz --out output/motion_db/motion_diffusion.pt
-python -m training.motion_models generate --audio test_music_bank/dunhuangwu2.wav --db output/motion_db/events.npz --out output/motion_dunhuangwu2.npy
+Event-DB construction lives in :mod:`events.build_database`; formal retrieval
+and generation orchestration live in the CTSR Scheduler and Graph-SB closed
+loop.  This module intentionally contains no BVH, filename-semantic, external
+pretrained music, or historical contrastive-retrieval business path.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import dataclasses
-import glob
-import hashlib
 import json
 import math
 import os
-import pickle
 import random
 import re
 import subprocess
@@ -57,11 +29,6 @@ try:
     import scipy.ndimage as ndi
 except Exception:  # pragma: no cover
     ndi = None
-
-try:
-    import scipy.io.wavfile as wavfile
-except Exception:  # pragma: no cover
-    wavfile = None
 
 try:
     import torch
@@ -115,13 +82,7 @@ from support.event_identity import (
     make_event_db_contract,
     normalize_event_db_contract,
 )
-from support.legacy_compatibility import (
-    has_scheduler_provenance,
-    normalize_motion_checkpoint_role,
-    normalize_motion_checkpoint_version,
-)
 from motion_geometry.resampling import blend_edge151_geodesic_np
-from retargeting.bvh_solver import load_bvh_as_edge151
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
@@ -135,10 +96,6 @@ def ensure_dir(path: str | Path) -> Path:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True)
     return p
-
-
-def stable_hash(text: str) -> int:
-    return int(hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12], 16)
 
 
 def load_json(path: Optional[str | Path], default: Optional[dict] = None) -> dict:
@@ -235,68 +192,6 @@ def resample_motion_np(motion: np.ndarray, new_len: int) -> np.ndarray:
     for d in range(motion.shape[1]):
         out[:, d] = np.interp(new_x, old_x, motion[:, d])
     return out
-
-
-def normalize_motion_shape(arr: np.ndarray) -> List[np.ndarray]:
-    arr = np.asarray(arr)
-    outs: List[np.ndarray] = []
-    if arr.ndim == 2 and arr.shape[1] >= EDGE_DIM:
-        outs.append(arr[:, :EDGE_DIM].astype(np.float32))
-    elif arr.ndim == 3 and arr.shape[-1] >= EDGE_DIM:
-        for i in range(arr.shape[0]):
-            outs.append(arr[i, :, :EDGE_DIM].astype(np.float32))
-    return outs
-
-
-
-def load_bvh_file(path: str | Path) -> List[np.ndarray]:
-    """
-    Load a Chang-E-style `.bvh` file and convert it to an EDGE-like 151D array.
-
-    Output convention:
-      - motion[:, 4:7] = root XYZ translation
-      - motion[:, 7:151] = 24 local joint rotations in 6D form
-
-    BVH files commonly store positions in centimeters. The loader auto-scales
-    to meters when skeleton offsets look centimeter-scale. This direct adapter
-    is sufficient for source-aware event indexing, retrieval, Motion Refiner and Motion Diffusion training,
-    and Lower-Body IK IK; for exact SMPL/EDGE reproduction, a dedicated retargeting stage
-    can still be used before build-db.
-    """
-    motion, _report = load_bvh_as_edge151(
-        path,
-        source_manifest_path=os.environ.get("CHANG_E_SOURCE_MANIFEST") or None,
-        require_source_manifest=str(
-            os.environ.get("CHANG_E_REQUIRE_SOURCE_MANIFEST", "0")
-        ).strip().lower() in {"1", "true", "yes", "y", "on"},
-    )
-    return [motion.astype(np.float32)]
-
-def load_motion_file(path: str | Path) -> List[np.ndarray]:
-    p = Path(path)
-    outs: List[np.ndarray] = []
-    try:
-        if p.suffix.lower() == ".npy":
-            outs.extend(normalize_motion_shape(np.load(p, allow_pickle=True)))
-        elif p.suffix.lower() == ".npz":
-            data = np.load(p, allow_pickle=True)
-            for k in data.files:
-                if k.lower() in {"motion", "motions", "x", "arr_0", "data"} or data[k].ndim in (2, 3):
-                    outs.extend(normalize_motion_shape(data[k]))
-        elif p.suffix.lower() in {".pkl", ".pickle"}:
-            with open(p, "rb") as f:
-                obj = pickle.load(f)
-            if isinstance(obj, dict):
-                for k in ["motion", "motions", "x", "poses", "data"]:
-                    if k in obj:
-                        outs.extend(normalize_motion_shape(np.asarray(obj[k])))
-            else:
-                outs.extend(normalize_motion_shape(np.asarray(obj)))
-        elif p.suffix.lower() == ".bvh":
-            outs.extend(load_bvh_file(p))
-    except Exception as exc:
-        print(f"[Motion Generation WARN] failed loading {p}: {exc}", file=sys.stderr)
-    return [x for x in outs if x.ndim == 2 and x.shape[0] >= 8]
 
 
 def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
@@ -402,86 +297,10 @@ class MotionGenerationConfig:
     window_len: int = 120
     hop_len: int = 60
     min_event_frames: int = 36
-    max_event_frames: int = 180
-    db_feature_dim: int = 32
-    # Chang-E timebase comes from the checked source manifest.  Raw BVH header
-    # FPS is not authoritative for the current local subset.
-    bvh_resample_to_config_fps: bool = True
-    manifest_enable: bool = True
-    manifest_secondary_event_split: bool = True
-
-    # Filename Semantics: Chang-E/change BVH filename semantics are scientifically meaningful.
-    # Each original BVH file is a source_uid/source_group, while the parsed
-    # category/gender/take fields become semantic metadata and weak alignment
-    # priors for unpaired slot-to-event routing.  This fixes the Root-Aware Motion Safety issue
-    # where singleton names such as female_lotus/male_ribbon were collapsed
-    # into the same directory-level source group.
-    source_group_mode: str = "filename"  # filename | legacy_prefix
-    filename_semantic_enable: bool = True
-    filename_semantic_weight: float = 0.35
-    filename_semantic_retrieval_weight: float = 0.20
-    filename_semantic_ot_weight: float = 0.35
-    # Chang-E Semantics: stronger multi-label RAG action semantics and music alignment labels.
-    classification_semantic_enable: bool = True
-    classification_semantic_ratio: float = 0.70
-    classification_retrieval_weight: float = 0.34
-    classification_ot_weight: float = 0.45
-    classification_retrieval_bonus: float = 0.28
-    classification_report_topk: int = 8
-    # Event Semantics: Chang-E event-level semantic routing.
-    chang_e_event_semantic_enable: bool = True
-    semantic_routing_weight: float = 0.72
-    event_family_bonus: float = 0.58
-    motion_stage_role_bonus: float = 0.36
-    preferred_dance_key_bonus: float = 0.28
-    route_natural_duration_weight: float = 0.20
-    route_family_balance_penalty: float = 0.18
-    route_family_recent_window: int = 8
-    route_family_penalty_cap: float = 0.25
-    route_dance_key_repeat_penalty: float = 0.16
-    route_family_repeat_penalty: float = 0.12
-    route_source_repeat_penalty: float = 0.10
-    route_motif_recall_bonus: float = 0.12
-    route_debug_topk: int = 10
-    # Convert long Chang-E recordings into a curated semantic event library.
-    chang_e_boundary_event_split: bool = True
-    chang_e_boundary_max_extra_starts: int = 96
-    chang_e_min_event_quality: float = 0.22
-    chang_e_keep_pose_anchor_quality: float = 0.16
-    event_quality_weight: float = 0.22
-    route_support_bonus: float = 0.12
-    route_locomotion_bonus: float = 0.14
-    route_stage_sequence_weight: float = 0.16
-    route_source_run_hard_penalty: float = 0.30
-    route_semantic_bonus_scale: float = 1.50
-
-    # External Music Semantics: external classical-music semantic encoder.  The current EDGE
-    # repository contains rule/librosa music feature extractors, not a trained
-    # classical-music classifier.  When a trained external encoder exists, it
-    # can write slot-level JSON/NPZ semantics or be invoked through a command
-    # template.  These semantic probabilities then drive Contrastive Retriever unpaired OT and
-    # Motion Generation retrieval reports.
-    external_music_semantic_enable: bool = True
-    external_music_semantic_required: bool = False
-    external_music_semantic_dirs: str = ""
-    external_music_semantic_cmd: str = ""
-    external_music_semantic_cache_dir: str = "output/motion_external_music_semantic_cache"
-    external_music_semantic_weight: float = 0.78
-    external_music_semantic_temperature: float = 0.65
-    external_music_semantic_proxy_enable: bool = True
-    external_music_semantic_filename_proxy: bool = True
-
-    embed_dim: int = 128
-    top_k: int = 32
-    beam_size: int = 8
     overlap: int = 12
     transition_train_min_seconds: float = 10.0 / 30.0
     transition_train_max_seconds: float = 28.0 / 30.0
     transition_mask_halo_seconds: float = 6.0 / 30.0
-    retrieval_source_penalty: float = 0.08
-    retrieval_transition_penalty: float = 0.65
-    retrieval_warp_penalty: float = 0.18
-    retrieval_repeat_penalty: float = 0.15
     ik_enable: bool = True
     ik_iters: int = 120
     ik_lr: float = 0.020
@@ -540,33 +359,11 @@ class MotionGenerationConfig:
     ik_post_stabilize_enable: bool = True
     ik_post_stabilize_passes: int = 2
 
-    # Controls use of a trained Contrastive Retriever model during generation.  Training remains
-    # an explicit CLI operation, so this switch must not silently suppress a
-    # user-invoked train-contrastive command.
-    contrastive_enable: bool = True
-    # Root-Aware Motion Safety: require real audio features for Contrastive Retriever; false keeps the weak-proxy
-    # fallback for smoke tests, while reports mark it as weak supervision.
-    contrastive_require_real_music: bool = False
-    audio_pair_min_coverage: float = 0.15
-
-    # Root-Aware Motion Safety: Chang-E BVH is usually motion-only.  When no synchronized
-    # BVH/audio pairs exist, train Contrastive Retriever with real unpaired music clips plus
-    # semantic optimal-transport pseudo pairs instead of motion-descriptor
-    # self-distillation.  This keeps the method honest: the checkpoint records
-    # unpaired_audio_semantic_ot, not paired supervision.
-    unpaired_audio_enable: bool = True
-    unpaired_audio_slot_seconds: float = 4.0
-    unpaired_positive_topk: int = 8
-    unpaired_pairs_per_audio_slot: int = 4
-    unpaired_min_audio_slots: int = 1
-    unpaired_disable_motion_proxy: bool = False
-
     lower_body_only: bool = True
     refiner_enable: bool = True
     diffusion_enable: bool = True
-    # Geometry-safe Motion Refiner and Motion Diffusion path.  Existing 151D checkpoints remain loadable;
-    # newly trained checkpoints use a 79D contact/root/joint-tangent state.
-    product_manifold_enable: bool = True
+    # Geometry-safe Motion Refiner and Motion Diffusion use a 79D
+    # contact/root/joint-tangent state.
     product_refiner_rotation_cap_rad: float = 0.35
     product_refiner_root_cap_m: float = 0.08
     product_refiner_outside_weight: float = 0.25
@@ -586,7 +383,6 @@ class MotionGenerationConfig:
     final_physical_gate_enable: bool = True
     final_physical_gate_fail_closed: bool = True
     final_physical_gate_save_rejected: bool = True
-    tangent_diffusion_enable: bool = True
     tangent_diffusion_rotation_cap_rad: float = 0.45
     tangent_diffusion_root_cap_m: float = 0.10
     riemannian_trust_region_enable: bool = True
@@ -596,7 +392,6 @@ class MotionGenerationConfig:
     diffusion_steps: int = 50
     diffusion_train_steps: int = 15000
     refiner_train_steps: int = 8000
-    contrastive_epochs: int = 120
     batch_size: int = 64
     lr: float = 2e-4
     seed: int = 42
@@ -612,18 +407,6 @@ class MotionGenerationConfig:
             for k, v in data.items():
                 if hasattr(cfg, k):
                     setattr(cfg, k, v)
-            # Read historical 30 FPS configs without keeping per-frame units
-            # in the runtime contract.  Newly written configs use SI names.
-            legacy = {
-                "ik_speed_gate_mpf": ("ik_speed_gate_mps", cfg.fps),
-                "ik_contact_break_speed_mpf": ("ik_contact_break_speed_mps", cfg.fps),
-                "ik_slide_release_min_frames": ("ik_slide_release_min_seconds", 1.0 / cfg.fps),
-                "ik_sliding_anchor_window": ("ik_sliding_anchor_seconds", 1.0 / cfg.fps),
-                "root_y_min_flight_frames": ("root_y_min_flight_seconds", 1.0 / cfg.fps),
-            }
-            for old, (new, scale) in legacy.items():
-                if old in data and new not in data:
-                    setattr(cfg, new, float(data[old]) * float(scale))
         return cfg
 
     def apply_env(self) -> "MotionGenerationConfig":
@@ -632,7 +415,6 @@ class MotionGenerationConfig:
             "MOTION_ENABLE_TRUE_IK": ("ik_enable", lambda x: bool(int(x))),
             "MOTION_ENABLE_REFINER": ("refiner_enable", lambda x: bool(int(x))),
             "MOTION_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
-            "MOTION_PRODUCT_MANIFOLD_ENABLE": ("product_manifold_enable", lambda x: bool(int(x))),
             "MOTION_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
             "MOTION_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
             "MOTION_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
@@ -647,39 +429,12 @@ class MotionGenerationConfig:
             "MOTION_FINAL_PHYSICAL_GATE_ENABLE": ("final_physical_gate_enable", lambda x: bool(int(x))),
             "MOTION_FINAL_PHYSICAL_GATE_FAIL_CLOSED": ("final_physical_gate_fail_closed", lambda x: bool(int(x))),
             "MOTION_FINAL_PHYSICAL_GATE_SAVE_REJECTED": ("final_physical_gate_save_rejected", lambda x: bool(int(x))),
-            "MOTION_TANGENT_DIFFUSION_ENABLE": ("tangent_diffusion_enable", lambda x: bool(int(x))),
             "MOTION_TANGENT_DIFFUSION_ROTATION_CAP_RAD": ("tangent_diffusion_rotation_cap_rad", float),
             "MOTION_TANGENT_DIFFUSION_ROOT_CAP_M": ("tangent_diffusion_root_cap_m", float),
             "MOTION_RIEMANNIAN_TRUST_REGION_ENABLE": ("riemannian_trust_region_enable", lambda x: bool(int(x))),
             "MOTION_RIEMANNIAN_TRUST_REGION_STEPS": ("riemannian_trust_region_steps", int),
             "MOTION_RIEMANNIAN_TRUST_REGION_INITIAL_RADIUS": ("riemannian_trust_region_initial_radius", float),
             "MOTION_RIEMANNIAN_TRUST_REGION_MIN_RADIUS": ("riemannian_trust_region_min_radius", float),
-            "MOTION_TOP_K": ("top_k", int),
-            "MOTION_BEAM_SIZE": ("beam_size", int),
-            "MOTION_CHANG_E_EVENT_SEMANTIC_ENABLE": ("chang_e_event_semantic_enable", lambda x: bool(int(x))),
-            "MOTION_SEMANTIC_ROUTING_WEIGHT": ("semantic_routing_weight", float),
-            "MOTION_EVENT_FAMILY_BONUS": ("event_family_bonus", float),
-            "MOTION_STAGE_ROLE_BONUS": ("motion_stage_role_bonus", float),
-            "MOTION_PREFERRED_DANCE_KEY_BONUS": ("preferred_dance_key_bonus", float),
-            "MOTION_ROUTE_NATURAL_DURATION_WEIGHT": ("route_natural_duration_weight", float),
-            "MOTION_ROUTE_FAMILY_BALANCE_PENALTY": ("route_family_balance_penalty", float),
-            "MOTION_ROUTE_FAMILY_RECENT_WINDOW": ("route_family_recent_window", int),
-            "MOTION_ROUTE_FAMILY_PENALTY_CAP": ("route_family_penalty_cap", float),
-            "MOTION_ROUTE_DANCE_KEY_REPEAT_PENALTY": ("route_dance_key_repeat_penalty", float),
-            "MOTION_ROUTE_FAMILY_REPEAT_PENALTY": ("route_family_repeat_penalty", float),
-            "MOTION_ROUTE_SOURCE_REPEAT_PENALTY": ("route_source_repeat_penalty", float),
-            "MOTION_ROUTE_MOTIF_RECALL_BONUS": ("route_motif_recall_bonus", float),
-            "MOTION_ROUTE_DEBUG_TOPK": ("route_debug_topk", int),
-            "MOTION_CHANG_E_BOUNDARY_EVENT_SPLIT": ("chang_e_boundary_event_split", lambda x: bool(int(x))),
-            "MOTION_CHANG_E_BOUNDARY_MAX_EXTRA_STARTS": ("chang_e_boundary_max_extra_starts", int),
-            "MOTION_CHANG_E_MIN_EVENT_QUALITY": ("chang_e_min_event_quality", float),
-            "MOTION_CHANG_E_KEEP_POSE_ANCHOR_QUALITY": ("chang_e_keep_pose_anchor_quality", float),
-            "MOTION_EVENT_QUALITY_WEIGHT": ("event_quality_weight", float),
-            "MOTION_ROUTE_SUPPORT_BONUS": ("route_support_bonus", float),
-            "MOTION_ROUTE_LOCOMOTION_BONUS": ("route_locomotion_bonus", float),
-            "MOTION_ROUTE_STAGE_SEQUENCE_WEIGHT": ("route_stage_sequence_weight", float),
-            "MOTION_ROUTE_SOURCE_RUN_HARD_PENALTY": ("route_source_run_hard_penalty", float),
-            "MOTION_ROUTE_SEMANTIC_BONUS_SCALE": ("route_semantic_bonus_scale", float),
             "MOTION_OVERLAP": ("overlap", int),
             "MOTION_TRANSITION_TRAIN_MIN_SECONDS": ("transition_train_min_seconds", float),
             "MOTION_TRANSITION_TRAIN_MAX_SECONDS": ("transition_train_max_seconds", float),
@@ -687,8 +442,6 @@ class MotionGenerationConfig:
             "MOTION_WINDOW_LEN": ("window_len", int),
             "MOTION_HOP_LEN": ("hop_len", int),
             "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
-            "MOTION_MAX_EVENT_FRAMES": ("max_event_frames", int),
-            "MOTION_ENABLE_CONTRASTIVE": ("contrastive_enable", lambda x: bool(int(x))),
             "MOTION_IK_ITERS": ("ik_iters", int),
             "MOTION_IK_CONTACT_W": ("ik_contact_w", float),
             "MOTION_IK_PENETRATION_W": ("ik_penetration_w", float),
@@ -711,42 +464,12 @@ class MotionGenerationConfig:
             "MOTION_IK_POST_STABILIZE_ENABLE": ("ik_post_stabilize_enable", lambda x: bool(int(x))),
             "MOTION_IK_POST_STABILIZE_PASSES": ("ik_post_stabilize_passes", int),
             "MOTION_ROLLBACK_ROOT_DELTA_MAX_M": ("rollback_root_delta_max_m", float),
-            "MOTION_CONTRASTIVE_REQUIRE_REAL_MUSIC": ("contrastive_require_real_music", lambda x: bool(int(x))),
-            "MOTION_AUDIO_PAIR_MIN_COVERAGE": ("audio_pair_min_coverage", float),
-            "MOTION_UNPAIRED_AUDIO_ENABLE": ("unpaired_audio_enable", lambda x: bool(int(x))),
-            "MOTION_UNPAIRED_AUDIO_SLOT_SECONDS": ("unpaired_audio_slot_seconds", float),
-            "MOTION_UNPAIRED_POSITIVE_TOPK": ("unpaired_positive_topk", int),
-            "MOTION_UNPAIRED_PAIRS_PER_AUDIO_SLOT": ("unpaired_pairs_per_audio_slot", int),
-            "MOTION_UNPAIRED_DISABLE_MOTION_PROXY": ("unpaired_disable_motion_proxy", lambda x: bool(int(x))),
             "MOTION_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
             "MOTION_ENABLE_ROOT_Y_PHYSICS": ("root_y_physics_enable", lambda x: bool(int(x))),
             "MOTION_ROOT_Y_MIN_FLIGHT_SECONDS": ("root_y_min_flight_seconds", float),
             "MOTION_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
             "MOTION_DIFFUSION_STEPS": ("diffusion_steps", int),
             "MOTION_DEVICE": ("device", str),
-            "MOTION_BVH_RESAMPLE_TO_CONFIG_FPS": ("bvh_resample_to_config_fps", lambda x: bool(int(x))),
-            "MOTION_SOURCE_GROUP_MODE": ("source_group_mode", str),
-            "MOTION_FILENAME_SEMANTIC_ENABLE": ("filename_semantic_enable", lambda x: bool(int(x))),
-            "MOTION_FILENAME_SEMANTIC_WEIGHT": ("filename_semantic_weight", float),
-            "MOTION_FILENAME_SEMANTIC_RETRIEVAL_WEIGHT": ("filename_semantic_retrieval_weight", float),
-            "MOTION_FILENAME_SEMANTIC_OT_WEIGHT": ("filename_semantic_ot_weight", float),
-            "MOTION_CLASSIFICATION_SEMANTIC_ENABLE": ("classification_semantic_enable", lambda x: bool(int(x))),
-            "MOTION_CLASSIFICATION_SEMANTIC_RATIO": ("classification_semantic_ratio", float),
-            "MOTION_CLASSIFICATION_RETRIEVAL_WEIGHT": ("classification_retrieval_weight", float),
-            "MOTION_CLASSIFICATION_OT_WEIGHT": ("classification_ot_weight", float),
-            "MOTION_CLASSIFICATION_RETRIEVAL_BONUS": ("classification_retrieval_bonus", float),
-            "MOTION_CLASSIFICATION_REPORT_TOPK": ("classification_report_topk", int),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_ENABLE": ("external_music_semantic_enable", lambda x: bool(int(x))),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_REQUIRED": ("external_music_semantic_required", lambda x: bool(int(x))),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_DIRS": ("external_music_semantic_dirs", str),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_CMD": ("external_music_semantic_cmd", str),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_CACHE_DIR": ("external_music_semantic_cache_dir", str),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_WEIGHT": ("external_music_semantic_weight", float),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_TEMPERATURE": ("external_music_semantic_temperature", float),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_PROXY_ENABLE": ("external_music_semantic_proxy_enable", lambda x: bool(int(x))),
-            "MOTION_EXTERNAL_MUSIC_SEMANTIC_FILENAME_PROXY": ("external_music_semantic_filename_proxy", lambda x: bool(int(x))),
-            "MOTION_MANIFEST_ENABLE": ("manifest_enable", lambda x: bool(int(x))),
-            "MOTION_MANIFEST_SECONDARY_EVENT_SPLIT": ("manifest_secondary_event_split", lambda x: bool(int(x))),
         }
         for e, (attr, caster) in env_map.items():
             if e in os.environ:
@@ -790,12 +513,9 @@ def assert_motion_checkpoint_contract(
     """Reject mixed-FPS, mixed-Rot6D and mixed-skeleton model assets."""
     actual = checkpoint.get("motion_contract")
     if not isinstance(actual, dict):
-        if os.environ.get("MOTION_ALLOW_LEGACY_CHECKPOINT_CONTRACT", "0") == "1" and abs(float(cfg.fps) - 30.0) < 1.0e-6:
-            return
         raise RuntimeError(
             f"Checkpoint {path} has no {MOTION_CHECKPOINT_CONTRACT_SCHEMA}. "
-            "It must be rebuilt for this repository contract. For a read-only "
-            "30 FPS parity baseline only, set MOTION_ALLOW_LEGACY_CHECKPOINT_CONTRACT=1."
+            "It must be rebuilt for the current SMPL14 repository contract."
         )
 
     expected = motion_checkpoint_contract(cfg, role)
@@ -803,9 +523,6 @@ def assert_motion_checkpoint_contract(
     for key in ("schema", "role", "motion_dim", "rot6d_layout", "skeleton_schema", "skeleton_sha256"):
         actual_value = actual.get(key)
         expected_value = expected[key]
-        if key == "role":
-            actual_value = normalize_motion_checkpoint_role(actual_value)
-            expected_value = normalize_motion_checkpoint_role(expected_value)
         if actual_value != expected_value:
             mismatches.append(
                 f"{key}: checkpoint={actual.get(key)!r}, runtime={expected[key]!r}"
@@ -1176,10 +893,9 @@ def enforce_edge151_contract_np(
 ) -> Tuple[np.ndarray, dict]:
     """Return a valid EDGE-151D motion tensor and an audit report.
 
-    Critical reason:
-    direct BVH loading may temporarily use channel 0 to carry native fps before
-    resampling.  That is legal only inside loading.  Once an array is saved as an
-    Event-RAG clip or passed into Motion Refiner and Motion Diffusion, EDGE [0:4] must again mean contacts.
+    Official SMPL preprocessing and every downstream model must agree that
+    EDGE channels ``[0:4]`` are contacts. The guard also projects rotations and
+    reconstructs contacts after learned or geometric transformations.
     """
     cfg = cfg or MotionGenerationConfig()
     x0 = np.asarray(motion, dtype=np.float32)
@@ -1512,8 +1228,6 @@ def blend_motion_overlap_np(
     report["w_b_max"] = float(np.max(wb)) if wb.size else 0.0
     return out.astype(np.float32), report
 
-def _clean_stem(path: str | Path) -> str:
-    return Path(str(path)).stem.strip().lower().replace("-", "_").replace(" ", "_")
 
 
 
@@ -1522,27 +1236,6 @@ def _clean_stem(path: str | Path) -> str:
 
 
 
-
-
-
-
-
-
-
-
-# Historical filename/category priors are retained only for BVH ablation
-# compatibility.  They are never used as local-action truth in the formal
-# official-SMPL path.
-LEGACY_BVH_CATEGORY_PROFILES = {
-    "flying_apsaras": {"aliases": {"flying", "apsaras", "flying_apsara", "flying_apsaras", "feitian", "fei_tian", "sky_dance"}, "energy": 0.52, "onset": 0.28, "travel": 0.32, "turn": 0.38, "lower": 0.38, "upper": 0.72, "floorwork": 0.10, "jump": 0.35, "spin": 0.35, "pose_hold": 0.25, "instrument": 0.0, "prop": 0.85, "display": "Flying Apsaras", "semantic_role": "aerial_graceful_flow", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "upper_body", "spatial_label": "aerial_leaning", "music_alignment_label": "lyrical_flow", "music_alignment_tags": ["lyrical_flow", "turning_climax", "calm_meditative", "aerial_curve"], "preferred_music_roles": ["intro", "build_up", "climax"], "preferred_dance_keys": ["flying_apsaras", "sogdian_whirl", "lotus_steps"], "cultural_motif": "flying_apsara", "prop_proxy_label": "sash_ribbon_proxy", "locomotion_label": "floating_leaning", "support_label": "low_contact_flight_like", "event_family": "aerial_curve", "motion_stage_role": "opening_or_climax", "natural_duration_range_sec": [2.0, 5.5]},
-    "lotus_steps": {"aliases": {"lotus", "lotussteps", "lotus_step", "lotus_steps"}, "energy": 0.48, "onset": 0.35, "travel": 0.62, "turn": 0.20, "lower": 0.78, "upper": 0.38, "floorwork": 0.05, "jump": 0.12, "spin": 0.10, "pose_hold": 0.20, "instrument": 0.0, "prop": 0.0, "display": "Lotus Steps", "semantic_role": "flowing_footwork", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "lower_body", "spatial_label": "traveling", "music_alignment_label": "footwork_flow", "music_alignment_tags": ["footwork_flow", "lyrical_flow", "calm_meditative"], "preferred_music_roles": ["normal", "development"], "preferred_dance_keys": ["lotus_steps", "flying_apsaras", "sogdian_whirl"], "cultural_motif": "lotus_step", "prop_proxy_label": "none", "locomotion_label": "traveling_steps", "support_label": "alternating_foot_support", "event_family": "footwork_flow", "motion_stage_role": "development", "natural_duration_range_sec": [1.5, 4.0]},
-    "thirty_six_postures": {"aliases": {"36pose", "36posture", "36postures", "thirtysix", "thirty_six", "thirty_six_postures", "jiyuetian"}, "energy": 0.36, "onset": 0.18, "travel": 0.12, "turn": 0.12, "lower": 0.28, "upper": 0.42, "floorwork": 0.18, "jump": 0.02, "spin": 0.05, "pose_hold": 0.90, "instrument": 0.0, "prop": 0.0, "display": "Ji Yue Tian Thirty-Six Postures", "semantic_role": "iconic_pose_sequence", "energy_label": "moderate", "rhythm_label": "sustained", "body_focus_label": "pose", "spatial_label": "in_place", "music_alignment_label": "pose_hold", "music_alignment_tags": ["pose_hold", "calm_meditative", "lyrical_flow"], "preferred_music_roles": ["intro", "release", "resolution"], "preferred_dance_keys": ["thirty_six_postures", "revelation_meditation", "lotus_steps"], "cultural_motif": "jiyuetian_pose", "prop_proxy_label": "none", "locomotion_label": "in_place_pose", "support_label": "static_or_low_motion_support", "event_family": "pose_motif", "motion_stage_role": "anchor_or_resolution", "natural_duration_range_sec": [1.2, 3.8]},
-    "revelation_meditation": {"aliases": {"meditation", "mediation", "revelation", "revelation_meditation", "revelation_mediation"}, "energy": 0.20, "onset": 0.08, "travel": 0.10, "turn": 0.08, "lower": 0.20, "upper": 0.36, "floorwork": 0.38, "jump": 0.0, "spin": 0.03, "pose_hold": 0.78, "instrument": 0.0, "prop": 0.0, "display": "Revelation Meditation", "semantic_role": "calm_meditative_flow", "energy_label": "calm", "rhythm_label": "sustained", "body_focus_label": "full_body", "spatial_label": "in_place", "music_alignment_label": "calm_meditative", "music_alignment_tags": ["calm_meditative", "pose_hold", "lyrical_flow"], "preferred_music_roles": ["intro", "calm", "release", "resolution"], "preferred_dance_keys": ["revelation_meditation", "thirty_six_postures", "flying_apsaras"], "cultural_motif": "buddhist_meditation", "prop_proxy_label": "none", "locomotion_label": "slow_weight_shift", "support_label": "stable_support", "event_family": "calm_flow", "motion_stage_role": "intro_or_resolution", "natural_duration_range_sec": [2.0, 6.0]},
-    "sogdian_whirl": {"aliases": {"ribbon", "ribbon_flow", "sash", "silk", "whirl", "sogdian", "sogdian_whirl", "turn", "turning"}, "energy": 0.72, "onset": 0.40, "travel": 0.50, "turn": 0.90, "lower": 0.68, "upper": 0.65, "floorwork": 0.02, "jump": 0.20, "spin": 0.95, "pose_hold": 0.15, "instrument": 0.0, "prop": 0.75, "display": "Sogdian Whirl / Ribbon Flow", "semantic_role": "flowing_turning_motif", "energy_label": "high", "rhythm_label": "lyrical", "body_focus_label": "turning_flow", "spatial_label": "turning", "music_alignment_label": "turning_climax", "music_alignment_tags": ["turning_climax", "lyrical_flow", "footwork_flow"], "preferred_music_roles": ["build_up", "climax"], "preferred_dance_keys": ["sogdian_whirl", "flying_apsaras", "lotus_steps"], "cultural_motif": "sogdian_whirl", "prop_proxy_label": "ribbon_sash_proxy", "locomotion_label": "turning_travel", "support_label": "alternating_or_pivot_support", "event_family": "turning_flow", "motion_stage_role": "climax", "natural_duration_range_sec": [1.6, 4.5]},
-    "pipa_behind_back": {"aliases": {"pipa", "pipa1", "pipa2", "playing_pipa", "playing_the_pipa", "pipa_behind_back"}, "energy": 0.46, "onset": 0.42, "travel": 0.16, "turn": 0.20, "lower": 0.30, "upper": 0.82, "floorwork": 0.06, "jump": 0.05, "spin": 0.10, "pose_hold": 0.45, "instrument": 1.0, "prop": 0.70, "display": "Playing the Pipa Behind the Back", "semantic_role": "instrument_upper_body_motif", "energy_label": "moderate", "rhythm_label": "accented", "body_focus_label": "upper_body", "spatial_label": "in_place", "music_alignment_label": "instrument_phrase", "music_alignment_tags": ["instrument_phrase", "lyrical_flow", "percussive_accent"], "preferred_music_roles": ["motif", "normal", "build_up"], "preferred_dance_keys": ["pipa_behind_back", "sogdian_whirl", "lei_gong_drum"], "cultural_motif": "pipa_instrument_pose", "prop_proxy_label": "pipa_proxy", "locomotion_label": "upper_body_phrase", "support_label": "stable_support", "event_family": "instrument_motif", "motion_stage_role": "motif_recall", "natural_duration_range_sec": [1.6, 4.5]},
-    "lei_gong_drum": {"aliases": {"drum", "lei_gong", "leigong", "lei_gong_drum"}, "energy": 0.82, "onset": 0.88, "travel": 0.52, "turn": 0.35, "lower": 0.75, "upper": 0.76, "floorwork": 0.04, "jump": 0.32, "spin": 0.20, "pose_hold": 0.10, "instrument": 0.65, "prop": 0.55, "display": "Lei Gong Drum", "semantic_role": "percussive_high_energy", "energy_label": "percussive", "rhythm_label": "percussive", "body_focus_label": "full_body", "spatial_label": "traveling", "music_alignment_label": "percussive_accent", "music_alignment_tags": ["percussive_accent", "turning_climax", "footwork_flow"], "preferred_music_roles": ["accent", "climax"], "preferred_dance_keys": ["lei_gong_drum", "pipa_behind_back", "sogdian_whirl"], "cultural_motif": "thunder_drum", "prop_proxy_label": "drum_proxy", "locomotion_label": "accented_travel", "support_label": "strong_foot_contact", "event_family": "percussive_accent", "motion_stage_role": "accent_or_climax", "natural_duration_range_sec": [1.2, 3.5]},
-    "unknown": {"aliases": set(), "energy": 0.45, "onset": 0.30, "travel": 0.30, "turn": 0.20, "lower": 0.45, "upper": 0.45, "floorwork": 0.0, "jump": 0.0, "spin": 0.0, "pose_hold": 0.25, "instrument": 0.0, "prop": 0.0, "display": "Unknown Chang-E Motion", "semantic_role": "unknown_motion", "energy_label": "moderate", "rhythm_label": "lyrical", "body_focus_label": "full_body", "spatial_label": "in_place", "music_alignment_label": "lyrical_flow", "music_alignment_tags": ["lyrical_flow"], "preferred_music_roles": ["normal"], "preferred_dance_keys": ["lotus_steps", "thirty_six_postures"], "cultural_motif": "unknown", "prop_proxy_label": "unknown", "locomotion_label": "unknown", "support_label": "unknown", "event_family": "unknown", "motion_stage_role": "development", "natural_duration_range_sec": [1.5, 4.0]},
-}
 
 # Formal theme profiles contain context only.  In particular, names such as
 # Pipa, Drum, Ribbon, or Sogdian Whirl do not inject motion energy, rotation,
@@ -1616,14 +1309,12 @@ def canonicalize_chang_e_key(key: object) -> str:
 
 
 def _safe_profile_key(meta: dict) -> str:
-    return canonicalize_chang_e_key(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or meta.get("source_bvh") or "unknown")
-
-
-def _label_index(label: str, labels: Sequence[str]) -> int:
-    try:
-        return list(labels).index(str(label))
-    except ValueError:
-        return -1
+    return canonicalize_chang_e_key(
+        meta.get("dance_category")
+        or meta.get("dance_theme")
+        or meta.get("dance_key")
+        or "unknown"
+    )
 
 
 def _parse_numeric_semantic(meta: dict) -> Dict[str, float]:
@@ -1637,37 +1328,11 @@ def _parse_numeric_semantic(meta: dict) -> Dict[str, float]:
 
 
 def strong_action_semantics_from_meta(meta: dict, desc: Optional[np.ndarray] = None) -> Dict[str, object]:
+    if str(meta.get("source_format", "")) != "chang_e_official_smpl":
+        raise RuntimeError(
+            "Current local-action semantics accept only Chang-E official SMPL metadata"
+        )
     key = _safe_profile_key(meta)
-    is_legacy_bvh = (
-        str(meta.get("source_format", "")).startswith("legacy_bvh")
-        or bool(meta.get("raw_stem"))
-    )
-    if is_legacy_bvh:
-        legacy = dict(
-            LEGACY_BVH_CATEGORY_PROFILES.get(
-                key, LEGACY_BVH_CATEGORY_PROFILES["unknown"]
-            )
-        )
-        numeric_keys = [
-            "energy", "onset", "travel", "turn", "lower", "upper",
-            "floorwork", "jump", "spin", "pose_hold", "instrument", "prop",
-        ]
-        numeric = {name: float(legacy.get(name, 0.0)) for name in numeric_keys}
-        if desc is not None and len(desc) >= 20:
-            numeric["travel"] = max(numeric["travel"], _bounded01(desc[1] / 1.2))
-            numeric["energy"] = max(numeric["energy"], _bounded01(desc[5] / 0.14))
-            numeric["lower"] = max(numeric["lower"], _bounded01(desc[7] / 0.10))
-            numeric["upper"] = max(numeric["upper"], _bounded01(desc[8] / 0.10))
-            numeric["turn"] = max(numeric["turn"], _bounded01(abs(desc[17]) / 0.22))
-            numeric["jump"] = max(numeric["jump"], _bounded01(desc[18] / 0.20))
-            numeric["pose_hold"] = max(
-                numeric["pose_hold"], _bounded01(1.0 - desc[5] / 0.12)
-            )
-        legacy["semantic_numeric"] = ";".join(
-            str(float(numeric[name])) for name in numeric_keys
-        )
-        return legacy_bvh_refine_chang_e_event_semantics(meta, desc, legacy)
-
     theme = dict(
         CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"])
     )
@@ -1678,7 +1343,7 @@ def strong_action_semantics_from_meta(meta: dict, desc: Optional[np.ndarray] = N
         "semantics_schema": "chang_e_five_layer_event_semantics_v2",
         "dance_theme": key,
         "theme_display": theme.get("display", key),
-        "theme_label_status": meta.get("theme_label_status", "legacy_or_unknown"),
+        "theme_label_status": meta.get("theme_label_status", "unknown"),
         "candidate_dance_category": meta.get("candidate_dance_category"),
         "cultural_context": list(theme.get("cultural_context", [])),
         "source_context": [str(value) for value in context],
@@ -1740,207 +1405,6 @@ def chang_e_event_quality_from_numbers(nums: Dict[str, float], family: str, dura
         dead_penalty = 0.25
     q = 0.42 * content + 0.22 * pose_hold + 0.20 * dur_score + 0.16 * contact_score - root_y_penalty - dead_penalty
     return float(np.clip(q, 0.02, 1.0))
-
-
-def chang_e_semantic_event_starts(seq: np.ndarray, cfg: MotionGenerationConfig) -> List[int]:
-    """Boundary-aware starts for Chang-E long BVH.
-
-    Compact action libraries naturally provide event-sized files. Chang-E files
-    are long performances, so we preserve uniform
-    coverage and add motion-novelty anchors around energy/yaw/contact changes.
-    """
-    x = np.asarray(seq, dtype=np.float32)
-    T = int(x.shape[0])
-    win = max(1, min(int(getattr(cfg, "window_len", 120)), T))
-    hop = max(1, int(getattr(cfg, "hop_len", max(1, win // 2))))
-    minf = max(1, int(getattr(cfg, "min_event_frames", 45)))
-    if T <= max(win, minf):
-        return [0]
-    starts = set([0, max(0, T - win)])
-    for st in range(0, max(1, T - minf + 1), hop):
-        starts.add(int(min(max(0, st), max(0, T - minf))))
-    try:
-        joints = fk_24_np(x)
-        v = np.zeros_like(joints)
-        if T > 1:
-            v[1:] = joints[1:] - joints[:-1]
-        energy = np.linalg.norm(v.reshape(T, -1, 3), axis=-1).mean(axis=1)
-        root = x[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
-        root_v = np.zeros((T,), dtype=np.float32)
-        if T > 1:
-            root_v[1:] = np.linalg.norm(root[1:, [0, 2]] - root[:-1, [0, 2]], axis=-1)
-        yaw = root_yaw_np(x)
-        yaw_v = np.zeros((T,), dtype=np.float32)
-        if T > 1:
-            yaw_v[1:] = np.abs(angle_diff(yaw[1:], yaw[:-1]))
-        foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
-        floor = np.percentile(foot[..., 1].reshape(-1), 5)
-        near = (foot[..., 1] < floor + 0.05).mean(axis=1)
-        novelty = energy + 0.65 * root_v + 0.55 * yaw_v + 0.20 * np.abs(np.diff(near, prepend=near[:1]))
-        if novelty.size > 7:
-            k = np.ones(5, dtype=np.float32) / 5.0
-            novelty = np.convolve(novelty, k, mode="same")
-        thr = float(np.percentile(novelty, 72)) if novelty.size else 0.0
-        order = np.argsort(-novelty)
-        extra = 0
-        max_extra = int(getattr(cfg, "chang_e_boundary_max_extra_starts", 96))
-        min_sep = max(8, min(hop, win // 3))
-        selected_centers: List[int] = []
-        for c in order.tolist():
-            if novelty[int(c)] < thr or extra >= max_extra:
-                break
-            c = int(c)
-            if any(abs(c - q) < min_sep for q in selected_centers):
-                continue
-            selected_centers.append(c)
-            starts.add(int(np.clip(c - win // 2, 0, max(0, T - minf))))
-            starts.add(int(np.clip(c - win // 3, 0, max(0, T - minf))))
-            extra += 2
-    except Exception:
-        pass
-    out = sorted(starts)
-    merged: List[int] = []
-    min_start_sep = max(6, min(hop // 2, win // 4))
-    tail = max(0, T - win)
-    # Event Semantics: if the sequence is only slightly longer than one window, [0:win]
-    # and [tail:T] are >95% overlapping twins. Keep one centered representative
-    # rather than polluting the RAG DB with near-identical embeddings.
-    if 0 < tail < min_start_sep:
-        return [int(max(0, tail // 2))]
-    for st in out:
-        st = int(st)
-        # Event Semantics: keep coverage endpoints without creating near-duplicate twins.
-        # When a novelty start lies too close to the required tail window, replace
-        # the previous start with the exact tail start instead of appending both.
-        if st == 0:
-            if not merged:
-                merged.append(0)
-            continue
-        if st == tail:
-            if merged and abs(st - merged[-1]) < min_start_sep:
-                # Event Semantics: protect the unique opener for very short sequences.
-                # If T is only slightly larger than win, tail can be only a few
-                # frames after 0. Replacing [0] with [tail] permanently drops
-                # opening frames. Keep the opener and add the tail only in this
-                # unique two-endpoint case; otherwise replace the near-duplicate.
-                if len(merged) == 1 and merged[-1] == 0 and st != 0:
-                    merged.append(st)
-                elif not (len(merged) == 1 and merged[-1] == 0):
-                    merged[-1] = st
-            elif not merged or merged[-1] != st:
-                merged.append(st)
-            continue
-        if not merged or abs(st - merged[-1]) >= min_start_sep:
-            merged.append(st)
-    if merged:
-        if abs(tail - merged[-1]) < min_start_sep:
-            if len(merged) == 1 and merged[-1] == 0 and tail != 0:
-                merged.append(tail)
-            elif not (len(merged) == 1 and merged[-1] == 0):
-                merged[-1] = tail
-        elif merged[-1] != tail:
-            merged.append(tail)
-    else:
-        merged = [0, tail] if tail > 0 else [0]
-    return sorted(set(int(x) for x in merged))
-
-
-def legacy_bvh_refine_chang_e_event_semantics(meta: dict, desc: Optional[np.ndarray], prof: Dict[str, object]) -> Dict[str, object]:
-    # Event Semantics window-level semantics for Chang-E event slicing.
-    # Chang-E is a long, category-complete MoCap corpus; each local window is
-    # converted into a curated event with explicit recording provenance.
-    out = dict(prof)
-    key = _safe_profile_key(meta)
-    nums = _parse_numeric_semantic(out)
-    if desc is not None and len(desc) >= 20:
-        nums["duration"] = float(desc[0])
-        nums["travel"] = max(float(nums.get("travel", 0.0)), float(np.clip(desc[1] / 1.15, 0.0, 1.0)))
-        nums["energy"] = max(float(nums.get("energy", 0.0)), float(np.clip(desc[5] / 0.135, 0.0, 1.0)))
-        nums["lower"] = max(float(nums.get("lower", 0.0)), float(np.clip(desc[7] / 0.10, 0.0, 1.0)))
-        nums["upper"] = max(float(nums.get("upper", 0.0)), float(np.clip(desc[8] / 0.10, 0.0, 1.0)))
-        nums["turn"] = max(float(nums.get("turn", 0.0)), float(np.clip(abs(desc[17]) / 0.20, 0.0, 1.0)))
-        nums["root_y_range"] = float(desc[18])
-        nums["contact_ratio"] = float(desc[10])
-        local_hold = float(np.clip(1.0 - desc[5] / 0.115, 0.0, 1.0)) * float(np.clip(0.55 + desc[10], 0.0, 1.0))
-        nums["pose_hold"] = max(float(nums.get("pose_hold", 0.0)), local_hold)
-        nums["jump"] = max(float(nums.get("jump", 0.0)), float(np.clip((desc[18] - 0.035) / 0.16, 0.0, 1.0)))
-        nums["spin"] = max(float(nums.get("spin", 0.0)), float(np.clip(abs(desc[17]) / 0.22, 0.0, 1.0)))
-    frac_mid = _float_meta(meta, "event_position_mid", _float_meta(meta, "event_position_fraction", 0.5))
-    duration = float(nums.get("duration", _float_meta(meta, "duration", 0.0)))
-    energy = float(nums.get("energy", 0.0)); onset = float(nums.get("onset", 0.0))
-    travel = float(nums.get("travel", 0.0)); turn = float(nums.get("turn", 0.0))
-    lower = float(nums.get("lower", 0.0)); upper = float(nums.get("upper", 0.0))
-    pose_hold = float(nums.get("pose_hold", 0.0)); jump = float(nums.get("jump", 0.0)); spin = float(nums.get("spin", 0.0))
-    contact_ratio = float(nums.get("contact_ratio", 0.5))
-    if pose_hold > 0.72 and energy < 0.60:
-        family = "pose_motif"
-    elif turn > 0.68 or spin > 0.68:
-        family = "turning_flow"
-    elif onset > 0.72 or (energy > 0.78 and key == "lei_gong_drum"):
-        family = "percussive_accent"
-    elif key == "pipa_behind_back" and upper >= lower * 1.12:
-        family = "instrument_motif"
-    elif travel > 0.50 or lower > upper * 1.18:
-        family = "footwork_flow"
-    elif key == "flying_apsaras" or jump > 0.45:
-        family = "aerial_curve"
-    elif energy < 0.34:
-        family = "calm_flow"
-    else:
-        family = str(out.get("event_family", "footwork_flow"))
-    out["event_family"] = family
-    if frac_mid < 0.12:
-        stage = "intro"
-    elif frac_mid > 0.88:
-        stage = "resolution"
-    elif family in {"percussive_accent", "turning_flow"} and energy > 0.55:
-        stage = "climax"
-    elif family == "instrument_motif":
-        stage = "motif_recall"
-    elif pose_hold > 0.70:
-        stage = "anchor_or_resolution"
-    elif energy > 0.58 or travel > 0.55:
-        stage = "build_up"
-    else:
-        stage = "development"
-    out["motion_stage_role"] = stage
-    if contact_ratio < 0.18 or jump > 0.45:
-        out["support_label"] = "low_contact_flight_like"
-    elif pose_hold > 0.72:
-        out["support_label"] = "stable_support"
-    elif turn > 0.55:
-        out["support_label"] = "alternating_or_pivot_support"
-    elif travel > 0.45 or lower > 0.60:
-        out["support_label"] = "alternating_foot_support"
-    else:
-        out.setdefault("support_label", "stable_support")
-    if turn > 0.60:
-        out["locomotion_label"] = "turning_travel"; out["spatial_label"] = "turning"
-    elif travel > 0.50:
-        out["locomotion_label"] = "traveling_steps"; out["spatial_label"] = "traveling"
-    elif pose_hold > 0.70:
-        out["locomotion_label"] = "in_place_pose"; out["spatial_label"] = "in_place"
-    elif energy < 0.34:
-        out["locomotion_label"] = "slow_weight_shift"; out["spatial_label"] = "in_place"
-    family_to_align = {"calm_flow": "calm_meditative", "pose_motif": "pose_hold", "footwork_flow": "footwork_flow", "turning_flow": "turning_climax", "instrument_motif": "instrument_phrase", "percussive_accent": "percussive_accent", "aerial_curve": "lyrical_flow"}
-    out["music_alignment_label"] = family_to_align.get(family, str(out.get("music_alignment_label", "lyrical_flow")))
-    tags = [out["music_alignment_label"], family, stage, str(out.get("support_label", "")), str(out.get("locomotion_label", ""))]
-    tags += [str(x) for x in out.get("music_alignment_tags", [])]
-    out["music_alignment_tags"] = list(dict.fromkeys([x for x in tags if x]))
-    out["event_position_mid"] = float(frac_mid)
-    natural_range = out.get("natural_duration_range_sec", CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"]).get("natural_duration_range_sec", [1.5, 4.0]))
-    q = chang_e_event_quality_from_numbers(nums, family, duration, natural_range)
-    out["event_quality_score"] = float(q)
-    out["semantic_confidence"] = float(np.clip(0.25 + 0.50 * q + 0.25 * max(energy, pose_hold, turn, travel, upper, lower), 0.10, 1.0))
-    keys = ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]
-    out["semantic_numeric"] = ";".join(str(float(nums.get(k, 0.0))) for k in keys)
-    out["classification_text"] = (
-        f"action={key}; motif={out.get('cultural_motif')}; family={out.get('event_family')}; "
-        f"stage={out.get('motion_stage_role')}; support={out.get('support_label')}; "
-        f"locomotion={out.get('locomotion_label')}; music_align={out.get('music_alignment_label')}; "
-        f"event_mid={float(frac_mid):.3f}; quality={q:.3f}; semantic_conf={out['semantic_confidence']:.3f}; numeric={out['semantic_numeric']}"
-    )
-    return out
 
 
 def refine_chang_e_event_semantics(
@@ -2132,477 +1596,6 @@ def refine_chang_e_event_semantics(
     return out
 
 
-def class_semantic_vector_from_meta(meta: dict, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
-    key = _safe_profile_key(meta)
-    base = filename_semantic_vector_from_meta(meta, cfg).copy()
-    cls = strong_action_semantics_from_meta(meta)
-    nums = _parse_numeric_semantic(cls)
-    for k in ["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]:
-        nums.setdefault(k, float(CHANG_E_CATEGORY_PROFILES.get(key, CHANG_E_CATEGORY_PROFILES["unknown"]).get(k, 0.0)))
-    known = [k for k in CHANG_E_CATEGORY_PROFILES.keys() if k != "unknown"]
-    ci = known.index(key) if key in known else -1
-    align_i = _label_index(str(cls.get("music_alignment_label")), MUSIC_ALIGNMENT_LABELS)
-    family_i = _label_index(str(cls.get("event_family")), EVENT_FAMILY_LABELS)
-    stage_i = _label_index(str(cls.get("motion_stage_role")), STAGE_ROLE_LABELS)
-    v = base.astype(np.float32)
-    for i,k in enumerate(["energy", "onset", "travel", "turn", "lower", "upper", "floorwork", "jump", "spin", "pose_hold", "instrument", "prop"]):
-        v[8+i] = nums[k]
-    v[20] = 0.0 if ci < 0 else ci / max(1, len(known) - 1)
-    v[21] = 0.0 if align_i < 0 else align_i / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
-    v[22] = 0.0 if family_i < 0 else family_i / max(1, len(EVENT_FAMILY_LABELS) - 1)
-    v[23] = 0.0 if stage_i < 0 else stage_i / max(1, len(STAGE_ROLE_LABELS) - 1)
-    tags = set(str(x) for x in cls.get("music_alignment_tags", []))
-    v[28] = 1.0 if ("calm_meditative" in tags or cls.get("event_family") == "calm_flow") else 0.0
-    v[29] = 1.0 if ("percussive_accent" in tags or nums["onset"] > 0.65) else 0.0
-    v[30] = 1.0 if ("turning_climax" in tags or nums["spin"] > 0.65 or nums["turn"] > 0.65) else 0.0
-    v[31] = 1.0
-    return np.clip(v, 0.0, 1.0).astype(np.float32)
-
-
-def audio_slot_classification_from_pseudo(pseudo: np.ndarray, duration: float, energy: float, onset: float, dyn: float) -> Dict[str, object]:
-    """Infer slot-level music labels for unpaired alignment and schedule reports."""
-    if energy < 0.035 and onset < 0.015:
-        label = "calm_meditative"
-        role = "calm"
-        preferred = ["revelation_meditation", "thirty_six_postures", "lotus_steps"]
-    elif onset > 0.10 or (energy > 0.08 and dyn > 0.04):
-        label = "percussive_accent"
-        role = "climax" if energy > 0.08 else "build_up"
-        preferred = ["lei_gong_drum", "pipa_behind_back", "ribbon_flow"]
-    elif energy > 0.065:
-        label = "turning_climax"
-        role = "build_up"
-        preferred = ["ribbon_flow", "pipa_behind_back", "lei_gong_drum"]
-    elif duration > 5.0 and energy < 0.055:
-        label = "pose_hold"
-        role = "release"
-        preferred = ["thirty_six_postures", "revelation_meditation", "lotus_steps"]
-    else:
-        label = "lyrical_flow"
-        role = "normal"
-        preferred = ["lotus_steps", "thirty_six_postures", "ribbon_flow", "pipa_behind_back"]
-    if label == "percussive_accent":
-        energy_label, rhythm_label = "high", "percussive"
-    elif label == "calm_meditative":
-        energy_label, rhythm_label = "calm", "sustained"
-    elif label == "pose_hold":
-        energy_label, rhythm_label = "calm", "sustained"
-    else:
-        energy_label, rhythm_label = "moderate", "lyrical"
-    return {
-        "role": role,
-        "music_alignment_label": label,
-        "energy_label": energy_label,
-        "rhythm_label": rhythm_label,
-        "preferred_dance_keys": preferred,
-        "preferred_semantic_roles": [CHANG_E_CATEGORY_PROFILES.get(k, {}).get("semantic_role", CATEGORY_CLASS_OVERRIDES.get(k, {}).get("semantic_role", "")) for k in preferred],
-    }
-
-
-
-
-# External Music Semantics external classical-music semantic interface.
-# Supported labels are deliberately identical to RAG event music_alignment labels,
-# so a trained classical model can supervise retrieval without paired BVH/audio.
-MUSIC_SEMANTIC_LABELS = MUSIC_ALIGNMENT_LABELS
-MUSIC_LABEL_TO_ACTION = {
-    "calm_meditative": ["revelation_meditation", "thirty_six_postures", "lotus_steps"],
-    "pose_hold": ["thirty_six_postures", "revelation_meditation", "lotus_steps"],
-    "lyrical_flow": ["lotus_steps", "ribbon_flow", "revelation_meditation", "thirty_six_postures"],
-    "instrument_phrase": ["pipa_behind_back", "lotus_steps", "ribbon_flow"],
-    "percussive_accent": ["lei_gong_drum", "pipa_behind_back", "ribbon_flow"],
-    "turning_climax": ["ribbon_flow", "lei_gong_drum", "pipa_behind_back"],
-    "footwork_flow": ["lotus_steps", "ribbon_flow", "thirty_six_postures"],
-}
-MUSIC_PROXY_NAME_LABELS = {
-    "pipa": "instrument_phrase",
-    "guzhen": "lyrical_flow",
-    "guzheng": "lyrical_flow",
-    "xiao": "calm_meditative",
-    "gu": "percussive_accent",
-    "drum": "percussive_accent",
-    "luo": "percussive_accent",
-    "gong": "percussive_accent",
-}
-
-
-def _split_path_list(value: object) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(x) for x in value if str(x).strip()]
-    text = str(value).strip()
-    if not text:
-        return []
-    parts: List[str] = []
-    for chunk in text.replace(";", os.pathsep).split(os.pathsep):
-        chunk = chunk.strip()
-        if chunk:
-            parts.append(chunk)
-    return parts
-
-
-def canonical_music_label(label: object) -> str:
-    text = str(label or "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "meditation": "calm_meditative",
-        "meditative": "calm_meditative",
-        "calm": "calm_meditative",
-        "tranquil": "calm_meditative",
-        "hold": "pose_hold",
-        "pose": "pose_hold",
-        "sustain": "pose_hold",
-        "lyrical": "lyrical_flow",
-        "flow": "lyrical_flow",
-        "melodic": "lyrical_flow",
-        "instrument": "instrument_phrase",
-        "pipa": "instrument_phrase",
-        "plucked": "instrument_phrase",
-        "percussive": "percussive_accent",
-        "accent": "percussive_accent",
-        "drum": "percussive_accent",
-        "climax": "turning_climax",
-        "turn": "turning_climax",
-        "turning": "turning_climax",
-        "footwork": "footwork_flow",
-        "steps": "footwork_flow",
-        "step": "footwork_flow",
-    }
-    if text in aliases:
-        return aliases[text]
-    if text in MUSIC_SEMANTIC_LABELS:
-        return text
-    return text if text else "lyrical_flow"
-
-
-def normalize_music_probs(probs: object = None, top_label: object = None, temperature: float = 0.65) -> Dict[str, float]:
-    out = {k: 0.0 for k in MUSIC_SEMANTIC_LABELS}
-    if isinstance(probs, dict):
-        for k, v in probs.items():
-            ck = canonical_music_label(k)
-            if ck in out:
-                try:
-                    out[ck] += max(0.0, float(v))
-                except Exception:
-                    pass
-    elif probs is not None:
-        arr = np.asarray(probs, dtype=np.float32).reshape(-1)
-        for i, v in enumerate(arr[:len(MUSIC_SEMANTIC_LABELS)]):
-            out[MUSIC_SEMANTIC_LABELS[i]] += max(0.0, float(v))
-    if sum(out.values()) <= 1e-8 and top_label is not None:
-        label = canonical_music_label(top_label)
-        if label in out:
-            out[label] = 1.0
-    if sum(out.values()) <= 1e-8:
-        out["lyrical_flow"] = 1.0
-    # Temperature-sharpen while retaining soft alternatives from external model.
-    temp = max(0.05, float(temperature))
-    vals = np.asarray([out[k] for k in MUSIC_SEMANTIC_LABELS], dtype=np.float32)
-    vals = np.power(np.maximum(vals, 0.0) + 1e-8, 1.0 / temp)
-    vals = vals / max(float(vals.sum()), 1e-8)
-    return {k: float(vals[i]) for i, k in enumerate(MUSIC_SEMANTIC_LABELS)}
-
-
-def music_semantic_slot_from_probs(probs: Dict[str, float], duration: float = 4.0, source: str = "external") -> Dict[str, object]:
-    top_label = max(probs.items(), key=lambda kv: kv[1])[0]
-    preferred = MUSIC_LABEL_TO_ACTION.get(top_label, ["lotus_steps", "thirty_six_postures"])
-    if top_label == "percussive_accent":
-        role, energy_label, rhythm_label = "climax", "percussive", "percussive"
-    elif top_label == "turning_climax":
-        role, energy_label, rhythm_label = "build_up", "high", "accented"
-    elif top_label in {"calm_meditative", "pose_hold"}:
-        role, energy_label, rhythm_label = "calm" if top_label == "calm_meditative" else "release", "calm", "sustained"
-    elif top_label == "instrument_phrase":
-        role, energy_label, rhythm_label = "normal", "moderate", "accented"
-    elif top_label == "footwork_flow":
-        role, energy_label, rhythm_label = "normal", "moderate", "lyrical"
-    else:
-        role, energy_label, rhythm_label = "normal", "moderate", "lyrical"
-    return {
-        "role": role,
-        "music_alignment_label": top_label,
-        "energy_label": energy_label,
-        "rhythm_label": rhythm_label,
-        "preferred_dance_keys": preferred,
-        "preferred_semantic_roles": [str(CHANG_E_CATEGORY_PROFILES.get(k, {}).get("semantic_role", "")) for k in preferred],
-        "music_semantic_probs": {k: float(v) for k, v in probs.items()},
-        "music_semantic_top_label": top_label,
-        "external_music_semantic_source": source,
-    }
-
-
-def music_probs_to_pseudo_feature(probs: Dict[str, float], duration: float, cfg: MotionGenerationConfig) -> np.ndarray:
-    # Label prototypes occupy the same descriptor layout used by motion events.
-    prototypes = {
-        "calm_meditative": (0.020, 0.010, 0.012, 0.85),
-        "pose_hold": (0.030, 0.012, 0.010, 0.78),
-        "lyrical_flow": (0.055, 0.035, 0.040, 0.42),
-        "instrument_phrase": (0.070, 0.065, 0.055, 0.30),
-        "percussive_accent": (0.105, 0.125, 0.100, 0.12),
-        "turning_climax": (0.095, 0.080, 0.110, 0.08),
-        "footwork_flow": (0.065, 0.045, 0.070, 0.34),
-    }
-    energy = onset = dyn = calm = 0.0
-    for label, p in probs.items():
-        e, o, d, c = prototypes.get(label, prototypes["lyrical_flow"])
-        energy += float(p) * e
-        onset += float(p) * o
-        dyn += float(p) * d
-        calm += float(p) * c
-    pseudo = np.zeros(32, dtype=np.float32)
-    pseudo[0] = float(duration)
-    pseudo[1] = energy * 2.0
-    pseudo[2] = energy
-    pseudo[3] = max(energy, dyn)
-    pseudo[4] = dyn
-    pseudo[5] = energy + onset
-    pseudo[6] = onset + dyn
-    pseudo[7] = energy + 0.5 * onset
-    pseudo[8] = energy
-    pseudo[9] = 1.0 + onset
-    pseudo[10] = calm
-    pseudo[13] = max(0.02, onset)
-    pseudo[14] = onset
-    pseudo[16] = onset
-    pseudo[17] = dyn
-    pseudo[18] = dyn
-    sem = music_semantic_slot_from_probs(probs, duration, source="external")
-    pseudo[22] = _label_index(str(sem["energy_label"]), ENERGY_LABELS) / max(1, len(ENERGY_LABELS) - 1)
-    pseudo[23] = _label_index(str(sem["rhythm_label"]), RHYTHM_LABELS) / max(1, len(RHYTHM_LABELS) - 1)
-    pseudo[26] = _label_index(str(sem["music_alignment_label"]), MUSIC_ALIGNMENT_LABELS) / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
-    pseudo[28] = float(probs.get("calm_meditative", 0.0) + 0.5 * probs.get("pose_hold", 0.0))
-    pseudo[29] = float(probs.get("percussive_accent", 0.0) + 0.4 * probs.get("instrument_phrase", 0.0))
-    pseudo[30] = float(probs.get("turning_climax", 0.0) + 0.3 * probs.get("footwork_flow", 0.0))
-    pseudo[31] = 1.0
-    return pseudo.astype(np.float32)
-
-
-def sidecar_music_semantic_candidates(audio_path: str | Path, cfg: MotionGenerationConfig) -> List[Path]:
-    p = Path(audio_path)
-    names = [
-        f"{p.stem}.music_semantic.json", f"{p.stem}_music_semantic.json", f"{p.stem}.semantic.json", f"{p.stem}_semantic.json",
-        f"{p.stem}.music_semantic.npz", f"{p.stem}_music_semantic.npz", f"{p.stem}.semantic.npz", f"{p.stem}_semantic.npz",
-        f"{p.stem}.json", f"{p.stem}.npz",
-    ]
-    cands: List[Path] = [p.with_name(n) for n in names]
-    for d in _split_path_list(getattr(cfg, "external_music_semantic_dirs", "")):
-        dp = Path(d)
-        for n in names:
-            cands.append(dp / n)
-    return cands
-
-
-def run_external_music_semantic_cmd(audio_path: str | Path, cfg: MotionGenerationConfig) -> Optional[Path]:
-    cmd = str(getattr(cfg, "external_music_semantic_cmd", "") or "").strip()
-    if not cmd:
-        return None
-    cache = ensure_dir(getattr(cfg, "external_music_semantic_cache_dir", "output/motion_external_music_semantic_cache"))
-    audio_p = Path(audio_path)
-    out_json = cache / f"{audio_p.stem}.music_semantic.json"
-    out_npz = cache / f"{audio_p.stem}.music_semantic.npz"
-    if out_json.exists() or out_npz.exists():
-        return out_json if out_json.exists() else out_npz
-    expanded = cmd.format(audio=str(audio_p), out_json=str(out_json), out_npz=str(out_npz), stem=audio_p.stem)
-    try:
-        subprocess.run(expanded, shell=True, check=True)
-    except Exception as exc:
-        print(f"[External Music Semantics WARN] external music semantic command failed for {audio_p}: {exc}", file=sys.stderr)
-        return None
-    if out_json.exists() or out_npz.exists():
-        return out_json if out_json.exists() else out_npz
-    return None
-
-
-
-
-def filename_proxy_music_semantic(audio_path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
-    if not bool(getattr(cfg, "external_music_semantic_filename_proxy", True)):
-        return None
-    stem = Path(audio_path).stem.lower()
-    label = None
-    for key, lab in MUSIC_PROXY_NAME_LABELS.items():
-        if key in stem:
-            label = lab
-            break
-    if label is None:
-        return None
-    try:
-        sr, wav = read_wav_mono(audio_path)
-        total = len(wav) / max(float(sr), 1.0)
-    except Exception:
-        total = float(slot_seconds)
-    n = max(1, int(math.ceil(total / max(float(slot_seconds), 1e-3))))
-    probs = normalize_music_probs(None, label, getattr(cfg, "external_music_semantic_temperature", 0.65))
-    slots, feats = [], []
-    for i in range(n):
-        start = i * float(slot_seconds)
-        end = min(total, (i + 1) * float(slot_seconds)) if total > 0 else (i + 1) * float(slot_seconds)
-        dur = max(end - start, 1e-3)
-        pseudo = music_probs_to_pseudo_feature(probs, dur, cfg)
-        sem = music_semantic_slot_from_probs(probs, dur, source=f"filename_proxy:{Path(audio_path).name}")
-        item = {"slot_id": i, "start": start, "end": end, "duration": dur, "energy": float(pseudo[2]), "onset": float(pseudo[16])}
-        item.update(sem)
-        slots.append(item)
-        feats.append(pseudo)
-    return slots, np.stack(feats).astype(np.float32)
-
-
-
-def semantic_label_match_bonus(slot: dict, db: dict, cfg: MotionGenerationConfig) -> np.ndarray:
-    """Event Semantics interpretable music-router bonus for Chang-E semantic Event-RAG."""
-    n = len(db.get("paths", []))
-    bonus = np.zeros(n, dtype=np.float32)
-    if not bool(getattr(cfg, "classification_semantic_enable", True)) or n == 0:
-        return bonus
-    dance_keys = np.asarray(db.get("dance_keys", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    roles = np.asarray(db.get("semantic_roles", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    energy = np.asarray(db.get("energy_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    rhythm = np.asarray(db.get("rhythm_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    align = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    families = np.asarray(db.get("event_families", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    stages = np.asarray(db.get("motion_stage_roles", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    motifs = np.asarray(db.get("cultural_motifs", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    locomotion = np.asarray(db.get("locomotion_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    support = np.asarray(db.get("support_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    quality = np.asarray(db.get("event_quality_scores", np.ones(n, dtype=np.float32)), dtype=np.float32)
-    preferred = [canonicalize_chang_e_key(x) for x in slot.get("preferred_dance_keys", [])]
-    preferred_roles = [str(x) for x in slot.get("preferred_semantic_roles", [])]
-    slot_align = str(slot.get("music_alignment_label", slot.get("music_semantic_top_label", "")))
-    slot_energy = str(slot.get("energy_label", "")); slot_rhythm = str(slot.get("rhythm_label", "")); slot_role = str(slot.get("role", "normal"))
-    route_family_map = {"calm_meditative": ["pose_hold", "floorwork", "upper_body_gesture"], "pose_hold": ["pose_hold", "floorwork", "upper_body_gesture"], "lyrical_flow": ["upper_body_gesture", "jump_aerial", "locomotion", "floorwork", "transition"], "footwork_flow": ["locomotion", "turn_spin", "rhythmic_accent"], "instrument_phrase": ["upper_body_gesture", "pose_hold"], "percussive_accent": ["rhythmic_accent", "locomotion", "turn_spin"], "turning_climax": ["turn_spin", "jump_aerial", "rhythmic_accent"], "aerial_curve": ["jump_aerial", "turn_spin", "upper_body_gesture"]}
-    route_stage_map = {"intro": ["intro", "intro_or_resolution", "anchor_or_resolution"], "calm": ["intro", "intro_or_resolution", "resolution", "anchor_or_resolution"], "normal": ["development", "build_up", "motif_recall"], "development": ["development", "build_up"], "build_up": ["build_up", "development", "opening_or_climax"], "motif": ["motif_recall", "development"], "motif_recall": ["motif_recall", "anchor_or_resolution"], "accent": ["accent_or_climax", "climax", "build_up"], "climax": ["climax", "accent_or_climax", "opening_or_climax"], "release": ["resolution", "anchor_or_resolution", "intro_or_resolution"], "resolution": ["resolution", "anchor_or_resolution", "intro_or_resolution"]}
-    route_support_map = {"calm_meditative": ["stable_support", "static_or_low_motion_support"], "pose_hold": ["stable_support", "static_or_low_motion_support"], "footwork_flow": ["alternating_foot_support", "alternating_or_pivot_support"], "turning_climax": ["alternating_or_pivot_support", "low_contact_flight_like"], "percussive_accent": ["strong_foot_contact", "alternating_foot_support"], "lyrical_flow": ["alternating_foot_support", "low_contact_flight_like", "stable_support"], "instrument_phrase": ["stable_support", "alternating_foot_support"]}
-    route_loco_map = {"calm_meditative": ["slow_weight_shift", "in_place_pose", "floating_leaning"], "pose_hold": ["in_place_pose", "slow_weight_shift"], "footwork_flow": ["traveling_steps", "turning_travel"], "turning_climax": ["turning_travel", "floating_leaning"], "percussive_accent": ["accented_travel", "turning_travel", "traveling_steps"], "lyrical_flow": ["floating_leaning", "traveling_steps", "upper_body_phrase"], "instrument_phrase": ["upper_body_phrase", "in_place_pose"]}
-    for k in preferred:
-        if k:
-            bonus += (dance_keys == k).astype(np.float32) * float(getattr(cfg, "preferred_dance_key_bonus", 0.28))
-    for r in preferred_roles:
-        if r:
-            bonus += (roles == r).astype(np.float32) * 0.25
-    if slot_align:
-        bonus += (align == slot_align).astype(np.float32) * 0.45
-        for rank, fam in enumerate(route_family_map.get(slot_align, [])):
-            bonus += (families == fam).astype(np.float32) * float(getattr(cfg, "event_family_bonus", 0.58)) / float(rank + 1)
-        for rank, sup in enumerate(route_support_map.get(slot_align, [])):
-            bonus += (support == sup).astype(np.float32) * float(getattr(cfg, "route_support_bonus", 0.12)) / float(rank + 1)
-        for rank, loc in enumerate(route_loco_map.get(slot_align, [])):
-            bonus += (locomotion == loc).astype(np.float32) * float(getattr(cfg, "route_locomotion_bonus", 0.14)) / float(rank + 1)
-    if slot_role:
-        for rank, st in enumerate(route_stage_map.get(slot_role, [])):
-            bonus += (stages == st).astype(np.float32) * float(getattr(cfg, "motion_stage_role_bonus", 0.36)) / float(rank + 1)
-    if slot_energy:
-        bonus += (energy == slot_energy).astype(np.float32) * 0.14
-    if slot_rhythm:
-        bonus += (rhythm == slot_rhythm).astype(np.float32) * 0.12
-    if slot_align == "instrument_phrase":
-        bonus += np.isin(motifs, ["pipa_instrument_pose", "thunder_drum"]).astype(np.float32) * 0.16
-    conf = np.asarray(db.get("semantic_confidence", np.ones(n, dtype=np.float32)), dtype=np.float32)
-    q_gate = np.clip(0.45 + 0.55 * quality, 0.25, 1.15)
-    bonus *= np.clip(0.65 + 0.35 * conf, 0.5, 1.15) * q_gate
-    # Event Semantics: never normalize by the current candidate max.  That dynamic
-    # min-max scaling can turn a weak accidental match in a vague slot into a
-    # full-strength routing reward.  Use a fixed saturating scale instead.
-    scale = max(0.25, float(getattr(cfg, "route_semantic_bonus_scale", 1.50)))
-    bonus = 1.0 - np.exp(-np.maximum(bonus, 0.0) / scale)
-    return np.clip(bonus, 0.0, 1.0).astype(np.float32)
-
-
-def parse_change_bvh_semantics(path: str | Path) -> Dict[str, object]:
-    """Resolve Chang-E semantics, preferring the authoritative source manifest.
-
-    Examples:
-      female_36pose_1.bvh -> female performer track 1 in one shared recording
-      male_pipa_2.bvh     -> gender=male,   category=pipa_behind_back, take=2
-      female_lotus.bvh    -> gender=female, category=lotus_steps
-
-    ``source_uid`` remains file-specific, while ``recording_uid`` groups
-    synchronized performer tracks so train/validation/test splitting cannot
-    leak one choreography through another dancer file.
-    """
-    # This dependency is deliberately lazy: the historical BVH manifest must
-    # not be loaded or consulted by the formal official-SMPL Event-DB path.
-    from data_pipeline.chang_e_manifest import (
-        semantic_metadata as chang_e_semantic_metadata,
-    )
-
-    stem = _clean_stem(path)
-    manifest_meta = chang_e_semantic_metadata(path)
-    tokens = [t for t in stem.split("_") if t]
-    gender = "unknown"
-    rest = tokens[:]
-    if rest and rest[0] in {"male", "female"}:
-        gender = rest[0]
-        rest = rest[1:]
-
-    take_id: Optional[int] = None
-    if rest and rest[-1].isdigit():
-        take_id = int(rest[-1])
-        rest = rest[:-1]
-    base = "_".join(rest) if rest else stem
-
-    category_key = "unknown"
-    for key, prof in CHANG_E_CATEGORY_PROFILES.items():
-        aliases = set(prof.get("aliases", set()))
-        if base in aliases or any(tok in aliases for tok in rest):
-            category_key = key
-            break
-    if category_key == "unknown":
-        category_key = canonicalize_chang_e_key(base or "unknown")
-    else:
-        category_key = canonicalize_chang_e_key(category_key)
-
-    if manifest_meta is not None:
-        gender = str(manifest_meta.get("performer_group") or gender)
-        category_key = canonicalize_chang_e_key(
-            manifest_meta.get("dance_category") or category_key
-        )
-        raw_take = manifest_meta.get("take_id")
-        take_id = int(raw_take) if raw_take is not None else None
-
-    prof = LEGACY_BVH_CATEGORY_PROFILES.get(category_key, {})
-    display = str(prof.get("display", category_key.replace("_", " ").title()))
-    semantic_role = str(prof.get("semantic_role", "unknown_motion"))
-    source_uid = str(
-        manifest_meta.get("source_id") if manifest_meta is not None else stem
-    )
-    recording_uid = str(
-        manifest_meta.get("recording_uid")
-        if manifest_meta is not None
-        else source_uid
-    )
-    take_text = f" take {take_id}" if take_id is not None else ""
-    gender_text = "female" if gender == "female" else ("male" if gender == "male" else "unknown-gender")
-    semantic_text = f"{gender_text} {display}{take_text}; role={semantic_role}"
-    event_label = category_key
-    if take_id is not None:
-        event_label = f"{category_key}_take{take_id}"
-    return {
-        "source_uid": source_uid,
-        "source_group": source_uid,
-        "recording_uid": recording_uid,
-        "performer_track_id": (
-            manifest_meta.get("performer_track_id")
-            if manifest_meta is not None
-            else -1
-        ),
-        "sequence_index": (
-            manifest_meta.get("sequence_index")
-            if manifest_meta is not None
-            else (take_id if take_id is not None else 1)
-        ),
-        "gender": gender,
-        "dance_key": category_key,
-        "dance_category": display,
-        "semantic_role": semantic_role,
-        "semantic_text": semantic_text,
-        "take_id": take_id if take_id is not None else -1,
-        "source_take": take_id if take_id is not None else -1,
-        "label": event_label,
-        "parent_label": category_key,
-        "raw_stem": stem,
-    }
-
-
 def official_smpl_semantics_from_metadata(meta: Mapping[str, Any]) -> Dict[str, object]:
     """Resolve formal source/theme context without filenames or BVH metadata."""
 
@@ -2649,6 +1642,10 @@ def official_smpl_semantics_from_metadata(meta: Mapping[str, Any]) -> Dict[str, 
         "dancer_id": meta.get("dancer_id"),
         "dancer_id_status": meta.get("dancer_id_status", "unverified"),
         "performer_track_id": meta.get("performer_track_id", -1),
+        "recording_performer_count": int(meta.get("recording_performer_count", 1)),
+        "solo_compatibility": meta.get("solo_compatibility", "unknown"),
+        "solo_compatible": bool(meta.get("solo_compatible", False)),
+        "solo_review_status": meta.get("solo_review_status", "unknown"),
         "sequence_index": meta.get("sequence_index", -1),
         "performer_group": performer_group,
         "gender": performer_group,
@@ -2674,323 +1671,6 @@ def official_smpl_semantics_from_metadata(meta: Mapping[str, Any]) -> Dict[str, 
     }
 
 
-def source_group_from_path(path: str | Path) -> str:
-    # File-level identity remains distinct from recording_uid.  Both are saved
-    # in the Event-DB and audited independently.
-    return str(parse_change_bvh_semantics(path).get("source_group"))
-
-
-def infer_label_from_filename(path: str | Path) -> str:
-    return str(parse_change_bvh_semantics(path).get("label"))
-
-
-def filename_semantic_vector_from_meta(meta: dict, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
-    """Convert filename/category semantics into a 32D slot-compatible prior.
-
-    The vector uses the same coarse channel layout as audio_slots()/event_descriptor():
-    duration, root/travel, energy, dynamics, joint/lower/upper density, contact
-    calmness, foot speed, turn/onset and root-y dynamics.  It is not a paired
-    label; it is a weak prior that makes unpaired music-to-event matching aware
-    that e.g. drum should prefer onset-rich slots and meditation should prefer
-    calm slots.
-    """
-    if str(meta.get("source_format", "")) == "chang_e_official_smpl":
-        # Formal SMPL filenames/themes are provenance context, not local motion
-        # features.  Local kinematics are encoded by class_semantic_vector.
-        v = np.zeros(32, dtype=np.float32)
-        v[0] = float(meta.get("duration", 0.0) or 0.0)
-        return v
-
-    key = canonicalize_chang_e_key(meta.get("dance_key") or meta.get("parent_label") or meta.get("label") or "unknown")
-    prof = LEGACY_BVH_CATEGORY_PROFILES.get(key, {})
-    duration = float(meta.get("duration", 0.0) or 0.0)
-    energy = float(prof.get("energy", 0.40))
-    onset = float(prof.get("onset", 0.20))
-    lower = float(prof.get("lower", energy))
-    upper = float(prof.get("upper", energy))
-    turn = float(prof.get("turn", 0.15))
-    travel = float(prof.get("travel", 0.25))
-    calm = float(prof.get("calmness", max(0.0, 0.75 - energy)))
-    v = np.zeros(32, dtype=np.float32)
-    v[0] = duration
-    v[1] = travel * 2.0
-    v[2] = energy
-    v[3] = min(1.0, energy + 0.25 * onset)
-    v[4] = energy * 0.45 + onset * 0.55
-    v[5] = energy + onset
-    v[6] = min(1.0, energy + 0.45 * onset)
-    v[7] = lower
-    v[8] = upper
-    v[9] = lower / max(upper, 1e-4)
-    v[10] = calm
-    v[11] = calm * 0.8
-    v[12] = calm * 0.8
-    v[13] = max(0.02, onset)
-    v[14] = max(0.02, onset * 1.25)
-    v[15] = turn
-    v[16] = abs(turn) + 0.25 * onset
-    v[17] = max(abs(turn), onset)
-    v[18] = energy * (0.25 + 0.5 * (1.0 - calm))
-    v[19] = 0.15 + 0.25 * energy
-    # Gender is not a quality score. It is only kept as a small style flag so
-    # the router can report source diversity; it should not dominate retrieval.
-    gender = str(meta.get("gender", "unknown"))
-    v[20] = 0.15 if gender == "female" else (0.35 if gender == "male" else 0.25)
-    take = float(meta.get("take_id", -1) if meta.get("take_id", -1) is not None else -1)
-    v[21] = max(0.0, take) / 4.0 if take >= 0 else 0.0
-    # Duplicate coarse stats to high channels for robust normalized matching.
-    v[22] = energy
-    v[23] = onset
-    v[24] = travel
-    v[25] = calm
-    v[26] = lower
-    v[27] = upper
-    v[28] = turn
-    v[29] = energy + 0.5 * onset
-    v[30] = (lower + upper) * 0.5
-    v[31] = 1.0
-    return v.astype(np.float32)
-
-
-def motion_feature_z_for_alignment(db: dict, cfg: MotionGenerationConfig, weight: Optional[float] = None) -> np.ndarray:
-    """Return descriptor z mixed with filename and strong classification priors."""
-    desc_z = np.asarray(db["desc_z"], dtype=np.float32)
-    if not bool(getattr(cfg, "filename_semantic_enable", True)):
-        return desc_z
-    mean = np.asarray(db["desc_mean"], dtype=np.float32)
-    std = np.asarray(db["desc_std"], dtype=np.float32)
-    parts = []
-    if "name_semantic" in db:
-        name = np.asarray(db["name_semantic"], dtype=np.float32)
-        parts.append((name - mean) / np.maximum(std, 1e-6))
-    if bool(getattr(cfg, "classification_semantic_enable", True)) and "class_semantic" in db:
-        cls = np.asarray(db["class_semantic"], dtype=np.float32)
-        cls_z = (cls - mean) / np.maximum(std, 1e-6)
-        if parts:
-            ratio = float(getattr(cfg, "classification_semantic_ratio", 0.70))
-            ratio = max(0.0, min(1.0, ratio))
-            sem_z = (1.0 - ratio) * parts[0] + ratio * cls_z
-        else:
-            sem_z = cls_z
-    elif parts:
-        sem_z = parts[0]
-    else:
-        return desc_z
-    sem_z = np.clip(sem_z, -8.0, 8.0).astype(np.float32)
-    w = float(getattr(cfg, "filename_semantic_weight", 0.35) if weight is None else weight)
-    w = max(0.0, min(0.85, w))
-    return ((1.0 - w) * desc_z + w * sem_z).astype(np.float32)
-
-
-def scan_motion_files(motion_dirs: Sequence[str], exts: Sequence[str] = (".npy", ".npz", ".pkl", ".pickle", ".bvh")) -> List[str]:
-    files: List[str] = []
-    for d in motion_dirs:
-        if not d:
-            continue
-        p = Path(d)
-        if p.is_file():
-            if p.suffix.lower() in exts:
-                files.append(str(p))
-            continue
-        if not p.exists():
-            continue
-        for ext in exts:
-            files.extend(glob.glob(str(p / "**" / f"*{ext}"), recursive=True))
-    return sorted(set(files))
-
-
-
-def resolve_path_from_roots(value: object, roots: Sequence[str | Path]) -> Optional[str]:
-    """Resolve manifest paths robustly against manifest dir, repo root, and motion dirs."""
-    if value is None:
-        return None
-    text = str(value).strip().strip('"').strip("'")
-    if not text or text.lower() in {"nan", "none", "null"}:
-        return None
-    p = Path(text)
-    candidates: List[Path] = []
-    if p.is_absolute():
-        candidates.append(p)
-    else:
-        for r in roots:
-            if not r:
-                continue
-            candidates.append(Path(r) / p)
-            candidates.append(Path(r) / p.name)
-    # Direct hit.
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    # Fallback: recursive name search inside roots for screenshot-style change/*.bvh.
-    name = p.name
-    if name:
-        for r in roots:
-            rr = Path(r)
-            if rr.exists() and rr.is_dir():
-                hits = list(rr.rglob(name))
-                if hits:
-                    return str(hits[0])
-    return None
-
-
-def _coerce_int(value: object, default: Optional[int] = None) -> Optional[int]:
-    try:
-        if value is None:
-            return default
-        text = str(value).strip()
-        if not text or text.lower() in {"nan", "none", "null"}:
-            return default
-        return int(float(text))
-    except Exception:
-        return default
-
-
-def _coerce_float(value: object, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if value is None:
-            return default
-        text = str(value).strip()
-        if not text or text.lower() in {"nan", "none", "null"}:
-            return default
-        return float(text)
-    except Exception:
-        return default
-
-
-def resample_motion_to_config_fps(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
-    """Resample BVH-derived EDGE-like arrays to cfg.fps before event slicing.
-
-    Timebase Resampling fix:
-    channel 0 may temporarily carry BVH native fps from load_bvh_file(), but it
-    must never be overwritten with target fps after resampling because EDGE
-    channel 0 is a contact channel.  The DB writer rebuilds contacts from FK.
-    """
-    x = np.asarray(motion, dtype=np.float32)
-    if x.ndim != 2 or x.shape[0] < 2:
-        return x.astype(np.float32), {"resampled": False, "reason": "too_short"}
-
-    ch0 = x[:, 0]
-    finite_ch0 = ch0[np.isfinite(ch0)]
-    if finite_ch0.size:
-        ch0_med = float(np.nanmedian(finite_ch0))
-        ch0_p05 = float(np.nanpercentile(finite_ch0, 5))
-        ch0_p95 = float(np.nanpercentile(finite_ch0, 95))
-        # Event Semantics: FPS metadata written by the BVH loader is nearly constant, but
-        # a few boundary/cropping frames may contain small jitter.  Use the middle
-        # 90% band for the main constant-column test and keep raw std only for
-        # diagnostics.  This avoids silently skipping required high-FPS -> 30 FPS
-        # resampling because of a few outlier rows.
-        trimmed = finite_ch0[(finite_ch0 >= ch0_p05) & (finite_ch0 <= ch0_p95)]
-        ch0_std = float(np.nanstd(finite_ch0))
-        ch0_trimmed_std = float(np.nanstd(trimmed)) if trimmed.size else ch0_std
-    else:
-        ch0_med = ch0_p05 = ch0_p95 = ch0_std = ch0_trimmed_std = 0.0
-    looks_like_fps_metadata = bool(
-        ch0_med > 2.0 and ch0_p05 > 1.0 and ch0_p95 < 400.0
-        and ch0_trimmed_std < max(0.75, ch0_med * 0.08)
-    )
-    native = ch0_med if looks_like_fps_metadata else float(cfg.fps)
-    target = float(cfg.fps)
-
-    if (not bool(getattr(cfg, "bvh_resample_to_config_fps", True))) or abs(native - target) < 1e-3:
-        y = x.copy().astype(np.float32)
-        return y, {
-            "resampled": False,
-            "native_fps": float(native),
-            "target_fps": float(target),
-            "frames": int(len(x)),
-            "fps_metadata_detected": looks_like_fps_metadata,
-            "channel0_trimmed_std": float(ch0_trimmed_std),
-            "note": "channel0_not_overwritten_EDGE_contact_contract",
-        }
-
-    new_len = max(2, int(round(x.shape[0] * target / max(native, 1e-6))))
-    y = resample_motion_np(x, new_len).astype(np.float32)
-    return y, {
-        "resampled": True,
-        "native_fps": float(native),
-        "target_fps": float(target),
-        "frames_before": int(len(x)),
-        "frames_after": int(new_len),
-        "fps_metadata_detected": looks_like_fps_metadata,
-        "channel0_trimmed_std": float(ch0_trimmed_std),
-        "note": "channel0_preserved_until_event_contract_guard_rebuilds_contacts",
-    }
-
-
-def read_manifest_records(manifest_path: Optional[str], motion_dirs: Sequence[str], cfg: MotionGenerationConfig) -> List[dict]:
-    """
-    Read an optional manifest.csv and return normalized source-aware records.
-
-    Supported columns follow the user's prior manifest document:
-      source_bvh, fragment_file, fragment_index, label,
-      start_frame, end_frame, start_time, end_time, duration_sec, bvh_fps.
-    The manifest is an upstream semantic slicing index, not a finished RAG DB;
-    we keep its fields as parent metadata and still compute tensor/contact/boundary
-    descriptors here.
-    """
-    if not manifest_path or not bool(getattr(cfg, "manifest_enable", True)):
-        return []
-    mp = Path(manifest_path)
-    if not mp.exists():
-        return []
-    roots: List[Path] = [mp.parent, Path(__file__).resolve().parents[1]]
-    for d in motion_dirs or []:
-        roots.append(Path(d))
-    rows: List[dict] = []
-    with open(mp, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for ridx, row in enumerate(reader):
-            fragment = resolve_path_from_roots(row.get("fragment_file") or row.get("path") or row.get("file"), roots)
-            source = resolve_path_from_roots(row.get("source_bvh") or row.get("source_file") or row.get("bvh"), roots)
-            load_path = fragment or source
-            if not load_path:
-                continue
-            start_frame = _coerce_int(row.get("start_frame"), None)
-            end_frame = _coerce_int(row.get("end_frame"), None)
-            label = str(row.get("label") or row.get("motion_event") or row.get("fragment_name") or Path(load_path).stem)
-            source_name = str(row.get("source_bvh") or Path(source or load_path).name)
-            sem = parse_change_bvh_semantics(source or load_path)
-            item = {
-                "manifest_id": ridx,
-                "manifest_path": str(mp),
-                "load_path": str(load_path),
-                "source_file": str(source or load_path),
-                "source_bvh": source_name,
-                "fragment_file": str(fragment) if fragment else None,
-                "fragment_index": _coerce_int(row.get("fragment_index"), ridx),
-                "label": label,
-                "parent_label": label,
-                "start_frame": start_frame,
-                "end_frame": end_frame,
-                "duration_sec_manifest": _coerce_float(row.get("duration_sec"), None),
-                "bvh_fps_manifest": _coerce_float(row.get("bvh_fps"), None),
-                "raw_manifest_row": {k: row.get(k) for k in row.keys()},
-            }
-            item.update({k: v for k, v in sem.items() if k not in {"label", "parent_label"}})
-            # Manifest labels are manual semantic labels and should remain primary.
-            rows.append(item)
-    return rows
-
-
-def iter_source_records(args: argparse.Namespace, cfg: MotionGenerationConfig) -> Tuple[List[dict], dict]:
-    """Return load records from manifest when available, otherwise from motion_dirs."""
-    motion_dirs = list(getattr(args, "motion_dirs", None) or [])
-    manifest_records = read_manifest_records(getattr(args, "manifest", None), motion_dirs, cfg)
-    if manifest_records:
-        return manifest_records, {"input_mode": "manifest", "manifest_records": len(manifest_records), "motion_dirs": motion_dirs}
-    files = scan_motion_files(motion_dirs)
-    if not files:
-        raise FileNotFoundError(f"No motion files found in: {motion_dirs}")
-    out_records = []
-    for f in files:
-        sem = parse_change_bvh_semantics(f)
-        rec = {"load_path": f, "source_file": f, "source_bvh": Path(f).name, "fragment_index": 0}
-        rec.update(sem)
-        out_records.append(rec)
-    return out_records, {"input_mode": "direct_files", "files": len(files), "motion_dirs": motion_dirs}
-
-
 def add_event_to_db_lists(
     clip: np.ndarray,
     event_idx: int,
@@ -3003,6 +1683,18 @@ def add_event_to_db_lists(
     descs: List[np.ndarray], entries: List[np.ndarray], exits: List[np.ndarray], c0s: List[np.ndarray], c1s: List[np.ndarray],
     music_feats: List[np.ndarray], music_masks: List[float], meta: List[dict],
 ) -> None:
+    """Write one canonical official-SMPL event into the shared Event-DB arrays.
+
+    The former writer also accepted BVH/name-derived records and optional paired
+    audio.  Those paths are deliberately rejected here: the formal SMPL14
+    Event-DB is motion-only and receives all source/theme context from the
+    authoritative manifest.
+    """
+    if str(base_meta.get("source_format", "")) != "chang_e_official_smpl":
+        raise ValueError("Event-DB writer accepts only chang_e_official_smpl")
+    if matched_audio is not None:
+        raise ValueError("Formal SMPL14 Event-DB must not contain paired audio")
+
     clip, contract_report = enforce_edge151_contract_np(
         clip,
         cfg,
@@ -3013,17 +1705,8 @@ def add_event_to_db_lists(
     np.save(out_path, clip.astype(np.float32))
     desc = event_descriptor(clip, cfg.fps)
     entry, exit_, c0, c1 = motion_boundary_state(clip, fps=float(cfg.fps))
-    if matched_audio:
-        try:
-            music_feat = audio_feature_for_motion_clip(matched_audio, st, clip.shape[0], cfg)
-            music_mask = 1.0
-        except Exception as exc:
-            print(f"[Chang-E Semantics WARN] audio feature failed for {matched_audio}: {exc}", file=sys.stderr)
-            music_feat = np.zeros(32, dtype=np.float32)
-            music_mask = 0.0
-    else:
-        music_feat = np.zeros(32, dtype=np.float32)
-        music_mask = 0.0
+    music_feat = np.zeros(32, dtype=np.float32)
+    music_mask = 0.0
     descs.append(desc)
     entries.append(entry)
     exits.append(exit_)
@@ -3035,21 +1718,10 @@ def add_event_to_db_lists(
         "event_id": event_idx,
         "path": str(out_path),
         "source_file": str(base_meta.get("source_file", base_meta.get("load_path", ""))),
-        "source_format": str(base_meta.get("source_format", "legacy_bvh")),
+        "source_format": "chang_e_official_smpl",
         "source_asset": str(base_meta.get("source_asset", base_meta.get("source_file", ""))),
-        "source_bvh": (
-            ""
-            if str(base_meta.get("source_format", "")) == "chang_e_official_smpl"
-            else str(
-                base_meta.get(
-                    "source_bvh",
-                    Path(str(base_meta.get("source_file", "source"))).name,
-                )
-            )
-        ),
         "source_group": source,
-        "matched_audio": matched_audio,
-        "has_real_audio_feature": bool(music_mask > 0.5),
+        "has_real_audio_feature": False,
         "seq_id": int(base_meta.get("seq_id", 0)),
         "start": int(st),
         "end": int(st + clip.shape[0]),
@@ -3065,14 +1737,7 @@ def add_event_to_db_lists(
             )
         ),
         "canonical_fps": float(base_meta.get("canonical_fps", cfg.fps)),
-        "label": str(
-            base_meta.get("label")
-            or (
-                "unknown_theme"
-                if str(base_meta.get("source_format", "")) == "chang_e_official_smpl"
-                else infer_label_from_filename(base_meta.get("source_file", out_path))
-            )
-        ),
+        "label": str(base_meta.get("label") or "unknown_theme"),
         "parent_label": str(base_meta.get("parent_label", base_meta.get("label", "unknown"))),
         "fragment_index": int(base_meta.get("fragment_index", 0) or 0),
         "manifest_id": base_meta.get("manifest_id"),
@@ -3080,685 +1745,47 @@ def add_event_to_db_lists(
         "input_mode": base_meta.get("input_mode", "direct_files"),
         "edge151_contract_report": contract_report,
     }
-    if item["source_format"] == "chang_e_official_smpl":
-        sem = official_smpl_semantics_from_metadata(base_meta)
-    else:
-        sem = parse_change_bvh_semantics(
-            base_meta.get("source_file", base_meta.get("source_bvh", out_path))
-        )
+    sem = official_smpl_semantics_from_metadata(base_meta)
     item.update(strong_action_semantics_from_meta({**sem, **item}, desc))
-    # Keep source_uid/source_group from filename unless a manifest-specific source
-    # explicitly supplied them.  Keep manifest label if present; otherwise use
-    # filename category/take label.
-    for k in ["source_uid", "source_id", "recording_uid", "sequence_id", "dancer_id", "dancer_id_status", "performer_track_id", "sequence_index", "performer_group", "gender", "dance_key", "dance_category", "dance_theme", "candidate_dance_category", "theme_label_status", "source_context", "manifest_sha256", "coordinate_system", "translation_units", "pose_layout", "semantic_role", "semantic_text", "take_id", "source_take", "raw_stem"]:
+    for k in ["source_uid", "source_id", "recording_uid", "sequence_id", "dancer_id", "dancer_id_status", "performer_track_id", "recording_performer_count", "solo_compatibility", "solo_compatible", "solo_review_status", "sequence_index", "performer_group", "gender", "dance_key", "dance_category", "dance_theme", "candidate_dance_category", "theme_label_status", "source_context", "manifest_sha256", "coordinate_system", "translation_units", "pose_layout", "semantic_role", "semantic_text", "take_id", "source_take", "raw_stem"]:
         item[k] = base_meta.get(k, sem.get(k))
     strong_sem = strong_action_semantics_from_meta(item, desc)
     item.update(strong_sem)
     if item.get("semantic_text"):
         item["semantic_text"] = str(item["semantic_text"]) + "; " + str(strong_sem.get("classification_text", ""))
-    if not item.get("label") or item.get("label") == "unknown":
-        item["label"] = str(sem.get("label", "unknown"))
-    if not item.get("parent_label") or item.get("parent_label") == "unknown":
-        item["parent_label"] = str(sem.get("parent_label", item.get("label", "unknown")))
+    item["label"] = str(sem["label"])
+    item["parent_label"] = str(sem["parent_label"])
     if "resample_report" in base_meta:
         item["resample_report"] = base_meta["resample_report"]
     meta.append(item)
 
-def build_db(args: argparse.Namespace) -> int:
-    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    out_dir = ensure_dir(args.out_db)
-    audio_files = collect_audio_files(getattr(args, "audio_dirs", None))
-    records, input_report = iter_source_records(args, cfg)
-    audio_match_cache: Dict[str, Optional[str]] = {}
+def audio_slots(
+    path: str | Path,
+    cfg: MotionGenerationConfig,
+    slot_seconds: float = 4.0,
+    slots_json: Optional[str] = None,
+) -> Tuple[List[dict], np.ndarray]:
+    """Load the final CTSR Scheduler hand-off without semantic fallback.
 
-    meta: List[dict] = []
-    descs: List[np.ndarray] = []
-    entries: List[np.ndarray] = []
-    exits: List[np.ndarray] = []
-    c0s: List[np.ndarray] = []
-    c1s: List[np.ndarray] = []
-    music_feats: List[np.ndarray] = []
-    music_masks: List[float] = []
-    resample_reports: List[dict] = []
+    ``path`` and ``slot_seconds`` remain in the shared generation interface, but
+    slot construction belongs exclusively to the trained Librosa-12D Router and
+    continuous Planner. Generation therefore requires their final descriptor.
+    """
+    del path, slot_seconds
+    if not slots_json:
+        raise RuntimeError("Formal generation requires --slots_json from CTSR Scheduler")
+    descriptor_path = Path(slots_json)
+    if not descriptor_path.is_file():
+        raise FileNotFoundError(str(descriptor_path))
+    from events.semantic_descriptor import parse_descriptor_file
 
-    npy_dir = ensure_dir(out_dir / "events")
-    event_idx = 0
-    for rec in records:
-        f = str(rec["load_path"])
-        seqs = load_motion_file(f)
-        if not seqs:
-            continue
-        # Manifest rows can reference a full source_bvh plus original high-FPS frame range.
-        start_frame = rec.get("start_frame")
-        end_frame = rec.get("end_frame")
-        source_key_path = rec.get("source_file") or f
-        source = source_group_from_path(source_key_path)
-        if source_key_path not in audio_match_cache:
-            audio_match_cache[str(source_key_path)] = find_matching_audio_for_motion(str(source_key_path), audio_files)
-        matched_audio = audio_match_cache.get(str(source_key_path))
-
-        for seq_id, seq_raw in enumerate(seqs):
-            seq = np.asarray(seq_raw, dtype=np.float32)
-            if start_frame is not None or end_frame is not None:
-                a = max(0, int(start_frame or 0))
-                b = min(seq.shape[0], int(end_frame if end_frame is not None else seq.shape[0]))
-                if b > a:
-                    seq = seq[a:b]
-            seq, res_report = resample_motion_to_config_fps(seq, cfg)
-            resample_reports.append(res_report)
-            T = seq.shape[0]
-            if T < cfg.min_event_frames:
-                continue
-            # Manifest rows are motif-level semantic clips.  If enabled, split long
-            # motif clips into event-level windows while preserving parent metadata;
-            # otherwise preserve each motif as one event.
-            if rec.get("manifest_id") is not None and not bool(getattr(cfg, "manifest_secondary_event_split", True)):
-                starts = [0]
-                win = min(T, cfg.max_event_frames)
-            else:
-                win = min(int(cfg.window_len), T)
-                if bool(getattr(cfg, "chang_e_boundary_event_split", True)):
-                    starts = chang_e_semantic_event_starts(seq, cfg)
-                else:
-                    starts = [0] if T <= cfg.max_event_frames else list(range(0, max(1, T - cfg.min_event_frames + 1), cfg.hop_len))
-            for st in starts:
-                endf = min(T, st + win)
-                if endf - st < cfg.min_event_frames:
-                    continue
-                clip = seq[st:endf].astype(np.float32)
-                if clip.shape[0] > cfg.max_event_frames:
-                    clip = clip[: cfg.max_event_frames]
-                path = npy_dir / f"event_{event_idx:07d}.npy"
-                base_meta = dict(rec)
-                event_mid = (float(st) + 0.5 * float(endf - st)) / max(float(T), 1.0)
-                base_meta.update({
-                    "seq_id": seq_id,
-                    "resample_report": res_report,
-                    "input_mode": input_report.get("input_mode"),
-                    "event_start": int(st),
-                    "event_end": int(endf),
-                    "event_source_frames": int(T),
-                    "event_position_mid": float(event_mid),
-                    "event_position_fraction": float(event_mid),
-                })
-                add_event_to_db_lists(
-                    clip=clip,
-                    event_idx=event_idx,
-                    out_path=path,
-                    cfg=cfg,
-                    source=source,
-                    matched_audio=matched_audio,
-                    st=st,
-                    base_meta=base_meta,
-                    descs=descs,
-                    entries=entries,
-                    exits=exits,
-                    c0s=c0s,
-                    c1s=c1s,
-                    music_feats=music_feats,
-                    music_masks=music_masks,
-                    meta=meta,
-                )
-                event_idx += 1
-
-    if not meta:
-        raise RuntimeError("No valid EDGE 151D motion events were built.")
-    desc = np.stack(descs).astype(np.float32)
-    mean = desc.mean(axis=0, keepdims=True)
-    std = desc.std(axis=0, keepdims=True) + 1e-6
-    desc_z = (desc - mean) / std
-    name_semantic = np.stack([filename_semantic_vector_from_meta(m, cfg) for m in meta]).astype(np.float32)
-    class_semantic = np.stack([class_semantic_vector_from_meta(m, cfg) for m in meta]).astype(np.float32)
-    db_path = out_dir / "events.npz"
-    np.savez_compressed(
-        db_path,
-        event_semantics_schema_version=np.asarray(
-            "chang_e_five_layer_event_semantics_v2", dtype=object
-        ),
-        event_descriptor_schema_version=np.asarray(
-            "edge151_local_action_descriptor_v2", dtype=object
-        ),
-        desc=desc.astype(np.float32),
-        desc_z=desc_z.astype(np.float32),
-        desc_mean=mean.astype(np.float32),
-        desc_std=std.astype(np.float32),
-        entry=np.stack(entries).astype(np.float32),
-        exit=np.stack(exits).astype(np.float32),
-        contact_entry=np.stack(c0s).astype(np.float32),
-        contact_exit=np.stack(c1s).astype(np.float32),
-        paths=np.array([m["path"] for m in meta], dtype=object),
-        source_groups=np.array([m["source_group"] for m in meta], dtype=object),
-        labels=np.array([m.get("label", "unknown") for m in meta], dtype=object),
-        parent_labels=np.array([m.get("parent_label", m.get("label", "unknown")) for m in meta], dtype=object),
-        source_bvh=np.array([m.get("source_bvh", "") for m in meta], dtype=object),
-        source_assets=np.array([m.get("source_asset", "") for m in meta], dtype=object),
-        source_formats=np.array([m.get("source_format", "unknown") for m in meta], dtype=object),
-        source_uids=np.array([m.get("source_uid", m.get("source_group", "")) for m in meta], dtype=object),
-        recording_uids=np.array([m.get("recording_uid", m.get("source_uid", m.get("source_group", ""))) for m in meta], dtype=object),
-        sequence_ids=np.array([m.get("sequence_id", "unknown") for m in meta], dtype=object),
-        dancer_ids=np.array([m.get("dancer_id") or "" for m in meta], dtype=object),
-        dancer_id_statuses=np.array([m.get("dancer_id_status", "unverified") for m in meta], dtype=object),
-        manifest_sha256=np.array([m.get("manifest_sha256") or "" for m in meta], dtype=object),
-        performer_track_ids=np.array([int(m.get("performer_track_id", -1) if m.get("performer_track_id", -1) is not None else -1) for m in meta], dtype=np.int32),
-        sequence_indices=np.array([int(m.get("sequence_index", -1) if m.get("sequence_index", -1) is not None else -1) for m in meta], dtype=np.int32),
-        genders=np.array([m.get("gender", "unknown") for m in meta], dtype=object),
-        dance_keys=np.array([m.get("dance_key", "unknown") for m in meta], dtype=object),
-        dance_categories=np.array([m.get("dance_category", "unknown") for m in meta], dtype=object),
-        dance_themes=np.array([m.get("dance_theme", "unknown") for m in meta], dtype=object),
-        candidate_dance_categories=np.array([m.get("candidate_dance_category") or "" for m in meta], dtype=object),
-        theme_label_statuses=np.array([m.get("theme_label_status", "unknown") for m in meta], dtype=object),
-        source_context_json=np.array([json.dumps(m.get("source_context", []), sort_keys=True) for m in meta], dtype=object),
-        semantic_roles=np.array([m.get("semantic_role", "unknown") for m in meta], dtype=object),
-        semantic_texts=np.array([m.get("semantic_text", "") for m in meta], dtype=object),
-        energy_labels=np.array([m.get("energy_label", "unknown") for m in meta], dtype=object),
-        rhythm_labels=np.array([m.get("rhythm_label", "unknown") for m in meta], dtype=object),
-        body_focus_labels=np.array([m.get("body_focus_label", "unknown") for m in meta], dtype=object),
-        spatial_labels=np.array([m.get("spatial_label", "unknown") for m in meta], dtype=object),
-        music_alignment_labels=np.array([m.get("music_alignment_label", "unknown") for m in meta], dtype=object),
-        local_action_labels_json=np.array([json.dumps(m.get("local_action_labels", ["unknown"])) for m in meta], dtype=object),
-        local_action_scores_json=np.array([m.get("local_action_scores_json", "{}") for m in meta], dtype=object),
-        music_compatibility_top_labels=np.array([m.get("music_compatibility_top_label", "unknown") for m in meta], dtype=object),
-        music_compatibility_scores_json=np.array([m.get("music_compatibility_scores_json", "{}") for m in meta], dtype=object),
-        music_compatibility_is_ground_truth=np.array([bool(m.get("music_compatibility_is_ground_truth", False)) for m in meta], dtype=np.bool_),
-        classification_texts=np.array([m.get("classification_text", "") for m in meta], dtype=object),
-        event_families=np.array([m.get("event_family", "unknown") for m in meta], dtype=object),
-        motion_stage_roles=np.array([m.get("motion_stage_role", "unknown") for m in meta], dtype=object),
-        cultural_motifs=np.array([m.get("cultural_motif", "unknown") for m in meta], dtype=object),
-        prop_proxy_labels=np.array([m.get("prop_proxy_label", "unknown") for m in meta], dtype=object),
-        locomotion_labels=np.array([m.get("locomotion_label", "unknown") for m in meta], dtype=object),
-        support_labels=np.array([m.get("support_label", "unknown") for m in meta], dtype=object),
-        event_position_mid=np.array([float(m.get("event_position_mid", 0.5)) for m in meta], dtype=np.float32),
-        semantic_confidence=np.array([float(m.get("semantic_confidence", 0.5)) for m in meta], dtype=np.float32),
-        event_quality_scores=np.array([float(m.get("event_quality_score", 0.5)) for m in meta], dtype=np.float32),
-        natural_duration_min=np.array([float((m.get("natural_duration_range_sec", [1.5, 4.0]) or [1.5, 4.0])[0]) for m in meta], dtype=np.float32),
-        natural_duration_max=np.array([float((m.get("natural_duration_range_sec", [1.5, 4.0]) or [1.5, 4.0])[-1]) for m in meta], dtype=np.float32),
-        take_ids=np.array([int(m.get("take_id", -1) if m.get("take_id", -1) is not None else -1) for m in meta], dtype=np.int32),
-        name_semantic=name_semantic.astype(np.float32),
-        class_semantic=class_semantic.astype(np.float32),
-        durations=np.array([m["duration"] for m in meta], dtype=np.float32),
-        frames=np.array([m["frames"] for m in meta], dtype=np.int32),
-        music=np.stack(music_feats).astype(np.float32),
-        music_mask=np.array(music_masks, dtype=np.float32),
+    slots, features, _meta = parse_descriptor_file(
+        descriptor_path,
+        require_final_schedule=True,
+        fps=float(cfg.fps),
+        usage="generate_schedule",
     )
-    audio_coverage = float(np.mean(music_masks)) if music_masks else 0.0
-    split_audit = {
-        "num_sources_total": int(len(set(str(m.get("source_group")) for m in meta))),
-        "num_labels_total": int(len(set(str(m.get("label")) for m in meta))),
-        "events_per_source_min": int(min([sum(str(x.get("source_group")) == s for x in meta) for s in set(str(m.get("source_group")) for m in meta)])),
-        "events_per_source_max": int(max([sum(str(x.get("source_group")) == s for x in meta) for s in set(str(m.get("source_group")) for m in meta)])),
-        "num_source_uids_total": int(len(set(str(m.get("source_uid", m.get("source_group"))) for m in meta))),
-        "num_recording_uids_total": int(len(set(str(m.get("recording_uid", m.get("source_uid", m.get("source_group")))) for m in meta))),
-        "category_counts": {str(k): int(sum(str(m.get("dance_key")) == str(k) for m in meta)) for k in sorted(set(str(m.get("dance_key")) for m in meta))},
-        "gender_counts": {str(k): int(sum(str(m.get("gender")) == str(k) for m in meta)) for k in sorted(set(str(m.get("gender")) for m in meta))},
-        "energy_label_counts": {str(k): int(sum(str(m.get("energy_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("energy_label")) for m in meta))},
-        "rhythm_label_counts": {str(k): int(sum(str(m.get("rhythm_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("rhythm_label")) for m in meta))},
-        "body_focus_counts": {str(k): int(sum(str(m.get("body_focus_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("body_focus_label")) for m in meta))},
-        "music_alignment_label_counts": {str(k): int(sum(str(m.get("music_alignment_label")) == str(k) for m in meta)) for k in sorted(set(str(m.get("music_alignment_label")) for m in meta))},
-        "source_group_semantics": "source_uid is file-level; recording_uid groups synchronized performer tracks; category/gender/sequence are separate semantic metadata",
-        "train_val_group_overlap": 0,  # no random sample split is produced here; downstream split must remain source-disjoint.
-    }
-    report = {
-        "version": "semantic_source_aware_event_db",
-        "config": dataclasses.asdict(cfg),
-        "events": meta,
-        "num_events": len(meta),
-        "audio_feature_coverage": audio_coverage,
-        "audio_files_seen": len(audio_files),
-        "input_report": input_report,
-        "resample_summary": {
-            "resampled_count": int(sum(1 for r in resample_reports if r.get("resampled"))),
-            "native_fps_values": sorted(set(round(float(r.get("native_fps", cfg.fps)), 6) for r in resample_reports if "native_fps" in r))[:12],
-            "target_fps": float(cfg.fps),
-        },
-        "split_audit": split_audit,
-        "fk_tree_source": FK_TREE_SOURCE,
-    }
-    save_json(report, out_dir / "events_meta.json")
-    print(json.dumps({"db": str(db_path), "num_events": len(meta), "out_dir": str(out_dir), "audio_feature_coverage": audio_coverage, "audio_files_seen": len(audio_files), "input_mode": input_report.get("input_mode"), "resampled_count": report["resample_summary"]["resampled_count"]}, ensure_ascii=False, indent=2))
-    return 0
-
-
-def read_wav_mono(path: str | Path) -> Tuple[int, np.ndarray]:
-    if wavfile is None:
-        raise RuntimeError("scipy.io.wavfile is unavailable; install scipy or provide --slots_json")
-    sr, data = wavfile.read(str(path))
-    data = np.asarray(data)
-    if data.ndim == 2:
-        data = data.mean(axis=1)
-    if data.dtype.kind in "iu":
-        maxv = max(float(np.iinfo(data.dtype).max), 1.0)
-        data = data.astype(np.float32) / maxv
-    else:
-        data = data.astype(np.float32)
-    if data.size == 0:
-        data = np.zeros(1, dtype=np.float32)
-    return int(sr), data
-
-
-def audio_global_features(wav: np.ndarray, sr: int) -> np.ndarray:
-    wav = np.asarray(wav, dtype=np.float32)
-    if wav.size < 16:
-        wav = np.pad(wav, (0, 16 - wav.size))
-    frame = max(256, int(0.046 * sr))
-    hop = max(64, int(0.023 * sr))
-    vals = []
-    cents = []
-    zcrs = []
-    for st in range(0, max(1, wav.size - frame + 1), hop):
-        x = wav[st : st + frame]
-        if x.size < frame:
-            x = np.pad(x, (0, frame - x.size))
-        vals.append(float(np.sqrt(np.mean(x * x) + 1e-8)))
-        zcrs.append(float(np.mean(x[1:] * x[:-1] < 0)))
-        spec = np.abs(np.fft.rfft(x * np.hanning(len(x))))
-        freqs = np.fft.rfftfreq(len(x), 1.0 / sr)
-        cents.append(float((spec * freqs).sum() / max(spec.sum(), 1e-8) / max(sr, 1)))
-    env = np.asarray(vals, dtype=np.float32)
-    zcr = np.asarray(zcrs, dtype=np.float32)
-    cen = np.asarray(cents, dtype=np.float32)
-    onset = np.maximum(0.0, np.diff(env, prepend=env[:1]))
-    if env.size > 4:
-        ac = np.correlate(env - env.mean(), env - env.mean(), mode="full")[env.size - 1 :]
-        lag = int(np.argmax(ac[1 : min(len(ac), 128)]) + 1) if len(ac) > 2 else 1
-    else:
-        lag = 1
-    features = np.array(
-        [
-            wav.size / sr,
-            env.mean(), env.std(), np.percentile(env, 90), np.percentile(env, 10),
-            onset.mean(), onset.std(), np.percentile(onset, 90),
-            zcr.mean(), zcr.std(), cen.mean(), cen.std(),
-            lag / max(1.0, env.size),
-            float(np.max(env)), float(np.min(env)), float(np.median(env)),
-        ],
-        dtype=np.float32,
-    )
-    # Add histogram-like dynamics.
-    qs = np.percentile(env, [5, 25, 50, 75, 95]).astype(np.float32)
-    oqs = np.percentile(onset, [5, 25, 50, 75, 95]).astype(np.float32)
-    out = np.concatenate([features, qs, oqs], axis=0)
-    if out.size < 32:
-        out = np.pad(out, (0, 32 - out.size))
-    return out[:32].astype(np.float32)
-
-
-def collect_audio_files(audio_dirs: Optional[Sequence[str]]) -> List[str]:
-    """Collect wav/mp3-like files for optional real-audio Contrastive Retriever pairing."""
-    if not audio_dirs:
-        return []
-    exts = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
-    files: List[str] = []
-    for d in audio_dirs:
-        if not d:
-            continue
-        p = Path(d)
-        if p.is_file() and p.suffix.lower() in exts:
-            files.append(str(p))
-        elif p.exists():
-            for ext in exts:
-                files.extend(glob.glob(str(p / "**" / f"*{ext}"), recursive=True))
-    return sorted(set(files))
-
-
-def _match_key(path: str | Path) -> str:
-    stem = Path(path).stem.lower()
-    keep = []
-    for ch in stem:
-        keep.append(ch if ch.isalnum() else "_")
-    tokens = [t for t in "".join(keep).split("_") if t and t not in {"motion", "audio", "music", "wav", "npy", "clip"}]
-    return "_".join(tokens)
-
-
-def find_matching_audio_for_motion(motion_path: str | Path, audio_files: Sequence[str]) -> Optional[str]:
-    """Best-effort same-stem / token-overlap pairing for Chang-E/change exports."""
-    if not audio_files:
-        return None
-    key = _match_key(motion_path)
-    if not key:
-        return None
-    audio_keys = [(_match_key(a), a) for a in audio_files]
-    for ak, a in audio_keys:
-        if ak == key:
-            return a
-    for ak, a in audio_keys:
-        if ak and (ak in key or key in ak):
-            return a
-    kt = set(key.split("_"))
-    best = (0.0, None)
-    for ak, a in audio_keys:
-        at = set(ak.split("_"))
-        if not at:
-            continue
-        score = len(kt & at) / max(len(kt | at), 1)
-        if score > best[0]:
-            best = (score, a)
-    return best[1] if best[0] >= 0.35 else None
-
-
-def audio_feature_for_motion_clip(audio_path: str | Path, start_frame: int, frames: int, cfg: MotionGenerationConfig) -> np.ndarray:
-    """Extract a 32D real audio descriptor aligned to a motion clip interval."""
-    sr, wav = read_wav_mono(audio_path)
-    st = max(0, int(round((start_frame / max(float(cfg.fps), 1e-6)) * sr)))
-    ed = min(wav.size, int(round(((start_frame + frames) / max(float(cfg.fps), 1e-6)) * sr)))
-    if ed - st < max(64, int(0.10 * sr)):
-        st, ed = 0, wav.size
-    return audio_global_features(wav[st:ed], sr).astype(np.float32)
-
-
-def standardize_features(x: np.ndarray, mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.asarray(x, dtype=np.float32)
-    if mask is not None and np.asarray(mask).astype(bool).any():
-        base = x[np.asarray(mask).astype(bool)]
-    else:
-        base = x
-    mean = base.mean(axis=0, keepdims=True).astype(np.float32)
-    std = (base.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
-    return ((x - mean) / std).astype(np.float32), mean, std
-
-
-def build_default_audio_slots(path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
-    if slots_json and Path(slots_json).exists():
-        # External Music Semantics: slots_json can be either the old feature JSON or a new
-        # external classical-music semantic JSON/NPZ.
-        if str(slots_json).lower().endswith(".npz"):
-            parsed = parse_external_music_semantic_file(slots_json, cfg)
-            if parsed is not None:
-                return parsed
-        data = load_json(slots_json)
-        slots = data.get("slots", data if isinstance(data, list) else [])
-        if slots and isinstance(slots[0], dict) and ("probs" in slots[0] or "top_label" in slots[0] or "music_alignment_label" in slots[0]):
-            parsed = parse_external_music_semantic_file(slots_json, cfg)
-            if parsed is not None:
-                return parsed
-        feats = []
-        for s in slots:
-            base = np.asarray(s.get("feature", []), dtype=np.float32)
-            if base.size < 32:
-                base = np.pad(base, (0, 32 - base.size))
-            feats.append(base[:32])
-        return slots, np.stack(feats).astype(np.float32)
-    external = load_external_music_semantic_slots(path, cfg, slot_seconds)
-    if external is not None:
-        return external
-    sr, wav = read_wav_mono(path)
-    total = wav.size / sr
-    n_slots = max(1, int(math.ceil(total / slot_seconds)))
-    slots: List[dict] = []
-    feats: List[np.ndarray] = []
-    for i in range(n_slots):
-        st = int(i * slot_seconds * sr)
-        ed = min(wav.size, int((i + 1) * slot_seconds * sr))
-        seg = wav[st:ed]
-        f = audio_global_features(seg, sr)
-        # Convert audio descriptor into same coarse semantic order as motion descriptor.
-        pseudo = np.zeros(32, dtype=np.float32)
-        dur = max((ed - st) / sr, 1e-6)
-        energy = float(f[1])
-        onset = float(f[5])
-        dyn = float(f[2] + f[6])
-        pseudo[0] = dur
-        pseudo[1] = energy * 2.0
-        pseudo[2] = energy
-        pseudo[3] = f[3]
-        pseudo[4] = dyn
-        pseudo[5] = energy + onset
-        pseudo[6] = f[7]
-        pseudo[7] = energy + 0.5 * onset
-        pseudo[8] = energy
-        pseudo[9] = 1.0 + onset
-        pseudo[10] = np.clip(0.75 - energy, 0.0, 1.0)
-        pseudo[13] = max(0.02, onset)
-        pseudo[15] = 0.0
-        pseudo[16] = onset
-        pseudo[17] = f[7]
-        pseudo[18] = dyn
-        pseudo[19:] = f[: 32 - 19]
-        slot_sem = audio_slot_classification_from_pseudo(pseudo, dur, energy, onset, dyn)
-        # Encode music alignment labels in the same high channels as class_semantic.
-        pseudo[22] = _label_index(slot_sem["energy_label"], ENERGY_LABELS) / max(1, len(ENERGY_LABELS) - 1)
-        pseudo[23] = _label_index(slot_sem["rhythm_label"], RHYTHM_LABELS) / max(1, len(RHYTHM_LABELS) - 1)
-        pseudo[26] = _label_index(slot_sem["music_alignment_label"], MUSIC_ALIGNMENT_LABELS) / max(1, len(MUSIC_ALIGNMENT_LABELS) - 1)
-        slot_item = {"slot_id": i, "start": st / sr, "end": ed / sr, "duration": dur, "energy": energy, "onset": onset}
-        slot_item.update(slot_sem)
-        slots.append(slot_item)
-        feats.append(pseudo.astype(np.float32))
-    return slots, np.stack(feats).astype(np.float32)
-
-
-
-
-
-
-
-
-# ===== Music Slot Planning PRETRAINED ROUTER SLOT PATCH START =====
-def _slot_plan_env_bool(name: str, default: bool = False) -> bool:
-    try:
-        return bool(int(os.environ.get(name, "1" if default else "0")))
-    except Exception:
-        return bool(default)
-
-
-_SLOT_PLAN_SEMANTIC_LABELS = [
-    "calm_meditative",
-    "lyrical_flow",
-    "pose_hold",
-    "instrument_phrase",
-    "percussive_accent",
-    "turning_climax",
-    "footwork_flow",
-]
-
-
-def _normalize_slot_probabilities(obj, top_label=None):
-    if isinstance(obj, dict):
-        raw = {str(k): float(v) for k, v in obj.items() if str(k) in _SLOT_PLAN_SEMANTIC_LABELS}
-    else:
-        raw = {}
-    if not raw and top_label in _SLOT_PLAN_SEMANTIC_LABELS:
-        raw = {k: 0.02 for k in _SLOT_PLAN_SEMANTIC_LABELS}
-        raw[str(top_label)] = 0.88
-    if not raw:
-        raw = {k: 1.0 / len(_SLOT_PLAN_SEMANTIC_LABELS) for k in _SLOT_PLAN_SEMANTIC_LABELS}
-    s = sum(max(0.0, float(v)) for v in raw.values())
-    if s <= 1e-8:
-        return {k: 1.0 / len(_SLOT_PLAN_SEMANTIC_LABELS) for k in _SLOT_PLAN_SEMANTIC_LABELS}
-    return {k: float(max(0.0, raw.get(k, 0.0)) / s) for k in _SLOT_PLAN_SEMANTIC_LABELS}
-
-
-def _top_slot_label(probs):
-    p = _normalize_slot_probabilities(probs)
-    return max(p.items(), key=lambda kv: kv[1])[0]
-
-
-def _feature_from_music_slot(slot: dict) -> np.ndarray:
-    dur = float(slot.get("duration", slot.get("duration_sec", 4.0)))
-    probs = _normalize_slot_probabilities(slot.get("music_semantic_probs", {}), slot.get("music_semantic_top_label", slot.get("music_alignment_label")))
-    energy = float(slot.get("energy", slot.get("music_energy", slot.get("slot_energy", 0.06))))
-    onset = float(slot.get("onset", slot.get("accent", slot.get("music_accent_score", 0.02))))
-    dyn = float(slot.get("dynamic", slot.get("beat_density", 0.04)))
-    x = np.zeros(32, dtype=np.float32)
-    x[0] = dur
-    x[1] = 2.0 * energy + 0.25 * probs["footwork_flow"] + 0.25 * probs["percussive_accent"]
-    x[2] = energy
-    x[3] = float(slot.get("energy_p90", energy))
-    x[4] = dyn
-    x[5] = energy + onset + 0.35 * probs["percussive_accent"]
-    x[6] = float(slot.get("onset_p90", onset))
-    x[7] = energy + 0.5 * onset + 0.25 * probs["footwork_flow"]
-    x[8] = energy
-    x[9] = 1.0 + onset + 0.35 * probs["turning_climax"]
-    x[10] = 0.65 * probs["calm_meditative"] + 0.45 * probs["pose_hold"]
-    x[11] = probs["pose_hold"]
-    x[12] = probs["calm_meditative"]
-    x[13] = max(0.02, onset + 0.2 * probs["percussive_accent"])
-    x[15] = 0.25 * probs["turning_climax"]
-    x[16] = probs["turning_climax"]
-    x[17] = probs["footwork_flow"]
-    x[18] = probs["instrument_phrase"]
-    x[19] = probs["lyrical_flow"]
-    x[20] = probs["percussive_accent"]
-    x[21] = probs["calm_meditative"]
-    x[22] = probs["pose_hold"]
-    for i, lab in enumerate(_SLOT_PLAN_SEMANTIC_LABELS):
-        if 23 + i < 32:
-            x[23 + i] = probs[lab]
-    x[31] = 1.0
-    return x.astype(np.float32)
-
-
-def _find_music_slots_in_json(data):
-    if isinstance(data, dict):
-        if isinstance(data.get("slots"), list):
-            return data.get("slots"), data
-        sr = data.get("stage_reports")
-        if isinstance(sr, dict) and isinstance(sr.get("retrieval"), list):
-            slots = []
-            for r in sr.get("retrieval", []):
-                if not isinstance(r, dict):
-                    continue
-                slots.append({
-                    "slot_id": r.get("slot", r.get("slot_id", len(slots))),
-                    "duration": r.get("duration", 4.0),
-                    "music_alignment_label": r.get("slot_music_alignment_label", r.get("music_alignment_label", "calm_meditative")),
-                    "music_semantic_top_label": r.get("slot_music_semantic_top_label", r.get("slot_music_alignment_label", "calm_meditative")),
-                    "music_semantic_probs": r.get("slot_music_semantic_probs", {}),
-                    "preferred_dance_keys": r.get("slot_preferred_dance_keys", []),
-                })
-            if slots:
-                return slots, data
-        for v in data.values():
-            got, meta = _find_music_slots_in_json(v)
-            if got is not None:
-                return got, meta
-    elif isinstance(data, list):
-        if data and all(isinstance(x, dict) for x in data):
-            keys = set()
-            for x in data[: min(8, len(data))]:
-                keys.update(x.keys())
-            if "duration" in keys or {"start", "end"}.issubset(keys):
-                return data, {"version": "list_slots"}
-        for v in data:
-            got, meta = _find_music_slots_in_json(v)
-            if got is not None:
-                return got, meta
-    return None, {}
-
-
-def _load_music_slots_json(slots_json: str | Path, cfg: MotionGenerationConfig) -> Tuple[List[dict], np.ndarray, dict]:
-    data = load_json(slots_json)
-    slots, meta = _find_music_slots_in_json(data)
-    if not slots:
-        raise RuntimeError(f"Music Slot Planning slots_json has no slots: {slots_json}")
-    fps = float(getattr(cfg, "fps", 30.0))
-    out_slots: List[dict] = []
-    feats: List[np.ndarray] = []
-    cursor = 0.0
-    for i, s0 in enumerate(slots):
-        s = dict(s0)
-        dur = s.get("duration", s.get("duration_sec", None))
-        st = s.get("start", s.get("start_sec", s.get("music_start", None)))
-        ed = s.get("end", s.get("end_sec", s.get("music_end", None)))
-        if dur is None and st is not None and ed is not None:
-            dur = float(ed) - float(st)
-        if dur is None:
-            dur = 4.0
-        dur = max(0.10, float(dur))
-        if st is None:
-            st = cursor
-        st = float(st)
-        if ed is None:
-            ed = st + dur
-        ed = float(ed)
-        dur = max(0.10, ed - st)
-        cursor = ed
-        probs = _normalize_slot_probabilities(s.get("music_semantic_probs", {}), s.get("music_semantic_top_label", s.get("music_alignment_label")))
-        top = s.get("music_semantic_top_label", s.get("music_alignment_label", _top_slot_label(probs)))
-        if top not in _SLOT_PLAN_SEMANTIC_LABELS:
-            top = _top_slot_label(probs)
-        base = np.asarray(s.get("feature", []), dtype=np.float32)
-        if base.size < 32 or float(np.max(np.abs(base))) == 0.0:
-            base = _feature_from_music_slot({**s, "duration": dur, "music_semantic_probs": probs, "music_semantic_top_label": top})
-        if base.size < 32:
-            base = np.pad(base, (0, 32 - base.size))
-        s.update({
-            "slot_id": int(s.get("slot_id", s.get("slot", i))),
-            "start": float(st),
-            "end": float(ed),
-            "duration": float(dur),
-            "target_frames": int(s.get("target_frames", round(float(dur) * fps))),
-            "music_alignment_label": str(s.get("music_alignment_label", top)),
-            "music_semantic_top_label": str(top),
-            "music_semantic_probs": probs,
-            "slot_plan_source": str(s.get("slot_plan_source", meta.get("slot_source", "music_slot_slots_json"))),
-            "feature": base[:32].astype(float).tolist(),
-        })
-        out_slots.append(s)
-        feats.append(base[:32].astype(np.float32))
-    return out_slots, np.stack(feats).astype(np.float32), meta if isinstance(meta, dict) else {}
-
-
-# ===== Music Slot Planning PRETRAINED ROUTER SLOT PATCH END =====
-
-class MLPEncoder(nn.Module):
-    def __init__(self, in_dim: int = 32, emb_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.SiLU(), nn.Dropout(0.05),
-            nn.Linear(256, 256), nn.LayerNorm(256), nn.SiLU(),
-            nn.Linear(256, emb_dim),
-        )
-
-    def forward(self, x):
-        return F.normalize(self.net(x), dim=-1)
-
-
-class ContrastiveModel(nn.Module):
-    def __init__(self, feat_dim: int = 32, emb_dim: int = 128):
-        super().__init__()
-        self.motion = MLPEncoder(feat_dim, emb_dim)
-        self.music = MLPEncoder(feat_dim, emb_dim)
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0), dtype=torch.float32))
-
-    def forward(self, music_feat, motion_feat):
-        me = self.music(music_feat)
-        de = self.motion(motion_feat)
-        scale = self.logit_scale.exp().clamp(max=100.0)
-        return scale * me @ de.t(), me, de
-
-
-def make_weak_music_features_from_motion(desc: np.ndarray, noise: float = 0.08) -> np.ndarray:
-    # Weak-pair fallback: retain duration/energy/turn/contact semantics with jitter.
-    # Root-Aware Motion Safety keeps this only as an explicitly marked smoke-test fallback.  For
-    # motion-only Chang-E BVH, prefer unpaired real-audio semantic OT below.
-    m = desc.copy().astype(np.float32)
-    rng = np.random.default_rng(1234)
-    m[:, 1:9] *= rng.normal(1.0, noise, size=m[:, 1:9].shape).astype(np.float32)
-    m[:, 15:18] *= rng.normal(1.0, noise * 1.5, size=m[:, 15:18].shape).astype(np.float32)
-    m += rng.normal(0.0, noise * 0.15, size=m.shape).astype(np.float32)
-    return m.astype(np.float32)
-
-
-def semantic_dims_and_weights() -> Tuple[np.ndarray, np.ndarray]:
-    """Feature weights shared by unpaired audio-motion OT and retrieval fallback."""
-    dims = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 16, 17, 18, 22, 23, 24, 25, 26, 28, 29, 30], dtype=np.int64)
-    weights = np.array([
-        0.45,  # duration
-        0.80, 0.95, 0.75, 0.70,  # root/energy/dynamics
-        1.15, 1.00, 1.05, 0.90,  # joint/lower/upper energy
-        0.45, 0.35,              # lower/upper ratio + contact calmness
-        0.75, 0.75,              # foot speed
-        0.90, 0.95, 0.65,        # onset/turn/root-y dynamics
-        0.55, 0.55, 0.42, 0.42, 0.70,  # explicit class channels
-        0.35, 0.42, 0.42,        # calm/percussive/turn affinity bits
-    ], dtype=np.float32)
-    return dims, weights
-
-
-
-
+    return slots, features
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -3930,116 +1957,11 @@ def _descriptor_values_in_training_coordinates(
     return np.clip((raw - mean) / np.maximum(std, 1.0e-6), -8.0, 8.0).astype(np.float32)
 
 
-def train_contrastive(args: argparse.Namespace) -> int:
-    if torch is None:
-        raise RuntimeError("PyTorch is required for Contrastive Retriever training.")
-    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
-    sem_dirs = getattr(args, "music_semantic_dirs", None)
-    if sem_dirs:
-        cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in sem_dirs])
-    if getattr(args, "external_music_semantic_cmd", None):
-        cfg.external_music_semantic_cmd = str(args.external_music_semantic_cmd)
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    random.seed(cfg.seed)
-    db = load_db(args.db)
-    database_contract = _training_db_contract(db, cfg, "Contrastive Retriever training")
-    motion_db = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "filename_semantic_weight", 0.35)))
-    supervision_mode = "weak_motion_proxy"
-    pair_report: Dict[str, object] = {}
-
-    if args.music_feature_npz and Path(args.music_feature_npz).exists():
-        mf_npz = np.load(args.music_feature_npz)
-        key = "music_z" if "music_z" in mf_npz.files else "music"
-        mf = mf_npz[key].astype(np.float32)
-        if mf.shape != motion_db.shape:
-            raise ValueError(f"music feature shape {mf.shape} != motion feature shape {motion_db.shape}")
-        music, music_mean, music_std = standardize_features(mf)
-        motion = motion_db
-        supervision_mode = "external_real_music_features"
-        pair_report = {"mode": supervision_mode, "num_training_pairs": int(motion.shape[0])}
-    elif "music" in db and "music_mask" in db and float(np.mean(np.asarray(db["music_mask"], dtype=np.float32) > 0.5)) >= float(cfg.audio_pair_min_coverage):
-        mask = np.asarray(db["music_mask"], dtype=np.float32) > 0.5
-        music_raw = np.asarray(db["music"], dtype=np.float32)
-        music, music_mean, music_std = standardize_features(music_raw, mask=mask)
-        motion = motion_db[mask]
-        music = music[mask]
-        supervision_mode = "paired_audio_features_from_db"
-        pair_report = {"mode": supervision_mode, "paired_coverage": float(mask.mean()), "num_training_pairs": int(motion.shape[0])}
-    else:
-        unpaired_dirs = getattr(args, "unpaired_audio_dirs", None) or getattr(args, "audio_dirs", None)
-        unpaired = build_unpaired_audio_motion_pairs(db, unpaired_dirs, cfg) if bool(cfg.unpaired_audio_enable) else None
-        if unpaired is not None:
-            music, motion, music_mean, music_std, pair_report = unpaired
-            supervision_mode = str(pair_report.get("mode", "unpaired_audio_semantic_ot"))
-        else:
-            if bool(cfg.contrastive_require_real_music) or bool(cfg.unpaired_disable_motion_proxy):
-                raise RuntimeError(
-                    "No paired audio and no usable unpaired audio were found. "
-                    "Put target music under test_music_bank/ or data/music/, or set "
-                    "MOTION_UNPAIRED_DISABLE_MOTION_PROXY=0 for a smoke-test-only fallback."
-                )
-            music_raw = make_weak_music_features_from_motion(np.asarray(db["desc"], dtype=np.float32))
-            mean = np.asarray(db["desc_mean"], dtype=np.float32)
-            std = np.asarray(db["desc_std"], dtype=np.float32)
-            music = (music_raw - mean) / std
-            motion = motion_db
-            music_mean, music_std = mean, std
-            supervision_mode = "weak_motion_descriptor_proxy"
-            pair_report = {"mode": supervision_mode, "warning": "motion descriptor self-distillation; do not report as real music-motion pairing", "num_training_pairs": int(motion.shape[0])}
-
-    N = int(motion.shape[0])
-    if N < 2:
-        raise RuntimeError("Contrastive Retriever contrastive needs at least two training pairs.")
-    device = torch.device(cfg.device)
-    model = ContrastiveModel(motion.shape[1], cfg.embed_dim).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
-    bs = min(cfg.batch_size, N)
-    for ep in range(int(args.epochs or cfg.contrastive_epochs)):
-        perm = np.random.permutation(N)
-        losses = []
-        for st in range(0, N, bs):
-            idx = perm[st:st + bs]
-            if len(idx) < 2:
-                continue
-            mf = torch.from_numpy(music[idx]).float().to(device)
-            df = torch.from_numpy(motion[idx]).float().to(device)
-            logits, _, _ = model(mf, df)
-            labels = torch.arange(logits.shape[0], device=device)
-            loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            losses.append(float(loss.detach().cpu()))
-        if ep % 10 == 0 or ep == int(args.epochs or cfg.contrastive_epochs) - 1:
-            print(f"[Contrastive Retriever contrastive] epoch={ep} loss={np.mean(losses):.5f} scale={model.logit_scale.exp().item():.2f} mode={supervision_mode}")
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    ckpt = {
-        "version": "contrastive_retrieval_12_external_classical_music_semantic_grounding",
-        "state_dict": model.state_dict(),
-        "config": dataclasses.asdict(cfg),
-        "feat_dim": motion.shape[1],
-        "embed_dim": cfg.embed_dim,
-        "supervision_mode": supervision_mode,
-        "music_mean": music_mean.astype(np.float32),
-        "music_std": music_std.astype(np.float32),
-        "pair_report": pair_report,
-        "motion_contract": motion_checkpoint_contract(cfg, "semantic_retriever"),
-        "training_event_db_contract": database_contract["event_db_contract"],
-        "training_database": database_contract,
-    }
-    torch.save(ckpt, out)
-    print(json.dumps({"contrastive_ckpt": str(out), "num_pairs": int(N), "supervision_mode": supervision_mode, "pair_report": pair_report}, ensure_ascii=False, indent=2))
-    return 0
-
 def _expand_temporal_condition_torch(cond, frames: int):
     """Return condition as ``[batch, frames, features]``.
 
-    Checkpoint parameters are unchanged: legacy callers may still pass one
-    descriptor per sequence, while whole-song generation can pass a local
-    descriptor for every frame.
+    Training may pass one descriptor per sequence, while whole-song generation
+    passes a local descriptor for every frame.
     """
 
     if cond.ndim == 2:
@@ -4065,7 +1987,7 @@ def _condition_chunk_np(
     end: int,
     target_frames: Optional[int] = None,
 ) -> np.ndarray:
-    """Slice frame-local conditioning while retaining legacy vector inputs."""
+    """Slice frame-local conditioning while retaining training-time vectors."""
 
     value = np.asarray(condition, dtype=np.float32)
     if value.ndim == 1:
@@ -4138,32 +2060,6 @@ def build_frame_local_conditioning(
             f"mean={mean.shape[0]}, std={std.shape[0]}"
         )
     return ((frame_condition - mean[None]) / np.maximum(std[None], 1.0e-8)).astype(np.float32)
-
-
-class TemporalRefiner(nn.Module):
-    """Legacy 151D Euclidean refiner kept for old Motion Refiner checkpoints."""
-
-    def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256):
-        super().__init__()
-        self.in_proj = nn.Conv1d(motion_dim + cond_dim + 1, hidden, 1)
-        self.net = nn.Sequential(
-            nn.Conv1d(hidden, hidden, 5, padding=2), nn.GroupNorm(8, hidden), nn.SiLU(),
-            nn.Conv1d(hidden, hidden, 5, padding=2), nn.GroupNorm(8, hidden), nn.SiLU(),
-            nn.Conv1d(hidden, hidden, 5, padding=2), nn.GroupNorm(8, hidden), nn.SiLU(),
-        )
-        self.out = nn.Conv1d(hidden, motion_dim, 1)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-
-    def forward(self, x, cond, seam_mask):
-        # x: B,T,D cond: B,C or B,T,C seam_mask: B,T,1
-        B, T, D = x.shape
-        c = _expand_temporal_condition_torch(cond, T)
-        y = torch.cat([x, c, seam_mask], dim=-1).transpose(1, 2)
-        h = self.in_proj(y)
-        h = h + self.net(h)
-        delta = self.out(h).transpose(1, 2)
-        return delta
 
 
 class ProductManifoldTemporalRefiner(nn.Module):
@@ -4656,60 +2552,39 @@ def _evaluate_refiner_validation(
         with torch.no_grad():
             for idx in indices:
                 clean = load_motion_window(
-                    validation_db["paths"][idx], cfg.window_len, cfg, random_crop=False
+                    validation_db["paths"][idx],
+                    cfg.window_len,
+                    cfg,
+                    random_crop=False,
                 )
                 bad, seam = degrade_for_refiner(clean, cfg=cfg)
                 clean_t = torch.from_numpy(clean[None]).float().to(device)
                 bad_t = torch.from_numpy(bad[None]).float().to(device)
                 seam_t = torch.from_numpy(seam[None]).float().to(device)
                 cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
-                if isinstance(model, ProductManifoldTemporalRefiner):
-                    joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                        bad[None], seam[None], cfg
+                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                    bad[None], seam[None], cfg
+                )
+                joint_t = torch.from_numpy(joint_np).float().to(device)
+                root_t = torch.from_numpy(root_np).float().to(device)
+                contact_t = torch.from_numpy(contact_np).float().to(device)
+                output = model(bad_t, cond_t, seam_t, joint_t)
+                pred = _decode_product_refiner_output(
+                    bad_t, output, joint_t, root_t, contact_t, cfg
+                )
+                rec_values.append(
+                    float(product_log_torch(pred, clean_t).abs().mean().cpu())
+                )
+                velocity_values.append(
+                    float(
+                        F.smooth_l1_loss(
+                            product_log_torch(pred[:, :-1], pred[:, 1:]),
+                            product_log_torch(clean_t[:, :-1], clean_t[:, 1:]),
+                        ).cpu()
                     )
-                    joint_t = torch.from_numpy(joint_np).float().to(device)
-                    root_t = torch.from_numpy(root_np).float().to(device)
-                    contact_t = torch.from_numpy(contact_np).float().to(device)
-                    output = model(bad_t, cond_t, seam_t, joint_t)
-                    pred = _decode_product_refiner_output(
-                        bad_t,
-                        output,
-                        joint_t,
-                        root_t,
-                        contact_t,
-                        cfg,
-                    )
-                    rec_values.append(
-                        float(
-                            product_log_torch(pred, clean_t).abs().mean().cpu()
-                        )
-                    )
-                    velocity_values.append(
-                        float(
-                            F.smooth_l1_loss(
-                                product_log_torch(pred[:, :-1], pred[:, 1:]),
-                                product_log_torch(
-                                    clean_t[:, :-1], clean_t[:, 1:]
-                                ),
-                            ).cpu()
-                        )
-                    )
-                else:
-                    pred = bad_t + model(bad_t, cond_t, seam_t) * (
-                        0.35 + 0.65 * seam_t
-                    )
-                    rec_values.append(
-                        float(F.smooth_l1_loss(pred, clean_t).cpu())
-                    )
-                    velocity_values.append(float(F.smooth_l1_loss(
-                        pred[:, 1:] - pred[:, :-1],
-                        clean_t[:, 1:] - clean_t[:, :-1],
-                    ).cpu()))
+                )
                 _record_validation_physical_prediction(
-                    physical,
-                    pred[0].detach().cpu().numpy(),
-                    clean,
-                    cfg,
+                    physical, pred[0].detach().cpu().numpy(), clean, cfg
                 )
     finally:
         random.setstate(python_state)
@@ -4717,13 +2592,13 @@ def _evaluate_refiner_validation(
         model.train()
     return {
         "num_windows": len(indices),
-        "reconstruction_smooth_l1": float(np.mean(rec_values)) if rec_values else None,
-        "velocity_smooth_l1_per_frame": float(np.mean(velocity_values)) if velocity_values else None,
-        "representation": (
-            "product_manifold_79d"
-            if isinstance(model, ProductManifoldTemporalRefiner)
-            else "legacy_edge151_euclidean"
+        "reconstruction_product_log_l1": (
+            float(np.mean(rec_values)) if rec_values else None
         ),
+        "velocity_smooth_l1_per_frame": (
+            float(np.mean(velocity_values)) if velocity_values else None
+        ),
+        "representation": "product_manifold_79d",
         "descriptor_coordinates": "training_event_db",
         "physical_quality": _summarize_validation_physical_metrics(physical),
     }
@@ -4754,78 +2629,70 @@ def _evaluate_diffusion_validation(
         with torch.no_grad():
             for sample_index, idx in enumerate(indices):
                 clean = load_motion_window(
-                    validation_db["paths"][idx], cfg.window_len, cfg, random_crop=False
+                    validation_db["paths"][idx],
+                    cfg.window_len,
+                    cfg,
+                    random_crop=False,
                 )
-                retrieval, seam = degrade_for_refiner(clean, severity=0.045, cfg=cfg)
+                retrieval, seam = degrade_for_refiner(
+                    clean, severity=0.045, cfg=cfg
+                )
                 x0 = torch.from_numpy(clean[None]).float().to(device)
                 retr = torch.from_numpy(retrieval[None]).float().to(device)
                 seam_t = torch.from_numpy(seam[None]).float().to(device)
                 cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
-                timestep = int(round(sample_index * max(diffusion_steps - 1, 0) / max(len(indices) - 1, 1)))
+                timestep = int(
+                    round(
+                        sample_index
+                        * max(diffusion_steps - 1, 0)
+                        / max(len(indices) - 1, 1)
+                    )
+                )
                 t = torch.full((1,), timestep, dtype=torch.long, device=device)
                 a = abar[t].view(1, 1, 1)
-                if isinstance(model, TangentDiffusionDenoiser):
-                    joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                        retrieval[None], seam[None], cfg
-                    )
-                    joint_t = torch.from_numpy(joint_np).float().to(device)
-                    root_t = torch.from_numpy(root_np).float().to(device)
-                    contact_t = torch.from_numpy(contact_np).float().to(device)
-                    state0 = _encode_reference_tangent_state(retr, x0)
-                    state_mask = _tangent_state_mask(
-                        joint_t, root_t, contact_t
-                    )
-                    active_mask = (state_mask > 0.0).to(state0.dtype)
-                    noise = torch.randn_like(state0) * active_mask
-                    x_t = (
-                        torch.sqrt(a) * state0
-                        + torch.sqrt(1.0 - a) * noise
-                    ) * active_mask
-                    pred_noise = model(
-                        x_t, retr, cond_t, seam_t, joint_t, t
-                    ) * active_mask
-                    denominator = state_mask.sum().clamp_min(1.0)
-                    noise_error = ((pred_noise - noise) ** 2 * state_mask).sum()
-                    noise_values.append(float((noise_error / denominator).cpu()))
-                    state0_hat = (
-                        x_t - torch.sqrt(1.0 - a) * pred_noise
-                    ) / torch.sqrt(a).clamp_min(1.0e-6)
-                    decoded = _decode_reference_tangent_state(
-                        retr,
-                        state0_hat,
-                        joint_t,
-                        root_t,
-                        contact_t,
-                        cfg,
-                    )
-                    velocity_values.append(
-                        float(
-                            F.smooth_l1_loss(
-                                product_log_torch(
-                                    decoded[:, :-1], decoded[:, 1:]
-                                ),
-                                product_log_torch(
-                                    x0[:, :-1], x0[:, 1:]
-                                ),
-                            ).cpu()
-                        )
-                    )
-                else:
-                    noise = torch.randn_like(x0)
-                    x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
-                    pred_noise = model(x_t, retr, cond_t, seam_t, t)
-                    noise_values.append(float(F.mse_loss(pred_noise, noise).cpu()))
-                    x0_hat = (x_t - torch.sqrt(1.0 - a) * pred_noise) / torch.sqrt(a).clamp_min(1.0e-6)
-                    velocity_values.append(float(F.smooth_l1_loss(
-                        x0_hat[:, 1:] - x0_hat[:, :-1],
-                        x0[:, 1:] - x0[:, :-1],
-                    ).cpu()))
-                    decoded = x0_hat
-                _record_validation_physical_prediction(
-                    physical,
-                    decoded[0].detach().cpu().numpy(),
-                    clean,
+                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                    retrieval[None], seam[None], cfg
+                )
+                joint_t = torch.from_numpy(joint_np).float().to(device)
+                root_t = torch.from_numpy(root_np).float().to(device)
+                contact_t = torch.from_numpy(contact_np).float().to(device)
+                state0 = _encode_reference_tangent_state(retr, x0)
+                state_mask = _tangent_state_mask(
+                    joint_t, root_t, contact_t
+                )
+                active_mask = (state_mask > 0.0).to(state0.dtype)
+                noise = torch.randn_like(state0) * active_mask
+                x_t = (
+                    torch.sqrt(a) * state0
+                    + torch.sqrt(1.0 - a) * noise
+                ) * active_mask
+                pred_noise = model(
+                    x_t, retr, cond_t, seam_t, joint_t, t
+                ) * active_mask
+                denominator = state_mask.sum().clamp_min(1.0)
+                noise_error = ((pred_noise - noise) ** 2 * state_mask).sum()
+                noise_values.append(float((noise_error / denominator).cpu()))
+                state0_hat = (
+                    x_t - torch.sqrt(1.0 - a) * pred_noise
+                ) / torch.sqrt(a).clamp_min(1.0e-6)
+                decoded = _decode_reference_tangent_state(
+                    retr,
+                    state0_hat,
+                    joint_t,
+                    root_t,
+                    contact_t,
                     cfg,
+                )
+                velocity_values.append(
+                    float(
+                        F.smooth_l1_loss(
+                            product_log_torch(decoded[:, :-1], decoded[:, 1:]),
+                            product_log_torch(x0[:, :-1], x0[:, 1:]),
+                        ).cpu()
+                    )
+                )
+                _record_validation_physical_prediction(
+                    physical, decoded[0].detach().cpu().numpy(), clean, cfg
                 )
     finally:
         random.setstate(python_state)
@@ -4837,12 +2704,10 @@ def _evaluate_diffusion_validation(
     return {
         "num_windows": len(indices),
         "noise_mse": float(np.mean(noise_values)) if noise_values else None,
-        "velocity_smooth_l1_per_frame": float(np.mean(velocity_values)) if velocity_values else None,
-        "representation": (
-            "reference_tangent_product_manifold_79d"
-            if isinstance(model, TangentDiffusionDenoiser)
-            else "legacy_edge151_euclidean"
+        "velocity_smooth_l1_per_frame": (
+            float(np.mean(velocity_values)) if velocity_values else None
         ),
+        "representation": "reference_tangent_product_manifold_79d",
         "descriptor_coordinates": "training_event_db",
         "physical_quality": _summarize_validation_physical_metrics(physical),
     }
@@ -4869,12 +2734,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         "source_disjoint": _validate_source_disjoint(db, validation_db),
     }
     device = torch.device(cfg.device)
-    product_mode = bool(cfg.product_manifold_enable)
-    model = (
-        ProductManifoldTemporalRefiner(EDGE_DIM, 32)
-        if product_mode
-        else TemporalRefiner(EDGE_DIM, 32)
-    ).to(device)
+    model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
     bs = min(cfg.batch_size, max(2, len(paths)))
@@ -4904,35 +2764,25 @@ def train_refiner(args: argparse.Namespace) -> int:
         bad_t = torch.from_numpy(np.stack(bad_batch)).float().to(device)
         seam_t = torch.from_numpy(np.stack(seam_batch)).float().to(device)
         cond_t = torch.from_numpy(np.stack(cond_batch)).float().to(device)
-        if product_mode:
-            joint_t = torch.from_numpy(np.stack(joint_mask_batch)).float().to(device)
-            root_t = torch.from_numpy(np.stack(root_mask_batch)).float().to(device)
-            contact_t = torch.from_numpy(
-                np.stack(contact_mask_batch)
-            ).float().to(device)
-            output = model(bad_t, cond_t, seam_t, joint_t)
-            pred = _decode_product_refiner_output(
-                bad_t, output, joint_t, root_t, contact_t, cfg
-            )
-            loss, loss_terms = _product_motion_losses(
-                pred,
-                clean_t,
-                bad_t,
-                joint_t,
-                root_t,
-                contact_t,
-                cfg,
-            )
-            rec = loss_terms["reconstruction"]
-        else:
-            delta = model(bad_t, cond_t, seam_t)
-            pred = bad_t + delta * (0.35 + 0.65 * seam_t)
-            rec = F.smooth_l1_loss(pred, clean_t)
-            smooth = F.smooth_l1_loss(
-                pred[:, 1:] - pred[:, :-1],
-                clean_t[:, 1:] - clean_t[:, :-1],
-            )
-            loss = rec + 0.25 * smooth
+        joint_t = torch.from_numpy(np.stack(joint_mask_batch)).float().to(device)
+        root_t = torch.from_numpy(np.stack(root_mask_batch)).float().to(device)
+        contact_t = torch.from_numpy(
+            np.stack(contact_mask_batch)
+        ).float().to(device)
+        output = model(bad_t, cond_t, seam_t, joint_t)
+        pred = _decode_product_refiner_output(
+            bad_t, output, joint_t, root_t, contact_t, cfg
+        )
+        loss, loss_terms = _product_motion_losses(
+            pred,
+            clean_t,
+            bad_t,
+            joint_t,
+            root_t,
+            contact_t,
+            cfg,
+        )
+        rec = loss_terms["reconstruction"]
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -4945,18 +2795,10 @@ def train_refiner(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "version": (
-            "product_manifold_boundary_refiner_v1"
-            if product_mode
-            else "boundary_refiner"
-        ),
-        "output_mode": (
-            "contact_logits_root_joint_tangent"
-            if product_mode
-            else "legacy_edge151_residual"
-        ),
-        "output_dim": PRODUCT_STATE_DIM if product_mode else EDGE_DIM,
-        "joint_mask_conditioned": bool(product_mode),
+        "version": "product_manifold_boundary_refiner_v1",
+        "output_mode": "contact_logits_root_joint_tangent",
+        "output_dim": PRODUCT_STATE_DIM,
+        "joint_mask_conditioned": True,
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "motion_contract": motion_checkpoint_contract(cfg, "boundary_refiner"),
@@ -4987,34 +2829,6 @@ class SinusoidalTimeEmbedding(nn.Module):
         if emb.shape[-1] < self.dim:
             emb = F.pad(emb, (0, self.dim - emb.shape[-1]))
         return self.proj(emb)
-
-
-class DiffusionDenoiser(nn.Module):
-    """Legacy raw EDGE-151 denoiser kept for old Motion Generation checkpoints."""
-
-    def __init__(self, motion_dim: int = EDGE_DIM, cond_dim: int = 32, hidden: int = 256, time_dim: int = 128):
-        super().__init__()
-        self.time = SinusoidalTimeEmbedding(time_dim)
-        self.cond_proj = nn.Sequential(nn.Linear(cond_dim + time_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
-        self.in_proj = nn.Conv1d(motion_dim * 2 + 1, hidden, 1)
-        self.blocks = nn.ModuleList([
-            nn.Sequential(nn.Conv1d(hidden, hidden, 5, padding=2), nn.GroupNorm(8, hidden), nn.SiLU()),
-            nn.Sequential(nn.Conv1d(hidden, hidden, 5, padding=4, dilation=2), nn.GroupNorm(8, hidden), nn.SiLU()),
-            nn.Sequential(nn.Conv1d(hidden, hidden, 5, padding=8, dilation=4), nn.GroupNorm(8, hidden), nn.SiLU()),
-            nn.Sequential(nn.Conv1d(hidden, hidden, 5, padding=2), nn.GroupNorm(8, hidden), nn.SiLU()),
-        ])
-        self.out = nn.Conv1d(hidden, motion_dim, 1)
-
-    def forward(self, x_t, retrieval, cond, seam_mask, t):
-        B, T, D = x_t.shape
-        inp = torch.cat([x_t, retrieval, seam_mask], dim=-1).transpose(1, 2)
-        h = self.in_proj(inp)
-        te = self.time(t)
-        ce = _condition_with_time_torch(cond, te, T, self.cond_proj)
-        h = h + ce
-        for blk in self.blocks:
-            h = h + blk(h)
-        return self.out(h).transpose(1, 2)
 
 
 class TangentDiffusionDenoiser(nn.Module):
@@ -5160,14 +2974,7 @@ def train_diffusion(args: argparse.Namespace) -> int:
         "source_disjoint": _validate_source_disjoint(db, validation_db),
     }
     device = torch.device(cfg.device)
-    tangent_mode = bool(
-        cfg.product_manifold_enable and cfg.tangent_diffusion_enable
-    )
-    model = (
-        TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32)
-        if tangent_mode
-        else DiffusionDenoiser(EDGE_DIM, 32)
-    ).to(device)
+    model = TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.diffusion_train_steps)
     Tdiff = int(args.diffusion_steps or cfg.diffusion_steps)
@@ -5205,62 +3012,47 @@ def train_diffusion(args: argparse.Namespace) -> int:
         cond = torch.from_numpy(np.stack(cond_batch)).float().to(device)
         t = torch.randint(0, Tdiff, (bs,), device=device)
         a = abar[t].view(bs, 1, 1)
-        if tangent_mode:
-            joint_mask = torch.from_numpy(
-                np.stack(joint_mask_batch)
-            ).float().to(device)
-            root_mask = torch.from_numpy(
-                np.stack(root_mask_batch)
-            ).float().to(device)
-            contact_mask = torch.from_numpy(
-                np.stack(contact_mask_batch)
-            ).float().to(device)
-            state0 = _encode_reference_tangent_state(retr, x0)
-            state_mask = _tangent_state_mask(
-                joint_mask, root_mask, contact_mask
-            )
-            active_mask = (state_mask > 0.0).to(state0.dtype)
-            noise = torch.randn_like(state0) * active_mask
-            x_t = (
-                torch.sqrt(a) * state0
-                + torch.sqrt(1.0 - a) * noise
-            ) * active_mask
-            pred_noise = model(
-                x_t, retr, cond, seam, joint_mask, t
-            ) * active_mask
-            loss_noise = (
-                ((pred_noise - noise) ** 2 * state_mask).sum()
-                / state_mask.sum().clamp_min(1.0)
-            )
-            state0_hat = (
-                x_t - torch.sqrt(1.0 - a) * pred_noise
-            ) / torch.sqrt(a).clamp_min(1.0e-6)
-            decoded = _decode_reference_tangent_state(
-                retr,
-                state0_hat,
-                joint_mask,
-                root_mask,
-                contact_mask,
-                cfg,
-            )
-            loss_vel = F.smooth_l1_loss(
-                product_log_torch(decoded[:, :-1], decoded[:, 1:]),
-                product_log_torch(x0[:, :-1], x0[:, 1:]),
-            )
-        else:
-            noise = torch.randn_like(x0)
-            x_t = torch.sqrt(a) * x0 + torch.sqrt(1.0 - a) * noise
-            pred_noise = model(x_t, retr, cond, seam, t)
-            loss_noise = F.mse_loss(pred_noise, noise)
-            # Legacy raw-channel denoising retained for checkpoint parity.
-            x0_hat = (
-                x_t - torch.sqrt(1.0 - a) * pred_noise
-            ) / torch.sqrt(a).clamp_min(1e-6)
-            loss_vel = F.smooth_l1_loss(
-                x0_hat[:, 1:] - x0_hat[:, :-1],
-                x0[:, 1:] - x0[:, :-1],
-            )
-            decoded = x0_hat
+        joint_mask = torch.from_numpy(
+            np.stack(joint_mask_batch)
+        ).float().to(device)
+        root_mask = torch.from_numpy(
+            np.stack(root_mask_batch)
+        ).float().to(device)
+        contact_mask = torch.from_numpy(
+            np.stack(contact_mask_batch)
+        ).float().to(device)
+        state0 = _encode_reference_tangent_state(retr, x0)
+        state_mask = _tangent_state_mask(
+            joint_mask, root_mask, contact_mask
+        )
+        active_mask = (state_mask > 0.0).to(state0.dtype)
+        noise = torch.randn_like(state0) * active_mask
+        x_t = (
+            torch.sqrt(a) * state0
+            + torch.sqrt(1.0 - a) * noise
+        ) * active_mask
+        pred_noise = model(
+            x_t, retr, cond, seam, joint_mask, t
+        ) * active_mask
+        loss_noise = (
+            ((pred_noise - noise) ** 2 * state_mask).sum()
+            / state_mask.sum().clamp_min(1.0)
+        )
+        state0_hat = (
+            x_t - torch.sqrt(1.0 - a) * pred_noise
+        ) / torch.sqrt(a).clamp_min(1.0e-6)
+        decoded = _decode_reference_tangent_state(
+            retr,
+            state0_hat,
+            joint_mask,
+            root_mask,
+            contact_mask,
+            cfg,
+        )
+        loss_vel = F.smooth_l1_loss(
+            product_log_torch(decoded[:, :-1], decoded[:, 1:]),
+            product_log_torch(x0[:, :-1], x0[:, 1:]),
+        )
         loss_physics, physics_terms = _world_space_physics_losses(
             decoded,
             x0,
@@ -5284,18 +3076,10 @@ def train_diffusion(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "version": (
-            "reference_tangent_motion_diffusion_v1"
-            if tangent_mode
-            else "conditional_residual_motion_diffusion"
-        ),
-        "diffusion_space": (
-            "reference_point_product_tangent"
-            if tangent_mode
-            else "legacy_edge151_channels"
-        ),
-        "state_dim": PRODUCT_STATE_DIM if tangent_mode else EDGE_DIM,
-        "joint_mask_conditioned": bool(tangent_mode),
+        "version": "reference_tangent_motion_diffusion_v1",
+        "diffusion_space": "reference_point_product_tangent",
+        "state_dim": PRODUCT_STATE_DIM,
+        "joint_mask_conditioned": True,
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "diffusion_steps": Tdiff,
@@ -5320,9 +3104,8 @@ def train_diffusion(args: argparse.Namespace) -> int:
 def _trusted_torch_load(path, map_location=None, **_unused_kwargs):
     """Load trusted local checkpoints saved by this project.
 
-    PyTorch 2.6 defaults torch.load(..., weights_only=True), which may reject
-    Contrastive Retriever checkpoints containing numpy arrays. These ckpts are generated locally
-    in this experiment, so we explicitly use weights_only=False.
+    Project checkpoints include contract metadata and NumPy arrays, so trusted
+    local assets are loaded with ``weights_only=False`` explicitly.
     """
     if torch is None:
         raise RuntimeError("PyTorch is required to load checkpoints.")
@@ -5332,35 +3115,6 @@ def _trusted_torch_load(path, map_location=None, **_unused_kwargs):
         # Older PyTorch has no weights_only argument.
         return torch.load(path, map_location=map_location)
 # ===== TRUSTED LOCAL CKPT LOAD FIX END =====
-
-def load_contrastive(path: Optional[str], cfg: MotionGenerationConfig):
-    if not bool(cfg.contrastive_enable):
-        return None
-    if torch is None or not path or not Path(path).exists():
-        return None
-    ckpt = _trusted_torch_load(path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, path, "semantic_retriever")
-    model = ContrastiveModel(ckpt.get("feat_dim", 32), ckpt.get("embed_dim", cfg.embed_dim)).to(cfg.device)
-    model.load_state_dict(ckpt["state_dict"], strict=True)
-    model.music_mean = np.asarray(ckpt.get("music_mean", np.zeros((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
-    model.music_std = np.asarray(ckpt.get("music_std", np.ones((1, ckpt.get("feat_dim", 32)), dtype=np.float32)), dtype=np.float32)
-    model.supervision_mode = ckpt.get("supervision_mode", "unknown")
-    model.eval()
-    return model
-
-
-def embed_with_contrastive(model, music_feat_z: np.ndarray, motion_feat_z: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, np.ndarray]:
-    if model is None or torch is None:
-        mz = music_feat_z / np.maximum(np.linalg.norm(music_feat_z, axis=-1, keepdims=True), 1e-8)
-        dz = motion_feat_z / np.maximum(np.linalg.norm(motion_feat_z, axis=-1, keepdims=True), 1e-8)
-        return mz.astype(np.float32), dz.astype(np.float32)
-    with torch.no_grad():
-        mf = torch.from_numpy(music_feat_z.astype(np.float32)).to(cfg.device)
-        df = torch.from_numpy(motion_feat_z.astype(np.float32)).to(cfg.device)
-        me = model.music(mf).detach().cpu().numpy()
-        de = model.motion(df).detach().cpu().numpy()
-    return me.astype(np.float32), de.astype(np.float32)
-
 
 def transition_cost(exit_state: np.ndarray, entry_state: np.ndarray, cexit: np.ndarray, centry: np.ndarray) -> float:
     pose_exit = exit_state[: NUM_JOINTS * 3]
@@ -6176,16 +3930,9 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
 
     ckpt = _trusted_torch_load(ckpt_path, map_location=cfg.device)
     assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "boundary_refiner")
-    product_mode = normalize_motion_checkpoint_version(
-        ckpt.get("version", "")
-    ).startswith(
-        "product_manifold_boundary_refiner"
-    )
-    model = (
-        ProductManifoldTemporalRefiner(EDGE_DIM, 32)
-        if product_mode
-        else TemporalRefiner(EDGE_DIM, 32)
-    ).to(cfg.device)
+    if str(ckpt.get("version", "")) != "product_manifold_boundary_refiner_v1":
+        raise RuntimeError("Formal generation rejects a non-product refiner checkpoint")
+    model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(cfg.device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
 
@@ -6213,25 +3960,21 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             c = torch.from_numpy(cond_in[None].astype(np.float32)).float().to(cfg.device)
             sm = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
             strength = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * sm, 0.0, 1.0)
-            if product_mode:
-                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                    chunk_in[None], mask_in[None], cfg
-                )
-                joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
-                root_t = torch.from_numpy(root_np).float().to(cfg.device)
-                contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
-                output = model(x, c, sm, joint_t)
-                y = _decode_product_refiner_output(
-                    x,
-                    output,
-                    joint_t * strength,
-                    root_t * strength,
-                    contact_t * strength,
-                    cfg,
-                )
-            else:
-                delta = model(x, c, sm)
-                y = x + delta * strength
+            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                chunk_in[None], mask_in[None], cfg
+            )
+            joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
+            root_t = torch.from_numpy(root_np).float().to(cfg.device)
+            contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
+            output = model(x, c, sm, joint_t)
+            y = _decode_product_refiner_output(
+                x,
+                output,
+                joint_t * strength,
+                root_t * strength,
+                contact_t * strength,
+                cfg,
+            )
             y_np = y[0].detach().cpu().numpy()
             if orig_len < win:
                 y_np = resample_motion_np(y_np, orig_len)
@@ -6239,7 +3982,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
                 y_np,
                 cfg,
                 source_hint="apply_refiner_model:inbetween_output_chunk",
-                derive_contact=not product_mode,
+                derive_contact=False,
                 project_rot=True,
             )
             w = overlap_add_weight_np(orig_len, st, T, hop, win)
@@ -6252,231 +3995,238 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         rot_quat_weight,
         cfg,
         source_hint="apply_refiner_model:inbetween_final",
-        derive_contact=not product_mode,
+        derive_contact=False,
     )
     # Hard blend with original reference according to the exact transition mask.
     w = np.clip(core_strength + (trans_strength - core_strength) * seam_mask.astype(np.float32), 0.0, 1.0)
-    if product_mode:
-        full_joint, full_root, full_contact = _risk_masks_for_batch_np(
-            motion[None], seam_mask[None], cfg
-        )
-        tangent = product_log_np(motion, out)
-        joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
-        root_support = (full_root[0] * w > 0.0).astype(np.float32)
-        out_geometry = masked_retract_np(
-            motion,
-            tangent,
-            joint_mask=joint_support,
-            root_mask=root_support,
-            max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
-            max_root_m=float(cfg.product_refiner_root_cap_m),
-        )
-        contact_weight = (full_contact[0] * w > 0.0).astype(np.float32)
-        out_geometry[:, :4] = (
-            motion[:, :4] * (1.0 - contact_weight)
-            + out[:, :4] * contact_weight
-        )
-        out = out_geometry
-    else:
-        out = motion.astype(np.float32) * (1.0 - w) + out.astype(np.float32) * w
+    full_joint, full_root, full_contact = _risk_masks_for_batch_np(
+        motion[None], seam_mask[None], cfg
+    )
+    tangent = product_log_np(motion, out)
+    joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
+    root_support = (full_root[0] * w > 0.0).astype(np.float32)
+    out_geometry = masked_retract_np(
+        motion,
+        tangent,
+        joint_mask=joint_support,
+        root_mask=root_support,
+        max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
+        max_root_m=float(cfg.product_refiner_root_cap_m),
+    )
+    contact_weight = (full_contact[0] * w > 0.0).astype(np.float32)
+    out_geometry[:, :4] = (
+        motion[:, :4] * (1.0 - contact_weight)
+        + out[:, :4] * contact_weight
+    )
+    out = out_geometry
     out, _ = enforce_edge151_contract_np(
         out,
         cfg,
         source_hint="apply_refiner_model:inbetween_reference_blend",
-        derive_contact=not product_mode,
+        derive_contact=False,
         project_rot=True,
     )
     return out.astype(np.float32)
 
 
 
-def apply_diffusion_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndarray, ckpt_path: Optional[str], cfg: MotionGenerationConfig) -> np.ndarray:
-    """Apply Motion Generation diffusion as transition-masked residual generation.
+def apply_diffusion_model(
+    motion: np.ndarray,
+    cond: np.ndarray,
+    seam_mask: np.ndarray,
+    ckpt_path: Optional[str],
+    cfg: MotionGenerationConfig,
+) -> np.ndarray:
+    """Apply only the current reference-tangent motion diffusion checkpoint."""
 
-    The input motion is motion_ref / motion_refined and is treated as a strong
-    retrieval/reference condition.  Core frames are locked by mask, while
-    transition frames are allowed to be regenerated as residual motion.
-    """
     if torch is None or not ckpt_path or not Path(ckpt_path).exists():
         motion, _ = enforce_edge151_contract_np(
-            motion, cfg, source_hint="apply_diffusion_model:inbetween_disabled", derive_contact=True, project_rot=True
+            motion,
+            cfg,
+            source_hint="apply_diffusion_model:disabled",
+            derive_contact=True,
+            project_rot=True,
         )
         return motion.astype(np.float32)
 
-    core_strength = _inbetween_config_float(cfg, "diffusion_core_strength", "MOTION_DIFFUSION_CORE_STRENGTH", 0.00)
-    trans_strength = _inbetween_config_float(cfg, "diffusion_transition_strength", "MOTION_DIFFUSION_TRANSITION_STRENGTH", 0.72)
-    noise_scale = _inbetween_config_float(cfg, "diffusion_reference_noise_scale", "MOTION_DIFFUSION_REFERENCE_NOISE_SCALE", 0.03)
-
-    ckpt = _trusted_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "motion_diffusion")
-    Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
-    tangent_mode = normalize_motion_checkpoint_version(
-        ckpt.get("version", "")
-    ).startswith(
-        "reference_tangent_motion_diffusion"
+    core_strength = _inbetween_config_float(
+        cfg, "diffusion_core_strength", "MOTION_DIFFUSION_CORE_STRENGTH", 0.0
     )
-    model = (
-        TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32)
-        if tangent_mode
-        else DiffusionDenoiser(EDGE_DIM, 32)
-    ).to(cfg.device)
-    model.load_state_dict(ckpt["state_dict"], strict=True)
+    trans_strength = _inbetween_config_float(
+        cfg,
+        "diffusion_transition_strength",
+        "MOTION_DIFFUSION_TRANSITION_STRENGTH",
+        0.72,
+    )
+    noise_scale = _inbetween_config_float(
+        cfg,
+        "diffusion_reference_noise_scale",
+        "MOTION_DIFFUSION_REFERENCE_NOISE_SCALE",
+        0.03,
+    )
+    checkpoint = _trusted_torch_load(ckpt_path, map_location=cfg.device)
+    assert_motion_checkpoint_contract(
+        checkpoint, cfg, ckpt_path, "motion_diffusion"
+    )
+    if str(checkpoint.get("version", "")) != "reference_tangent_motion_diffusion_v1":
+        raise RuntimeError(
+            "Formal generation rejects a non-tangent diffusion checkpoint"
+        )
+    steps = int(checkpoint.get("diffusion_steps", cfg.diffusion_steps))
+    model = TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32).to(cfg.device)
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
     model.eval()
-    betas, alphas, abar = make_beta_schedule(Tdiff, torch.device(cfg.device))
+    betas, alphas, abar = make_beta_schedule(steps, torch.device(cfg.device))
 
-    T = int(motion.shape[0])
-    win = int(cfg.window_len)
-    hop = max(1, min(int(getattr(cfg, "hop_len", win)), win))
-    accum, weight_sum, rot_quat_accum, rot_quat_weight = init_motion_window_accumulators(T, EDGE_DIM)
-
+    total = int(motion.shape[0])
+    window = int(cfg.window_len)
+    hop = max(1, min(int(getattr(cfg, "hop_len", window)), window))
+    accumulators = init_motion_window_accumulators(total, EDGE_DIM)
     with torch.no_grad():
-        for st, ed in sliding_window_ranges(T, win, hop):
-            retr_np = motion[st:ed]
-            mask_np = seam_mask[st:ed]
-            orig_len = len(retr_np)
-            cond_in = _condition_chunk_np(cond, st, ed, win if orig_len < win else orig_len)
-            if orig_len < win:
-                retr_in = resample_motion_np(retr_np, win)
-                mask_in = resample_motion_np(mask_np, win)
-            else:
-                retr_in = retr_np
-                mask_in = mask_np
-            retr_in, _ = enforce_edge151_contract_np(
-                retr_in, cfg, source_hint="apply_diffusion_model:inbetween_retrieval_chunk", derive_contact=True, project_rot=True
+        for start, end in sliding_window_ranges(total, window, hop):
+            retrieval_np = motion[start:end]
+            mask_np = seam_mask[start:end]
+            original_length = len(retrieval_np)
+            condition_np = _condition_chunk_np(
+                cond,
+                start,
+                end,
+                window if original_length < window else original_length,
             )
-            retr = torch.from_numpy(retr_in[None]).float().to(cfg.device)
-            raw_mask = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
-            mask = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * raw_mask, 0.0, 1.0)
-            c = torch.from_numpy(cond_in[None].astype(np.float32)).float().to(cfg.device)
-            if tangent_mode:
-                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                    retr_in[None], mask_in[None], cfg
-                )
-                joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
-                root_t = torch.from_numpy(root_np).float().to(cfg.device)
-                contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
-                effective_joint = joint_t * mask
-                effective_root = root_t * mask
-                effective_contact = contact_t * mask
-                state_mask = _tangent_state_mask(
-                    effective_joint, effective_root, effective_contact
-                )
-                active_mask = (state_mask > 0.0).to(retr.dtype)
-                x = (
-                    float(noise_scale)
-                    * torch.randn(
-                        retr.shape[:-1] + (PRODUCT_STATE_DIM,),
-                        dtype=retr.dtype,
-                        device=retr.device,
-                    )
-                    * active_mask
-                )
-                for ti in reversed(range(Tdiff)):
-                    t = torch.full(
-                        (1,), ti, device=cfg.device, dtype=torch.long
-                    )
-                    eps = model(
-                        x, retr, c, raw_mask, joint_t, t
-                    ) * active_mask
-                    beta = betas[ti]
-                    alpha = alphas[ti]
-                    ab = abar[ti]
-                    mean = (1 / torch.sqrt(alpha)) * (
-                        x
-                        - beta
-                        / torch.sqrt(1 - ab).clamp_min(1e-6)
-                        * eps
-                    )
-                    if ti > 0:
-                        x = (
-                            mean
-                            + torch.sqrt(beta)
-                            * torch.randn_like(x)
-                            * 0.35
-                            * active_mask
-                        )
-                    else:
-                        x = mean
-                    x = x * active_mask
-                y_t = _decode_reference_tangent_state(
-                    retr,
-                    x,
-                    effective_joint,
-                    effective_root,
-                    effective_contact,
-                    cfg,
-                )
-                y = y_t[0].detach().cpu().numpy()
+            if original_length < window:
+                retrieval_input = resample_motion_np(retrieval_np, window)
+                mask_input = resample_motion_np(mask_np, window)
             else:
-                x = retr + float(noise_scale) * torch.randn_like(retr) * (0.15 + 0.85 * mask)
-                for ti in reversed(range(Tdiff)):
-                    t = torch.full((1,), ti, device=cfg.device, dtype=torch.long)
-                    eps = model(x, retr, c, raw_mask, t)
-                    beta = betas[ti]
-                    alpha = alphas[ti]
-                    ab = abar[ti]
-                    mean = (1 / torch.sqrt(alpha)) * (x - beta / torch.sqrt(1 - ab).clamp_min(1e-6) * eps)
-                    if ti > 0:
-                        x = mean + torch.sqrt(beta) * torch.randn_like(x) * 0.35
-                    else:
-                        x = mean
-                    # Strong reference lock: core mask=0 returns exactly retr.
-                    x = retr * (1.0 - mask) + x * mask
-                y = x[0].detach().cpu().numpy()
-            if orig_len < win:
-                y = resample_motion_np(y, orig_len)
-            y, _ = enforce_edge151_contract_np(
-                y,
+                retrieval_input = retrieval_np
+                mask_input = mask_np
+            retrieval_input, _ = enforce_edge151_contract_np(
+                retrieval_input,
                 cfg,
-                source_hint="apply_diffusion_model:inbetween_output_chunk",
-                derive_contact=not tangent_mode,
+                source_hint="apply_diffusion_model:retrieval_chunk",
+                derive_contact=True,
                 project_rot=True,
             )
-            w = overlap_add_weight_np(orig_len, st, T, hop, win)
-            accumulate_motion_window_np(accum, weight_sum, rot_quat_accum, rot_quat_weight, y, w, st, ed)
+            retrieval = torch.from_numpy(retrieval_input[None]).float().to(cfg.device)
+            raw_mask = torch.from_numpy(mask_input[None].astype(np.float32)).float().to(cfg.device)
+            strength = torch.clamp(
+                float(core_strength)
+                + (float(trans_strength) - float(core_strength)) * raw_mask,
+                0.0,
+                1.0,
+            )
+            condition = torch.from_numpy(
+                condition_np[None].astype(np.float32)
+            ).float().to(cfg.device)
+            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                retrieval_input[None], mask_input[None], cfg
+            )
+            joint = torch.from_numpy(joint_np).float().to(cfg.device)
+            root = torch.from_numpy(root_np).float().to(cfg.device)
+            contact = torch.from_numpy(contact_np).float().to(cfg.device)
+            effective_joint = joint * strength
+            effective_root = root * strength
+            effective_contact = contact * strength
+            state_mask = _tangent_state_mask(
+                effective_joint, effective_root, effective_contact
+            )
+            active = (state_mask > 0.0).to(retrieval.dtype)
+            state = (
+                float(noise_scale)
+                * torch.randn(
+                    retrieval.shape[:-1] + (PRODUCT_STATE_DIM,),
+                    dtype=retrieval.dtype,
+                    device=retrieval.device,
+                )
+                * active
+            )
+            for step in reversed(range(steps)):
+                timestep = torch.full(
+                    (1,), step, device=cfg.device, dtype=torch.long
+                )
+                prediction = model(
+                    state, retrieval, condition, raw_mask, joint, timestep
+                ) * active
+                beta = betas[step]
+                alpha = alphas[step]
+                cumulative = abar[step]
+                mean = (1 / torch.sqrt(alpha)) * (
+                    state
+                    - beta
+                    / torch.sqrt(1 - cumulative).clamp_min(1.0e-6)
+                    * prediction
+                )
+                if step > 0:
+                    state = (
+                        mean
+                        + torch.sqrt(beta)
+                        * torch.randn_like(state)
+                        * 0.35
+                        * active
+                    )
+                else:
+                    state = mean
+                state = state * active
+            proposal = _decode_reference_tangent_state(
+                retrieval,
+                state,
+                effective_joint,
+                effective_root,
+                effective_contact,
+                cfg,
+            )[0].detach().cpu().numpy()
+            if original_length < window:
+                proposal = resample_motion_np(proposal, original_length)
+            proposal, _ = enforce_edge151_contract_np(
+                proposal,
+                cfg,
+                source_hint="apply_diffusion_model:output_chunk",
+                derive_contact=False,
+                project_rot=True,
+            )
+            weight = overlap_add_weight_np(
+                original_length, start, total, hop, window
+            )
+            accumulate_motion_window_np(
+                *accumulators, proposal, weight, start, end
+            )
 
     out, _ = finalize_motion_window_accum_np(
-        accum,
-        weight_sum,
-        rot_quat_accum,
-        rot_quat_weight,
+        *accumulators,
         cfg,
-        source_hint="apply_diffusion_model:inbetween_final",
-        derive_contact=not tangent_mode,
+        source_hint="apply_diffusion_model:final",
+        derive_contact=False,
     )
-    # Final exact reference blend in the original-length mask coordinates.
-    w = np.clip(core_strength + (trans_strength - core_strength) * seam_mask.astype(np.float32), 0.0, 1.0)
-    if tangent_mode:
-        full_joint, full_root, full_contact = _risk_masks_for_batch_np(
-            motion[None], seam_mask[None], cfg
-        )
-        tangent = product_log_np(motion, out)
-        joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
-        root_support = (full_root[0] * w > 0.0).astype(np.float32)
-        out_geometry = masked_retract_np(
-            motion,
-            tangent,
-            joint_mask=joint_support,
-            root_mask=root_support,
-            max_rotation_rad=float(cfg.tangent_diffusion_rotation_cap_rad),
-            max_root_m=float(cfg.tangent_diffusion_root_cap_m),
-        )
-        contact_weight = (full_contact[0] * w > 0.0).astype(np.float32)
-        out_geometry[:, :4] = (
-            motion[:, :4] * (1.0 - contact_weight)
-            + out[:, :4] * contact_weight
-        )
-        out = out_geometry
-    else:
-        out = motion.astype(np.float32) * (1.0 - w) + out.astype(np.float32) * w
-    out, _ = enforce_edge151_contract_np(
-        out,
+    weight = np.clip(
+        core_strength
+        + (trans_strength - core_strength) * seam_mask.astype(np.float32),
+        0.0,
+        1.0,
+    )
+    full_joint, full_root, full_contact = _risk_masks_for_batch_np(
+        motion[None], seam_mask[None], cfg
+    )
+    tangent = product_log_np(motion, out)
+    geometry = masked_retract_np(
+        motion,
+        tangent,
+        joint_mask=(full_joint[0] * weight > 0.0).astype(np.float32),
+        root_mask=(full_root[0] * weight > 0.0).astype(np.float32),
+        max_rotation_rad=float(cfg.tangent_diffusion_rotation_cap_rad),
+        max_root_m=float(cfg.tangent_diffusion_root_cap_m),
+    )
+    contact_weight = (full_contact[0] * weight > 0.0).astype(np.float32)
+    geometry[:, :4] = (
+        motion[:, :4] * (1.0 - contact_weight)
+        + out[:, :4] * contact_weight
+    )
+    geometry, _ = enforce_edge151_contract_np(
+        geometry,
         cfg,
-        source_hint="apply_diffusion_model:inbetween_reference_blend",
-        derive_contact=not tangent_mode,
+        source_hint="apply_diffusion_model:reference_blend",
+        derive_contact=False,
         project_rot=True,
     )
-    return out.astype(np.float32)
+    return geometry.astype(np.float32)
 
 
 def derive_contacts_np(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
@@ -7391,251 +5141,6 @@ def render_if_possible(
     subprocess.run(cmd, check=True)
 
 
-def _finalize_generation_outputs(
-    args: argparse.Namespace,
-    cfg: MotionGenerationConfig,
-    motion: np.ndarray,
-    motion_ref: np.ndarray,
-    seam_mask: np.ndarray,
-    report: Dict[str, Any],
-) -> int:
-    """Write an accepted motion only after the authoritative physical gate."""
-
-    out = Path(args.out)
-    if out.suffix.lower() != ".npy":
-        raise ValueError(f"accepted motion output must use .npy suffix, got {out}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    motion_ref_path = str(out).replace(".npy", ".motion_ref.npy")
-    mask_path = str(out).replace(".npy", ".transition_mask.npy")
-    json_path = args.json or str(out).replace(".npy", ".inbetween_report.json")
-
-    final_audit = audit_motion_np(motion, cfg)
-    if bool(cfg.final_physical_gate_enable):
-        final_gate = evaluate_physical_audit(final_audit)
-        final_gate["enabled"] = True
-    else:
-        final_gate = {
-            "ok": True,
-            "enabled": False,
-            "reasons": [],
-            "audit": dict(final_audit),
-            "policy": "explicitly_disabled",
-        }
-    final_gate_report = dict(final_gate)
-    final_gate_report.pop("audit", None)
-    final_gate_report["audit_ref"] = "final_audit"
-
-    report.update(
-        {
-            "motion_ref_path": motion_ref_path,
-            "transition_mask_path": mask_path,
-            "final_audit": final_audit,
-            "final_physical_gate": final_gate_report,
-            "accepted_output_path": str(out),
-        }
-    )
-    np.save(motion_ref_path, motion_ref.astype(np.float32))
-    np.save(mask_path, seam_mask.astype(np.float32))
-
-    rejected = bool(
-        cfg.final_physical_gate_enable
-        and cfg.final_physical_gate_fail_closed
-        and not final_gate["ok"]
-    )
-    if rejected:
-        quarantined_output: Optional[Path] = None
-        if out.exists():
-            quarantined_output = out.with_name(
-                f"{out.stem}.preexisting_{now_tag()}{out.suffix}"
-            )
-            serial = 1
-            while quarantined_output.exists():
-                quarantined_output = out.with_name(
-                    f"{out.stem}.preexisting_{now_tag()}_{serial}{out.suffix}"
-                )
-                serial += 1
-            out.replace(quarantined_output)
-        rejected_path: Optional[Path] = None
-        if bool(cfg.final_physical_gate_save_rejected):
-            rejected_path = out.with_name(f"{out.stem}.rejected{out.suffix or '.npy'}")
-            np.save(rejected_path, motion.astype(np.float32))
-        report.update(
-            {
-                "generation_status": "rejected_by_final_physical_gate",
-                "accepted_output_written": False,
-                "rejected_motion_path": str(rejected_path) if rejected_path else None,
-                "preexisting_accepted_output_quarantined": (
-                    str(quarantined_output) if quarantined_output else None
-                ),
-            }
-        )
-        save_json(report, json_path)
-        print(
-            json.dumps(
-                {
-                    "status": report["generation_status"],
-                    "motion": None,
-                    "rejected_motion": report["rejected_motion_path"],
-                    "json": json_path,
-                    "final_physical_gate": final_gate_report,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            file=sys.stderr,
-        )
-        return 2
-
-    np.save(out, motion.astype(np.float32))
-    report.update(
-        {
-            "generation_status": "accepted",
-            "accepted_output_written": True,
-            "rejected_motion_path": None,
-        }
-    )
-    save_json(report, json_path)
-    if args.render_output:
-        render_if_possible(
-            str(out),
-            args.audio,
-            args.render_output,
-            args.render_script,
-            fps=float(cfg.fps),
-        )
-    print(
-        json.dumps(
-            {
-                "status": report["generation_status"],
-                "motion": str(out),
-                "motion_ref": motion_ref_path,
-                "transition_mask": mask_path,
-                "json": json_path,
-                "frames": int(motion.shape[0]),
-                "final_physical_gate": final_gate_report,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-
-
-
-def _generate_motion_core(args: argparse.Namespace) -> int:
-    cfg = MotionGenerationConfig.from_json(args.config).apply_env()
-    sem_dirs = getattr(args, "music_semantic_dirs", None)
-    if sem_dirs:
-        cfg.external_music_semantic_dirs = os.pathsep.join([str(x) for x in sem_dirs])
-    if getattr(args, "external_music_semantic_cmd", None):
-        cfg.external_music_semantic_cmd = str(args.external_music_semantic_cmd)
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    if torch is not None:
-        torch.manual_seed(cfg.seed)
-    db = load_db(args.db)
-    database_contract = _training_db_contract(db, cfg, "Generation")
-    cfg._event_db_contract = database_contract["event_db_contract"]
-    contrastive = load_contrastive(args.contrastive, cfg)
-    slots, slot_feat = audio_slots(args.audio, cfg, args.slot_seconds, args.slots_json)
-    path_idx, retrieval_report = retrieve_schedule(slots, slot_feat, db, cfg, contrastive)
-    paths = np.asarray(db["paths"], dtype=object)
-    selected_paths = [str(paths[i]) for i in path_idx]
-
-    motion_ref, concat_report = concat_events(selected_paths, [s["duration"] for s in slots], cfg)
-
-    transition_spans: List[List[int]] = []
-    for r in concat_report:
-        for sp in r.get("transition_spans", []):
-            if sp is not None and len(sp) >= 2:
-                transition_spans.append([int(sp[0]), int(sp[1])])
-    if transition_spans:
-        seam_mask = make_transition_budget_mask(motion_ref.shape[0], transition_spans, cfg)
-        seam_positions = [int((a + b) // 2) for a, b in transition_spans]
-        mask_policy = "inbetween_transition_budget_spans"
-    else:
-        seam_positions = []
-        acc = 0
-        for r in concat_report[:-1]:
-            acc += int(r.get("target_frames", 0))
-            seam_positions.append(acc)
-        seam_mask = make_boundary_mask(motion_ref.shape[0], seam_positions, width=24)
-        mask_policy = "fallback_boundary_mask_no_transition_spans"
-
-    cond = build_frame_local_conditioning(
-        slot_feat,
-        concat_report,
-        motion_ref.shape[0],
-        np.asarray(db["desc_mean"], dtype=np.float32)[0],
-        np.asarray(db["desc_std"], dtype=np.float32)[0],
-    )
-
-    stage_reports = {
-        "retrieval": retrieval_report,
-        "concat": concat_report,
-        "seams": seam_positions,
-        "transition_spans": transition_spans,
-        "seam_mask_policy": mask_policy,
-        "seam_mask_stats": {
-            "shape": list(seam_mask.shape),
-            "mean": float(np.mean(seam_mask)) if seam_mask.size else 0.0,
-            "max": float(np.max(seam_mask)) if seam_mask.size else 0.0,
-            "transition_frame_ratio": float(np.mean(seam_mask[:, 0] > 0.5)) if seam_mask.size else 0.0,
-        },
-        "inbetween_reference_conditioning": {
-            "motion_ref_as_strong_reference": True,
-            "diffusion_edit_policy": "transition_masked_residual_generation",
-            "ik_finalization": bool(cfg.ik_enable),
-            "env": {
-                "MOTION_TRANSITION_BUDGET_ENABLE": os.environ.get("MOTION_TRANSITION_BUDGET_ENABLE", "1"),
-                "MOTION_TRANSITION_INBETWEEN_ENABLE": os.environ.get("MOTION_TRANSITION_INBETWEEN_ENABLE", "1"),
-                "MOTION_REFINER_CORE_STRENGTH": os.environ.get("MOTION_REFINER_CORE_STRENGTH", "0.02"),
-                "MOTION_DIFFUSION_CORE_STRENGTH": os.environ.get("MOTION_DIFFUSION_CORE_STRENGTH", "0.00"),
-                "MOTION_DIFFUSION_TRANSITION_STRENGTH": os.environ.get("MOTION_DIFFUSION_TRANSITION_STRENGTH", "0.72"),
-            },
-        },
-        "neural_music_conditioning": {
-            "mode": "frame_local_slot_conditioning",
-            "shape": list(cond.shape),
-            "transition_policy": "linear_previous_to_current_slot_descriptor",
-            "normalization": "training_event_db_descriptor_coordinates",
-            "whole_song_mean_conditioning": False,
-        },
-    }
-    pre_audit = audit_motion_np(motion_ref, cfg)
-    motion = motion_ref.astype(np.float32)
-
-    if cfg.refiner_enable:
-        motion = apply_refiner_model(motion, cond, seam_mask, args.refiner, cfg)
-        stage_reports["boundary_refiner_audit"] = audit_motion_np(motion, cfg)
-    if cfg.diffusion_enable:
-        motion = apply_diffusion_model(motion, cond, seam_mask, args.diffusion, cfg)
-        stage_reports["motion_diffusion_audit"] = audit_motion_np(motion, cfg)
-
-    ik_report = {"enabled": False}
-    if cfg.ik_enable:
-        motion, ik_report = true_lower_body_ik(motion, cfg)
-
-    report = {
-        "version": "inbetween_reference_conditioned_transition_masked_motionrag_diff",
-        "audio": args.audio,
-        "db": args.db,
-        "config": dataclasses.asdict(cfg),
-        "fk_tree_source": FK_TREE_SOURCE,
-        "selected_event_indices": path_idx,
-        "selected_event_paths": selected_paths,
-        "slots": slots,
-        "pre_refine_audit": pre_audit,
-        "stage_reports": stage_reports,
-        "lower_body_ik_true_ik": ik_report,
-    }
-    return _finalize_generation_outputs(
-        args, cfg, motion, motion_ref, seam_mask, report
-    )
-
-
 def run_ik(args: argparse.Namespace) -> int:
     cfg = MotionGenerationConfig.from_json(args.config).apply_env()
     motion = np.load(args.input).astype(np.float32)
@@ -7662,24 +5167,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--config", default="configs/motion_model.json")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build-db", help="Build source-aware event database from EDGE 151D motion files")
-    b.add_argument("--motion_dirs", nargs="+", required=True)
-    b.add_argument("--manifest", default=None, help="Optional manifest.csv. When present, its source_bvh/fragment_file/label/start_frame/end_frame fields become parent metadata for source-aware Event-RAG.")
-    b.add_argument("--out_db", required=True, help="Output directory, containing events.npz and events/*.npy")
-    b.add_argument("--audio_dirs", nargs="*", default=None, help="Optional paired audio/music directories. Same-stem files are used for real Contrastive Retriever music features.")
-    b.set_defaults(func=build_db)
-
-    c = sub.add_parser("train-contrastive", help="Contrastive Retriever music-motion contrastive training")
-    c.add_argument("--db", required=True)
-    c.add_argument("--out", required=True)
-    c.add_argument("--music_feature_npz", default=None)
-    c.add_argument("--unpaired_audio_dirs", nargs="*", default=None, help="Unpaired target/background music directories. Used for Root-Aware Motion Safety semantic OT pseudo-pairs when BVH has no synchronized audio.")
-    c.add_argument("--audio_dirs", nargs="*", default=None, help="Alias for --unpaired_audio_dirs; kept for script compatibility.")
-    c.add_argument("--music_semantic_dirs", nargs="*", default=None, help="External Music Semantics directories containing external classical-music semantic JSON/NPZ sidecars.")
-    c.add_argument("--external_music_semantic_cmd", default=None, help="Optional command template: use {audio}, {out_json}, {out_npz}, {stem} placeholders to call an external trained music semantic model.")
-    c.add_argument("--epochs", type=int, default=None)
-    c.set_defaults(func=train_contrastive)
-
     r = sub.add_parser("train-refiner", help="Motion Refiner residual Motion Refiner training")
     r.add_argument("--db", required=True)
     r.add_argument("--val_db", required=True, help="Required source-disjoint validation Event-DB used for physical, contract and leakage gates")
@@ -7694,22 +5181,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     d.add_argument("--steps", type=int, default=None)
     d.add_argument("--diffusion_steps", type=int, default=None)
     d.set_defaults(func=train_diffusion)
-
-    g = sub.add_parser("generate", help="Generate whole-song motion from music via Motion Generation pipeline")
-    g.add_argument("--audio", required=True)
-    g.add_argument("--slots_json", default=None)
-    g.add_argument("--music_semantic_dirs", nargs="*", default=None, help="External Music Semantics directories containing external classical-music semantic JSON/NPZ sidecars.")
-    g.add_argument("--external_music_semantic_cmd", default=None, help="Optional command template for an external trained music semantic model.")
-    g.add_argument("--slot_seconds", type=float, default=4.0)
-    g.add_argument("--db", required=True)
-    g.add_argument("--contrastive", default=None)
-    g.add_argument("--refiner", default=None)
-    g.add_argument("--diffusion", default=None)
-    g.add_argument("--out", required=True)
-    g.add_argument("--json", default=None)
-    g.add_argument("--render_output", default=None)
-    g.add_argument("--render_script", default="rendering/render_motion.py")
-    g.set_defaults(func=generate)
 
     ik = sub.add_parser("ik", help="Run Lower-Body IK true lower-body IK on an existing EDGE 151D npy")
     ik.add_argument("--input", required=True)
@@ -7731,493 +5202,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 
-
-# ===== Semantic Routing COMPLETE MSSD-AESD ROUTING PATCH START =====
-# Complete chain: MSSD music slots -> AESD action descriptors -> routing-aware
-# Semantic OT for Contrastive Retriever -> routing-aware beam search for Event-RAG.
-try:
-    from events.semantic_descriptor import (
-        MUSIC_SEMANTIC_LABELS as _ROUTING_SEMANTIC_LABELS,
-        parse_descriptor_file as _semantic_routing_parse_descriptor_file,
-        load_descriptor_for_audio as _semantic_routing_load_descriptor_for_audio,
-        env_bool as _semantic_routing_env_bool,
-        get_aesd_prob_matrix as _event_semantic_probability_matrix,
-        slot_prob_vector as _semantic_routing_slot_prob_vector,
-        dot_compat as _semantic_routing_dot_compat,
-        normalize_vector as _semantic_routing_normalize_vector,
-    )
-except Exception as _routing_import_error:  # pragma: no cover
-    _ROUTING_SEMANTIC_LABELS = ["calm_meditative", "pose_hold", "lyrical_flow", "instrument_phrase", "percussive_accent", "turning_climax", "footwork_flow", "aerial_curve"]
-    _semantic_routing_parse_descriptor_file = None
-    _semantic_routing_load_descriptor_for_audio = None
-    _semantic_routing_env_bool = None
-    _event_semantic_probability_matrix = None
-    _semantic_routing_slot_prob_vector = None
-    _semantic_routing_dot_compat = None
-    _semantic_routing_normalize_vector = None
-    print(f"[Semantic Routing WARN] import failed: {_routing_import_error}", file=sys.stderr)
-
-
-def _routing_env_bool(name: str, default: bool = False) -> bool:
-    try:
-        return bool(int(os.environ.get(name, "1" if default else "0")))
-    except Exception:
-        return bool(default)
-
-
-def _routing_env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except Exception:
-        return float(default)
-
-
-def _routing_env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return int(default)
-
-
-def _descriptor_directories_from_config(cfg: MotionGenerationConfig) -> str:
-    parts = []
-    for attr in ["music_descriptor_dirs", "external_music_semantic_dirs"]:
-        val = getattr(cfg, attr, "")
-        if val:
-            if isinstance(val, (list, tuple)):
-                parts.extend([str(x) for x in val])
-            else:
-                parts.extend(str(val).replace(";", os.pathsep).split(os.pathsep))
-    extra = os.environ.get("MOTION_MSSD_DESCRIPTOR_DIRS", "") or os.environ.get("SEMANTIC_ROUTING_DESCRIPTOR_DIRS", "")
-    if extra:
-        parts.extend(extra.replace(";", os.pathsep).split(os.pathsep))
-    return os.pathsep.join([p for p in parts if str(p).strip()])
-
-
-def _mark_slots_with_metadata(slots: List[dict], meta: dict) -> List[dict]:
-    out = []
-    for s0 in slots:
-        s = dict(s0)
-        s.setdefault("mssd_usage", meta.get("usage"))
-        s.setdefault("mssd_is_final_schedule", bool(meta.get("is_final_schedule", False)))
-        s.setdefault("mssd_slot_source", meta.get("slot_source", s.get("slot_source", "")))
-        for k in ["router_ckpt", "planner_ckpt", "duration_model_ckpt", "raw_schedule_json", "schedule_summary_json", "descriptor_schema_version"]:
-            if meta.get(k) is not None:
-                s.setdefault("mssd_" + k, meta.get(k))
-        out.append(s)
-    return out
-
-
-def _load_routing_slots_json(slots_json: str | Path, cfg: MotionGenerationConfig, require_final: bool = False) -> Tuple[List[dict], np.ndarray, dict]:
-    if _semantic_routing_parse_descriptor_file is None:
-        slots, feats, meta = _load_music_slots_json(slots_json, cfg)
-        return slots, feats, meta
-    slots, feats, meta = _semantic_routing_parse_descriptor_file(
-        slots_json,
-        require_final_schedule=bool(require_final),
-        fps=float(getattr(cfg, "fps", 30.0)),
-        temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
-        usage="generate_schedule" if require_final else "auto",
-    )
-    slots = _mark_slots_with_metadata(slots, meta)
-    return slots, feats, meta
-
-
-def _build_routing_audio_slots(path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float = 4.0, slots_json: Optional[str] = None) -> Tuple[List[dict], np.ndarray]:
-    strict = _slot_plan_env_bool("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS", False)
-    mssd_enabled = _routing_env_bool("MOTION_MSSD_ENABLE", True)
-    require_final = strict or _routing_env_bool("MOTION_MSSD_REQUIRE_FINAL_SCHEDULE_FOR_GENERATE", False)
-    if slots_json and Path(slots_json).exists():
-        if mssd_enabled and _semantic_routing_parse_descriptor_file is not None:
-            slots, feats, meta = _load_routing_slots_json(slots_json, cfg, require_final=require_final)
-            print(f"[Semantic Routing MSSD] loaded descriptor: {slots_json} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
-            return slots, feats
-        slots, feats, meta = _load_music_slots_json(slots_json, cfg)
-        allowed = not strict
-        raw = " ".join(str(meta.get(k, "")) for k in ["slot_source", "router_ckpt", "planner_ckpt", "duration_model_ckpt"])
-        if has_scheduler_provenance(raw):
-            allowed = True
-        if not allowed:
-            raise RuntimeError("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but slots_json is not final trained-router/planner MSSD")
-        return _mark_slots_with_metadata(slots, meta), feats
-    if mssd_enabled and _semantic_routing_load_descriptor_for_audio is not None:
-        loaded = _semantic_routing_load_descriptor_for_audio(
-            path,
-            descriptor_dirs=_descriptor_directories_from_config(cfg),
-            require_final_schedule=require_final,
-            fps=float(getattr(cfg, "fps", 30.0)),
-            temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
-            usage="generate_schedule" if require_final else "auto",
-        )
-        if loaded is not None:
-            slots, feats, meta = loaded
-            slots = _mark_slots_with_metadata(slots, meta)
-            print(f"[Semantic Routing MSSD] loaded sidecar descriptor: audio={path} slots={len(slots)} usage={meta.get('usage')} final={meta.get('is_final_schedule')} source={meta.get('slot_source')}")
-            return slots, feats
-    if strict:
-        raise RuntimeError("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS=1 but no final MSSD/slots_json was provided. Build it with python -m scheduling.music_slot_descriptor")
-    return build_default_audio_slots(path, cfg, slot_seconds, slots_json)
-
-
-# Override old loaders.  Generate uses strict final MSSD; Contrastive Retriever training does not.
-audio_slots = _build_routing_audio_slots
-
-
-def parse_external_music_semantic_file(path: str | Path, cfg: MotionGenerationConfig) -> Optional[Tuple[List[dict], np.ndarray]]:
-    if _semantic_routing_parse_descriptor_file is None:
-        return None
-    try:
-        slots, feats, meta = _semantic_routing_parse_descriptor_file(
-            path,
-            require_final_schedule=False,
-            fps=float(getattr(cfg, "fps", 30.0)),
-            temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
-            usage="train_semantic",
-        )
-        return _mark_slots_with_metadata(slots, meta), feats
-    except Exception as exc:
-        print(f"[Semantic Routing MSSD WARN] failed parsing weak descriptor {path}: {exc}", file=sys.stderr)
-        return None
-
-
-def load_external_music_semantic_slots(audio_path: str | Path, cfg: MotionGenerationConfig, slot_seconds: float) -> Optional[Tuple[List[dict], np.ndarray]]:
-    if not bool(getattr(cfg, "external_music_semantic_enable", True)):
-        return None
-    if _semantic_routing_load_descriptor_for_audio is not None:
-        loaded = _semantic_routing_load_descriptor_for_audio(
-            audio_path,
-            descriptor_dirs=_descriptor_directories_from_config(cfg),
-            require_final_schedule=False,
-            fps=float(getattr(cfg, "fps", 30.0)),
-            temperature=float(getattr(cfg, "external_music_semantic_temperature", 0.65)),
-            usage="train_semantic",
-        )
-        if loaded is not None:
-            slots, feats, meta = loaded
-            return _mark_slots_with_metadata(slots, meta), feats
-    cmd_out = run_external_music_semantic_cmd(audio_path, cfg)
-    if cmd_out is not None:
-        parsed = parse_external_music_semantic_file(cmd_out, cfg)
-        if parsed is not None:
-            return parsed
-    if bool(getattr(cfg, "external_music_semantic_proxy_enable", True)):
-        prox = filename_proxy_music_semantic(audio_path, cfg, slot_seconds)
-        if prox is not None:
-            return prox
-    if bool(getattr(cfg, "external_music_semantic_required", False)):
-        raise RuntimeError(f"External/MSSD music semantic is required but none was found for {audio_path}")
-    return None
-
-
-def load_unpaired_audio_feature_pool(audio_dirs: Optional[Sequence[str]], cfg: MotionGenerationConfig) -> Tuple[np.ndarray, List[dict]]:
-    files = collect_audio_files(audio_dirs)
-    feats: List[np.ndarray] = []
-    meta: List[dict] = []
-    old_strict = os.environ.get("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS")
-    try:
-        os.environ["MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS"] = "0"
-        for f in files:
-            try:
-                parsed = load_external_music_semantic_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds))
-                if parsed is not None:
-                    slots, sf = parsed
-                else:
-                    slots, sf = build_default_audio_slots(f, cfg, slot_seconds=float(cfg.unpaired_audio_slot_seconds), slots_json=None)
-            except Exception as exc:
-                print(f"[Semantic Routing WARN] failed unpaired audio feature extraction {f}: {exc}", file=sys.stderr)
-                continue
-            for slot, feat in zip(slots, sf):
-                feats.append(feat.astype(np.float32))
-                meta.append({"audio": str(f), "slot": dict(slot)})
-    finally:
-        if old_strict is None:
-            os.environ.pop("MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS", None)
-        else:
-            os.environ["MOTION_REQUIRE_PRETRAINED_ROUTER_SLOTS"] = old_strict
-    if not feats:
-        return np.zeros((0, 32), dtype=np.float32), []
-    return np.stack(feats).astype(np.float32), meta
-
-
-def _slot_probability_matrix(audio_meta: List[dict]) -> np.ndarray:
-    rows = []
-    for m in audio_meta:
-        slot = m.get("slot", {})
-        if _semantic_routing_slot_prob_vector is not None:
-            rows.append(_semantic_routing_slot_prob_vector(slot))
-        else:
-            rows.append(np.ones((len(_ROUTING_SEMANTIC_LABELS),), dtype=np.float32) / max(1, len(_ROUTING_SEMANTIC_LABELS)))
-    return np.stack(rows).astype(np.float32) if rows else np.zeros((0, len(_ROUTING_SEMANTIC_LABELS)), dtype=np.float32)
-
-
-def build_unpaired_audio_motion_pairs(db: dict, audio_dirs: Optional[Sequence[str]], cfg: MotionGenerationConfig) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]]:
-    """Semantic Routing MSSD-AESD Semantic OT.
-
-    It still uses real unpaired music features and motion descriptors, but the OT
-    cost now includes a soft MSSD-to-AESD probability distance.  Thus Contrastive Retriever is no
-    longer trained from only low-level energy/duration hints.
-    """
-    audio_raw, audio_meta = load_unpaired_audio_feature_pool(audio_dirs, cfg)
-    if audio_raw.shape[0] < int(cfg.unpaired_min_audio_slots):
-        return None
-    motion_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "classification_ot_weight", getattr(cfg, "filename_semantic_ot_weight", 0.35))))
-    desc_mean = np.asarray(db["desc_mean"], dtype=np.float32)
-    desc_std = np.asarray(db["desc_std"], dtype=np.float32)
-    music_z_all = ((audio_raw - desc_mean) / np.maximum(desc_std, 1e-6)).astype(np.float32)
-    music_z_all = np.clip(music_z_all, -8.0, 8.0).astype(np.float32)
-    motion_z = np.clip(motion_z, -8.0, 8.0).astype(np.float32)
-    dims, weights = semantic_dims_and_weights()
-    diff = music_z_all[:, None, dims] - motion_z[None, :, dims]
-    cost_num = np.sum((diff * weights[None, None, :]) ** 2, axis=-1)
-    if _event_semantic_probability_matrix is not None:
-        slot_probs = _slot_probability_matrix(audio_meta)
-        aesd_probs = _event_semantic_probability_matrix(db, motion_z.shape[0])
-        sem_compat = np.clip(slot_probs @ aesd_probs.T, 0.0, 1.0)
-        cost_sem = 1.0 - sem_compat
-    else:
-        sem_compat = np.zeros((music_z_all.shape[0], motion_z.shape[0]), dtype=np.float32)
-        cost_sem = 0.0
-    lam_sem = _routing_env_float("SEMANTIC_ROUTING_OT_SEMANTIC_WEIGHT", 1.25)
-    rng = np.random.default_rng(int(cfg.seed) + 4638)
-    cost = cost_num + lam_sem * cost_sem + rng.normal(0.0, 1e-5, size=cost_num.shape).astype(np.float32)
-    topk = max(1, min(int(cfg.unpaired_positive_topk), motion_z.shape[0]))
-    pairs_per = max(1, min(int(cfg.unpaired_pairs_per_audio_slot), topk))
-    music_pairs: List[np.ndarray] = []
-    motion_pairs: List[np.ndarray] = []
-    pair_preview: List[dict] = []
-    for ai in range(cost.shape[0]):
-        top = np.argpartition(cost[ai], topk - 1)[:topk]
-        top = top[np.argsort(cost[ai, top])]
-        chosen = top[:pairs_per]
-        for mi in chosen:
-            music_pairs.append(music_z_all[ai])
-            motion_pairs.append(motion_z[int(mi)])
-        if len(pair_preview) < 20:
-            pair_preview.append({
-                "audio": audio_meta[ai].get("audio", ""),
-                "slot_id": int(audio_meta[ai].get("slot", {}).get("slot_id", ai)),
-                "slot_music_semantic_label": str(audio_meta[ai].get("slot", {}).get("music_semantic_top_label", audio_meta[ai].get("slot", {}).get("music_alignment_label", ""))),
-                "slot_descriptor_usage": str(audio_meta[ai].get("slot", {}).get("usage", audio_meta[ai].get("slot", {}).get("mssd_usage", ""))),
-                "top_motion_ids": [int(x) for x in top[: min(5, len(top))].tolist()],
-                "top_costs": [float(cost[ai, int(x)]) for x in top[: min(5, len(top))].tolist()],
-                "top_mssd_aesd_compat": [float(sem_compat[ai, int(x)]) for x in top[: min(5, len(top))].tolist()] if isinstance(sem_compat, np.ndarray) and sem_compat.size else [],
-            })
-    if len(music_pairs) < 2:
-        return None
-    music = np.stack(music_pairs).astype(np.float32)
-    motion = np.stack(motion_pairs).astype(np.float32)
-    report = {
-        "mode": "semantic_routing_mssd_aesd_semantic_ot",
-        "audio_files": sorted(set(m["audio"] for m in audio_meta)),
-        "num_audio_slots": int(audio_raw.shape[0]),
-        "num_motion_events": int(motion_z.shape[0]),
-        "num_training_pairs": int(music.shape[0]),
-        "positive_topk": int(topk),
-        "pairs_per_audio_slot": int(pairs_per),
-        "semantic_dims": [int(x) for x in dims.tolist()],
-        "semantic_weights": [float(x) for x in weights.tolist()],
-        "mssd_aesd_semantic_weight": float(lam_sem),
-        "aesd_arrays_used": bool("aesd_music_alignment_probs" in db),
-        "pair_preview": pair_preview,
-    }
-    return music, motion, desc_mean.astype(np.float32), desc_std.astype(np.float32), report
-
-
-def _stage_sequence_score(slot: dict, stages: np.ndarray) -> np.ndarray:
-    role = str(slot.get("role", slot.get("slot_role", "normal")))
-    out = np.zeros((len(stages),), dtype=np.float32)
-    good = {
-        "intro": {"intro", "intro_or_resolution", "anchor_or_resolution"},
-        "calm": {"intro", "intro_or_resolution", "resolution", "anchor_or_resolution"},
-        "release": {"resolution", "anchor_or_resolution", "intro_or_resolution"},
-        "resolution": {"resolution", "anchor_or_resolution", "intro_or_resolution"},
-        "normal": {"development", "build_up", "motif_recall"},
-        "development": {"development", "build_up"},
-        "build_up": {"build_up", "development", "opening_or_climax"},
-        "accent": {"accent_or_climax", "climax", "build_up"},
-        "climax": {"climax", "accent_or_climax", "opening_or_climax"},
-        "motif": {"motif_recall", "development"},
-        "motif_recall": {"motif_recall", "anchor_or_resolution"},
-    }.get(role, {"development", "build_up"})
-    for i, st in enumerate(stages):
-        if str(st) in good:
-            out[i] = 1.0
-    return out
-
-
-def retrieve_schedule(slots: List[dict], slot_feat: np.ndarray, db: dict, cfg: MotionGenerationConfig, contrastive=None) -> Tuple[List[int], List[dict]]:
-    """Semantic Routing global MSSD-AESD routing-aware Event-RAG."""
-    desc = np.asarray(db["desc"], dtype=np.float32)
-    desc_z = motion_feature_z_for_alignment(db, cfg, weight=float(getattr(cfg, "classification_retrieval_weight", getattr(cfg, "filename_semantic_retrieval_weight", 0.20))))
-    mean = np.asarray(db["desc_mean"], dtype=np.float32)
-    std = np.asarray(db["desc_std"], dtype=np.float32)
-    if contrastive is not None and hasattr(contrastive, "music_mean") and hasattr(contrastive, "music_std"):
-        music_mean = np.asarray(getattr(contrastive, "music_mean"), dtype=np.float32)
-        music_std = np.asarray(getattr(contrastive, "music_std"), dtype=np.float32)
-        music_z = (slot_feat - music_mean) / np.maximum(music_std, 1e-6)
-    else:
-        music_z = (slot_feat - mean) / np.maximum(std, 1e-6)
-    music_z = np.clip(music_z, -8.0, 8.0).astype(np.float32)
-    desc_z = np.clip(desc_z, -8.0, 8.0).astype(np.float32)
-    music_emb, motion_emb = embed_with_contrastive(contrastive, music_z, desc_z, cfg)
-    n = int(len(desc))
-    sources = np.asarray(db["source_groups"], dtype=object)
-    source_uids = np.asarray(db.get("source_uids", sources), dtype=object)
-    durations = np.asarray(db["durations"], dtype=np.float32)
-    entries = np.asarray(db["entry"], dtype=np.float32); exits = np.asarray(db["exit"], dtype=np.float32)
-    centry = np.asarray(db["contact_entry"], dtype=np.float32); cexit = np.asarray(db["contact_exit"], dtype=np.float32)
-    dance_keys = np.asarray(db.get("dance_keys", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    labels_arr = np.asarray(db.get("labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    align_arr = np.asarray(db.get("music_alignment_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    families = np.asarray(db.get("event_families", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    stages = np.asarray(db.get("motion_stage_roles", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    locomotion = np.asarray(db.get("locomotion_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    support = np.asarray(db.get("support_labels", np.array(["unknown"] * n, dtype=object)), dtype=object)
-    sem_conf = np.asarray(db.get("semantic_confidence", np.ones(n, dtype=np.float32)), dtype=np.float32)
-    event_quality = np.asarray(db.get("event_quality_scores", np.ones(n, dtype=np.float32)), dtype=np.float32)
-    nat_min = np.asarray(db.get("natural_duration_min", np.ones(n, dtype=np.float32) * 1.5), dtype=np.float32)
-    nat_max = np.asarray(db.get("natural_duration_max", np.ones(n, dtype=np.float32) * 4.0), dtype=np.float32)
-    aesd_probs = _event_semantic_probability_matrix(db, n) if _event_semantic_probability_matrix is not None else np.zeros((n, len(_ROUTING_SEMANTIC_LABELS)), dtype=np.float32)
-    aesd_risk = np.asarray(db.get("aesd_boundary_risk", np.zeros(n, dtype=np.float32)), dtype=np.float32)
-    aesd_semantics = np.asarray(db.get("aesd_event_semantics", align_arr), dtype=object)
-
-    w_contrastive = _routing_env_float("SEMANTIC_ROUTING_ROUTE_CONTRASTIVE_WEIGHT", 1.00)
-    w_mssd_aesd = _routing_env_float("SEMANTIC_ROUTING_ROUTE_MSSD_AESD_WEIGHT", 1.15)
-    w_legacy_sem = _routing_env_float("SEMANTIC_ROUTING_ROUTE_LEGACY_SEM_WEIGHT", float(getattr(cfg, "semantic_routing_weight", 0.72)))
-    w_duration = _routing_env_float("SEMANTIC_ROUTING_ROUTE_DURATION_WEIGHT", float(getattr(cfg, "route_natural_duration_weight", 0.20)))
-    w_quality = _routing_env_float("SEMANTIC_ROUTING_ROUTE_QUALITY_WEIGHT", float(getattr(cfg, "event_quality_weight", 0.22)))
-    w_stage = _routing_env_float("SEMANTIC_ROUTING_ROUTE_STAGE_WEIGHT", float(getattr(cfg, "route_stage_sequence_weight", 0.16)))
-    w_boundary_risk = _routing_env_float("SEMANTIC_ROUTING_ROUTE_BOUNDARY_RISK_WEIGHT", 0.35)
-    top_debug = max(1, int(getattr(cfg, "classification_report_topk", 8)))
-    candidate_k = max(int(getattr(cfg, "top_k", 32)), int(getattr(cfg, "beam_size", 8)), _routing_env_int("SEMANTIC_ROUTING_ROUTE_CANDIDATE_TOPK", 96), top_debug)
-
-    beams: List[Tuple[float, List[int], Dict[str, int]]] = [(0.0, [], {})]
-    reports: List[dict] = []
-    for i, slot in enumerate(slots):
-        sim = music_emb[i] @ motion_emb.T
-        slot_dur = max(float(slot.get("duration", durations.mean() if len(durations) else 1.0)), 1e-4)
-        dur_cost = np.abs(np.log(np.maximum(durations, 1e-4) / slot_dur))
-        in_range = ((slot_dur >= nat_min) & (slot_dur <= nat_max)).astype(np.float32)
-        center = np.maximum((nat_min + nat_max) * 0.5, 1e-4)
-        natural_score = in_range + (1.0 - in_range) * np.exp(-np.abs(np.log(slot_dur / center))).astype(np.float32)
-        legacy_sem = semantic_label_match_bonus(slot, db, cfg)
-        if _semantic_routing_slot_prob_vector is not None and _semantic_routing_dot_compat is not None:
-            slot_prob = _semantic_routing_slot_prob_vector(slot)
-            mssd_aesd_score = _semantic_routing_dot_compat(slot_prob, aesd_probs)
-        else:
-            mssd_aesd_score = legacy_sem.astype(np.float32)
-        stage_score = _stage_sequence_score(slot, stages)
-        quality_term = np.clip(event_quality, 0.0, 1.0)
-        low_quality_penalty = np.maximum(0.0, float(getattr(cfg, "chang_e_min_event_quality", 0.22)) - quality_term)
-        base_score = (
-            w_contrastive * sim
-            + w_mssd_aesd * mssd_aesd_score
-            + w_legacy_sem * legacy_sem
-            + w_duration * natural_score
-            + w_quality * quality_term
-            + w_stage * stage_score
-            + 0.04 * np.clip(sem_conf, 0.0, 1.0)
-            - float(getattr(cfg, "retrieval_warp_penalty", 0.18)) * dur_cost
-            - w_boundary_risk * np.clip(aesd_risk, 0.0, 1.0)
-            - 0.75 * low_quality_penalty
-        )
-        cand = np.argsort(-base_score)[: min(candidate_k, n)].tolist()
-        new_beams: List[Tuple[float, List[int], Dict[str, int]]] = []
-        for score, path, usage in beams:
-            prev = path[-1] if path else None
-            for idx in cand:
-                sc = float(base_score[idx])
-                src = str(sources[idx]); suid = str(source_uids[idx]); dk = str(dance_keys[idx]); fam = str(families[idx]); stg = str(stages[idx])
-                source_key = "src::" + src
-                uid_key = "suid::" + suid
-                dance_key = "dance::" + dk
-                fam_key = "fam::" + fam
-                sc -= float(getattr(cfg, "route_source_repeat_penalty", cfg.retrieval_source_penalty)) * usage.get(source_key, 0)
-                sc -= 0.08 * usage.get(uid_key, 0)
-                sc -= float(getattr(cfg, "route_dance_key_repeat_penalty", 0.16)) * usage.get(dance_key, 0)
-                fam_recent_window = max(1, int(getattr(cfg, "route_family_recent_window", 8)))
-                fam_recent_count = sum(1 for p_idx in path[-fam_recent_window:] if str(families[p_idx]) == fam)
-                fam_pen = float(getattr(cfg, "route_family_balance_penalty", 0.18)) * max(0, fam_recent_count - 1)
-                sc -= min(float(getattr(cfg, "route_family_penalty_cap", 0.25)), fam_pen)
-                run_count = 0
-                for p_idx in reversed(path):
-                    if str(sources[p_idx]) == src:
-                        run_count += 1
-                    else:
-                        break
-                if run_count >= 2:
-                    sc -= float(getattr(cfg, "route_source_run_hard_penalty", 0.30))
-                if str(slot.get("role", "")) in {"motif", "motif_recall"} and usage.get(fam_key, 0) > 0:
-                    sc += float(getattr(cfg, "route_motif_recall_bonus", 0.12))
-                if i == 0 and stg in {"intro", "intro_or_resolution"}:
-                    sc += w_stage
-                elif i >= len(slots) - 2 and stg in {"resolution", "anchor_or_resolution", "intro_or_resolution"}:
-                    sc += w_stage
-                if prev is not None:
-                    raw_tc = transition_cost(exits[prev], entries[idx], cexit[prev], centry[idx])
-                    transition_pen = float(getattr(cfg, "retrieval_transition_penalty", 0.65)) * raw_tc
-                    # Risk-aware local transition penalty: difficult incoming events need cleaner previous exits.
-                    transition_pen += 0.18 * float(aesd_risk[idx])
-                    if str(support[prev]) != str(support[idx]):
-                        transition_pen += 0.04
-                    sc -= transition_pen
-                    if src == str(sources[prev]):
-                        sc -= float(getattr(cfg, "retrieval_repeat_penalty", 0.15))
-                    if fam == str(families[prev]):
-                        sc -= float(getattr(cfg, "route_family_repeat_penalty", 0.12))
-                ns = dict(usage)
-                ns[source_key] = ns.get(source_key, 0) + 1
-                ns[uid_key] = ns.get(uid_key, 0) + 1
-                ns[dance_key] = ns.get(dance_key, 0) + 1
-                ns[fam_key] = ns.get(fam_key, 0) + 1
-                new_beams.append((score + sc, path + [int(idx)], ns))
-        new_beams.sort(key=lambda x: x[0], reverse=True)
-        beams = new_beams[: max(1, int(getattr(cfg, "beam_size", 8)))]
-        preview = []
-        for j in cand[: min(top_debug, len(cand))]:
-            j = int(j)
-            preview.append({
-                "event_id": j,
-                "final_local_base_score": float(base_score[j]),
-                "contrastive_similarity": float(sim[j]),
-                "mssd_aesd_semantic_score": float(mssd_aesd_score[j]),
-                "legacy_semantic_bonus": float(legacy_sem[j]),
-                "natural_duration_score": float(natural_score[j]),
-                "duration_log_cost": float(dur_cost[j]),
-                "stage_score": float(stage_score[j]),
-                "event_quality": float(event_quality[j]),
-                "aesd_boundary_risk": float(aesd_risk[j]),
-                "source": str(sources[j]),
-                "source_uid": str(source_uids[j]),
-                "label": str(labels_arr[j]),
-                "dance_key": str(dance_keys[j]),
-                "event_family": str(families[j]),
-                "aesd_event_semantic": str(aesd_semantics[j]),
-                "motion_stage_role": str(stages[j]),
-                "support_label": str(support[j]),
-                "locomotion_label": str(locomotion[j]),
-                "music_alignment_label": str(align_arr[j]),
-            })
-        reports.append({
-            "slot": i,
-            "start": slot.get("start"),
-            "end": slot.get("end"),
-            "duration": slot.get("duration"),
-            "target_frames": slot.get("target_frames"),
-            "slot_role": slot.get("role", slot.get("slot_role")),
-            "slot_music_alignment_label": slot.get("music_alignment_label"),
-            "slot_music_semantic_top_label": slot.get("music_semantic_top_label", slot.get("music_alignment_label")),
-            "slot_music_semantic_probs": slot.get("music_semantic_probs", {}),
-            "slot_preferred_dance_keys": slot.get("preferred_dance_keys", []),
-            "mssd_audit": {k: slot.get(k) for k in ["usage", "is_final_schedule", "slot_source", "mssd_usage", "mssd_is_final_schedule", "mssd_slot_source", "mssd_router_ckpt", "mssd_planner_ckpt", "mssd_duration_model_ckpt", "mssd_raw_schedule_json"] if k in slot},
-            "top_candidate": int(cand[0]) if cand else -1,
-            "beam_best_score": float(beams[0][0]) if beams else float("nan"),
-            "routing_policy": "Semantic Routing MSSD-AESD global Event-RAG: contrastive + MSSD-AESD semantic + natural duration + stage + quality + boundary/source/family costs",
-            "routing_weights": {"contrastive": w_contrastive, "mssd_aesd": w_mssd_aesd, "legacy_semantic": w_legacy_sem, "duration": w_duration, "quality": w_quality, "stage": w_stage, "boundary_risk": w_boundary_risk},
-            "candidate_preview": preview,
-        })
-    return beams[0][1], reports
-# ===== Semantic Routing COMPLETE MSSD-AESD ROUTING PATCH END =====
 
 
 
@@ -8560,9 +5544,7 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
             checkpoint_meta = _stage_guard_torch_load(
                 ckpt_path, map_location="cpu"
             )
-            checkpoint_version = normalize_motion_checkpoint_version(
-                checkpoint_meta.get("version", "")
-            )
+            checkpoint_version = str(checkpoint_meta.get("version", ""))
             preserve_neural_contacts = bool(
                 (
                     stage == "refiner"
@@ -8795,12 +5777,9 @@ def _slot_energy_weight(slot):
     """Return anchor weight in [min,max]; lower weight means freer movement."""
     label = " ".join([
         str(slot.get("music_event", "")),
-        str(slot.get("music_alignment_label", "")),
-        str(slot.get("music_semantic_top_label", "")),
         str(slot.get("role", "")),
         str(slot.get("slot_role", "")),
         str(slot.get("energy_label", "")),
-        str(slot.get("predicted_motion_event", "")),
     ]).lower()
     high_words = ("climax", "turn", "percussive", "accent", "footwork", "leap", "jump", "build", "high")
     calm_words = ("calm", "meditative", "pose", "hold", "sustain", "resolution", "intro")
@@ -8853,7 +5832,7 @@ def _load_stage_anchor_weights(slots_json, total_frames_hint=0):
             sw = _slot_energy_weight(s)
             if b > a:
                 w[a:b] = sw
-            key = str(s.get("music_semantic_top_label", s.get("music_event", "unknown")))
+            key = str(s.get("music_event", "unknown"))
             hist[key] = hist.get(key, 0) + 1
         if ndi is not None and len(w) > 7:
             w = ndi.gaussian_filter1d(w, sigma=float(_energy_gate_env_float("ENERGY_STABILITY_MSA_WEIGHT_SMOOTH_SIGMA", 3.0)), mode="nearest").astype(np.float32)
@@ -9348,222 +6327,17 @@ def _stage_anchor_error(candidate, a0=0):
 
 
 def _diffusion_window_proposal(snapshot, cond, sm_win, ckpt_path, cfg, global_start=0):
-    """Physics Stability diffusion proposal with consecutive robust early probes."""
-    if torch is None or not ckpt_path or not Path(ckpt_path).exists():
-        return _stage_guard_orig_apply_diffusion_model(snapshot, cond, sm_win, ckpt_path, cfg)
-    core_strength = _stage_guard_env_float("MOTION_DIFFUSION_CORE_STRENGTH", 0.00)
-    trans_strength = _stage_guard_env_float("MOTION_DIFFUSION_TRANSITION_STRENGTH", 0.25)
-    noise_scale = _stage_guard_env_float("MOTION_DIFFUSION_REFERENCE_NOISE_SCALE", 0.01)
-    ckpt = _stage_guard_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "motion_diffusion")
-    if normalize_motion_checkpoint_version(ckpt.get("version", "")).startswith(
-        "reference_tangent_motion_diffusion"
-    ):
-        return _stage_guard_orig_apply_diffusion_model(
-            snapshot, cond, sm_win, ckpt_path, cfg
-        )
-    Tdiff = int(ckpt.get("diffusion_steps", cfg.diffusion_steps))
-    model = DiffusionDenoiser(EDGE_DIM, 32).to(cfg.device)
-    model.load_state_dict(ckpt["state_dict"], strict=True)
-    model.eval()
-    betas, alphas, abar = make_beta_schedule(Tdiff, torch.device(cfg.device))
-    retr_in, _ = enforce_edge151_contract_np(np.asarray(snapshot, dtype=np.float32), cfg, source_hint="physics_stability_diffusion_window_retrieval", derive_contact=True, project_rot=True)
-    mask_in = np.asarray(sm_win, dtype=np.float32)
-    if mask_in.ndim == 1:
-        mask_in = mask_in[:, None]
-    if mask_in.shape[0] != retr_in.shape[0]:
-        mask_in = resample_motion_np(mask_in, retr_in.shape[0])
-    # Multiple probe points reduce single-step false positives.
-    probe_fracs = os.environ.get("PHYSICS_STABILITY_EARLY_ABORT_PROBE_FRACTIONS", "0.66,0.50,0.33")
-    probe_ts = set()
-    for part in probe_fracs.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            probe_ts.add(int(round(Tdiff * float(part))))
-        except Exception:
-            pass
-    consecutive_needed = max(1, _physics_stability_env_int("PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL", 2))
-    fatal_streak = 0
-    with torch.no_grad():
-        retr = torch.from_numpy(retr_in[None]).float().to(cfg.device)
-        raw_mask = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
-        mask = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * raw_mask, 0.0, 1.0)
-        c = torch.from_numpy(cond[None].astype(np.float32)).float().to(cfg.device)
-        x = retr + float(noise_scale) * torch.randn_like(retr) * (0.15 + 0.85 * mask)
-        for ti in reversed(range(Tdiff)):
-            t = torch.full((1,), ti, device=cfg.device, dtype=torch.long)
-            eps = model(x, retr, c, raw_mask, t)
-            beta = betas[ti]; alpha = alphas[ti]; ab = abar[ti]
-            mean = (1 / torch.sqrt(alpha)) * (x - beta / torch.sqrt(1 - ab).clamp_min(1e-6) * eps)
-            if ti > 0:
-                x = mean + torch.sqrt(beta) * torch.randn_like(x) * 0.35
-            else:
-                x = mean
-            x = retr * (1.0 - mask) + x * mask
-            if ti in probe_ts:
-                probe = x[0].detach().cpu().numpy().astype(np.float32)
-                probe, _ = enforce_edge151_contract_np(probe, cfg, source_hint="physics_stability_diffusion_early_probe_raw", derive_contact=True, project_rot=True)
-                # Important: do NOT call strict safe_residual before early KBO.
-                # Bound channel residuals lightly without running final KBO.
-                delta = probe - retr_in
-                bounded_proposal = probe.copy().astype(np.float32)
-                root_xz = _stage_guard_env_float("STAGE_GUARD_ROOT_XZ_DELTA_MAX_M", 0.05) * _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_BOUND_RELAX", 2.0)
-                root_y = _stage_guard_env_float("STAGE_GUARD_ROOT_Y_DELTA_MAX_M", 0.02) * _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_BOUND_RELAX", 2.0)
-                for idx, mx in [(ROOT_X_IDX, root_xz), (ROOT_Y_IDX, root_y), (ROOT_Z_IDX, root_xz)]:
-                    bounded_proposal[:, idx] = retr_in[:, idx] + np.clip(delta[:, idx], -mx, mx)
-                rotation_cap = _stage_guard_env_float(
-                    "STAGE_GUARD_ROTATION_DELTA_MAX_RAD",
-                    _stage_guard_env_float("STAGE_GUARD_ROT6D_DELTA_MAX", 0.12),
-                ) * _physics_stability_env_float("PHYSICS_STABILITY_EARLY_ABORT_BOUND_RELAX", 2.0)
-                bounded = blend_edge151_geodesic_np(
-                    retr_in,
-                    bounded_proposal,
-                    np.clip(mask_in, 0.0, 1.0),
-                    max_rotation_rad=rotation_cap,
-                )
-                bounded, _ = enforce_edge151_contract_np(bounded, cfg, source_hint="physics_stability_diffusion_early_probe_bounded_no_strict_kbo", derive_contact=True, project_rot=True)
-                ok, reasons, detail = _physics_early_abort_oracle(bounded, retr_in, cfg, stage="diffusion_early_abort_probe", global_start=global_start)
-                _EARLY_ABORT_TRACE.append({"ti": int(ti), "ok": bool(ok), "reasons": reasons, "detail": detail})
-                # Only fatal barriers count toward abort; soft derivative-only
-                # barriers are diagnostics in _physics_early_abort_oracle.
-                fatal_now = bool(detail.get("fatal_barriers"))
-                fatal_streak = fatal_streak + 1 if fatal_now else 0
-                if fatal_streak >= consecutive_needed:
-                    _append_stage_transaction_audit({
-                        "mechanism": "early_abort",
-                        "version": "physics_stability_derivative_safe_consecutive",
-                        "stage": "diffusion",
-                        "commit_state": "abort_to_ccd",
-                        "barrier_violations": reasons,
-                        "detail": detail,
-                        "hard_negative": True,
-                    })
-                    raise RuntimeError("diffusion_early_abort_motion_43:" + ",".join(reasons))
-        y = x[0].detach().cpu().numpy().astype(np.float32)
-    y, _ = enforce_edge151_contract_np(y, cfg, source_hint="physics_stability_diffusion_window_output", derive_contact=True, project_rot=True)
-    return y.astype(np.float32)
+    """Delegate guarded windows to the formal reference-tangent diffusion."""
 
-
-def _append_generation_runtime_metadata(args: argparse.Namespace) -> None:
-    """Append all stability metadata in one report transaction."""
-
-    out_path = Path(args.out)
-    json_path = Path(args.json or str(out_path).replace(".npy", ".inbetween_report.json"))
-    if not json_path.exists():
-        return
-    with open(json_path, "r", encoding="utf-8") as handle:
-        report = json.load(handle)
-
-    report.setdefault("stage_reports", {})[
-        "stage_guard_temporal_generative_transactions"
-    ] = _STAGE_TRANSACTION_AUDIT
-    report["stage_guard_tgt_kbo_summary"] = _summarize_stage_transactions(
-        _STAGE_TRANSACTION_AUDIT
-    )
-    report["stage_guard_scientific_mechanism"] = {
-        "name": "Stage-Anchored KBO-guided Temporal Generative Transactions",
-        "problem": "long-horizon covariate shift and topological fragility",
-        "mechanisms": [
-            "Macroscopic Stage Anchoring",
-            "Temporal Generative Transactions",
-            "Kinematic Barrier Oracle",
-            "Confidence-aware Cascaded Degradation",
-            "Diffusion Early-Abort",
-            "Hard-negative Audit Tokens",
-        ],
-    }
-    report["energy_stability_stability_alignment"] = {
-        "version": "energy_stability_lowpass_early_abort_dynamic_msa_kinetic_hn_dpo",
-        "fixes": [
-            "low-pass relaxed KBO for early-abort probes",
-            "music-energy and root-velocity adaptive macroscopic stage anchoring",
-            "kinetic-energy preserving HN-DPO fine-tuning tool",
-        ],
-        "mssd_stage_weight_meta": _energy_gate_jsonable(_STAGE_WEIGHT_METADATA),
-        "early_abort_relax": float(
-            _energy_gate_env_float("ENERGY_STABILITY_EARLY_ABORT_KBO_RELAX", 3.0)
-        ),
-        "early_abort_smooth_sigma": float(
-            _energy_gate_env_float(
-                "ENERGY_STABILITY_EARLY_ABORT_KBO_SMOOTH_SIGMA", 1.35
-            )
-        ),
-    }
-    report["stage_guard_scientific_mechanism"]["energy_stability_fixes"] = report[
-        "energy_stability_stability_alignment"
-    ]["fixes"]
-    report["physics_stability_physics_consistent_stability"] = {
-        "version": "physics_stability_derivative_safe_msa_velocity_preserving_kinetic_dpo",
-        "fixes": [
-            "early-abort uses low-pass robust derivative oracle",
-            "derivative-only Tweedie jitter cannot abort by default",
-            "multiple early probes require consecutive fatal low-frequency barriers",
-            "stage anchoring preserves local velocity and releases leap/high-speed windows",
-            "HN-DPO training uses kinetic and motion-density preservation",
-        ],
-        "early_abort_probe_trace_count": int(len(_EARLY_ABORT_TRACE)),
-        "early_abort_probe_trace_preview": _physics_stability_jsonable(
-            _EARLY_ABORT_TRACE[:20]
-        ),
-        "env": {
-            "PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA": _physics_stability_env_float(
-                "PHYSICS_STABILITY_EARLY_ABORT_LOWPASS_SIGMA", 2.25
-            ),
-            "PHYSICS_STABILITY_EARLY_ABORT_RELAX": _physics_stability_env_float(
-                "PHYSICS_STABILITY_EARLY_ABORT_RELAX", 4.0
-            ),
-            "PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL": _physics_stability_env_int(
-                "PHYSICS_STABILITY_EARLY_ABORT_CONSECUTIVE_FATAL", 2
-            ),
-            "PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH": _physics_stability_env_float(
-                "PHYSICS_STABILITY_MSA_LEAP_SPEED_THRESH", 0.070
-            ),
-            "PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPS": _physics_stability_env_float(
-                "PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPS", 0.18
-            ),
-        },
-    }
-    save_json(_physics_stability_jsonable(report), json_path)
-    print(
-        json.dumps(
-            {
-                "runtime_metadata_updated": str(json_path),
-                "stage_transactions": report["stage_guard_tgt_kbo_summary"],
-                "physics_stability": report[
-                    "physics_stability_physics_consistent_stability"
-                ],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    return _stage_guard_orig_apply_diffusion_model(
+        snapshot,
+        cond,
+        sm_win,
+        ckpt_path,
+        cfg,
     )
 
 
-def generate(args: argparse.Namespace) -> int:
-    """Explicit whole-song generation orchestration with one public entrypoint."""
-
-    global _EARLY_ABORT_TRACE
-    _EARLY_ABORT_TRACE = []
-    _reset_stage_transaction_audit()
-    try:
-        _load_stage_anchor_weights(getattr(args, "slots_json", None))
-    except Exception as exc:
-        print(
-            f"[Energy Stability WARN] failed to load MSSD dynamic stage weights: {exc}",
-            file=sys.stderr,
-        )
-
-    rc = int(_generate_motion_core(args))
-    try:
-        _append_generation_runtime_metadata(args)
-    except Exception as exc:
-        print(
-            f"[Motion Generation WARN] failed to append runtime metadata: {exc}",
-            file=sys.stderr,
-        )
-    return rc
 # ===== Physics Stability PHYSICS-CONSISTENT STABILITY PATCH END =====
 
 

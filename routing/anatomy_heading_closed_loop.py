@@ -89,7 +89,7 @@ def _runtime_fps(argv: Sequence[str]) -> float:
         if raw is not None and str(raw).strip():
             values[name] = float(raw)
     if not values:
-        values["legacy_default"] = 30.0
+        values["default_fps"] = 30.0
     for source, value in values.items():
         if not np.isfinite(value) or value <= 0.0:
             raise RuntimeError(

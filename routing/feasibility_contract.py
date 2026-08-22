@@ -38,6 +38,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from support.event_identity import event_uids_from_generation_db
+
 _INSTALLED = False
 _ACTIVE_TIER = 0
 _RESOLVED_PERFORMER = "mixed"
@@ -548,7 +550,6 @@ def install(route_runtime: Any) -> Dict[str, Any]:
 
         (
             db,
-            contrastive,
             slots,
             slot_feat,
             path_idx,
@@ -575,11 +576,13 @@ def install(route_runtime: Any) -> Dict[str, Any]:
         performer_report: Dict[str, Any] = {}
         for split_pass in range(policy.max_slot_split_passes + 1):
             if split_pass > 0:
-                path_idx, retrieval_report = motion_runtime.retrieve_schedule(
-                    slots, features, db, cfg, contrastive
-                )
-                candidate_lists = base.extract_candidate_lists(
-                    path_idx, retrieval_report, db, cfg
+                event_uids = event_uids_from_generation_db(db)
+                path_idx, candidate_lists, retrieval_report = (
+                    base.formal_candidate_state_from_slots(
+                        slots,
+                        event_uids,
+                        boundary_top_k=policy.candidate_pool,
+                    )
                 )
             candidate_lists, performer_report = filter_candidate_lists(
                 candidate_lists, db, policy
@@ -601,7 +604,6 @@ def install(route_runtime: Any) -> Dict[str, Any]:
                 })
                 return (
                     db,
-                    contrastive,
                     list(slots),
                     features,
                     list(map(int, path_idx)),

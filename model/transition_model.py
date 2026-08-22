@@ -42,7 +42,7 @@ class EndpointTransitionRefiner(nn.Module):
 
     The network preserves contacts and root X/Z by default. It refines root Y and
     joint rotations only, matching the conservative strategy that worked best in
-    the legacy phrase scheduler experiments.
+    optional project-trained transition experiments.
     """
 
     def __init__(

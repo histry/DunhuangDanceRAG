@@ -18,7 +18,6 @@ def _db():
 
 
 def test_predicted_bottleneck_activation_adds_future_candidate(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
     config = ConstraintBudgetConfig.from_environment(total_slots=3)
     model = BackwardReachabilityModel.build([[0], [1], [2]], _db(), constraint_config=config)
     report = model.activate_candidates(slot=1, event_ids=[3], reason="unit_test")
@@ -28,8 +27,7 @@ def test_predicted_bottleneck_activation_adds_future_candidate(monkeypatch):
 
 
 def test_compressed_cache_key_ignores_small_dual_float_noise(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_STATE_REACHABILITY_USAGE_QUANTIZATION", "0.10")
+    monkeypatch.setenv("ROUTING_BUDGET_STATE_REACHABILITY_USAGE_QUANTIZATION", "0.10")
     config = ConstraintBudgetConfig.from_environment(total_slots=3)
     model = BackwardReachabilityModel.build([[0], [1], [2]], _db(), constraint_config=config)
     key_a = model._cache_key(

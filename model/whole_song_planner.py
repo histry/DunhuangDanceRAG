@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Phrase-sequence planner for whole-song cultural dance choreography.
+"""Current-protocol phrase planner for whole-song choreography.
 
-This replacement keeps the original planner architecture intact, but changes
-the default transition vocabulary from short fixed cuts to music/physics-ready
-durations. Old checkpoints remain loadable because their saved config still
-overrides this fallback.
+The planner predicts continuous duration/activity and transition class only.
+Local-action compatibility belongs to the temporal Router and formal candidate
+sets; a categorical dance-event head would duplicate the archived BVH task.
 """
 from __future__ import annotations
 
@@ -16,14 +15,12 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from support.common import EVENT_TYPES
-
-
 MUSIC_DOMINANT_TRANSITION_LENGTHS: tuple[int, ...] = (12, 16, 20, 24, 30, 36, 42, 48)
+PLANNER_ARCHITECTURE = "ctsr_continuous_planner_v2"
 
 
 class WholeSongPlanner(nn.Module):
-    """Predict motion-event type, natural duration and transition class per phrase."""
+    """Predict natural duration, transition class, and activity per phrase."""
 
     def __init__(
         self,
@@ -32,7 +29,6 @@ class WholeSongPlanner(nn.Module):
         num_layers: int = 4,
         num_heads: int = 4,
         dropout: float = 0.15,
-        num_event_types: int = len(EVENT_TYPES),
         transition_lengths: tuple[int, ...] = MUSIC_DOMINANT_TRANSITION_LENGTHS,
         fps: float = 30.0,
         min_duration_seconds: float = 8.0 / 30.0,
@@ -41,7 +37,6 @@ class WholeSongPlanner(nn.Module):
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.hidden_dim = int(hidden_dim)
-        self.num_event_types = int(num_event_types)
         self.transition_lengths = tuple(int(x) for x in transition_lengths)
         self.fps = float(fps)
         if not math.isfinite(self.fps) or self.fps <= 0.0:
@@ -68,7 +63,6 @@ class WholeSongPlanner(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.event_head = nn.Linear(hidden_dim, num_event_types)
         self.log_duration_head = nn.Linear(hidden_dim, 1)
         self.transition_head = nn.Linear(hidden_dim, len(self.transition_lengths))
         self.activity_head = nn.Linear(hidden_dim, 1)
@@ -80,7 +74,6 @@ class WholeSongPlanner(nn.Module):
         hidden = self.encoder(hidden, src_key_padding_mask=padding_mask)
         log_duration = self.log_duration_head(hidden).squeeze(-1)
         return {
-            "event_logits": self.event_head(hidden),
             "log_duration": log_duration,
             "duration_frames": torch.exp(log_duration).clamp(
                 self.duration_min_frames, self.duration_max_frames
@@ -96,6 +89,11 @@ def load_whole_song_planner_checkpoint(
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if str(checkpoint.get("architecture", "")) != PLANNER_ARCHITECTURE:
+        raise RuntimeError(
+            "Planner checkpoint is not a current-protocol asset; historical "
+            "checkpoints remain available only through the archive tag"
+        )
     config = dict(checkpoint.get("config", {}))
     model = WholeSongPlanner(
         feature_dim=int(config.get("feature_dim", 32)),
@@ -103,7 +101,6 @@ def load_whole_song_planner_checkpoint(
         num_layers=int(config.get("num_layers", 4)),
         num_heads=int(config.get("num_heads", 4)),
         dropout=float(config.get("dropout", 0.15)),
-        num_event_types=int(config.get("num_event_types", len(EVENT_TYPES))),
         transition_lengths=tuple(config.get("transition_lengths", MUSIC_DOMINANT_TRANSITION_LENGTHS)),
         fps=float(config.get("fps", 30.0)),
         min_duration_seconds=float(config.get("min_duration_seconds", 8.0 / 30.0)),
@@ -114,15 +111,9 @@ def load_whole_song_planner_checkpoint(
     model.eval()
     return {"model": model, "config": config, "checkpoint": checkpoint}
 
-
-# Public, version-free API. The historical class alias remains only for
-# checkpoint compatibility and is not used in public file names.
-WholeSongPlanner = WholeSongPlanner
-
-
 def load_planner_checkpoint(
     path: str | Path,
     device: torch.device | str = "cpu",
 ) -> Dict[str, Any]:
-    """Load a historical planner checkpoint through the public API."""
+    """Load a current-protocol planner checkpoint."""
     return load_whole_song_planner_checkpoint(path, device=device)

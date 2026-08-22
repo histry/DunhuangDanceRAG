@@ -140,61 +140,61 @@ class SafeSourceCoverageConfig:
     @classmethod
     def from_environment(cls) -> "SafeSourceCoverageConfig":
         return cls(
-            enabled=_env_bool("BR_HPR_SOURCE_COVERAGE_ENABLE", True),
+            enabled=_env_bool("ROUTING_BUDGET_SOURCE_COVERAGE_ENABLE", True),
             target_safe_sources=max(
-                1, _env_int("BR_HPR_MINIMUM_SAFE_SOURCE_COUNT", 2)
+                1, _env_int("ROUTING_BUDGET_MINIMUM_SAFE_SOURCE_COUNT", 2)
             ),
             target_safe_families=max(
-                1, _env_int("BR_HPR_MINIMUM_SAFE_FAMILY_COUNT", 2)
+                1, _env_int("ROUTING_BUDGET_MINIMUM_SAFE_FAMILY_COUNT", 2)
             ),
             reservoir_maximum_per_slot=max(
-                1, _env_int("BR_HPR_SOURCE_RESERVOIR_MAXIMUM_PER_SLOT", 24)
+                1, _env_int("ROUTING_BUDGET_SOURCE_RESERVOIR_MAXIMUM_PER_SLOT", 24)
             ),
             reservoir_per_source=max(
-                1, _env_int("BR_HPR_SOURCE_RESERVOIR_PER_SOURCE", 3)
+                1, _env_int("ROUTING_BUDGET_SOURCE_RESERVOIR_PER_SOURCE", 3)
             ),
             expansion_maximum_exact=max(
-                0, _env_int("BR_HPR_SOURCE_EXPANSION_MAXIMUM_EXACT", 8)
+                0, _env_int("ROUTING_BUDGET_SOURCE_EXPANSION_MAXIMUM_EXACT", 8)
             ),
             expansion_per_source=max(
-                1, _env_int("BR_HPR_SOURCE_EXPANSION_PER_SOURCE", 2)
+                1, _env_int("ROUTING_BUDGET_SOURCE_EXPANSION_PER_SOURCE", 2)
             ),
             minimum_anatomy_quality=float(
                 np.clip(
-                    _env_float("BR_HPR_SOURCE_EXPANSION_ANATOMY_MIN", 0.30),
+                    _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_ANATOMY_MIN", 0.30),
                     0.0,
                     1.0,
                 )
             ),
             quality_weight=max(
-                0.0, _env_float("BR_HPR_SOURCE_EXPANSION_QUALITY_WEIGHT", 0.55)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_QUALITY_WEIGHT", 0.55)
             ),
             anatomy_weight=max(
-                0.0, _env_float("BR_HPR_SOURCE_EXPANSION_ANATOMY_WEIGHT", 0.45)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_ANATOMY_WEIGHT", 0.45)
             ),
             heading_weight=max(
-                0.0, _env_float("BR_HPR_SOURCE_EXPANSION_HEADING_WEIGHT", 0.25)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_HEADING_WEIGHT", 0.25)
             ),
             duration_weight=max(
-                0.0, _env_float("BR_HPR_SOURCE_EXPANSION_DURATION_WEIGHT", 0.35)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_DURATION_WEIGHT", 0.35)
             ),
             family_affinity_weight=max(
                 0.0,
-                _env_float("BR_HPR_SOURCE_EXPANSION_FAMILY_AFFINITY_WEIGHT", 0.30),
+                _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_FAMILY_AFFINITY_WEIGHT", 0.30),
             ),
             hierarchy_affinity_weight=max(
                 0.0,
-                _env_float("BR_HPR_SOURCE_EXPANSION_HIERARCHY_WEIGHT", 0.20),
+                _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_HIERARCHY_WEIGHT", 0.20),
             ),
             history_novelty_weight=max(
                 0.0,
-                _env_float("BR_HPR_SOURCE_EXPANSION_HISTORY_NOVELTY_WEIGHT", 0.20),
+                _env_float("ROUTING_BUDGET_SOURCE_EXPANSION_HISTORY_NOVELTY_WEIGHT", 0.20),
             ),
             bottleneck_initial_reservoir_per_slot=max(
-                0, _env_int("BR_HPR_BOTTLENECK_INITIAL_RESERVOIR_PER_SLOT", 8)
+                0, _env_int("ROUTING_BUDGET_BOTTLENECK_INITIAL_RESERVOIR_PER_SLOT", 8)
             ),
             bottleneck_expansion_maximum=max(
-                0, _env_int("BR_HPR_BOTTLENECK_EXPANSION_MAXIMUM", 12)
+                0, _env_int("ROUTING_BUDGET_BOTTLENECK_EXPANSION_MAXIMUM", 12)
             ),
         )
 

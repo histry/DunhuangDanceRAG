@@ -5,11 +5,10 @@ from routing.hierarchical_constraint_model import (
 
 
 def test_continuous_recovery_uses_remaining_resource_not_fixed_count(monkeypatch):
-    monkeypatch.setenv("BR_HPR_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_CONTROLLED_RECOVERY_ENABLE", "1")
-    monkeypatch.setenv("BR_HPR_RECOVERY_BUDGET_TOTAL", "1.0")
-    monkeypatch.setenv("BR_HPR_RECOVERY_TOPK", "3")
-    monkeypatch.setenv("BR_HPR_RECOVERY_MAXIMUM_CHARGE_PER_SLOT", "1.0")
+    monkeypatch.setenv("ROUTING_BUDGET_CONTROLLED_RECOVERY_ENABLE", "1")
+    monkeypatch.setenv("ROUTING_BUDGET_RECOVERY_BUDGET_TOTAL", "1.0")
+    monkeypatch.setenv("ROUTING_BUDGET_RECOVERY_TOPK", "3")
+    monkeypatch.setenv("ROUTING_BUDGET_RECOVERY_MAXIMUM_CHARGE_PER_SLOT", "1.0")
     config = ConstraintBudgetConfig.from_environment(total_slots=11)
     rows = [
         {

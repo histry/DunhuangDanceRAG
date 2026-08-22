@@ -70,7 +70,7 @@ def event_identity(db: Mapping[str, Any], event_id: int) -> dict[str, str]:
         "source_uid": str(_db_value(db, "source_uids", event_id, "unknown_source")),
         "family_id": str(_db_value(db, "event_families", event_id, "unknown_family")),
         "event_uid": str(
-            _db_value(db, "event_uids", event_id, f"legacy_index_{int(event_id)}")
+            _db_value(db, "event_uids", event_id, f"event_index_{int(event_id)}")
         ),
     }
 
@@ -325,165 +325,165 @@ class ConstraintBudgetConfig:
     def from_environment(cls, total_slots: int) -> "ConstraintBudgetConfig":
         slots = max(1, int(total_slots))
         return cls(
-            enabled=_env_bool("BR_HPR_ENABLE", True),
+            enabled=True,
             total_slots=slots,
-            event_cooldown_slots=max(1, _env_int("BR_HPR_EVENT_COOLDOWN_SLOTS", 8)),
-            maximum_source_run=max(1, _env_int("BR_HPR_MAX_SOURCE_RUN", 2)),
+            event_cooldown_slots=max(1, _env_int("ROUTING_BUDGET_EVENT_COOLDOWN_SLOTS", 8)),
+            maximum_source_run=max(1, _env_int("ROUTING_BUDGET_MAX_SOURCE_RUN", 2)),
             maximum_source_share=float(
-                np.clip(_env_float("BR_HPR_MAX_SOURCE_SHARE", 0.40), 0.0, 1.0)
+                np.clip(_env_float("ROUTING_BUDGET_MAX_SOURCE_SHARE", 0.40), 0.0, 1.0)
             ),
             maximum_family_share=float(
-                np.clip(_env_float("BR_HPR_MAX_FAMILY_SHARE", 0.50), 0.0, 1.0)
+                np.clip(_env_float("ROUTING_BUDGET_MAX_FAMILY_SHARE", 0.50), 0.0, 1.0)
             ),
-            minimum_share_history=max(1, _env_int("BR_HPR_MIN_SHARE_HISTORY", 6)),
+            minimum_share_history=max(1, _env_int("ROUTING_BUDGET_MIN_SHARE_HISTORY", 6)),
             observability_target=float(
-                np.clip(_env_float("BR_HPR_OBSERVABILITY_TARGET", 0.45), 0.05, 1.0)
+                np.clip(_env_float("ROUTING_BUDGET_OBSERVABILITY_TARGET", 0.45), 0.05, 1.0)
             ),
             hierarchy_similarity_target=float(
                 np.clip(
-                    _env_float("BR_HPR_HIERARCHY_SIMILARITY_TARGET", 0.55),
+                    _env_float("ROUTING_BUDGET_HIERARCHY_SIMILARITY_TARGET", 0.55),
                     0.0,
                     0.99,
                 )
             ),
             hierarchy_temperature=max(
-                1.0e-3, _env_float("BR_HPR_HIERARCHY_TEMPERATURE", 1.25)
+                1.0e-3, _env_float("ROUTING_BUDGET_HIERARCHY_TEMPERATURE", 1.25)
             ),
             hierarchy_recency_decay=max(
-                0.25, _env_float("BR_HPR_HIERARCHY_RECENCY_DECAY", 3.0)
+                0.25, _env_float("ROUTING_BUDGET_HIERARCHY_RECENCY_DECAY", 3.0)
             ),
             hyperbolic_dimension=max(
-                2, _env_int("BR_HPR_HYPERBOLIC_DIMENSION", 8)
+                2, _env_int("ROUTING_BUDGET_HYPERBOLIC_DIMENSION", 8)
             ),
             hyperbolic_maximum_radius=float(
                 np.clip(
-                    _env_float("BR_HPR_HYPERBOLIC_MAXIMUM_RADIUS", 0.82),
+                    _env_float("ROUTING_BUDGET_HYPERBOLIC_MAXIMUM_RADIUS", 0.82),
                     0.20,
                     0.95,
                 )
             ),
             event_repeat_budget=max(
                 0.0,
-                _env_float("BR_HPR_EVENT_REPEAT_BUDGET", max(1.0, 0.10 * slots)),
+                _env_float("ROUTING_BUDGET_EVENT_REPEAT_BUDGET", max(1.0, 0.10 * slots)),
             ),
             source_run_budget=max(
                 0.0,
-                _env_float("BR_HPR_SOURCE_RUN_BUDGET", max(0.75, 0.08 * slots)),
+                _env_float("ROUTING_BUDGET_SOURCE_RUN_BUDGET", max(0.75, 0.08 * slots)),
             ),
             source_share_budget=max(
                 0.0,
-                _env_float("BR_HPR_SOURCE_SHARE_BUDGET", max(0.75, 0.08 * slots)),
+                _env_float("ROUTING_BUDGET_SOURCE_SHARE_BUDGET", max(0.75, 0.08 * slots)),
             ),
             family_share_budget=max(
                 0.0,
-                _env_float("BR_HPR_FAMILY_SHARE_BUDGET", max(0.90, 0.10 * slots)),
+                _env_float("ROUTING_BUDGET_FAMILY_SHARE_BUDGET", max(0.90, 0.10 * slots)),
             ),
             observability_budget=max(
                 0.0,
-                _env_float("BR_HPR_OBSERVABILITY_BUDGET", max(0.75, 0.08 * slots)),
+                _env_float("ROUTING_BUDGET_OBSERVABILITY_BUDGET", max(0.75, 0.08 * slots)),
             ),
             hierarchy_repetition_budget=max(
                 0.0,
                 _env_float(
-                    "BR_HPR_HIERARCHY_REPETITION_BUDGET", max(1.50, 0.15 * slots)
+                    "ROUTING_BUDGET_HIERARCHY_REPETITION_BUDGET", max(1.50, 0.15 * slots)
                 ),
             ),
             event_repeat_weight=max(
-                0.0, _env_float("BR_HPR_EVENT_REPEAT_WEIGHT", 1.20)
+                0.0, _env_float("ROUTING_BUDGET_EVENT_REPEAT_WEIGHT", 1.20)
             ),
             source_run_weight=max(
-                0.0, _env_float("BR_HPR_SOURCE_RUN_WEIGHT", 1.00)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_RUN_WEIGHT", 1.00)
             ),
             source_share_weight=max(
-                0.0, _env_float("BR_HPR_SOURCE_SHARE_WEIGHT", 0.80)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_SHARE_WEIGHT", 0.80)
             ),
             family_share_weight=max(
-                0.0, _env_float("BR_HPR_FAMILY_SHARE_WEIGHT", 0.65)
+                0.0, _env_float("ROUTING_BUDGET_FAMILY_SHARE_WEIGHT", 0.65)
             ),
             observability_weight=max(
-                0.0, _env_float("BR_HPR_OBSERVABILITY_WEIGHT", 0.60)
+                0.0, _env_float("ROUTING_BUDGET_OBSERVABILITY_WEIGHT", 0.60)
             ),
             hierarchy_repetition_weight=max(
-                0.0, _env_float("BR_HPR_HIERARCHY_REPETITION_WEIGHT", 0.90)
+                0.0, _env_float("ROUTING_BUDGET_HIERARCHY_REPETITION_WEIGHT", 0.90)
             ),
             future_reachability_weight=max(
-                0.0, _env_float("BR_HPR_FUTURE_REACHABILITY_WEIGHT", 0.75)
+                0.0, _env_float("ROUTING_BUDGET_FUTURE_REACHABILITY_WEIGHT", 0.75)
             ),
             dual_learning_rate=max(
-                0.0, _env_float("BR_HPR_DUAL_LEARNING_RATE", 0.25)
+                0.0, _env_float("ROUTING_BUDGET_DUAL_LEARNING_RATE", 0.25)
             ),
-            recovery_penalty=max(0.0, _env_float("BR_HPR_RECOVERY_PENALTY", 4.0)),
-            recovery_topk=max(1, _env_int("BR_HPR_RECOVERY_TOPK", 2)),
+            recovery_penalty=max(0.0, _env_float("ROUTING_BUDGET_RECOVERY_PENALTY", 4.0)),
+            recovery_topk=max(1, _env_int("ROUTING_BUDGET_RECOVERY_TOPK", 2)),
             budget_tolerance=max(
-                0.0, _env_float("BR_HPR_BUDGET_TOLERANCE", 1.0e-6)
+                0.0, _env_float("ROUTING_BUDGET_BUDGET_TOLERANCE", 1.0e-6)
             ),
             controlled_recovery_enabled=_env_bool(
-                "BR_HPR_CONTROLLED_RECOVERY_ENABLE", True
+                "ROUTING_BUDGET_CONTROLLED_RECOVERY_ENABLE", True
             ),
             recovery_budget_total=max(
-                0.0, _env_float("BR_HPR_RECOVERY_BUDGET_TOTAL", 3.0)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_BUDGET_TOTAL", 3.0)
             ),
             recovery_minimum_charge=max(
-                0.0, _env_float("BR_HPR_RECOVERY_MINIMUM_CHARGE", 0.05)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_MINIMUM_CHARGE", 0.05)
             ),
             recovery_maximum_charge_per_slot=max(
-                0.0, _env_float("BR_HPR_RECOVERY_MAXIMUM_CHARGE_PER_SLOT", 0.90)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_MAXIMUM_CHARGE_PER_SLOT", 0.90)
             ),
             recovery_event_repeat_weight=max(
-                0.0, _env_float("BR_HPR_RECOVERY_EVENT_REPEAT_WEIGHT", 1.00)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_EVENT_REPEAT_WEIGHT", 1.00)
             ),
             recovery_source_run_weight=max(
-                0.0, _env_float("BR_HPR_RECOVERY_SOURCE_RUN_WEIGHT", 0.65)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_SOURCE_RUN_WEIGHT", 0.65)
             ),
             recovery_source_share_weight=max(
-                0.0, _env_float("BR_HPR_RECOVERY_SOURCE_SHARE_WEIGHT", 0.45)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_SOURCE_SHARE_WEIGHT", 0.45)
             ),
             recovery_family_share_weight=max(
-                0.0, _env_float("BR_HPR_RECOVERY_FAMILY_SHARE_WEIGHT", 0.55)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_FAMILY_SHARE_WEIGHT", 0.55)
             ),
             recovery_observability_weight=max(
-                0.0, _env_float("BR_HPR_RECOVERY_OBSERVABILITY_WEIGHT", 0.50)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_OBSERVABILITY_WEIGHT", 0.50)
             ),
             recovery_hierarchy_weight=max(
-                0.0, _env_float("BR_HPR_RECOVERY_HIERARCHY_WEIGHT", 0.55)
+                0.0, _env_float("ROUTING_BUDGET_RECOVERY_HIERARCHY_WEIGHT", 0.55)
             ),
             source_scarcity_enabled=_env_bool(
-                "BR_HPR_SOURCE_SCARCITY_ENABLE", True
+                "ROUTING_BUDGET_SOURCE_SCARCITY_ENABLE", True
             ),
             minimum_safe_source_count=max(
-                1, _env_int("BR_HPR_MINIMUM_SAFE_SOURCE_COUNT", 2)
+                1, _env_int("ROUTING_BUDGET_MINIMUM_SAFE_SOURCE_COUNT", 2)
             ),
             source_scarcity_minimum_scale=float(
                 np.clip(
-                    _env_float("BR_HPR_SOURCE_SCARCITY_MINIMUM_SCALE", 0.12),
+                    _env_float("ROUTING_BUDGET_SOURCE_SCARCITY_MINIMUM_SCALE", 0.12),
                     0.0,
                     1.0,
                 )
             ),
             source_scarcity_budget_credit=max(
-                0.0, _env_float("BR_HPR_SOURCE_SCARCITY_BUDGET_CREDIT", 0.25)
+                0.0, _env_float("ROUTING_BUDGET_SOURCE_SCARCITY_BUDGET_CREDIT", 0.25)
             ),
             family_scarcity_enabled=_env_bool(
-                "BR_HPR_FAMILY_SCARCITY_ENABLE", True
+                "ROUTING_BUDGET_FAMILY_SCARCITY_ENABLE", True
             ),
             minimum_safe_family_count=max(
-                1, _env_int("BR_HPR_MINIMUM_SAFE_FAMILY_COUNT", 2)
+                1, _env_int("ROUTING_BUDGET_MINIMUM_SAFE_FAMILY_COUNT", 2)
             ),
             family_scarcity_minimum_scale=float(
                 np.clip(
-                    _env_float("BR_HPR_FAMILY_SCARCITY_MINIMUM_SCALE", 0.12),
+                    _env_float("ROUTING_BUDGET_FAMILY_SCARCITY_MINIMUM_SCALE", 0.12),
                     0.0,
                     1.0,
                 )
             ),
             family_scarcity_budget_credit=max(
-                0.0, _env_float("BR_HPR_FAMILY_SCARCITY_BUDGET_CREDIT", 0.25)
+                0.0, _env_float("ROUTING_BUDGET_FAMILY_SCARCITY_BUDGET_CREDIT", 0.25)
             ),
             recovery_minimum_viability_depth=max(
-                1, _env_int("BR_HPR_RECOVERY_MINIMUM_VIABILITY_DEPTH", 2)
+                1, _env_int("ROUTING_BUDGET_RECOVERY_MINIMUM_VIABILITY_DEPTH", 2)
             ),
             recovery_require_safe_successor=_env_bool(
-                "BR_HPR_RECOVERY_REQUIRE_SAFE_SUCCESSOR", True
+                "ROUTING_BUDGET_RECOVERY_REQUIRE_SAFE_SUCCESSOR", True
             ),
         )
 
@@ -835,7 +835,6 @@ def assess_candidate_constraints(
         "hard_valid": True,
         "hard_reasons": [],
         "soft_reasons": list(soft_reasons),
-        "legacy_hard_reasons": list(soft_reasons),
         "penalty": diversity_penalty,
         "cooldown_slots": int(config.event_cooldown_slots),
         "event_repeat_gap": repeat_gap,

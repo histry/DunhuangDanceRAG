@@ -35,7 +35,7 @@ DEFAULT_MANIFEST = (
     / "sources.json"
 )
 
-MANIFEST_SCHEMA = "chang_e_official_smpl_manifest_v2"
+MANIFEST_SCHEMA = "chang_e_official_smpl_manifest_v3_solo_aware"
 POSE_LAYOUT = "smplx55_axis_angle_body22_to_smpl24_hands_zero_v1"
 COORDINATE_SYSTEM = "y_up"
 TRANSLATION_UNITS = "m"
@@ -305,6 +305,7 @@ def load_manifest(
     source_ids: set[str] = set()
     files: set[str] = set()
     recording_uids: set[str] = set()
+    rows_by_recording: Dict[str, list[Mapping[str, Any]]] = {}
 
     for index, raw in enumerate(rows):
         if not isinstance(raw, Mapping):
@@ -355,6 +356,30 @@ def load_manifest(
         if raw.get("dancer_id_status") == "verified" and not raw.get("dancer_id"):
             raise ValueError(
                 f"SMPL manifest row {source_id} marks an empty dancer_id verified"
+            )
+
+        recording_performer_count = int(raw.get("recording_performer_count", 0))
+        if recording_performer_count < 1:
+            raise ValueError(
+                f"SMPL manifest row {source_id} has invalid recording_performer_count"
+            )
+        solo_compatibility = str(raw.get("solo_compatibility", ""))
+        if solo_compatibility not in {
+            "single_track_recording",
+            "requires_manual_review",
+            "manually_reviewed_solo_compatible",
+        }:
+            raise ValueError(
+                f"SMPL manifest row {source_id} has invalid solo_compatibility"
+            )
+        if bool(raw.get("solo_compatible", False)) != (
+            solo_compatibility in {
+                "single_track_recording",
+                "manually_reviewed_solo_compatible",
+            }
+        ):
+            raise ValueError(
+                f"SMPL manifest row {source_id} has inconsistent solo compatibility fields"
             )
 
         theme_status = str(raw.get("theme_label_status", ""))
@@ -445,6 +470,18 @@ def load_manifest(
         source_ids.add(source_id)
         files.add(filename.lower())
         recording_uids.add(recording_uid)
+        rows_by_recording.setdefault(recording_uid, []).append(raw)
+
+    for recording_uid, recording_rows in rows_by_recording.items():
+        expected_count = len(recording_rows)
+        for row in recording_rows:
+            declared_count = int(row.get("recording_performer_count", 0))
+            if declared_count != expected_count:
+                raise ValueError(
+                    "SMPL manifest recording_performer_count mismatch: "
+                    f"recording_uid={recording_uid!r}, declared={declared_count}, "
+                    f"observed_tracks={expected_count}"
+                )
 
     declared_groups = int(
         payload.get(
@@ -596,6 +633,10 @@ def validate_source(
             "performer_track_id",
             -1,
         ),
+        "recording_performer_count": int(row["recording_performer_count"]),
+        "solo_compatibility": row["solo_compatibility"],
+        "solo_compatible": bool(row["solo_compatible"]),
+        "solo_review_status": row.get("solo_review_status", "unknown"),
         "sequence_index": row.get(
             "sequence_index",
             -1,
@@ -681,6 +722,10 @@ def semantic_metadata(
         "performer_track_id": row.get(
             "performer_track_id"
         ),
+        "recording_performer_count": row.get("recording_performer_count"),
+        "solo_compatibility": row.get("solo_compatibility"),
+        "solo_compatible": row.get("solo_compatible"),
+        "solo_review_status": row.get("solo_review_status"),
         "sequence_index": row.get(
             "sequence_index"
         ),

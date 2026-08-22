@@ -18,8 +18,8 @@ def _db():
 
 
 def test_expansion_plan_keeps_multiple_unverified_sources(monkeypatch):
-    monkeypatch.setenv("BR_HPR_SOURCE_EXPANSION_MAXIMUM_EXACT", "4")
-    monkeypatch.setenv("BR_HPR_SOURCE_EXPANSION_PER_SOURCE", "2")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_EXPANSION_MAXIMUM_EXACT", "4")
+    monkeypatch.setenv("ROUTING_BUDGET_SOURCE_EXPANSION_PER_SOURCE", "2")
     config = SafeSourceCoverageConfig.from_environment()
     batches, report = build_state_source_expansion_batches(
         reservoir_event_ids=[2, 3, 4, 5, 6],
@@ -37,7 +37,7 @@ def test_expansion_plan_keeps_multiple_unverified_sources(monkeypatch):
 
 
 def test_bottleneck_selection_prefers_new_source_and_family(monkeypatch):
-    monkeypatch.setenv("BR_HPR_BOTTLENECK_EXPANSION_MAXIMUM", "2")
+    monkeypatch.setenv("ROUTING_BUDGET_BOTTLENECK_EXPANSION_MAXIMUM", "2")
     config = SafeSourceCoverageConfig.from_environment()
     selected, report = select_bottleneck_layer_expansion_candidates(
         reservoir_event_ids=[2, 4, 6],

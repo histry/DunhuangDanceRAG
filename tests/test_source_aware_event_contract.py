@@ -8,7 +8,7 @@ class SourceAwareEventContractTest(unittest.TestCase):
     def _report(self):
         return {
             "schema": "chang_e_official_smpl_source_aware_preprocess_v1",
-            "version": "chang_e_official_smpl_source_aware_preprocess_event_geometry_2",
+            "version": "chang_e_official_smpl_source_aware_preprocess_event_geometry_3_solo_aware",
             "ok": True,
             "source_gate_ok": True,
             "source_preprocess_ok": True,

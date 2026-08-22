@@ -3,7 +3,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from data_pipeline import split_sources
 from data_pipeline.split_sources import (
@@ -38,20 +37,18 @@ class SourceAwareSplitTest(unittest.TestCase):
                         "source_format": "chang_e_official_smpl",
                         "source_id": "female_36pose_1",
                         "recording_uid": "female_36pose_sequence",
+                        "recording_performer_count": 2,
+                        "solo_compatibility": "requires_manual_review",
+                        "solo_compatible": False,
+                        "solo_review_status": "pending_manual_review",
                         "performer_group": "female",
                         "dance_category": "thirty_six_postures",
                     },
                 },
             )
 
-            with mock.patch.object(
-                split_sources.motion_api,
-                "parse_change_bvh_semantics",
-                side_effect=AssertionError(
-                    "BVH parser entered formal SMPL path"
-                ),
-            ):
-                record = source_record(root, motion)
+            self.assertFalse(hasattr(split_sources, "motion_api"))
+            record = source_record(root, motion)
 
         self.assertEqual(record["source_uid"], "female_36pose_1")
         self.assertEqual(record["recording_uid"], "female_36pose_sequence")
@@ -60,7 +57,7 @@ class SourceAwareSplitTest(unittest.TestCase):
             "chang_e_official_smpl",
         )
 
-    def test_non_official_format_stays_on_legacy_bvh_parser(self):
+    def test_non_official_format_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             motion = self._write_report(
@@ -75,22 +72,11 @@ class SourceAwareSplitTest(unittest.TestCase):
                     },
                 },
             )
-            legacy_semantic = {
-                "source_uid": "female_take_01",
-                "recording_uid": "female_take_01",
-                "performer_group": "female",
-                "dance_key": "legacy",
-            }
-
-            with mock.patch.object(
-                split_sources.motion_api,
-                "parse_change_bvh_semantics",
-                return_value=legacy_semantic,
-            ) as parser:
-                record = source_record(root, motion)
-
-        parser.assert_called_once_with("female_take_01.bvh")
-        self.assertEqual(record["source_uid"], "female_take_01")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "accepts only source_format=chang_e_official_smpl",
+            ):
+                source_record(root, motion)
 
     def test_direct_official_contract_without_format_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

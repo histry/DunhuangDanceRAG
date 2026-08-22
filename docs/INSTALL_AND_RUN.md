@@ -1,56 +1,29 @@
 # Installation and formal run
 
-## 1. Install into EDGE
+The server environment is expected to exist already.
 
 ```bash
-cd /path/to/EDGE_RESEARCH_FEASIBILITY_AND_CLEAN_SYNC_PATCH
-bash install_edge.sh \
-  /home/disk/lsm/storage/EDGE \
-  /home/disk/lsm/conda_envs/edge/bin/python
+REPO=/home/disk/lsm/storage/DunhuangDanceRAG
+PY=/home/disk/lsm/conda_envs/edge/bin/python
+cd "$REPO"
+
+export GENERATION_PYTHON="$PY"
+export EXPERIMENT_PROFILE=research
+source configs/experiment.env
+
+bash scripts/preflight.sh
+bash scripts/run_official_smpl_full.sh \
+  "$CHANG_E_OFFICIAL_SMPL_DIR" \
+  assets/music/test/audio/dunhuangwu2.wav
 ```
 
-## 2. Synchronize the cleaned project
+The formal run requires a clean Git worktree, 14 manifest-authorized NPZ
+sources, strict Librosa backend success for every training song, and
+single-person-compatible Event-DB rows. It rebuilds all indexes and checkpoints
+inside the run output directory.
+
+After a successful trained run, generate another WAV without retraining:
 
 ```bash
-bash install_dunhuang_dance_rag.sh \
-  /home/disk/lsm/storage/DunhuangDanceRAG \
-  /home/disk/lsm/conda_envs/edge/bin/python
+bash scripts/generate_only.sh /path/to/audio.wav /path/to/trained_run auto
 ```
-
-EDGE should remain the development/training source of truth.  Synchronize the
-clean project after every algorithmic contract change and only publish the
-clean project after a full successful run.
-
-## 3. Full rebuild and retraining
-
-```bash
-cd /home/disk/lsm/storage/EDGE
-
-export GENERATION_REBUILD_RETARGET_CACHE=1
-export GENERATION_REBUILD_EVENT_DB=1
-export GENERATION_RETRAIN_CONTRASTIVE=1
-export GENERATION_RETRAIN_REFINER=1
-export GENERATION_RETRAIN_DIFFUSION=1
-
-export PERFORMER_GROUP=auto
-export PERFORMER_ALLOW_CROSS_GROUP_RESCUE=0
-
-bash scripts/run_experiment.sh \
-  "$PWD/test_music_bank/dunhuangwu2.wav"
-```
-
-## 4. Generation-only verification before a costly rebuild
-
-The previous checkpoints may be used only as a diagnostic smoke test when the
-old database paths are still present.  A formal result with new `change/` BVHs
-requires a full cache/database/model rebuild.
-
-## 5. Expected scientific invariants
-
-- at least 8 source-safe BVHs;
-- exact source-disjoint split;
-- with 4F/8M and 8/2/2: train 2F+6M, val 1F+1M, test 1F+1M;
-- Event DB contains `performer_groups` and `genders`;
-- no source/anatomy unsafe rescue;
-- generated frame count follows the current WAV;
-- final report contains `research_feasibility` diagnostics.

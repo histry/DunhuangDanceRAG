@@ -28,14 +28,21 @@ from scheduling.music_phrase_segmentation import (
     split_music_phrases_for_events,
     whole_song_features,
 )
+from scheduling.temporal_router_contract import phrase_feature_sequences
+from scheduling.temporal_router_contract import (
+    FORMAL_PLANNER_CONTRACT,
+    assert_formal_router_scientific_contract,
+)
 from support.common import (
-    EVENT_TO_ID,
-    event_compatibility,
     family_id,
     intrinsic_transition_cost_from_arrays,
     posture_state_distance,
 )
-from training.music_corpus import audio_sha256, discover_training_audio
+from training.music_corpus import (
+    assert_content_disjoint,
+    audio_sha256,
+    discover_training_audio,
+)
 from support.scheduler_checkpoint_contracts import (
     assert_scheduler_checkpoint_contract,
     scheduler_training_contract,
@@ -79,7 +86,6 @@ def _select_event_path(
     cooldown_slots: int,
     candidate_pool: int,
 ) -> list[int]:
-    event_types = [str(item.get("event_type", "neutral_flow")) for item in items]
     sources = [str(item.get("source_uid", "unknown")) for item in items]
     families = [str(item.get("family_id", family_id(item))) for item in items]
     selected: list[int] = []
@@ -91,16 +97,11 @@ def _select_event_path(
             1.0,
             float(phrase.length - (0 if slot == 0 else phrase.transition_base_frames)),
         )
-        compatibility = np.asarray(
-            [event_compatibility(phrase.music_event, value) for value in event_types],
-            dtype=np.float32,
-        )
         duration_cost = np.abs(
             np.log((natural_duration + 1.0) / (phrase_target + 1.0))
         )
         score = (
             np.asarray(similarity[slot], dtype=np.float32)
-            + 0.70 * compatibility
             + 0.30 * quality
             - 0.28 * duration_cost
         )
@@ -250,8 +251,10 @@ def build_dataset(args: argparse.Namespace) -> int:
         index_json=args.index_json,
         index_npz=args.index_npz,
         path=args.router_ckpt,
-        allow_legacy_30fps=False,
     )
+    if str(router_checkpoint.get("architecture", "")) != "ctsr_weak_temporal_v1":
+        raise RuntimeError("Planner dataset requires the formal CTSR temporal Router")
+    assert_formal_router_scientific_contract(router_checkpoint)
     duration_checkpoint = torch.load(
         args.duration_ckpt, map_location="cpu", weights_only=False
     )
@@ -263,7 +266,6 @@ def build_dataset(args: argparse.Namespace) -> int:
         index_json=args.index_json,
         index_npz=args.index_npz,
         path=args.duration_ckpt,
-        allow_legacy_30fps=False,
     )
     router = load_router_checkpoint(args.router_ckpt, device=device)
     with torch.no_grad():
@@ -272,9 +274,15 @@ def build_dataset(args: argparse.Namespace) -> int:
         )
 
     audio_paths = discover_training_audio(args.music_dirs)
+    if int(args.expected_num_songs) > 0 and len(audio_paths) != int(
+        args.expected_num_songs
+    ):
+        raise RuntimeError(
+            f"Planner expected {args.expected_num_songs} unique songs, got {len(audio_paths)}"
+        )
+    heldout_report = assert_content_disjoint(audio_paths, args.heldout_audio)
     cache_dir = Path(args.cache_dir).resolve()
     feature_sequences: list[np.ndarray] = []
-    event_sequences: list[np.ndarray] = []
     duration_sequences: list[np.ndarray] = []
     transition_sequences: list[np.ndarray] = []
     activity_sequences: list[np.ndarray] = []
@@ -288,12 +296,16 @@ def build_dataset(args: argparse.Namespace) -> int:
             fps=args.fps,
             cache_dir=cache_dir,
             max_seconds=args.max_seconds,
+            require_rhythm=bool(args.require_rhythm_features),
+            require_librosa=True,
         )
         phrases, _segmentation = segment_music_phrases(
             features,
             fps=args.fps,
             min_phrase_seconds=args.min_phrase_seconds,
             max_phrase_seconds=args.max_phrase_seconds,
+            boundary_quantile=args.boundary_quantile,
+            beat_snap_seconds=args.beat_snap_seconds,
         )
         phrases, _slots = split_music_phrases_for_events(
             features,
@@ -301,17 +313,22 @@ def build_dataset(args: argparse.Namespace) -> int:
             fps=args.fps,
             enabled=True,
             max_slot_seconds=args.max_slot_seconds,
+            calm_max_slot_seconds=args.calm_max_slot_seconds,
             min_slot_seconds=args.min_slot_seconds,
             max_events_per_phrase=args.max_events_per_phrase,
+            beat_snap_seconds=args.slot_beat_snap_seconds,
         )
         if not phrases:
             continue
-        queries = np.stack(
-            [np.asarray(phrase.query, dtype=np.float32) for phrase in phrases]
-        )
+        sequence_frames = int(getattr(router, "sequence_frames", 0))
+        if sequence_frames < 2:
+            raise RuntimeError(
+                "CTSR-Weak Router checkpoint has no valid sequence_frames contract"
+            )
+        router_music = phrase_feature_sequences(features, phrases, sequence_frames)
         with torch.no_grad():
             music_embedding = router.encode_music(
-                torch.from_numpy(queries).to(device)
+                torch.from_numpy(router_music).to(device)
             )
             similarity = (music_embedding @ motion_embedding.t()).cpu().numpy()
         chosen = _select_event_path(
@@ -334,13 +351,10 @@ def build_dataset(args: argparse.Namespace) -> int:
             cooldown_slots=args.cooldown_slots,
             candidate_pool=args.weak_candidate_pool,
         )
-        event_ids = []
         duration_targets = []
         selected_uids = []
         transition_targets = []
         for slot, event_index in enumerate(chosen):
-            event_name = str(items[event_index].get("event_type", "neutral_flow"))
-            event_ids.append(EVENT_TO_ID.get(event_name, EVENT_TO_ID["neutral_flow"]))
             duration_targets.append(float(natural_duration[event_index]))
             selected_uids.append(str(items[event_index]["event_uid"]))
             if slot == 0:
@@ -355,7 +369,6 @@ def build_dataset(args: argparse.Namespace) -> int:
                 [np.asarray(phrase.planner_feature, dtype=np.float32) for phrase in phrases]
             )
         )
-        event_sequences.append(np.asarray(event_ids, dtype=np.int64))
         duration_sequences.append(np.asarray(duration_targets, dtype=np.float32))
         transition_sequences.append(np.asarray(transition_targets, dtype=np.int64))
         activity_sequences.append(
@@ -373,7 +386,6 @@ def build_dataset(args: argparse.Namespace) -> int:
     np.savez_compressed(
         target,
         features=_object_array(feature_sequences),
-        event_ids=_object_array(event_sequences),
         duration_frames=_object_array(duration_sequences),
         transition_class=_object_array(transition_sequences),
         activity=_object_array(activity_sequences),
@@ -394,10 +406,18 @@ def build_dataset(args: argparse.Namespace) -> int:
         duration_checkpoint_sha256=np.asarray(
             sha256_file(args.duration_ckpt), dtype=object
         ),
+        router_architecture=np.asarray(
+            str(getattr(router, "architecture", "")), dtype=object
+        ),
     )
     report = {
         "schema": "dunhuang_whole_song_planner_dataset_v1",
-        "supervision": "current_router_and_contract_constrained_weak_labels",
+        "supervision": "ctsr_weak_router_and_contract_constrained_pseudo_labels",
+        "router_supervision_source": str(
+            getattr(router, "supervision_source", "unknown")
+        ),
+        "categorical_event_head": False,
+        "is_ground_truth": False,
         "dataset": str(target),
         "num_songs": len(feature_sequences),
         "num_slots": int(sum(len(value) for value in feature_sequences)),
@@ -406,6 +426,20 @@ def build_dataset(args: argparse.Namespace) -> int:
         "event_db_contract": metadata["event_db_contract"],
         "router_checkpoint": str(Path(args.router_ckpt).resolve()),
         "duration_checkpoint": str(Path(args.duration_ckpt).resolve()),
+        "content_disjoint": heldout_report,
+        "segmentation_contract": {
+            "shared_with_router_and_inference": True,
+            "min_phrase_seconds": float(args.min_phrase_seconds),
+            "max_phrase_seconds": float(args.max_phrase_seconds),
+            "boundary_quantile": float(args.boundary_quantile),
+            "beat_snap_seconds": float(args.beat_snap_seconds),
+            "max_slot_seconds": float(args.max_slot_seconds),
+            "calm_max_slot_seconds": float(args.calm_max_slot_seconds),
+            "min_slot_seconds": float(args.min_slot_seconds),
+            "max_events_per_phrase": int(args.max_events_per_phrase),
+            "slot_beat_snap_seconds": float(args.slot_beat_snap_seconds),
+            "require_rhythm_features": bool(args.require_rhythm_features),
+        },
     }
     target.with_suffix(".report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
@@ -426,7 +460,6 @@ class _PlannerDataset(Dataset):
         index = self.indices[position]
         return (
             torch.from_numpy(self.payload["features"][index].astype(np.float32)),
-            torch.from_numpy(self.payload["event_ids"][index].astype(np.int64)),
             torch.from_numpy(self.payload["duration_frames"][index].astype(np.float32)),
             torch.from_numpy(self.payload["transition_class"][index].astype(np.int64)),
             torch.from_numpy(self.payload["activity"][index].astype(np.float32)),
@@ -440,17 +473,14 @@ def _collate(batch: Sequence[tuple[torch.Tensor, ...]]) -> dict[str, torch.Tenso
     padding_mask = positions >= lengths[:, None]
     return {
         "features": pad_sequence([row[0] for row in batch], batch_first=True),
-        "event_ids": pad_sequence(
-            [row[1] for row in batch], batch_first=True, padding_value=-100
-        ),
         "duration_frames": pad_sequence(
-            [row[2] for row in batch], batch_first=True, padding_value=0.0
+            [row[1] for row in batch], batch_first=True, padding_value=0.0
         ),
         "transition_class": pad_sequence(
-            [row[3] for row in batch], batch_first=True, padding_value=-100
+            [row[2] for row in batch], batch_first=True, padding_value=-100
         ),
         "activity": pad_sequence(
-            [row[4] for row in batch], batch_first=True, padding_value=0.0
+            [row[3] for row in batch], batch_first=True, padding_value=0.0
         ),
         "padding_mask": padding_mask,
     }
@@ -480,7 +510,6 @@ def train_model(args: argparse.Namespace) -> int:
             )
         names = (
             "features",
-            "event_ids",
             "duration_frames",
             "transition_class",
             "activity",
@@ -497,6 +526,17 @@ def train_model(args: argparse.Namespace) -> int:
         duration_path = Path(str(np.asarray(data["duration_checkpoint"]).item()))
         router_hash = str(np.asarray(data["router_checkpoint_sha256"]).item())
         duration_hash = str(np.asarray(data["duration_checkpoint_sha256"]).item())
+        router_architecture = str(
+            np.asarray(
+                data["router_architecture"]
+                if "router_architecture" in data.files
+                else ""
+            ).item()
+        )
+    if router_architecture != "ctsr_weak_temporal_v1":
+        raise RuntimeError(
+            f"Planner dataset used non-formal Router architecture={router_architecture!r}"
+        )
     if sha256_file(router_path) != router_hash:
         raise RuntimeError(
             "Router checkpoint changed after Planner weak labels were generated"
@@ -541,18 +581,13 @@ def train_model(args: argparse.Namespace) -> int:
 
     def run_epoch(loader: DataLoader, training: bool) -> tuple[float, dict[str, float]]:
         model.train(training)
-        totals = {name: 0.0 for name in ("loss", "event", "duration", "transition", "activity")}
+        totals = {name: 0.0 for name in ("loss", "duration", "transition", "activity")}
         samples = 0
         for batch in loader:
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             valid = ~batch["padding_mask"]
             with torch.set_grad_enabled(training):
                 output = model(batch["features"], padding_mask=batch["padding_mask"])
-                event_loss = F.cross_entropy(
-                    output["event_logits"].reshape(-1, output["event_logits"].shape[-1]),
-                    batch["event_ids"].reshape(-1),
-                    ignore_index=-100,
-                )
                 duration_loss = F.smooth_l1_loss(
                     output["log_duration"][valid],
                     torch.log(batch["duration_frames"][valid].clamp_min(1.0)),
@@ -569,8 +604,7 @@ def train_model(args: argparse.Namespace) -> int:
                     output["activity"][valid], batch["activity"][valid].clamp(0.0, 1.0)
                 )
                 loss = (
-                    args.event_weight * event_loss
-                    + args.duration_weight * duration_loss
+                    args.duration_weight * duration_loss
                     + args.transition_weight * transition_loss
                     + args.activity_weight * activity_loss
                 )
@@ -582,7 +616,6 @@ def train_model(args: argparse.Namespace) -> int:
             count = int(valid.sum())
             for name, value in (
                 ("loss", loss),
-                ("event", event_loss),
                 ("duration", duration_loss),
                 ("transition", transition_loss),
                 ("activity", activity_loss),
@@ -610,11 +643,12 @@ def train_model(args: argparse.Namespace) -> int:
         "num_layers": args.num_layers,
         "num_heads": args.num_heads,
         "dropout": args.dropout,
-        "num_event_types": len(EVENT_TO_ID),
         "transition_lengths": list(transition_lengths),
         "fps": float(args.fps),
         "min_duration_seconds": 8.0 / 30.0,
         "max_duration_seconds": 20.0,
+        "architecture": "ctsr_continuous_planner_v2",
+        "categorical_event_head": False,
     }
     output_path = Path(args.out).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -630,7 +664,8 @@ def train_model(args: argparse.Namespace) -> int:
             patience = 0
             torch.save(
                 {
-                    "version": "formal_whole_song_planner_v1",
+                    "version": "formal_whole_song_planner_v2",
+                    "architecture": "ctsr_continuous_planner_v2",
                     "model_state_dict": model.state_dict(),
                     "config": config,
                     "fps": float(args.fps),
@@ -638,6 +673,7 @@ def train_model(args: argparse.Namespace) -> int:
                     "val_loss": val_loss,
                     "val_metrics": val_metrics,
                     "scheduler_contract": contract,
+                    "formal_planner_contract": dict(FORMAL_PLANNER_CONTRACT),
                 },
                 output_path,
             )
@@ -667,15 +703,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build.add_argument("--router_ckpt", required=True)
     build.add_argument("--duration_ckpt", required=True)
     build.add_argument("--music_dirs", nargs="+", required=True)
+    build.add_argument("--heldout_audio", nargs="*", default=[])
+    build.add_argument("--expected_num_songs", type=int, default=0)
     build.add_argument("--cache_dir", required=True)
     build.add_argument("--out", required=True)
     build.add_argument("--fps", type=float, required=True)
     build.add_argument("--max_seconds", type=float, default=0.0)
     build.add_argument("--min_phrase_seconds", type=float, default=2.5)
     build.add_argument("--max_phrase_seconds", type=float, default=7.5)
+    build.add_argument("--boundary_quantile", type=float, default=0.68)
+    build.add_argument("--beat_snap_seconds", type=float, default=0.35)
     build.add_argument("--max_slot_seconds", type=float, default=3.2)
+    build.add_argument("--calm_max_slot_seconds", type=float, default=4.5)
     build.add_argument("--min_slot_seconds", type=float, default=1.6)
     build.add_argument("--max_events_per_phrase", type=int, default=4)
+    build.add_argument("--slot_beat_snap_seconds", type=float, default=0.25)
+    build.add_argument(
+        "--require_rhythm_features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     build.add_argument("--cooldown_slots", type=int, default=8)
     build.add_argument("--weak_candidate_pool", type=int, default=256)
 
@@ -693,7 +740,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     train.add_argument("--num_layers", type=int, default=4)
     train.add_argument("--num_heads", type=int, default=4)
     train.add_argument("--dropout", type=float, default=0.15)
-    train.add_argument("--event_weight", type=float, default=1.0)
     train.add_argument("--duration_weight", type=float, default=0.65)
     train.add_argument("--transition_weight", type=float, default=0.50)
     train.add_argument("--activity_weight", type=float, default=0.25)

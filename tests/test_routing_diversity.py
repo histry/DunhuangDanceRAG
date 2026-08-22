@@ -26,10 +26,11 @@ class RoutingDiversityTests(unittest.TestCase):
             "dance_keys": np.asarray(["d0", "d1", "d1", "d2"], dtype=object),
         }
 
-    def test_exact_event_cooldown_is_hard(self):
+    def test_exact_event_cooldown_is_a_continuous_preference(self):
         result = diversity_assessment(self.db, 0, [2, 0])
-        self.assertFalse(result["hard_valid"])
-        self.assertIn("event_uid_cooldown", result["hard_reasons"])
+        self.assertTrue(result["hard_valid"])
+        self.assertIn("event_uid_cooldown", result["soft_reasons"])
+        self.assertGreater(result["penalty"], 0.0)
 
     def test_primary_is_a_soft_prior_not_an_absolute_commit(self):
         rows = [
@@ -67,43 +68,51 @@ class RoutingDiversityTests(unittest.TestCase):
             (SimpleNamespace(event_id=1, safe=True, risk_score=0.01, rank=0), {}),
             (SimpleNamespace(event_id=2, safe=True, risk_score=0.2, rank=1), {}),
         ]
-        with patch.dict(os.environ, {"ROUTING_SAFETY_MAX_SOURCE_RUN": "1"}, clear=False):
+        with patch.dict(
+            os.environ,
+            {
+                "ROUTING_BUDGET_MAX_SOURCE_RUN": "1",
+                "ROUTING_BUDGET_SOURCE_RUN_WEIGHT": "10",
+            },
+            clear=False,
+        ):
             selected, _extra, decision = select_safe_diverse_proposal(
                 rows, db=self.db, selected_event_ids=[0], primary_event_id=1
             )
         self.assertEqual(selected.event_id, 2)
         self.assertEqual(decision, "reselected_heading_physics_diverse")
 
-    def test_global_source_and_family_shares_are_hard_after_warmup(self):
+    def test_global_source_and_family_shares_are_soft_after_warmup(self):
         with patch.dict(
             os.environ,
             {
-                "ROUTING_SAFETY_MIN_SHARE_HISTORY": "3",
-                "ROUTING_SAFETY_MAX_SOURCE_SHARE": "0.40",
-                "ROUTING_SAFETY_MAX_FAMILY_SHARE": "0.50",
-                "ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS": "1",
-                "ROUTING_SAFETY_MAX_SOURCE_RUN": "3",
+                "ROUTING_BUDGET_MIN_SHARE_HISTORY": "3",
+                "ROUTING_BUDGET_MAX_SOURCE_SHARE": "0.40",
+                "ROUTING_BUDGET_MAX_FAMILY_SHARE": "0.50",
+                "ROUTING_BUDGET_EVENT_COOLDOWN_SLOTS": "1",
+                "ROUTING_BUDGET_MAX_SOURCE_RUN": "3",
             },
             clear=False,
         ):
             source = diversity_assessment(self.db, 1, [0, 2, 3])
             family = diversity_assessment(self.db, 2, [1, 2, 3])
-        self.assertFalse(source["hard_valid"])
-        self.assertIn("source_share", source["hard_reasons"])
-        self.assertFalse(family["hard_valid"])
-        self.assertIn("family_share", family["hard_reasons"])
+        self.assertTrue(source["hard_valid"])
+        self.assertIn("source_share", source["soft_reasons"])
+        self.assertTrue(family["hard_valid"])
+        self.assertIn("family_share", family["soft_reasons"])
 
-    def test_cooldown_is_not_silently_relaxed_when_pool_is_exhausted(self):
+    def test_cooldown_penalty_remains_finite_when_pool_is_exhausted(self):
         rows = [
             (SimpleNamespace(event_id=0, safe=True, risk_score=0.01, rank=0), {}),
         ]
-        with self.assertRaisesRegex(RuntimeError, "exhausted candidates"):
-            select_safe_diverse_proposal(
-                rows,
-                db=self.db,
-                selected_event_ids=[0],
-                primary_event_id=0,
-            )
+        selected, extra, _decision = select_safe_diverse_proposal(
+            rows,
+            db=self.db,
+            selected_event_ids=[0],
+            primary_event_id=0,
+        )
+        self.assertEqual(selected.event_id, 0)
+        self.assertGreater(extra["diversity"]["penalty"], 0.0)
 
     def test_physical_safety_is_never_relaxed(self):
         rows = [
@@ -156,7 +165,7 @@ class RoutingDiversityTests(unittest.TestCase):
         )
         self.assertLess(preferred, weak)
 
-    def test_beam_pruning_keeps_one_branch_per_source(self):
+    def test_beam_pruning_respects_requested_width(self):
         states = [
             DynamicBeamState(
                 motion=np.zeros((0, 151), dtype=np.float32),
@@ -175,10 +184,7 @@ class RoutingDiversityTests(unittest.TestCase):
             ),
         ]
         kept = prune_states(states, self.db, width=2)
-        kept_sources = {
-            self.db["source_uids"][state.selected_event_ids[-1]] for state in kept
-        }
-        self.assertEqual(len(kept_sources), 2)
+        self.assertEqual(len(kept), 2)
 
 
 if __name__ == "__main__":

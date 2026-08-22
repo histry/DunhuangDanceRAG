@@ -2,7 +2,6 @@ import json
 import os
 import tempfile
 import unittest
-from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
@@ -20,7 +19,6 @@ from motion_geometry.smpl24 import skeleton_contract
 from support.event_identity import make_event_db_contract
 from training.motion_models import (
     MotionGenerationConfig,
-    _finalize_generation_outputs,
     _new_validation_physical_accumulator,
     _record_validation_physical_prediction,
     _summarize_validation_physical_metrics,
@@ -186,29 +184,21 @@ class MotionTrainingContractTests(unittest.TestCase):
         condition = torch.randn(1, frames, 32)
         motion = torch.zeros(1, frames, 151)
         seam = torch.zeros(1, frames, 1)
-        refiner = motion_runtime.TemporalRefiner()
-        refined = refiner(motion, condition, seam)
-        self.assertEqual(tuple(refined.shape), (1, frames, 151))
+        joint_mask = torch.ones(1, frames, 24)
+        refiner = motion_runtime.ProductManifoldTemporalRefiner()
+        refined = refiner(motion, condition, seam, joint_mask)
+        self.assertEqual(tuple(refined.shape), (1, frames, 79))
 
-        denoiser = motion_runtime.DiffusionDenoiser()
+        denoiser = motion_runtime.TangentDiffusionDenoiser()
         denoised = denoiser(
-            motion,
+            torch.zeros(1, frames, 79),
             motion,
             condition,
             seam,
+            joint_mask,
             torch.zeros(1, dtype=torch.long),
         )
-        self.assertEqual(tuple(denoised.shape), (1, frames, 151))
-
-    def test_generation_has_one_explicit_public_entrypoint(self):
-        source = (Path(__file__).parents[1] / "training" / "motion_models.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(source.count("\ndef generate("), 1)
-        self.assertNotIn("_stage_guard_orig_generate", source)
-        self.assertNotIn("_energy_stability_orig_generate", source)
-        self.assertNotIn("_physics_stability_orig_generate", source)
-        self.assertNotIn("PHYSICS_STABILITY_MSA_MAX_CORRECTION_VEL_MPF", source)
+        self.assertEqual(tuple(denoised.shape), (1, frames, 79))
 
     def test_validation_summary_contains_deployment_physical_metrics(self):
         cfg = MotionGenerationConfig()
@@ -222,39 +212,6 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertIn("joint_jerk_mps3_p95", summary["worst_window"])
         self.assertIn("joint_rotation_step_rad_p95", summary["worst_window"])
         self.assertIn("root_horizontal_net_displacement_m", summary["worst_window"])
-
-    def test_final_physical_gate_rejects_without_writing_accepted_output(self):
-        cfg = MotionGenerationConfig()
-        motion = self._identity_motion(60)
-        motion[:, 4] = np.where(np.arange(60) % 2 == 0, 0.0, 2.0)
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            args = Namespace(
-                out=str(root / "motion.npy"),
-                json=str(root / "report.json"),
-                audio=None,
-                render_output=None,
-                render_script="rendering/render_motion.py",
-            )
-            np.save(root / "motion.npy", self._identity_motion(10))
-            rc = _finalize_generation_outputs(
-                args,
-                cfg,
-                motion,
-                self._identity_motion(60),
-                np.zeros((60, 1), dtype=np.float32),
-                {},
-            )
-            self.assertEqual(rc, 2)
-            self.assertFalse((root / "motion.npy").exists())
-            self.assertTrue((root / "motion.rejected.npy").exists())
-            self.assertEqual(len(list(root.glob("motion.preexisting_*.npy"))), 1)
-            report = json.loads((root / "report.json").read_text(encoding="utf-8"))
-            self.assertEqual(report["generation_status"], "rejected_by_final_physical_gate")
-            self.assertFalse(report["accepted_output_written"])
-            self.assertFalse(report["final_physical_gate"]["ok"])
-            self.assertIsNotNone(report["preexisting_accepted_output_quarantined"])
-
 
 if __name__ == "__main__":
     unittest.main()

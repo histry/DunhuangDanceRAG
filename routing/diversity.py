@@ -22,11 +22,6 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
-
 def _db_value(db: Mapping[str, Any], key: str, index: int, default: str) -> str:
     values = db.get(key)
     if values is None or index < 0 or index >= len(values):
@@ -36,7 +31,7 @@ def _db_value(db: Mapping[str, Any], key: str, index: int, default: str) -> str:
 
 def event_identity(db: Mapping[str, Any], event_id: int) -> dict[str, str]:
     return {
-        "event_uid": _db_value(db, "event_uids", event_id, f"legacy_index_{event_id}"),
+        "event_uid": _db_value(db, "event_uids", event_id, f"event_index_{event_id}"),
         "source_uid": _db_value(db, "source_uids", event_id, "unknown"),
         "recording_uid": _db_value(
             db,
@@ -56,77 +51,22 @@ def diversity_assessment(
 ) -> dict[str, Any]:
     """Evaluate history diversity without turning preferences into safety gates.
 
-    Under BR-HPR, exact repetition and source/family concentration are continuous
-    costs.  The legacy binary behavior remains available by setting
-    ``BR_HPR_ENABLE=0``.
+    Exact repetition and source/family concentration are continuous costs.
+    Physical, anatomical and severe-heading constraints remain hard gates in
+    their owning modules.
     """
-    probabilistic = _env_bool("BR_HPR_ENABLE", False)
-
     identity = event_identity(db, event_id)
     history = [event_identity(db, int(value)) for value in selected_event_ids]
-
-    # Keep the legacy baseline isolated from BR-HPR environment variables.
-    # This is essential for reproducible ablations: sourcing br_hpr.env must not
-    # alter the Routing Safety hard-diversity baseline when BR_HPR_ENABLE=0.
-    if probabilistic:
-        cooldown = max(
-            1,
-            _env_int(
-                "BR_HPR_EVENT_COOLDOWN_SLOTS",
-                _env_int("ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS", 8),
-            ),
-        )
-        max_source_run = max(
-            1,
-            _env_int(
-                "BR_HPR_MAX_SOURCE_RUN",
-                _env_int("ROUTING_SAFETY_MAX_SOURCE_RUN", 2),
-            ),
-        )
-        max_source_share = _env_float(
-            "BR_HPR_MAX_SOURCE_SHARE",
-            _env_float("ROUTING_SAFETY_MAX_SOURCE_SHARE", 0.40),
-        )
-        max_recording_share = _env_float(
-            "BR_HPR_MAX_RECORDING_SHARE",
-            _env_float("ROUTING_SAFETY_MAX_RECORDING_SHARE", max_source_share),
-        )
-        max_family_share = _env_float(
-            "BR_HPR_MAX_FAMILY_SHARE",
-            _env_float("ROUTING_SAFETY_MAX_FAMILY_SHARE", 0.50),
-        )
-        minimum_share_history = max(
-            1,
-            _env_int(
-                "BR_HPR_MIN_SHARE_HISTORY",
-                _env_int("ROUTING_SAFETY_MIN_SHARE_HISTORY", 6),
-            ),
-        )
-    else:
-        cooldown = max(
-            1,
-            _env_int("ROUTING_SAFETY_EVENT_COOLDOWN_SLOTS", 8),
-        )
-        max_source_run = max(
-            1,
-            _env_int("ROUTING_SAFETY_MAX_SOURCE_RUN", 2),
-        )
-        max_source_share = _env_float(
-            "ROUTING_SAFETY_MAX_SOURCE_SHARE",
-            0.40,
-        )
-        max_recording_share = _env_float(
-            "ROUTING_SAFETY_MAX_RECORDING_SHARE",
-            max_source_share,
-        )
-        max_family_share = _env_float(
-            "ROUTING_SAFETY_MAX_FAMILY_SHARE",
-            0.50,
-        )
-        minimum_share_history = max(
-            1,
-            _env_int("ROUTING_SAFETY_MIN_SHARE_HISTORY", 6),
-        )
+    cooldown = max(1, _env_int("ROUTING_BUDGET_EVENT_COOLDOWN_SLOTS", 8))
+    max_source_run = max(1, _env_int("ROUTING_BUDGET_MAX_SOURCE_RUN", 2))
+    max_source_share = _env_float("ROUTING_BUDGET_MAX_SOURCE_SHARE", 0.40)
+    max_recording_share = _env_float(
+        "ROUTING_BUDGET_MAX_RECORDING_SHARE", max_source_share
+    )
+    max_family_share = _env_float("ROUTING_BUDGET_MAX_FAMILY_SHARE", 0.50)
+    minimum_share_history = max(
+        1, _env_int("ROUTING_BUDGET_MIN_SHARE_HISTORY", 6)
+    )
 
     recent_uids = [row["event_uid"] for row in history[-cooldown:]]
     exact_cooldown_violation = identity["event_uid"] in recent_uids
@@ -161,26 +101,26 @@ def diversity_assessment(
 
     share_active = len(history) >= minimum_share_history
 
-    legacy_reasons: list[str] = []
+    preference_reasons: list[str] = []
     if exact_cooldown_violation:
-        legacy_reasons.append("event_uid_cooldown")
+        preference_reasons.append("event_uid_cooldown")
     if source_run_after > max_source_run:
-        legacy_reasons.append("source_run")
+        preference_reasons.append("source_run")
     if (
         share_active
         and source_share > max_source_share + 1.0e-9
     ):
-        legacy_reasons.append("source_share")
+        preference_reasons.append("source_share")
     if (
         share_active
         and recording_share > max_recording_share + 1.0e-9
     ):
-        legacy_reasons.append("recording_share")
+        preference_reasons.append("recording_share")
     if (
         share_active
         and family_share > max_family_share + 1.0e-9
     ):
-        legacy_reasons.append("family_share")
+        preference_reasons.append("family_share")
 
     repeat_violation = 0.0
     if repeat_gap is not None and repeat_gap <= cooldown:
@@ -214,44 +154,12 @@ def diversity_assessment(
         else 0.0
     )
 
-    if probabilistic:
-        penalty = 0.0
-        penalty += (
-            _env_float("BR_HPR_EVENT_REPEAT_WEIGHT", 1.20)
-            * repeat_violation
-        )
-        penalty += (
-            _env_float("BR_HPR_SOURCE_RUN_WEIGHT", 1.00)
-            * source_run_violation
-        )
-        penalty += (
-            _env_float("BR_HPR_SOURCE_SHARE_WEIGHT", 0.80)
-            * source_share_violation
-        )
-        penalty += (
-            _env_float("BR_HPR_RECORDING_SHARE_WEIGHT", 0.80)
-            * recording_share_violation
-        )
-        penalty += (
-            _env_float("BR_HPR_FAMILY_SHARE_WEIGHT", 0.65)
-            * family_share_violation
-        )
-    else:
-        # Preserve the original Routing Safety baseline scoring semantics.
-        penalty = 0.0
-        if share_active:
-            penalty += (
-                _env_float("ROUTING_SAFETY_SOURCE_SHARE_WEIGHT", 2.0)
-                * max(0.0, source_share - max_source_share)
-            )
-            penalty += (
-                _env_float("ROUTING_SAFETY_RECORDING_SHARE_WEIGHT", 2.0)
-                * max(0.0, recording_share - max_recording_share)
-            )
-            penalty += (
-                _env_float("ROUTING_SAFETY_FAMILY_SHARE_WEIGHT", 1.2)
-                * max(0.0, family_share - max_family_share)
-            )
+    penalty = 0.0
+    penalty += _env_float("ROUTING_BUDGET_EVENT_REPEAT_WEIGHT", 1.20) * repeat_violation
+    penalty += _env_float("ROUTING_BUDGET_SOURCE_RUN_WEIGHT", 1.00) * source_run_violation
+    penalty += _env_float("ROUTING_BUDGET_SOURCE_SHARE_WEIGHT", 0.80) * source_share_violation
+    penalty += _env_float("ROUTING_BUDGET_RECORDING_SHARE_WEIGHT", 0.80) * recording_share_violation
+    penalty += _env_float("ROUTING_BUDGET_FAMILY_SHARE_WEIGHT", 0.65) * family_share_violation
 
     penalty += (
         _env_float("ROUTING_SAFETY_SOURCE_REUSE_WEIGHT", 0.08)
@@ -268,10 +176,9 @@ def diversity_assessment(
 
     return {
         **identity,
-        "hard_valid": True if probabilistic else not legacy_reasons,
-        "hard_reasons": [] if probabilistic else list(legacy_reasons),
-        "soft_reasons": list(legacy_reasons),
-        "legacy_hard_reasons": list(legacy_reasons),
+        "hard_valid": True,
+        "hard_reasons": [],
+        "soft_reasons": list(preference_reasons),
         "penalty": float(penalty),
         "cooldown_slots": int(cooldown),
         "event_repeat_gap": repeat_gap,
@@ -279,7 +186,7 @@ def diversity_assessment(
         "source_share_after": float(source_share),
         "recording_share_after": float(recording_share),
         "family_share_after": float(family_share),
-        "probabilistic_preference_mode": bool(probabilistic),
+        "probabilistic_preference_mode": True,
         "preference_violations": {
             "event_repeat": float(repeat_violation),
             "source_run": float(source_run_violation),

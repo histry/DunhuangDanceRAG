@@ -2,11 +2,7 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import Any, Mapping
-
-
-LEGACY_30FPS_ENV = "DUNHUANG_ALLOW_LEGACY_30FPS_CHECKPOINTS"
 
 
 def checkpoint_declared_fps(checkpoint: Mapping[str, Any]) -> Any:
@@ -26,12 +22,10 @@ def assert_checkpoint_fps(
     role: str,
     runtime_fps: float,
     path: str = "",
-    legacy_env: str = LEGACY_30FPS_ENV,
 ) -> float:
     """Validate a checkpoint's physical sampling-rate contract.
 
-    Missing metadata is accepted only for an explicitly requested, read-only
-    30 FPS legacy parity run. Formal 30/60 FPS experiments must declare FPS.
+    Missing metadata is rejected for every current-protocol experiment.
     """
     runtime = float(runtime_fps)
     if not math.isfinite(runtime) or runtime <= 0.0:
@@ -39,15 +33,8 @@ def assert_checkpoint_fps(
     declared = checkpoint_declared_fps(checkpoint)
     label = f"{role} checkpoint" + (f" {path}" if path else "")
     if declared is None:
-        legacy_ok = (
-            abs(runtime - 30.0) <= 1.0e-6
-            and os.environ.get(legacy_env, "0") == "1"
-        )
-        if legacy_ok:
-            return 30.0
         raise RuntimeError(
-            f"{label} has no FPS contract. Rebuild the rate-specific asset. "
-            f"For a read-only 30 FPS parity baseline only, set {legacy_env}=1."
+            f"{label} has no FPS contract. Rebuild the rate-specific asset."
         )
     try:
         value = float(declared)
