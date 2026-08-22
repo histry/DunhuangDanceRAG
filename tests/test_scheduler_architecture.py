@@ -1,5 +1,4 @@
 import ast
-import json
 import re
 import unittest
 from pathlib import Path
@@ -197,6 +196,24 @@ class SchedulerArchitectureTests(unittest.TestCase):
         start = source.index(marker)
         block = source[start : start + 700]
         self.assertIn('--fps "$GENERATION_FPS"', block)
+
+    def test_formal_split_and_event_db_audit_share_one_manifest_contract(self):
+        research = (ROOT / "configs" / "research.env").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('RETARGET_CLEAN_TRAIN_RATIO:-0.50', research)
+        self.assertIn('RETARGET_CLEAN_VAL_RATIO:-0.25', research)
+        self.assertIn('RETARGET_CLEAN_TEST_RATIO:-0.25', research)
+
+        pipeline = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'SPLIT_MANIFEST="$CACHE_SPLIT_ROOT/source_split_manifest.json"',
+            pipeline,
+        )
+        self.assertIn('--split_manifest "$SPLIT_MANIFEST"', pipeline)
+        self.assertIn('--split "$split"', pipeline)
 
     def test_pipeline_trains_scheduler_models_before_motion_refinement(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")

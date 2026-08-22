@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -20,6 +20,100 @@ if str(ROOT) not in sys.path:
 from contracts.heading import (  # noqa: E402
     heading_metrics_np,
 )
+
+
+def load_split_membership_contract(
+    manifest_path: str | Path,
+    split: str,
+) -> Dict[str, Any]:
+    path = Path(manifest_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    schema = str(payload.get("schema", ""))
+    if not schema.startswith("category_covered_recording_disjoint_cache_split_"):
+        raise RuntimeError(f"Unsupported source split schema: {schema!r}")
+    if not bool(payload.get("ok", False)):
+        raise RuntimeError(
+            "Source split manifest is not accepted: "
+            + " | ".join(map(str, payload.get("reasons", [])))
+        )
+    split_name = str(split).strip().lower()
+    if split_name not in {"train", "val", "test"}:
+        raise ValueError(f"Unsupported split role: {split!r}")
+    split_row = payload.get("splits", {}).get(split_name)
+    if not isinstance(split_row, dict):
+        raise RuntimeError(f"Source split manifest lacks split={split_name!r}")
+    expected_sources = sorted(
+        {str(value) for value in split_row.get("source_uids", [])}
+    )
+    expected_recordings = sorted(
+        {str(value) for value in split_row.get("recording_uids", [])}
+    )
+    if not expected_sources or not expected_recordings:
+        raise RuntimeError(
+            f"Source split manifest has empty membership for split={split_name!r}"
+        )
+    target_recordings = int(
+        payload.get("target_counts", {}).get(
+            split_name,
+            len(expected_recordings),
+        )
+    )
+    if len(expected_recordings) != target_recordings:
+        raise RuntimeError(
+            "Source split manifest recording count mismatch: "
+            f"split={split_name}, expected_members={len(expected_recordings)}, "
+            f"target={target_recordings}"
+        )
+    split_protocol = str(payload.get("split_protocol", ""))
+    if (
+        split_protocol == "category_covered_source_disjoint"
+        and split_name in {"val", "test"}
+        and target_recordings < 2
+    ):
+        raise RuntimeError(
+            "Ordinary source-disjoint Event-DB audit requires at least two "
+            f"recording groups in split={split_name!r}; got {target_recordings}"
+        )
+    return {
+        "schema": "event_db_exact_split_membership_v1",
+        "manifest": str(path.resolve()),
+        "manifest_schema": schema,
+        "split_protocol": split_protocol,
+        "split": split_name,
+        "expected_source_uids": expected_sources,
+        "expected_recording_uids": expected_recordings,
+        "expected_num_source_uids": len(expected_sources),
+        "expected_num_recording_uids": len(expected_recordings),
+    }
+
+
+def split_membership_reasons(
+    source_uids: Sequence[Any],
+    recording_uids: Sequence[Any],
+    contract: Mapping[str, Any],
+) -> List[str]:
+    actual_sources = {str(value) for value in source_uids}
+    actual_recordings = {str(value) for value in recording_uids}
+    expected_sources = {
+        str(value) for value in contract.get("expected_source_uids", [])
+    }
+    expected_recordings = {
+        str(value) for value in contract.get("expected_recording_uids", [])
+    }
+    reasons: List[str] = []
+    if actual_sources != expected_sources:
+        reasons.append(
+            "source_split_membership_mismatch:"
+            f"missing={sorted(expected_sources - actual_sources)},"
+            f"extra={sorted(actual_sources - expected_sources)}"
+        )
+    if actual_recordings != expected_recordings:
+        reasons.append(
+            "recording_split_membership_mismatch:"
+            f"missing={sorted(expected_recordings - actual_recordings)},"
+            f"extra={sorted(actual_recordings - expected_recordings)}"
+        )
+    return reasons
 
 
 def jsonable(x: Any) -> Any:
@@ -43,10 +137,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--csv", default=None)
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--allow_failed", action="store_true")
+    ap.add_argument("--split_manifest", default=None)
+    ap.add_argument("--split", choices=("train", "val", "test"), default=None)
     args = ap.parse_args(argv)
+    if bool(args.split_manifest) != bool(args.split):
+        ap.error("--split_manifest and --split must be provided together")
 
-    data = np.load(args.db, allow_pickle=True)
-    db = {k: data[k] for k in data.files}
+    with np.load(args.db, allow_pickle=True) as data:
+        db = {k: data[k] for k in data.files}
+    split_contract: Optional[Dict[str, Any]] = None
+    split_contract_error: Optional[str] = None
+    if args.split_manifest:
+        try:
+            split_contract = load_split_membership_contract(
+                args.split_manifest,
+                args.split,
+            )
+        except Exception as exc:
+            split_contract_error = str(exc)
     required = [
         "heading_contract_schema_version",
         "paths",
@@ -165,10 +273,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         reasons.append(
             f"entry_heading_p95_deg={entry_p95:.3f}>limit={max_entry:.3f}"
         )
-    if len(set(map(str, source_uids.tolist()))) < 2:
-        reasons.append("fewer_than_two_source_uids")
-    if len(set(map(str, recording_uids.tolist()))) < 2:
-        reasons.append("fewer_than_two_recording_uids")
+    if split_contract_error:
+        reasons.append(f"split_membership_contract_error={split_contract_error}")
+    elif split_contract is not None:
+        reasons.extend(
+            split_membership_reasons(
+                source_uids.tolist(),
+                recording_uids.tolist(),
+                split_contract,
+            )
+        )
+    else:
+        if len(set(map(str, source_uids.tolist()))) < 2:
+            reasons.append("fewer_than_two_source_uids")
+        if len(set(map(str, recording_uids.tolist()))) < 2:
+            reasons.append("fewer_than_two_recording_uids")
 
     intent_hist = {
         k: int(np.sum(intents == k))
@@ -184,6 +303,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "num_recording_uids": int(
             len(set(map(str, recording_uids.tolist())))
         ),
+        "split_membership_contract": split_contract,
+        "split_membership_contract_error": split_contract_error,
         "intent_histogram": intent_hist,
         "entry_heading_abs_deg_p95": entry_p95,
         "entry_heading_abs_deg_max": float(

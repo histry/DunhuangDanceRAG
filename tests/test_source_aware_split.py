@@ -2,6 +2,7 @@
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from data_pipeline import split_sources
@@ -15,6 +16,32 @@ from data_pipeline.split_sources import (
 
 
 class SourceAwareSplitTest(unittest.TestCase):
+    def _committed_official_manifest_units(self):
+        manifest_path = (
+            Path(__file__).resolve().parents[1]
+            / "assets"
+            / "motion"
+            / "smpl_official_14"
+            / "sources.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        rows = []
+        for source in manifest["sources"]:
+            if not bool(source["solo_compatible"]):
+                continue
+            rows.append(
+                {
+                    "source_uid": source["source_id"],
+                    "recording_uid": source["recording_uid"],
+                    "performer_group": source["performer_group"],
+                    "dance_key": source["dance_category"],
+                    "theme_label_status": source["theme_label_status"],
+                    "dancer_id": source["dancer_id"],
+                    "dancer_id_status": source["dancer_id_status"],
+                }
+            )
+        return manifest, recording_group_records(rows)
+
     def _write_report(self, root, report):
         motion = root / "segment_000.npy"
         motion.write_bytes(b"placeholder")
@@ -178,6 +205,87 @@ class SourceAwareSplitTest(unittest.TestCase):
         for unique_theme in ("flying_apsaras", "lotus_steps", "lei_gong_drum"):
             unit = next(row for row in units if row["dance_key"] == unique_theme)
             self.assertEqual(assignment[unit["source_uid"]], "train")
+
+    def test_formal_solo_split_has_two_groups_and_repeatable_theme_per_eval(self):
+        units = [
+            row
+            for row in self._official_recording_units()
+            if row["dance_key"]
+            not in {"thirty_six_postures", "lei_gong_drum"}
+        ]
+        target = exact_split_counts(len(units), 0.50, 0.25, 0.25)
+        assignment = assign_records_category_covered(
+            units,
+            target,
+            seed=20260718,
+        )
+        self.assertEqual(target, {"train": 4, "val": 2, "test": 2})
+        confirmed_counts = Counter(
+            row["dance_key"]
+            for row in units
+            if row["theme_label_status"] == "confirmed"
+        )
+        repeatable = {
+            theme for theme, count in confirmed_counts.items() if count >= 2
+        }
+        train_themes = {
+            row["dance_key"]
+            for row in units
+            if assignment[row["source_uid"]] == "train"
+            and row["theme_label_status"] == "confirmed"
+        }
+        self.assertEqual(train_themes, set(confirmed_counts))
+        for split in ("val", "test"):
+            split_rows = [
+                row
+                for row in units
+                if assignment[row["source_uid"]] == split
+            ]
+            self.assertEqual(len(split_rows), 2)
+            self.assertTrue(
+                any(
+                    row["theme_label_status"] == "confirmed"
+                    and row["dance_key"] in repeatable
+                    for row in split_rows
+                )
+            )
+
+    def test_committed_smpl14_manifest_satisfies_formal_solo_protocol(self):
+        manifest, units = self._committed_official_manifest_units()
+        self.assertEqual(manifest["num_sources"], 14)
+        self.assertEqual(manifest["num_recording_groups"], 11)
+        self.assertEqual(len(units), 8)
+
+        target = exact_split_counts(len(units), 0.50, 0.25, 0.25)
+        assignment = assign_records_category_covered(
+            units,
+            target,
+            seed=20260718,
+        )
+        counts = Counter(assignment.values())
+        self.assertEqual(counts, Counter({"train": 4, "val": 2, "test": 2}))
+
+        confirmed_counts = Counter(
+            row["dance_key"]
+            for row in units
+            if row["theme_label_status"] == "confirmed"
+        )
+        repeatable = {
+            theme for theme, count in confirmed_counts.items() if count >= 2
+        }
+        for split in ("val", "test"):
+            split_rows = [
+                row
+                for row in units
+                if assignment[row["source_uid"]] == split
+            ]
+            self.assertTrue(
+                any(
+                    row["theme_label_status"] == "confirmed"
+                    and row["dance_key"] in repeatable
+                    for row in split_rows
+                )
+            )
 
     def test_unique_theme_holdout_is_explicit_zero_shot_protocol(self):
         units = self._official_recording_units()

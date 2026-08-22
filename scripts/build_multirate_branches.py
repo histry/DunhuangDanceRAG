@@ -163,9 +163,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--refiner_steps", type=int)
     parser.add_argument("--diffusion_steps", type=int)
     parser.add_argument("--split_seed", type=int, default=20260718)
-    parser.add_argument("--train_ratio", type=float, default=0.67)
-    parser.add_argument("--val_ratio", type=float, default=0.165)
-    parser.add_argument("--test_ratio", type=float, default=0.165)
+    parser.add_argument("--train_ratio", type=float, default=0.50)
+    parser.add_argument("--val_ratio", type=float, default=0.25)
+    parser.add_argument("--test_ratio", type=float, default=0.25)
     args = parser.parse_args(argv)
 
     if args.execute and args.train_motion_models and not args.regression_audio:

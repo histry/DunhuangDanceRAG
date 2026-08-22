@@ -571,22 +571,42 @@ def main() -> int:
             float(
                 os.environ.get(
                     "GENERATION_TRAIN_RATIO",
-                    "0.67",
+                    "0.50",
                 )
             ),
             float(
                 os.environ.get(
                     "GENERATION_VAL_RATIO",
-                    "0.165",
+                    "0.25",
                 )
             ),
             float(
                 os.environ.get(
                     "GENERATION_TEST_RATIO",
-                    "0.165",
+                    "0.25",
                 )
             ),
         )
+        if (
+            str(
+                os.environ.get(
+                    "GENERATION_SPLIT_PROTOCOL",
+                    "category_covered_source_disjoint",
+                )
+            )
+            == "category_covered_source_disjoint"
+            and any(
+                int(
+                    runtime["split_counts_at_recording_groups"][split]
+                )
+                < 2
+                for split in ("val", "test")
+            )
+        ):
+            errors.append(
+                "Formal ordinary source-disjoint evaluation requires at least "
+                "two recording groups in both validation and test"
+            )
 
     except Exception as exc:
         errors.append(

@@ -6,7 +6,10 @@ Priority order for the local Chang-E subset:
 1. no source or synchronized-recording leakage;
 2. non-empty train/validation/test;
 3. every confirmed held-out dance theme is represented in training;
-4. gender-group coverage in validation and test when feasible.
+4. at least two recording groups in validation and test for the ordinary
+   source-disjoint protocol;
+5. each held-out split contains a repeatable confirmed theme when feasible;
+6. gender-group coverage in validation and test when feasible.
 
 The 14 official SMPL performer tracks form 11 recording groups because three two-person recordings
 are exported as separate performer tracks.  Exact split counts therefore apply
@@ -30,7 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 SPLITS = ("train", "val", "test")
-SCHEMA = "category_covered_recording_disjoint_cache_split_v4_solo_aware"
+SCHEMA = "category_covered_recording_disjoint_cache_split_v5_manifest_audited"
 
 
 def save_json(obj: Any, path: Path) -> None:
@@ -235,6 +238,21 @@ def assign_records_category_covered(
         if str(row.get("theme_label_status", "confirmed")) == "confirmed"
         and str(row.get("dance_key", "unknown")) != "unknown"
     }
+    category_counts = Counter(
+        str(row["dance_key"])
+        for row in rows
+        if str(row.get("theme_label_status", "confirmed")) == "confirmed"
+        and str(row.get("dance_key", "unknown")) != "unknown"
+    )
+    repeatable_confirmed_categories = {
+        category for category, count in category_counts.items() if count >= 2
+    }
+    heldout_repeatable_capacity = sum(
+        max(0, count - 1) for count in category_counts.values()
+    )
+    require_repeatable_confirmed_in_each_eval = bool(
+        val_n > 0 and test_n > 0 and heldout_repeatable_capacity >= 2
+    )
 
     best: Optional[Tuple[float, Tuple[str, ...], Dict[str, str]]] = None
     for val_indices_tuple in combinations(range(n), val_n):
@@ -264,6 +282,18 @@ def assign_records_category_covered(
             }
             if not heldout_confirmed.issubset(train_categories):
                 continue
+            if require_repeatable_confirmed_in_each_eval:
+                if any(
+                    not any(
+                        str(rows[index].get("theme_label_status", "confirmed"))
+                        == "confirmed"
+                        and str(rows[index]["dance_key"])
+                        in repeatable_confirmed_categories
+                        for index in split_indices[split]
+                    )
+                    for split in ("val", "test")
+                ):
+                    continue
 
             score = 0.0
             # Gender is a reporting stratum, not a dancer identity. Reward its
@@ -283,13 +313,8 @@ def assign_records_category_covered(
 
             # Prefer distribution of repeatable themes across both held-out
             # sets, without forcing single-recording themes out of training.
-            category_counts = Counter(
-                str(row["dance_key"])
-                for row in rows
-                if str(row.get("theme_label_status", "confirmed")) == "confirmed"
-            )
             for category, count in category_counts.items():
-                if category == "unknown" or count < 2:
+                if count < 2:
                     continue
                 split_presence = sum(
                     any(str(rows[index]["dance_key"]) == category for index in split_indices[split])
@@ -737,9 +762,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--cache_root", required=True)
     parser.add_argument("--out_root", required=True)
     parser.add_argument("--seed", type=int, default=20260718)
-    parser.add_argument("--train_ratio", type=float, default=0.67)
-    parser.add_argument("--val_ratio", type=float, default=0.165)
-    parser.add_argument("--test_ratio", type=float, default=0.165)
+    parser.add_argument("--train_ratio", type=float, default=0.50)
+    parser.add_argument("--val_ratio", type=float, default=0.25)
+    parser.add_argument("--test_ratio", type=float, default=0.25)
     parser.add_argument(
         "--protocol",
         choices=(
@@ -934,12 +959,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reasons.append("count_mismatch_%s" % split)
         if not split_records[split]:
             reasons.append("empty_%s" % split)
+    if args.protocol == "category_covered_source_disjoint":
+        for split in ("val", "test"):
+            if int(target[split]) < 2:
+                reasons.append(
+                    "ordinary_%s_requires_at_least_two_recording_groups" % split
+                )
     confirmed_categories = {
         row["dance_key"]
         for row in recording_units
         if row.get("theme_label_status") == "confirmed"
         and row["dance_key"] != "unknown"
     }
+    confirmed_recording_category_counts = Counter(
+        row["dance_key"]
+        for row in recording_units
+        if row.get("theme_label_status") == "confirmed"
+        and row["dance_key"] != "unknown"
+    )
+    repeatable_confirmed_categories = {
+        category
+        for category, count in confirmed_recording_category_counts.items()
+        if count >= 2
+    }
+    require_repeatable_confirmed_eval = bool(
+        args.protocol == "category_covered_source_disjoint"
+        and sum(
+            max(0, count - 1)
+            for count in confirmed_recording_category_counts.values()
+        )
+        >= 2
+    )
     train_confirmed_categories = {
         row["dance_key"]
         for row in split_records["train"]
@@ -950,6 +1000,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         train_confirmed_categories
     ):
         reasons.append("confirmed_theme_missing_from_train")
+    if require_repeatable_confirmed_eval:
+        for split in ("val", "test"):
+            split_categories = {
+                row["dance_key"]
+                for row in recording_units
+                if assignment[row["source_uid"]] == split
+                and row.get("theme_label_status") == "confirmed"
+            }
+            if not (split_categories & repeatable_confirmed_categories):
+                reasons.append(
+                    "repeatable_confirmed_theme_missing_from_%s" % split
+                )
     # female/male is only a reporting stratum in this release, not a verified
     # dancer identity. Exact category coverage and recording disjointness are
     # hard; sex coverage is deliberately not promoted to a scientific gate.
@@ -1024,6 +1086,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             "leave_one_theme_out_reported_separately": True,
             "all_data_training_allowed_for_qualitative_generation_only": True,
+        },
+        "event_db_audit_contract": {
+            "membership_mode": "exact_source_split_manifest",
+            "expected_recording_group_counts": dict(target),
+            "ordinary_eval_min_recording_groups": 2,
+            "repeatable_confirmed_theme_required_in_each_heldout_split": (
+                require_repeatable_confirmed_eval
+            ),
+            "single_group_eval_allowed_only_for_leave_one_theme_out": True,
         },
         "unknown_performer_group_allowed": bool(
             args.allow_unknown_performer_group

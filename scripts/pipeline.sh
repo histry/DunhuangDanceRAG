@@ -165,10 +165,14 @@ else
 fi
 
 echo "========== 5. SPLIT EVENT-DB HARD AUDITS =========="
+SPLIT_MANIFEST="$CACHE_SPLIT_ROOT/source_split_manifest.json"
+require_file "$SPLIT_MANIFEST" "source split manifest"
 for split in train val test; do
   db="$DB_SPLIT_ROOT/$split/events.npz"
   "$PY" evaluation/audit_event_database.py \
     --db "$db" \
+    --split_manifest "$SPLIT_MANIFEST" \
+    --split "$split" \
     --out "$OUT_ROOT/${split}.event_heading.audit.json" \
     --csv "$OUT_ROOT/${split}.event_heading.audit.csv"
   "$PY" evaluation/audit_formal_single_person_db.py \

@@ -15,6 +15,15 @@ Verified dancer-disjoint claims are forbidden unless authoritative dancer IDs
 exist. Single-recording themes belong in leave-one-theme-out evaluation, not
 ordinary category-internal metrics.
 
+After the formal solo filter, the ordinary SMPL14 protocol has eight eligible
+recording groups and uses an exact `4/2/2` train/validation/test split. Unique
+confirmed themes remain in training. Validation and test each contain two
+recording groups and at least one confirmed theme that also occurs in training;
+pending ribbon themes cannot form an entire held-out split. Event-DB audits
+fail closed against the exact source and recording membership recorded in
+`source_split_manifest.json`. A one-recording held-out split is accepted only
+when that manifest declares the separate leave-one-theme-out protocol.
+
 ## Event semantics
 
 The Event-DB separates source identity, dance theme, multi-label local action,
