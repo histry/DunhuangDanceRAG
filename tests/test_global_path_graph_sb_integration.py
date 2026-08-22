@@ -73,6 +73,9 @@ class GlobalPathGraphSBIntegrationTests(unittest.TestCase):
             candidates = [list(range(count)) for _ in slots]
             common = {
                 "PERFORMER_GROUP": "female",
+                "PERFORMER_IDENTITY_MODE": "group",
+                "PERFORMER_REQUIRE_SOLO_COMPATIBLE": "0",
+                "GROUNDING_GLOBAL_ROUTE_ENABLE": "1",
                 "GROUNDING_GLOBAL_ROUTE_TOPK": "4",
                 "GRAPH_ROUTE_SOLVER": "fisher_rao_graph_sb",
             }

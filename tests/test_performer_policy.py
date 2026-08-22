@@ -1,5 +1,7 @@
 import os
 import unittest
+from unittest.mock import patch
+
 import numpy as np
 
 from routing.performer_policy import resolve_candidate_policy, performer_switch_penalty
@@ -7,6 +9,19 @@ from routing.performer_policy import resolve_candidate_policy, performer_switch_
 
 class PerformerPolicyTest(unittest.TestCase):
     def setUp(self):
+        self.performer_environment = patch.dict(
+            os.environ,
+            {
+                "PERFORMER_GROUP": "auto",
+                "PERFORMER_IDENTITY_MODE": "group",
+                "PERFORMER_REQUIRE_SOLO_COMPATIBLE": "0",
+                "PERFORMER_ALLOW_IDENTITY_RESCUE": "0",
+                "PERFORMER_ALLOW_CROSS_GROUP_RESCUE": "0",
+            },
+            clear=False,
+        )
+        self.performer_environment.start()
+        self.addCleanup(self.performer_environment.stop)
         self.db = {
             "paths": np.asarray(["a", "b", "c", "d"], dtype=object),
             "genders": np.asarray(["female", "male", "female", "male"], dtype=object),

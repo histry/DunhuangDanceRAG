@@ -138,7 +138,11 @@ class AudioRhythmContractTests(unittest.TestCase):
                         "cache_schema": "music_12d_content_addressed_cache_v2",
                         "audio": str(audio_path),
                         "audio_sha256": digest,
-                        "extractor": {"backend": "librosa", "tempo_bpm": 0.0},
+                        "extractor": {
+                            "backend": "librosa",
+                            "backend_version": "test",
+                            "tempo_bpm": 0.0,
+                        },
                     }
                 ),
                 encoding="utf-8",
