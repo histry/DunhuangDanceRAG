@@ -66,6 +66,47 @@ class CTSRWeakRouterTests(unittest.TestCase):
         self.assertFalse(report["is_ground_truth"])
         self.assertFalse(report["paired_audio_motion"])
 
+    def test_sparse_ot_realistic_union_support_converges_past_legacy_cap(self) -> None:
+        phrase_count, event_count = 10, 328
+        rng = np.random.default_rng(263)
+        base_cost = rng.random(event_count)
+        cost = np.clip(
+            base_cost[None, :]
+            + rng.normal(0.0, 0.07, (phrase_count, event_count)),
+            0.0,
+            1.0,
+        )
+        groups = (
+            ["flying_apsaras"] * 143
+            + ["lotus_steps"] * 83
+            + ["revelation_meditation"] * 75
+            + ["pipa_behind_back"] * 27
+        )
+
+        _, legacy_report = sparse_sinkhorn_teacher(
+            cost,
+            groups,
+            top_k=64,
+            epsilon=0.12,
+            max_iterations=200,
+            tolerance=1.0e-5,
+        )
+        self.assertFalse(legacy_report["converged"])
+
+        teacher, report = sparse_sinkhorn_teacher(
+            cost,
+            groups,
+            top_k=64,
+            epsilon=0.12,
+            max_iterations=5000,
+            tolerance=1.0e-5,
+        )
+        self.assertTrue(report["converged"])
+        self.assertGreater(report["iterations"], 200)
+        self.assertLessEqual(report["row_marginal_error"], report["tolerance"])
+        self.assertLessEqual(report["column_marginal_error"], report["tolerance"])
+        np.testing.assert_allclose(teacher.sum(axis=1), 1.0, atol=1.0e-5)
+
     def test_event_probabilities_remain_multi_label_at_action_level(self) -> None:
         events = np.asarray([[0.75, 0.25]], dtype=np.float32)
         items = [

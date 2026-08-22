@@ -93,7 +93,7 @@ def sparse_sinkhorn_teacher(
     *,
     top_k: int = 64,
     epsilon: float = 0.12,
-    max_iterations: int = 200,
+    max_iterations: int = 5000,
     tolerance: float = 1.0e-5,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Build a sparse, group-balanced soft teacher for one unpaired song.
@@ -112,6 +112,12 @@ def sparse_sinkhorn_teacher(
     temperature = float(epsilon)
     if not np.isfinite(temperature) or temperature <= 0.0:
         raise ValueError("Semantic OT epsilon must be finite and positive")
+    iteration_limit = int(max_iterations)
+    if iteration_limit < 1:
+        raise ValueError("Semantic OT max_iterations must be positive")
+    convergence_tolerance = float(tolerance)
+    if not np.isfinite(convergence_tolerance) or convergence_tolerance <= 0.0:
+        raise ValueError("Semantic OT tolerance must be finite and positive")
 
     phrase_count, event_count = matrix.shape
     keep = max(2, min(int(top_k), event_count))
@@ -136,14 +142,14 @@ def sparse_sinkhorn_teacher(
     right = np.ones_like(target)
     converged = False
     iterations = 0
-    for iterations in range(1, max(1, int(max_iterations)) + 1):
+    for iterations in range(1, iteration_limit + 1):
         left = source / np.maximum(kernel @ right, 1.0e-18)
         right = target / np.maximum(kernel.T @ left, 1.0e-18)
         if iterations == 1 or iterations % 10 == 0:
             transport_probe = left[:, None] * kernel * right[None, :]
             row_error = float(np.max(np.abs(transport_probe.sum(axis=1) - source)))
             column_error = float(np.max(np.abs(transport_probe.sum(axis=0) - target)))
-            if max(row_error, column_error) <= float(tolerance):
+            if max(row_error, column_error) <= convergence_tolerance:
                 converged = True
                 break
 
@@ -172,6 +178,8 @@ def sparse_sinkhorn_teacher(
         "active_events": int(len(active)),
         "top_k": int(keep),
         "epsilon": temperature,
+        "max_iterations": iteration_limit,
+        "tolerance": convergence_tolerance,
         "iterations": int(iterations),
         "converged": bool(converged),
         "row_marginal_error": row_error,

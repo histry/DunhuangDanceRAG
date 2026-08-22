@@ -304,6 +304,9 @@ def build_dataset(args: argparse.Namespace) -> int:
             "balance_key": balance_key,
             "top_k": int(args.teacher_top_k),
             "epsilon": float(args.teacher_epsilon),
+            "max_iterations": int(args.teacher_max_iterations),
+            "tolerance": float(args.teacher_tolerance),
+            "fail_closed_on_nonconvergence": True,
             "is_ground_truth": False,
         },
         "transport_summary": {
@@ -608,7 +611,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build.add_argument("--sequence_frames", type=int, default=64)
     build.add_argument("--teacher_top_k", type=int, default=64)
     build.add_argument("--teacher_epsilon", type=float, default=0.12)
-    build.add_argument("--teacher_max_iterations", type=int, default=200)
+    build.add_argument("--teacher_max_iterations", type=int, default=5000)
     build.add_argument("--teacher_tolerance", type=float, default=1.0e-5)
     build.add_argument("--teacher_balance_key", default="recording_uid")
     build.add_argument("--require_librosa_backend", default="1")

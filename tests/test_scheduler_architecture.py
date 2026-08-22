@@ -474,6 +474,8 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertNotIn("GENERATION_DEEP_MUSIC", pipeline)
         self.assertNotIn("grounding.model", pipeline)
 
+        self.assertIn('ROUTING_WEAK_OT_MAX_ITER:-5000', profile)
+
         router = (ROOT / "training" / "temporal_music_router.py").read_text(
             encoding="utf-8"
         )
