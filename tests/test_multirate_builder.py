@@ -78,6 +78,11 @@ class MultirateBuilderTests(unittest.TestCase):
                     branch["training_event_db"],
                     branch["event_dbs"]["train"],
                 )
+                expected_max_event_frames = int(branch["fps"] / 30.0 * 120)
+                self.assertEqual(
+                    branch["profile"]["max_event_frames"],
+                    expected_max_event_frames,
+                )
 
 
 if __name__ == "__main__":

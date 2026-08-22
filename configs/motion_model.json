@@ -3,6 +3,7 @@
   "window_len": 120,
   "hop_len": 45,
   "min_event_frames": 45,
+  "max_event_frames": 120,
   "overlap": 12,
   "transition_train_min_seconds": 0.3333333333333333,
   "transition_train_max_seconds": 0.9333333333333333,

@@ -297,6 +297,7 @@ class MotionGenerationConfig:
     window_len: int = 120
     hop_len: int = 60
     min_event_frames: int = 36
+    max_event_frames: int = 120
     overlap: int = 12
     transition_train_min_seconds: float = 10.0 / 30.0
     transition_train_max_seconds: float = 28.0 / 30.0
@@ -442,6 +443,7 @@ class MotionGenerationConfig:
             "MOTION_WINDOW_LEN": ("window_len", int),
             "MOTION_HOP_LEN": ("hop_len", int),
             "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
+            "MOTION_MAX_EVENT_FRAMES": ("max_event_frames", int),
             "MOTION_IK_ITERS": ("ik_iters", int),
             "MOTION_IK_CONTACT_W": ("ik_contact_w", float),
             "MOTION_IK_PENETRATION_W": ("ik_penetration_w", float),

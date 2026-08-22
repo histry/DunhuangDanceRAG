@@ -79,6 +79,21 @@ class MotionTrainingContractTests(unittest.TestCase):
             cfg = MotionGenerationConfig().apply_env()
         self.assertEqual(cfg.fps, 60.0)
 
+    def test_formal_event_duration_bounds_are_explicit_and_overridable(self):
+        cfg = MotionGenerationConfig.from_json("configs/motion_model.json")
+        self.assertEqual(cfg.min_event_frames, 45)
+        self.assertEqual(cfg.max_event_frames, 120)
+        self.assertGreater(cfg.max_event_frames, cfg.min_event_frames)
+        with mock.patch.dict(
+            os.environ,
+            {"MOTION_MAX_EVENT_FRAMES": "180"},
+            clear=False,
+        ):
+            overridden = MotionGenerationConfig.from_json(
+                "configs/motion_model.json"
+            ).apply_env()
+        self.assertEqual(overridden.max_event_frames, 180)
+
     def test_validation_sources_must_be_disjoint(self):
         train = _database(sources=["a", "b"])
         validation = _database(sources=["b", "c"])
