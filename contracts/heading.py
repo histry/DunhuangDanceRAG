@@ -285,22 +285,44 @@ def heading_metrics_np(motion: np.ndarray, fps: float = 30.0) -> Dict[str, float
 def canonicalize_event_entry_heading_np(
     motion: np.ndarray,
     fps: float = 30.0,
-) -> Tuple[np.ndarray, Dict[str, float]]:
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     x = np.asarray(motion, dtype=np.float32).copy()
     if len(x) == 0:
-        return x, {"entry_heading_before_rad": 0.0, "entry_heading_after_rad": 0.0}
+        return x, {
+            "entry_anchor_contract": "physical_first_frame_yaw_zero_v1",
+            "entry_heading_before_rad": 0.0,
+            "entry_heading_before_deg": 0.0,
+            "entry_heading_window_reference_rad": 0.0,
+            "entry_heading_window_reference_deg": 0.0,
+            "entry_heading_window_frames": 0,
+            "entry_heading_after_rad": 0.0,
+            "entry_heading_after_deg": 0.0,
+        }
     n = max(1, min(len(x), int(round(env_float("EVENT_HEADING_ENTRY_HEADING_MEDIAN_SECONDS", 0.15) * fps))))
     y = root_yaw_np(x[:n])
-    # Circular mean is robust to +/-pi wrapping.
-    entry = float(math.atan2(float(np.mean(np.sin(y))), float(np.mean(np.cos(y)))))
+    # Keep the short-window circular reference for diagnostics, but anchor the
+    # actual event to its physical first frame.  Downstream composition and the
+    # hard Event-DB audit both operate on that first-frame endpoint; rotating by
+    # the window mean alone leaves a residual whenever an event starts while
+    # turning and makes construction and audit measure different quantities.
+    window_reference = float(
+        math.atan2(float(np.mean(np.sin(y))), float(np.mean(np.cos(y))))
+    )
+    entry = float(y[0])
     pivot = x[0, [ROOT_X_IDX, ROOT_Z_IDX]].copy()
     x = rotate_motion_constant_yaw_np(x, -entry, pivot_xz=pivot)
     x[:, ROOT_X_IDX] -= float(x[0, ROOT_X_IDX])
     x[:, ROOT_Z_IDX] -= float(x[0, ROOT_Z_IDX])
     after = float(root_yaw_np(x[:1])[0])
     return x.astype(np.float32), {
+        "entry_anchor_contract": "physical_first_frame_yaw_zero_v1",
         "entry_heading_before_rad": entry,
         "entry_heading_before_deg": float(np.degrees(entry)),
+        "entry_heading_window_reference_rad": window_reference,
+        "entry_heading_window_reference_deg": float(
+            np.degrees(window_reference)
+        ),
+        "entry_heading_window_frames": int(n),
         "entry_heading_after_rad": after,
         "entry_heading_after_deg": float(np.degrees(after)),
     }

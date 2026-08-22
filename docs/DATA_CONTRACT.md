@@ -24,6 +24,11 @@ fail closed against the exact source and recording membership recorded in
 `source_split_manifest.json`. A one-recording held-out split is accepted only
 when that manifest declares the separate leave-one-theme-out protocol.
 
+Each Event-DB motion is rigidly canonicalized so its physical first-frame root
+yaw is zero (`physical_first_frame_yaw_zero_v1`). The short entry window is
+retained only as diagnostic context. This keeps event construction, endpoint
+composition, and the entry-heading hard audit on the same measured quantity.
+
 ## Event semantics
 
 The Event-DB separates source identity, dance theme, multi-label local action,

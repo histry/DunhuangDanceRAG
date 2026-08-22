@@ -8,7 +8,12 @@ from pathlib import Path
 
 import numpy as np
 
-from contracts.heading import enforce_event_heading_contract, infer_turn_intent
+from contracts.heading import (
+    canonicalize_event_entry_heading_np,
+    enforce_event_heading_contract,
+    infer_turn_intent,
+    unwrap_root_yaw_np,
+)
 from evaluation.validate_formal_route import validate_formal_route_report
 from evaluation.audit_formal_single_person_db import audit_single_person_db
 from motion_geometry.rotations import matrix_to_rot6d_np
@@ -143,6 +148,34 @@ class FormalFailClosedContractTests(unittest.TestCase):
         _corrected, report = enforce_event_heading_contract(motion, {}, fps=30.0)
         self.assertTrue(report["valid"])
         self.assertNotIn(report["reason"], {"drop_reset_or_drift", "non_turn_yaw_exceeds_hard_budget"})
+
+    def test_event_entry_heading_anchors_physical_first_frame(self) -> None:
+        # The first 0.15 seconds already contain a fast turn, so their circular
+        # reference is deliberately different from the physical first frame.
+        motion = sustained_turn_motion(frames=31, degrees=180.0)
+        before = unwrap_root_yaw_np(motion)
+
+        canonical, report = canonicalize_event_entry_heading_np(
+            motion,
+            fps=30.0,
+        )
+        after = unwrap_root_yaw_np(canonical)
+
+        self.assertEqual(
+            report["entry_anchor_contract"],
+            "physical_first_frame_yaw_zero_v1",
+        )
+        self.assertGreater(
+            abs(float(report["entry_heading_window_reference_deg"])),
+            5.0,
+        )
+        self.assertLess(abs(float(np.degrees(after[0]))), 1.0e-3)
+        self.assertLess(abs(float(report["entry_heading_after_deg"])), 1.0e-3)
+        self.assertAlmostEqual(
+            float(after[-1] - after[0]),
+            float(before[-1] - before[0]),
+            places=4,
+        )
 
     def test_formal_graph_sb_acceptance(self) -> None:
         slot = self._formal_slot()
