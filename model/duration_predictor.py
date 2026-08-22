@@ -640,10 +640,3 @@ def load_duration_checkpoint(path: str | Path, device: torch.device | str = "cpu
 
 # Version-free public API; historical names remain for checkpoint compatibility.
 DurationPredictor = MonotonicDurationModel
-
-
-def load_duration_checkpoint(
-    path: str | Path,
-    device: torch.device | str = "cpu",
-) -> Dict[str, Any]:
-    return load_duration_checkpoint(path, device=device)
