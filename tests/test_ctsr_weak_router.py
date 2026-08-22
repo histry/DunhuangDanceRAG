@@ -32,6 +32,7 @@ from training.weak_semantic_ot import (
     sparse_sinkhorn_teacher,
     weighted_control_cost,
 )
+from training.temporal_music_router import transport_marginal_contract
 
 
 class CTSRWeakRouterTests(unittest.TestCase):
@@ -106,6 +107,47 @@ class CTSRWeakRouterTests(unittest.TestCase):
         self.assertLessEqual(report["row_marginal_error"], report["tolerance"])
         self.assertLessEqual(report["column_marginal_error"], report["tolerance"])
         np.testing.assert_allclose(teacher.sum(axis=1), 1.0, atol=1.0e-5)
+
+    def test_formal_marginal_contract_is_explicit_when_strict_solver_is_slow(
+        self,
+    ) -> None:
+        group_sizes = [143, 83, 75, 27]
+        groups = np.concatenate(
+            [np.repeat(name, size) for name, size in zip("abcd", group_sizes)]
+        )
+        starts = np.cumsum([0] + group_sizes[:-1]).tolist()
+        first_counts = [0, 0, 52, 12]
+        second_counts = [7, 21, 21, 15]
+        first: list[int] = []
+        second: list[int] = []
+        for start, first_count, second_count in zip(
+            starts, first_counts, second_counts
+        ):
+            first.extend(range(start, start + first_count))
+            second.extend(
+                range(start + first_count, start + first_count + second_count)
+            )
+
+        cost = np.ones((10, 328), dtype=np.float64)
+        cost[:5, first] = 0.0
+        cost[5:, second] = 0.0
+        _, report = sparse_sinkhorn_teacher(
+            cost,
+            groups,
+            top_k=64,
+            epsilon=0.12,
+            max_iterations=5000,
+            tolerance=1.0e-5,
+        )
+        self.assertFalse(report["converged"])
+        self.assertGreater(report["row_marginal_error"], 1.0e-5)
+        self.assertLess(report["row_marginal_error"], 1.0e-4)
+
+        accepted = transport_marginal_contract(report, 1.0e-4)
+        rejected = transport_marginal_contract(report, 1.0e-5)
+        self.assertTrue(accepted["marginal_contract_ok"])
+        self.assertFalse(accepted["strict_solver_converged"])
+        self.assertFalse(rejected["marginal_contract_ok"])
 
     def test_event_probabilities_remain_multi_label_at_action_level(self) -> None:
         events = np.asarray([[0.75, 0.25]], dtype=np.float32)

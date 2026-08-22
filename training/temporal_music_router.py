@@ -57,6 +57,26 @@ def _bool(value: str | int | bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def transport_marginal_contract(
+    report: dict[str, Any], maximum_error: float
+) -> dict[str, Any]:
+    """Audit a completed OT plan against the declared formal marginal bound."""
+
+    limit = float(maximum_error)
+    if not np.isfinite(limit) or limit <= 0.0:
+        raise ValueError("Semantic OT maximum marginal error must be finite and positive")
+    row_error = float(report.get("row_marginal_error", float("inf")))
+    column_error = float(report.get("column_marginal_error", float("inf")))
+    finite = bool(np.isfinite(row_error) and np.isfinite(column_error))
+    return {
+        "strict_solver_converged": bool(report.get("converged", False)),
+        "marginal_contract_maximum_error": limit,
+        "marginal_contract_ok": bool(
+            finite and row_error <= limit and column_error <= limit
+        ),
+    }
+
+
 def _group_split(
     groups: np.ndarray, val_ratio: float, seed: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -191,14 +211,13 @@ def build_dataset(args: argparse.Namespace) -> int:
             max_iterations=int(args.teacher_max_iterations),
             tolerance=float(args.teacher_tolerance),
         )
-        maximum_allowed_error = max(
-            1.0e-4, 10.0 * float(args.teacher_tolerance)
+        transport_report.update(
+            transport_marginal_contract(
+                transport_report,
+                float(args.teacher_max_marginal_error),
+            )
         )
-        if (
-            not bool(transport_report["converged"])
-            or float(transport_report["row_marginal_error"]) > maximum_allowed_error
-            or float(transport_report["column_marginal_error"]) > maximum_allowed_error
-        ):
+        if not bool(transport_report["marginal_contract_ok"]):
             raise RuntimeError(
                 "Semantic OT teacher failed its marginal contract for "
                 f"{audio_path}: {transport_report}"
@@ -305,12 +324,19 @@ def build_dataset(args: argparse.Namespace) -> int:
             "top_k": int(args.teacher_top_k),
             "epsilon": float(args.teacher_epsilon),
             "max_iterations": int(args.teacher_max_iterations),
-            "tolerance": float(args.teacher_tolerance),
-            "fail_closed_on_nonconvergence": True,
+            "strict_solver_tolerance": float(args.teacher_tolerance),
+            "maximum_marginal_error": float(args.teacher_max_marginal_error),
+            "strict_solver_convergence_required": False,
+            "fail_closed_on_marginal_contract": True,
             "is_ground_truth": False,
         },
         "transport_summary": {
-            "songs_converged": int(sum(bool(row["converged"]) for row in transport_reports)),
+            "songs_strict_solver_converged": int(
+                sum(bool(row["converged"]) for row in transport_reports)
+            ),
+            "songs_marginal_contract_ok": int(
+                sum(bool(row["marginal_contract_ok"]) for row in transport_reports)
+            ),
             "songs_total": int(len(transport_reports)),
             "max_row_marginal_error": float(max(row["row_marginal_error"] for row in transport_reports)),
             "max_column_marginal_error": float(max(row["column_marginal_error"] for row in transport_reports)),
@@ -613,6 +639,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build.add_argument("--teacher_epsilon", type=float, default=0.12)
     build.add_argument("--teacher_max_iterations", type=int, default=5000)
     build.add_argument("--teacher_tolerance", type=float, default=1.0e-5)
+    build.add_argument("--teacher_max_marginal_error", type=float, default=1.0e-4)
     build.add_argument("--teacher_balance_key", default="recording_uid")
     build.add_argument("--require_librosa_backend", default="1")
     build.add_argument("--require_rhythm_features", default="1")

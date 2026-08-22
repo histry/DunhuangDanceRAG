@@ -475,6 +475,8 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertNotIn("grounding.model", pipeline)
 
         self.assertIn('ROUTING_WEAK_OT_MAX_ITER:-5000', profile)
+        self.assertIn('ROUTING_WEAK_OT_MAX_MARGINAL_ERROR:-0.0001', profile)
+        self.assertIn('--teacher_max_marginal_error "$ROUTING_WEAK_OT_MAX_MARGINAL_ERROR"', pipeline)
 
         router = (ROOT / "training" / "temporal_music_router.py").read_text(
             encoding="utf-8"

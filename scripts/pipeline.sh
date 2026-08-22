@@ -263,6 +263,7 @@ if [[ "$GENERATION_RETRAIN_ROUTER" == "1" ]]; then
     --teacher_epsilon "$ROUTING_WEAK_OT_EPSILON" \
     --teacher_max_iterations "$ROUTING_WEAK_OT_MAX_ITER" \
     --teacher_tolerance "$ROUTING_WEAK_OT_TOLERANCE" \
+    --teacher_max_marginal_error "$ROUTING_WEAK_OT_MAX_MARGINAL_ERROR" \
     --teacher_balance_key "$ROUTING_WEAK_OT_BALANCE_KEY" \
     --require_librosa_backend "$REQUIRE_LIBROSA_BACKEND"
   "$PY" training/temporal_music_router.py train \
