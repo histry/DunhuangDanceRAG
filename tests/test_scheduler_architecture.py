@@ -215,6 +215,20 @@ class SchedulerArchitectureTests(unittest.TestCase):
         self.assertIn('--split_manifest "$SPLIT_MANIFEST"', pipeline)
         self.assertIn('--split "$split"', pipeline)
 
+    def test_formal_event_db_entry_keeps_physical_enrichment_reachable(self):
+        entry = (ROOT / "events" / "build_database_entry.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("filter_database(", entry)
+        self.assertIn("augment_database(", entry)
+        self.assertNotIn("grounding", entry.lower())
+
+        index = (ROOT / "scheduling" / "build_generation_index.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FORMAL_ANATOMY_SCHEMA", index)
+        self.assertIn("FORMAL_INTRINSIC_GEOMETRY_SCHEMA", index)
+
     def test_pipeline_trains_scheduler_models_before_motion_refinement(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(encoding="utf-8")
         markers = [

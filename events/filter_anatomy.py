@@ -71,8 +71,8 @@ def _source_ids(payload: Dict[str, Any], paths: np.ndarray, n: int) -> np.ndarra
 
 
 def filter_database(db_path: Path, meta_path: Path, audit_path: Path) -> Dict[str, Any]:
-    obj = np.load(db_path, allow_pickle=True)
-    payload: Dict[str, Any] = {k: obj[k] for k in obj.files}
+    with np.load(db_path, allow_pickle=True) as obj:
+        payload: Dict[str, Any] = {k: obj[k] for k in obj.files}
     paths = np.asarray(payload["paths"], dtype=object)
     n = len(paths)
     source_ids = _source_ids(payload, paths, n)

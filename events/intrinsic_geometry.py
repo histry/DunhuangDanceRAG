@@ -549,8 +549,8 @@ def augment_database(
         "event_geometry_w2_barycenter_std": bary_std,
         "event_geometry_shared_embedding": shared,
         "event_geometry_source_private_embedding": private,
-        # Existing routing already consumes this key.  Updating it lets the old
-        # Contrastive Retriever/Motion Generation path benefit from anatomy and intrinsic dynamics immediately.
+        # Keep the common quality key aligned with the formal physical contract
+        # consumed by AESD, Scheduler indexing, and motion training.
         "event_quality_scores": combined_q,
     })
 

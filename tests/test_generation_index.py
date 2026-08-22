@@ -4,7 +4,11 @@ from pathlib import Path
 
 import numpy as np
 
-from scheduling.build_generation_index import build_generation_index
+from scheduling.build_generation_index import (
+    FORMAL_ANATOMY_SCHEMA,
+    FORMAL_INTRINSIC_GEOMETRY_SCHEMA,
+    build_generation_index,
+)
 from scheduling.index_io import load_shared_index
 from motion_geometry.smpl24 import skeleton_contract_json
 
@@ -15,6 +19,20 @@ def identity_motion(frames: int) -> np.ndarray:
     rot = np.asarray([1, 0, 0, 0, 1, 0], dtype=np.float32)
     motion[:, 7:] = np.tile(rot, 24)
     return motion
+
+
+def physical_enrichment_fields(count: int) -> dict:
+    return {
+        "anatomy_contract_schema_version": np.asarray(
+            FORMAL_ANATOMY_SCHEMA, dtype=object
+        ),
+        "event_geometry_geometry_schema_version": np.asarray(
+            FORMAL_INTRINSIC_GEOMETRY_SCHEMA, dtype=object
+        ),
+        "anatomy_quality": np.full(count, 0.9, dtype=np.float32),
+        "anatomy_hard_valid": np.ones(count, dtype=np.bool_),
+        "event_geometry_combined_quality": np.full(count, 0.85, dtype=np.float32),
+    }
 
 
 class GenerationIndexTests(unittest.TestCase):
@@ -46,16 +64,24 @@ class GenerationIndexTests(unittest.TestCase):
                 ),
                 solo_compatible=np.asarray([True, True]),
                 solo_review_statuses=np.asarray(
-                    ["not_required_single_track", "not_required_single_track"], dtype=object
+                    ["not_required_single_track", "not_required_single_track"],
+                    dtype=object,
                 ),
                 posture_entry=np.asarray(["standing", "half_squat"], dtype=object),
                 posture_exit=np.asarray(["standing", "standing"], dtype=object),
                 posture_mode=np.asarray(["standing", "half_squat"], dtype=object),
-                aesd_event_semantics=np.asarray(["pose_hold", "turning_climax"], dtype=object),
+                aesd_event_semantics=np.asarray(
+                    ["pose_hold", "turning_climax"], dtype=object
+                ),
                 canonical_fps=np.asarray([30.0, 30.0], dtype=np.float32),
                 source_start_seconds=np.asarray([0.0, 10.0 / 30.0], dtype=np.float64),
-                source_end_seconds=np.asarray([24.0 / 30.0, 40.0 / 30.0], dtype=np.float64),
-                skeleton_contract_json=np.asarray(skeleton_contract_json(), dtype=object),
+                source_end_seconds=np.asarray(
+                    [24.0 / 30.0, 40.0 / 30.0], dtype=np.float64
+                ),
+                skeleton_contract_json=np.asarray(
+                    skeleton_contract_json(), dtype=object
+                ),
+                **physical_enrichment_fields(2),
             )
             json_path = root / "index.json"
             npz_path = root / "index.npz"
@@ -67,7 +93,9 @@ class GenerationIndexTests(unittest.TestCase):
                 self.assertEqual(items[0]["source_uid"], "source_a")
                 self.assertTrue(items[0]["solo_compatible"])
                 self.assertEqual(items[0]["dancer_id"], "dancer_a")
-                self.assertEqual(metadata["event_db_contract"], report["event_db_contract"])
+                self.assertEqual(
+                    metadata["event_db_contract"], report["event_db_contract"]
+                )
                 self.assertEqual(metadata["canonical_fps_values"], [30.0])
                 self.assertEqual(
                     metadata["natural_duration_units"],
@@ -95,8 +123,35 @@ class GenerationIndexTests(unittest.TestCase):
                     skeleton_contract_json(),
                     dtype=object,
                 ),
+                **physical_enrichment_fields(1),
             )
             with self.assertRaisesRegex(RuntimeError, "posture state fields"):
+                build_generation_index(
+                    db_path,
+                    root / "index.json",
+                    root / "index.npz",
+                )
+
+    def test_builder_rejects_database_without_physical_enrichment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            motion_path = root / "event.npy"
+            np.save(motion_path, identity_motion(24))
+            db_path = root / "events_aesd.npz"
+            np.savez_compressed(
+                db_path,
+                paths=np.asarray([str(motion_path)], dtype=object),
+                source_uids=np.asarray(["source_a"], dtype=object),
+                starts=np.asarray([0]),
+                ends=np.asarray([24]),
+                frames=np.asarray([24]),
+                canonical_fps=np.asarray([30.0], dtype=np.float32),
+                skeleton_contract_json=np.asarray(
+                    skeleton_contract_json(),
+                    dtype=object,
+                ),
+            )
+            with self.assertRaisesRegex(RuntimeError, "physical enrichment chain"):
                 build_generation_index(
                     db_path,
                     root / "index.json",

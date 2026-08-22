@@ -1,38 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Anatomy-Heading wrapper: run the preserved Fresh-Audio Generation event builder, then anatomy-gate it."""
-from __future__ import annotations
-import sys
+"""Compatibility alias for the unified formal Event-DB entrypoint."""
+
 from pathlib import Path
-from typing import Optional, Sequence
+import sys
 
-from events import build_database as base
-from events.filter_anatomy import filter_database
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-
-def _value(args, flag):
-    try:
-        i = args.index(flag)
-        return args[i + 1]
-    except Exception:
-        return None
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    rc = int(base.main(args))
-    if rc != 0:
-        return rc
-    out_dir = _value(args, "--out_db")
-    if not out_dir:
-        raise RuntimeError("Anatomy-Heading event wrapper requires --out_db")
-    root = Path(out_dir)
-    filter_database(
-        root / "events.npz",
-        root / "events_meta.json",
-        root / "events.anatomy_heading_anatomy.audit.json",
-    )
-    return 0
+from events.build_database_entry import main  # noqa: E402
 
 if __name__ == "__main__":
     raise SystemExit(main())

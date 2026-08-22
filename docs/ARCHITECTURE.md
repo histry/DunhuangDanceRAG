@@ -4,7 +4,8 @@ The main branch contains one business path:
 
 1. validate the authoritative 14-file Chang-E SMPL manifest;
 2. convert explicit 165D pose layout to SMPL24/EDGE151 and build a clean source cache;
-3. split recording groups before event slicing, then build five-layer Event-DBs;
+3. split recording groups before event slicing, then build Event-DBs with
+   posture-aware Anatomy filtering and intrinsic physical endpoint geometry;
 4. extract strict Librosa 12D phrase sequences from non-test music;
 5. train CTSR-Weak Router, Duration model, and continuous Whole-Song Planner;
 6. produce one final MSSD whose sibling candidates come from the same CTSR Router;

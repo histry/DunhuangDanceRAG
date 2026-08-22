@@ -61,6 +61,10 @@ VALID_POSTURE_STATES = {
     "standing",
     "aerial",
 }
+FORMAL_ANATOMY_SCHEMA = "retarget_clean_posture_aware_event_anatomy_filter"
+FORMAL_INTRINSIC_GEOMETRY_SCHEMA = (
+    "event_geometry_intrinsic_event_geometry_v3_physical_endpoints"
+)
 
 LOCAL_ACTION_LABELS = (
     "pose_hold",
@@ -86,8 +90,17 @@ def _json_object(value: Any, default: Any) -> Any:
 
 
 def _db_dict(path: Path) -> dict[str, Any]:
-    source = np.load(path, allow_pickle=True)
-    return {key: source[key] for key in source.files}
+    with np.load(path, allow_pickle=True) as source:
+        return {key: source[key] for key in source.files}
+
+
+def _scalar_text(value: Any) -> str:
+    raw = value
+    if isinstance(raw, np.ndarray) and raw.ndim == 0:
+        raw = raw.item()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return str(raw)
 
 
 def _array(db: Mapping[str, Any], key: str, count: int, default: Any) -> np.ndarray:
@@ -164,6 +177,29 @@ def build_generation_index(
             "Generation DB has no canonical_fps contract; rebuild it with "
             "events.build_database instead of assuming 30 FPS."
         )
+    physical_schemas = {
+        "anatomy_contract_schema_version": FORMAL_ANATOMY_SCHEMA,
+        "event_geometry_geometry_schema_version": FORMAL_INTRINSIC_GEOMETRY_SCHEMA,
+    }
+    for field, expected in physical_schemas.items():
+        actual = _scalar_text(db.get(field, ""))
+        if actual != expected:
+            raise RuntimeError(
+                "Generation DB has not passed the formal project-owned "
+                "physical enrichment chain: "
+                f"field={field!r}, expected={expected!r}, actual={actual!r}. "
+                "Rebuild through events/build_database_entry.py."
+            )
+    required_physical_arrays = (
+        "anatomy_quality",
+        "anatomy_hard_valid",
+        "event_geometry_combined_quality",
+    )
+    missing_physical = [field for field in required_physical_arrays if field not in db]
+    if missing_physical:
+        raise RuntimeError(
+            f"Generation DB lacks formal physical enrichment arrays: {missing_physical}"
+        )
     event_uids = event_uids_from_generation_db(db)
     contract = make_event_db_contract(event_uids)
 
@@ -203,6 +239,23 @@ def build_generation_index(
     heading_quality = _array(db, "event_heading_quality", count, 0.5).astype(np.float32)
     yaw = _array(db, "event_net_yaw_rad", count, 0.0).astype(np.float32)
     durations_sec = _array(db, "durations", count, 0.0).astype(np.float32)
+    if not bool(np.all(hard_valid)):
+        raise RuntimeError(
+            "Generation DB contains events that failed the hard anatomy gate"
+        )
+    for field, values in (
+        ("anatomy_quality", anatomy_quality),
+        ("event_geometry_combined_quality", quality),
+    ):
+        if (
+            not np.all(np.isfinite(values))
+            or np.any(values < 0.0)
+            or np.any(values > 1.0)
+        ):
+            raise RuntimeError(
+                f"Generation DB physical quality field {field!r} must be finite "
+                "and lie in [0,1]"
+            )
     canonical_fps = np.asarray(db["canonical_fps"], dtype=np.float32)
     if canonical_fps.ndim == 0:
         canonical_fps = np.full(count, float(canonical_fps), dtype=np.float32)
@@ -289,11 +342,6 @@ def build_generation_index(
         embeddings.append(motion_mmr_embedding(motion, out_dim=64, fps=fps))
         entry_pose.append(motion[0].astype(np.float32))
         exit_pose.append(motion[-1].astype(np.float32))
-        first = np.diff(motion[: min(edge_frames, len(motion))], axis=0)
-        last = np.diff(
-            motion[max(0, len(motion) - edge_frames) :],
-            axis=0,
-        )
         rotation_matrices = rot6d_to_matrix_np(
             motion[:, ROT6D_START:ROT6D_END].reshape(len(motion), 24, 6)
         )
@@ -433,6 +481,11 @@ def build_generation_index(
             "exit_root_height_m": "m_above_event_floor",
         },
         "generation_db": str(db_path),
+        "physical_enrichment_contract": {
+            "anatomy_schema": FORMAL_ANATOMY_SCHEMA,
+            "intrinsic_geometry_schema": FORMAL_INTRINSIC_GEOMETRY_SCHEMA,
+            "fail_closed": True,
+        },
         "event_db_contract": contract,
         "performer_identity_contract": {
             "dancer_identity_verified": bool(
