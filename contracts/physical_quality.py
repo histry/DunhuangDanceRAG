@@ -299,6 +299,38 @@ class PhysicalQualityLimits:
 
 
 @dataclass(frozen=True)
+class PretrainingRoutePhysicalPolicy:
+    """Catastrophic-only policy for the pretraining Scheduler smoke test.
+
+    The same-WAV regression runs before the Motion Refiner, diffusion model,
+    and boundary closed loop. It must reject malformed motion and unsafe
+    vertical/rotation states without pretending that the unrefined
+    concatenation already satisfies the final render contract.
+    """
+
+    foot_penetration_catastrophic_threshold_m: float = -0.18
+    foot_penetration_catastrophic_max_seconds: float = 0.08
+
+    @classmethod
+    def from_environment(cls) -> "PretrainingRoutePhysicalPolicy":
+        return cls(
+            foot_penetration_catastrophic_threshold_m=_env_float(
+                "PRETRAIN_ROUTE_CATASTROPHIC_FOOT_PENETRATION_MIN_M",
+                None,
+                -0.18,
+            ),
+            foot_penetration_catastrophic_max_seconds=_env_float(
+                "PRETRAIN_ROUTE_CATASTROPHIC_FOOT_PENETRATION_MAX_SECONDS",
+                None,
+                0.08,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class SourcePhysicalQualityPolicy:
     """Pre-training Retarget Clean policy, never used by final generation.
 
@@ -984,6 +1016,99 @@ def evaluate_physical_audit(
             name: {"ok": not values, "reasons": list(values)}
             for name, values in layer_reasons.items()
         },
+    }
+
+
+def evaluate_pretraining_route_audit(
+    audit: Mapping[str, Any],
+    limits: Optional[PhysicalQualityLimits] = None,
+    *,
+    policy: Optional[PretrainingRoutePhysicalPolicy] = None,
+) -> Dict[str, Any]:
+    """Gate the same-WAV Scheduler smoke test without using final semantics.
+
+    This stage executes before learned motion repair. Final anti-jitter,
+    planted-foot, and long-horizon horizontal-drift failures are retained as
+    diagnostics, but they cannot prevent the Refiner/diffusion/boundary stages
+    from running. Contract failures, unsafe root-vertical motion, malformed
+    rotations, and sustained catastrophic floor penetration remain hard.
+    """
+
+    final_diagnostic = evaluate_physical_audit(audit, limits=limits)
+    pol = policy or PretrainingRoutePhysicalPolicy.from_environment()
+
+    blocking_layers = ("contract", "root_vertical", "rotation_quality")
+    diagnostic_only_layers = (
+        "anti_jitter",
+        "foot_contact",
+        "long_horizon_root_drift",
+    )
+    hard_reasons = [
+        str(reason)
+        for layer in blocking_layers
+        for reason in final_diagnostic["layers"][layer]["reasons"]
+    ]
+
+    catastrophic_reasons: list[str] = []
+    threshold_ok, observed_threshold = _required_metric(
+        audit, "foot_penetration_catastrophic_threshold_m"
+    )
+    if not threshold_ok:
+        catastrophic_reasons.append(
+            "missing_or_nonfinite:foot_penetration_catastrophic_threshold_m"
+        )
+    elif abs(
+        observed_threshold - float(pol.foot_penetration_catastrophic_threshold_m)
+    ) > 1.0e-9:
+        catastrophic_reasons.append(
+            "pretraining_penetration_catastrophic_threshold_mismatch"
+        )
+
+    run_ok, run_seconds = _required_metric(
+        audit, "foot_penetration_catastrophic_run_max_seconds"
+    )
+    if not run_ok:
+        catastrophic_reasons.append(
+            "missing_or_nonfinite:foot_penetration_catastrophic_run_max_seconds"
+        )
+    elif run_seconds > float(pol.foot_penetration_catastrophic_max_seconds):
+        catastrophic_reasons.append("foot_penetration_sustained_catastrophic")
+
+    reasons = list(dict.fromkeys(hard_reasons + catastrophic_reasons))
+    diagnostic_only_reasons = [
+        str(reason)
+        for layer in diagnostic_only_layers
+        for reason in final_diagnostic["layers"][layer]["reasons"]
+    ]
+    return {
+        "schema": "pretraining_scheduler_route_physical_gate_v1",
+        "contract_role": "pretraining_scheduler_route_smoke_test",
+        "ok": not reasons,
+        "reasons": reasons,
+        "blocking_layers": list(blocking_layers),
+        "diagnostic_only_layers": list(diagnostic_only_layers),
+        "diagnostic_only_reasons": diagnostic_only_reasons,
+        "policy": pol.to_dict(),
+        "catastrophic_penetration": {
+            "observed_threshold_m": observed_threshold if threshold_ok else None,
+            "observed_run_max_seconds": run_seconds if run_ok else None,
+        },
+        # The caller stores the authoritative full final diagnostic separately;
+        # keep only a compact summary here to avoid duplicating its large audit.
+        "final_generation_diagnostic": {
+            "schema": final_diagnostic["schema"],
+            "contract_role": final_diagnostic["contract_role"],
+            "ok": final_diagnostic["ok"],
+            "reasons": list(final_diagnostic["reasons"]),
+            "layers": dict(final_diagnostic["layers"]),
+        },
+        "final_generation_gate_required_after_motion_repair": True,
+        "required_downstream_stages": [
+            "motion_refiner",
+            "motion_diffusion",
+            "boundary_closed_loop",
+            "final_generation_physical_gate",
+        ],
     }
 
 

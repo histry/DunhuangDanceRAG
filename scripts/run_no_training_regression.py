@@ -17,7 +17,39 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from routing.boundary_closed_loop import physical_quality_gate
+from contracts.physical_quality import (
+    evaluate_physical_audit,
+    evaluate_pretraining_route_audit,
+)
+from motion_geometry.smpl24 import MOTION_DIM
+
+
+def evaluate_scheduler_motion_tensor(motion: np.ndarray) -> dict:
+    """Validate the raw whole-song motion before IK or metric computation."""
+
+    shape = list(getattr(motion, "shape", ()))
+    reasons: list[str] = []
+    if motion.ndim != 2:
+        reasons.append(f"motion_rank_mismatch:{motion.ndim}!=2")
+    elif motion.shape[0] <= 0:
+        reasons.append("motion_has_no_frames")
+    elif motion.shape[1] != MOTION_DIM:
+        reasons.append(f"motion_dim_mismatch:{motion.shape[1]}!={MOTION_DIM}")
+
+    try:
+        nonfinite_count = int((~np.isfinite(motion)).sum())
+    except (TypeError, ValueError):
+        nonfinite_count = -1
+    if nonfinite_count != 0:
+        reasons.append(f"motion_nonfinite_count:{nonfinite_count}")
+    return {
+        "schema": "pretraining_scheduler_motion_tensor_contract_v1",
+        "ok": not reasons,
+        "reasons": reasons,
+        "shape": shape,
+        "expected_motion_dim": int(MOTION_DIM),
+        "nonfinite_count": nonfinite_count,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -70,8 +102,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     schedule = report["schedule"]
     motion = np.load(motion_path, allow_pickle=True)
-    if motion.ndim == 3:
+    if motion.ndim == 3 and motion.shape[0] == 1:
         motion = motion[0]
+    motion_tensor_contract = evaluate_scheduler_motion_tensor(motion)
+    if not motion_tensor_contract["ok"]:
+        raise RuntimeError(
+            "Invalid same-WAV Scheduler motion tensor: "
+            + ",".join(motion_tensor_contract["reasons"])
+        )
 
     import training.motion_models as motion_runtime
 
@@ -95,7 +133,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     action_path = out_dir / "same_wav_no_training_action.npy"
     np.save(action_path, motion.astype(np.float32))
     audit = motion_runtime.audit_motion_np(motion, cfg)
-    physical = physical_quality_gate(audit)
+    # Stage 7E runs before Refiner, diffusion, and boundary closed-loop repair.
+    # Keep the strict final-generation gate as an explicit diagnostic, while
+    # using a separate catastrophic-only gate to decide whether training may
+    # continue.
+    physical = evaluate_physical_audit(audit)
+    pretraining_physical = evaluate_pretraining_route_audit(audit)
 
     event_uids = [str(row.get("event_uid", row.get("event_id"))) for row in schedule]
     sources = [str(row.get("source_uid", "unknown")) for row in schedule]
@@ -115,17 +158,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         reasons.append("source_share_too_high")
     if transition_fraction > args.max_transition_fraction + 1e-9:
         reasons.append("transition_fraction_too_high")
-    if not physical["ok"]:
-        reasons.extend(physical["reasons"])
+    if not pretraining_physical["ok"]:
+        reasons.extend(pretraining_physical["reasons"])
 
     result = {
-        "schema": "same_wav_no_training_regression_v1",
+        "schema": "same_wav_no_training_regression_v2",
         "ok": not reasons,
         "reasons": reasons,
         "audio": str(Path(args.audio).resolve()),
         "schedule_report": str(report_path),
         "action_motion": str(action_path),
         "event_db_contract": report.get("event_db_contract"),
+        "motion_tensor_contract": motion_tensor_contract,
         "route": {
             "num_slots": len(schedule),
             "unique_events": len(set(event_uids)),
@@ -136,7 +180,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "transition_fraction": transition_fraction,
         },
         "ik": ik_report,
+        "pretraining_physical_gate": pretraining_physical,
         "physical": physical,
+        "physical_contract_role": "final_generation_diagnostic_only",
+        "final_generation_physical_gate_required_after_motion_repair": True,
     }
     gate_path = out_dir / "regression_gate.json"
     gate_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
