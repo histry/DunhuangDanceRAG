@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping
@@ -31,6 +30,29 @@ from support.event_identity import (
 
 SCHEDULER_CHECKPOINT_CONTRACT_SCHEMA = "dunhuang_scheduler_checkpoint_contract_v1"
 SCHEDULER_ROLES = {"router", "duration", "planner"}
+
+# Git commit identity is training provenance, not by itself a runtime model
+# compatibility contract.  A documentation, audit or downstream quality-gate
+# fix must not force an expensive Scheduler retrain when the serialized model
+# implementation is byte-for-byte unchanged.  Conversely, state-dict shape
+# checks alone are too weak because a same-shaped implementation can change
+# semantics.  These are the role-specific files that define checkpoint loading
+# and forward behavior; cross-commit reuse is fail-closed when any of them
+# changed.
+SCHEDULER_RUNTIME_MODEL_FILES: dict[str, tuple[str, ...]] = {
+    "router": (
+        "model/music_motion_router.py",
+        "model/temporal_music_motion_router.py",
+        "scheduling/temporal_router_contract.py",
+    ),
+    "duration": (
+        "model/duration_predictor.py",
+        "motion_geometry/rotations.py",
+    ),
+    "planner": (
+        "model/whole_song_planner.py",
+    ),
+}
 
 
 def sha256_file(path: str | Path) -> str:
@@ -70,6 +92,117 @@ def repository_code_provenance() -> dict[str, Any]:
         "worktree_clean": not bool(status.strip()),
         "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
         "status_entries": int(len([line for line in status.splitlines() if line])),
+    }
+
+
+def _changed_runtime_model_files(
+    *,
+    role: str,
+    checkpoint_commit: str,
+    runtime_commit: str,
+) -> list[str]:
+    """Return role-model files changed between two recorded Git commits.
+
+    The comparison deliberately uses committed blobs.  The caller separately
+    requires both the training and runtime worktrees to be clean before a
+    cross-commit checkpoint can be accepted.
+    """
+
+    root = Path(__file__).resolve().parents[1]
+    files = SCHEDULER_RUNTIME_MODEL_FILES[role]
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                f"{checkpoint_commit}..{runtime_commit}",
+                "--",
+                *files,
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            "Cannot verify cross-commit Scheduler model compatibility; fetch "
+            f"the checkpoint commit or retrain the {role} checkpoint: {exc}"
+        ) from exc
+    return sorted({line.strip() for line in result.stdout.splitlines() if line.strip()})
+
+
+def _assert_code_provenance_compatible(
+    expected_code: Mapping[str, Any],
+    runtime_code: Mapping[str, Any],
+    *,
+    role: str,
+    path: str,
+) -> dict[str, Any]:
+    """Validate provenance while separating training identity from compatibility."""
+
+    if expected_code.get("schema") != runtime_code.get("schema"):
+        raise RuntimeError(
+            f"{role} checkpoint code provenance mismatch for schema: "
+            f"checkpoint={expected_code.get('schema')!r}, "
+            f"runtime={runtime_code.get('schema')!r}, path={path}"
+        )
+    checkpoint_commit = str(expected_code.get("commit", "")).strip()
+    runtime_commit = str(runtime_code.get("commit", "")).strip()
+    if not checkpoint_commit or not runtime_commit:
+        raise RuntimeError(f"{role} checkpoint has incomplete Git commit provenance: {path}")
+
+    if checkpoint_commit == runtime_commit:
+        for key in ("worktree_clean", "status_sha256"):
+            if expected_code.get(key) != runtime_code.get(key):
+                raise RuntimeError(
+                    f"{role} checkpoint code provenance mismatch for {key}: "
+                    f"checkpoint={expected_code.get(key)!r}, "
+                    f"runtime={runtime_code.get(key)!r}, path={path}"
+                )
+        return {
+            "schema": "scheduler_runtime_code_compatibility_v1",
+            "policy": "exact_training_commit_and_worktree",
+            "checkpoint_commit": checkpoint_commit,
+            "runtime_commit": runtime_commit,
+            "cross_commit_reuse": False,
+            "role_model_files": list(SCHEDULER_RUNTIME_MODEL_FILES[role]),
+            "changed_role_model_files": [],
+            "ok": True,
+        }
+
+    # A dirty tree cannot be reconstructed from the commit alone, so there is
+    # no sound way to prove cross-commit compatibility in that case.
+    if not bool(expected_code.get("worktree_clean")) or not bool(
+        runtime_code.get("worktree_clean")
+    ):
+        raise RuntimeError(
+            f"{role} checkpoint cross-commit reuse requires clean training and "
+            f"runtime worktrees: checkpoint_clean={expected_code.get('worktree_clean')!r}, "
+            f"runtime_clean={runtime_code.get('worktree_clean')!r}, path={path}"
+        )
+    changed = _changed_runtime_model_files(
+        role=role,
+        checkpoint_commit=checkpoint_commit,
+        runtime_commit=runtime_commit,
+    )
+    if changed:
+        raise RuntimeError(
+            f"{role} checkpoint runtime model implementation changed since training: "
+            f"files={changed}, checkpoint_commit={checkpoint_commit!r}, "
+            f"runtime_commit={runtime_commit!r}, path={path}. Retrain this checkpoint."
+        )
+    return {
+        "schema": "scheduler_runtime_code_compatibility_v1",
+        "policy": "role_scoped_model_implementation_unchanged",
+        "checkpoint_commit": checkpoint_commit,
+        "runtime_commit": runtime_commit,
+        "cross_commit_reuse": True,
+        "role_model_files": list(SCHEDULER_RUNTIME_MODEL_FILES[role]),
+        "changed_role_model_files": [],
+        "ok": True,
     }
 
 
@@ -271,13 +404,12 @@ def assert_scheduler_checkpoint_contract(
     if not isinstance(expected_code, Mapping):
         raise RuntimeError(f"{role} checkpoint has no Git code provenance: {path}")
     runtime_code = repository_code_provenance()
-    for key in ("schema", "commit", "worktree_clean", "status_sha256"):
-        if expected_code.get(key) != runtime_code.get(key):
-            raise RuntimeError(
-                f"{role} checkpoint code provenance mismatch for {key}: "
-                f"checkpoint={expected_code.get(key)!r}, runtime={runtime_code.get(key)!r}, "
-                f"path={path}"
-            )
+    runtime_code_compatibility = _assert_code_provenance_compatible(
+        expected_code,
+        runtime_code,
+        role=role,
+        path=path,
+    )
     if event_db_contract is not None:
         assert_same_event_db_contract(
             event_db_contract,
@@ -301,4 +433,6 @@ def assert_scheduler_checkpoint_contract(
                 f"{role} checkpoint {label} hash mismatch: "
                 f"checkpoint={expected_hash}, runtime={actual_hash}, path={path}"
             )
-    return dict(contract)
+    validated = dict(contract)
+    validated["runtime_code_compatibility"] = runtime_code_compatibility
+    return validated

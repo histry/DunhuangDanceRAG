@@ -172,7 +172,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Generation Event-DB. The formal Router is initialized from scratch, "
             "uses Librosa 12D temporal sequences and a declared semantic_ot_teacher, "
             "and contains neither external pretrained weights nor human labels. "
-            "A previous checkpoint is accepted only when all contracts and hashes match."
+            "A previous checkpoint retains its exact training Git provenance and is "
+            "accepted only when all data/representation/scientific contracts and hashes "
+            "match and its role-specific runtime model implementation is unchanged."
         ),
         "required_lifecycle": [
             "build_generation_aligned_scheduler_index",
