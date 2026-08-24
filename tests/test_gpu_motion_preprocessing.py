@@ -379,25 +379,33 @@ def test_cuda_formal_training_entrypoints_complete_one_step(tmp_path):
     refiner_path = tmp_path / "refiner.pt"
     diffusion_path = tmp_path / "diffusion.pt"
 
-    assert models.train_refiner(
-        Namespace(
-            config=str(config_path),
-            db=str(train_db),
-            val_db=str(validation_db),
-            out=str(refiner_path),
-            steps=1,
-        )
-    ) == 0
-    assert models.train_diffusion(
-        Namespace(
-            config=str(config_path),
-            db=str(train_db),
-            val_db=str(validation_db),
-            out=str(diffusion_path),
-            steps=1,
-            diffusion_steps=2,
-        )
-    ) == 0
+    # Formal operators commonly export fail-closed=1 before running tests.
+    # Isolate this one-step CUDA reachability smoke test from that ambient
+    # policy: one optimizer step is intentionally not a convergence claim.
+    with mock.patch.dict(
+        os.environ,
+        {"MOTION_CHECKPOINT_VALIDATION_FAIL_CLOSED": "0"},
+        clear=False,
+    ):
+        assert models.train_refiner(
+            Namespace(
+                config=str(config_path),
+                db=str(train_db),
+                val_db=str(validation_db),
+                out=str(refiner_path),
+                steps=1,
+            )
+        ) == 0
+        assert models.train_diffusion(
+            Namespace(
+                config=str(config_path),
+                db=str(train_db),
+                val_db=str(validation_db),
+                out=str(diffusion_path),
+                steps=1,
+                diffusion_steps=2,
+            )
+        ) == 0
 
     refiner = models._trusted_torch_load(refiner_path, map_location="cpu")
     diffusion = models._trusted_torch_load(diffusion_path, map_location="cpu")
