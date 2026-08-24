@@ -172,20 +172,37 @@ def test_gpu_preprocessing_is_explicit_and_overridable():
 
 
 def test_cuda_device_resolution_handles_indexed_and_invalid_devices():
-    with mock.patch.object(models.torch.cuda, "is_available", return_value=False):
-        cfg = models.MotionGenerationConfig(device="cuda:0").apply_env()
+    # ``apply_env`` intentionally gives MOTION_DEVICE precedence over the
+    # dataclass constructor.  Pin each scenario here so an operator's exported
+    # MOTION_DEVICE (for example the formal ``cuda`` setting) cannot silently
+    # change what this test exercises.
+    with mock.patch.dict(
+        os.environ,
+        {"MOTION_DEVICE": "cuda:0"},
+        clear=False,
+    ), mock.patch.object(models.torch.cuda, "is_available", return_value=False):
+        cfg = models.MotionGenerationConfig().apply_env()
     assert cfg.device == "cpu"
 
-    with mock.patch.object(
+    with mock.patch.dict(
+        os.environ,
+        {"MOTION_DEVICE": "cuda:3"},
+        clear=False,
+    ), mock.patch.object(
         models.torch.cuda,
         "is_available",
         return_value=True,
     ), mock.patch.object(models.torch.cuda, "device_count", return_value=1):
         with pytest.raises(ValueError, match="only 1 CUDA device"):
-            models.MotionGenerationConfig(device="cuda:3").apply_env()
+            models.MotionGenerationConfig().apply_env()
 
-    with pytest.raises(ValueError, match="Invalid MOTION_DEVICE"):
-        models.MotionGenerationConfig(device="not-a-device").apply_env()
+    with mock.patch.dict(
+        os.environ,
+        {"MOTION_DEVICE": "not-a-device"},
+        clear=False,
+    ):
+        with pytest.raises(ValueError, match="Invalid MOTION_DEVICE"):
+            models.MotionGenerationConfig().apply_env()
 
 
 def test_ik_best_state_has_no_per_iteration_host_sync():
