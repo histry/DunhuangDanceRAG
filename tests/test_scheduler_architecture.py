@@ -529,7 +529,12 @@ class SchedulerArchitectureTests(unittest.TestCase):
         )
         start = source.index("def train_refiner(")
         block = source[start : start + 2600]
-        self.assertIn("degrade_for_refiner(clean, cfg=cfg)", block)
+        self.assertIn("bad, seam = degrade_for_refiner(", block)
+        self.assertIn("cfg=cfg,", block)
+        self.assertIn(
+            "finalize_contract=not gpu_preprocessing",
+            block,
+        )
         self.assertNotIn("degrade_for_refiner(clean)\n", block)
 
     def test_post_processing_reaudits_exact_returned_motion(self):

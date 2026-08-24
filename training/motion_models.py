@@ -11,6 +11,7 @@ pretrained music, or historical contrastive-retrieval business path.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import json
 import math
@@ -60,6 +61,7 @@ from motion_geometry.rotations import (
     matrix_to_rot6d_torch as _contract_matrix_to_rot6d_torch,
     rot6d_to_matrix_np as _contract_rot6d_to_matrix_np,
     rot6d_to_matrix_torch as _contract_rot6d_to_matrix_torch,
+    so3_log_torch,
 )
 from motion_geometry.product_manifold import (
     PRODUCT_STATE_DIM,
@@ -68,8 +70,9 @@ from motion_geometry.product_manifold import (
     product_log_np,
     product_log_torch,
 )
-from contracts.boundary import build_frame_joint_risk_mask
+from contracts.boundary import BODY_PARTS, build_frame_joint_risk_mask
 from contracts.physical_quality import (
+    PeakJerkMaskConfig,
     PhysicalQualityLimits,
     StageAcceptancePolicy,
     compute_joint_kinematic_metrics,
@@ -194,11 +197,19 @@ def resample_motion_np(motion: np.ndarray, new_len: int) -> np.ndarray:
     return out
 
 
-def rot6d_to_matrix_np(x: np.ndarray) -> np.ndarray:
-    return _contract_rot6d_to_matrix_np(x)
+def rot6d_to_matrix_np(
+    x: np.ndarray,
+    *,
+    project: bool = True,
+) -> np.ndarray:
+    return _contract_rot6d_to_matrix_np(x, project=project)
 
 
-def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
+def matrix_to_rot6d_np(
+    mat: np.ndarray,
+    *,
+    project: bool = True,
+) -> np.ndarray:
     """Convert rotation matrices to EDGE/Zhou 6D in column-concatenated form.
 
     Motion Loading/Event Semantics critical fix:
@@ -210,7 +221,7 @@ def matrix_to_rot6d_np(mat: np.ndarray) -> np.ndarray:
     saved Event-RAG clips and makes strict raw-rot6d audit fail even after
     projection.
     """
-    return _contract_matrix_to_rot6d_np(mat)
+    return _contract_matrix_to_rot6d_np(mat, project=project)
 
 
 def fk_24_np(motion: np.ndarray) -> np.ndarray:
@@ -220,7 +231,9 @@ def fk_24_np(motion: np.ndarray) -> np.ndarray:
     T = motion.shape[0]
     root = motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
     rot6d = motion[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)
-    local_r = rot6d_to_matrix_np(rot6d)
+    # Rot6D decoding already performs a stable Gram-Schmidt projection. The
+    # additional nearest-SO(3) SVD is redundant inside the repeated FK path.
+    local_r = rot6d_to_matrix_np(rot6d, project=False)
     global_r = np.zeros((T, NUM_JOINTS, 3, 3), dtype=np.float32)
     joints = np.zeros((T, NUM_JOINTS, 3), dtype=np.float32)
     global_r[:, 0] = local_r[:, 0]
@@ -255,9 +268,34 @@ def project_rot6d_torch(x):
     return matrix_to_rot6d_torch(rot6d_to_matrix_torch(x))
 
 
+_FK_OFFSETS_TORCH_CACHE: Dict[Tuple[str, Any], Any] = {}
+
+
 def fk_24_torch(motion, parents=None, offsets=None):
-    parents = torch.as_tensor(PARENTS if parents is None else parents, device=motion.device, dtype=torch.long)
-    offsets = torch.as_tensor(OFFSETS if offsets is None else offsets, device=motion.device, dtype=motion.dtype)
+    if parents is None:
+        parent_ids = tuple(int(value) for value in PARENTS)
+    elif torch.is_tensor(parents):
+        parent_ids = tuple(
+            int(value) for value in parents.detach().cpu().tolist()
+        )
+    else:
+        parent_ids = tuple(int(value) for value in parents)
+    if offsets is None:
+        offset_key = (str(motion.device), motion.dtype)
+        offsets_t = _FK_OFFSETS_TORCH_CACHE.get(offset_key)
+        if offsets_t is None:
+            offsets_t = torch.as_tensor(
+                OFFSETS,
+                device=motion.device,
+                dtype=motion.dtype,
+            )
+            _FK_OFFSETS_TORCH_CACHE[offset_key] = offsets_t
+    else:
+        offsets_t = torch.as_tensor(
+            offsets,
+            device=motion.device,
+            dtype=motion.dtype,
+        )
     if motion.ndim < 2 or motion.shape[-1] != EDGE_DIM:
         raise ValueError(f"Expected [...,{EDGE_DIM}], got {tuple(motion.shape)}")
     leading = motion.shape[:-1]
@@ -268,13 +306,13 @@ def fk_24_torch(motion, parents=None, offsets=None):
     global_r = []
     joints = []
     for j in range(NUM_JOINTS):
-        p = int(parents[j].item())
+        p = parent_ids[j]
         if j == 0 or p < 0:
             gr = local_r[:, j]
             pos = root
         else:
             gr = torch.matmul(global_r[p], local_r[:, j])
-            off = offsets[j].view(1, 3, 1)
+            off = offsets_t[j].view(1, 3, 1)
             pos = joints[p] + torch.matmul(global_r[p], off).squeeze(-1)
         global_r.append(gr)
         joints.append(pos)
@@ -394,6 +432,13 @@ class MotionGenerationConfig:
     diffusion_train_steps: int = 15000
     refiner_train_steps: int = 8000
     batch_size: int = 64
+    inference_window_batch_size: int = 16
+    gpu_preprocessing: bool = True
+    # Bound diffusion inference noise independently of whole-song duration.
+    # One window stores [diffusion_steps, window_len, PRODUCT_STATE_DIM]
+    # float values; the runtime further caps the configured inference batch so
+    # this temporary tensor cannot grow without limit.
+    diffusion_noise_batch_max_mib: float = 256.0
     lr: float = 2e-4
     seed: int = 42
     device: str = "cuda"
@@ -442,6 +487,18 @@ class MotionGenerationConfig:
             "MOTION_TRANSITION_MASK_HALO_SECONDS": ("transition_mask_halo_seconds", float),
             "MOTION_WINDOW_LEN": ("window_len", int),
             "MOTION_HOP_LEN": ("hop_len", int),
+            "MOTION_INFERENCE_WINDOW_BATCH_SIZE": (
+                "inference_window_batch_size",
+                int,
+            ),
+            "MOTION_GPU_PREPROCESSING": (
+                "gpu_preprocessing",
+                lambda x: bool(int(x)),
+            ),
+            "MOTION_DIFFUSION_NOISE_BATCH_MAX_MIB": (
+                "diffusion_noise_batch_max_mib",
+                float,
+            ),
             "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
             "MOTION_MAX_EVENT_FRAMES": ("max_event_frames", int),
             "MOTION_IK_ITERS": ("ik_iters", int),
@@ -476,8 +533,37 @@ class MotionGenerationConfig:
         for e, (attr, caster) in env_map.items():
             if e in os.environ:
                 setattr(self, attr, caster(os.environ[e]))
-        if self.device == "cuda" and (torch is None or not torch.cuda.is_available()):
-            self.device = "cpu"
+        if torch is None:
+            if str(self.device).startswith("cuda"):
+                self.device = "cpu"
+            return self
+        try:
+            resolved_device = torch.device(self.device)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid MOTION_DEVICE {self.device!r}") from exc
+        if resolved_device.type == "cuda":
+            if not torch.cuda.is_available():
+                print(
+                    json.dumps(
+                        {
+                            "stage": "motion_device_resolution",
+                            "requested": str(self.device),
+                            "resolved": "cpu",
+                            "reason": "cuda_unavailable",
+                        }
+                    ),
+                    flush=True,
+                )
+                self.device = "cpu"
+            elif (
+                resolved_device.index is not None
+                and resolved_device.index >= torch.cuda.device_count()
+            ):
+                raise ValueError(
+                    f"MOTION_DEVICE {self.device!r} selects CUDA index "
+                    f"{resolved_device.index}, but only "
+                    f"{torch.cuda.device_count()} CUDA device(s) are visible"
+                )
         return self
 
 
@@ -754,7 +840,11 @@ def project_edge151_rot6d_np(motion: np.ndarray) -> Tuple[np.ndarray, dict]:
     rot = x[:, ROT6D_START:ROT6D_END].reshape(x.shape[0], NUM_JOINTS, 6)
     rot, sanitize_report = sanitize_rot6d_np(rot)
     x[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(
-        rot6d_to_matrix_np(rot.reshape(x.shape[0], NUM_JOINTS, 6))
+        rot6d_to_matrix_np(
+            rot.reshape(x.shape[0], NUM_JOINTS, 6),
+            project=False,
+        ),
+        project=False,
     ).reshape(x.shape[0], -1)
     sanitize_report["projected"] = True
     return x.astype(np.float32), sanitize_report
@@ -2112,20 +2202,41 @@ def _risk_masks_for_batch_np(
     motion_batch: np.ndarray,
     seam_batch: np.ndarray,
     cfg: MotionGenerationConfig,
+    *,
+    executor: Optional[ThreadPoolExecutor] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build the same frame x joint risk masks for training and inference."""
-    joint_masks: List[np.ndarray] = []
-    root_masks: List[np.ndarray] = []
-    contact_masks: List[np.ndarray] = []
-    for motion, seam in zip(
-        np.asarray(motion_batch, dtype=np.float32),
-        np.asarray(seam_batch, dtype=np.float32),
-    ):
-        masks = build_frame_joint_risk_mask(
+    """Build ordered frame x joint risk masks for a complete training batch."""
+    motions = np.asarray(motion_batch, dtype=np.float32)
+    seams = np.asarray(seam_batch, dtype=np.float32)
+    if motions.ndim != 3 or motions.shape[-1] != EDGE_DIM:
+        raise ValueError(
+            f"motion_batch must have shape [B,T,{EDGE_DIM}], got "
+            f"{motions.shape}"
+        )
+    if seams.ndim not in {2, 3} or seams.shape[:2] != motions.shape[:2]:
+        raise ValueError(
+            f"seam_batch must be event-aligned with {motions.shape[:2]}, "
+            f"got {seams.shape}"
+        )
+
+    def build_one(pair: Tuple[np.ndarray, np.ndarray]):
+        motion, seam = pair
+        return build_frame_joint_risk_mask(
             motion,
             seam,
             fps=float(cfg.fps),
         )
+
+    pairs = list(zip(motions, seams))
+    masks_batch = (
+        list(executor.map(build_one, pairs))
+        if executor is not None and len(pairs) > 1
+        else [build_one(pair) for pair in pairs]
+    )
+    joint_masks: List[np.ndarray] = []
+    root_masks: List[np.ndarray] = []
+    contact_masks: List[np.ndarray] = []
+    for masks in masks_batch:
         joint_masks.append(np.asarray(masks["joint"], dtype=np.float32))
         root_masks.append(np.asarray(masks["root"], dtype=np.float32)[:, None])
         contact_masks.append(
@@ -2136,6 +2247,542 @@ def _risk_masks_for_batch_np(
         np.stack(root_masks),
         np.stack(contact_masks),
     )
+
+
+_RISK_ANCESTORS_TORCH_CACHE: Dict[Tuple[str, int], Any] = {}
+
+
+def _risk_mask_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _risk_mask_env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _risk_ancestor_matrix_torch(device: Any, parent_depth: int):
+    key = (str(device), int(parent_depth))
+    cached = _RISK_ANCESTORS_TORCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ancestors = np.zeros((NUM_JOINTS, NUM_JOINTS), dtype=np.float32)
+    for source_joint in range(NUM_JOINTS):
+        chain_joint = source_joint
+        for _ in range(max(0, int(parent_depth)) + 1):
+            if chain_joint < 0 or chain_joint >= NUM_JOINTS:
+                break
+            ancestors[source_joint, chain_joint] = 1.0
+            chain_joint = int(PARENTS[chain_joint])
+    cached = torch.as_tensor(ancestors, device=device)
+    _RISK_ANCESTORS_TORCH_CACHE[key] = cached
+    return cached
+
+
+def _risk_masks_for_batch_torch(
+    motion_batch: Any,
+    seam_batch: Any,
+    cfg: MotionGenerationConfig,
+) -> Tuple[Any, Any, Any]:
+    """Build the formal repair masks as one device-resident batch.
+
+    This mirrors ``build_frame_joint_risk_mask``: seam dilation, robust
+    angular risk, world-space Peak-Jerk, parent-chain expansion, body-part
+    propagation, root acceleration and contact changes.  Keeping the result on
+    the model device removes one CPU/SciPy pass and three host-to-device copies
+    per sample.
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for batched risk masks")
+    motion = motion_batch
+    seam = seam_batch
+    if motion.ndim != 3 or motion.shape[-1] != EDGE_DIM:
+        raise ValueError(
+            f"motion_batch must have shape [B,T,{EDGE_DIM}], got "
+            f"{tuple(motion.shape)}"
+        )
+    if seam.ndim == 2:
+        seam = seam.unsqueeze(-1)
+    if seam.ndim != 3 or seam.shape[:2] != motion.shape[:2]:
+        raise ValueError(
+            f"seam_batch must be event-aligned with {tuple(motion.shape[:2])}, "
+            f"got {tuple(seam.shape)}"
+        )
+    if motion.device != seam.device:
+        raise ValueError("motion_batch and seam_batch must share one device")
+    if not motion.is_floating_point() or not seam.is_floating_point():
+        raise ValueError("motion_batch and seam_batch must be floating tensors")
+
+    batch, frames = int(motion.shape[0]), int(motion.shape[1])
+    dtype, device = motion.dtype, motion.device
+    seam_active = seam.amax(dim=-1) > 0.01
+    dilation = max(
+        0,
+        int(
+            round(
+                _risk_mask_env_int("GROUNDING_MASK_DILATE", 3)
+                * float(cfg.fps)
+                / 30.0
+            )
+        ),
+    )
+    if dilation > 0:
+        seam_active = F.max_pool1d(
+            seam_active.to(dtype).unsqueeze(1),
+            kernel_size=2 * dilation + 1,
+            stride=1,
+            padding=dilation,
+        ).squeeze(1) > 0.0
+
+    rotations = rot6d_to_matrix_torch(
+        motion[..., ROT6D_START:ROT6D_END].reshape(
+            batch, frames, NUM_JOINTS, 6
+        )
+    )
+    angular_speed = torch.zeros(
+        (batch, frames, NUM_JOINTS),
+        dtype=dtype,
+        device=device,
+    )
+    angular_acceleration = torch.zeros_like(angular_speed)
+    if frames > 1:
+        relative = rotations[:, :-1].transpose(-1, -2) @ rotations[:, 1:]
+        omega = so3_log_torch(relative) * float(cfg.fps)
+        angular_speed[:, 1:] = torch.linalg.vector_norm(omega, dim=-1)
+        if frames > 2:
+            alpha = torch.diff(omega, dim=1) * float(cfg.fps)
+            angular_acceleration[:, 2:] = torch.linalg.vector_norm(
+                alpha,
+                dim=-1,
+            )
+
+    def robust_z(values: Any):
+        median = torch.quantile(
+            values,
+            0.5,
+            dim=1,
+            keepdim=True,
+            interpolation="linear",
+        )
+        mad = torch.quantile(
+            (values - median).abs(),
+            0.5,
+            dim=1,
+            keepdim=True,
+            interpolation="linear",
+        ) + 1.0e-5
+        return torch.clamp_min(
+            (values - median) / (1.4826 * mad),
+            0.0,
+        )
+
+    risk = (
+        0.55 * torch.clamp(robust_z(angular_speed) / 5.0, 0.0, 1.0)
+        + 0.45
+        * torch.clamp(
+            robust_z(angular_acceleration) / 5.0,
+            0.0,
+            1.0,
+        )
+    )
+    risk = risk * seam_active[..., None].to(dtype)
+    minimum = _risk_mask_env_float("GROUNDING_MASK_MIN_ON_SEAM", 0.18)
+    risk = torch.where(
+        seam_active[..., None],
+        torch.clamp_min(risk, minimum),
+        risk,
+    )
+
+    peak_cfg = PeakJerkMaskConfig.from_environment()
+    peak_joint = torch.zeros_like(risk)
+    if peak_cfg.enabled and frames >= 4:
+        # The authoritative NumPy Peak-Jerk contract promotes FK positions to
+        # float64 before taking a third difference.  Match that precision here
+        # so samples close to the formal threshold cannot change support merely
+        # because GPU preprocessing is enabled.
+        joints = fk_24_torch(motion).to(dtype=torch.float64)
+        jerk = torch.diff(joints, n=3, dim=1) * float(cfg.fps) ** 3
+        jerk_norm = torch.linalg.vector_norm(jerk, dim=-1)
+        percentile = float(np.clip(peak_cfg.percentile, 0.0, 100.0))
+        adaptive = torch.quantile(
+            jerk_norm.reshape(batch, -1),
+            percentile / 100.0,
+            dim=1,
+            interpolation="linear",
+        )
+        threshold = torch.maximum(
+            adaptive,
+            torch.full_like(adaptive, peak_cfg.absolute_threshold_mps3),
+        )
+        risky = jerk_norm >= threshold[:, None, None]
+        radius = max(
+            0,
+            int(
+                round(
+                    int(peak_cfg.radius_frames_at_30fps)
+                    * float(cfg.fps)
+                    / 30.0
+                )
+            ),
+        )
+        # Derivative sample d owns motion frames [d-r, d+3+r].
+        expanded = F.max_pool1d(
+            F.pad(
+                risky.permute(0, 2, 1).to(dtype),
+                (3 + radius, 3 + radius),
+            ),
+            kernel_size=4 + 2 * radius,
+            stride=1,
+        ).permute(0, 2, 1) > 0.0
+        ancestors = _risk_ancestor_matrix_torch(
+            device,
+            int(peak_cfg.parent_depth),
+        ).to(dtype=dtype)
+        peak_joint = (
+            expanded.to(dtype) @ ancestors > 0.0
+        ).to(dtype)
+
+    risk = torch.maximum(risk, peak_joint)
+    for ids in BODY_PARTS.values():
+        indices = list(map(int, ids))
+        part = risk[..., indices].amax(dim=-1, keepdim=True)
+        risk[..., indices] = torch.maximum(
+            risk[..., indices],
+            part
+            * _risk_mask_env_float("GROUNDING_PART_PROPAGATION", 0.65),
+        )
+
+    root_velocity = torch.zeros(
+        (batch, frames, 3), dtype=dtype, device=device
+    )
+    root_acceleration = torch.zeros_like(root_velocity)
+    root = motion[..., [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+    if frames > 1:
+        root_velocity[:, 1:] = torch.diff(root, dim=1) * float(cfg.fps)
+    if frames > 2:
+        root_acceleration[:, 2:] = (
+            torch.diff(root_velocity[:, 1:], dim=1) * float(cfg.fps)
+        )
+    root_score = torch.clamp(
+        torch.linalg.vector_norm(root_acceleration, dim=-1)
+        / _risk_mask_env_float("GROUNDING_ROOT_ACC_MASK_SCALE", 8.0),
+        0.0,
+        1.0,
+    ) * seam_active.to(dtype)
+    root_score = torch.maximum(root_score, peak_joint[..., 0])
+
+    contact_score = torch.zeros(
+        (batch, frames), dtype=dtype, device=device
+    )
+    if frames > 1:
+        contact_score[:, 1:] = (
+            torch.diff(motion[..., :4].clamp(0.0, 1.0), dim=1)
+            .abs()
+            .amax(dim=-1)
+            * float(cfg.fps)
+            / 30.0
+        )
+    contact_score = torch.maximum(
+        contact_score * seam_active.to(dtype),
+        seam_active.to(dtype) * 0.25,
+    )
+    contact_score = torch.maximum(
+        contact_score,
+        peak_joint[..., list(DEFAULT_FOOT_JOINTS)].amax(dim=-1),
+    )
+
+    return (
+        risk.clamp(0.0, 1.0),
+        root_score.clamp(0.0, 1.0).unsqueeze(-1),
+        contact_score.clamp(0.0, 1.0).unsqueeze(-1),
+    )
+
+
+def _gpu_preprocessing_enabled(
+    cfg: MotionGenerationConfig,
+    device: Any,
+) -> bool:
+    resolved = torch.device(device) if torch is not None else None
+    return bool(
+        torch is not None
+        and bool(cfg.gpu_preprocessing)
+        and resolved is not None
+        and resolved.type == "cuda"
+        and torch.cuda.is_available()
+    )
+
+
+def _diffusion_noise_window_cap(
+    cfg: MotionGenerationConfig,
+    *,
+    steps: int,
+    window: int,
+    dtype: Any,
+) -> int:
+    """Maximum noise windows allowed in one inference allocation."""
+    if int(steps) < 1 or int(window) < 1:
+        raise ValueError(
+            "diffusion noise requires positive steps and window length, got "
+            f"steps={steps!r}, window={window!r}"
+        )
+    limit_mib = float(cfg.diffusion_noise_batch_max_mib)
+    if not np.isfinite(limit_mib) or limit_mib <= 0.0:
+        raise ValueError(
+            "diffusion_noise_batch_max_mib must be a positive finite value, "
+            f"got {limit_mib!r}"
+        )
+    element_size = torch.empty((), dtype=dtype).element_size()
+    bytes_per_window = (
+        int(steps)
+        * int(window)
+        * int(PRODUCT_STATE_DIM)
+        * int(element_size)
+    )
+    limit_bytes = int(limit_mib * (1024 ** 2))
+    if limit_bytes < bytes_per_window:
+        minimum_mib = bytes_per_window / float(1024 ** 2)
+        raise ValueError(
+            "diffusion_noise_batch_max_mib is smaller than one diffusion "
+            f"window ({limit_mib:.3f} MiB configured, "
+            f"{minimum_mib:.3f} MiB required)"
+        )
+    return max(1, limit_bytes // bytes_per_window)
+
+
+def _diffusion_noise_batch_torch(
+    window_indices: Sequence[int],
+    *,
+    base_seed: int,
+    steps: int,
+    window: int,
+    dtype: Any,
+    device: Any,
+):
+    """Create bounded per-window noise independent of batch partitioning.
+
+    A separate deterministic generator per global window avoids both the old
+    full-song allocation and batch-size-dependent random streams.  Each window
+    still uses one device allocation instead of one allocation per diffusion
+    step.
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for diffusion noise")
+    indices = [int(value) for value in window_indices]
+    if not indices:
+        raise ValueError("window_indices must not be empty")
+    resolved = torch.device(device)
+    modulus = (1 << 63) - 1
+    noise = torch.empty(
+        (len(indices), int(steps), int(window), int(PRODUCT_STATE_DIM)),
+        dtype=dtype,
+        device=resolved,
+    )
+    for row_index, global_index in enumerate(indices):
+        if global_index < 0:
+            raise ValueError("window indices must be non-negative")
+        generator = torch.Generator(device=resolved)
+        window_seed = (
+            int(base_seed) + 0x9E3779B1 * int(global_index)
+        ) % modulus
+        generator.manual_seed(window_seed)
+        noise[row_index].normal_(generator=generator)
+    return noise
+
+
+_SYMMETRIC_PAD_INDEX_TORCH_CACHE: Dict[Tuple[str, int, int], Any] = {}
+
+
+def _symmetric_pad_indices_torch(
+    frames: int,
+    radius: int,
+    device: Any,
+):
+    key = (str(device), int(frames), int(radius))
+    cached = _SYMMETRIC_PAD_INDEX_TORCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    positions = torch.arange(
+        -int(radius),
+        int(frames) + int(radius),
+        device=device,
+        dtype=torch.long,
+    )
+    period = max(2, 2 * int(frames))
+    folded = torch.remainder(positions, period)
+    indices = torch.where(
+        folded < int(frames),
+        folded,
+        2 * int(frames) - 1 - folded,
+    )
+    _SYMMETRIC_PAD_INDEX_TORCH_CACHE[key] = indices
+    return indices
+
+
+def _median_bool_filter_torch(values: Any, size: int):
+    window = max(1, int(size))
+    if window <= 1 or values.shape[1] <= 1:
+        return values.to(dtype=torch.bool)
+    if window % 2 == 0:
+        window += 1
+    radius = window // 2
+    indices = _symmetric_pad_indices_torch(
+        int(values.shape[1]),
+        radius,
+        values.device,
+    )
+    padded = values.index_select(1, indices).to(dtype=torch.int16)
+    votes = padded.unfold(1, window, 1).sum(dim=-1)
+    return votes >= (radius + 1)
+
+
+def _enforce_internal_batch_contract_torch(
+    motion_batch: Any,
+    cfg: MotionGenerationConfig,
+    *,
+    derive_contact: bool = True,
+):
+    """GPU contract finalization for validated internal motion batches.
+
+    The general NumPy guard retains fallback reports for arbitrary external
+    input.  Training corruption is narrower: its source is already validated,
+    only finite root/Rot6D noise is added, and the batch needs rotation
+    projection plus FK contact reconstruction.  This specialized path mirrors
+    those operations without moving every sample back through CPU/SciPy.
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required for GPU training finalization")
+    if motion_batch.ndim != 3 or motion_batch.shape[-1] != EDGE_DIM:
+        raise ValueError(
+            f"training motion must be [B,T,{EDGE_DIM}], got "
+            f"{tuple(motion_batch.shape)}"
+        )
+    motion = motion_batch.clone()
+    motion[..., :ROT6D_START] = torch.nan_to_num(
+        motion[..., :ROT6D_START],
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    batch, frames = int(motion.shape[0]), int(motion.shape[1])
+    rotations6d = motion[..., ROT6D_START:ROT6D_END].reshape(
+        batch,
+        frames,
+        NUM_JOINTS,
+        6,
+    )
+    finite_rotation = torch.isfinite(rotations6d).all(dim=-1)
+    rotations6d = torch.nan_to_num(
+        rotations6d,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    a1, a2 = rotations6d[..., :3], rotations6d[..., 3:]
+    n1 = torch.linalg.vector_norm(a1, dim=-1)
+    n2 = torch.linalg.vector_norm(a2, dim=-1)
+    cross_norm = torch.linalg.vector_norm(torch.cross(a1, a2, dim=-1), dim=-1)
+    invalid = (
+        ~finite_rotation
+        | (n1 < 1.0e-5)
+        | (n2 < 1.0e-5)
+        | (cross_norm < 1.0e-5)
+    )
+    identity = torch.as_tensor(
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        dtype=motion.dtype,
+        device=motion.device,
+    )
+    rotations6d = torch.where(
+        invalid[..., None],
+        identity,
+        rotations6d,
+    )
+    projected = matrix_to_rot6d_torch(
+        rot6d_to_matrix_torch(rotations6d)
+    )
+    motion[..., ROT6D_START:ROT6D_END] = projected.reshape(
+        batch,
+        frames,
+        -1,
+    )
+    if not derive_contact:
+        motion[..., :4] = motion[..., :4].clamp(0.0, 1.0)
+        return motion
+
+    joints = fk_24_torch(motion)
+    feet = joints[..., list(DEFAULT_FOOT_JOINTS), :]
+    foot_y = feet[..., 1]
+    floor_y = torch.quantile(
+        foot_y.reshape(batch, -1),
+        0.05,
+        dim=1,
+        interpolation="linear",
+    )
+    velocity = torch.zeros(
+        feet.shape[:-1],
+        dtype=motion.dtype,
+        device=motion.device,
+    )
+    if frames > 1:
+        velocity[:, 1:] = (
+            torch.linalg.vector_norm(
+                feet[:, 1:, :, (0, 2)] - feet[:, :-1, :, (0, 2)],
+                dim=-1,
+            )
+            * float(cfg.fps)
+        )
+    height_score = torch.clamp(
+        1.0
+        - (foot_y - floor_y[:, None, None])
+        / max(float(cfg.ik_height_margin), 1.0e-6),
+        0.0,
+        1.0,
+    )
+    speed_score = torch.clamp(
+        1.0 - velocity / max(float(cfg.ik_speed_gate_mps), 1.0e-6),
+        0.0,
+        1.0,
+    )
+    confidence = 0.62 * height_score + 0.38 * speed_score
+    event = torch.where(
+        confidence >= float(cfg.ik_contact_high),
+        torch.ones_like(confidence, dtype=torch.int8),
+        torch.where(
+            confidence <= float(cfg.ik_contact_low),
+            -torch.ones_like(confidence, dtype=torch.int8),
+            torch.zeros_like(confidence, dtype=torch.int8),
+        ),
+    )
+    frame_index = torch.arange(
+        frames,
+        device=motion.device,
+        dtype=torch.long,
+    )[None, :, None]
+    last_event_index = torch.where(
+        event != 0,
+        frame_index,
+        torch.full_like(frame_index, -1),
+    ).cummax(dim=1).values
+    gathered_event = torch.gather(
+        event,
+        1,
+        last_event_index.clamp_min(0).expand_as(event),
+    )
+    contact = (last_event_index >= 0) & (gathered_event > 0)
+    median_frames = max(1, int(round(float(cfg.fps) / 6.0)))
+    if median_frames % 2 == 0:
+        median_frames += 1
+    contact = _median_bool_filter_torch(contact, median_frames)
+    contact &= velocity <= float(
+        getattr(cfg, "ik_contact_break_speed_mps", 0.54)
+    )
+    motion[..., :4] = contact.to(dtype=motion.dtype)
+    return motion
 
 
 def _decode_product_refiner_output(
@@ -2180,8 +2827,13 @@ def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
             "physics loss expects matching [B,T,151] tensors, got "
             f"{tuple(prediction.shape)} and {tuple(clean.shape)}"
         )
-    predicted_joints = fk_24_torch(prediction)
-    clean_joints = fk_24_torch(clean)
+    # One batched FK halves the Python joint-loop and GPU kernel-launch count.
+    # Batch items remain independent, so this is numerically equivalent to two
+    # separate FK calls while keeping gradients for ``prediction`` intact.
+    batch_size = prediction.shape[0]
+    combined_joints = fk_24_torch(torch.cat([prediction, clean], dim=0))
+    predicted_joints = combined_joints[:batch_size]
+    clean_joints = combined_joints[batch_size:]
     foot_ids = list(DEFAULT_FOOT_JOINTS)
     predicted_feet = predicted_joints[:, :, foot_ids]
     clean_feet = clean_joints[:, :, foot_ids]
@@ -2261,6 +2913,36 @@ def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
         + float(cfg.physics_jerk_loss_weight) * jerk_loss
     )
     return total, terms
+
+
+def _training_risk_mask_executor(
+    batch_size: int,
+) -> Tuple[Optional[ThreadPoolExecutor], int]:
+    configured = os.environ.get("MOTION_RISK_MASK_WORKERS")
+    if configured is None:
+        requested = min(8, max(1, int(os.cpu_count() or 1)))
+    else:
+        try:
+            requested = int(configured)
+        except ValueError as exc:
+            raise ValueError(
+                "MOTION_RISK_MASK_WORKERS must be an integer"
+            ) from exc
+    workers = min(max(1, requested), max(1, int(batch_size)))
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    print(
+        json.dumps(
+            {
+                "stage": "risk_mask_batch",
+                "batch_size": int(batch_size),
+                "workers": workers,
+                "parallel": executor is not None,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return executor, workers
 
 
 def _product_motion_losses(
@@ -2343,6 +3025,176 @@ def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[Motio
     return load_motion_window(p, target_len, cfg)
 
 
+def _load_motion_array(path: str | Path) -> np.ndarray:
+    """Load one event array once and validate the training representation."""
+    motion = np.asarray(np.load(str(path), allow_pickle=False), dtype=np.float32)
+    if motion.ndim != 2 or motion.shape[1] != EDGE_DIM:
+        raise RuntimeError(
+            f"motion event must have shape [frames,{EDGE_DIM}], got "
+            f"{motion.shape} for {path}"
+        )
+    if motion.shape[0] < 1:
+        raise RuntimeError(f"motion event has no frames: {path}")
+    if not np.isfinite(motion).all():
+        raise RuntimeError(f"motion event contains non-finite values: {path}")
+    return np.ascontiguousarray(motion)
+
+
+def _motion_window_from_array(
+    motion: np.ndarray,
+    target_len: int,
+    cfg: Optional[MotionGenerationConfig],
+    *,
+    source_hint: str,
+    random_crop: bool = True,
+) -> np.ndarray:
+    """Create a contract-valid window without performing file I/O."""
+    m = np.asarray(motion, dtype=np.float32)
+    if m.shape[0] == target_len:
+        out = m
+    elif m.shape[0] > target_len:
+        start = (
+            random.randint(0, m.shape[0] - target_len)
+            if random_crop
+            else (m.shape[0] - target_len) // 2
+        )
+        out = m[start:start + target_len]
+    else:
+        out = resample_motion_np(m, target_len)
+    out, _ = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint=source_hint,
+        derive_contact=True,
+        project_rot=True,
+    )
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+@dataclasses.dataclass(frozen=True)
+class PreloadedMotionWindowPool:
+    """Event-aligned in-memory windows for formal motion-model training.
+
+    Refiner events longer than the requested window remain raw so every sample
+    keeps the original random-crop distribution. Shorter/equal events and all
+    diffusion inputs are deterministic, so their contract-valid windows are
+    prepared once instead of being rebuilt at every optimization step.
+    """
+
+    paths: Tuple[str, ...]
+    raw_motions: Tuple[np.ndarray, ...]
+    fixed_windows: Tuple[Optional[np.ndarray], ...]
+    target_len: int
+    mode: str
+    cfg: MotionGenerationConfig
+    unique_paths: int
+    resident_bytes: int
+
+    @classmethod
+    def preload(
+        cls,
+        paths: Sequence[str | Path],
+        target_len: int,
+        cfg: MotionGenerationConfig,
+        *,
+        mode: str,
+    ) -> "PreloadedMotionWindowPool":
+        if mode not in {"refiner", "diffusion"}:
+            raise ValueError(f"unsupported motion preload mode: {mode!r}")
+        normalized_paths = tuple(str(path) for path in paths)
+        if not normalized_paths:
+            raise RuntimeError(f"cannot preload an empty {mode} motion dataset")
+
+        array_cache: Dict[str, np.ndarray] = {}
+        fixed_cache: Dict[str, np.ndarray] = {}
+        raw_motions: List[np.ndarray] = []
+        fixed_windows: List[Optional[np.ndarray]] = []
+        for path in normalized_paths:
+            if path not in array_cache:
+                raw = _load_motion_array(path)
+                raw.setflags(write=False)
+                array_cache[path] = raw
+            raw = array_cache[path]
+            raw_motions.append(raw)
+
+            deterministic = mode == "diffusion" or raw.shape[0] <= target_len
+            fixed: Optional[np.ndarray] = None
+            if deterministic:
+                if path not in fixed_cache:
+                    if mode == "diffusion":
+                        prepared = resample_motion_np(raw, target_len)
+                        prepared, _ = enforce_edge151_contract_np(
+                            prepared,
+                            cfg,
+                            source_hint=f"train_diffusion_clean:{path}",
+                            derive_contact=True,
+                            project_rot=True,
+                        )
+                        prepared = np.ascontiguousarray(
+                            prepared, dtype=np.float32
+                        )
+                    else:
+                        prepared = _motion_window_from_array(
+                            raw,
+                            target_len,
+                            cfg,
+                            source_hint=f"sample_motion_window:{path}",
+                            random_crop=False,
+                        )
+                    prepared.setflags(write=False)
+                    fixed_cache[path] = prepared
+                fixed = fixed_cache[path]
+            fixed_windows.append(fixed)
+
+        resident_bytes = sum(value.nbytes for value in array_cache.values())
+        resident_bytes += sum(value.nbytes for value in fixed_cache.values())
+        pool = cls(
+            paths=normalized_paths,
+            raw_motions=tuple(raw_motions),
+            fixed_windows=tuple(fixed_windows),
+            target_len=int(target_len),
+            mode=mode,
+            cfg=cfg,
+            unique_paths=len(array_cache),
+            resident_bytes=int(resident_bytes),
+        )
+        print(
+            json.dumps(
+                {
+                    "stage": f"{mode}_motion_preload",
+                    "events": len(normalized_paths),
+                    "unique_paths": pool.unique_paths,
+                    "fixed_windows": sum(
+                        value is not None for value in fixed_windows
+                    ),
+                    "random_crop_windows": sum(
+                        value is None for value in fixed_windows
+                    ),
+                    "resident_mib": round(pool.resident_bytes / (1024 ** 2), 2),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return pool
+
+    def sample(self, index: int) -> np.ndarray:
+        fixed = self.fixed_windows[index]
+        if fixed is not None:
+            # Training corruption copies its input before mutation and the clean
+            # batch is stacked later, so returning the read-only cached view
+            # avoids an otherwise redundant full-window memcpy per sample.
+            return fixed
+        path = self.paths[index]
+        return _motion_window_from_array(
+            self.raw_motions[index],
+            self.target_len,
+            self.cfg,
+            source_hint=f"sample_motion_window:{path}",
+            random_crop=True,
+        )
+
+
 def load_motion_window(
     path: str | Path,
     target_len: int,
@@ -2352,22 +3204,25 @@ def load_motion_window(
 ) -> np.ndarray:
     """Load one event and return a contract-valid fixed-length training window."""
     p = str(path)
-    m = np.load(p).astype(np.float32)
-    if m.shape[0] == target_len:
-        out = m
-    elif m.shape[0] > target_len:
-        st = random.randint(0, m.shape[0] - target_len) if random_crop else (m.shape[0] - target_len) // 2
-        out = m[st:st + target_len]
-    else:
-        out = resample_motion_np(m, target_len)
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"sample_motion_window:{p}", derive_contact=True, project_rot=True)
-    return out.astype(np.float32)
+    return _motion_window_from_array(
+        _load_motion_array(p),
+        target_len,
+        cfg,
+        source_hint=f"sample_motion_window:{p}",
+        random_crop=random_crop,
+    )
 
 
 
 
 
-def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional[MotionGenerationConfig] = None) -> Tuple[np.ndarray, np.ndarray]:
+def degrade_for_refiner(
+    clean: np.ndarray,
+    severity: float = 0.06,
+    cfg: Optional[MotionGenerationConfig] = None,
+    *,
+    finalize_contract: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
     """Reference Inbetweening transition-masked corruption for Motion Refiner and Motion Diffusion training.
 
     Instead of arbitrary global drift only, corrupt a local transition region by
@@ -2380,7 +3235,8 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
     T, D = x.shape
     seam = np.zeros((T, 1), dtype=np.float32)
     if T <= 12:
-        x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_too_short", derive_contact=True, project_rot=True)
+        if finalize_contract:
+            x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_too_short", derive_contact=True, project_rot=True)
         return x.astype(np.float32), seam
 
     min_w = max(1, int(round(float(cfg.transition_train_min_seconds) * float(cfg.fps))))
@@ -2396,7 +3252,13 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
         prev_tail = x[max(0, a - 4):a]
         curr_head = x[b:min(T, b + 4)]
         if prev_tail.shape[0] >= 1 and curr_head.shape[0] >= 1:
-            bridge = reference_motion_inbetween_np(prev_tail, curr_head, b - a, cfg)
+            bridge = reference_motion_inbetween_np(
+                prev_tail,
+                curr_head,
+                b - a,
+                cfg,
+                finalize_contract=False,
+            )
             # Add light residual corruption mainly in root/rot channels; contacts rebuilt later.
             noise = np.zeros_like(bridge, dtype=np.float32)
             noise[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.18, size=(bridge.shape[0], 3)).astype(np.float32)
@@ -2418,7 +3280,8 @@ def degrade_for_refiner(clean: np.ndarray, severity: float = 0.06, cfg: Optional
     noise[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.025, size=(T, 3)).astype(np.float32)
     noise[:, ROT6D_START:ROT6D_END] = np.random.normal(0, severity * 0.012, size=(T, ROT6D_END - ROT6D_START)).astype(np.float32)
     x += noise
-    x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_for_transition_refiner", derive_contact=True, project_rot=True)
+    if finalize_contract:
+        x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_for_transition_refiner", derive_contact=True, project_rot=True)
     return x.astype(np.float32), np.clip(seam, 0.0, 1.0).astype(np.float32)
 
 
@@ -2549,6 +3412,7 @@ def _evaluate_refiner_validation(
     rec_values: List[float] = []
     velocity_values: List[float] = []
     physical = _new_validation_physical_accumulator()
+    gpu_preprocessing = _gpu_preprocessing_enabled(cfg, device)
     model.eval()
     try:
         with torch.no_grad():
@@ -2559,17 +3423,32 @@ def _evaluate_refiner_validation(
                     cfg,
                     random_crop=False,
                 )
-                bad, seam = degrade_for_refiner(clean, cfg=cfg)
+                bad, seam = degrade_for_refiner(
+                    clean,
+                    cfg=cfg,
+                    finalize_contract=not gpu_preprocessing,
+                )
                 clean_t = torch.from_numpy(clean[None]).float().to(device)
                 bad_t = torch.from_numpy(bad[None]).float().to(device)
                 seam_t = torch.from_numpy(seam[None]).float().to(device)
                 cond_t = torch.from_numpy(cond_z[idx][None]).float().to(device)
-                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                    bad[None], seam[None], cfg
-                )
-                joint_t = torch.from_numpy(joint_np).float().to(device)
-                root_t = torch.from_numpy(root_np).float().to(device)
-                contact_t = torch.from_numpy(contact_np).float().to(device)
+                if gpu_preprocessing:
+                    bad_t = _enforce_internal_batch_contract_torch(
+                        bad_t,
+                        cfg,
+                    )
+                    joint_t, root_t, contact_t = _risk_masks_for_batch_torch(
+                        bad_t,
+                        seam_t,
+                        cfg,
+                    )
+                else:
+                    joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                        bad[None], seam[None], cfg
+                    )
+                    joint_t = torch.from_numpy(joint_np).float().to(device)
+                    root_t = torch.from_numpy(root_np).float().to(device)
+                    contact_t = torch.from_numpy(contact_np).float().to(device)
                 output = model(bad_t, cond_t, seam_t, joint_t)
                 pred = _decode_product_refiner_output(
                     bad_t, output, joint_t, root_t, contact_t, cfg
@@ -2626,6 +3505,7 @@ def _evaluate_diffusion_validation(
     noise_values: List[float] = []
     velocity_values: List[float] = []
     physical = _new_validation_physical_accumulator()
+    gpu_preprocessing = _gpu_preprocessing_enabled(cfg, device)
     model.eval()
     try:
         with torch.no_grad():
@@ -2637,7 +3517,10 @@ def _evaluate_diffusion_validation(
                     random_crop=False,
                 )
                 retrieval, seam = degrade_for_refiner(
-                    clean, severity=0.045, cfg=cfg
+                    clean,
+                    severity=0.045,
+                    cfg=cfg,
+                    finalize_contract=not gpu_preprocessing,
                 )
                 x0 = torch.from_numpy(clean[None]).float().to(device)
                 retr = torch.from_numpy(retrieval[None]).float().to(device)
@@ -2652,12 +3535,23 @@ def _evaluate_diffusion_validation(
                 )
                 t = torch.full((1,), timestep, dtype=torch.long, device=device)
                 a = abar[t].view(1, 1, 1)
-                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                    retrieval[None], seam[None], cfg
-                )
-                joint_t = torch.from_numpy(joint_np).float().to(device)
-                root_t = torch.from_numpy(root_np).float().to(device)
-                contact_t = torch.from_numpy(contact_np).float().to(device)
+                if gpu_preprocessing:
+                    retr = _enforce_internal_batch_contract_torch(
+                        retr,
+                        cfg,
+                    )
+                    joint_t, root_t, contact_t = _risk_masks_for_batch_torch(
+                        retr,
+                        seam_t,
+                        cfg,
+                    )
+                else:
+                    joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                        retrieval[None], seam[None], cfg
+                    )
+                    joint_t = torch.from_numpy(joint_np).float().to(device)
+                    root_t = torch.from_numpy(root_np).float().to(device)
+                    contact_t = torch.from_numpy(contact_np).float().to(device)
                 state0 = _encode_reference_tangent_state(retr, x0)
                 state_mask = _tangent_state_mask(
                     joint_t, root_t, contact_t
@@ -2715,6 +3609,32 @@ def _evaluate_diffusion_validation(
     }
 
 
+def _emit_training_progress(
+    label: str,
+    step: int,
+    total_steps: int,
+    started_at: float,
+    **metrics: float,
+) -> None:
+    """Emit an unbuffered progress line with measured throughput and ETA."""
+    completed = step + 1
+    elapsed_seconds = max(time.perf_counter() - started_at, 1.0e-6)
+    steps_per_second = completed / elapsed_seconds
+    remaining_seconds = max(total_steps - completed, 0) / max(
+        steps_per_second, 1.0e-9
+    )
+    metric_text = " ".join(
+        f"{name}={float(value):.6f}" for name, value in metrics.items()
+    )
+    print(
+        f"{label} step={completed}/{total_steps} {metric_text} "
+        f"steps_per_second={steps_per_second:.4f} "
+        f"elapsed_minutes={elapsed_seconds / 60.0:.1f} "
+        f"eta_minutes={remaining_seconds / 60.0:.1f}",
+        flush=True,
+    )
+
+
 def train_refiner(args: argparse.Namespace) -> int:
     if torch is None:
         raise RuntimeError("PyTorch is required for Motion Refiner training.")
@@ -2740,37 +3660,74 @@ def train_refiner(args: argparse.Namespace) -> int:
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
     bs = min(cfg.batch_size, max(2, len(paths)))
+    motion_pool = PreloadedMotionWindowPool.preload(
+        paths,
+        cfg.window_len,
+        cfg,
+        mode="refiner",
+    )
+    gpu_preprocessing = _gpu_preprocessing_enabled(cfg, device)
+    risk_executor = None
+    if gpu_preprocessing:
+        print(
+            json.dumps(
+                {
+                    "stage": "risk_mask_batch",
+                    "backend": "torch_cuda",
+                    "batch_size": int(bs),
+                    "device": str(device),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    else:
+        risk_executor, _ = _training_risk_mask_executor(bs)
+    training_started_at = time.perf_counter()
     for step in range(steps):
         clean_batch = []
         bad_batch = []
         seam_batch = []
-        joint_mask_batch = []
-        root_mask_batch = []
-        contact_mask_batch = []
         cond_batch = []
         for _ in range(bs):
             idx = random.randrange(len(paths))
-            clean = load_motion_window(paths[idx], cfg.window_len, cfg)
-            bad, seam = degrade_for_refiner(clean, cfg=cfg)
+            clean = motion_pool.sample(idx)
+            bad, seam = degrade_for_refiner(
+                clean,
+                cfg=cfg,
+                finalize_contract=not gpu_preprocessing,
+            )
             clean_batch.append(clean)
             bad_batch.append(bad)
             seam_batch.append(seam)
-            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                bad[None], seam[None], cfg
-            )
-            joint_mask_batch.append(joint_np[0])
-            root_mask_batch.append(root_np[0])
-            contact_mask_batch.append(contact_np[0])
             cond_batch.append(desc_z[idx])
-        clean_t = torch.from_numpy(np.stack(clean_batch)).float().to(device)
-        bad_t = torch.from_numpy(np.stack(bad_batch)).float().to(device)
-        seam_t = torch.from_numpy(np.stack(seam_batch)).float().to(device)
+        clean_np = np.stack(clean_batch)
+        bad_np = np.stack(bad_batch)
+        seam_np = np.stack(seam_batch)
+        clean_t = torch.from_numpy(clean_np).float().to(device)
+        bad_t = torch.from_numpy(bad_np).float().to(device)
+        seam_t = torch.from_numpy(seam_np).float().to(device)
         cond_t = torch.from_numpy(np.stack(cond_batch)).float().to(device)
-        joint_t = torch.from_numpy(np.stack(joint_mask_batch)).float().to(device)
-        root_t = torch.from_numpy(np.stack(root_mask_batch)).float().to(device)
-        contact_t = torch.from_numpy(
-            np.stack(contact_mask_batch)
-        ).float().to(device)
+        if gpu_preprocessing:
+            bad_t = _enforce_internal_batch_contract_torch(
+                bad_t,
+                cfg,
+            )
+            joint_t, root_t, contact_t = _risk_masks_for_batch_torch(
+                bad_t,
+                seam_t,
+                cfg,
+            )
+        else:
+            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                bad_np,
+                seam_np,
+                cfg,
+                executor=risk_executor,
+            )
+            joint_t = torch.from_numpy(joint_np).float().to(device)
+            root_t = torch.from_numpy(root_np).float().to(device)
+            contact_t = torch.from_numpy(contact_np).float().to(device)
         output = model(bad_t, cond_t, seam_t, joint_t)
         pred = _decode_product_refiner_output(
             bad_t, output, joint_t, root_t, contact_t, cfg
@@ -2789,8 +3746,17 @@ def train_refiner(args: argparse.Namespace) -> int:
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if step % 200 == 0 or step == steps - 1:
-            print(f"[Boundary Refiner] step={step} loss={loss.item():.6f} rec={rec.item():.6f}")
+        if step == 0 or (step + 1) % 200 == 0 or step == steps - 1:
+            _emit_training_progress(
+                "[Boundary Refiner]",
+                step,
+                steps,
+                training_started_at,
+                loss=loss.item(),
+                rec=rec.item(),
+            )
+    if risk_executor is not None:
+        risk_executor.shutdown(wait=True)
     validation_report["metrics"] = _evaluate_refiner_validation(
         model, validation_db, db, cfg, device
     )
@@ -2813,7 +3779,18 @@ def train_refiner(args: argparse.Namespace) -> int:
         },
         "validation": validation_report,
     }, out)
-    print(json.dumps({"refiner_ckpt": str(out), "steps": steps, "validation": validation_report}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "refiner_ckpt": str(out),
+                "steps": steps,
+                "validation": validation_report,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
     return 0
 
 
@@ -2982,47 +3959,77 @@ def train_diffusion(args: argparse.Namespace) -> int:
     Tdiff = int(args.diffusion_steps or cfg.diffusion_steps)
     _, _, abar = make_beta_schedule(Tdiff, device)
     bs = min(cfg.batch_size, max(2, len(paths)))
+    motion_pool = PreloadedMotionWindowPool.preload(
+        paths,
+        cfg.window_len,
+        cfg,
+        mode="diffusion",
+    )
+    gpu_preprocessing = _gpu_preprocessing_enabled(cfg, device)
+    risk_executor = None
+    if gpu_preprocessing:
+        print(
+            json.dumps(
+                {
+                    "stage": "risk_mask_batch",
+                    "backend": "torch_cuda",
+                    "batch_size": int(bs),
+                    "device": str(device),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    else:
+        risk_executor, _ = _training_risk_mask_executor(bs)
+    training_started_at = time.perf_counter()
     for step in range(steps):
         clean_batch = []
         retr_batch = []
         seam_batch = []
-        joint_mask_batch = []
-        root_mask_batch = []
-        contact_mask_batch = []
         cond_batch = []
         for _ in range(bs):
             idx = random.randrange(len(paths))
-            clean = np.load(str(paths[idx])).astype(np.float32)
-            clean = resample_motion_np(clean, cfg.window_len)
-            clean, _ = enforce_edge151_contract_np(
-                clean, cfg, source_hint=f"train_diffusion_clean:{paths[idx]}", derive_contact=True, project_rot=True
+            clean = motion_pool.sample(idx)
+            retr, seam = degrade_for_refiner(
+                clean,
+                severity=0.045,
+                cfg=cfg,
+                finalize_contract=not gpu_preprocessing,
             )
-            retr, seam = degrade_for_refiner(clean, severity=0.045, cfg=cfg)
             clean_batch.append(clean)
             retr_batch.append(retr)
             seam_batch.append(seam)
-            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                retr[None], seam[None], cfg
-            )
-            joint_mask_batch.append(joint_np[0])
-            root_mask_batch.append(root_np[0])
-            contact_mask_batch.append(contact_np[0])
             cond_batch.append(desc_z[idx])
-        x0 = torch.from_numpy(np.stack(clean_batch)).float().to(device)
-        retr = torch.from_numpy(np.stack(retr_batch)).float().to(device)
-        seam = torch.from_numpy(np.stack(seam_batch)).float().to(device)
+        clean_np = np.stack(clean_batch)
+        retr_np = np.stack(retr_batch)
+        seam_np = np.stack(seam_batch)
+        x0 = torch.from_numpy(clean_np).float().to(device)
+        retr = torch.from_numpy(retr_np).float().to(device)
+        seam = torch.from_numpy(seam_np).float().to(device)
         cond = torch.from_numpy(np.stack(cond_batch)).float().to(device)
         t = torch.randint(0, Tdiff, (bs,), device=device)
         a = abar[t].view(bs, 1, 1)
-        joint_mask = torch.from_numpy(
-            np.stack(joint_mask_batch)
-        ).float().to(device)
-        root_mask = torch.from_numpy(
-            np.stack(root_mask_batch)
-        ).float().to(device)
-        contact_mask = torch.from_numpy(
-            np.stack(contact_mask_batch)
-        ).float().to(device)
+        if gpu_preprocessing:
+            retr = _enforce_internal_batch_contract_torch(
+                retr,
+                cfg,
+            )
+            joint_mask, root_mask, contact_mask = _risk_masks_for_batch_torch(
+                retr,
+                seam,
+                cfg,
+            )
+        else:
+            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                retr_np,
+                seam_np,
+                cfg,
+                executor=risk_executor,
+            )
+            joint_mask = torch.from_numpy(joint_np).float().to(device)
+            root_mask = torch.from_numpy(root_np).float().to(device)
+            contact_mask = torch.from_numpy(contact_np).float().to(device)
         state0 = _encode_reference_tangent_state(retr, x0)
         state_mask = _tangent_state_mask(
             joint_mask, root_mask, contact_mask
@@ -3065,13 +4072,19 @@ def train_diffusion(args: argparse.Namespace) -> int:
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if step % 250 == 0 or step == steps - 1:
-            print(
-                f"[Motion Generation diffusion] step={step} loss={loss.item():.6f} "
-                f"noise={loss_noise.item():.6f} "
-                f"physics={loss_physics.item():.6f} "
-                f"jerk={physics_terms['jerk'].item():.6f}"
+        if step == 0 or (step + 1) % 250 == 0 or step == steps - 1:
+            _emit_training_progress(
+                "[Motion Generation diffusion]",
+                step,
+                steps,
+                training_started_at,
+                loss=loss.item(),
+                noise=loss_noise.item(),
+                physics=loss_physics.item(),
+                jerk=physics_terms["jerk"].item(),
             )
+    if risk_executor is not None:
+        risk_executor.shutdown(wait=True)
     validation_report["metrics"] = _evaluate_diffusion_validation(
         model, validation_db, db, cfg, device, abar, Tdiff
     )
@@ -3095,7 +4108,18 @@ def train_diffusion(args: argparse.Namespace) -> int:
         },
         "validation": validation_report,
     }, out)
-    print(json.dumps({"diffusion_ckpt": str(out), "steps": steps, "validation": validation_report}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "diffusion_ckpt": str(out),
+                "steps": steps,
+                "validation": validation_report,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        flush=True,
+    )
     return 0
 
 
@@ -3577,7 +4601,14 @@ def _slerp_quaternion_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.nd
     return np.where(use_lerp, lerp, slerp).astype(np.float32)
 
 
-def reference_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, n_frames: int, cfg: MotionGenerationConfig) -> np.ndarray:
+def reference_motion_inbetween_np(
+    prev_tail: np.ndarray,
+    curr_head: np.ndarray,
+    n_frames: int,
+    cfg: MotionGenerationConfig,
+    *,
+    finalize_contract: bool = True,
+) -> np.ndarray:
     """Kinematic inbetweening in EDGE-151D: root Hermite + per-joint rotation SLERP.
 
     prev_tail and curr_head are short clips. The generated bridge excludes both
@@ -3627,15 +4658,32 @@ def reference_motion_inbetween_np(prev_tail: np.ndarray, curr_head: np.ndarray, 
     out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
 
     # Rotation: joint-wise quaternion SLERP, then convert back to legal Rot6D.
-    Ra = rot6d_to_matrix_np(a[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
-    Rb = rot6d_to_matrix_np(b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
+    Ra = rot6d_to_matrix_np(
+        a[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6),
+        project=False,
+    )[0]
+    Rb = rot6d_to_matrix_np(
+        b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6),
+        project=False,
+    )[0]
     qa = matrix_to_quat_np(Ra)
     qb = matrix_to_quat_np(Rb)
     q = _slerp_quaternion_np(qa, qb, phase.reshape(n, 1, 1))
     R = quat_to_matrix_np(q)
-    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(R).reshape(n, -1)
+    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(
+        R,
+        project=False,
+    ).reshape(n, -1)
 
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint="inbetween_motion_inbetween", derive_contact=True, project_rot=True)
+    if not finalize_contract:
+        return out.astype(np.float32)
+    out, _ = enforce_edge151_contract_np(
+        out,
+        cfg,
+        source_hint="inbetween_motion_inbetween",
+        derive_contact=True,
+        project_rot=True,
+    )
     return out.astype(np.float32)
 
 
@@ -3906,6 +4954,93 @@ def analytic_residual_refine(motion: np.ndarray, seam_positions: Sequence[int], 
     return out.astype(np.float32)
 
 
+_INFERENCE_MODEL_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
+
+
+def _cached_inference_model(
+    role: str,
+    ckpt_path: str | Path,
+    cfg: MotionGenerationConfig,
+) -> Dict[str, Any]:
+    """Load one immutable inference checkpoint/model per file revision."""
+    path = Path(ckpt_path).resolve()
+    stat = path.stat()
+    key = (
+        str(role),
+        str(path),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        str(cfg.device),
+    )
+    cached = _INFERENCE_MODEL_CACHE.get(key)
+    if cached is None:
+        checkpoint = _trusted_torch_load(path, map_location=cfg.device)
+        if role == "boundary_refiner":
+            expected_version = "product_manifold_boundary_refiner_v1"
+            if str(checkpoint.get("version", "")) != expected_version:
+                raise RuntimeError(
+                    "Formal generation rejects a non-product refiner checkpoint"
+                )
+            model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(cfg.device)
+            schedule = None
+        elif role == "motion_diffusion":
+            expected_version = "reference_tangent_motion_diffusion_v1"
+            if str(checkpoint.get("version", "")) != expected_version:
+                raise RuntimeError(
+                    "Formal generation rejects a non-tangent diffusion checkpoint"
+                )
+            model = TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32).to(
+                cfg.device
+            )
+            diffusion_steps = int(
+                checkpoint.get("diffusion_steps", cfg.diffusion_steps)
+            )
+            schedule = make_beta_schedule(
+                diffusion_steps,
+                torch.device(cfg.device),
+            )
+        else:
+            raise ValueError(f"unsupported inference model role: {role!r}")
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        model.eval()
+        cached = {
+            "checkpoint": checkpoint,
+            "model": model,
+            "schedule": schedule,
+        }
+        # Discard stale revisions of the same role/path/device while retaining
+        # the independent Refiner and Diffusion entries.
+        stale_keys = [
+            candidate
+            for candidate in _INFERENCE_MODEL_CACHE
+            if candidate[0] == str(role)
+            and candidate[1] == str(path)
+            and candidate[4] == str(cfg.device)
+        ]
+        for stale_key in stale_keys:
+            _INFERENCE_MODEL_CACHE.pop(stale_key, None)
+        _INFERENCE_MODEL_CACHE[key] = cached
+        print(
+            json.dumps(
+                {
+                    "stage": "motion_inference_model_cache",
+                    "role": role,
+                    "checkpoint": str(path),
+                    "cache_hit": False,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    assert_motion_checkpoint_contract(
+        cached["checkpoint"],
+        cfg,
+        path,
+        role,
+    )
+    return cached
+
+
 
 
 
@@ -3930,44 +5065,122 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         )
         return refined.astype(np.float32)
 
-    ckpt = _trusted_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(ckpt, cfg, ckpt_path, "boundary_refiner")
-    if str(ckpt.get("version", "")) != "product_manifold_boundary_refiner_v1":
-        raise RuntimeError("Formal generation rejects a non-product refiner checkpoint")
-    model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(cfg.device)
-    model.load_state_dict(ckpt["state_dict"], strict=True)
-    model.eval()
+    cached_model = _cached_inference_model(
+        "boundary_refiner",
+        ckpt_path,
+        cfg,
+    )
+    model = cached_model["model"]
+    gpu_preprocessing = _gpu_preprocessing_enabled(cfg, cfg.device)
 
     T = int(motion.shape[0])
     win = int(cfg.window_len)
     hop = max(1, min(int(getattr(cfg, "hop_len", win)), win))
     accum, weight_sum, rot_quat_accum, rot_quat_weight = init_motion_window_accumulators(T, EDGE_DIM)
+    records: List[Dict[str, Any]] = []
+    for st, ed in sliding_window_ranges(T, win, hop):
+        chunk = motion[st:ed]
+        mask = seam_mask[st:ed]
+        orig_len = len(chunk)
+        cond_in = _condition_chunk_np(
+            cond,
+            st,
+            ed,
+            win if orig_len < win else orig_len,
+        )
+        if orig_len < win:
+            chunk_in = resample_motion_np(chunk, win)
+            mask_in = resample_motion_np(mask, win)
+        else:
+            chunk_in = chunk
+            mask_in = mask
+        if not gpu_preprocessing:
+            chunk_in, _ = enforce_edge151_contract_np(
+                chunk_in,
+                cfg,
+                source_hint="apply_refiner_model:inbetween_input_chunk",
+                derive_contact=True,
+                project_rot=True,
+            )
+        records.append(
+            {
+                "start": st,
+                "end": ed,
+                "original_length": orig_len,
+                "chunk": chunk_in,
+                "condition": cond_in,
+                "mask": mask_in,
+            }
+        )
+
+    inference_batch_size = min(
+        max(1, int(cfg.inference_window_batch_size)),
+        max(1, len(records)),
+    )
+    risk_workers = (
+        0
+        if gpu_preprocessing
+        else min(
+            8,
+            max(1, int(os.cpu_count() or 1)),
+            inference_batch_size,
+        )
+    )
+    risk_executor = (
+        ThreadPoolExecutor(max_workers=risk_workers)
+        if risk_workers > 1
+        else None
+    )
+    print(
+        json.dumps(
+            {
+                "stage": "boundary_refiner_inference_windows",
+                "windows": len(records),
+                "batch_size": inference_batch_size,
+                "risk_workers": risk_workers,
+                "risk_backend": (
+                    "torch_cuda" if gpu_preprocessing else "numpy_cpu"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
     with torch.no_grad():
-        for st, ed in sliding_window_ranges(T, win, hop):
-            chunk = motion[st:ed]
-            mask = seam_mask[st:ed]
-            orig_len = len(chunk)
-            cond_in = _condition_chunk_np(cond, st, ed, win if orig_len < win else orig_len)
-            if orig_len < win:
-                chunk_in = resample_motion_np(chunk, win)
-                mask_in = resample_motion_np(mask, win)
-            else:
-                chunk_in = chunk
-                mask_in = mask
-            chunk_in, _ = enforce_edge151_contract_np(
-                chunk_in, cfg, source_hint="apply_refiner_model:inbetween_input_chunk", derive_contact=True, project_rot=True
-            )
-            x = torch.from_numpy(chunk_in[None]).float().to(cfg.device)
-            c = torch.from_numpy(cond_in[None].astype(np.float32)).float().to(cfg.device)
-            sm = torch.from_numpy(mask_in[None].astype(np.float32)).float().to(cfg.device)
+        for batch_start in range(0, len(records), inference_batch_size):
+            batch_records = records[
+                batch_start:batch_start + inference_batch_size
+            ]
+            chunk_batch = np.stack([item["chunk"] for item in batch_records])
+            condition_batch = np.stack(
+                [item["condition"] for item in batch_records]
+            ).astype(np.float32)
+            mask_batch = np.stack(
+                [item["mask"] for item in batch_records]
+            ).astype(np.float32)
+            x = torch.from_numpy(chunk_batch).float().to(cfg.device)
+            c = torch.from_numpy(condition_batch).float().to(cfg.device)
+            sm = torch.from_numpy(mask_batch).float().to(cfg.device)
+            if gpu_preprocessing:
+                x = _enforce_internal_batch_contract_torch(x, cfg)
             strength = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * sm, 0.0, 1.0)
-            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                chunk_in[None], mask_in[None], cfg
-            )
-            joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
-            root_t = torch.from_numpy(root_np).float().to(cfg.device)
-            contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
+            if gpu_preprocessing:
+                joint_t, root_t, contact_t = _risk_masks_for_batch_torch(
+                    x,
+                    sm,
+                    cfg,
+                )
+            else:
+                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                    chunk_batch,
+                    mask_batch,
+                    cfg,
+                    executor=risk_executor,
+                )
+                joint_t = torch.from_numpy(joint_np).float().to(cfg.device)
+                root_t = torch.from_numpy(root_np).float().to(cfg.device)
+                contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
             output = model(x, c, sm, joint_t)
             y = _decode_product_refiner_output(
                 x,
@@ -3977,18 +5190,53 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
                 contact_t * strength,
                 cfg,
             )
-            y_np = y[0].detach().cpu().numpy()
-            if orig_len < win:
-                y_np = resample_motion_np(y_np, orig_len)
-            y_np, _ = enforce_edge151_contract_np(
-                y_np,
-                cfg,
-                source_hint="apply_refiner_model:inbetween_output_chunk",
-                derive_contact=False,
-                project_rot=True,
+            if gpu_preprocessing:
+                y = _enforce_internal_batch_contract_torch(
+                    y,
+                    cfg,
+                    derive_contact=False,
+                )
+            proposals = y.detach().cpu().numpy()
+            for item, y_np in zip(batch_records, proposals):
+                orig_len = int(item["original_length"])
+                st = int(item["start"])
+                ed = int(item["end"])
+                if orig_len < win:
+                    y_np = resample_motion_np(y_np, orig_len)
+                    y_np, _ = enforce_edge151_contract_np(
+                        y_np,
+                        cfg,
+                        source_hint="apply_refiner_model:resampled_output_chunk",
+                        derive_contact=False,
+                        project_rot=True,
+                    )
+                elif not gpu_preprocessing:
+                    y_np, _ = enforce_edge151_contract_np(
+                        y_np,
+                        cfg,
+                        source_hint="apply_refiner_model:inbetween_output_chunk",
+                        derive_contact=False,
+                        project_rot=True,
+                    )
+                w = overlap_add_weight_np(orig_len, st, T, hop, win)
+                accumulate_motion_window_np(
+                    accum,
+                    weight_sum,
+                    rot_quat_accum,
+                    rot_quat_weight,
+                    y_np,
+                    w,
+                    st,
+                    ed,
+                )
+            print(
+                f"[Boundary Refiner inference] "
+                f"windows={min(batch_start + len(batch_records), len(records))}"
+                f"/{len(records)}",
+                flush=True,
             )
-            w = overlap_add_weight_np(orig_len, st, T, hop, win)
-            accumulate_motion_window_np(accum, weight_sum, rot_quat_accum, rot_quat_weight, y_np, w, st, ed)
+    if risk_executor is not None:
+        risk_executor.shutdown(wait=True)
 
     out, _ = finalize_motion_window_accum_np(
         accum,
@@ -4001,9 +5249,20 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
     )
     # Hard blend with original reference according to the exact transition mask.
     w = np.clip(core_strength + (trans_strength - core_strength) * seam_mask.astype(np.float32), 0.0, 1.0)
-    full_joint, full_root, full_contact = _risk_masks_for_batch_np(
-        motion[None], seam_mask[None], cfg
-    )
+    if gpu_preprocessing:
+        with torch.no_grad():
+            full_masks = _risk_masks_for_batch_torch(
+                torch.from_numpy(motion[None]).float().to(cfg.device),
+                torch.from_numpy(seam_mask[None]).float().to(cfg.device),
+                cfg,
+            )
+        full_joint, full_root, full_contact = (
+            value.cpu().numpy() for value in full_masks
+        )
+    else:
+        full_joint, full_root, full_contact = _risk_masks_for_batch_np(
+            motion[None], seam_mask[None], cfg
+        )
     tangent = product_log_np(motion, out)
     joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
     root_support = (full_root[0] * w > 0.0).astype(np.float32)
@@ -4066,41 +5325,39 @@ def apply_diffusion_model(
         "MOTION_DIFFUSION_REFERENCE_NOISE_SCALE",
         0.03,
     )
-    checkpoint = _trusted_torch_load(ckpt_path, map_location=cfg.device)
-    assert_motion_checkpoint_contract(
-        checkpoint, cfg, ckpt_path, "motion_diffusion"
+    cached_model = _cached_inference_model(
+        "motion_diffusion",
+        ckpt_path,
+        cfg,
     )
-    if str(checkpoint.get("version", "")) != "reference_tangent_motion_diffusion_v1":
-        raise RuntimeError(
-            "Formal generation rejects a non-tangent diffusion checkpoint"
-        )
+    checkpoint = cached_model["checkpoint"]
+    model = cached_model["model"]
     steps = int(checkpoint.get("diffusion_steps", cfg.diffusion_steps))
-    model = TangentDiffusionDenoiser(PRODUCT_STATE_DIM, 32).to(cfg.device)
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
-    model.eval()
-    betas, alphas, abar = make_beta_schedule(steps, torch.device(cfg.device))
+    betas, alphas, abar = cached_model["schedule"]
+    gpu_preprocessing = _gpu_preprocessing_enabled(cfg, cfg.device)
 
     total = int(motion.shape[0])
     window = int(cfg.window_len)
     hop = max(1, min(int(getattr(cfg, "hop_len", window)), window))
     accumulators = init_motion_window_accumulators(total, EDGE_DIM)
-    with torch.no_grad():
-        for start, end in sliding_window_ranges(total, window, hop):
-            retrieval_np = motion[start:end]
-            mask_np = seam_mask[start:end]
-            original_length = len(retrieval_np)
-            condition_np = _condition_chunk_np(
-                cond,
-                start,
-                end,
-                window if original_length < window else original_length,
-            )
-            if original_length < window:
-                retrieval_input = resample_motion_np(retrieval_np, window)
-                mask_input = resample_motion_np(mask_np, window)
-            else:
-                retrieval_input = retrieval_np
-                mask_input = mask_np
+    records: List[Dict[str, Any]] = []
+    for start, end in sliding_window_ranges(total, window, hop):
+        retrieval_np = motion[start:end]
+        mask_np = seam_mask[start:end]
+        original_length = len(retrieval_np)
+        condition_np = _condition_chunk_np(
+            cond,
+            start,
+            end,
+            window if original_length < window else original_length,
+        )
+        if original_length < window:
+            retrieval_input = resample_motion_np(retrieval_np, window)
+            mask_input = resample_motion_np(mask_np, window)
+        else:
+            retrieval_input = retrieval_np
+            mask_input = mask_np
+        if not gpu_preprocessing:
             retrieval_input, _ = enforce_edge151_contract_np(
                 retrieval_input,
                 cfg,
@@ -4108,8 +5365,97 @@ def apply_diffusion_model(
                 derive_contact=True,
                 project_rot=True,
             )
-            retrieval = torch.from_numpy(retrieval_input[None]).float().to(cfg.device)
-            raw_mask = torch.from_numpy(mask_input[None].astype(np.float32)).float().to(cfg.device)
+        records.append(
+            {
+                "start": start,
+                "end": end,
+                "original_length": original_length,
+                "retrieval": retrieval_input,
+                "condition": condition_np,
+                "mask": mask_input,
+            }
+        )
+
+    noise_window_cap = _diffusion_noise_window_cap(
+        cfg,
+        steps=steps,
+        window=window,
+        dtype=torch.float32,
+    )
+    inference_batch_size = min(
+        max(1, int(cfg.inference_window_batch_size)),
+        max(1, len(records)),
+        noise_window_cap,
+    )
+    # Consume the caller-controlled global stream once.  All subsequent noise
+    # is derived from the global window index, so changing batch size cannot
+    # change the generated song while memory remains bounded to one batch.
+    noise_seed = int(
+        torch.randint(
+            0,
+            (1 << 31) - 1,
+            (1,),
+            device="cpu",
+            dtype=torch.int64,
+        ).item()
+    )
+    risk_workers = (
+        0
+        if gpu_preprocessing
+        else min(
+            8,
+            max(1, int(os.cpu_count() or 1)),
+            inference_batch_size,
+        )
+    )
+    risk_executor = (
+        ThreadPoolExecutor(max_workers=risk_workers)
+        if risk_workers > 1
+        else None
+    )
+    print(
+        json.dumps(
+            {
+                "stage": "motion_diffusion_inference_windows",
+                "windows": len(records),
+                "batch_size": inference_batch_size,
+                "diffusion_steps": steps,
+                "risk_workers": risk_workers,
+                "risk_backend": (
+                    "torch_cuda" if gpu_preprocessing else "numpy_cpu"
+                ),
+                "noise_backend": "seeded_per_window_device_batch",
+                "noise_window_cap": noise_window_cap,
+                "noise_batch_max_mib": float(
+                    cfg.diffusion_noise_batch_max_mib
+                ),
+                "noise_seed": noise_seed,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    with torch.no_grad():
+        for batch_start in range(0, len(records), inference_batch_size):
+            batch_records = records[
+                batch_start:batch_start + inference_batch_size
+            ]
+            retrieval_batch = np.stack(
+                [item["retrieval"] for item in batch_records]
+            )
+            mask_batch = np.stack(
+                [item["mask"] for item in batch_records]
+            ).astype(np.float32)
+            condition_batch = np.stack(
+                [item["condition"] for item in batch_records]
+            ).astype(np.float32)
+            retrieval = torch.from_numpy(retrieval_batch).float().to(cfg.device)
+            raw_mask = torch.from_numpy(mask_batch).float().to(cfg.device)
+            if gpu_preprocessing:
+                retrieval = _enforce_internal_batch_contract_torch(
+                    retrieval,
+                    cfg,
+                )
             strength = torch.clamp(
                 float(core_strength)
                 + (float(trans_strength) - float(core_strength)) * raw_mask,
@@ -4117,14 +5463,24 @@ def apply_diffusion_model(
                 1.0,
             )
             condition = torch.from_numpy(
-                condition_np[None].astype(np.float32)
+                condition_batch
             ).float().to(cfg.device)
-            joint_np, root_np, contact_np = _risk_masks_for_batch_np(
-                retrieval_input[None], mask_input[None], cfg
-            )
-            joint = torch.from_numpy(joint_np).float().to(cfg.device)
-            root = torch.from_numpy(root_np).float().to(cfg.device)
-            contact = torch.from_numpy(contact_np).float().to(cfg.device)
+            if gpu_preprocessing:
+                joint, root, contact = _risk_masks_for_batch_torch(
+                    retrieval,
+                    raw_mask,
+                    cfg,
+                )
+            else:
+                joint_np, root_np, contact_np = _risk_masks_for_batch_np(
+                    retrieval_batch,
+                    mask_batch,
+                    cfg,
+                    executor=risk_executor,
+                )
+                joint = torch.from_numpy(joint_np).float().to(cfg.device)
+                root = torch.from_numpy(root_np).float().to(cfg.device)
+                contact = torch.from_numpy(contact_np).float().to(cfg.device)
             effective_joint = joint * strength
             effective_root = root * strength
             effective_contact = contact * strength
@@ -4132,18 +5488,26 @@ def apply_diffusion_model(
                 effective_joint, effective_root, effective_contact
             )
             active = (state_mask > 0.0).to(retrieval.dtype)
+
+            batch_noise = _diffusion_noise_batch_torch(
+                range(batch_start, batch_start + len(batch_records)),
+                base_seed=noise_seed,
+                steps=steps,
+                window=window,
+                dtype=retrieval.dtype,
+                device=cfg.device,
+            )
             state = (
                 float(noise_scale)
-                * torch.randn(
-                    retrieval.shape[:-1] + (PRODUCT_STATE_DIM,),
-                    dtype=retrieval.dtype,
-                    device=retrieval.device,
-                )
+                * batch_noise[:, 0]
                 * active
             )
             for step in reversed(range(steps)):
                 timestep = torch.full(
-                    (1,), step, device=cfg.device, dtype=torch.long
+                    (len(batch_records),),
+                    step,
+                    device=cfg.device,
+                    dtype=torch.long,
                 )
                 prediction = model(
                     state, retrieval, condition, raw_mask, joint, timestep
@@ -4161,36 +5525,67 @@ def apply_diffusion_model(
                     state = (
                         mean
                         + torch.sqrt(beta)
-                        * torch.randn_like(state)
+                        * batch_noise[:, steps - step]
                         * 0.35
                         * active
                     )
                 else:
                     state = mean
                 state = state * active
-            proposal = _decode_reference_tangent_state(
+            proposals = _decode_reference_tangent_state(
                 retrieval,
                 state,
                 effective_joint,
                 effective_root,
                 effective_contact,
                 cfg,
-            )[0].detach().cpu().numpy()
-            if original_length < window:
-                proposal = resample_motion_np(proposal, original_length)
-            proposal, _ = enforce_edge151_contract_np(
-                proposal,
-                cfg,
-                source_hint="apply_diffusion_model:output_chunk",
-                derive_contact=False,
-                project_rot=True,
             )
-            weight = overlap_add_weight_np(
-                original_length, start, total, hop, window
+            if gpu_preprocessing:
+                proposals = _enforce_internal_batch_contract_torch(
+                    proposals,
+                    cfg,
+                    derive_contact=False,
+                )
+            proposals = proposals.detach().cpu().numpy()
+            for item, proposal in zip(batch_records, proposals):
+                original_length = int(item["original_length"])
+                start = int(item["start"])
+                end = int(item["end"])
+                if original_length < window:
+                    proposal = resample_motion_np(proposal, original_length)
+                    proposal, _ = enforce_edge151_contract_np(
+                        proposal,
+                        cfg,
+                        source_hint="apply_diffusion_model:resampled_output_chunk",
+                        derive_contact=False,
+                        project_rot=True,
+                    )
+                elif not gpu_preprocessing:
+                    proposal, _ = enforce_edge151_contract_np(
+                        proposal,
+                        cfg,
+                        source_hint="apply_diffusion_model:output_chunk",
+                        derive_contact=False,
+                        project_rot=True,
+                    )
+                weight = overlap_add_weight_np(
+                    original_length, start, total, hop, window
+                )
+                accumulate_motion_window_np(
+                    *accumulators,
+                    proposal,
+                    weight,
+                    start,
+                    end,
+                )
+            print(
+                f"[Motion diffusion inference] "
+                f"windows={min(batch_start + len(batch_records), len(records))}"
+                f"/{len(records)}",
+                flush=True,
             )
-            accumulate_motion_window_np(
-                *accumulators, proposal, weight, start, end
-            )
+    if risk_executor is not None:
+        risk_executor.shutdown(wait=True)
 
     out, _ = finalize_motion_window_accum_np(
         *accumulators,
@@ -4204,9 +5599,20 @@ def apply_diffusion_model(
         0.0,
         1.0,
     )
-    full_joint, full_root, full_contact = _risk_masks_for_batch_np(
-        motion[None], seam_mask[None], cfg
-    )
+    if gpu_preprocessing:
+        with torch.no_grad():
+            full_masks = _risk_masks_for_batch_torch(
+                torch.from_numpy(motion[None]).float().to(cfg.device),
+                torch.from_numpy(seam_mask[None]).float().to(cfg.device),
+                cfg,
+            )
+        full_joint, full_root, full_contact = (
+            value.cpu().numpy() for value in full_masks
+        )
+    else:
+        full_joint, full_root, full_contact = _risk_masks_for_batch_np(
+            motion[None], seam_mask[None], cfg
+        )
     tangent = product_log_np(motion, out)
     geometry = masked_retract_np(
         motion,
@@ -4231,8 +5637,22 @@ def apply_diffusion_model(
     return geometry.astype(np.float32)
 
 
-def derive_contacts_np(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-    joints = fk_24_np(motion)
+def derive_contacts_np(
+    motion: np.ndarray,
+    cfg: MotionGenerationConfig,
+    *,
+    precomputed_joints: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    joints = (
+        fk_24_np(motion)
+        if precomputed_joints is None
+        else np.asarray(precomputed_joints, dtype=np.float32)
+    )
+    expected_joints = (len(np.asarray(motion)), NUM_JOINTS, 3)
+    if joints.shape != expected_joints:
+        raise ValueError(
+            f"Expected precomputed joints {expected_joints}, got {joints.shape}"
+        )
     foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
     foot_y = foot[..., 1]
     floor_y = float(np.percentile(foot_y.reshape(-1), 5))
@@ -4714,6 +6134,12 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
     starts = list(range(0, T, stride))
     accum = np.zeros_like(out_all, dtype=np.float32)
     weight_sum = np.zeros((T, 1), dtype=np.float32)
+    lower_idx = torch.as_tensor(
+        LOWER_BODY_JOINTS,
+        device=device,
+        dtype=torch.long,
+    )
+    floor = torch.tensor(floor_y, device=device, dtype=torch.float32)
     for st in starts:
         ed = min(T, st + chunk)
         if ed - st < 4:
@@ -4723,18 +6149,21 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         base = torch.from_numpy(base_np).float().to(device)
         rot_full = base[:, ROT6D_START:ROT6D_END].reshape(L, NUM_JOINTS, 6).detach().clone()
         root = base[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].detach().clone().requires_grad_(True)
-        lower_idx = torch.as_tensor(LOWER_BODY_JOINTS, device=device, dtype=torch.long)
         lower_rot = rot_full[:, lower_idx].detach().clone().requires_grad_(True)
         opt = torch.optim.Adam([lower_rot, root], lr=cfg.ik_lr)
         target = torch.from_numpy(targets[st:ed]).float().to(device)
         contact = torch.from_numpy(contacts[st:ed].astype(np.float32)).float().to(device)
         contact_ramp = torch.from_numpy(contact_ramps[st:ed]).float().to(device)
         confidence = torch.from_numpy(conf[st:ed]).float().to(device)
-        floor = torch.tensor(floor_y, device=device, dtype=torch.float32)
         base_rot = rot_full[:, lower_idx].detach().clone()
         base_root = root.detach().clone()
-        best_loss = float("inf")
-        best_motion = None
+        best_loss_device = torch.full(
+            (),
+            float("inf"),
+            dtype=base.dtype,
+            device=device,
+        )
+        best_motion_device = base.detach().clone()
         for it in range(int(cfg.ik_iters)):
             rr = project_rot6d_torch(lower_rot)
             rr = base_rot + torch.clamp(rr - base_rot, -cfg.ik_max_delta_rot, cfg.ik_max_delta_rot)
@@ -4778,9 +6207,29 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
                         float(cfg.rollback_root_delta_max_m),
                     )
                 )
-            if float(loss.detach().cpu()) < best_loss:
-                best_loss = float(loss.detach().cpu())
-                best_motion = mm.detach().cpu().numpy()
+            # Keep best-state selection entirely on the accelerator.  The old
+            # implementation synchronized the GPU and copied [L,151] back to
+            # the host on nearly every improving iteration.
+            detached_loss = loss.detach()
+            improved = torch.isfinite(detached_loss) & (
+                detached_loss < best_loss_device
+            )
+            best_motion_device = torch.where(
+                improved,
+                mm.detach(),
+                best_motion_device,
+            )
+            best_loss_device = torch.where(
+                improved,
+                detached_loss,
+                best_loss_device,
+            )
+        best_loss = float(best_loss_device.cpu())
+        best_motion = (
+            best_motion_device.cpu().numpy()
+            if np.isfinite(best_loss)
+            else None
+        )
         if best_motion is not None:
             weight = np.ones((L, 1), dtype=np.float32)
             ov = min(overlap, L // 2 if L > 1 else 0)
@@ -4799,8 +6248,16 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
     # Re-orthogonalize all rotation channels after optimization.
     if torch is not None:
         with torch.no_grad():
-            x = torch.from_numpy(out_all[:, ROT6D_START:ROT6D_END].reshape(T, NUM_JOINTS, 6)).float()
-            out_all[:, ROT6D_START:ROT6D_END] = project_rot6d_torch(x).numpy().reshape(T, -1)
+            x = torch.from_numpy(
+                out_all[:, ROT6D_START:ROT6D_END].reshape(
+                    T,
+                    NUM_JOINTS,
+                    6,
+                )
+            ).float().to(device)
+            out_all[:, ROT6D_START:ROT6D_END] = (
+                project_rot6d_torch(x).cpu().numpy().reshape(T, -1)
+            )
     post_stabilize_report: Dict[str, Any] = {
         "enabled": bool(cfg.ik_post_stabilize_enable),
         "applied": False,
@@ -5099,9 +6556,17 @@ def audit_motion_np(
     cfg: Optional[MotionGenerationConfig] = None,
     *,
     sliding_support_eligible: Optional[np.ndarray] = None,
+    precomputed_joints: Optional[np.ndarray] = None,
 ) -> dict:
     cfg = cfg or MotionGenerationConfig()
-    contacts, _, _, _ = derive_contacts_np(motion, cfg)
+    reusable_joints = precomputed_joints
+    if reusable_joints is None and np.isfinite(motion).all():
+        reusable_joints = fk_24_np(motion)
+    contacts, _, _, _ = derive_contacts_np(
+        motion,
+        cfg,
+        precomputed_joints=reusable_joints,
+    )
     audited_motion = np.asarray(motion, dtype=np.float32).copy()
     audited_motion[:, :4] = contacts.astype(np.float32)
     from motion_geometry.physical import motion_physical_metrics_np
@@ -5110,6 +6575,7 @@ def audit_motion_np(
         audited_motion,
         fps=float(cfg.fps),
         sliding_support_eligible=sliding_support_eligible,
+        precomputed_joints=reusable_joints,
     )
     report["root_y_range_m"] = float(
         np.max(audited_motion[:, ROOT_Y_IDX]) - np.min(audited_motion[:, ROOT_Y_IDX])
@@ -5352,6 +6818,7 @@ def _kinematic_stability_metrics(motion, cfg):
     if m.ndim != 2 or m.shape[0] < 2 or m.shape[1] < EDGE_DIM:
         stats["valid"] = False
         return stats
+    joints = None
     try:
         joints = fk_24_np(m)
         stats["fk_finite"] = bool(np.isfinite(joints).all())
@@ -5382,7 +6849,7 @@ def _kinematic_stability_metrics(motion, cfg):
         stats["fk_finite"] = False
         stats["fk_error"] = str(exc)
     try:
-        stats.update(audit_motion_np(m, cfg))
+        stats.update(audit_motion_np(m, cfg, precomputed_joints=joints))
     except Exception as exc:
         stats["audit_error"] = str(exc)
     stats["root_y_range_m"] = float(
@@ -5603,6 +7070,7 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
                 stage=stage,
                 global_start=a,
                 preserve_contacts=preserve_neural_contacts,
+                validate_barrier=False,
             )
             ok, reasons, detail = _kinematic_barrier_oracle(cand, snapshot, cfg, stage=f"{stage}_neural_commit", global_start=a)
             if ok:
@@ -5929,6 +7397,7 @@ def _bounded_residual_update(
     stage="stage",
     global_start=0,
     preserve_contacts=False,
+    validate_barrier=True,
 ):
     cand = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
@@ -5980,10 +7449,11 @@ def _bounded_residual_update(
         global_start=global_start,
         preserve_contacts=preserve_contacts,
     )
-    ok, reasons, detail = _kinematic_barrier_oracle(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
-    if not ok:
-        _append_stage_transaction_audit({"mechanism": "KBO", "version": "motion_42", "stage": stage, "event": "bounded_residual_rejected", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
-        return ref.astype(np.float32)
+    if validate_barrier:
+        ok, reasons, detail = _kinematic_barrier_oracle(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
+        if not ok:
+            _append_stage_transaction_audit({"mechanism": "KBO", "version": "motion_42", "stage": stage, "event": "bounded_residual_rejected", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
+            return ref.astype(np.float32)
     return out.astype(np.float32)
 
 
@@ -6102,6 +7572,7 @@ def _robust_derivative_metrics(motion, cfg):
     if m.ndim != 2 or m.shape[0] < 4 or m.shape[1] < EDGE_DIM:
         st["valid"] = False
         return st
+    joints = None
     try:
         joints = fk_24_np(m)
         st["fk_finite"] = bool(np.isfinite(joints).all())
@@ -6130,7 +7601,7 @@ def _robust_derivative_metrics(motion, cfg):
         st["fk_finite"] = False
         st["fk_error"] = str(exc)
     try:
-        st.update(audit_motion_np(m, cfg))
+        st.update(audit_motion_np(m, cfg, precomputed_joints=joints))
     except Exception as exc:
         st["audit_error"] = str(exc)
     st["root_y_range_m"] = float(np.max(m[:, ROOT_Y_IDX]) - np.min(m[:, ROOT_Y_IDX])) if m.size else 0.0

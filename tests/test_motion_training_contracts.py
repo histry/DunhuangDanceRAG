@@ -1,4 +1,5 @@
 import json
+import inspect
 import os
 import tempfile
 import unittest
@@ -78,6 +79,22 @@ class MotionTrainingContractTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MOTION_FPS": "60"}, clear=False):
             cfg = MotionGenerationConfig().apply_env()
         self.assertEqual(cfg.fps, 60.0)
+
+    def test_motion_audit_reuses_one_fk_for_contacts_and_metrics(self):
+        motion = self._identity_motion(60)
+        original_fk = motion_runtime.fk_24_np
+        with mock.patch.object(
+            motion_runtime,
+            "fk_24_np",
+            wraps=original_fk,
+        ) as training_fk, mock.patch(
+            "motion_geometry.physical.fk24_np",
+            side_effect=AssertionError("physical audit repeated FK"),
+        ):
+            report = motion_runtime.audit_motion_np(motion)
+
+        self.assertEqual(training_fk.call_count, 1)
+        self.assertEqual(report["frames"], len(motion))
 
     def test_formal_event_duration_bounds_are_explicit_and_overridable(self):
         cfg = MotionGenerationConfig.from_json("configs/motion_model.json")
@@ -214,6 +231,153 @@ class MotionTrainingContractTests(unittest.TestCase):
             torch.zeros(1, dtype=torch.long),
         )
         self.assertEqual(tuple(denoised.shape), (1, frames, 79))
+
+    def test_preloaded_pool_reads_fixed_event_once(self):
+        cfg = MotionGenerationConfig()
+        cfg.window_len = 60
+        motion = self._identity_motion(60)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "event.npy"
+            np.save(path, motion)
+            original_load = np.load
+            with mock.patch.object(
+                motion_runtime.np,
+                "load",
+                wraps=original_load,
+            ) as load_mock:
+                pool = motion_runtime.PreloadedMotionWindowPool.preload(
+                    [path, path],
+                    cfg.window_len,
+                    cfg,
+                    mode="refiner",
+                )
+                first = pool.sample(0)
+                second = pool.sample(1)
+            self.assertEqual(load_mock.call_count, 1)
+            self.assertEqual(pool.unique_paths, 1)
+            self.assertEqual(len(pool.fixed_windows), 2)
+            self.assertTrue(np.array_equal(first, second))
+            self.assertFalse(first.flags.writeable)
+
+    def test_preloaded_refiner_pool_preserves_random_crop(self):
+        cfg = MotionGenerationConfig()
+        cfg.window_len = 60
+        motion = self._identity_motion(80)
+        motion[:, 4] = np.arange(80, dtype=np.float32)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "long_event.npy"
+            np.save(path, motion)
+            pool = motion_runtime.PreloadedMotionWindowPool.preload(
+                [path],
+                cfg.window_len,
+                cfg,
+                mode="refiner",
+            )
+            self.assertIsNone(pool.fixed_windows[0])
+            with mock.patch.object(
+                motion_runtime.random,
+                "randint",
+                side_effect=[0, 20],
+            ):
+                first = pool.sample(0)
+                second = pool.sample(0)
+            self.assertFalse(np.array_equal(first[:, 4], second[:, 4]))
+            self.assertEqual(first.shape, (60, 151))
+            self.assertEqual(second.shape, (60, 151))
+
+    def test_training_bridge_can_defer_redundant_contract_finalization(self):
+        cfg = MotionGenerationConfig()
+        previous = self._identity_motion(4)
+        following = self._identity_motion(4)
+        following[:, 4] = 0.25
+        finalized = motion_runtime.reference_motion_inbetween_np(
+            previous,
+            following,
+            20,
+            cfg,
+        )
+        deferred = motion_runtime.reference_motion_inbetween_np(
+            previous,
+            following,
+            20,
+            cfg,
+            finalize_contract=False,
+        )
+        manually_finalized, _ = motion_runtime.enforce_edge151_contract_np(
+            deferred,
+            cfg,
+            source_hint="test_deferred_training_bridge",
+            derive_contact=True,
+            project_rot=True,
+        )
+        self.assertTrue(
+            np.allclose(finalized, manually_finalized, atol=2.0e-6)
+        )
+
+    def test_parallel_batch_risk_masks_match_serial_order(self):
+        cfg = MotionGenerationConfig()
+        motion = self._identity_motion(30)
+        motion[8:13, 4] = np.linspace(0.0, 0.2, 5, dtype=np.float32)
+        batch = np.stack([motion, motion[::-1].copy()])
+        seam = np.zeros((2, 30, 1), dtype=np.float32)
+        seam[0, 8:13] = 1.0
+        seam[1, 17:22] = 1.0
+        serial = motion_runtime._risk_masks_for_batch_np(batch, seam, cfg)
+        with motion_runtime.ThreadPoolExecutor(max_workers=2) as executor:
+            parallel = motion_runtime._risk_masks_for_batch_np(
+                batch,
+                seam,
+                cfg,
+                executor=executor,
+            )
+        for expected, actual in zip(serial, parallel):
+            self.assertTrue(np.array_equal(expected, actual))
+
+    def test_motion_training_hot_loops_use_preload_and_one_batch_mask_call(self):
+        refiner_source = inspect.getsource(motion_runtime.train_refiner)
+        diffusion_source = inspect.getsource(motion_runtime.train_diffusion)
+        for source in (refiner_source, diffusion_source):
+            self.assertIn("PreloadedMotionWindowPool.preload", source)
+            self.assertEqual(source.count("_risk_masks_for_batch_np("), 1)
+        self.assertNotIn("np.load", diffusion_source)
+
+    def test_training_progress_is_unbuffered_and_reports_eta(self):
+        with mock.patch("builtins.print") as print_mock:
+            motion_runtime._emit_training_progress(
+                "[test]",
+                0,
+                10,
+                motion_runtime.time.perf_counter() - 1.0,
+                loss=1.0,
+            )
+        self.assertTrue(print_mock.call_args.kwargs["flush"])
+        output = print_mock.call_args.args[0]
+        self.assertIn("step=1/10", output)
+        self.assertIn("steps_per_second=", output)
+        self.assertIn("eta_minutes=", output)
+
+    @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
+    def test_physics_loss_contract_remains_reachable(self):
+        torch = motion_runtime.torch
+        cfg = MotionGenerationConfig()
+        motion = torch.from_numpy(self._identity_motion(8))[None]
+        total, terms = motion_runtime._world_space_physics_losses(
+            motion,
+            motion,
+            cfg,
+        )
+        self.assertTrue(bool(torch.isfinite(total)))
+        self.assertEqual(
+            set(terms),
+            {
+                "fk",
+                "foot",
+                "support",
+                "penetration",
+                "acceleration",
+                "jerk",
+            },
+        )
 
     def test_validation_summary_contains_deployment_physical_metrics(self):
         cfg = MotionGenerationConfig()

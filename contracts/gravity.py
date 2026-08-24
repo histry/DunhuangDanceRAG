@@ -99,7 +99,8 @@ def fk24_np(motion: np.ndarray) -> np.ndarray:
     if x.ndim != 2 or x.shape[-1] < EDGE_DIM:
         raise ValueError(f"Expected [T,151], got {x.shape}")
     local = rot6d_to_matrix_np(
-        x[:, ROT6D_START:ROT6D_END].reshape(len(x), NUM_JOINTS, 6)
+        x[:, ROT6D_START:ROT6D_END].reshape(len(x), NUM_JOINTS, 6),
+        project=False,
     )
     return fk24_from_local_np(x, local)
 

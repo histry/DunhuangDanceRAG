@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 import pytest
 
@@ -48,3 +50,30 @@ def test_world_physics_loss_is_zero_at_clean_target():
 
     assert total.item() == pytest.approx(0.0, abs=1.0e-8)
     assert all(value.item() == pytest.approx(0.0, abs=1.0e-8) for value in terms.values())
+
+
+def test_fk_reuses_offsets_without_per_joint_device_synchronization():
+    motion = _identity_batch()
+    models._FK_OFFSETS_TORCH_CACHE.clear()
+    first = models.fk_24_torch(motion)
+    assert len(models._FK_OFFSETS_TORCH_CACHE) == 1
+    cached_offset_id = id(next(iter(models._FK_OFFSETS_TORCH_CACHE.values())))
+    second = models.fk_24_torch(motion)
+
+    assert id(next(iter(models._FK_OFFSETS_TORCH_CACHE.values()))) == cached_offset_id
+    assert models.torch.equal(first, second)
+    assert ".item()" not in inspect.getsource(models.fk_24_torch)
+
+
+def test_batched_physics_fk_matches_two_independent_calls():
+    clean = _identity_batch()
+    prediction = clean.clone()
+    prediction[:, 5, 4] += 0.03
+    separate_prediction = models.fk_24_torch(prediction)
+    separate_clean = models.fk_24_torch(clean)
+    combined = models.fk_24_torch(
+        models.torch.cat([prediction, clean], dim=0)
+    )
+
+    assert models.torch.equal(combined[:1], separate_prediction)
+    assert models.torch.equal(combined[1:], separate_clean)

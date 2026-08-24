@@ -682,6 +682,7 @@ def motion_physical_metrics_np(
     sliding_support_eligible: np.ndarray | None = None,
     support_policy: str = SUPPORT_POLICY_FINAL,
     source_comparison_bones: Sequence[int] | np.ndarray | None = None,
+    precomputed_joints: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Report final SI metrics plus source-only normalized diagnostics.
 
@@ -705,12 +706,34 @@ def motion_physical_metrics_np(
     second_orthogonal_norm = np.linalg.norm(second_orthogonal, axis=-1)
     collinearity = np.abs(np.sum(first * second, axis=-1)) / np.maximum(first_norm * second_norm, 1e-12)
     degenerate = ~finite_rot6d | (first_norm < 1e-5) | (second_norm < 1e-5) | (second_orthogonal_norm < 1e-5)
-    rotation_matrices = rot6d_to_matrix_np(safe_rot6d.astype(np.float32))
-    rotation_steps = so3_geodesic_np(rotation_matrices[:-1], rotation_matrices[1:]) if len(rotation_matrices) > 1 else np.zeros((0,24), dtype=np.float32)
+    rotation_matrices = rot6d_to_matrix_np(
+        safe_rot6d.astype(np.float32),
+        project=False,
+    )
+    rotation_steps = so3_geodesic_np(
+        rotation_matrices[:-1],
+        rotation_matrices[1:],
+        project=False,
+    ) if len(rotation_matrices) > 1 else np.zeros((0,24), dtype=np.float32)
     extremity_rotation_steps = rotation_steps[:, list(EXTREMITY_JOINTS)] if rotation_steps.size else np.zeros((0,len(EXTREMITY_JOINTS)), dtype=np.float32)
-    angular_acceleration_norm = np.linalg.norm(angular_acceleration_np(rotation_matrices, fps=float(fps)), axis=-1)
+    angular_acceleration_norm = np.linalg.norm(
+        angular_acceleration_np(
+            rotation_matrices,
+            fps=float(fps),
+            project=False,
+        ),
+        axis=-1,
+    )
     safe_motion = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    joints = fk24_np(safe_motion)
+    if precomputed_joints is None:
+        joints = fk24_np(safe_motion)
+    else:
+        joints = np.asarray(precomputed_joints, dtype=np.float32)
+        expected_joints = (len(x), NUM_JOINTS, 3)
+        if joints.shape != expected_joints:
+            raise ValueError(
+                f"Expected precomputed joints {expected_joints}, got {joints.shape}"
+            )
     velocity = np.diff(joints, axis=0) * float(fps)
     acceleration = np.diff(joints, n=2, axis=0) * float(fps)**2
     jerk = np.diff(joints, n=3, axis=0) * float(fps)**3

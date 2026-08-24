@@ -6,6 +6,7 @@ from evaluation.motion_activity_analysis import (
     ActivityThresholds,
     evaluate_final_motion_activity,
 )
+from contracts.gravity import fk24_np
 from motion_geometry.physical import motion_physical_metrics_np
 from motion_geometry.rotations import matrix_to_rot6d_np, so3_exp_np
 from motion_geometry.smpl24 import MOTION_DIM
@@ -100,6 +101,18 @@ def test_stable_identity_motion_passes_all_physical_layers():
 
     assert decision["ok"] is True, decision["reasons"]
     assert all(layer["ok"] for layer in decision["layers"].values())
+
+
+def test_precomputed_fk_preserves_every_physical_metric():
+    motion = _alternating_shoulder_jitter(90, angle=0.01)
+    expected = motion_physical_metrics_np(motion, fps=30.0)
+    actual = motion_physical_metrics_np(
+        motion,
+        fps=30.0,
+        precomputed_joints=fk24_np(motion),
+    )
+
+    assert actual == expected
 
 
 def test_raw_rot6d_degeneracy_is_not_hidden_by_so3_projection():

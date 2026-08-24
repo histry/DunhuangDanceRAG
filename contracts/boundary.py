@@ -13,7 +13,6 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from motion_geometry.rotations import (
-    angular_acceleration_np,
     angular_velocity_np,
     matrix_to_rot6d_np,
     relative_rotvec_np,
@@ -94,11 +93,18 @@ def _window_features(motion: np.ndarray, from_end: bool, frames: int, fps: float
     x = _motion(motion)
     n = max(3, min(int(frames), len(x)))
     clip = x[-n:] if from_end else x[:n]
-    r = rot6d_to_matrix_np(clip[:, ROT6D_START:ROT6D_END].reshape(len(clip), NUM_JOINTS, 6))
+    r = rot6d_to_matrix_np(
+        clip[:, ROT6D_START:ROT6D_END].reshape(len(clip), NUM_JOINTS, 6),
+        project=False,
+    )
     ref = r[-1] if from_end else r[0]
-    tangent = relative_rotvec_np(ref[None], r)
-    omega = angular_velocity_np(r, fps=fps)
-    alpha = angular_acceleration_np(r, fps=fps)
+    tangent = relative_rotvec_np(ref[None], r, project=False)
+    omega = angular_velocity_np(r, fps=fps, project=False)
+    alpha = (
+        np.diff(omega, axis=0).astype(np.float32) * float(fps)
+        if len(omega) >= 2
+        else np.zeros((0, NUM_JOINTS, 3), dtype=np.float32)
+    )
     if len(omega) < len(r):
         omega = np.concatenate([omega, omega[-1:]], axis=0) if len(omega) else np.zeros((len(r), NUM_JOINTS, 3), np.float32)
     if len(alpha) < len(r):
@@ -233,10 +239,15 @@ def build_frame_joint_risk_mask(
     seam_f = _dilate(seam_f, dilation)
 
     r = rot6d_to_matrix_np(
-        x[:, ROT6D_START:ROT6D_END].reshape(t, NUM_JOINTS, 6)
+        x[:, ROT6D_START:ROT6D_END].reshape(t, NUM_JOINTS, 6),
+        project=False,
     )
-    omega = angular_velocity_np(r, fps=fps)
-    alpha = angular_acceleration_np(r, fps=fps)
+    omega = angular_velocity_np(r, fps=fps, project=False)
+    alpha = (
+        np.diff(omega, axis=0).astype(np.float32) * float(fps)
+        if len(omega) >= 2
+        else np.zeros((0, NUM_JOINTS, 3), dtype=np.float32)
+    )
     angular_speed = np.zeros((t, NUM_JOINTS), np.float32)
     angular_acceleration = np.zeros((t, NUM_JOINTS), np.float32)
     if len(omega):

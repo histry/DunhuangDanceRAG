@@ -3,9 +3,11 @@ import numpy as np
 from motion_geometry.rotations import matrix_to_rot6d_np, so3_exp_np
 from contracts.physical_quality import (
     PeakJerkMaskConfig,
+    _expand_peak_jerk_pairs,
     build_peak_jerk_risk_mask,
     build_repair_mask,
 )
+from motion_geometry.smpl24 import NUM_JOINTS, PARENTS
 
 
 def _identity_motion(frames: int = 20) -> np.ndarray:
@@ -84,3 +86,32 @@ def test_foot_peak_jerk_also_owns_contact_channel():
 
     assert np.count_nonzero(peak["joint"][:, 7]) > 0
     assert np.count_nonzero(peak["contact"]) > 0
+
+
+def test_vectorized_peak_expansion_matches_reference_loop():
+    frames = 37
+    rng = np.random.default_rng(20260824)
+    risky = rng.random((frames - 3, NUM_JOINTS)) < 0.12
+    for radius, parent_depth in ((0, 0), (2, 2), (4, 3)):
+        expected_joint = np.zeros((frames, NUM_JOINTS), dtype=np.float32)
+        expected_frame = np.zeros(frames, dtype=np.float32)
+        for derivative_frame, joint_id in np.argwhere(risky):
+            start = max(0, int(derivative_frame) - radius)
+            end = min(frames, int(derivative_frame) + 4 + radius)
+            chain_joint = int(joint_id)
+            for _ in range(parent_depth + 1):
+                if chain_joint < 0 or chain_joint >= NUM_JOINTS:
+                    break
+                expected_joint[start:end, chain_joint] = 1.0
+                chain_joint = int(PARENTS[chain_joint])
+            expected_frame[start:end] = 1.0
+
+        actual_joint, actual_frame = _expand_peak_jerk_pairs(
+            risky,
+            frames=frames,
+            radius=radius,
+            parent_depth=parent_depth,
+            parents=PARENTS,
+        )
+        assert np.array_equal(actual_joint, expected_joint)
+        assert np.array_equal(actual_frame, expected_frame)

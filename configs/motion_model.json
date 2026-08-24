@@ -60,6 +60,9 @@
   "diffusion_train_steps": 15000,
   "refiner_train_steps": 8000,
   "batch_size": 64,
+  "inference_window_batch_size": 16,
+  "gpu_preprocessing": true,
+  "diffusion_noise_batch_max_mib": 256.0,
   "lr": 0.0002,
   "seed": 42,
   "device": "cuda"

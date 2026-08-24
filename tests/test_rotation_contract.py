@@ -6,6 +6,7 @@ import motion_geometry.rotations as rotation_module
 from motion_geometry.rotations import (
     CANONICAL_ROT6D_LAYOUT,
     ROT6D_LAYOUT_PYTORCH3D_ROW,
+    angular_velocity_np,
     convert_motion_rot6d_layout_np,
     convert_rot6d_layout_np,
     matrix_to_rot6d_np,
@@ -21,6 +22,40 @@ from motion_geometry.heading import resample_motion_so3, root_yaw_np
 
 
 class RotationContractTest(unittest.TestCase):
+    def test_preprojected_fast_path_matches_full_so3_projection(self):
+        rng = np.random.default_rng(20260824)
+        rotations6d = rng.normal(size=(48, 24, 6)).astype(np.float32)
+        projected = rot6d_to_matrix_np(rotations6d, project=True)
+        fast = rot6d_to_matrix_np(rotations6d, project=False)
+        self.assertLess(float(np.max(np.abs(projected - fast))), 2.0e-6)
+
+        projected_velocity = angular_velocity_np(
+            projected,
+            fps=30.0,
+            project=True,
+        )
+        fast_velocity = angular_velocity_np(
+            fast,
+            fps=30.0,
+            project=False,
+        )
+        self.assertTrue(
+            np.allclose(projected_velocity, fast_velocity, atol=2.0e-4)
+        )
+        projected_steps = so3_geodesic_np(
+            projected[:-1],
+            projected[1:],
+            project=True,
+        )
+        fast_steps = so3_geodesic_np(
+            fast[:-1],
+            fast[1:],
+            project=False,
+        )
+        self.assertTrue(
+            np.allclose(projected_steps, fast_steps, atol=2.0e-5)
+        )
+
     def test_column_concat_roundtrip(self):
         rng = np.random.default_rng(20260717)
         q, _ = np.linalg.qr(rng.normal(size=(256, 3, 3)))

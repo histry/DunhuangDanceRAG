@@ -176,14 +176,23 @@ def convert_motion_rot6d_layout_np(
     return values.astype(np.float32)
 
 
-def so3_geodesic_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def so3_geodesic_np(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    project: bool = True,
+) -> np.ndarray:
     """Geodesic angle on SO(3), in radians.
 
     ``atan2(sin(theta), cos(theta))`` is used instead of a raw ``acos`` so
     round-trip tests remain accurate near the identity in float32.
     """
-    ra = project_to_so3_np(a).astype(np.float64)
-    rb = project_to_so3_np(b).astype(np.float64)
+    ra = (
+        project_to_so3_np(a) if project else _as_float_np(a)
+    ).astype(np.float64)
+    rb = (
+        project_to_so3_np(b) if project else _as_float_np(b)
+    ).astype(np.float64)
     rel = np.swapaxes(ra, -1, -2) @ rb
     tr = np.trace(rel, axis1=-2, axis2=-1)
     cos = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
@@ -196,9 +205,9 @@ def so3_geodesic_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.arctan2(sin, cos).astype(np.float32)
 
 
-def so3_log_np(m: np.ndarray) -> np.ndarray:
+def so3_log_np(m: np.ndarray, *, project: bool = True) -> np.ndarray:
     """Log map from SO(3) to rotation vectors in so(3)."""
-    r = project_to_so3_np(m)
+    r = project_to_so3_np(m) if project else _as_float_np(m)
     shape = r.shape[:-2]
     flat = r.reshape(-1, 3, 3).astype(np.float64)
     if Rotation is not None:
@@ -269,24 +278,44 @@ def so3_exp_np(v: np.ndarray) -> np.ndarray:
     return out.reshape(*shape, 3, 3).astype(np.float32)
 
 
-def relative_rotvec_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def relative_rotvec_np(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    project: bool = True,
+) -> np.ndarray:
     """Return Log(a^T b)."""
-    ra = project_to_so3_np(a)
-    rb = project_to_so3_np(b)
-    return so3_log_np(np.swapaxes(ra, -1, -2) @ rb)
+    ra = project_to_so3_np(a) if project else _as_float_np(a)
+    rb = project_to_so3_np(b) if project else _as_float_np(b)
+    return so3_log_np(
+        np.swapaxes(ra, -1, -2) @ rb,
+        project=project,
+    )
 
 
-def angular_velocity_np(rotations: np.ndarray, fps: float = 30.0) -> np.ndarray:
+def angular_velocity_np(
+    rotations: np.ndarray,
+    fps: float = 30.0,
+    *,
+    project: bool = True,
+) -> np.ndarray:
     """Body-frame angular velocity, shape ``[T-1,...,3]`` in rad/s."""
-    r = project_to_so3_np(rotations)
+    r = project_to_so3_np(rotations) if project else _as_float_np(rotations)
     if r.shape[0] < 2:
         return np.zeros((0,) + r.shape[1:-2] + (3,), dtype=np.float32)
-    return relative_rotvec_np(r[:-1], r[1:]) * float(fps)
+    return (
+        relative_rotvec_np(r[:-1], r[1:], project=False) * float(fps)
+    )
 
 
-def angular_acceleration_np(rotations: np.ndarray, fps: float = 30.0) -> np.ndarray:
+def angular_acceleration_np(
+    rotations: np.ndarray,
+    fps: float = 30.0,
+    *,
+    project: bool = True,
+) -> np.ndarray:
     """First difference of body-frame angular velocity in rad/s^2."""
-    w = angular_velocity_np(rotations, fps=fps)
+    w = angular_velocity_np(rotations, fps=fps, project=project)
     if w.shape[0] < 2:
         return np.zeros((0,) + w.shape[1:], dtype=np.float32)
     return np.diff(w, axis=0).astype(np.float32) * float(fps)

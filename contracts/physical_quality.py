@@ -1704,6 +1704,48 @@ def _frames_at_rate(frames_at_30fps: int, fps: float) -> int:
     return max(0, int(round(int(frames_at_30fps) * float(fps) / 30.0)))
 
 
+def _expand_peak_jerk_pairs(
+    risky: np.ndarray,
+    *,
+    frames: int,
+    radius: int,
+    parent_depth: int,
+    parents: Sequence[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorize the exact temporal and parent-chain Peak-Jerk expansion."""
+    risky_pairs = np.asarray(risky, dtype=bool)
+    expected = (max(0, int(frames) - 3), NUM_JOINTS)
+    if risky_pairs.shape != expected:
+        raise ValueError(
+            f"risky Peak-Jerk pairs must have shape {expected}, got "
+            f"{risky_pairs.shape}"
+        )
+    expanded = np.zeros((int(frames), NUM_JOINTS), dtype=bool)
+    derivative_frames = risky_pairs.shape[0]
+    for offset in range(-max(0, int(radius)), 4 + max(0, int(radius))):
+        source_start = max(0, -offset)
+        source_end = min(derivative_frames, int(frames) - offset)
+        if source_end <= source_start:
+            continue
+        expanded[source_start + offset:source_end + offset] |= risky_pairs[
+            source_start:source_end
+        ]
+
+    ancestors = np.zeros((NUM_JOINTS, NUM_JOINTS), dtype=np.uint8)
+    for source_joint in range(NUM_JOINTS):
+        chain_joint = source_joint
+        for _ in range(max(0, int(parent_depth)) + 1):
+            if chain_joint < 0 or chain_joint >= NUM_JOINTS:
+                break
+            ancestors[source_joint, chain_joint] = 1
+            chain_joint = int(parents[chain_joint])
+    joint_mask = (
+        expanded.astype(np.uint8) @ ancestors > 0
+    ).astype(np.float32)
+    frame_mask = np.any(expanded, axis=1).astype(np.float32)
+    return joint_mask, frame_mask
+
+
 def build_peak_jerk_risk_mask(
     motion: np.ndarray,
     *,
@@ -1752,18 +1794,13 @@ def build_peak_jerk_risk_mask(
     risky = jerk_norm >= threshold
     radius = _frames_at_rate(cfg.radius_frames_at_30fps, fps)
 
-    for derivative_frame, joint_id in np.argwhere(risky):
-        derivative_frame = int(derivative_frame)
-        joint_id = int(joint_id)
-        start = max(0, derivative_frame - radius)
-        end = min(frames, derivative_frame + 4 + radius)
-        chain_joint = joint_id
-        for _ in range(max(0, int(cfg.parent_depth)) + 1):
-            if chain_joint < 0 or chain_joint >= NUM_JOINTS:
-                break
-            joint_mask[start:end, chain_joint] = 1.0
-            chain_joint = int(parents[chain_joint])
-        frame_mask[start:end] = 1.0
+    joint_mask, frame_mask = _expand_peak_jerk_pairs(
+        risky,
+        frames=frames,
+        radius=radius,
+        parent_depth=int(cfg.parent_depth),
+        parents=parents,
+    )
 
     root_mask = joint_mask[:, 0].copy()
     contact_mask = np.max(
