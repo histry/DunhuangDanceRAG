@@ -402,6 +402,9 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertIn("root_horizontal_net_displacement_m", summary["worst_window"])
         self.assertEqual(summary["stage_repair"]["pass_rate"], 1.0)
         self.assertEqual(summary["clean_reference_fidelity"]["pass_rate"], 1.0)
+        self.assertEqual(
+            summary["clean_physical_non_regression"]["pass_rate"], 1.0
+        )
         self.assertFalse(
             summary["final_generation_gate_diagnostic"]["checkpoint_criterion"]
         )
@@ -443,6 +446,9 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertEqual(summary["stage_repair"]["pass_rate"], 1.0)
         self.assertEqual(summary["clean_reference_fidelity"]["pass_rate"], 1.0)
         self.assertEqual(
+            summary["clean_physical_non_regression"]["pass_rate"], 1.0
+        )
+        self.assertEqual(
             summary["final_generation_gate_diagnostic"]["prediction"]["pass_rate"],
             0.0,
         )
@@ -483,6 +489,7 @@ class MotionTrainingContractTests(unittest.TestCase):
                 "fk_position_error_m_max": 0.02,
                 "stage_repair": {"pass_rate": 1.0},
                 "clean_reference_fidelity": {"pass_rate": 1.0},
+                "clean_physical_non_regression": {"pass_rate": 1.0},
                 "final_generation_gate_diagnostic": {
                     "prediction": {"pass_rate": 0.0},
                 },

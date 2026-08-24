@@ -1551,6 +1551,19 @@ def evaluate_stage_candidate(
         if not before_finite or not after_finite:
             continue
 
+        # ``before`` and ``candidate`` can describe the same SO(3) motion on
+        # opposite sides of a matrix/Rot6D/FK round trip.  Do not turn
+        # float32-scale reconstruction noise into a scientific regression,
+        # especially when authentic motion is already above an absolute final
+        # threshold.  This epsilon is six orders below the observed metric and
+        # never substitutes for the configured stage margin.
+        comparison_epsilon = max(
+            1.0e-8,
+            abs(float(before)) * 1.0e-6,
+            abs(float(spec.absolute_limit)) * 1.0e-9,
+        )
+        detail[f"comparison_epsilon_{spec.key}"] = comparison_epsilon
+
         if spec.direction == "high":
             allowed = _allowed_after_stage(
                 before,
@@ -1559,9 +1572,12 @@ def evaluate_stage_candidate(
                 spec.stage_margin,
             )
             detail[f"allowed_{spec.key}"] = allowed
-            if after > allowed:
+            if after > allowed + comparison_epsilon:
                 reasons.append(spec.regression_reason)
-            if before <= spec.absolute_limit and after > spec.absolute_limit:
+            if (
+                before <= spec.absolute_limit
+                and after > spec.absolute_limit + comparison_epsilon
+            ):
                 reasons.append(f"absolute_{spec.key}")
         else:
             allowed = _minimum_after_stage(
@@ -1570,9 +1586,12 @@ def evaluate_stage_candidate(
                 spec.stage_margin,
             )
             detail[f"allowed_{spec.key}"] = allowed
-            if after < allowed:
+            if after < allowed - comparison_epsilon:
                 reasons.append(spec.regression_reason)
-            if before >= spec.absolute_limit and after < spec.absolute_limit:
+            if (
+                before >= spec.absolute_limit
+                and after < spec.absolute_limit - comparison_epsilon
+            ):
                 reasons.append(f"absolute_{spec.key}")
 
     before_jerk_max = detail.get("before_joint_jerk_mps3_max", float("nan"))

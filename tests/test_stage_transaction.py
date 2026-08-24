@@ -164,3 +164,18 @@ def test_clean_reference_fidelity_is_relative_not_an_absolute_final_gate():
         "reference_fidelity_root_horizontal_radius_p95_m_regressed"
         in rejected["reasons"]
     )
+
+
+def test_stage_candidate_tolerates_only_float_round_trip_noise():
+    before = _audit_for_level(1.0)
+    candidate = dict(before)
+    candidate["joint_jerk_mps3_max"] = (
+        before["joint_jerk_mps3_max"] * (1.0 + 5.0e-7)
+    )
+    rounding = evaluate_stage_candidate(before, candidate)
+    assert rounding["accepted"] is True, rounding["reasons"]
+
+    candidate["joint_jerk_mps3_max"] = before["joint_jerk_mps3_max"] + 1.0
+    regression = evaluate_stage_candidate(before, candidate)
+    assert regression["accepted"] is False
+    assert "joint_jerk_max_regressed" in regression["reasons"]

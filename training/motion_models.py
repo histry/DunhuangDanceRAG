@@ -3408,6 +3408,7 @@ def _new_validation_physical_accumulator() -> Dict[str, Any]:
         "clean_audits": [],
         "degraded_audits": [],
         "stage_repair_gates": [],
+        "clean_non_regression_gates": [],
         "clean_fidelity_gates": [],
         "prediction_final_diagnostic_gates": [],
         "clean_final_diagnostic_gates": [],
@@ -3489,6 +3490,12 @@ def _record_validation_physical_prediction(
     fidelity_gate = evaluate_stage_reference_fidelity(
         clean_audit,
         prediction_audit,
+    )
+    clean_non_regression_gate = evaluate_stage_candidate(
+        clean_audit,
+        prediction_audit,
+        require_repair_gain=False,
+        ignored_layers=("long_horizon_root_drift",),
     )
     try:
         degraded_product_error = float(
@@ -3577,6 +3584,9 @@ def _record_validation_physical_prediction(
     accumulator["clean_audits"].append(clean_audit)
     accumulator["degraded_audits"].append(degraded_audit)
     accumulator["stage_repair_gates"].append(stage_gate)
+    accumulator["clean_non_regression_gates"].append(
+        clean_non_regression_gate
+    )
     accumulator["clean_fidelity_gates"].append(fidelity_gate)
     accumulator["prediction_final_diagnostic_gates"].append(
         prediction_final_gate
@@ -3682,6 +3692,16 @@ def _summarize_validation_physical_metrics(
                 "contracts.physical_quality."
                 "evaluate_stage_reference_fidelity"
             ),
+        },
+        "clean_physical_non_regression": {
+            **_summarize_validation_gates(
+                list(accumulator.get("clean_non_regression_gates", [])),
+                accepted_key="accepted",
+            ),
+            "gate": "contracts.physical_quality.evaluate_stage_candidate",
+            "reference": "authentic_clean_motion",
+            "ignored_layers": ["long_horizon_root_drift"],
+            "absolute_final_gate_used": False,
         },
         "final_generation_gate_diagnostic": {
             "prediction": _summarize_validation_gates(
@@ -3977,10 +3997,14 @@ def _checkpoint_validation_decision(
     physical = metrics.get("physical_quality", {})
     stage_repair = physical.get("stage_repair", {})
     clean_fidelity = physical.get("clean_reference_fidelity", {})
+    clean_non_regression = physical.get(
+        "clean_physical_non_regression", {}
+    )
     observed: Dict[str, Optional[float]] = {
         "num_windows": physical.get("num_windows"),
         "stage_repair_rate": stage_repair.get("pass_rate"),
         "clean_fidelity_rate": clean_fidelity.get("pass_rate"),
+        "clean_non_regression_rate": clean_non_regression.get("pass_rate"),
         "fk_position_error_m_p95": physical.get("fk_position_error_m_p95"),
         "fk_position_error_m_max": physical.get("fk_position_error_m_max"),
     }
@@ -4036,6 +4060,10 @@ def _checkpoint_validation_decision(
     )
     _require_min(
         "clean_fidelity_rate",
+        thresholds["min_clean_fidelity_rate"],
+    )
+    _require_min(
+        "clean_non_regression_rate",
         thresholds["min_clean_fidelity_rate"],
     )
     _require_max(
