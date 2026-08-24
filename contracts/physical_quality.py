@@ -13,8 +13,9 @@ The two contracts intentionally have different semantics:
   automatically treated as planted support; robust penetration statistics are
   used together with a catastrophic-minimum guard.
 
-Neural-stage transactional acceptance and Peak-Jerk repair masks continue to
-use the strict final-generation contract.
+Neural-stage transactional acceptance uses reference-relative regression
+checks.  The strict absolute final-generation contract remains authoritative
+only after the complete repair/IK/closed-loop stack.
 """
 from __future__ import annotations
 
@@ -1514,11 +1515,20 @@ def evaluate_stage_candidate(
     limits: Optional[PhysicalQualityLimits] = None,
     policy: Optional[StageAcceptancePolicy] = None,
     require_repair_gain: bool = False,
+    ignored_layers: Sequence[str] = (),
 ) -> Dict[str, Any]:
-    """Evaluate a neural-stage candidate against strict final safety."""
+    """Evaluate a neural-stage candidate relative to its damaged input.
+
+    ``ignored_layers`` is intentionally explicit.  Checkpoint validation uses
+    it only for long-horizon root travel: a four-second authentic locomotion
+    event must not be treated as whole-song root drift.  Inference-time stage
+    transactions retain the default empty set and therefore preserve their
+    existing strict behaviour.
+    """
 
     lim = limits or PhysicalQualityLimits.from_environment()
     pol = policy or StageAcceptancePolicy.from_environment()
+    ignored = {str(layer) for layer in ignored_layers}
     reasons: list[str] = []
     detail: Dict[str, float] = {}
 
@@ -1528,6 +1538,8 @@ def evaluate_stage_candidate(
             reasons.append(f"{label}_missing_or_invalid_schema")
 
     for spec in physical_metric_specs(lim, pol):
+        if spec.layer in ignored:
+            continue
         before_finite, before = _required_metric(before_audit, spec.key)
         after_finite, after = _required_metric(candidate_audit, spec.key)
         detail[f"before_{spec.key}"] = before
@@ -1587,6 +1599,78 @@ def evaluate_stage_candidate(
         "limits": lim.as_audit_limits(),
         "policy": asdict(pol),
         "require_repair_gain": bool(require_repair_gain),
+        "ignored_layers": sorted(ignored),
+    }
+
+
+def evaluate_stage_reference_fidelity(
+    reference_audit: Mapping[str, Any],
+    candidate_audit: Mapping[str, Any],
+    *,
+    limits: Optional[PhysicalQualityLimits] = None,
+    policy: Optional[StageAcceptancePolicy] = None,
+) -> Dict[str, Any]:
+    """Require a neural prediction to remain close to authentic clean motion.
+
+    This contract is deliberately reference-relative and does not reuse the
+    final absolute gate.  Recorded Dunhuang locomotion may legitimately exceed
+    a whole-song root-drift threshold, and fast low-foot source observations
+    are not automatically planted support.  The candidate may vary within the
+    same per-metric ratio/margin budget used by stage transactions, but it may
+    not introduce a material regression relative to the clean target.
+    """
+
+    lim = limits or PhysicalQualityLimits.from_environment()
+    pol = policy or StageAcceptancePolicy.from_environment()
+    reasons: list[str] = []
+    detail: Dict[str, float] = {}
+
+    for label, audit in (
+        ("reference", reference_audit),
+        ("candidate", candidate_audit),
+    ):
+        schema = str(audit.get("schema", ""))
+        if schema != PHYSICAL_METRICS_SCHEMA:
+            reasons.append(f"{label}_missing_or_invalid_schema")
+
+    for spec in physical_metric_specs(lim, pol):
+        reference_finite, reference = _required_metric(
+            reference_audit, spec.key
+        )
+        candidate_finite, candidate = _required_metric(
+            candidate_audit, spec.key
+        )
+        detail[f"reference_{spec.key}"] = reference
+        detail[f"candidate_{spec.key}"] = candidate
+        if not reference_finite:
+            reasons.append(f"reference_missing_or_nonfinite:{spec.key}")
+        if not candidate_finite:
+            reasons.append(f"candidate_missing_or_nonfinite:{spec.key}")
+        if not reference_finite or not candidate_finite:
+            continue
+
+        if spec.direction == "high":
+            allowed = max(
+                reference * float(spec.stage_ratio),
+                reference + float(spec.stage_margin),
+            )
+            detail[f"allowed_{spec.key}"] = float(allowed)
+            if candidate > allowed:
+                reasons.append(f"reference_fidelity_{spec.key}_regressed")
+        else:
+            allowed = reference - float(spec.stage_margin)
+            detail[f"allowed_{spec.key}"] = float(allowed)
+            if candidate < allowed:
+                reasons.append(f"reference_fidelity_{spec.key}_regressed")
+
+    reasons = list(dict.fromkeys(reasons))
+    return {
+        "accepted": not reasons,
+        "reasons": reasons,
+        "detail": detail,
+        "policy": asdict(pol),
+        "absolute_final_gate_used": False,
+        "reference_role": "authentic_clean_motion",
     }
 
 

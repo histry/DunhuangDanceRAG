@@ -78,6 +78,7 @@ from contracts.physical_quality import (
     compute_joint_kinematic_metrics,
     evaluate_physical_audit,
     evaluate_stage_candidate,
+    evaluate_stage_reference_fidelity,
 )
 from support.event_identity import (
     assert_same_event_db_contract,
@@ -340,6 +341,7 @@ class MotionGenerationConfig:
     transition_train_min_seconds: float = 10.0 / 30.0
     transition_train_max_seconds: float = 28.0 / 30.0
     transition_mask_halo_seconds: float = 6.0 / 30.0
+    transition_tangent_smoothing_passes: int = 4
     ik_enable: bool = True
     ik_iters: int = 120
     ik_lr: float = 0.020
@@ -416,6 +418,16 @@ class MotionGenerationConfig:
     physics_acceleration_loss_weight: float = 0.02
     physics_jerk_loss_weight: float = 0.01
     physics_static_support_speed_mps: float = 0.18
+    # Checkpoint validation is a stage-relative contract.  The final absolute
+    # generation gate remains diagnostic here and becomes authoritative only
+    # after Diffusion, boundary repair and IK.
+    checkpoint_validation_fail_closed: bool = True
+    checkpoint_validation_min_stage_repair_rate: float = 0.75
+    checkpoint_validation_min_clean_fidelity_rate: float = 0.75
+    checkpoint_validation_max_fk_p95_m: float = 0.15
+    checkpoint_validation_max_fk_max_m: float = 1.0
+    checkpoint_validation_max_refiner_product_log_l1: float = 0.03
+    checkpoint_validation_min_geometry_repair_gain: float = 0.03
     # Whole-sequence acceptance is authoritative. A candidate that fails the
     # SI physical gate is written only as an explicitly rejected diagnostic,
     # never to the requested accepted-output path.
@@ -485,6 +497,38 @@ class MotionGenerationConfig:
             "MOTION_TRANSITION_TRAIN_MIN_SECONDS": ("transition_train_min_seconds", float),
             "MOTION_TRANSITION_TRAIN_MAX_SECONDS": ("transition_train_max_seconds", float),
             "MOTION_TRANSITION_MASK_HALO_SECONDS": ("transition_mask_halo_seconds", float),
+            "MOTION_TRANSITION_TANGENT_SMOOTHING_PASSES": (
+                "transition_tangent_smoothing_passes",
+                int,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_FAIL_CLOSED": (
+                "checkpoint_validation_fail_closed",
+                lambda x: bool(int(x)),
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_STAGE_REPAIR_RATE": (
+                "checkpoint_validation_min_stage_repair_rate",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_CLEAN_FIDELITY_RATE": (
+                "checkpoint_validation_min_clean_fidelity_rate",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MAX_FK_P95_M": (
+                "checkpoint_validation_max_fk_p95_m",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MAX_FK_MAX_M": (
+                "checkpoint_validation_max_fk_max_m",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MAX_REFINER_PRODUCT_LOG_L1": (
+                "checkpoint_validation_max_refiner_product_log_l1",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_GEOMETRY_REPAIR_GAIN": (
+                "checkpoint_validation_min_geometry_repair_gain",
+                float,
+            ),
             "MOTION_WINDOW_LEN": ("window_len", int),
             "MOTION_HOP_LEN": ("hop_len", int),
             "MOTION_INFERENCE_WINDOW_BATCH_SIZE": (
@@ -3216,6 +3260,29 @@ def load_motion_window(
 
 
 
+def _smooth_standard_normal_time_np(
+    shape: Tuple[int, ...],
+    *,
+    passes: int,
+) -> np.ndarray:
+    """Return temporally correlated, per-channel unit-RMS Gaussian noise."""
+
+    if not shape or int(shape[0]) < 1:
+        return np.zeros(shape, dtype=np.float32)
+    value = np.random.normal(0.0, 1.0, size=shape).astype(np.float32)
+    for _ in range(max(1, int(passes))):
+        pad_width = [(1, 1)] + [(0, 0)] * (value.ndim - 1)
+        padded = np.pad(value, pad_width, mode="edge")
+        value = (
+            0.25 * padded[:-2]
+            + 0.50 * padded[1:-1]
+            + 0.25 * padded[2:]
+        ).astype(np.float32)
+    value -= np.mean(value, axis=0, keepdims=True)
+    rms = np.sqrt(np.mean(value * value, axis=0, keepdims=True))
+    return (value / np.maximum(rms, 1.0e-6)).astype(np.float32)
+
+
 def degrade_for_refiner(
     clean: np.ndarray,
     severity: float = 0.06,
@@ -3227,12 +3294,13 @@ def degrade_for_refiner(
 
     Instead of arbitrary global drift only, corrupt a local transition region by
     replacing it with a weak root-Hermite / rotation-SLERP inbetweening path plus
-    noise. This matches the inference-time transition-budget mask: the model
-    learns to repair motion_ref only near boundaries while preserving core clips.
+    smooth product-manifold tangent perturbations. This matches the
+    inference-time transition-budget mask: the model learns to repair motion_ref
+    only near boundaries while preserving core clips exactly.
     """
     cfg = cfg or MotionGenerationConfig()
     x = np.asarray(clean, dtype=np.float32).copy()
-    T, D = x.shape
+    T = x.shape[0]
     seam = np.zeros((T, 1), dtype=np.float32)
     if T <= 12:
         if finalize_contract:
@@ -3259,27 +3327,46 @@ def degrade_for_refiner(
                 cfg,
                 finalize_contract=False,
             )
-            # Add light residual corruption mainly in root/rot channels; contacts rebuilt later.
-            noise = np.zeros_like(bridge, dtype=np.float32)
-            noise[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.18, size=(bridge.shape[0], 3)).astype(np.float32)
-            noise[:, ROT6D_START:ROT6D_END] = np.random.normal(0, severity * 0.08, size=(bridge.shape[0], ROT6D_END - ROT6D_START)).astype(np.float32)
-            x[a:b] = bridge + noise
+            # Never add Euclidean noise directly to Rot6D.  Build one C1-tapered,
+            # temporally correlated tangent perturbation and retract it on
+            # R^3 x SO(3)^24.  This creates realistic boundary uncertainty
+            # without manufacturing frame-independent jerk across the song.
+            span = int(bridge.shape[0])
+            phase = (
+                (np.arange(span, dtype=np.float32) + 1.0)
+                / float(span + 1)
+            )
+            taper = (np.sin(np.pi * phase) ** 2).astype(np.float32)
+            passes = max(
+                1,
+                int(getattr(cfg, "transition_tangent_smoothing_passes", 4)),
+            )
+            root_noise = _smooth_standard_normal_time_np(
+                (span, 3), passes=passes
+            )
+            joint_noise = _smooth_standard_normal_time_np(
+                (span, NUM_JOINTS, 3), passes=passes
+            )
+            tangent = np.zeros((span, 3 + NUM_JOINTS * 3), dtype=np.float32)
+            tangent[:, :3] = (
+                root_noise * taper[:, None] * float(severity) * 0.18
+            )
+            tangent[:, 3:] = (
+                joint_noise
+                * taper[:, None, None]
+                * float(severity)
+                * 0.08
+            ).reshape(span, -1)
+            x[a:b] = masked_retract_np(
+                bridge,
+                tangent,
+                joint_mask=np.ones((span, NUM_JOINTS), dtype=np.float32),
+                root_mask=np.ones((span, 1), dtype=np.float32),
+                max_rotation_rad=max(1.0e-4, float(severity) * 0.20),
+                max_root_m=max(1.0e-4, float(severity) * 0.30),
+            )
             seam[max(0, a - halo):min(T, b + halo), 0] = 0.35
             seam[a:b, 0] = 1.0
-        # Soft post-boundary drift to simulate mismatched retrieval alignment.
-        offset = np.zeros(D, dtype=np.float32)
-        offset[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.45, size=3)
-        offset[ROT6D_START:ROT6D_END] = np.random.normal(0, severity * 0.16, size=ROT6D_END - ROT6D_START)
-        tail = T - b
-        if tail > 0:
-            decay = np.linspace(1.0, 0.0, tail, dtype=np.float32)[:, None]
-            x[b:] += decay * offset[None]
-
-    # Tiny background noise keeps denoising stable without encouraging core rewrite.
-    noise = np.zeros_like(x, dtype=np.float32)
-    noise[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = np.random.normal(0, severity * 0.025, size=(T, 3)).astype(np.float32)
-    noise[:, ROT6D_START:ROT6D_END] = np.random.normal(0, severity * 0.012, size=(T, ROT6D_END - ROT6D_START)).astype(np.float32)
-    x += noise
     if finalize_contract:
         x, _ = enforce_edge151_contract_np(x, cfg, source_hint="inbetween_degrade_for_transition_refiner", derive_contact=True, project_rot=True)
     return x.astype(np.float32), np.clip(seam, 0.0, 1.0).astype(np.float32)
@@ -3316,7 +3403,38 @@ _VALIDATION_PHYSICAL_KEYS = (
 
 
 def _new_validation_physical_accumulator() -> Dict[str, Any]:
-    return {"audits": [], "gates": [], "fk_errors": []}
+    return {
+        "prediction_audits": [],
+        "clean_audits": [],
+        "degraded_audits": [],
+        "stage_repair_gates": [],
+        "clean_fidelity_gates": [],
+        "prediction_final_diagnostic_gates": [],
+        "clean_final_diagnostic_gates": [],
+        "fk_errors": [],
+    }
+
+
+def _safe_validation_audit(
+    motion: np.ndarray,
+    cfg: MotionGenerationConfig,
+    *,
+    role: str,
+    support_policy: str,
+) -> Dict[str, Any]:
+    try:
+        return audit_motion_np(
+            np.asarray(motion, dtype=np.float32),
+            cfg,
+            support_policy=support_policy,
+        )
+    except Exception as exc:
+        # Never project or sanitize a broken model prediction into an
+        # apparently healthy checkpoint validation sample.
+        return {
+            "schema": f"invalid_checkpoint_validation_{role}",
+            "validation_audit_error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _record_validation_physical_prediction(
@@ -3324,6 +3442,8 @@ def _record_validation_physical_prediction(
     prediction: np.ndarray,
     clean: np.ndarray,
     cfg: MotionGenerationConfig,
+    *,
+    degraded: Optional[np.ndarray] = None,
 ) -> None:
     predicted = np.asarray(prediction, dtype=np.float32)
     target, _ = enforce_edge151_contract_np(
@@ -3333,16 +3453,118 @@ def _record_validation_physical_prediction(
         derive_contact=True,
         project_rot=True,
     )
+    damaged = (
+        target
+        if degraded is None
+        else np.asarray(degraded, dtype=np.float32)
+    )
+
+    # Checkpoint validation is source/event-stage aware.  Fast low-foot source
+    # observations remain swing, and authentic short-event travel is compared
+    # to its own clean reference instead of being called whole-song drift.
+    prediction_audit = _safe_validation_audit(
+        predicted,
+        cfg,
+        role="prediction",
+        support_policy="source_observation",
+    )
+    clean_audit = _safe_validation_audit(
+        target,
+        cfg,
+        role="clean_target",
+        support_policy="source_observation",
+    )
+    degraded_audit = _safe_validation_audit(
+        damaged,
+        cfg,
+        role="degraded_input",
+        support_policy="source_observation",
+    )
+    degraded_physical_diagnostic = evaluate_stage_candidate(
+        degraded_audit,
+        prediction_audit,
+        require_repair_gain=False,
+        ignored_layers=("long_horizon_root_drift",),
+    )
+    fidelity_gate = evaluate_stage_reference_fidelity(
+        clean_audit,
+        prediction_audit,
+    )
     try:
-        audit = audit_motion_np(predicted, cfg)
-    except Exception as exc:
-        # Validation is fail-closed: never project or sanitize a broken model
-        # prediction into an apparently healthy physical sample.
-        audit = {
-            "schema": "invalid_validation_prediction",
-            "validation_audit_error": f"{type(exc).__name__}: {exc}",
-        }
-    gate = evaluate_physical_audit(audit)
+        degraded_product_error = float(
+            np.mean(np.abs(product_log_np(target, damaged)))
+        )
+        prediction_product_error = float(
+            np.mean(np.abs(product_log_np(target, predicted)))
+        )
+        if not np.isfinite(degraded_product_error):
+            degraded_product_error = float("inf")
+        if not np.isfinite(prediction_product_error):
+            prediction_product_error = float("inf")
+    except Exception:
+        degraded_product_error = float("inf")
+        prediction_product_error = float("inf")
+    repair_floor = 1.0e-6
+    stage_reasons: List[str] = []
+    stage_detail: Dict[str, Any] = {
+        "degraded_product_log_l1_to_clean": degraded_product_error,
+        "prediction_product_log_l1_to_clean": prediction_product_error,
+        "minimum_geometry_repair_gain": float(
+            cfg.checkpoint_validation_min_geometry_repair_gain
+        ),
+    }
+    if not np.isfinite(degraded_product_error) or not np.isfinite(
+        prediction_product_error
+    ):
+        geometry_repair_gain = float("-inf")
+        stage_reasons.append("nonfinite_product_geometry_error")
+    elif degraded is not None and degraded_product_error > repair_floor:
+        geometry_repair_gain = (
+            degraded_product_error - prediction_product_error
+        ) / degraded_product_error
+        minimum_gain = float(
+            cfg.checkpoint_validation_min_geometry_repair_gain
+        )
+        if not np.isfinite(geometry_repair_gain) or geometry_repair_gain < minimum_gain:
+            stage_reasons.append("no_meaningful_geometry_repair_gain")
+    else:
+        # Compatibility for direct validation helpers without synthetic
+        # corruption: exact/near-exact clean reconstruction is healthy.
+        geometry_repair_gain = (
+            1.0 if prediction_product_error <= repair_floor else float("-inf")
+        )
+        if prediction_product_error > repair_floor:
+            stage_reasons.append("uncorrupted_reference_not_reconstructed")
+    stage_detail["geometry_repair_gain"] = float(geometry_repair_gain)
+    stage_gate = {
+        "schema": "checkpoint_product_geometry_repair_gate_v1",
+        "accepted": not stage_reasons,
+        "reasons": list(dict.fromkeys(stage_reasons)),
+        "detail": stage_detail,
+        "acceptance_basis": "product_geometry_repair_toward_clean",
+        # Smoothing corruption can score physically better than authentic
+        # motion.  Keep this comparison for diagnosis, never as acceptance.
+        "degraded_physical_comparison_diagnostic": (
+            degraded_physical_diagnostic
+        ),
+    }
+
+    # Preserve the strict final gate as a named diagnostic only.  It is not a
+    # checkpoint criterion before Diffusion, boundary repair and IK.
+    prediction_final_audit = _safe_validation_audit(
+        predicted,
+        cfg,
+        role="prediction_final_diagnostic",
+        support_policy="final_fail_closed",
+    )
+    clean_final_audit = _safe_validation_audit(
+        target,
+        cfg,
+        role="clean_final_diagnostic",
+        support_policy="final_fail_closed",
+    )
+    prediction_final_gate = evaluate_physical_audit(prediction_final_audit)
+    clean_final_gate = evaluate_physical_audit(clean_final_audit)
     try:
         fk_error = np.linalg.norm(
             fk_24_np(predicted) - fk_24_np(target), axis=-1
@@ -3351,23 +3573,21 @@ def _record_validation_physical_prediction(
             fk_error = np.full((1,), np.inf, dtype=np.float32)
     except Exception:
         fk_error = np.full((1,), np.inf, dtype=np.float32)
-    accumulator["audits"].append(audit)
-    accumulator["gates"].append(gate)
+    accumulator["prediction_audits"].append(prediction_audit)
+    accumulator["clean_audits"].append(clean_audit)
+    accumulator["degraded_audits"].append(degraded_audit)
+    accumulator["stage_repair_gates"].append(stage_gate)
+    accumulator["clean_fidelity_gates"].append(fidelity_gate)
+    accumulator["prediction_final_diagnostic_gates"].append(
+        prediction_final_gate
+    )
+    accumulator["clean_final_diagnostic_gates"].append(clean_final_gate)
     accumulator["fk_errors"].append(fk_error.reshape(-1))
 
 
-def _summarize_validation_physical_metrics(
-    accumulator: Mapping[str, Any],
+def _summarize_validation_audits(
+    audits: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    audits = list(accumulator.get("audits", []))
-    gates = list(accumulator.get("gates", []))
-    error_parts = list(accumulator.get("fk_errors", []))
-    errors = np.concatenate(error_parts) if error_parts else np.zeros(0, dtype=np.float32)
-    failure_counts: Dict[str, int] = {}
-    for gate in gates:
-        for reason in gate.get("reasons", []):
-            failure_counts[str(reason)] = failure_counts.get(str(reason), 0) + 1
-
     worst_window: Dict[str, Optional[float]] = {}
     mean_across_windows: Dict[str, Optional[float]] = {}
     for key in _VALIDATION_PHYSICAL_KEYS:
@@ -3377,23 +3597,118 @@ def _summarize_validation_physical_metrics(
             mean_across_windows[key] = None
             continue
         worst_window[key] = (
-            float(min(values)) if key == "foot_penetration_min_m" else float(max(values))
+            float(min(values))
+            if key == "foot_penetration_min_m"
+            else float(max(values))
         )
         mean_across_windows[key] = float(np.mean(values))
-
-    passed = sum(bool(gate.get("ok", False)) for gate in gates)
     return {
-        "num_windows": len(audits),
+        "worst_window": worst_window,
+        "mean_across_windows": mean_across_windows,
+    }
+
+
+def _summarize_validation_gates(
+    gates: Sequence[Mapping[str, Any]],
+    *,
+    accepted_key: str,
+) -> Dict[str, Any]:
+    failure_counts: Dict[str, int] = {}
+    passed = 0
+    for gate in gates:
+        passed += int(bool(gate.get(accepted_key, False)))
+        for reason in gate.get("reasons", []):
+            failure_counts[str(reason)] = failure_counts.get(str(reason), 0) + 1
+    count = len(gates)
+    return {
+        "pass_rate": float(passed / count) if count else None,
+        "passed_windows": int(passed),
+        "failed_windows": int(count - passed),
+        "failure_reasons": failure_counts,
+    }
+
+
+def _summarize_validation_physical_metrics(
+    accumulator: Mapping[str, Any],
+) -> Dict[str, Any]:
+    prediction_audits = list(accumulator.get("prediction_audits", []))
+    clean_audits = list(accumulator.get("clean_audits", []))
+    degraded_audits = list(accumulator.get("degraded_audits", []))
+    stage_repair_gates = list(accumulator.get("stage_repair_gates", []))
+    error_parts = list(accumulator.get("fk_errors", []))
+    errors = np.concatenate(error_parts) if error_parts else np.zeros(0, dtype=np.float32)
+    prediction_summary = _summarize_validation_audits(prediction_audits)
+    geometry_gain_minimum = next(
+        (
+            gate.get("detail", {}).get("minimum_geometry_repair_gain")
+            for gate in stage_repair_gates
+            if gate.get("detail", {}).get("minimum_geometry_repair_gain")
+            is not None
+        ),
+        None,
+    )
+    return {
+        "schema": "motion_checkpoint_stage_validation_v2",
+        "num_windows": len(prediction_audits),
         "fk_position_error_m_mean": float(np.mean(errors)) if errors.size else None,
         "fk_position_error_m_p95": float(np.percentile(errors, 95)) if errors.size else None,
         "fk_position_error_m_max": float(np.max(errors)) if errors.size else None,
-        "physical_gate_pass_rate": float(passed / len(gates)) if gates else None,
-        "physical_gate_failed_windows": int(len(gates) - passed),
-        "physical_gate_failure_reasons": failure_counts,
-        "worst_window": worst_window,
-        "mean_across_windows": mean_across_windows,
-        "gate": "contracts.physical_quality.evaluate_physical_audit",
-        "aggregation_note": "worst_window is conservative across deterministic validation windows",
+        # Compatibility locations now unambiguously describe the prediction,
+        # while acceptance is reported in named stage contracts below.
+        **prediction_summary,
+        "prediction": prediction_summary,
+        "clean_target": _summarize_validation_audits(clean_audits),
+        "degraded_input": _summarize_validation_audits(degraded_audits),
+        "stage_repair": {
+            **_summarize_validation_gates(
+                stage_repair_gates,
+                accepted_key="accepted",
+            ),
+            "gate": "checkpoint_product_geometry_repair_gate_v1",
+            "ignored_layers": ["long_horizon_root_drift"],
+            "degraded_physical_comparison_is_diagnostic_only": True,
+            "geometry_repair_gain": {
+                "metric": "mean_absolute_product_log_to_clean",
+                "minimum": geometry_gain_minimum,
+                "configured_per_window": True,
+            },
+        },
+        "clean_reference_fidelity": {
+            **_summarize_validation_gates(
+                list(accumulator.get("clean_fidelity_gates", [])),
+                accepted_key="accepted",
+            ),
+            "gate": (
+                "contracts.physical_quality."
+                "evaluate_stage_reference_fidelity"
+            ),
+        },
+        "final_generation_gate_diagnostic": {
+            "prediction": _summarize_validation_gates(
+                list(
+                    accumulator.get(
+                        "prediction_final_diagnostic_gates", []
+                    )
+                ),
+                accepted_key="ok",
+            ),
+            "clean_target": _summarize_validation_gates(
+                list(accumulator.get("clean_final_diagnostic_gates", [])),
+                accepted_key="ok",
+            ),
+            "gate": "contracts.physical_quality.evaluate_physical_audit",
+            "checkpoint_criterion": False,
+            "authoritative_after": [
+                "diffusion",
+                "boundary_closed_loop",
+                "lower_body_ik",
+            ],
+        },
+        "support_policy": "source_observation",
+        "aggregation_note": (
+            "worst_window is conservative across deterministic validation "
+            "windows; final-generation absolute pass rate is diagnostic only"
+        ),
     }
 
 
@@ -3465,7 +3780,11 @@ def _evaluate_refiner_validation(
                     )
                 )
                 _record_validation_physical_prediction(
-                    physical, pred[0].detach().cpu().numpy(), clean, cfg
+                    physical,
+                    pred[0].detach().cpu().numpy(),
+                    clean,
+                    cfg,
+                    degraded=bad_t[0].detach().cpu().numpy(),
                 )
     finally:
         random.setstate(python_state)
@@ -3588,7 +3907,11 @@ def _evaluate_diffusion_validation(
                     )
                 )
                 _record_validation_physical_prediction(
-                    physical, decoded[0].detach().cpu().numpy(), clean, cfg
+                    physical,
+                    decoded[0].detach().cpu().numpy(),
+                    clean,
+                    cfg,
+                    degraded=retr[0].detach().cpu().numpy(),
                 )
     finally:
         random.setstate(python_state)
@@ -3633,6 +3956,145 @@ def _emit_training_progress(
         f"eta_minutes={remaining_seconds / 60.0:.1f}",
         flush=True,
     )
+
+
+def _checkpoint_validation_decision(
+    metrics: Mapping[str, Any],
+    cfg: MotionGenerationConfig,
+    *,
+    stage: str,
+) -> Dict[str, Any]:
+    """Decide whether a neural-stage checkpoint may become a formal asset.
+
+    This deliberately does not consume the strict final-generation diagnostic.
+    Refiner and diffusion checkpoints are accepted on their own stage contract:
+    repair the synthetic seam relative to the degraded input, remain faithful
+    to the clean source target, and keep the FK error bounded.  The absolute
+    whole-song physical gate remains downstream of repair, IK and closed-loop
+    composition.
+    """
+
+    physical = metrics.get("physical_quality", {})
+    stage_repair = physical.get("stage_repair", {})
+    clean_fidelity = physical.get("clean_reference_fidelity", {})
+    observed: Dict[str, Optional[float]] = {
+        "num_windows": physical.get("num_windows"),
+        "stage_repair_rate": stage_repair.get("pass_rate"),
+        "clean_fidelity_rate": clean_fidelity.get("pass_rate"),
+        "fk_position_error_m_p95": physical.get("fk_position_error_m_p95"),
+        "fk_position_error_m_max": physical.get("fk_position_error_m_max"),
+    }
+    thresholds: Dict[str, float] = {
+        "min_stage_repair_rate": float(
+            cfg.checkpoint_validation_min_stage_repair_rate
+        ),
+        "min_clean_fidelity_rate": float(
+            cfg.checkpoint_validation_min_clean_fidelity_rate
+        ),
+        "max_fk_position_error_m_p95": float(
+            cfg.checkpoint_validation_max_fk_p95_m
+        ),
+        "max_fk_position_error_m_max": float(
+            cfg.checkpoint_validation_max_fk_max_m
+        ),
+    }
+    reasons: List[str] = []
+
+    def _require_min(name: str, minimum: float) -> None:
+        raw = observed.get(name)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            reasons.append(f"missing_or_nonfinite:{name}")
+            return
+        if not np.isfinite(value):
+            reasons.append(f"missing_or_nonfinite:{name}")
+        elif value < float(minimum):
+            reasons.append(f"{name}_too_low")
+
+    def _require_max(name: str, maximum: float) -> None:
+        raw = observed.get(name)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            reasons.append(f"missing_or_nonfinite:{name}")
+            return
+        if not np.isfinite(value):
+            reasons.append(f"missing_or_nonfinite:{name}")
+        elif value > float(maximum):
+            reasons.append(f"{name}_too_high")
+
+    try:
+        num_windows = int(observed["num_windows"])
+    except (TypeError, ValueError):
+        num_windows = 0
+    if num_windows <= 0:
+        reasons.append("validation_windows_missing")
+    _require_min(
+        "stage_repair_rate",
+        thresholds["min_stage_repair_rate"],
+    )
+    _require_min(
+        "clean_fidelity_rate",
+        thresholds["min_clean_fidelity_rate"],
+    )
+    _require_max(
+        "fk_position_error_m_p95",
+        thresholds["max_fk_position_error_m_p95"],
+    )
+    _require_max(
+        "fk_position_error_m_max",
+        thresholds["max_fk_position_error_m_max"],
+    )
+
+    if stage == "refiner":
+        metric_name = "reconstruction_product_log_l1"
+        observed[metric_name] = metrics.get(metric_name)
+        thresholds["max_reconstruction_product_log_l1"] = float(
+            cfg.checkpoint_validation_max_refiner_product_log_l1
+        )
+        _require_max(
+            metric_name,
+            thresholds["max_reconstruction_product_log_l1"],
+        )
+    elif stage != "diffusion":
+        reasons.append(f"unsupported_checkpoint_stage:{stage}")
+
+    scientific_acceptance = not reasons
+    fail_closed = bool(cfg.checkpoint_validation_fail_closed)
+    return {
+        "schema": "motion_checkpoint_publication_decision_v1",
+        "stage": str(stage),
+        "scientific_acceptance": bool(scientific_acceptance),
+        "publish_allowed": bool(scientific_acceptance or not fail_closed),
+        "fail_closed_enforced": fail_closed,
+        "reasons": reasons,
+        "thresholds": thresholds,
+        "observed": observed,
+        "final_generation_gate_used": False,
+        "final_generation_gate_role": (
+            "diagnostic_only_until_diffusion_boundary_ik_closed_loop"
+        ),
+    }
+
+
+def _save_checkpoint_after_validation(
+    payload: Mapping[str, Any],
+    requested_path: Path,
+    decision: Mapping[str, Any],
+) -> Tuple[Path, bool]:
+    """Publish an accepted checkpoint, or quarantine a rejected candidate."""
+
+    publish = bool(decision.get("publish_allowed", False))
+    actual_path = requested_path
+    if not publish:
+        suffix = requested_path.suffix or ".pt"
+        actual_path = requested_path.with_name(
+            f"{requested_path.stem}.rejected_validation{suffix}"
+        )
+    actual_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(dict(payload), actual_path)
+    return actual_path, publish
 
 
 def train_refiner(args: argparse.Namespace) -> int:
@@ -3760,9 +4222,15 @@ def train_refiner(args: argparse.Namespace) -> int:
     validation_report["metrics"] = _evaluate_refiner_validation(
         model, validation_db, db, cfg, device
     )
+    decision = _checkpoint_validation_decision(
+        validation_report["metrics"],
+        cfg,
+        stage="refiner",
+    )
+    validation_report["checkpoint_decision"] = decision
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    payload = {
         "version": "product_manifold_boundary_refiner_v1",
         "output_mode": "contact_logits_root_joint_tangent",
         "output_dim": PRODUCT_STATE_DIM,
@@ -3778,11 +4246,18 @@ def train_refiner(args: argparse.Namespace) -> int:
             "std": np.asarray(db["desc_std"], dtype=np.float32),
         },
         "validation": validation_report,
-    }, out)
+    }
+    saved_path, published = _save_checkpoint_after_validation(
+        payload,
+        out,
+        decision,
+    )
     print(
         json.dumps(
             {
-                "refiner_ckpt": str(out),
+                "refiner_ckpt": str(saved_path),
+                "requested_ckpt": str(out),
+                "published": bool(published),
                 "steps": steps,
                 "validation": validation_report,
             },
@@ -3791,7 +4266,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
-    return 0
+    return 0 if published else 2
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -4088,9 +4563,15 @@ def train_diffusion(args: argparse.Namespace) -> int:
     validation_report["metrics"] = _evaluate_diffusion_validation(
         model, validation_db, db, cfg, device, abar, Tdiff
     )
+    decision = _checkpoint_validation_decision(
+        validation_report["metrics"],
+        cfg,
+        stage="diffusion",
+    )
+    validation_report["checkpoint_decision"] = decision
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    payload = {
         "version": "reference_tangent_motion_diffusion_v1",
         "diffusion_space": "reference_point_product_tangent",
         "state_dim": PRODUCT_STATE_DIM,
@@ -4107,11 +4588,18 @@ def train_diffusion(args: argparse.Namespace) -> int:
             "std": np.asarray(db["desc_std"], dtype=np.float32),
         },
         "validation": validation_report,
-    }, out)
+    }
+    saved_path, published = _save_checkpoint_after_validation(
+        payload,
+        out,
+        decision,
+    )
     print(
         json.dumps(
             {
-                "diffusion_ckpt": str(out),
+                "diffusion_ckpt": str(saved_path),
+                "requested_ckpt": str(out),
+                "published": bool(published),
                 "steps": steps,
                 "validation": validation_report,
             },
@@ -4120,7 +4608,7 @@ def train_diffusion(args: argparse.Namespace) -> int:
         ),
         flush=True,
     )
-    return 0
+    return 0 if published else 2
 
 
 
@@ -6555,6 +7043,7 @@ def audit_motion_np(
     motion: np.ndarray,
     cfg: Optional[MotionGenerationConfig] = None,
     *,
+    support_policy: str = "final_fail_closed",
     sliding_support_eligible: Optional[np.ndarray] = None,
     precomputed_joints: Optional[np.ndarray] = None,
 ) -> dict:
@@ -6574,6 +7063,7 @@ def audit_motion_np(
     report = motion_physical_metrics_np(
         audited_motion,
         fps=float(cfg.fps),
+        support_policy=support_policy,
         sliding_support_eligible=sliding_support_eligible,
         precomputed_joints=reusable_joints,
     )

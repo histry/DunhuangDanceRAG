@@ -4,6 +4,7 @@ from contracts.physical_quality import (
     PhysicalQualityLimits,
     StageAcceptancePolicy,
     evaluate_stage_candidate,
+    evaluate_stage_reference_fidelity,
     run_stage_transaction,
 )
 from motion_geometry.physical import motion_physical_metrics_np
@@ -126,3 +127,40 @@ def test_stage_policy_covers_window_extremity_support_and_root_drift_metrics():
     assert "foot_support_drift_m_max_regressed" in decision["reasons"]
     assert "root_horizontal_drift_speed_mps_regressed" in decision["reasons"]
     assert "joint_rotation_step_rad_max_regressed" in decision["reasons"]
+
+
+def test_checkpoint_stage_can_explicitly_ignore_short_event_root_travel():
+    before = _audit_for_level(1.0)
+    before["root_horizontal_radius_p95_m"] = 3.0
+    candidate = dict(before)
+    candidate["root_horizontal_radius_p95_m"] = 3.01
+
+    strict = evaluate_stage_candidate(before, candidate)
+    checkpoint = evaluate_stage_candidate(
+        before,
+        candidate,
+        ignored_layers=("long_horizon_root_drift",),
+    )
+
+    assert strict["accepted"] is False
+    assert "root_horizontal_radius_p95_m_regressed" in strict["reasons"]
+    assert checkpoint["accepted"] is True, checkpoint["reasons"]
+    assert checkpoint["ignored_layers"] == ["long_horizon_root_drift"]
+
+
+def test_clean_reference_fidelity_is_relative_not_an_absolute_final_gate():
+    reference = _audit_for_level(1.0)
+    reference["root_horizontal_radius_p95_m"] = 3.0
+
+    faithful = evaluate_stage_reference_fidelity(reference, dict(reference))
+    regressed = dict(reference)
+    regressed["root_horizontal_radius_p95_m"] = 3.5
+    rejected = evaluate_stage_reference_fidelity(reference, regressed)
+
+    assert faithful["accepted"] is True, faithful["reasons"]
+    assert faithful["absolute_final_gate_used"] is False
+    assert rejected["accepted"] is False
+    assert (
+        "reference_fidelity_root_horizontal_radius_p95_m_regressed"
+        in rejected["reasons"]
+    )

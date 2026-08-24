@@ -20,6 +20,7 @@ from motion_geometry.smpl24 import skeleton_contract
 from support.event_identity import make_event_db_contract
 from training.motion_models import (
     MotionGenerationConfig,
+    _checkpoint_validation_decision,
     _new_validation_physical_accumulator,
     _record_validation_physical_prediction,
     _summarize_validation_physical_metrics,
@@ -28,6 +29,7 @@ from training.motion_models import (
     _validate_source_disjoint,
     assert_motion_checkpoint_contract,
     build_frame_local_conditioning,
+    degrade_for_refiner,
     identity6d_np,
     load_db,
     motion_checkpoint_contract,
@@ -383,14 +385,134 @@ class MotionTrainingContractTests(unittest.TestCase):
         cfg = MotionGenerationConfig()
         motion = self._identity_motion(60)
         accumulator = _new_validation_physical_accumulator()
-        _record_validation_physical_prediction(accumulator, motion, motion, cfg)
+        _record_validation_physical_prediction(
+            accumulator,
+            motion,
+            motion,
+            cfg,
+            degraded=motion,
+        )
         summary = _summarize_validation_physical_metrics(accumulator)
         self.assertEqual(summary["num_windows"], 1)
+        self.assertEqual(summary["schema"], "motion_checkpoint_stage_validation_v2")
         self.assertIn("fk_position_error_m_p95", summary)
         self.assertIn("foot_skate_mps_p95", summary["worst_window"])
         self.assertIn("joint_jerk_mps3_p95", summary["worst_window"])
         self.assertIn("joint_rotation_step_rad_p95", summary["worst_window"])
         self.assertIn("root_horizontal_net_displacement_m", summary["worst_window"])
+        self.assertEqual(summary["stage_repair"]["pass_rate"], 1.0)
+        self.assertEqual(summary["clean_reference_fidelity"]["pass_rate"], 1.0)
+        self.assertFalse(
+            summary["final_generation_gate_diagnostic"]["checkpoint_criterion"]
+        )
+
+    def test_degradation_is_local_smooth_and_stays_on_product_manifold(self):
+        cfg = MotionGenerationConfig()
+        clean = self._identity_motion(120)
+        clean[:, 4] = np.linspace(0.0, 0.6, len(clean), dtype=np.float32)
+        with mock.patch.object(motion_runtime.random, "randint", side_effect=[24, 60]):
+            np.random.seed(20260824)
+            degraded, seam = degrade_for_refiner(
+                clean,
+                cfg=cfg,
+                finalize_contract=False,
+            )
+
+        inactive = seam[:, 0] == 0.0
+        np.testing.assert_array_equal(degraded[inactive, 4:], clean[inactive, 4:])
+        self.assertGreater(float(np.max(np.abs(degraded - clean))), 0.0)
+        matrices = rot6d_to_matrix_np(degraded[:, 7:151].reshape(-1, 24, 6))
+        determinants = np.linalg.det(matrices)
+        np.testing.assert_allclose(determinants, 1.0, atol=2.0e-5)
+        self.assertTrue(np.isfinite(degraded).all())
+
+    def test_authentic_event_travel_is_not_a_checkpoint_failure(self):
+        cfg = MotionGenerationConfig()
+        motion = self._identity_motion(60)
+        motion[:, 4] = np.linspace(0.0, 1.0, len(motion), dtype=np.float32)
+        accumulator = _new_validation_physical_accumulator()
+        _record_validation_physical_prediction(
+            accumulator,
+            motion,
+            motion,
+            cfg,
+            degraded=motion,
+        )
+        summary = _summarize_validation_physical_metrics(accumulator)
+
+        self.assertEqual(summary["stage_repair"]["pass_rate"], 1.0)
+        self.assertEqual(summary["clean_reference_fidelity"]["pass_rate"], 1.0)
+        self.assertEqual(
+            summary["final_generation_gate_diagnostic"]["prediction"]["pass_rate"],
+            0.0,
+        )
+
+    def test_unchanged_degraded_input_is_not_counted_as_repair(self):
+        cfg = MotionGenerationConfig()
+        clean = self._identity_motion(120)
+        with mock.patch.object(motion_runtime.random, "randint", side_effect=[24, 60]):
+            np.random.seed(20260824)
+            degraded, _ = degrade_for_refiner(
+                clean,
+                cfg=cfg,
+                finalize_contract=False,
+            )
+        accumulator = _new_validation_physical_accumulator()
+        _record_validation_physical_prediction(
+            accumulator,
+            degraded,
+            clean,
+            cfg,
+            degraded=degraded,
+        )
+        summary = _summarize_validation_physical_metrics(accumulator)
+
+        self.assertEqual(summary["stage_repair"]["pass_rate"], 0.0)
+        self.assertIn(
+            "no_meaningful_geometry_repair_gain",
+            summary["stage_repair"]["failure_reasons"],
+        )
+
+    def test_checkpoint_decision_ignores_final_gate_diagnostic(self):
+        cfg = MotionGenerationConfig()
+        metrics = {
+            "reconstruction_product_log_l1": 0.01,
+            "physical_quality": {
+                "num_windows": 16,
+                "fk_position_error_m_p95": 0.01,
+                "fk_position_error_m_max": 0.02,
+                "stage_repair": {"pass_rate": 1.0},
+                "clean_reference_fidelity": {"pass_rate": 1.0},
+                "final_generation_gate_diagnostic": {
+                    "prediction": {"pass_rate": 0.0},
+                },
+            },
+        }
+        decision = _checkpoint_validation_decision(metrics, cfg, stage="refiner")
+
+        self.assertTrue(decision["scientific_acceptance"])
+        self.assertTrue(decision["publish_allowed"])
+        self.assertFalse(decision["final_generation_gate_used"])
+
+        metrics["physical_quality"]["stage_repair"]["pass_rate"] = 0.0
+        rejected = _checkpoint_validation_decision(metrics, cfg, stage="refiner")
+        self.assertFalse(rejected["scientific_acceptance"])
+        self.assertFalse(rejected["publish_allowed"])
+
+    @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
+    def test_rejected_checkpoint_is_quarantined_not_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            requested = Path(tmp) / "boundary_refiner.pt"
+            saved, published = motion_runtime._save_checkpoint_after_validation(
+                {"version": "test_candidate"},
+                requested,
+                {"publish_allowed": False},
+            )
+
+            self.assertFalse(published)
+            self.assertFalse(requested.exists())
+            self.assertEqual(saved.name, "boundary_refiner.rejected_validation.pt")
+            self.assertTrue(saved.is_file())
 
 if __name__ == "__main__":
     unittest.main()

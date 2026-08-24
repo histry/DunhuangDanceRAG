@@ -369,6 +369,9 @@ def test_cuda_formal_training_entrypoints_complete_one_step(tmp_path):
                 "refiner_train_steps": 1,
                 "diffusion_train_steps": 1,
                 "diffusion_steps": 2,
+                # This smoke test proves CUDA reachability, not scientific
+                # convergence after a single optimizer step.
+                "checkpoint_validation_fail_closed": False,
             }
         ),
         encoding="utf-8",
