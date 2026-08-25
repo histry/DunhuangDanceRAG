@@ -97,15 +97,19 @@ if ! [[ "${MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS:-}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+# Router and Duration are independent upstream models.  Planner serializes the
+# exact hashes of both checkpoints, so changing either upstream requires a new
+# Planner.  The Generation Index belongs to the Event-DB lifecycle rather than
+# to a model-training lifecycle: preserving an unchanged Event-DB must preserve
+# the exact Index bytes already bound to reusable checkpoints.
 SCHEDULER_RETRAIN_SET="${GENERATION_RETRAIN_ROUTER}/${GENERATION_RETRAIN_DURATION}/${GENERATION_RETRAIN_PLANNER}"
-case "$SCHEDULER_RETRAIN_SET" in
-  0/0/0) SCHEDULER_RETRAIN_ALL=0 ;;
-  1/1/1) SCHEDULER_RETRAIN_ALL=1 ;;
-  *)
-    echo "[FATAL] Router, Duration and Planner share one serialized Generation Index and must be retrained or reused together; got $SCHEDULER_RETRAIN_SET" >&2
-    exit 2
-    ;;
-esac
+if [[ "$GENERATION_RETRAIN_PLANNER" != "1" \
+   && ( "$GENERATION_RETRAIN_ROUTER" == "1" \
+     || "$GENERATION_RETRAIN_DURATION" == "1" ) ]]; then
+  echo "[FATAL] Retraining Router or Duration changes a Planner upstream checkpoint; retrain Planner too. Got Router/Duration/Planner=$SCHEDULER_RETRAIN_SET" >&2
+  exit 2
+fi
+SCHEDULER_REBUILD_INDEX="$GENERATION_REBUILD_EVENT_DB"
 
 if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" \
    && "$GENERATION_REBUILD_EVENT_DB" != "1" ]]; then
@@ -113,7 +117,9 @@ if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" \
   exit 2
 fi
 if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
-  if [[ "$SCHEDULER_RETRAIN_ALL" != "1" \
+  if [[ "$GENERATION_RETRAIN_ROUTER" != "1" \
+     || "$GENERATION_RETRAIN_DURATION" != "1" \
+     || "$GENERATION_RETRAIN_PLANNER" != "1" \
      || "$GENERATION_RETRAIN_REFINER" != "1" \
      || "$GENERATION_RETRAIN_DIFFUSION" != "1" ]]; then
     echo "[FATAL] Rebuilding Event-DB changes every learned-data contract; retrain Router/Duration/Planner, Refiner and Diffusion together." >&2
@@ -283,7 +289,7 @@ ALIGNED_SCHEDULER_DIR="$OUT_ROOT/scheduler_generation_assets"
 ALIGNED_INDEX_JSON="$ALIGNED_SCHEDULER_DIR/event_index.json"
 ALIGNED_INDEX_NPZ="$ALIGNED_SCHEDULER_DIR/duration_index.npz"
 mkdir -p "$ALIGNED_SCHEDULER_DIR"
-if [[ "$SCHEDULER_RETRAIN_ALL" == "1" ]]; then
+if [[ "$SCHEDULER_REBUILD_INDEX" == "1" ]]; then
   INDEX_CANDIDATE_DIR="$(mktemp -d "$ALIGNED_SCHEDULER_DIR/.index_candidate.XXXXXX")"
   "$PY" scheduling/build_generation_index.py \
     --db "$GENERATION_DB" \

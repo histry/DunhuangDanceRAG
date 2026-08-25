@@ -488,7 +488,7 @@ class SchedulerArchitectureTests(unittest.TestCase):
             cleanup_block,
         )
 
-    def test_pipeline_preserves_scheduler_assets_on_checkpoint_resume(self):
+    def test_pipeline_uses_dependency_aware_scheduler_retraining(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(
             encoding="utf-8"
         )
@@ -498,7 +498,27 @@ class SchedulerArchitectureTests(unittest.TestCase):
             source,
         )
         self.assertIn(
+            'if [[ "$GENERATION_RETRAIN_PLANNER" != "1"',
+            source,
+        )
+        self.assertIn(
+            '"$GENERATION_RETRAIN_ROUTER" == "1"',
+            source,
+        )
+        self.assertIn(
+            '"$GENERATION_RETRAIN_DURATION" == "1"',
+            source,
+        )
+        self.assertIn(
+            "Retraining Router or Duration changes a Planner upstream checkpoint",
+            source,
+        )
+        self.assertNotIn(
             "Router, Duration and Planner share one serialized Generation Index",
+            source,
+        )
+        self.assertIn(
+            'SCHEDULER_REBUILD_INDEX="$GENERATION_REBUILD_EVENT_DB"',
             source,
         )
         start = source.index(
@@ -506,7 +526,8 @@ class SchedulerArchitectureTests(unittest.TestCase):
         )
         end = source.index("export GENERATION_INDEX_JSON", start)
         block = source[start:end]
-        self.assertIn('if [[ "$SCHEDULER_RETRAIN_ALL" == "1" ]]', block)
+        self.assertIn('if [[ "$SCHEDULER_REBUILD_INDEX" == "1" ]]', block)
+        self.assertNotIn("SCHEDULER_RETRAIN_ALL", source)
         self.assertIn("build_generation_index.py", block)
         self.assertIn(
             "Preserving the exact Scheduler Index bytes bound to existing checkpoints",
