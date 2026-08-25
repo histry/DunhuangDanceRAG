@@ -304,6 +304,11 @@ def build_frame_joint_risk_mask(
     root_score *= seam_f.astype(np.float32)
     root_score = np.maximum(
         root_score,
+        seam_f.astype(np.float32)
+        * _env_float("GROUNDING_ROOT_MASK_MIN_ON_SEAM", 0.18),
+    )
+    root_score = np.maximum(
+        root_score,
         np.asarray(peak["root"], dtype=np.float32),
     )
 

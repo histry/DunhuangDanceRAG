@@ -47,7 +47,7 @@ def test_refiner_window_batching_matches_single_window_execution():
         checkpoint_path = Path(td) / "refiner.pt"
         torch.save(
             {
-                "version": "product_manifold_boundary_refiner_v1",
+                "version": "product_manifold_boundary_refiner_v2",
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
                     cfg,
@@ -76,6 +76,38 @@ def test_refiner_window_batching_matches_single_window_execution():
     assert len(models._INFERENCE_MODEL_CACHE) == 1
 
 
+def test_formal_refiner_rejects_pre_dilation_v1_checkpoint():
+    torch = models.torch
+    cfg = _config(1)
+    motion = _identity_motion(30)
+    condition = np.zeros((len(motion), 32), dtype=np.float32)
+    seam = np.ones((len(motion), 1), dtype=np.float32)
+    model = models.ProductManifoldTemporalRefiner(151, 32)
+    models._INFERENCE_MODEL_CACHE.clear()
+
+    with tempfile.TemporaryDirectory() as td:
+        checkpoint_path = Path(td) / "legacy_refiner.pt"
+        torch.save(
+            {
+                "version": "product_manifold_boundary_refiner_v1",
+                "state_dict": model.state_dict(),
+                "motion_contract": models.motion_checkpoint_contract(
+                    cfg,
+                    "boundary_refiner",
+                ),
+            },
+            checkpoint_path,
+        )
+        with pytest.raises(RuntimeError, match="non-product refiner"):
+            models._stage_guard_orig_apply_refiner_model(
+                motion,
+                condition,
+                seam,
+                str(checkpoint_path),
+                cfg,
+            )
+
+
 def test_diffusion_window_batching_preserves_seeded_result():
     torch = models.torch
     cfg = _config(1)
@@ -91,7 +123,7 @@ def test_diffusion_window_batching_preserves_seeded_result():
         checkpoint_path = Path(td) / "diffusion.pt"
         torch.save(
             {
-                "version": "reference_tangent_motion_diffusion_v1",
+                "version": "reference_tangent_motion_diffusion_v2",
                 "diffusion_steps": 2,
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
@@ -145,7 +177,7 @@ def test_cuda_diffusion_gpu_preprocessing_preserves_seeded_batching():
         checkpoint_path = Path(td) / "diffusion_cuda.pt"
         torch.save(
             {
-                "version": "reference_tangent_motion_diffusion_v1",
+                "version": "reference_tangent_motion_diffusion_v2",
                 "diffusion_steps": 2,
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(

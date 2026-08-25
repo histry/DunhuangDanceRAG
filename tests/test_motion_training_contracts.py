@@ -401,6 +401,18 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertIn("joint_rotation_step_rad_p95", summary["worst_window"])
         self.assertIn("root_horizontal_net_displacement_m", summary["worst_window"])
         self.assertEqual(summary["stage_repair"]["pass_rate"], 1.0)
+        self.assertEqual(
+            summary["stage_repair"]["geometry_repair_gain"]["observed"][
+                "mean"
+            ],
+            1.0,
+        )
+        self.assertEqual(
+            summary["stage_repair"][
+                "prediction_product_log_l1_to_clean"
+            ]["mean"],
+            0.0,
+        )
         self.assertEqual(summary["clean_reference_fidelity"]["pass_rate"], 1.0)
         self.assertEqual(
             summary["clean_physical_non_regression"]["pass_rate"], 1.0
@@ -428,6 +440,91 @@ class MotionTrainingContractTests(unittest.TestCase):
         determinants = np.linalg.det(matrices)
         np.testing.assert_allclose(determinants, 1.0, atol=2.0e-5)
         self.assertTrue(np.isfinite(degraded).all())
+
+    def test_refiner_receptive_field_covers_formal_training_seam(self):
+        cfg = MotionGenerationConfig()
+        model = motion_runtime.ProductManifoldTemporalRefiner()
+        maximum_seam = int(
+            round(cfg.transition_train_max_seconds * cfg.fps)
+        )
+        self.assertEqual(model.temporal_dilations, (1, 2, 4))
+        self.assertGreaterEqual(
+            model.temporal_receptive_field_frames,
+            maximum_seam + 1,
+        )
+
+    @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
+    def test_refiner_loss_is_normalized_on_corrupted_seam_and_requires_gain(self):
+        torch = motion_runtime.torch
+        cfg = MotionGenerationConfig(device="cpu")
+        clean = self._identity_motion(60)
+        clean_t = torch.from_numpy(clean[None])
+        degraded_t = clean_t.clone()
+        degraded_t[:, 20:40, motion_runtime.ROOT_X_IDX] += 0.05
+        seam = torch.zeros((1, 60, 1), dtype=torch.float32)
+        seam[:, 20:40] = 1.0
+        joint = torch.zeros((1, 60, 24), dtype=torch.float32)
+        root = torch.ones((1, 60, 1), dtype=torch.float32)
+        contact = torch.zeros((1, 60, 1), dtype=torch.float32)
+
+        _, unchanged = motion_runtime._product_motion_losses(
+            degraded_t,
+            clean_t,
+            degraded_t,
+            joint,
+            root,
+            contact,
+            cfg,
+            seam_mask=seam,
+        )
+        _, repaired = motion_runtime._product_motion_losses(
+            clean_t,
+            clean_t,
+            degraded_t,
+            joint,
+            root,
+            contact,
+            cfg,
+            seam_mask=seam,
+        )
+        harmed_t = clean_t.clone()
+        harmed_t[:, 0:10, motion_runtime.ROOT_X_IDX] += 0.02
+        _, harmed = motion_runtime._product_motion_losses(
+            harmed_t,
+            clean_t,
+            degraded_t,
+            joint,
+            root,
+            contact,
+            cfg,
+            seam_mask=seam,
+        )
+
+        self.assertGreater(
+            unchanged["active_reconstruction"].item(),
+            unchanged["reconstruction"].item(),
+        )
+        self.assertGreater(unchanged["repair_margin"].item(), 0.0)
+        self.assertAlmostEqual(repaired["active_reconstruction"].item(), 0.0)
+        self.assertAlmostEqual(repaired["repair_margin"].item(), 0.0)
+        self.assertAlmostEqual(repaired["clean_preservation"].item(), 0.0)
+        self.assertGreater(harmed["clean_preservation"].item(), 0.0)
+
+    def test_transition_bridge_mix_is_fail_closed(self):
+        cfg = MotionGenerationConfig()
+        cfg.transition_bridge_mix = 0.0
+        clean = self._identity_motion(120)
+        with self.assertRaisesRegex(ValueError, "transition_bridge_mix"):
+            with mock.patch.object(
+                motion_runtime.random,
+                "randint",
+                side_effect=[24, 60],
+            ):
+                degrade_for_refiner(
+                    clean,
+                    cfg=cfg,
+                    finalize_contract=False,
+                )
 
     def test_authentic_event_travel_is_not_a_checkpoint_failure(self):
         cfg = MotionGenerationConfig()

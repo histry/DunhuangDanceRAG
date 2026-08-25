@@ -408,6 +408,20 @@ class MotionGenerationConfig:
     product_refiner_rotation_cap_rad: float = 0.35
     product_refiner_root_cap_m: float = 0.08
     product_refiner_outside_weight: float = 0.25
+    # The synthetic transition occupies only a minority of a training window.
+    # Keep a small whole-window fidelity term, but normalize the main geometry
+    # objective on the actually corrupted seam so authentic high-motion frames
+    # selected by the Peak-Jerk mask cannot dilute the repair signal.
+    product_refiner_global_reconstruction_weight: float = 0.25
+    product_refiner_active_reconstruction_weight: float = 1.0
+    product_refiner_tangent_supervision_weight: float = 0.50
+    product_refiner_repair_margin_weight: float = 1.0
+    product_refiner_clean_preservation_weight: float = 1.0
+    # A full endpoint-only inbetween discards the unknown clean interior and
+    # makes source-disjoint reconstruction ill posed.  Retain half of the
+    # authentic local trajectory while injecting the same transition artifact
+    # seen by the boundary stage.
+    transition_bridge_mix: float = 0.50
     # Differentiable world-space supervision shared by Motion Refiner and Motion Generation.  The
     # acceleration/jerk residuals are normalized inside the loss, so these
     # weights are comparable to the product-manifold reconstruction term.
@@ -476,6 +490,27 @@ class MotionGenerationConfig:
             "MOTION_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
             "MOTION_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
             "MOTION_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
+            "MOTION_PRODUCT_REFINER_GLOBAL_RECONSTRUCTION_WEIGHT": (
+                "product_refiner_global_reconstruction_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_ACTIVE_RECONSTRUCTION_WEIGHT": (
+                "product_refiner_active_reconstruction_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_TANGENT_SUPERVISION_WEIGHT": (
+                "product_refiner_tangent_supervision_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_REPAIR_MARGIN_WEIGHT": (
+                "product_refiner_repair_margin_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_CLEAN_PRESERVATION_WEIGHT": (
+                "product_refiner_clean_preservation_weight",
+                float,
+            ),
+            "MOTION_TRANSITION_BRIDGE_MIX": ("transition_bridge_mix", float),
             "MOTION_PHYSICS_FK_LOSS_WEIGHT": ("physics_fk_loss_weight", float),
             "MOTION_PHYSICS_FOOT_LOSS_WEIGHT": ("physics_foot_loss_weight", float),
             "MOTION_PHYSICS_SUPPORT_LOSS_WEIGHT": ("physics_support_loss_weight", float),
@@ -2214,17 +2249,25 @@ class ProductManifoldTemporalRefiner(nn.Module):
         hidden: int = 256,
     ):
         super().__init__()
+        # Kernel-5 dilations [1,2,4] give a 29-frame receptive field.  This
+        # covers the configured 28-frame maximum synthetic seam; the former
+        # undilated stack saw only 13 frames and could not observe both seam
+        # boundaries from its centre.
+        self.temporal_dilations = (1, 2, 4)
+        self.temporal_receptive_field_frames = 1 + 4 * sum(
+            self.temporal_dilations
+        )
         self.in_proj = nn.Conv1d(
             motion_dim + cond_dim + 1 + NUM_JOINTS, hidden, 1
         )
         self.net = nn.Sequential(
-            nn.Conv1d(hidden, hidden, 5, padding=2),
+            nn.Conv1d(hidden, hidden, 5, padding=2, dilation=1),
             nn.GroupNorm(8, hidden),
             nn.SiLU(),
-            nn.Conv1d(hidden, hidden, 5, padding=2),
+            nn.Conv1d(hidden, hidden, 5, padding=4, dilation=2),
             nn.GroupNorm(8, hidden),
             nn.SiLU(),
-            nn.Conv1d(hidden, hidden, 5, padding=2),
+            nn.Conv1d(hidden, hidden, 5, padding=8, dilation=4),
             nn.GroupNorm(8, hidden),
             nn.SiLU(),
         )
@@ -2518,6 +2561,11 @@ def _risk_masks_for_batch_torch(
         0.0,
         1.0,
     ) * seam_active.to(dtype)
+    root_score = torch.maximum(
+        root_score,
+        seam_active.to(dtype)
+        * _risk_mask_env_float("GROUNDING_ROOT_MASK_MIN_ON_SEAM", 0.18),
+    )
     root_score = torch.maximum(root_score, peak_joint[..., 0])
 
     contact_score = torch.zeros(
@@ -2997,6 +3045,7 @@ def _product_motion_losses(
     root_mask,
     contact_mask,
     cfg: MotionGenerationConfig,
+    seam_mask=None,
 ):
     contact_target = clean[..., :4].clamp(0.0, 1.0)
     contact_weight = 0.25 + 0.75 * contact_mask
@@ -3032,6 +3081,64 @@ def _product_motion_losses(
         ],
         dim=-1,
     ).clamp(0.0, 1.0)
+
+    # ``joint_mask`` may deliberately include authentic Peak-Jerk frames away
+    # from the synthetic seam.  They are editable at inference, but they were
+    # not damaged in this supervised sample.  Normalize the primary repair
+    # objective on the known corruption support instead of averaging a short
+    # seam over every frame and all 75 geometry channels.
+    if seam_mask is None:
+        corruption_support = torch.ones_like(product_mask[..., :1])
+    else:
+        corruption_support = seam_mask
+        if corruption_support.ndim == product_mask.ndim - 1:
+            corruption_support = corruption_support.unsqueeze(-1)
+        if corruption_support.shape[:-1] != product_mask.shape[:-1]:
+            raise ValueError(
+                "seam_mask must be frame-aligned with the product motion loss"
+            )
+        corruption_support = corruption_support.amax(
+            dim=-1,
+            keepdim=True,
+        ).clamp(0.0, 1.0)
+    repair_mask = product_mask * corruption_support
+
+    def weighted_per_sample(value, weight):
+        expanded = torch.broadcast_to(weight, value.shape)
+        numerator = (value * expanded).sum(dim=(1, 2))
+        denominator = expanded.sum(dim=(1, 2)).clamp_min(1.0)
+        return numerator / denominator
+
+    active_reconstruction_per_sample = weighted_per_sample(
+        reconstruction_tangent.abs(),
+        repair_mask,
+    )
+    active_reconstruction_loss = active_reconstruction_per_sample.mean()
+
+    target_delta = product_log_torch(reference, clean)
+    applied_delta = product_log_torch(reference, prediction)
+    tangent_supervision_loss = weighted_per_sample(
+        F.smooth_l1_loss(
+            applied_delta,
+            target_delta,
+            reduction="none",
+        ),
+        repair_mask,
+    ).mean()
+    degraded_error = weighted_per_sample(
+        target_delta.detach().abs(),
+        repair_mask,
+    )
+    minimum_gain = float(cfg.checkpoint_validation_min_geometry_repair_gain)
+    repair_margin_loss = torch.relu(
+        active_reconstruction_per_sample
+        - (1.0 - minimum_gain) * degraded_error
+    ).mean()
+    clean_preservation_loss = weighted_per_sample(
+        applied_delta.abs(),
+        product_mask * (1.0 - corruption_support),
+    ).mean()
+
     outside_loss = (
         F.smooth_l1_loss(
             reference_delta,
@@ -3046,7 +3153,16 @@ def _product_motion_losses(
         cfg,
     )
     total = (
-        reconstruction_loss
+        float(cfg.product_refiner_global_reconstruction_weight)
+        * reconstruction_loss
+        + float(cfg.product_refiner_active_reconstruction_weight)
+        * active_reconstruction_loss
+        + float(cfg.product_refiner_tangent_supervision_weight)
+        * tangent_supervision_loss
+        + float(cfg.product_refiner_repair_margin_weight)
+        * repair_margin_loss
+        + float(cfg.product_refiner_clean_preservation_weight)
+        * clean_preservation_loss
         + 0.25 * velocity_loss
         + 0.20 * contact_loss
         + float(cfg.product_refiner_outside_weight) * outside_loss
@@ -3054,6 +3170,11 @@ def _product_motion_losses(
     )
     terms = {
         "reconstruction": reconstruction_loss,
+        "active_reconstruction": active_reconstruction_loss,
+        "tangent_supervision": tangent_supervision_loss,
+        "repair_margin": repair_margin_loss,
+        "clean_preservation": clean_preservation_loss,
+        "degraded_active_product_l1": degraded_error.mean(),
         "velocity": velocity_loss,
         "contact": contact_loss,
         "outside": outside_loss,
@@ -3357,8 +3478,22 @@ def degrade_for_refiner(
                 * float(severity)
                 * 0.08
             ).reshape(span, -1)
+            bridge_mix = float(getattr(cfg, "transition_bridge_mix", 0.50))
+            if not np.isfinite(bridge_mix) or not 0.0 < bridge_mix <= 1.0:
+                raise ValueError(
+                    "transition_bridge_mix must be finite in (0, 1], got "
+                    f"{bridge_mix!r}"
+                )
+            clean_segment = x[a:b].copy()
+            bridge_delta = product_log_np(clean_segment, bridge)
+            mixed_bridge = masked_retract_np(
+                clean_segment,
+                bridge_delta * bridge_mix,
+                joint_mask=np.ones((span, NUM_JOINTS), dtype=np.float32),
+                root_mask=np.ones((span, 1), dtype=np.float32),
+            )
             x[a:b] = masked_retract_np(
-                bridge,
+                mixed_bridge,
                 tangent,
                 joint_mask=np.ones((span, NUM_JOINTS), dtype=np.float32),
                 root_mask=np.ones((span, 1), dtype=np.float32),
@@ -3657,6 +3792,24 @@ def _summarize_validation_physical_metrics(
         ),
         None,
     )
+
+    def summarize_stage_detail(key: str) -> Dict[str, Optional[float]]:
+        values = [
+            float(gate.get("detail", {}).get(key))
+            for gate in stage_repair_gates
+            if gate.get("detail", {}).get(key) is not None
+        ]
+        finite = np.asarray(
+            [value for value in values if np.isfinite(value)],
+            dtype=np.float64,
+        )
+        return {
+            "mean": float(np.mean(finite)) if finite.size else None,
+            "p50": float(np.percentile(finite, 50)) if finite.size else None,
+            "minimum": float(np.min(finite)) if finite.size else None,
+            "maximum": float(np.max(finite)) if finite.size else None,
+        }
+
     return {
         "schema": "motion_checkpoint_stage_validation_v2",
         "num_windows": len(prediction_audits),
@@ -3681,7 +3834,16 @@ def _summarize_validation_physical_metrics(
                 "metric": "mean_absolute_product_log_to_clean",
                 "minimum": geometry_gain_minimum,
                 "configured_per_window": True,
+                "observed": summarize_stage_detail(
+                    "geometry_repair_gain"
+                ),
             },
+            "degraded_product_log_l1_to_clean": summarize_stage_detail(
+                "degraded_product_log_l1_to_clean"
+            ),
+            "prediction_product_log_l1_to_clean": summarize_stage_detail(
+                "prediction_product_log_l1_to_clean"
+            ),
         },
         "clean_reference_fidelity": {
             **_summarize_validation_gates(
@@ -4230,6 +4392,7 @@ def train_refiner(args: argparse.Namespace) -> int:
             root_t,
             contact_t,
             cfg,
+            seam_mask=seam_t,
         )
         rec = loss_terms["reconstruction"]
         opt.zero_grad(set_to_none=True)
@@ -4244,6 +4407,9 @@ def train_refiner(args: argparse.Namespace) -> int:
                 training_started_at,
                 loss=loss.item(),
                 rec=rec.item(),
+                active=loss_terms["active_reconstruction"].item(),
+                repair=loss_terms["repair_margin"].item(),
+                preserve=loss_terms["clean_preservation"].item(),
             )
     if risk_executor is not None:
         risk_executor.shutdown(wait=True)
@@ -4259,10 +4425,24 @@ def train_refiner(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": "product_manifold_boundary_refiner_v1",
+        "version": "product_manifold_boundary_refiner_v2",
         "output_mode": "contact_logits_root_joint_tangent",
         "output_dim": PRODUCT_STATE_DIM,
         "joint_mask_conditioned": True,
+        "temporal_architecture": {
+            "dilations": list(model.temporal_dilations),
+            "receptive_field_frames": int(
+                model.temporal_receptive_field_frames
+            ),
+        },
+        "training_objective": {
+            "schema": "seam_normalized_relative_repair_v1",
+            "corruption_support": "synthetic_transition_seam",
+            "minimum_relative_geometry_gain": float(
+                cfg.checkpoint_validation_min_geometry_repair_gain
+            ),
+            "transition_bridge_mix": float(cfg.transition_bridge_mix),
+        },
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "motion_contract": motion_checkpoint_contract(cfg, "boundary_refiner"),
@@ -4600,10 +4780,15 @@ def train_diffusion(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": "reference_tangent_motion_diffusion_v1",
+        "version": "reference_tangent_motion_diffusion_v2",
         "diffusion_space": "reference_point_product_tangent",
         "state_dim": PRODUCT_STATE_DIM,
         "joint_mask_conditioned": True,
+        "training_corruption": {
+            "schema": "retained_clean_transition_bridge_v1",
+            "transition_bridge_mix": float(cfg.transition_bridge_mix),
+            "rotation_noise": "smooth_so3_tangent",
+        },
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
         "diffusion_steps": Tdiff,
@@ -5492,7 +5677,7 @@ def _cached_inference_model(
     if cached is None:
         checkpoint = _trusted_torch_load(path, map_location=cfg.device)
         if role == "boundary_refiner":
-            expected_version = "product_manifold_boundary_refiner_v1"
+            expected_version = "product_manifold_boundary_refiner_v2"
             if str(checkpoint.get("version", "")) != expected_version:
                 raise RuntimeError(
                     "Formal generation rejects a non-product refiner checkpoint"
@@ -5500,7 +5685,7 @@ def _cached_inference_model(
             model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(cfg.device)
             schedule = None
         elif role == "motion_diffusion":
-            expected_version = "reference_tangent_motion_diffusion_v1"
+            expected_version = "reference_tangent_motion_diffusion_v2"
             if str(checkpoint.get("version", "")) != expected_version:
                 raise RuntimeError(
                     "Formal generation rejects a non-tangent diffusion checkpoint"
