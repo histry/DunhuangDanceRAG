@@ -69,6 +69,46 @@ require_file() {
   }
 }
 
+for flag_name in \
+  GENERATION_REBUILD_RETARGET_CACHE \
+  GENERATION_REBUILD_EVENT_DB \
+  GENERATION_RETRAIN_ROUTER \
+  GENERATION_RETRAIN_DURATION \
+  GENERATION_RETRAIN_PLANNER \
+  GENERATION_RETRAIN_REFINER \
+  GENERATION_RETRAIN_DIFFUSION
+do
+  flag_value="${!flag_name:-}"
+  if [[ "$flag_value" != "0" && "$flag_value" != "1" ]]; then
+    echo "[FATAL] $flag_name must be 0 or 1, got '$flag_value'" >&2
+    exit 2
+  fi
+done
+
+SCHEDULER_RETRAIN_SET="${GENERATION_RETRAIN_ROUTER}/${GENERATION_RETRAIN_DURATION}/${GENERATION_RETRAIN_PLANNER}"
+case "$SCHEDULER_RETRAIN_SET" in
+  0/0/0) SCHEDULER_RETRAIN_ALL=0 ;;
+  1/1/1) SCHEDULER_RETRAIN_ALL=1 ;;
+  *)
+    echo "[FATAL] Router, Duration and Planner share one serialized Generation Index and must be retrained or reused together; got $SCHEDULER_RETRAIN_SET" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" \
+   && "$GENERATION_REBUILD_EVENT_DB" != "1" ]]; then
+  echo "[FATAL] Rebuilding the SMPL cache requires rebuilding its Event-DB." >&2
+  exit 2
+fi
+if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
+  if [[ "$SCHEDULER_RETRAIN_ALL" != "1" \
+     || "$GENERATION_RETRAIN_REFINER" != "1" \
+     || "$GENERATION_RETRAIN_DIFFUSION" != "1" ]]; then
+    echo "[FATAL] Rebuilding Event-DB changes every learned-data contract; retrain Router/Duration/Planner, Refiner and Diffusion together." >&2
+    exit 2
+  fi
+fi
+
 # Formal music semantics fail closed on the only supported feature backend.
 if [[ "${REQUIRE_LIBROSA_BACKEND:-0}" != "1" ]]; then
   echo "[FATAL] Formal music semantics require Librosa 12D." >&2
@@ -135,17 +175,22 @@ echo "========== 2. SOURCE GRAVITY DIAGNOSTIC =========="
   --csv "$OUT_ROOT/retarget_cache.gravity.csv"
 
 echo "========== 3. SOURCE SPLIT BEFORE EVENT SLICING =========="
-"$PY" data_pipeline/split_sources.py \
-  --cache_root "$RETARGET_CACHE" \
-  --out_root "$CACHE_SPLIT_ROOT" \
-  --seed "$GENERATION_SPLIT_SEED" \
-  --train_ratio "$GENERATION_TRAIN_RATIO" \
-  --val_ratio "$GENERATION_VAL_RATIO" \
-  --test_ratio "$GENERATION_TEST_RATIO" \
-  --protocol "$GENERATION_SPLIT_PROTOCOL" \
-  --heldout_theme "$GENERATION_HELDOUT_THEME" \
-  --mode copy \
-  --overwrite
+if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
+  "$PY" data_pipeline/split_sources.py \
+    --cache_root "$RETARGET_CACHE" \
+    --out_root "$CACHE_SPLIT_ROOT" \
+    --seed "$GENERATION_SPLIT_SEED" \
+    --train_ratio "$GENERATION_TRAIN_RATIO" \
+    --val_ratio "$GENERATION_VAL_RATIO" \
+    --test_ratio "$GENERATION_TEST_RATIO" \
+    --protocol "$GENERATION_SPLIT_PROTOCOL" \
+    --heldout_theme "$GENERATION_HELDOUT_THEME" \
+    --mode copy \
+    --overwrite
+else
+  require_file "$CACHE_SPLIT_ROOT/source_split_manifest.json" \
+    "existing source split manifest"
+fi
 
 echo "========== 4. BUILD SPLIT-SPECIFIC HEADING EVENT DATABASES =========="
 if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
@@ -181,45 +226,80 @@ for split in train val test; do
 done
 
 echo "========== 6. AESD ENRICHMENT PER SPLIT =========="
-for split in train val test; do
-  db="$DB_SPLIT_ROOT/$split/events.npz"
-  aesd="$DB_SPLIT_ROOT/$split/events_aesd.npz"
-  "$PY" events/build_semantics.py \
-    --db "$db" \
-    --out "$aesd" \
-    --json "$OUT_ROOT/${split}.aesd_build.json"
-done
+if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
+  for split in train val test; do
+    db="$DB_SPLIT_ROOT/$split/events.npz"
+    aesd="$DB_SPLIT_ROOT/$split/events_aesd.npz"
+    "$PY" events/build_semantics.py \
+      --db "$db" \
+      --out "$aesd" \
+      --json "$OUT_ROOT/${split}.aesd_build.json"
+  done
+else
+  require_file "$TRAIN_AESD" "existing train AESD Event-DB"
+  require_file "$VAL_AESD" "existing val AESD Event-DB"
+  require_file "$TEST_AESD" "existing test AESD Event-DB"
+fi
 
 if [[ "$GENERATION_DB_MODE" == "qualitative_all_change" ]]; then
-  echo "========== 6B. BUILD ALL-CHANGE QUALITATIVE UPPER-BOUND DB =========="
-  "$PY" events/build_database_entry.py \
-    --config "$CONFIG" \
-    --motion_dirs "$RETARGET_CACHE" \
-    --out_db "$ALL_DB_DIR" \
-    --overwrite
-  "$PY" evaluation/audit_event_database.py \
-    --db "$ALL_DB" \
-    --out "$OUT_ROOT/all_change.event_heading.audit.json" \
-    --csv "$OUT_ROOT/all_change.event_heading.audit.csv"
-  "$PY" events/build_semantics.py \
-    --db "$ALL_DB" \
-    --out "$ALL_AESD" \
-    --json "$OUT_ROOT/all_change.aesd_build.json"
+  if [[ "$GENERATION_REBUILD_EVENT_DB" == "1" ]]; then
+    echo "========== 6B. BUILD ALL-CHANGE QUALITATIVE UPPER-BOUND DB =========="
+    "$PY" events/build_database_entry.py \
+      --config "$CONFIG" \
+      --motion_dirs "$RETARGET_CACHE" \
+      --out_db "$ALL_DB_DIR" \
+      --overwrite
+    "$PY" evaluation/audit_event_database.py \
+      --db "$ALL_DB" \
+      --out "$OUT_ROOT/all_change.event_heading.audit.json" \
+      --csv "$OUT_ROOT/all_change.event_heading.audit.csv"
+    "$PY" events/build_semantics.py \
+      --db "$ALL_DB" \
+      --out "$ALL_AESD" \
+      --json "$OUT_ROOT/all_change.aesd_build.json"
+  else
+    require_file "$ALL_DB" "existing all-change qualitative Event-DB"
+    require_file "$ALL_AESD" "existing all-change qualitative AESD Event-DB"
+  fi
   GENERATION_DB="$ALL_AESD"
 else
   GENERATION_DB="$TRAIN_AESD"
 fi
 
-echo "========== 6A. BUILD GENERATION-ALIGNED SCHEDULER INDEX =========="
+echo "========== 6A. GENERATION-ALIGNED SCHEDULER INDEX LIFECYCLE =========="
 ALIGNED_SCHEDULER_DIR="$OUT_ROOT/scheduler_generation_assets"
 ALIGNED_INDEX_JSON="$ALIGNED_SCHEDULER_DIR/event_index.json"
 ALIGNED_INDEX_NPZ="$ALIGNED_SCHEDULER_DIR/duration_index.npz"
 mkdir -p "$ALIGNED_SCHEDULER_DIR"
-"$PY" scheduling/build_generation_index.py \
-  --db "$GENERATION_DB" \
-  --out_json "$ALIGNED_INDEX_JSON" \
-  --out_npz "$ALIGNED_INDEX_NPZ" \
-  --report "$ALIGNED_SCHEDULER_DIR/build_report.json"
+if [[ "$SCHEDULER_RETRAIN_ALL" == "1" ]]; then
+  INDEX_CANDIDATE_DIR="$(mktemp -d "$ALIGNED_SCHEDULER_DIR/.index_candidate.XXXXXX")"
+  "$PY" scheduling/build_generation_index.py \
+    --db "$GENERATION_DB" \
+    --out_json "$INDEX_CANDIDATE_DIR/event_index.json" \
+    --out_npz "$INDEX_CANDIDATE_DIR/duration_index.npz" \
+    --report "$INDEX_CANDIDATE_DIR/build_report.json"
+  if [[ -s "$ALIGNED_INDEX_JSON" || -s "$ALIGNED_INDEX_NPZ" ]]; then
+    INDEX_ARCHIVE_DIR="$ALIGNED_SCHEDULER_DIR/archive/index_before_${RUN_TAG}_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$INDEX_ARCHIVE_DIR"
+    [[ ! -s "$ALIGNED_INDEX_JSON" ]] || \
+      cp -p "$ALIGNED_INDEX_JSON" "$INDEX_ARCHIVE_DIR/"
+    [[ ! -s "$ALIGNED_INDEX_NPZ" ]] || \
+      cp -p "$ALIGNED_INDEX_NPZ" "$INDEX_ARCHIVE_DIR/"
+    [[ ! -s "$ALIGNED_SCHEDULER_DIR/build_report.json" ]] || \
+      cp -p "$ALIGNED_SCHEDULER_DIR/build_report.json" "$INDEX_ARCHIVE_DIR/"
+  fi
+  mv -f "$INDEX_CANDIDATE_DIR/event_index.json" "$ALIGNED_INDEX_JSON"
+  mv -f "$INDEX_CANDIDATE_DIR/duration_index.npz" "$ALIGNED_INDEX_NPZ"
+  mv -f "$INDEX_CANDIDATE_DIR/build_report.json" \
+    "$ALIGNED_SCHEDULER_DIR/build_report.json"
+  rmdir "$INDEX_CANDIDATE_DIR"
+else
+  echo "[REUSE] Preserving the exact Scheduler Index bytes bound to existing checkpoints."
+  require_file "$ALIGNED_INDEX_JSON" \
+    "existing Generation-aligned Scheduler index JSON"
+  require_file "$ALIGNED_INDEX_NPZ" \
+    "existing Generation-aligned Scheduler index NPZ"
+fi
 export GENERATION_INDEX_JSON="$ALIGNED_INDEX_JSON"
 export GENERATION_DURATION_INDEX_NPZ="$ALIGNED_INDEX_NPZ"
 # A hierarchy built for the old 4225-event snapshot is never reused with the

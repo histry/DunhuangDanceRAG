@@ -459,6 +459,51 @@ class SchedulerArchitectureTests(unittest.TestCase):
             self.assertIn('--db "$TRAIN_AESD"', block)
             self.assertIn('--val_db "$VAL_AESD"', block)
 
+    def test_pipeline_preserves_scheduler_assets_on_checkpoint_resume(self):
+        source = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'SCHEDULER_RETRAIN_SET="${GENERATION_RETRAIN_ROUTER}/'
+            '${GENERATION_RETRAIN_DURATION}/${GENERATION_RETRAIN_PLANNER}"',
+            source,
+        )
+        self.assertIn(
+            "Router, Duration and Planner share one serialized Generation Index",
+            source,
+        )
+        start = source.index(
+            "6A. GENERATION-ALIGNED SCHEDULER INDEX LIFECYCLE"
+        )
+        end = source.index("export GENERATION_INDEX_JSON", start)
+        block = source[start:end]
+        self.assertIn('if [[ "$SCHEDULER_RETRAIN_ALL" == "1" ]]', block)
+        self.assertIn("build_generation_index.py", block)
+        self.assertIn(
+            "Preserving the exact Scheduler Index bytes bound to existing checkpoints",
+            block,
+        )
+        self.assertIn('require_file "$ALIGNED_INDEX_NPZ"', block)
+        self.assertIn("INDEX_CANDIDATE_DIR=", block)
+        self.assertIn("INDEX_ARCHIVE_DIR=", block)
+
+    def test_pipeline_reuses_split_and_aesd_with_event_db(self):
+        source = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'require_file "$CACHE_SPLIT_ROOT/source_split_manifest.json"',
+            source,
+        )
+        self.assertIn(
+            'require_file "$TRAIN_AESD" "existing train AESD Event-DB"',
+            source,
+        )
+        self.assertIn(
+            "Rebuilding Event-DB changes every learned-data contract",
+            source,
+        )
+
     def test_formal_music_semantics_use_only_librosa_and_project_router(self):
         profile = (ROOT / "configs" / "research.env").read_text(
             encoding="utf-8"
