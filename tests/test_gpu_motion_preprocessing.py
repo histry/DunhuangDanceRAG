@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from training import motion_models as models
+from motion_geometry.rotations import so3_exp_torch
 from motion_geometry.smpl24 import skeleton_contract
 from support.event_identity import make_event_db_contract
 
@@ -114,6 +115,43 @@ def test_torch_risk_masks_match_numpy_contract(device):
     for cpu_value, torch_value in zip(expected, actual):
         np.testing.assert_allclose(cpu_value, torch_value, atol=2.0e-5)
         np.testing.assert_array_equal(cpu_value > 0.0, torch_value > 0.0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_risk_mask_formal_batch_handles_near_pi_joint_step(device):
+    torch = models.torch
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    cfg = models.MotionGenerationConfig(device=device)
+    frames = 16
+    motion = torch.zeros((2, frames, 151), dtype=torch.float32, device=device)
+    rotations = torch.eye(3, dtype=torch.float32, device=device).expand(
+        2, frames, 24, 3, 3
+    ).clone()
+    near_pi_vector = torch.tensor(
+        [0.0, float(np.pi - 5.0e-5), 0.0],
+        dtype=torch.float32,
+        device=device,
+    )
+    rotations[:, 7, 5] = so3_exp_torch(near_pi_vector)
+    motion[..., 7:151] = models.matrix_to_rot6d_torch(rotations).reshape(
+        2, frames, 144
+    )
+    seam = torch.ones((2, frames, 1), dtype=torch.float32, device=device)
+
+    joint, root, contact = models._risk_masks_for_batch_torch(
+        motion,
+        seam,
+        cfg,
+    )
+
+    assert joint.shape == (2, frames, 24)
+    assert root.shape == (2, frames, 1)
+    assert contact.shape == (2, frames, 1)
+    assert torch.isfinite(joint).all()
+    assert torch.isfinite(root).all()
+    assert torch.isfinite(contact).all()
+    assert bool((joint[:, :, 5] > 0.0).any())
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

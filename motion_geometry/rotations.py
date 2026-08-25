@@ -404,16 +404,31 @@ def so3_geodesic_torch(a: "torch.Tensor", b: "torch.Tensor") -> "torch.Tensor":
 
 
 def so3_log_torch(m: "torch.Tensor") -> "torch.Tensor":
-    """Differentiable Log map for the small relative rotations in motion data."""
+    """Differentiable SO(3) Log map for arbitrary batch prefixes.
+
+    The near-pi branch deliberately operates on a flattened matrix batch.  A
+    multidimensional boolean mask followed by ``None`` indexing has different
+    advanced-indexing semantics in PyTorch (for example ``[B,T,J]`` becomes
+    incompatible with ``[B,1,T,J]``).  Flattening keeps the branch independent
+    of whether callers provide ``[N,3,3]``, ``[B,T,3,3]`` or the formal motion
+    training shape ``[B,T,J,3,3]``.
+    """
     if torch is None:
         raise RuntimeError("PyTorch is required")
-    trace = torch.diagonal(m, dim1=-2, dim2=-1).sum(dim=-1)
+    if m.ndim < 2 or tuple(m.shape[-2:]) != (3, 3):
+        raise ValueError(
+            "so3_log_torch expects [...,3,3], got "
+            f"{tuple(m.shape)}"
+        )
+    prefix = tuple(m.shape[:-2])
+    flat = m.reshape(-1, 3, 3)
+    trace = torch.diagonal(flat, dim1=-2, dim2=-1).sum(dim=-1)
     cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
     vee = torch.stack(
         [
-            m[..., 2, 1] - m[..., 1, 2],
-            m[..., 0, 2] - m[..., 2, 0],
-            m[..., 1, 0] - m[..., 0, 1],
+            flat[..., 2, 1] - flat[..., 1, 2],
+            flat[..., 0, 2] - flat[..., 2, 0],
+            flat[..., 1, 0] - flat[..., 0, 1],
         ],
         dim=-1,
     )
@@ -427,8 +442,8 @@ def so3_log_torch(m: "torch.Tensor") -> "torch.Tensor":
     result = vee * scale[..., None]
 
     if torch.any(near_pi):
-        identity = torch.eye(3, dtype=m.dtype, device=m.device)
-        symmetric = 0.5 * (m[near_pi] + identity)
+        identity = torch.eye(3, dtype=flat.dtype, device=flat.device)
+        symmetric = 0.5 * (flat[near_pi] + identity)
         diagonal = torch.diagonal(symmetric, dim1=-2, dim2=-1).clamp_min(0.0)
         largest = diagonal.argmax(dim=-1)
         columns = symmetric.transpose(-1, -2)
@@ -443,8 +458,8 @@ def so3_log_torch(m: "torch.Tensor") -> "torch.Tensor":
         flip = (axis * near_vee).sum(dim=-1) < 0.0
         axis = torch.where(flip[:, None], -axis, axis)
         result = result.clone()
-        result[near_pi] = axis * angle[near_pi, None]
-    return result
+        result[near_pi] = axis * angle[near_pi].unsqueeze(-1)
+    return result.reshape(prefix + (3,))
 
 
 def so3_exp_torch(v: "torch.Tensor") -> "torch.Tensor":

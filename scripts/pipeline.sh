@@ -44,6 +44,8 @@ ALL_AESD="$ALL_DB_DIR/events_aesd.npz"
 
 REFINER_CKPT="${REFINER_CKPT:-$OUT_ROOT/motion_refiner_train_only_refiner.pt}"
 MOTION_CKPT="${MOTION_CKPT:-$OUT_ROOT/motion_train_only_diffusion.pt}"
+REFINER_TRAINING_SNAPSHOT="${REFINER_TRAINING_SNAPSHOT:-$REFINER_CKPT.training_snapshot.pt}"
+DIFFUSION_TRAINING_SNAPSHOT="${DIFFUSION_TRAINING_SNAPSHOT:-$MOTION_CKPT.training_snapshot.pt}"
 
 SCHEDULER_CHECKPOINT_DIR="${SCHEDULER_CHECKPOINT_DIR:-$OUT_ROOT/checkpoints}"
 SCHEDULER_TRAIN_DIR="${SCHEDULER_TRAIN_DIR:-$OUT_ROOT/scheduler_training}"
@@ -84,6 +86,16 @@ do
     exit 2
   fi
 done
+
+if [[ "${MOTION_TRAINING_AUTO_RESUME:-}" != "0" \
+   && "${MOTION_TRAINING_AUTO_RESUME:-}" != "1" ]]; then
+  echo "[FATAL] MOTION_TRAINING_AUTO_RESUME must be 0 or 1, got '${MOTION_TRAINING_AUTO_RESUME:-}'" >&2
+  exit 2
+fi
+if ! [[ "${MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[FATAL] MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS must be a positive integer, got '${MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS:-}'" >&2
+  exit 2
+fi
 
 SCHEDULER_RETRAIN_SET="${GENERATION_RETRAIN_ROUTER}/${GENERATION_RETRAIN_DURATION}/${GENERATION_RETRAIN_PLANNER}"
 case "$SCHEDULER_RETRAIN_SET" in
@@ -478,19 +490,34 @@ fi
 
 echo "========== 8. TRAIN Motion Refiner ON TRAIN-SOURCE CANONICAL EVENTS =========="
 if [[ "$GENERATION_RETRAIN_REFINER" == "1" ]]; then
+  REFINER_RESUME_ARGS=()
+  if [[ "$MOTION_TRAINING_AUTO_RESUME" == "1" \
+     && -s "$REFINER_TRAINING_SNAPSHOT" ]]; then
+    echo "[RESUME] Refiner training snapshot: $REFINER_TRAINING_SNAPSHOT"
+    REFINER_RESUME_ARGS=(--resume_snapshot "$REFINER_TRAINING_SNAPSHOT")
+  fi
   "$PY" training/motion_models.py \
     --config "$CONFIG" \
     train-refiner \
     --db "$TRAIN_AESD" \
     --val_db "$VAL_AESD" \
     --out "$REFINER_CKPT" \
-    --steps "$REFINER_STEPS"
+    --steps "$REFINER_STEPS" \
+    --snapshot_path "$REFINER_TRAINING_SNAPSHOT" \
+    --snapshot_every "$MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS" \
+    "${REFINER_RESUME_ARGS[@]}"
 else
   require_file "$REFINER_CKPT" "Motion Refiner checkpoint"
 fi
 
 echo "========== 9. TRAIN Motion Generation ON TRAIN-SOURCE CANONICAL EVENTS =========="
 if [[ "$GENERATION_RETRAIN_DIFFUSION" == "1" ]]; then
+  DIFFUSION_RESUME_ARGS=()
+  if [[ "$MOTION_TRAINING_AUTO_RESUME" == "1" \
+     && -s "$DIFFUSION_TRAINING_SNAPSHOT" ]]; then
+    echo "[RESUME] Diffusion training snapshot: $DIFFUSION_TRAINING_SNAPSHOT"
+    DIFFUSION_RESUME_ARGS=(--resume_snapshot "$DIFFUSION_TRAINING_SNAPSHOT")
+  fi
   "$PY" training/motion_models.py \
     --config "$CONFIG" \
     train-diffusion \
@@ -498,7 +525,10 @@ if [[ "$GENERATION_RETRAIN_DIFFUSION" == "1" ]]; then
     --val_db "$VAL_AESD" \
     --out "$MOTION_CKPT" \
     --steps "$MOTION_STEPS" \
-    --diffusion_steps "$MOTION_DIFFUSION_STEPS"
+    --diffusion_steps "$MOTION_DIFFUSION_STEPS" \
+    --snapshot_path "$DIFFUSION_TRAINING_SNAPSHOT" \
+    --snapshot_every "$MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS" \
+    "${DIFFUSION_RESUME_ARGS[@]}"
 else
   require_file "$MOTION_CKPT" "Motion Generation checkpoint"
 fi
@@ -681,6 +711,32 @@ echo "========== 17. SCIENTIFIC FIXED-CAMERA RENDER =========="
   --camera_mode fixed \
   --render_smooth_window 1 \
   --gravity_audit_json "$OUT_ROOT/final.render_gravity.json"
+
+echo "========== 18. RETIRE TRAINING-ONLY RECOVERY SNAPSHOTS =========="
+RECOVERY_SNAPSHOTS_TO_RETIRE=()
+if [[ "$GENERATION_RETRAIN_REFINER" == "1" ]]; then
+  RECOVERY_SNAPSHOTS_TO_RETIRE+=("$REFINER_TRAINING_SNAPSHOT")
+fi
+if [[ "$GENERATION_RETRAIN_DIFFUSION" == "1" ]]; then
+  RECOVERY_SNAPSHOTS_TO_RETIRE+=("$DIFFUSION_TRAINING_SNAPSHOT")
+fi
+"$PY" - "${RECOVERY_SNAPSHOTS_TO_RETIRE[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+retired = []
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    if path.is_file():
+        path.unlink()
+        retired.append(str(path))
+print(json.dumps({
+    "ok": True,
+    "reason": "formal_pipeline_completed_with_validated_models_and_video",
+    "retired_training_snapshots": retired,
+}, ensure_ascii=False, indent=2))
+PY
 
 echo "========== Fresh-Audio Generation COMPLETE =========="
 printf "FRESH_MSSD=%s\nROUTING_MSSD=%s\nGENERATION_DB=%s\nFINAL_NPY=%s\nFINAL_REPORT=%s\nFINAL_MP4=%s\n" \

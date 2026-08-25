@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -457,6 +458,7 @@ class MotionGenerationConfig:
     diffusion_steps: int = 50
     diffusion_train_steps: int = 15000
     refiner_train_steps: int = 8000
+    training_snapshot_interval_steps: int = 200
     batch_size: int = 64
     inference_window_batch_size: int = 16
     gpu_preprocessing: bool = True
@@ -577,6 +579,10 @@ class MotionGenerationConfig:
             "MOTION_DIFFUSION_NOISE_BATCH_MAX_MIB": (
                 "diffusion_noise_batch_max_mib",
                 float,
+            ),
+            "MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS": (
+                "training_snapshot_interval_steps",
+                int,
             ),
             "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
             "MOTION_MAX_EVENT_FRAMES": ("max_event_frames", int),
@@ -4287,6 +4293,342 @@ def _save_checkpoint_after_validation(
     return actual_path, publish
 
 
+TRAINING_RESUME_SNAPSHOT_SCHEMA = "dunhuang_motion_training_resume_v1"
+
+
+def _training_stage_contract(stage: str) -> Tuple[str, str]:
+    if stage == "refiner":
+        return "boundary_refiner", "product_manifold_boundary_refiner_v2"
+    if stage == "diffusion":
+        return "motion_diffusion", "reference_tangent_motion_diffusion_v2"
+    raise ValueError(f"unsupported training snapshot stage: {stage!r}")
+
+
+def _training_code_revision() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _training_config_sha256(
+    cfg: MotionGenerationConfig,
+    *,
+    stage: str,
+    diffusion_steps: Optional[int] = None,
+) -> str:
+    _, model_version = _training_stage_contract(stage)
+    training_config = dataclasses.asdict(cfg)
+    # Recovery frequency changes only durability, never the optimization or
+    # scientific model contract, so it must not invalidate an otherwise exact
+    # resume snapshot.
+    training_config.pop("training_snapshot_interval_steps", None)
+    payload = {
+        "stage": str(stage),
+        "model_version": model_version,
+        "config": training_config,
+        "diffusion_steps": (
+            None if diffusion_steps is None else int(diffusion_steps)
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _capture_training_rng_state() -> Dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.random.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+def _restore_training_rng_state(state: Mapping[str, Any]) -> None:
+    required = {"python", "numpy", "torch_cpu", "torch_cuda"}
+    missing = sorted(required - set(state))
+    if missing:
+        raise RuntimeError(
+            f"training resume snapshot is missing RNG fields: {missing}"
+        )
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch_cpu"].cpu())
+    cuda_states = state.get("torch_cuda")
+    if cuda_states is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "training resume snapshot contains CUDA RNG state but CUDA "
+                "is unavailable"
+            )
+        if len(cuda_states) != torch.cuda.device_count():
+            raise RuntimeError(
+                "training resume snapshot CUDA device-count mismatch: "
+                f"snapshot={len(cuda_states)}, runtime={torch.cuda.device_count()}"
+            )
+        torch.cuda.set_rng_state_all([value.cpu() for value in cuda_states])
+
+
+def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}"
+    )
+    try:
+        torch.save(dict(payload), temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _save_training_resume_snapshot(
+    path: Path,
+    *,
+    stage: str,
+    model: Any,
+    optimizer: Any,
+    completed_steps: int,
+    target_steps: int,
+    elapsed_seconds: float,
+    cfg: MotionGenerationConfig,
+    training_contract: Mapping[str, Any],
+    validation_contract: Mapping[str, Any],
+    diffusion_steps: Optional[int] = None,
+) -> Dict[str, Any]:
+    role, model_version = _training_stage_contract(stage)
+    if completed_steps < 0 or completed_steps > target_steps:
+        raise ValueError(
+            "completed training steps must be within the target: "
+            f"{completed_steps}/{target_steps}"
+        )
+    payload: Dict[str, Any] = {
+        "schema": TRAINING_RESUME_SNAPSHOT_SCHEMA,
+        "stage": str(stage),
+        "formal_checkpoint": False,
+        "publication_state": "resume_only_not_validated",
+        "model_version": model_version,
+        "completed_steps": int(completed_steps),
+        "target_steps": int(target_steps),
+        "elapsed_seconds": max(0.0, float(elapsed_seconds)),
+        "diffusion_steps": (
+            None if diffusion_steps is None else int(diffusion_steps)
+        ),
+        "motion_contract": motion_checkpoint_contract(cfg, role),
+        "training_event_db_contract": dict(
+            training_contract["event_db_contract"]
+        ),
+        "validation_event_db_contract": dict(
+            validation_contract["event_db_contract"]
+        ),
+        "training_config_sha256": _training_config_sha256(
+            cfg,
+            stage=stage,
+            diffusion_steps=diffusion_steps,
+        ),
+        "code_revision": _training_code_revision(),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "rng_state": _capture_training_rng_state(),
+        "checkpoint_decision": {
+            "publish_allowed": False,
+            "reason": "training_resume_snapshot_has_not_passed_validation",
+        },
+    }
+    _atomic_torch_save(payload, path)
+    print(
+        json.dumps(
+            {
+                "stage": f"{stage}_training_snapshot",
+                "path": str(path),
+                "completed_steps": int(completed_steps),
+                "target_steps": int(target_steps),
+                "formal_checkpoint": False,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return payload
+
+
+def _load_training_resume_snapshot(
+    path: Path,
+    *,
+    stage: str,
+    model: Any,
+    optimizer: Any,
+    target_steps: int,
+    cfg: MotionGenerationConfig,
+    training_contract: Mapping[str, Any],
+    validation_contract: Mapping[str, Any],
+    device: Any,
+    diffusion_steps: Optional[int] = None,
+) -> Tuple[int, float, Dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"training resume snapshot missing: {path}")
+    snapshot = _trusted_torch_load(path, map_location=device)
+    if not isinstance(snapshot, Mapping):
+        raise RuntimeError(f"invalid training resume snapshot payload: {path}")
+    if snapshot.get("schema") != TRAINING_RESUME_SNAPSHOT_SCHEMA:
+        raise RuntimeError(
+            f"training resume snapshot schema mismatch for {path}: "
+            f"{snapshot.get('schema')!r}"
+        )
+    if bool(snapshot.get("formal_checkpoint", True)):
+        raise RuntimeError(
+            f"training resume snapshot {path} is not marked resume-only"
+        )
+    role, model_version = _training_stage_contract(stage)
+    if snapshot.get("stage") != stage:
+        raise RuntimeError(
+            f"training resume snapshot stage mismatch for {path}: "
+            f"snapshot={snapshot.get('stage')!r}, runtime={stage!r}"
+        )
+    if snapshot.get("model_version") != model_version:
+        raise RuntimeError(
+            f"training resume snapshot model mismatch for {path}: "
+            f"snapshot={snapshot.get('model_version')!r}, "
+            f"runtime={model_version!r}"
+        )
+    assert_motion_checkpoint_contract(snapshot, cfg, path, role)
+    assert_same_event_db_contract(
+        training_contract["event_db_contract"],
+        snapshot.get("training_event_db_contract"),
+        context=f"{stage} resume training Event-DB",
+    )
+    assert_same_event_db_contract(
+        validation_contract["event_db_contract"],
+        snapshot.get("validation_event_db_contract"),
+        context=f"{stage} resume validation Event-DB",
+    )
+    expected_config = _training_config_sha256(
+        cfg,
+        stage=stage,
+        diffusion_steps=diffusion_steps,
+    )
+    if snapshot.get("training_config_sha256") != expected_config:
+        raise RuntimeError(
+            f"{stage} resume training configuration mismatch for {path}"
+        )
+    snapshot_diffusion_steps = snapshot.get("diffusion_steps")
+    expected_diffusion_steps = (
+        None if diffusion_steps is None else int(diffusion_steps)
+    )
+    if snapshot_diffusion_steps != expected_diffusion_steps:
+        raise RuntimeError(
+            f"{stage} resume diffusion schedule mismatch for {path}: "
+            f"snapshot={snapshot_diffusion_steps!r}, "
+            f"runtime={expected_diffusion_steps!r}"
+        )
+    completed_steps = int(snapshot.get("completed_steps", -1))
+    if completed_steps < 0 or completed_steps > int(target_steps):
+        raise RuntimeError(
+            f"{stage} resume step mismatch for {path}: "
+            f"completed={completed_steps}, target={target_steps}"
+        )
+    if int(snapshot.get("target_steps", -1)) != int(target_steps):
+        raise RuntimeError(
+            f"{stage} resume target-step mismatch for {path}: "
+            f"snapshot={snapshot.get('target_steps')!r}, "
+            f"runtime={target_steps!r}"
+        )
+    snapshot_revision = str(snapshot.get("code_revision", "unknown"))
+    runtime_revision = _training_code_revision()
+    if (
+        snapshot_revision != "unknown"
+        and runtime_revision != "unknown"
+        and snapshot_revision != runtime_revision
+    ):
+        raise RuntimeError(
+            f"{stage} resume code revision mismatch for {path}: "
+            f"snapshot={snapshot_revision}, runtime={runtime_revision}"
+        )
+    try:
+        model.load_state_dict(snapshot["model_state_dict"], strict=True)
+        optimizer.load_state_dict(snapshot["optimizer_state_dict"])
+        _restore_training_rng_state(snapshot["rng_state"])
+    except KeyError as exc:
+        raise RuntimeError(
+            f"{stage} resume snapshot {path} is missing {exc.args[0]!r}"
+        ) from exc
+    elapsed_seconds = max(0.0, float(snapshot.get("elapsed_seconds", 0.0)))
+    resume_info = {
+        "resumed": True,
+        "snapshot_path": str(path),
+        "completed_steps": completed_steps,
+        "snapshot_code_revision": snapshot_revision,
+        "runtime_code_revision": runtime_revision,
+        "cross_revision": snapshot_revision != runtime_revision,
+    }
+    print(
+        json.dumps(
+            {
+                "stage": f"{stage}_training_resume",
+                **resume_info,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return completed_steps, elapsed_seconds, resume_info
+
+
+def _resolve_training_snapshot_options(
+    args: argparse.Namespace,
+    cfg: MotionGenerationConfig,
+    requested_checkpoint: Path,
+) -> Tuple[Path, Optional[Path], int]:
+    resume_value = getattr(args, "resume_snapshot", None)
+    output_value = getattr(args, "snapshot_path", None)
+    resume_path = Path(resume_value).expanduser() if resume_value else None
+    if output_value:
+        snapshot_path = Path(output_value).expanduser()
+    elif resume_path is not None:
+        snapshot_path = resume_path
+    else:
+        suffix = requested_checkpoint.suffix or ".pt"
+        snapshot_path = requested_checkpoint.with_name(
+            f"{requested_checkpoint.stem}.training_snapshot{suffix}"
+        )
+    if (
+        resume_path is not None
+        and resume_path.resolve() != snapshot_path.resolve()
+    ):
+        raise ValueError(
+            "--resume_snapshot and --snapshot_path must identify the same "
+            "recovery file"
+        )
+    raw_interval = getattr(args, "snapshot_every", None)
+    interval = int(
+        cfg.training_snapshot_interval_steps
+        if raw_interval is None
+        else raw_interval
+    )
+    if interval < 1:
+        raise ValueError("training snapshot interval must be at least one step")
+    if resume_path is None and snapshot_path.exists():
+        raise RuntimeError(
+            f"training snapshot already exists: {snapshot_path}. Pass "
+            "--resume_snapshot to continue it, or archive it before a fresh run."
+        )
+    return snapshot_path, resume_path, interval
+
+
 def train_refiner(args: argparse.Namespace) -> int:
     if torch is None:
         raise RuntimeError("PyTorch is required for Motion Refiner training.")
@@ -4311,6 +4653,36 @@ def train_refiner(args: argparse.Namespace) -> int:
     model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
+    if steps < 1:
+        raise ValueError("Motion Refiner training requires at least one step")
+    out = Path(args.out)
+    snapshot_path, resume_path, snapshot_interval = (
+        _resolve_training_snapshot_options(args, cfg, out)
+    )
+    start_step = 0
+    resumed_elapsed_seconds = 0.0
+    resume_info: Dict[str, Any] = {
+        "resumed": False,
+        "snapshot_path": None,
+        "completed_steps": 0,
+        "snapshot_code_revision": None,
+        "runtime_code_revision": _training_code_revision(),
+        "cross_revision": False,
+    }
+    if resume_path is not None:
+        start_step, resumed_elapsed_seconds, resume_info = (
+            _load_training_resume_snapshot(
+                resume_path,
+                stage="refiner",
+                model=model,
+                optimizer=opt,
+                target_steps=steps,
+                cfg=cfg,
+                training_contract=database_contract,
+                validation_contract=validation_contract,
+                device=device,
+            )
+        )
     bs = min(cfg.batch_size, max(2, len(paths)))
     motion_pool = PreloadedMotionWindowPool.preload(
         paths,
@@ -4335,8 +4707,8 @@ def train_refiner(args: argparse.Namespace) -> int:
         )
     else:
         risk_executor, _ = _training_risk_mask_executor(bs)
-    training_started_at = time.perf_counter()
-    for step in range(steps):
+    training_started_at = time.perf_counter() - resumed_elapsed_seconds
+    for step in range(start_step, steps):
         clean_batch = []
         bad_batch = []
         seam_batch = []
@@ -4399,6 +4771,25 @@ def train_refiner(args: argparse.Namespace) -> int:
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        completed_steps = step + 1
+        if (
+            completed_steps % snapshot_interval == 0
+            or completed_steps == steps
+        ):
+            _save_training_resume_snapshot(
+                snapshot_path,
+                stage="refiner",
+                model=model,
+                optimizer=opt,
+                completed_steps=completed_steps,
+                target_steps=steps,
+                elapsed_seconds=(
+                    time.perf_counter() - training_started_at
+                ),
+                cfg=cfg,
+                training_contract=database_contract,
+                validation_contract=validation_contract,
+            )
         if step == 0 or (step + 1) % 200 == 0 or step == steps - 1:
             _emit_training_progress(
                 "[Boundary Refiner]",
@@ -4422,7 +4813,6 @@ def train_refiner(args: argparse.Namespace) -> int:
         stage="refiner",
     )
     validation_report["checkpoint_decision"] = decision
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": "product_manifold_boundary_refiner_v2",
@@ -4452,6 +4842,12 @@ def train_refiner(args: argparse.Namespace) -> int:
             "source": "training_event_db",
             "mean": np.asarray(db["desc_mean"], dtype=np.float32),
             "std": np.asarray(db["desc_std"], dtype=np.float32),
+        },
+        "training_resume": resume_info,
+        "training_snapshot": {
+            "schema": TRAINING_RESUME_SNAPSHOT_SCHEMA,
+            "interval_steps": int(snapshot_interval),
+            "resume_only": True,
         },
         "validation": validation_report,
     }
@@ -4640,6 +5036,39 @@ def train_diffusion(args: argparse.Namespace) -> int:
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.diffusion_train_steps)
     Tdiff = int(args.diffusion_steps or cfg.diffusion_steps)
+    if steps < 1:
+        raise ValueError("Motion Diffusion training requires at least one step")
+    if Tdiff < 2:
+        raise ValueError("Motion Diffusion requires at least two diffusion steps")
+    out = Path(args.out)
+    snapshot_path, resume_path, snapshot_interval = (
+        _resolve_training_snapshot_options(args, cfg, out)
+    )
+    start_step = 0
+    resumed_elapsed_seconds = 0.0
+    resume_info: Dict[str, Any] = {
+        "resumed": False,
+        "snapshot_path": None,
+        "completed_steps": 0,
+        "snapshot_code_revision": None,
+        "runtime_code_revision": _training_code_revision(),
+        "cross_revision": False,
+    }
+    if resume_path is not None:
+        start_step, resumed_elapsed_seconds, resume_info = (
+            _load_training_resume_snapshot(
+                resume_path,
+                stage="diffusion",
+                model=model,
+                optimizer=opt,
+                target_steps=steps,
+                cfg=cfg,
+                training_contract=database_contract,
+                validation_contract=validation_contract,
+                device=device,
+                diffusion_steps=Tdiff,
+            )
+        )
     _, _, abar = make_beta_schedule(Tdiff, device)
     bs = min(cfg.batch_size, max(2, len(paths)))
     motion_pool = PreloadedMotionWindowPool.preload(
@@ -4665,8 +5094,8 @@ def train_diffusion(args: argparse.Namespace) -> int:
         )
     else:
         risk_executor, _ = _training_risk_mask_executor(bs)
-    training_started_at = time.perf_counter()
-    for step in range(steps):
+    training_started_at = time.perf_counter() - resumed_elapsed_seconds
+    for step in range(start_step, steps):
         clean_batch = []
         retr_batch = []
         seam_batch = []
@@ -4755,6 +5184,26 @@ def train_diffusion(args: argparse.Namespace) -> int:
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        completed_steps = step + 1
+        if (
+            completed_steps % snapshot_interval == 0
+            or completed_steps == steps
+        ):
+            _save_training_resume_snapshot(
+                snapshot_path,
+                stage="diffusion",
+                model=model,
+                optimizer=opt,
+                completed_steps=completed_steps,
+                target_steps=steps,
+                elapsed_seconds=(
+                    time.perf_counter() - training_started_at
+                ),
+                cfg=cfg,
+                training_contract=database_contract,
+                validation_contract=validation_contract,
+                diffusion_steps=Tdiff,
+            )
         if step == 0 or (step + 1) % 250 == 0 or step == steps - 1:
             _emit_training_progress(
                 "[Motion Generation diffusion]",
@@ -4777,7 +5226,6 @@ def train_diffusion(args: argparse.Namespace) -> int:
         stage="diffusion",
     )
     validation_report["checkpoint_decision"] = decision
-    out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": "reference_tangent_motion_diffusion_v2",
@@ -4799,6 +5247,12 @@ def train_diffusion(args: argparse.Namespace) -> int:
             "source": "training_event_db",
             "mean": np.asarray(db["desc_mean"], dtype=np.float32),
             "std": np.asarray(db["desc_std"], dtype=np.float32),
+        },
+        "training_resume": resume_info,
+        "training_snapshot": {
+            "schema": TRAINING_RESUME_SNAPSHOT_SCHEMA,
+            "interval_steps": int(snapshot_interval),
+            "resume_only": True,
         },
         "validation": validation_report,
     }
@@ -7343,6 +7797,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     r.add_argument("--val_db", required=True, help="Required source-disjoint validation Event-DB used for physical, contract and leakage gates")
     r.add_argument("--out", required=True)
     r.add_argument("--steps", type=int, default=None)
+    r.add_argument(
+        "--snapshot_path",
+        default=None,
+        help="Resume-only atomic training snapshot output (never a formal checkpoint)",
+    )
+    r.add_argument(
+        "--resume_snapshot",
+        default=None,
+        help="Resume the exact Refiner optimizer/RNG state from this snapshot",
+    )
+    r.add_argument("--snapshot_every", type=int, default=None)
     r.set_defaults(func=train_refiner)
 
     d = sub.add_parser("train-diffusion", help="Motion Generation conditional residual diffusion training")
@@ -7351,6 +7816,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     d.add_argument("--out", required=True)
     d.add_argument("--steps", type=int, default=None)
     d.add_argument("--diffusion_steps", type=int, default=None)
+    d.add_argument(
+        "--snapshot_path",
+        default=None,
+        help="Resume-only atomic training snapshot output (never a formal checkpoint)",
+    )
+    d.add_argument(
+        "--resume_snapshot",
+        default=None,
+        help="Resume the exact Diffusion optimizer/RNG state from this snapshot",
+    )
+    d.add_argument("--snapshot_every", type=int, default=None)
     d.set_defaults(func=train_diffusion)
 
     ik = sub.add_parser("ik", help="Run Lower-Body IK true lower-body IK on an existing EDGE 151D npy")

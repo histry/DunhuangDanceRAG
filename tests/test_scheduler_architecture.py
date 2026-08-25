@@ -459,6 +459,35 @@ class SchedulerArchitectureTests(unittest.TestCase):
             self.assertIn('--db "$TRAIN_AESD"', block)
             self.assertIn('--val_db "$VAL_AESD"', block)
 
+    def test_pipeline_uses_resume_only_motion_training_snapshots(self):
+        source = (ROOT / "scripts" / "pipeline.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("REFINER_TRAINING_SNAPSHOT=", source)
+        self.assertIn("DIFFUSION_TRAINING_SNAPSHOT=", source)
+        self.assertIn('MOTION_TRAINING_AUTO_RESUME" == "1"', source)
+        self.assertIn('--resume_snapshot "$REFINER_TRAINING_SNAPSHOT"', source)
+        self.assertIn('--resume_snapshot "$DIFFUSION_TRAINING_SNAPSHOT"', source)
+        self.assertIn(
+            '--snapshot_every "$MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS"',
+            source,
+        )
+        cleanup = source.index(
+            "18. RETIRE TRAINING-ONLY RECOVERY SNAPSHOTS"
+        )
+        render = source.index("17. SCIENTIFIC FIXED-CAMERA RENDER")
+        self.assertGreater(cleanup, render)
+        cleanup_block = source[cleanup:]
+        self.assertIn("retired_training_snapshots", cleanup_block)
+        self.assertIn(
+            'if [[ "$GENERATION_RETRAIN_REFINER" == "1" ]]',
+            cleanup_block,
+        )
+        self.assertIn(
+            'if [[ "$GENERATION_RETRAIN_DIFFUSION" == "1" ]]',
+            cleanup_block,
+        )
+
     def test_pipeline_preserves_scheduler_assets_on_checkpoint_resume(self):
         source = (ROOT / "scripts" / "pipeline.sh").read_text(
             encoding="utf-8"
@@ -573,7 +602,8 @@ class SchedulerArchitectureTests(unittest.TestCase):
             encoding="utf-8"
         )
         start = source.index("def train_refiner(")
-        block = source[start : start + 2600]
+        end = source.index("class SinusoidalTimeEmbedding", start)
+        block = source[start:end]
         self.assertIn("bad, seam = degrade_for_refiner(", block)
         self.assertIn("cfg=cfg,", block)
         self.assertIn(

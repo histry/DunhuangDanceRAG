@@ -121,6 +121,68 @@ class RotationContractTest(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(value).all()))
         self.assertTrue(bool((torch.linalg.vector_norm(value, dim=-1) > 3.0).all()))
 
+    def test_torch_log_supports_formal_batched_near_pi_prefixes(self):
+        try:
+            import torch
+        except Exception:
+            self.skipTest("PyTorch is not installed in the lightweight test runtime")
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        for device in devices:
+            with self.subTest(device=device):
+                axes = torch.randn(
+                    2, 7, 24, 3, dtype=torch.float64, device=device
+                )
+                axes = torch.nn.functional.normalize(axes, dim=-1)
+                angles = torch.full(
+                    (2, 7, 24, 1),
+                    float(np.pi - 5.0e-5),
+                    dtype=torch.float64,
+                    device=device,
+                )
+                rotations = so3_exp_torch(axes * angles)
+                value = so3_log_torch(rotations)
+                recovered = so3_exp_torch(value)
+                error = so3_geodesic_np(
+                    rotations.detach().cpu().numpy(),
+                    recovered.detach().cpu().numpy(),
+                )
+                self.assertEqual(tuple(value.shape), (2, 7, 24, 3))
+                self.assertTrue(bool(torch.isfinite(value).all()))
+                self.assertLess(float(error.max()), 3.0e-4)
+
+    def test_torch_log_mixed_angles_has_finite_backward_for_formal_prefixes(self):
+        try:
+            import torch
+        except Exception:
+            self.skipTest("PyTorch is not installed in the lightweight test runtime")
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        for device in devices:
+            with self.subTest(device=device):
+                angles = torch.tensor(
+                    [0.0, 1.0e-6, 0.35, float(np.pi - 5.0e-5)],
+                    dtype=torch.float64,
+                    device=device,
+                ).reshape(1, 4, 1, 1)
+                axes = torch.tensor(
+                    [0.2, -0.7, 0.4],
+                    dtype=torch.float64,
+                    device=device,
+                ).reshape(1, 1, 1, 3)
+                axes = torch.nn.functional.normalize(axes, dim=-1)
+                vectors = (axes * angles).expand(2, 4, 24, 3).clone()
+                vectors.requires_grad_(True)
+                value = so3_log_torch(so3_exp_torch(vectors))
+                loss = value.square().sum()
+                loss.backward()
+                self.assertEqual(tuple(value.shape), (2, 4, 24, 3))
+                self.assertTrue(bool(torch.isfinite(value).all()))
+                self.assertIsNotNone(vectors.grad)
+                self.assertTrue(bool(torch.isfinite(vectors.grad).all()))
+
     def test_torch_exp_matches_numpy_and_has_finite_gradient(self):
         try:
             import torch
