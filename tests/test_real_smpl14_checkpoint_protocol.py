@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from motion_geometry.product_manifold import product_exp_np, product_log_np
+
 from retargeting.smpl_adapter import (
     CHANG_E_POSE_LAYOUT,
     load_smpl24_parameters,
@@ -61,6 +63,7 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
     cfg = MotionGenerationConfig.from_json(ROOT / "configs" / "motion_model.json")
     ideal = _new_validation_physical_accumulator()
     no_repair = _new_validation_physical_accumulator()
+    exact_product_repair = _new_validation_physical_accumulator()
     outside_seam_changes = []
 
     for index, source in enumerate(_real_smpl14_files()):
@@ -87,6 +90,17 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
             cfg,
             degraded=degraded,
         )
+        reconstructed = product_exp_np(
+            degraded,
+            product_log_np(degraded, clean),
+        )
+        _record_validation_physical_prediction(
+            exact_product_repair,
+            reconstructed,
+            clean,
+            cfg,
+            degraded=degraded,
+        )
         inactive = seam[:, 0] == 0.0
         outside_seam_changes.append(
             float(np.max(np.abs((degraded - clean)[inactive, 4:])))
@@ -94,6 +108,9 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
 
     ideal_summary = _summarize_validation_physical_metrics(ideal)
     no_repair_summary = _summarize_validation_physical_metrics(no_repair)
+    exact_product_summary = _summarize_validation_physical_metrics(
+        exact_product_repair
+    )
 
     assert ideal_summary["stage_repair"]["pass_rate"] == 1.0
     assert ideal_summary["clean_reference_fidelity"]["pass_rate"] == 1.0
@@ -101,6 +118,11 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
         ideal_summary["clean_physical_non_regression"]["pass_rate"] == 1.0
     )
     assert no_repair_summary["stage_repair"]["pass_rate"] == 0.0
+    assert exact_product_summary["stage_repair"]["pass_rate"] == 1.0
+    assert (
+        exact_product_summary["clean_reference_fidelity"]["pass_rate"]
+        == 1.0
+    )
     assert max(outside_seam_changes) < 2.0e-6
     assert not ideal_summary["final_generation_gate_diagnostic"][
         "checkpoint_criterion"
@@ -117,3 +139,19 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
     assert rejected["scientific_acceptance"] is False
     assert rejected["publish_allowed"] is False
     assert "stage_repair_rate_too_low" in rejected["reasons"]
+
+    # The strict multi-metric clean comparison is retained as a diagnostic,
+    # but product-manifold round trips must not be rejected after the bounded
+    # clean-reference fidelity gate and the real clean-input identity gate pass.
+    exact_product_summary["clean_physical_non_regression"]["pass_rate"] = 0.0
+    exact_product_summary["clean_input_identity"] = {"pass_rate": 1.0}
+    accepted = _checkpoint_validation_decision(
+        {
+            "reconstruction_product_log_l1": 0.0,
+            "physical_quality": exact_product_summary,
+        },
+        cfg,
+        stage="refiner",
+    )
+    assert accepted["scientific_acceptance"] is True
+    assert accepted["publish_allowed"] is True

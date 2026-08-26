@@ -447,7 +447,7 @@ class MotionTrainingContractTests(unittest.TestCase):
         maximum_seam = int(
             round(cfg.transition_train_max_seconds * cfg.fps)
         )
-        self.assertEqual(model.temporal_dilations, (1, 2, 4))
+        self.assertEqual(model.temporal_dilations, (1, 2, 5))
         self.assertGreaterEqual(
             model.temporal_receptive_field_frames,
             maximum_seam + 1,
@@ -505,10 +505,60 @@ class MotionTrainingContractTests(unittest.TestCase):
             unchanged["reconstruction"].item(),
         )
         self.assertGreater(unchanged["repair_margin"].item(), 0.0)
+        self.assertAlmostEqual(
+            unchanged["repair_margin"].item()
+            / unchanged["active_reconstruction"].item(),
+            cfg.product_refiner_training_target_repair_gain,
+            places=5,
+        )
         self.assertAlmostEqual(repaired["active_reconstruction"].item(), 0.0)
         self.assertAlmostEqual(repaired["repair_margin"].item(), 0.0)
         self.assertAlmostEqual(repaired["clean_preservation"].item(), 0.0)
         self.assertGreater(harmed["clean_preservation"].item(), 0.0)
+
+    @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
+    def test_refiner_soft_mask_scales_before_applied_tangent_cap(self):
+        torch = motion_runtime.torch
+        cfg = MotionGenerationConfig(device="cpu")
+        clean = torch.from_numpy(self._identity_motion(12))[None]
+        output = torch.zeros((1, 12, motion_runtime.PRODUCT_STATE_DIM))
+        mask_value = 0.18
+        target_angle = 0.10
+        output[..., 4 + 3] = target_angle / mask_value
+        joint = torch.zeros((1, 12, 24))
+        joint[..., 0] = mask_value
+        root = torch.zeros((1, 12, 1))
+        contact = torch.zeros((1, 12, 1))
+
+        prediction = motion_runtime._decode_product_refiner_output(
+            clean, output, joint, root, contact, cfg
+        )
+        applied = motion_runtime.product_log_torch(clean, prediction)
+        angle = torch.linalg.vector_norm(
+            applied[..., 3:6], dim=-1
+        ).mean()
+
+        self.assertAlmostEqual(float(angle), target_angle, places=5)
+
+    @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
+    def test_clean_identity_loss_rejects_refiner_edits(self):
+        torch = motion_runtime.torch
+        cfg = MotionGenerationConfig(device="cpu")
+        clean = torch.from_numpy(self._identity_motion(30))[None]
+        joint = torch.ones((1, 30, 24))
+        root = torch.ones((1, 30, 1))
+        contact = torch.ones((1, 30, 1))
+        exact, _ = motion_runtime._product_refiner_clean_identity_loss(
+            clean, clean, joint, root, contact, cfg
+        )
+        harmed = clean.clone()
+        harmed[:, 8:22, motion_runtime.ROOT_X_IDX] += 0.02
+        changed, _ = motion_runtime._product_refiner_clean_identity_loss(
+            harmed, clean, joint, root, contact, cfg
+        )
+
+        self.assertAlmostEqual(float(exact), 0.0, places=7)
+        self.assertGreater(float(changed), 0.0)
 
     def test_transition_bridge_mix_is_fail_closed(self):
         cfg = MotionGenerationConfig()
@@ -586,7 +636,8 @@ class MotionTrainingContractTests(unittest.TestCase):
                 "fk_position_error_m_max": 0.02,
                 "stage_repair": {"pass_rate": 1.0},
                 "clean_reference_fidelity": {"pass_rate": 1.0},
-                "clean_physical_non_regression": {"pass_rate": 1.0},
+                "clean_physical_non_regression": {"pass_rate": 0.0},
+                "clean_input_identity": {"pass_rate": 1.0},
                 "final_generation_gate_diagnostic": {
                     "prediction": {"pass_rate": 0.0},
                 },
@@ -597,11 +648,21 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertTrue(decision["scientific_acceptance"])
         self.assertTrue(decision["publish_allowed"])
         self.assertFalse(decision["final_generation_gate_used"])
+        self.assertTrue(decision["clean_non_regression_diagnostic_only"])
 
         metrics["physical_quality"]["stage_repair"]["pass_rate"] = 0.0
         rejected = _checkpoint_validation_decision(metrics, cfg, stage="refiner")
         self.assertFalse(rejected["scientific_acceptance"])
         self.assertFalse(rejected["publish_allowed"])
+
+        metrics["physical_quality"]["stage_repair"]["pass_rate"] = 1.0
+        metrics["physical_quality"]["clean_input_identity"]["pass_rate"] = 0.0
+        rejected_identity = _checkpoint_validation_decision(
+            metrics, cfg, stage="refiner"
+        )
+        self.assertIn(
+            "clean_identity_rate_too_low", rejected_identity["reasons"]
+        )
 
     @unittest.skipIf(motion_runtime.torch is None, "PyTorch unavailable")
     def test_rejected_checkpoint_is_quarantined_not_published(self):

@@ -47,7 +47,7 @@ def test_refiner_window_batching_matches_single_window_execution():
         checkpoint_path = Path(td) / "refiner.pt"
         torch.save(
             {
-                "version": "product_manifold_boundary_refiner_v2",
+                "version": "product_manifold_boundary_refiner_v3",
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
                     cfg,
@@ -76,7 +76,14 @@ def test_refiner_window_batching_matches_single_window_execution():
     assert len(models._INFERENCE_MODEL_CACHE) == 1
 
 
-def test_formal_refiner_rejects_pre_dilation_v1_checkpoint():
+@pytest.mark.parametrize(
+    "legacy_version",
+    [
+        "product_manifold_boundary_refiner_v1",
+        "product_manifold_boundary_refiner_v2",
+    ],
+)
+def test_formal_refiner_rejects_legacy_checkpoint(legacy_version):
     torch = models.torch
     cfg = _config(1)
     motion = _identity_motion(30)
@@ -89,7 +96,7 @@ def test_formal_refiner_rejects_pre_dilation_v1_checkpoint():
         checkpoint_path = Path(td) / "legacy_refiner.pt"
         torch.save(
             {
-                "version": "product_manifold_boundary_refiner_v1",
+                "version": legacy_version,
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
                     cfg,
