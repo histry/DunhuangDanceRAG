@@ -74,6 +74,169 @@ def _write_training_db(root, label: str):
     return db_path
 
 
+def test_refiner_best_validation_candidate_is_nonformal_and_roundtrips(
+    tmp_path,
+):
+    cfg = models.MotionGenerationConfig(device="cpu")
+    model = models.ProductManifoldTemporalRefiner(151, 32)
+    training_contract = _database_contract("train")
+    validation_contract = _database_contract("validation")
+    metrics = {
+        "reconstruction_product_log_l1": 0.01,
+        "physical_quality": {
+            "stage_repair": {"pass_rate": 0.75},
+            "temporal_repair": {"pass_rate": 0.875},
+            "clean_input_identity": {"pass_rate": 1.0},
+            "fk_position_error_m_p95": 0.02,
+        },
+    }
+    decision = {
+        "scientific_acceptance": True,
+        "publish_allowed": True,
+        "reasons": [],
+    }
+    path = tmp_path / "boundary_refiner.best_validation.pt"
+
+    saved = models._save_refiner_best_validation_candidate(
+        path,
+        model=model,
+        completed_steps=1000,
+        metrics=metrics,
+        decision=decision,
+        cfg=cfg,
+        training_contract=training_contract,
+        validation_contract=validation_contract,
+    )
+    loaded = models._load_refiner_best_validation_candidate(
+        path,
+        cfg=cfg,
+        training_contract=training_contract,
+        validation_contract=validation_contract,
+    )
+
+    assert saved["formal_checkpoint"] is False
+    assert saved["publication_state"] == (
+        "validated_training_candidate_not_formal"
+    )
+    assert loaded["completed_steps"] == 1000
+    assert loaded["checkpoint_decision"]["publish_allowed"] is True
+
+
+def test_refiner_best_score_prioritizes_all_gates_over_lower_error():
+    rejected_metrics = {
+        "reconstruction_product_log_l1": 0.0001,
+        "physical_quality": {
+            "stage_repair": {"pass_rate": 1.0},
+            "temporal_repair": {"pass_rate": 0.5},
+            "clean_input_identity": {"pass_rate": 1.0},
+            "fk_position_error_m_p95": 0.001,
+        },
+    }
+    accepted_metrics = {
+        "reconstruction_product_log_l1": 0.01,
+        "physical_quality": {
+            "stage_repair": {"pass_rate": 0.75},
+            "temporal_repair": {"pass_rate": 0.75},
+            "clean_input_identity": {"pass_rate": 0.75},
+            "fk_position_error_m_p95": 0.02,
+        },
+    }
+
+    rejected_score = models._refiner_validation_score(
+        rejected_metrics,
+        {"scientific_acceptance": False},
+    )
+    accepted_score = models._refiner_validation_score(
+        accepted_metrics,
+        {"scientific_acceptance": True},
+    )
+
+    assert accepted_score > rejected_score
+
+
+def test_refiner_training_publishes_earlier_best_validation_candidate(
+    tmp_path,
+):
+    train_path = _write_training_db(tmp_path, "train_best")
+    validation_path = _write_training_db(tmp_path, "validation_best")
+    config_path = tmp_path / "best_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "fps": 30.0,
+                "window_len": 16,
+                "hop_len": 8,
+                "batch_size": 2,
+                "device": "cpu",
+                "gpu_preprocessing": False,
+                "checkpoint_validation_fail_closed": True,
+                "training_snapshot_interval_steps": 1,
+                "training_validation_interval_steps": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "refiner.pt"
+    accepted = {
+        "scientific_acceptance": True,
+        "publish_allowed": True,
+        "reasons": [],
+    }
+    rejected = {
+        "scientific_acceptance": False,
+        "publish_allowed": False,
+        "reasons": ["temporal_repair_rate_too_low"],
+    }
+    accepted_metrics = {
+        "reconstruction_product_log_l1": 0.01,
+        "physical_quality": {
+            "stage_repair": {"pass_rate": 0.75},
+            "temporal_repair": {"pass_rate": 0.75},
+            "clean_input_identity": {"pass_rate": 0.75},
+            "fk_position_error_m_p95": 0.02,
+        },
+    }
+    rejected_metrics = {
+        "reconstruction_product_log_l1": 0.001,
+        "physical_quality": {
+            "stage_repair": {"pass_rate": 1.0},
+            "temporal_repair": {"pass_rate": 0.5},
+            "clean_input_identity": {"pass_rate": 1.0},
+            "fk_position_error_m_p95": 0.01,
+        },
+    }
+    args = Namespace(
+        config=str(config_path),
+        db=str(train_path),
+        val_db=str(validation_path),
+        out=str(output_path),
+        steps=2,
+        snapshot_path=str(tmp_path / "refiner.resume.pt"),
+        resume_snapshot=None,
+        snapshot_every=1,
+        validation_every=1,
+    )
+
+    with mock.patch.object(
+        models,
+        "_evaluate_refiner_validation",
+        side_effect=[accepted_metrics, rejected_metrics],
+    ), mock.patch.object(
+        models,
+        "_checkpoint_validation_decision",
+        side_effect=[accepted, rejected],
+    ):
+        assert models.train_refiner(args) == 0
+
+    checkpoint = models._trusted_torch_load(output_path, map_location="cpu")
+    assert checkpoint["validation"]["selection"][
+        "selected_completed_steps"
+    ] == 1
+    assert checkpoint["validation"]["checkpoint_decision"][
+        "scientific_acceptance"
+    ] is True
+
+
 @pytest.mark.parametrize(
     ("stage", "diffusion_steps"),
     [("refiner", None), ("diffusion", 50)],

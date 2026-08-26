@@ -413,21 +413,24 @@ class MotionGenerationConfig:
     # Keep a small whole-window fidelity term, but normalize the main geometry
     # objective on the actually corrupted seam so authentic high-motion frames
     # selected by the Peak-Jerk mask cannot dilute the repair signal.
-    product_refiner_global_reconstruction_weight: float = 0.25
-    product_refiner_active_reconstruction_weight: float = 1.0
-    product_refiner_tangent_supervision_weight: float = 0.50
+    product_refiner_global_reconstruction_weight: float = 0.05
+    product_refiner_active_reconstruction_weight: float = 0.0
+    product_refiner_tangent_supervision_weight: float = 0.0
     product_refiner_repair_margin_weight: float = 1.0
     product_refiner_clean_preservation_weight: float = 1.0
-    # Checkpoint publication only needs a small measurable gain, but using the
-    # same 3% value as the training target lets the residual network converge
-    # to an almost-no-op solution. Train toward a near-clean repair and keep
-    # the weaker checkpoint threshold as an independent scientific gate.
-    product_refiner_training_target_repair_gain: float = 0.90
-    product_refiner_temporal_supervision_weight: float = 0.50
+    # Endpoint inbetweening deliberately removes unobservable interior detail.
+    # Train a bounded relative improvement rather than asking a deterministic
+    # refiner to reconstruct that missing trajectory exactly.
+    product_refiner_training_target_repair_gain: float = 0.10
+    product_refiner_temporal_supervision_weight: float = 0.0
     # A degraded-only training distribution never teaches the network that an
     # already-clean transition must remain unchanged. The paired identity
     # branch uses the same seam/risk contract with authentic clean input.
     product_refiner_clean_identity_weight: float = 0.50
+    product_refiner_endpoint_continuity_weight: float = 0.50
+    product_refiner_seam_velocity_weight: float = 0.20
+    product_refiner_seam_acceleration_weight: float = 0.25
+    product_refiner_seam_jerk_weight: float = 0.30
     # A full endpoint-only inbetween discards the unknown clean interior and
     # makes source-disjoint reconstruction ill posed.  Retain half of the
     # authentic local trajectory while injecting the same transition artifact
@@ -448,11 +451,16 @@ class MotionGenerationConfig:
     # after Diffusion, boundary repair and IK.
     checkpoint_validation_fail_closed: bool = True
     checkpoint_validation_min_stage_repair_rate: float = 0.75
+    checkpoint_validation_min_temporal_repair_rate: float = 0.75
+    # Kept for report compatibility; full-window fidelity is diagnostic only.
     checkpoint_validation_min_clean_fidelity_rate: float = 0.75
+    checkpoint_validation_min_clean_identity_rate: float = 0.75
     checkpoint_validation_max_fk_p95_m: float = 0.15
     checkpoint_validation_max_fk_max_m: float = 1.0
     checkpoint_validation_max_refiner_product_log_l1: float = 0.03
     checkpoint_validation_min_geometry_repair_gain: float = 0.03
+    checkpoint_validation_min_temporal_repair_gain: float = 0.03
+    checkpoint_validation_min_endpoint_repair_gain: float = 0.03
     checkpoint_validation_max_clean_identity_product_log_l1: float = 0.005
     checkpoint_validation_max_clean_identity_contact_l1: float = 0.05
     # Whole-sequence acceptance is authoritative. A candidate that fails the
@@ -471,6 +479,7 @@ class MotionGenerationConfig:
     diffusion_train_steps: int = 15000
     refiner_train_steps: int = 8000
     training_snapshot_interval_steps: int = 200
+    training_validation_interval_steps: int = 1000
     batch_size: int = 64
     inference_window_batch_size: int = 16
     gpu_preprocessing: bool = True
@@ -536,6 +545,22 @@ class MotionGenerationConfig:
                 "product_refiner_clean_identity_weight",
                 float,
             ),
+            "MOTION_PRODUCT_REFINER_ENDPOINT_CONTINUITY_WEIGHT": (
+                "product_refiner_endpoint_continuity_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_SEAM_VELOCITY_WEIGHT": (
+                "product_refiner_seam_velocity_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_SEAM_ACCELERATION_WEIGHT": (
+                "product_refiner_seam_acceleration_weight",
+                float,
+            ),
+            "MOTION_PRODUCT_REFINER_SEAM_JERK_WEIGHT": (
+                "product_refiner_seam_jerk_weight",
+                float,
+            ),
             "MOTION_TRANSITION_BRIDGE_MIX": ("transition_bridge_mix", float),
             "MOTION_PHYSICS_FK_LOSS_WEIGHT": ("physics_fk_loss_weight", float),
             "MOTION_PHYSICS_FOOT_LOSS_WEIGHT": ("physics_foot_loss_weight", float),
@@ -570,8 +595,16 @@ class MotionGenerationConfig:
                 "checkpoint_validation_min_stage_repair_rate",
                 float,
             ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_TEMPORAL_REPAIR_RATE": (
+                "checkpoint_validation_min_temporal_repair_rate",
+                float,
+            ),
             "MOTION_CHECKPOINT_VALIDATION_MIN_CLEAN_FIDELITY_RATE": (
                 "checkpoint_validation_min_clean_fidelity_rate",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_CLEAN_IDENTITY_RATE": (
+                "checkpoint_validation_min_clean_identity_rate",
                 float,
             ),
             "MOTION_CHECKPOINT_VALIDATION_MAX_FK_P95_M": (
@@ -588,6 +621,14 @@ class MotionGenerationConfig:
             ),
             "MOTION_CHECKPOINT_VALIDATION_MIN_GEOMETRY_REPAIR_GAIN": (
                 "checkpoint_validation_min_geometry_repair_gain",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_TEMPORAL_REPAIR_GAIN": (
+                "checkpoint_validation_min_temporal_repair_gain",
+                float,
+            ),
+            "MOTION_CHECKPOINT_VALIDATION_MIN_ENDPOINT_REPAIR_GAIN": (
+                "checkpoint_validation_min_endpoint_repair_gain",
                 float,
             ),
             "MOTION_CHECKPOINT_VALIDATION_MAX_CLEAN_IDENTITY_PRODUCT_LOG_L1": (
@@ -614,6 +655,10 @@ class MotionGenerationConfig:
             ),
             "MOTION_TRAINING_SNAPSHOT_INTERVAL_STEPS": (
                 "training_snapshot_interval_steps",
+                int,
+            ),
+            "MOTION_TRAINING_VALIDATION_INTERVAL_STEPS": (
+                "training_validation_interval_steps",
                 int,
             ),
             "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
@@ -2980,7 +3025,80 @@ def _decode_product_refiner_output(
     return torch.cat([contacts, geometry[..., 4:]], dim=-1)
 
 
-def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
+def _derivative_support_torch(
+    seam_mask,
+    order: int,
+    *,
+    boundary_only: bool = False,
+):
+    """Return frame support for a temporal derivative touching the seam.
+
+    ``torch.diff(..., n=order)`` consumes ``order + 1`` source frames.  The
+    support therefore has the derivative's shorter time axis.  Boundary-only
+    support selects stencils that cross between clean context and the corrupt
+    core; non-boundary support selects every stencil that touches the core.
+    """
+
+    if order < 1:
+        raise ValueError("temporal derivative order must be positive")
+    if seam_mask.ndim == 3:
+        core = seam_mask[..., 0]
+    elif seam_mask.ndim == 2:
+        core = seam_mask
+    else:
+        raise ValueError(
+            "seam_mask must be [B,T] or [B,T,1], got "
+            f"{tuple(seam_mask.shape)}"
+        )
+    core = (core >= 0.5).to(dtype=seam_mask.dtype)
+    width = int(core.shape[1]) - int(order)
+    if width <= 0:
+        return core[:, :0]
+    stencil = torch.stack(
+        [core[:, offset:offset + width] for offset in range(order + 1)],
+        dim=-1,
+    )
+    maximum = stencil.amax(dim=-1)
+    if boundary_only:
+        return maximum - stencil.amin(dim=-1)
+    return maximum
+
+
+def _masked_temporal_fk_loss_torch(
+    predicted_joints,
+    clean_joints,
+    seam_mask,
+    *,
+    order: int,
+    scale: float,
+    boundary_only: bool = False,
+):
+    if predicted_joints.shape[1] <= order:
+        return predicted_joints.new_zeros(())
+    support = _derivative_support_torch(
+        seam_mask,
+        order,
+        boundary_only=boundary_only,
+    )
+    predicted_delta = torch.diff(
+        predicted_joints, n=order, dim=1
+    ) / float(scale)
+    clean_delta = torch.diff(clean_joints, n=order, dim=1) / float(scale)
+    error = F.smooth_l1_loss(
+        predicted_delta,
+        clean_delta,
+        reduction="none",
+    ).mean(dim=(-1, -2))
+    return (error * support).sum() / support.sum().clamp_min(1.0)
+
+
+def _world_space_physics_losses(
+    prediction,
+    clean,
+    cfg: MotionGenerationConfig,
+    *,
+    seam_mask=None,
+):
     """Differentiable FK/foot/dynamics losses for EDGE-151D batches.
 
     Static support is defined from the clean target's contact and world-space
@@ -3061,6 +3179,41 @@ def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
 
     acceleration_loss = derivative_loss(2, 10.0)
     jerk_loss = derivative_loss(3, 1000.0)
+    if seam_mask is None:
+        endpoint_continuity_loss = fk_loss.new_zeros(())
+        seam_velocity_loss = fk_loss.new_zeros(())
+        seam_acceleration_loss = fk_loss.new_zeros(())
+        seam_jerk_loss = fk_loss.new_zeros(())
+    else:
+        endpoint_continuity_loss = _masked_temporal_fk_loss_torch(
+            predicted_joints,
+            clean_joints,
+            seam_mask,
+            order=1,
+            scale=1.0 / float(cfg.fps),
+            boundary_only=True,
+        )
+        seam_velocity_loss = _masked_temporal_fk_loss_torch(
+            predicted_joints,
+            clean_joints,
+            seam_mask,
+            order=1,
+            scale=1.0 / float(cfg.fps),
+        )
+        seam_acceleration_loss = _masked_temporal_fk_loss_torch(
+            predicted_joints,
+            clean_joints,
+            seam_mask,
+            order=2,
+            scale=10.0 / (float(cfg.fps) ** 2),
+        )
+        seam_jerk_loss = _masked_temporal_fk_loss_torch(
+            predicted_joints,
+            clean_joints,
+            seam_mask,
+            order=3,
+            scale=1000.0 / (float(cfg.fps) ** 3),
+        )
     terms = {
         "fk": fk_loss,
         "foot": foot_loss,
@@ -3068,6 +3221,10 @@ def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
         "penetration": penetration_loss,
         "acceleration": acceleration_loss,
         "jerk": jerk_loss,
+        "endpoint_continuity": endpoint_continuity_loss,
+        "seam_velocity": seam_velocity_loss,
+        "seam_acceleration": seam_acceleration_loss,
+        "seam_jerk": seam_jerk_loss,
     }
     total = (
         float(cfg.physics_fk_loss_weight) * fk_loss
@@ -3076,6 +3233,13 @@ def _world_space_physics_losses(prediction, clean, cfg: MotionGenerationConfig):
         + float(cfg.physics_penetration_loss_weight) * penetration_loss
         + float(cfg.physics_acceleration_loss_weight) * acceleration_loss
         + float(cfg.physics_jerk_loss_weight) * jerk_loss
+        + float(cfg.product_refiner_endpoint_continuity_weight)
+        * endpoint_continuity_loss
+        + float(cfg.product_refiner_seam_velocity_weight)
+        * seam_velocity_loss
+        + float(cfg.product_refiner_seam_acceleration_weight)
+        * seam_acceleration_loss
+        + float(cfg.product_refiner_seam_jerk_weight) * seam_jerk_loss
     )
     return total, terms
 
@@ -3252,6 +3416,7 @@ def _product_motion_losses(
         prediction,
         clean,
         cfg,
+        seam_mask=seam_mask,
     )
     total = (
         float(cfg.product_refiner_global_reconstruction_weight)
@@ -3283,6 +3448,10 @@ def _product_motion_losses(
         "contact": contact_loss,
         "outside": outside_loss,
         "physics": physics_loss,
+        "endpoint_continuity": physics_terms["endpoint_continuity"],
+        "seam_velocity": physics_terms["seam_velocity"],
+        "seam_acceleration": physics_terms["seam_acceleration"],
+        "seam_jerk": physics_terms["seam_jerk"],
     }
     terms.update({f"physics_{key}": value for key, value in physics_terms.items()})
     return total, terms
@@ -3708,6 +3877,7 @@ def _new_validation_physical_accumulator() -> Dict[str, Any]:
         "clean_audits": [],
         "degraded_audits": [],
         "stage_repair_gates": [],
+        "temporal_repair_gates": [],
         "clean_non_regression_gates": [],
         "clean_fidelity_gates": [],
         "clean_identity_prediction_audits": [],
@@ -3717,6 +3887,145 @@ def _new_validation_physical_accumulator() -> Dict[str, Any]:
         "prediction_final_diagnostic_gates": [],
         "clean_final_diagnostic_gates": [],
         "fk_errors": [],
+    }
+
+
+def _derivative_support_np(
+    seam_mask: np.ndarray,
+    order: int,
+    *,
+    boundary_only: bool = False,
+) -> np.ndarray:
+    seam = np.asarray(seam_mask, dtype=np.float32)
+    if seam.ndim == 2 and seam.shape[-1] == 1:
+        seam = seam[:, 0]
+    if seam.ndim != 1:
+        raise ValueError(f"seam_mask must be [T] or [T,1], got {seam.shape}")
+    width = len(seam) - int(order)
+    if width <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    core = (seam >= 0.5).astype(np.float32)
+    stencil = np.stack(
+        [core[offset:offset + width] for offset in range(order + 1)],
+        axis=-1,
+    )
+    maximum = np.max(stencil, axis=-1)
+    if boundary_only:
+        return (maximum - np.min(stencil, axis=-1)).astype(np.float32)
+    return maximum.astype(np.float32)
+
+
+def _seam_fk_temporal_errors_np(
+    candidate: np.ndarray,
+    clean: np.ndarray,
+    seam_mask: np.ndarray,
+    cfg: MotionGenerationConfig,
+) -> Dict[str, float]:
+    candidate_joints = fk_24_np(np.asarray(candidate, dtype=np.float32))
+    clean_joints = fk_24_np(np.asarray(clean, dtype=np.float32))
+
+    def error(order: int, scale: float, *, boundary_only: bool = False) -> float:
+        if len(candidate_joints) <= order:
+            return 0.0
+        support = _derivative_support_np(
+            seam_mask,
+            order,
+            boundary_only=boundary_only,
+        )
+        if not np.any(support > 0.0):
+            return 0.0
+        candidate_delta = np.diff(candidate_joints, n=order, axis=0) / float(scale)
+        clean_delta = np.diff(clean_joints, n=order, axis=0) / float(scale)
+        per_frame = np.mean(np.abs(candidate_delta - clean_delta), axis=(1, 2))
+        return float(np.sum(per_frame * support) / max(float(np.sum(support)), 1.0))
+
+    fps = float(cfg.fps)
+    return {
+        "endpoint_velocity_error": error(
+            1,
+            1.0 / fps,
+            boundary_only=True,
+        ),
+        "seam_velocity_error": error(1, 1.0 / fps),
+        "seam_acceleration_error": error(2, 10.0 / (fps ** 2)),
+        "seam_jerk_error": error(3, 1000.0 / (fps ** 3)),
+    }
+
+
+def _temporal_repair_gate_np(
+    prediction: np.ndarray,
+    degraded: np.ndarray,
+    clean: np.ndarray,
+    seam_mask: np.ndarray,
+    cfg: MotionGenerationConfig,
+) -> Dict[str, Any]:
+    prediction_error = _seam_fk_temporal_errors_np(
+        prediction,
+        clean,
+        seam_mask,
+        cfg,
+    )
+    degraded_error = _seam_fk_temporal_errors_np(
+        degraded,
+        clean,
+        seam_mask,
+        cfg,
+    )
+    floor = 1.0e-6
+
+    def relative_gain(reference: float, candidate: float) -> float:
+        if reference <= floor:
+            return 1.0 if candidate <= floor else float("-inf")
+        return float((reference - candidate) / reference)
+
+    temporal_keys = (
+        "seam_velocity_error",
+        "seam_acceleration_error",
+        "seam_jerk_error",
+    )
+    degraded_temporal = float(np.mean([degraded_error[key] for key in temporal_keys]))
+    prediction_temporal = float(np.mean([prediction_error[key] for key in temporal_keys]))
+    temporal_gain = relative_gain(degraded_temporal, prediction_temporal)
+    endpoint_gain = relative_gain(
+        degraded_error["endpoint_velocity_error"],
+        prediction_error["endpoint_velocity_error"],
+    )
+    jerk_non_regression = bool(
+        prediction_error["seam_jerk_error"]
+        <= degraded_error["seam_jerk_error"] * 1.02 + floor
+    )
+    reasons: List[str] = []
+    if (
+        not np.isfinite(temporal_gain)
+        or temporal_gain
+        < float(cfg.checkpoint_validation_min_temporal_repair_gain)
+    ):
+        reasons.append("no_meaningful_temporal_repair_gain")
+    if (
+        not np.isfinite(endpoint_gain)
+        or endpoint_gain
+        < float(cfg.checkpoint_validation_min_endpoint_repair_gain)
+    ):
+        reasons.append("no_meaningful_endpoint_continuity_gain")
+    if not jerk_non_regression:
+        reasons.append("seam_fk_jerk_regressed")
+    return {
+        "schema": "checkpoint_seam_fk_temporal_repair_gate_v1",
+        "accepted": not reasons,
+        "reasons": reasons,
+        "detail": {
+            "prediction": prediction_error,
+            "degraded": degraded_error,
+            "temporal_repair_gain": temporal_gain,
+            "endpoint_repair_gain": endpoint_gain,
+            "minimum_temporal_repair_gain": float(
+                cfg.checkpoint_validation_min_temporal_repair_gain
+            ),
+            "minimum_endpoint_repair_gain": float(
+                cfg.checkpoint_validation_min_endpoint_repair_gain
+            ),
+            "jerk_non_regression": jerk_non_regression,
+        },
     }
 
 
@@ -3749,6 +4058,7 @@ def _record_validation_physical_prediction(
     cfg: MotionGenerationConfig,
     *,
     degraded: Optional[np.ndarray] = None,
+    seam_mask: Optional[np.ndarray] = None,
 ) -> None:
     predicted = np.asarray(prediction, dtype=np.float32)
     target, _ = enforce_edge151_contract_np(
@@ -3802,12 +4112,16 @@ def _record_validation_physical_prediction(
         ignored_layers=("long_horizon_root_drift",),
     )
     try:
-        degraded_product_error = float(
-            np.mean(np.abs(product_log_np(target, damaged)))
-        )
-        prediction_product_error = float(
-            np.mean(np.abs(product_log_np(target, predicted)))
-        )
+        degraded_product_delta = np.abs(product_log_np(target, damaged))
+        prediction_product_delta = np.abs(product_log_np(target, predicted))
+        if seam_mask is not None:
+            seam = np.asarray(seam_mask, dtype=np.float32).reshape(-1)
+            local = seam >= 0.5
+            if np.any(local):
+                degraded_product_delta = degraded_product_delta[local]
+                prediction_product_delta = prediction_product_delta[local]
+        degraded_product_error = float(np.mean(degraded_product_delta))
+        prediction_product_error = float(np.mean(prediction_product_delta))
         if not np.isfinite(degraded_product_error):
             degraded_product_error = float("inf")
         if not np.isfinite(prediction_product_error):
@@ -3859,6 +4173,26 @@ def _record_validation_physical_prediction(
             degraded_physical_diagnostic
         ),
     }
+    if seam_mask is None:
+        temporal_gate = {
+            "schema": "checkpoint_seam_fk_temporal_repair_gate_v1",
+            "accepted": True,
+            "reasons": [],
+            "detail": {
+                "compatibility_without_seam": True,
+                "temporal_repair_gain": 1.0,
+                "endpoint_repair_gain": 1.0,
+                "jerk_non_regression": True,
+            },
+        }
+    else:
+        temporal_gate = _temporal_repair_gate_np(
+            predicted,
+            damaged,
+            target,
+            seam_mask,
+            cfg,
+        )
 
     # Preserve the strict final gate as a named diagnostic only.  It is not a
     # checkpoint criterion before Diffusion, boundary repair and IK.
@@ -3888,6 +4222,7 @@ def _record_validation_physical_prediction(
     accumulator["clean_audits"].append(clean_audit)
     accumulator["degraded_audits"].append(degraded_audit)
     accumulator["stage_repair_gates"].append(stage_gate)
+    accumulator["temporal_repair_gates"].append(temporal_gate)
     accumulator["clean_non_regression_gates"].append(
         clean_non_regression_gate
     )
@@ -4021,6 +4356,9 @@ def _summarize_validation_physical_metrics(
     clean_audits = list(accumulator.get("clean_audits", []))
     degraded_audits = list(accumulator.get("degraded_audits", []))
     stage_repair_gates = list(accumulator.get("stage_repair_gates", []))
+    temporal_repair_gates = list(
+        accumulator.get("temporal_repair_gates", [])
+    )
     error_parts = list(accumulator.get("fk_errors", []))
     errors = np.concatenate(error_parts) if error_parts else np.zeros(0, dtype=np.float32)
     prediction_summary = _summarize_validation_audits(prediction_audits)
@@ -4042,10 +4380,13 @@ def _summarize_validation_physical_metrics(
         None,
     )
 
-    def summarize_stage_detail(key: str) -> Dict[str, Optional[float]]:
+    def summarize_gate_detail(
+        gates: Sequence[Mapping[str, Any]],
+        key: str,
+    ) -> Dict[str, Optional[float]]:
         values = [
             float(gate.get("detail", {}).get(key))
-            for gate in stage_repair_gates
+            for gate in gates
             if gate.get("detail", {}).get(key) is not None
         ]
         finite = np.asarray(
@@ -4059,8 +4400,11 @@ def _summarize_validation_physical_metrics(
             "maximum": float(np.max(finite)) if finite.size else None,
         }
 
+    def summarize_stage_detail(key: str) -> Dict[str, Optional[float]]:
+        return summarize_gate_detail(stage_repair_gates, key)
+
     return {
-        "schema": "motion_checkpoint_stage_validation_v2",
+        "schema": "motion_checkpoint_stage_validation_v3",
         "num_windows": len(prediction_audits),
         "fk_position_error_m_mean": float(np.mean(errors)) if errors.size else None,
         "fk_position_error_m_p95": float(np.percentile(errors, 95)) if errors.size else None,
@@ -4094,6 +4438,54 @@ def _summarize_validation_physical_metrics(
                 "prediction_product_log_l1_to_clean"
             ),
         },
+        "temporal_repair": {
+            **_summarize_validation_gates(
+                temporal_repair_gates,
+                accepted_key="accepted",
+            ),
+            "gate": "checkpoint_seam_fk_temporal_repair_gate_v1",
+            "criteria": [
+                "endpoint_velocity_continuity_gain",
+                "seam_fk_velocity_acceleration_jerk_gain",
+                "seam_fk_jerk_non_regression",
+            ],
+            "temporal_repair_gain": {
+                "minimum": next(
+                    (
+                        gate.get("detail", {}).get(
+                            "minimum_temporal_repair_gain"
+                        )
+                        for gate in temporal_repair_gates
+                        if gate.get("detail", {}).get(
+                            "minimum_temporal_repair_gain"
+                        ) is not None
+                    ),
+                    None,
+                ),
+                "observed": summarize_gate_detail(
+                    temporal_repair_gates,
+                    "temporal_repair_gain",
+                ),
+            },
+            "endpoint_repair_gain": {
+                "minimum": next(
+                    (
+                        gate.get("detail", {}).get(
+                            "minimum_endpoint_repair_gain"
+                        )
+                        for gate in temporal_repair_gates
+                        if gate.get("detail", {}).get(
+                            "minimum_endpoint_repair_gain"
+                        ) is not None
+                    ),
+                    None,
+                ),
+                "observed": summarize_gate_detail(
+                    temporal_repair_gates,
+                    "endpoint_repair_gain",
+                ),
+            },
+        },
         "clean_reference_fidelity": {
             **_summarize_validation_gates(
                 list(accumulator.get("clean_fidelity_gates", [])),
@@ -4102,6 +4494,11 @@ def _summarize_validation_physical_metrics(
             "gate": (
                 "contracts.physical_quality."
                 "evaluate_stage_reference_fidelity"
+            ),
+            "checkpoint_criterion": False,
+            "diagnostic_note": (
+                "full-window all-metric conjunction is diagnostic; checkpoint "
+                "publication uses separate local geometry and seam temporal gates"
             ),
         },
         "clean_input_identity": {
@@ -4158,7 +4555,8 @@ def _summarize_validation_physical_metrics(
             "checkpoint_criterion": False,
             "diagnostic_note": (
                 "strict multi-metric stage comparison of repaired versus clean; "
-                "clean_reference_fidelity is the bounded relative criterion"
+                "local geometry and seam FK temporal repair are the checkpoint "
+                "criteria"
             ),
         },
         "final_generation_gate_diagnostic": {
@@ -4184,8 +4582,9 @@ def _summarize_validation_physical_metrics(
         },
         "support_policy": "source_observation",
         "aggregation_note": (
-            "worst_window is conservative across deterministic validation "
-            "windows; final-generation absolute pass rate is diagnostic only"
+            "geometry and seam temporal repair are separate deterministic "
+            "validation gates; full-window fidelity and final-generation "
+            "absolute pass rate are diagnostic only"
         ),
     }
 
@@ -4295,6 +4694,7 @@ def _evaluate_refiner_validation(
                     clean,
                     cfg,
                     degraded=bad_t[0].detach().cpu().numpy(),
+                    seam_mask=seam,
                 )
                 _record_validation_clean_identity_prediction(
                     physical,
@@ -4428,6 +4828,7 @@ def _evaluate_diffusion_validation(
                     clean,
                     cfg,
                     degraded=retr[0].detach().cpu().numpy(),
+                    seam_mask=seam,
                 )
     finally:
         random.setstate(python_state)
@@ -4483,15 +4884,17 @@ def _checkpoint_validation_decision(
     """Decide whether a neural-stage checkpoint may become a formal asset.
 
     This deliberately does not consume the strict final-generation diagnostic.
-    Refiner and diffusion checkpoints are accepted on their own stage contract:
-    repair the synthetic seam relative to the degraded input, remain faithful
-    to the clean source target, and keep the FK error bounded.  The absolute
-    whole-song physical gate remains downstream of repair, IK and closed-loop
-    composition.
+    Refiner and diffusion checkpoints are accepted on two independent local
+    contracts: product-geometry repair and seam FK temporal repair.  The
+    full-window all-metric clean comparison is retained as a diagnostic because
+    it is an overly strict conjunction for a deliberately edited transition.
+    The absolute whole-song physical gate remains downstream of repair, IK and
+    closed-loop composition.
     """
 
     physical = metrics.get("physical_quality", {})
     stage_repair = physical.get("stage_repair", {})
+    temporal_repair = physical.get("temporal_repair", {})
     clean_fidelity = physical.get("clean_reference_fidelity", {})
     clean_non_regression = physical.get(
         "clean_physical_non_regression", {}
@@ -4500,6 +4903,7 @@ def _checkpoint_validation_decision(
     observed: Dict[str, Optional[float]] = {
         "num_windows": physical.get("num_windows"),
         "stage_repair_rate": stage_repair.get("pass_rate"),
+        "temporal_repair_rate": temporal_repair.get("pass_rate"),
         "clean_fidelity_rate": clean_fidelity.get("pass_rate"),
         "clean_non_regression_rate": clean_non_regression.get("pass_rate"),
         "clean_identity_rate": clean_identity.get("pass_rate"),
@@ -4510,11 +4914,11 @@ def _checkpoint_validation_decision(
         "min_stage_repair_rate": float(
             cfg.checkpoint_validation_min_stage_repair_rate
         ),
-        "min_clean_fidelity_rate": float(
-            cfg.checkpoint_validation_min_clean_fidelity_rate
+        "min_temporal_repair_rate": float(
+            cfg.checkpoint_validation_min_temporal_repair_rate
         ),
         "min_clean_identity_rate": float(
-            cfg.checkpoint_validation_min_clean_fidelity_rate
+            cfg.checkpoint_validation_min_clean_identity_rate
         ),
         "max_fk_position_error_m_p95": float(
             cfg.checkpoint_validation_max_fk_p95_m
@@ -4560,8 +4964,8 @@ def _checkpoint_validation_decision(
         thresholds["min_stage_repair_rate"],
     )
     _require_min(
-        "clean_fidelity_rate",
-        thresholds["min_clean_fidelity_rate"],
+        "temporal_repair_rate",
+        thresholds["min_temporal_repair_rate"],
     )
     _require_max(
         "fk_position_error_m_p95",
@@ -4592,7 +4996,7 @@ def _checkpoint_validation_decision(
     scientific_acceptance = not reasons
     fail_closed = bool(cfg.checkpoint_validation_fail_closed)
     return {
-        "schema": "motion_checkpoint_publication_decision_v1",
+        "schema": "motion_checkpoint_publication_decision_v2",
         "stage": str(stage),
         "scientific_acceptance": bool(scientific_acceptance),
         "publish_allowed": bool(scientific_acceptance or not fail_closed),
@@ -4602,6 +5006,7 @@ def _checkpoint_validation_decision(
         "observed": observed,
         "final_generation_gate_used": False,
         "clean_non_regression_diagnostic_only": True,
+        "clean_reference_fidelity_diagnostic_only": True,
         "final_generation_gate_role": (
             "diagnostic_only_until_diffusion_boundary_ik_closed_loop"
         ),
@@ -4628,11 +5033,12 @@ def _save_checkpoint_after_validation(
 
 
 TRAINING_RESUME_SNAPSHOT_SCHEMA = "dunhuang_motion_training_resume_v1"
+REFINER_BEST_VALIDATION_SCHEMA = "dunhuang_refiner_best_validation_v1"
 
 
 def _training_stage_contract(stage: str) -> Tuple[str, str]:
     if stage == "refiner":
-        return "boundary_refiner", "product_manifold_boundary_refiner_v3"
+        return "boundary_refiner", "product_manifold_boundary_refiner_v4"
     if stage == "diffusion":
         return "motion_diffusion", "reference_tangent_motion_diffusion_v2"
     raise ValueError(f"unsupported training snapshot stage: {stage!r}")
@@ -4728,6 +5134,159 @@ def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _finite_score_value(value: Any, *, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if np.isfinite(result) else float(default)
+
+
+def _refiner_validation_score(
+    metrics: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> Tuple[float, ...]:
+    """Rank deterministic validation candidates without hiding a failed gate."""
+
+    physical = metrics.get("physical_quality", {})
+    geometry_rate = _finite_score_value(
+        physical.get("stage_repair", {}).get("pass_rate"),
+        default=-1.0,
+    )
+    temporal_rate = _finite_score_value(
+        physical.get("temporal_repair", {}).get("pass_rate"),
+        default=-1.0,
+    )
+    identity_rate = _finite_score_value(
+        physical.get("clean_input_identity", {}).get("pass_rate"),
+        default=-1.0,
+    )
+    reconstruction = _finite_score_value(
+        metrics.get("reconstruction_product_log_l1"),
+        default=float("inf"),
+    )
+    fk_p95 = _finite_score_value(
+        physical.get("fk_position_error_m_p95"),
+        default=float("inf"),
+    )
+    return (
+        float(bool(decision.get("scientific_acceptance", False))),
+        min(geometry_rate, temporal_rate, identity_rate),
+        geometry_rate + temporal_rate + identity_rate,
+        -reconstruction,
+        -fk_p95,
+    )
+
+
+def _save_refiner_best_validation_candidate(
+    path: Path,
+    *,
+    model: Any,
+    completed_steps: int,
+    metrics: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    cfg: MotionGenerationConfig,
+    training_contract: Mapping[str, Any],
+    validation_contract: Mapping[str, Any],
+) -> Dict[str, Any]:
+    score = _refiner_validation_score(metrics, decision)
+    payload = {
+        "schema": REFINER_BEST_VALIDATION_SCHEMA,
+        "formal_checkpoint": False,
+        "publication_state": "validated_training_candidate_not_formal",
+        "model_version": "product_manifold_boundary_refiner_v4",
+        "completed_steps": int(completed_steps),
+        "score": list(score),
+        "metrics": dict(metrics),
+        "checkpoint_decision": dict(decision),
+        "motion_contract": motion_checkpoint_contract(cfg, "boundary_refiner"),
+        "training_event_db_contract": dict(
+            training_contract["event_db_contract"]
+        ),
+        "validation_event_db_contract": dict(
+            validation_contract["event_db_contract"]
+        ),
+        "training_config_sha256": _training_config_sha256(
+            cfg,
+            stage="refiner",
+        ),
+        "code_revision": _training_code_revision(),
+        "model_state_dict": {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        },
+    }
+    _atomic_torch_save(payload, path)
+    print(
+        json.dumps(
+            {
+                "stage": "refiner_best_validation_candidate",
+                "path": str(path),
+                "completed_steps": int(completed_steps),
+                "score": list(score),
+                "scientific_acceptance": bool(
+                    decision.get("scientific_acceptance", False)
+                ),
+                "formal_checkpoint": False,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return payload
+
+
+def _load_refiner_best_validation_candidate(
+    path: Path,
+    *,
+    cfg: MotionGenerationConfig,
+    training_contract: Mapping[str, Any],
+    validation_contract: Mapping[str, Any],
+) -> Dict[str, Any]:
+    payload = _trusted_torch_load(path, map_location="cpu")
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"invalid Refiner best-validation payload: {path}")
+    if payload.get("schema") != REFINER_BEST_VALIDATION_SCHEMA:
+        raise RuntimeError(f"Refiner best-validation schema mismatch: {path}")
+    if payload.get("model_version") != "product_manifold_boundary_refiner_v4":
+        raise RuntimeError(f"Refiner best-validation model mismatch: {path}")
+    if bool(payload.get("formal_checkpoint", True)):
+        raise RuntimeError(f"Refiner best-validation candidate is marked formal: {path}")
+    assert_motion_checkpoint_contract(
+        dict(payload),
+        cfg,
+        path,
+        "boundary_refiner",
+    )
+    assert_same_event_db_contract(
+        training_contract["event_db_contract"],
+        payload.get("training_event_db_contract"),
+        context="Refiner best candidate training Event-DB",
+    )
+    assert_same_event_db_contract(
+        validation_contract["event_db_contract"],
+        payload.get("validation_event_db_contract"),
+        context="Refiner best candidate validation Event-DB",
+    )
+    expected_config = _training_config_sha256(cfg, stage="refiner")
+    if payload.get("training_config_sha256") != expected_config:
+        raise RuntimeError(
+            f"Refiner best-validation training configuration mismatch: {path}"
+        )
+    snapshot_revision = str(payload.get("code_revision", "unknown"))
+    runtime_revision = _training_code_revision()
+    if (
+        snapshot_revision != "unknown"
+        and runtime_revision != "unknown"
+        and snapshot_revision != runtime_revision
+    ):
+        raise RuntimeError(
+            "Refiner best-validation code revision mismatch for "
+            f"{path}: candidate={snapshot_revision}, runtime={runtime_revision}"
+        )
+    return dict(payload)
 
 
 def _save_training_resume_snapshot(
@@ -4993,6 +5552,22 @@ def train_refiner(args: argparse.Namespace) -> int:
     snapshot_path, resume_path, snapshot_interval = (
         _resolve_training_snapshot_options(args, cfg, out)
     )
+    validation_interval = int(
+        cfg.training_validation_interval_steps
+        if getattr(args, "validation_every", None) is None
+        else args.validation_every
+    )
+    if validation_interval < 1:
+        raise ValueError("training validation interval must be at least one step")
+    suffix = out.suffix or ".pt"
+    best_validation_path = out.with_name(
+        f"{out.stem}.best_validation{suffix}"
+    )
+    if resume_path is None and best_validation_path.exists():
+        raise RuntimeError(
+            f"Refiner best-validation candidate already exists: "
+            f"{best_validation_path}. Archive it before a fresh run."
+        )
     start_step = 0
     resumed_elapsed_seconds = 0.0
     resume_info: Dict[str, Any] = {
@@ -5017,6 +5592,17 @@ def train_refiner(args: argparse.Namespace) -> int:
                 device=device,
             )
         )
+    best_validation: Optional[Dict[str, Any]] = None
+    best_score: Optional[Tuple[float, ...]] = None
+    if resume_path is not None and best_validation_path.exists():
+        best_validation = _load_refiner_best_validation_candidate(
+            best_validation_path,
+            cfg=cfg,
+            training_contract=database_contract,
+            validation_contract=validation_contract,
+        )
+        best_score = tuple(float(value) for value in best_validation["score"])
+    validation_history: List[Dict[str, Any]] = []
     bs = min(cfg.batch_size, max(2, len(paths)))
     motion_pool = PreloadedMotionWindowPool.preload(
         paths,
@@ -5161,6 +5747,60 @@ def train_refiner(args: argparse.Namespace) -> int:
                 training_contract=database_contract,
                 validation_contract=validation_contract,
             )
+        if (
+            completed_steps % validation_interval == 0
+            or completed_steps == steps
+        ):
+            periodic_metrics = _evaluate_refiner_validation(
+                model,
+                validation_db,
+                db,
+                cfg,
+                device,
+            )
+            periodic_decision = _checkpoint_validation_decision(
+                periodic_metrics,
+                cfg,
+                stage="refiner",
+            )
+            periodic_score = _refiner_validation_score(
+                periodic_metrics,
+                periodic_decision,
+            )
+            improved = best_score is None or periodic_score > best_score
+            validation_history.append(
+                {
+                    "completed_steps": int(completed_steps),
+                    "score": list(periodic_score),
+                    "scientific_acceptance": bool(
+                        periodic_decision.get("scientific_acceptance", False)
+                    ),
+                    "reasons": list(periodic_decision.get("reasons", [])),
+                    "selected_as_best": bool(improved),
+                }
+            )
+            print(
+                json.dumps(
+                    {
+                        "stage": "refiner_periodic_validation",
+                        **validation_history[-1],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            if improved:
+                best_validation = _save_refiner_best_validation_candidate(
+                    best_validation_path,
+                    model=model,
+                    completed_steps=completed_steps,
+                    metrics=periodic_metrics,
+                    decision=periodic_decision,
+                    cfg=cfg,
+                    training_contract=database_contract,
+                    validation_contract=validation_contract,
+                )
+                best_score = periodic_score
         if step == 0 or (step + 1) % 200 == 0 or step == steps - 1:
             _emit_training_progress(
                 "[Boundary Refiner]",
@@ -5173,23 +5813,34 @@ def train_refiner(args: argparse.Namespace) -> int:
                 repair=loss_terms["repair_margin"].item(),
                 preserve=loss_terms["clean_preservation"].item(),
                 temporal=loss_terms["temporal_supervision"].item(),
+                endpoint=loss_terms["endpoint_continuity"].item(),
+                seam_velocity=loss_terms["seam_velocity"].item(),
+                seam_acceleration=loss_terms["seam_acceleration"].item(),
+                seam_jerk=loss_terms["seam_jerk"].item(),
                 identity=identity_terms["reconstruction"].item(),
                 identity_contact=identity_terms["contact"].item(),
             )
     if risk_executor is not None:
         risk_executor.shutdown(wait=True)
-    validation_report["metrics"] = _evaluate_refiner_validation(
-        model, validation_db, db, cfg, device
-    )
-    decision = _checkpoint_validation_decision(
-        validation_report["metrics"],
-        cfg,
-        stage="refiner",
-    )
+    if best_validation is None:
+        raise RuntimeError("Refiner training produced no validation candidate")
+    model.load_state_dict(best_validation["model_state_dict"], strict=True)
+    validation_report["metrics"] = best_validation["metrics"]
+    decision = dict(best_validation["checkpoint_decision"])
     validation_report["checkpoint_decision"] = decision
+    validation_report["selection"] = {
+        "schema": REFINER_BEST_VALIDATION_SCHEMA,
+        "best_candidate": str(best_validation_path),
+        "selected_completed_steps": int(
+            best_validation["completed_steps"]
+        ),
+        "score": list(best_validation["score"]),
+        "validation_interval_steps": int(validation_interval),
+        "history": validation_history,
+    }
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": "product_manifold_boundary_refiner_v3",
+        "version": "product_manifold_boundary_refiner_v4",
         "output_mode": "contact_logits_soft_scaled_applied_root_joint_tangent",
         "output_dim": PRODUCT_STATE_DIM,
         "joint_mask_conditioned": True,
@@ -5200,7 +5851,7 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
         },
         "training_objective": {
-            "schema": "paired_clean_identity_relative_repair_v2",
+            "schema": "endpoint_fk_temporal_relative_repair_v3",
             "corruption_support": "synthetic_transition_seam",
             "minimum_relative_geometry_gain": float(
                 cfg.checkpoint_validation_min_geometry_repair_gain
@@ -5214,6 +5865,17 @@ def train_refiner(args: argparse.Namespace) -> int:
             "temporal_supervision_weight": float(
                 cfg.product_refiner_temporal_supervision_weight
             ),
+            "endpoint_continuity_weight": float(
+                cfg.product_refiner_endpoint_continuity_weight
+            ),
+            "seam_fk_temporal_weights": {
+                "velocity": float(cfg.product_refiner_seam_velocity_weight),
+                "acceleration": float(
+                    cfg.product_refiner_seam_acceleration_weight
+                ),
+                "jerk": float(cfg.product_refiner_seam_jerk_weight),
+            },
+            "unobservable_clean_interior_exact_reconstruction": False,
             "tangent_mask_semantics": (
                 "soft_scale_then_cap_applied_tangent_v1"
             ),
@@ -5234,6 +5896,13 @@ def train_refiner(args: argparse.Namespace) -> int:
             "schema": TRAINING_RESUME_SNAPSHOT_SCHEMA,
             "interval_steps": int(snapshot_interval),
             "resume_only": True,
+        },
+        "best_validation_candidate": {
+            "path": str(best_validation_path),
+            "selected_completed_steps": int(
+                best_validation["completed_steps"]
+            ),
+            "formal_checkpoint": False,
         },
         "validation": validation_report,
     }
@@ -6517,7 +7186,7 @@ def _cached_inference_model(
     if cached is None:
         checkpoint = _trusted_torch_load(path, map_location=cfg.device)
         if role == "boundary_refiner":
-            expected_version = "product_manifold_boundary_refiner_v3"
+            expected_version = "product_manifold_boundary_refiner_v4"
             if str(checkpoint.get("version", "")) != expected_version:
                 raise RuntimeError(
                     "Formal generation rejects a non-product refiner checkpoint"
@@ -8194,6 +8863,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Resume the exact Refiner optimizer/RNG state from this snapshot",
     )
     r.add_argument("--snapshot_every", type=int, default=None)
+    r.add_argument(
+        "--validation_every",
+        type=int,
+        default=None,
+        help="Run deterministic source-disjoint validation every N steps",
+    )
     r.set_defaults(func=train_refiner)
 
     d = sub.add_parser("train-diffusion", help="Motion Generation conditional residual diffusion training")

@@ -378,6 +378,10 @@ class MotionTrainingContractTests(unittest.TestCase):
                 "penetration",
                 "acceleration",
                 "jerk",
+                "endpoint_continuity",
+                "seam_velocity",
+                "seam_acceleration",
+                "seam_jerk",
             },
         )
 
@@ -394,13 +398,14 @@ class MotionTrainingContractTests(unittest.TestCase):
         )
         summary = _summarize_validation_physical_metrics(accumulator)
         self.assertEqual(summary["num_windows"], 1)
-        self.assertEqual(summary["schema"], "motion_checkpoint_stage_validation_v2")
+        self.assertEqual(summary["schema"], "motion_checkpoint_stage_validation_v3")
         self.assertIn("fk_position_error_m_p95", summary)
         self.assertIn("foot_skate_mps_p95", summary["worst_window"])
         self.assertIn("joint_jerk_mps3_p95", summary["worst_window"])
         self.assertIn("joint_rotation_step_rad_p95", summary["worst_window"])
         self.assertIn("root_horizontal_net_displacement_m", summary["worst_window"])
         self.assertEqual(summary["stage_repair"]["pass_rate"], 1.0)
+        self.assertEqual(summary["temporal_repair"]["pass_rate"], 1.0)
         self.assertEqual(
             summary["stage_repair"]["geometry_repair_gain"]["observed"][
                 "mean"
@@ -635,6 +640,7 @@ class MotionTrainingContractTests(unittest.TestCase):
                 "fk_position_error_m_p95": 0.01,
                 "fk_position_error_m_max": 0.02,
                 "stage_repair": {"pass_rate": 1.0},
+                "temporal_repair": {"pass_rate": 1.0},
                 "clean_reference_fidelity": {"pass_rate": 1.0},
                 "clean_physical_non_regression": {"pass_rate": 0.0},
                 "clean_input_identity": {"pass_rate": 1.0},
@@ -656,6 +662,16 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertFalse(rejected["publish_allowed"])
 
         metrics["physical_quality"]["stage_repair"]["pass_rate"] = 1.0
+        metrics["physical_quality"]["temporal_repair"]["pass_rate"] = 0.0
+        rejected_temporal = _checkpoint_validation_decision(
+            metrics, cfg, stage="refiner"
+        )
+        self.assertIn(
+            "temporal_repair_rate_too_low",
+            rejected_temporal["reasons"],
+        )
+
+        metrics["physical_quality"]["temporal_repair"]["pass_rate"] = 1.0
         metrics["physical_quality"]["clean_input_identity"]["pass_rate"] = 0.0
         rejected_identity = _checkpoint_validation_decision(
             metrics, cfg, stage="refiner"

@@ -47,7 +47,7 @@ def test_refiner_window_batching_matches_single_window_execution():
         checkpoint_path = Path(td) / "refiner.pt"
         torch.save(
             {
-                "version": "product_manifold_boundary_refiner_v3",
+                "version": "product_manifold_boundary_refiner_v4",
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
                     cfg,
@@ -81,6 +81,7 @@ def test_refiner_window_batching_matches_single_window_execution():
     [
         "product_manifold_boundary_refiner_v1",
         "product_manifold_boundary_refiner_v2",
+        "product_manifold_boundary_refiner_v3",
     ],
 )
 def test_formal_refiner_rejects_legacy_checkpoint(legacy_version):

@@ -52,6 +52,94 @@ def test_world_physics_loss_is_zero_at_clean_target():
     assert all(value.item() == pytest.approx(0.0, abs=1.0e-8) for value in terms.values())
 
 
+def test_seam_world_temporal_losses_are_local_and_differentiable():
+    clean = _identity_batch(frames=16)
+    prediction = clean.clone()
+    prediction[:, 5, 4] += 0.08
+    prediction.requires_grad_(True)
+    seam = models.torch.zeros((1, 16, 1), dtype=prediction.dtype)
+    seam[:, 5:11] = 1.0
+    cfg = models.MotionGenerationConfig(device="cpu")
+
+    total, terms = models._world_space_physics_losses(
+        prediction,
+        clean,
+        cfg,
+        seam_mask=seam,
+    )
+    total.backward()
+
+    assert terms["endpoint_continuity"].item() > 0.0
+    assert terms["seam_velocity"].item() > 0.0
+    assert terms["seam_acceleration"].item() > 0.0
+    assert terms["seam_jerk"].item() > 0.0
+    assert prediction.grad is not None
+    assert models.torch.isfinite(prediction.grad).all()
+
+
+def test_refiner_relative_target_does_not_require_exact_clean_interior():
+    clean = _identity_batch(frames=16)
+    degraded = clean.clone()
+    degraded[:, 5:11, 4] += 0.05
+    prediction = clean.clone()
+    prediction[:, 5:11, 4] += 0.045
+    seam = models.torch.zeros((1, 16, 1), dtype=clean.dtype)
+    seam[:, 5:11] = 1.0
+    joint_mask = models.torch.ones((1, 16, 24), dtype=clean.dtype)
+    root_mask = models.torch.ones((1, 16, 1), dtype=clean.dtype)
+    contact_mask = models.torch.zeros((1, 16, 4), dtype=clean.dtype)
+    cfg = models.MotionGenerationConfig(
+        device="cpu",
+        product_refiner_training_target_repair_gain=0.10,
+    )
+
+    _, terms = models._product_motion_losses(
+        prediction,
+        clean,
+        degraded,
+        joint_mask,
+        root_mask,
+        contact_mask,
+        cfg,
+        seam_mask=seam,
+    )
+
+    assert terms["active_reconstruction"].item() > 0.0
+    assert terms["repair_margin"].item() == pytest.approx(0.0, abs=1.0e-7)
+
+
+def test_temporal_repair_gate_accepts_improvement_and_rejects_noop():
+    clean = _identity_batch(frames=24)[0].numpy()
+    degraded = clean.copy()
+    degraded[7:17, 4] += np.sin(
+        np.linspace(0.0, np.pi, 10, dtype=np.float32)
+    ) * 0.08
+    prediction = clean + 0.5 * (degraded - clean)
+    seam = np.zeros((24, 1), dtype=np.float32)
+    seam[7:17] = 1.0
+    cfg = models.MotionGenerationConfig(device="cpu")
+
+    repaired = models._temporal_repair_gate_np(
+        prediction,
+        degraded,
+        clean,
+        seam,
+        cfg,
+    )
+    noop = models._temporal_repair_gate_np(
+        degraded,
+        degraded,
+        clean,
+        seam,
+        cfg,
+    )
+
+    assert repaired["accepted"] is True
+    assert repaired["detail"]["jerk_non_regression"] is True
+    assert noop["accepted"] is False
+    assert "no_meaningful_temporal_repair_gain" in noop["reasons"]
+
+
 def test_fk_reuses_offsets_without_per_joint_device_synchronization():
     motion = _identity_batch()
     models._FK_OFFSETS_TORCH_CACHE.clear()

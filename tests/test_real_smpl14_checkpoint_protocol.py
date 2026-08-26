@@ -82,6 +82,7 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
             clean,
             cfg,
             degraded=degraded,
+            seam_mask=seam,
         )
         _record_validation_physical_prediction(
             no_repair,
@@ -89,6 +90,7 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
             clean,
             cfg,
             degraded=degraded,
+            seam_mask=seam,
         )
         reconstructed = product_exp_np(
             degraded,
@@ -100,6 +102,7 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
             clean,
             cfg,
             degraded=degraded,
+            seam_mask=seam,
         )
         inactive = seam[:, 0] == 0.0
         outside_seam_changes.append(
@@ -113,12 +116,15 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
     )
 
     assert ideal_summary["stage_repair"]["pass_rate"] == 1.0
+    assert ideal_summary["temporal_repair"]["pass_rate"] == 1.0
     assert ideal_summary["clean_reference_fidelity"]["pass_rate"] == 1.0
     assert (
         ideal_summary["clean_physical_non_regression"]["pass_rate"] == 1.0
     )
     assert no_repair_summary["stage_repair"]["pass_rate"] == 0.0
+    assert no_repair_summary["temporal_repair"]["pass_rate"] == 0.0
     assert exact_product_summary["stage_repair"]["pass_rate"] == 1.0
+    assert exact_product_summary["temporal_repair"]["pass_rate"] == 1.0
     assert (
         exact_product_summary["clean_reference_fidelity"]["pass_rate"]
         == 1.0
