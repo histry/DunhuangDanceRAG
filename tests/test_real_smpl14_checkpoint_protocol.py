@@ -18,6 +18,7 @@ from training.motion_models import (
     _summarize_validation_physical_metrics,
     degrade_for_refiner,
 )
+from training import motion_models as models
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -161,3 +162,30 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
     )
     assert accepted["scientific_acceptance"] is True
     assert accepted["publish_allowed"] is True
+
+
+def test_real_smpl14_zero_refiner_preserves_authentic_clean_motion(tmp_path):
+    if models.torch is None:
+        pytest.skip("PyTorch unavailable")
+    cfg = MotionGenerationConfig(device="cpu")
+    accumulator = _new_validation_physical_accumulator()
+    for source in _real_smpl14_files():
+        clean = _central_real_window(source, tmp_path / source.name, 120)
+        # Match load_motion_window(): the adapter's provisional contacts are
+        # re-derived under the training configuration before the model sees it.
+        clean, _ = models.enforce_edge151_contract_np(
+            clean, cfg, derive_contact=True, project_rot=True,
+        )
+        tensor = models.torch.from_numpy(clean[None])
+        prediction = models._decode_product_refiner_output(
+            tensor, tensor.new_zeros((1, len(clean), 79)),
+            tensor.new_ones((1, len(clean), 24)),
+            tensor.new_ones((1, len(clean), 1)),
+            tensor.new_ones((1, len(clean), 1)), cfg,
+        )
+        models._record_validation_clean_identity_prediction(
+            accumulator, prediction[0].numpy(), clean, cfg,
+        )
+    gates = accumulator["clean_identity_gates"]
+    assert len(gates) == 14
+    assert all(gate["accepted"] for gate in gates), [gate["reasons"] for gate in gates]

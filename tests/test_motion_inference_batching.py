@@ -47,7 +47,7 @@ def test_refiner_window_batching_matches_single_window_execution():
         checkpoint_path = Path(td) / "refiner.pt"
         torch.save(
             {
-                "version": "product_manifold_boundary_refiner_v4",
+                "version": "product_manifold_boundary_refiner_v5",
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
                     cfg,
@@ -76,12 +76,30 @@ def test_refiner_window_batching_matches_single_window_execution():
     assert len(models._INFERENCE_MODEL_CACHE) == 1
 
 
+def test_refiner_cache_rejects_changed_decoder_configuration(tmp_path):
+    cfg = _config(1)
+    model = models.ProductManifoldTemporalRefiner(151, 32)
+    path = tmp_path / "v5.pt"
+    models.torch.save({
+        "version": models.REFINER_MODEL_VERSION,
+        "state_dict": model.state_dict(),
+        "motion_contract": models.motion_checkpoint_contract(cfg, "boundary_refiner"),
+        "config": {"product_refiner_residual_smoothing_passes": 2, "product_refiner_residual_taper_frames": 3},
+    }, path)
+    models._INFERENCE_MODEL_CACHE.clear()
+    models._cached_inference_model("boundary_refiner", path, cfg)
+    cfg.product_refiner_residual_smoothing_passes = 0
+    with pytest.raises(RuntimeError, match="decoder configuration mismatch"):
+        models._cached_inference_model("boundary_refiner", path, cfg)
+
+
 @pytest.mark.parametrize(
     "legacy_version",
     [
         "product_manifold_boundary_refiner_v1",
         "product_manifold_boundary_refiner_v2",
         "product_manifold_boundary_refiner_v3",
+        "product_manifold_boundary_refiner_v4",
     ],
 )
 def test_formal_refiner_rejects_legacy_checkpoint(legacy_version):

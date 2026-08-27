@@ -154,6 +154,52 @@ def test_refiner_best_score_prioritizes_all_gates_over_lower_error():
     assert accepted_score > rejected_score
 
 
+def test_refiner_pilot_pauses_without_publishing_and_keeps_full_resume_target(tmp_path):
+    train = _write_training_db(tmp_path, "pilot_train")
+    val = _write_training_db(tmp_path, "pilot_val")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"device": "cpu", "window_len": 16, "batch_size": 2}), encoding="utf-8")
+    out = tmp_path / "pilot.pt"
+    args = Namespace(
+        config=str(config), db=str(train), val_db=str(val), out=str(out),
+        steps=3, stop_after_steps=1, snapshot_every=2, validation_every=2,
+        train_probe_windows=0,
+    )
+    with mock.patch.object(models, "_evaluate_refiner_validation", return_value={}), mock.patch.object(
+        models, "_checkpoint_validation_decision",
+        return_value={"scientific_acceptance": True, "publish_allowed": True, "reasons": []},
+    ):
+        assert models.train_refiner(args) == 0
+    assert not out.exists(), "even an accepted pilot must not publish a formal model"
+    snapshot = models._trusted_torch_load(tmp_path / "pilot.training_snapshot.pt", map_location="cpu")
+    assert snapshot["completed_steps"] == 1
+    assert snapshot["target_steps"] == 3
+    assert snapshot["model_version"] == models.REFINER_MODEL_VERSION
+    assert (tmp_path / "pilot.best_validation.pt").is_file()
+    report = json.loads((tmp_path / "pilot.validation_step_000001.json").read_text())
+    assert report["training_probe"] is None
+
+
+def test_train_fit_probe_cannot_override_failed_source_disjoint_validation(tmp_path):
+    train = _write_training_db(tmp_path, "probe_train")
+    val = _write_training_db(tmp_path, "probe_val")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"device": "cpu", "window_len": 16, "batch_size": 2}), encoding="utf-8")
+    out = tmp_path / "refiner.pt"
+    args = Namespace(config=str(config), db=str(train), val_db=str(val), out=str(out), steps=1, train_probe_windows=2)
+    rejected = {"scientific_acceptance": False, "publish_allowed": False, "reasons": ["stage_repair_rate_too_low"]}
+    accepted = {"scientific_acceptance": True, "publish_allowed": True, "reasons": []}
+    with mock.patch.object(models, "_evaluate_refiner_validation", return_value={}), mock.patch.object(
+        models, "_checkpoint_validation_decision", side_effect=[rejected, accepted]
+    ):
+        assert models.train_refiner(args) == 2
+    assert not out.exists()
+    report = json.loads((tmp_path / "refiner.validation_step_000001.json").read_text())
+    assert report["checkpoint_decision"]["scientific_acceptance"] is False
+    assert report["training_probe"]["decision"]["scientific_acceptance"] is True
+    assert report["training_probe"]["used_for_checkpoint_selection"] is False
+
+
 def test_refiner_training_publishes_earlier_best_validation_candidate(
     tmp_path,
 ):
@@ -215,6 +261,7 @@ def test_refiner_training_publishes_earlier_best_validation_candidate(
         resume_snapshot=None,
         snapshot_every=1,
         validation_every=1,
+        train_probe_windows=0,
     )
 
     with mock.patch.object(

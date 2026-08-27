@@ -382,6 +382,7 @@ class MotionTrainingContractTests(unittest.TestCase):
                 "seam_velocity",
                 "seam_acceleration",
                 "seam_jerk",
+                "relative_temporal",
             },
         )
 
@@ -511,8 +512,7 @@ class MotionTrainingContractTests(unittest.TestCase):
         )
         self.assertGreater(unchanged["repair_margin"].item(), 0.0)
         self.assertAlmostEqual(
-            unchanged["repair_margin"].item()
-            / unchanged["active_reconstruction"].item(),
+            unchanged["repair_margin"].item(),
             cfg.product_refiner_training_target_repair_gain,
             places=5,
         )
