@@ -78,33 +78,34 @@ def load_cohort(directory, db, cfg, db_path, val_path, expected_windows):
                                 "fixed_batch_sha256": report["fixed_batch_sha256"]}
 
 
+def allowed_seam_starts(cfg, width):
+    """The formal generator's legal center/clamping rule, shared by probes."""
+    frames = int(cfg.window_len)
+    pairs = set()
+    for center in range(max(2, frames // 5), max(3, 4 * frames // 5) + 1):
+        a = max(1, center - width // 2)
+        b = min(frames - 1, a + width)
+        a = max(1, b - width)
+        if b - a == width:
+            pairs.add(a)
+    if len(pairs) < 6:
+        raise ValueError("too few legal training seam positions for paired probes")
+    return np.asarray(sorted(pairs), dtype=int)
+
+
 def make_recipes(cfg, count, seed, severity=.06):
     """Independent streams; changing mode cannot change geometry or random draws."""
     frames = int(cfg.window_len)
     low = max(4, int(round(cfg.transition_train_min_seconds * cfg.fps)))
     high = max(low, min(int(round(cfg.transition_train_max_seconds * cfg.fps)), frames // 3))
     widths = np.linspace(low, high, 4, dtype=int)
-    def allowed_starts(width):
-        # Match the existing training generator's center/clamping rule, not
-        # arbitrary window-edge seams with less context than training sees.
-        pairs = set()
-        for center in range(max(2, frames // 5), max(3, 4 * frames // 5) + 1):
-            a = max(1, center - width // 2)
-            b = min(frames - 1, a + width)
-            a = max(1, b - width)
-            if b - a == width:
-                pairs.add(a)
-        if len(pairs) < 6:
-            raise ValueError("too few legal training seam positions for paired probes")
-        return np.asarray(sorted(pairs), dtype=int)
-
     result = []
     for window in range(count):
         seen = set()
         training = []
         for recipe_id, width in enumerate(widths):
             seed_value = private_seed(seed, window, recipe_id, "seam")
-            positions = np.random.default_rng(seed_value).permutation(allowed_starts(int(width)))
+            positions = np.random.default_rng(seed_value).permutation(allowed_seam_starts(cfg, int(width)))
             a = next(int(p) for p in positions if (int(p), int(p) + int(width)) not in seen)
             b = a + int(width)
             seen.add((a, b))
@@ -123,7 +124,7 @@ def make_recipes(cfg, count, seed, severity=.06):
         for recipe_id in (0, 3):
             row = training[recipe_id]
             seed_value = private_seed(seed, window, recipe_id, "probe_position")
-            positions = np.random.default_rng(seed_value).permutation(allowed_starts(row["b"] - row["a"]))
+            positions = np.random.default_rng(seed_value).permutation(allowed_seam_starts(cfg, row["b"] - row["a"]))
             a = next(int(p) for p in positions if (int(p), int(p) + row["b"] - row["a"]) not in seen)
             result.append({**row, "split": "probe_unseen_position", "a": a,
                            "b": a + row["b"] - row["a"], "seam_seed": seed_value})
@@ -133,28 +134,32 @@ def make_recipes(cfg, count, seed, severity=.06):
     return result
 
 
-def build_banks(clean, cond, windows, recipes, cfg, device):
+def prepare_bank(clean, cond, windows, rows, cfg, device, mode):
+    """One bank or one online batch, with identical formal preprocessing."""
+    bad, seams, provenance = [], [], []
+    for row in rows:
+        damaged, seam = m.degrade_for_refiner(
+            clean[row["window_index"]], cfg=cfg, mode=mode, recipe=row,
+            finalize_contract=not m._gpu_preprocessing_enabled(cfg, device)
+        )
+        bad.append(damaged)
+        seams.append(seam)
+        provenance.append({**windows[row["window_index"]],
+                           **{k: v for k, v in row.items() if k != "tangent"},
+                           "seam_core_frames": np.flatnonzero(seam[:, 0] >= .5).tolist()})
+    indices = [row["window_index"] for row in rows]
+    batch = m._prepare_refiner_batch(clean[indices], np.stack(bad), np.stack(seams), cond[indices], cfg, device)
+    return batch, provenance
+
+
+def build_banks(clean, cond, windows, recipes, cfg, device, *, modes=MODES, splits=SPLITS):
     banks = {}
-    for mode in MODES:
-        for split in SPLITS:
+    for mode in modes:
+        for split in splits:
             if mode == "bridge_only" and split == "probe_unseen_noise":
                 continue  # a deterministic duplicate is NOT an unseen probe
             rows = [row for row in recipes if row["split"] == split]
-            bad, seams, provenance = [], [], []
-            for row in rows:
-                x = clean[row["window_index"]]
-                damaged, seam = m.degrade_for_refiner(
-                    x, cfg=cfg, mode=mode, recipe=row,
-                    finalize_contract=not m._gpu_preprocessing_enabled(cfg, device)
-                )
-                bad.append(damaged)
-                seams.append(seam)
-                provenance.append({**windows[row["window_index"]],
-                                   **{k: v for k, v in row.items() if k != "tangent"},
-                                   "seam_core_frames": np.flatnonzero(seam[:, 0] >= .5).tolist()})
-            indices = [row["window_index"] for row in rows]
-            batch = m._prepare_refiner_batch(clean[indices], np.stack(bad), np.stack(seams), cond[indices], cfg, device)
-            banks[(mode, split)] = (batch, provenance)
+            banks[(mode, split)] = prepare_bank(clean, cond, windows, rows, cfg, device, mode)
             print(json.dumps({"stage": "factor_bank", "mode": mode, "split": split, "cases": len(rows)}), flush=True)
     return banks
 
