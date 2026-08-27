@@ -340,7 +340,11 @@ class MotionTrainingContractTests(unittest.TestCase):
         diffusion_source = inspect.getsource(motion_runtime.train_diffusion)
         for source in (refiner_source, diffusion_source):
             self.assertIn("PreloadedMotionWindowPool.preload", source)
-            self.assertEqual(source.count("_risk_masks_for_batch_np("), 1)
+        self.assertEqual(refiner_source.count("_prepare_refiner_batch("), 1)
+        shared = inspect.getsource(motion_runtime._prepare_refiner_batch)
+        self.assertEqual(shared.count("_risk_masks_for_batch_np("), 1)
+        self.assertEqual(shared.count("_risk_masks_for_batch_torch("), 1)
+        self.assertEqual(diffusion_source.count("_risk_masks_for_batch_np("), 1)
         self.assertNotIn("np.load", diffusion_source)
 
     def test_training_progress_is_unbuffered_and_reports_eta(self):

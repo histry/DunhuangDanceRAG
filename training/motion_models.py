@@ -88,10 +88,11 @@ from support.event_identity import (
     normalize_event_db_contract,
 )
 from motion_geometry.resampling import blend_edge151_geodesic_np
+from motion_geometry.physical import EXTREMITY_JOINTS, ContactStateThresholds
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v5"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v6"
 
 
 def now_tag() -> str:
@@ -485,6 +486,7 @@ class MotionGenerationConfig:
     refiner_train_steps: int = 8000
     training_snapshot_interval_steps: int = 200
     training_validation_interval_steps: int = 1000
+    training_gradient_diagnostic_interval_steps: int = 200
     batch_size: int = 64
     inference_window_batch_size: int = 16
     gpu_preprocessing: bool = True
@@ -677,6 +679,9 @@ class MotionGenerationConfig:
             "MOTION_TRAINING_VALIDATION_INTERVAL_STEPS": (
                 "training_validation_interval_steps",
                 int,
+            ),
+            "MOTION_TRAINING_GRADIENT_DIAGNOSTIC_INTERVAL_STEPS": (
+                "training_gradient_diagnostic_interval_steps", int,
             ),
             "MOTION_MIN_EVENT_FRAMES": ("min_event_frames", int),
             "MOTION_MAX_EVENT_FRAMES": ("max_event_frames", int),
@@ -3583,57 +3588,210 @@ def _product_refiner_clean_identity_loss(
     contact_mask,
     cfg: MotionGenerationConfig,
 ):
-    """Penalize any Refiner geometry edit on an authentic clean transition."""
+    """A dead-band constraint, not a second objective pulling every edit to zero.
 
-    identity_delta = product_log_torch(clean, prediction)
-    product_mask = torch.cat(
-        [
-            root_mask.expand(identity_delta.shape[:-1] + (3,)),
-            joint_mask[..., None]
-            .expand(joint_mask.shape + (3,))
-            .reshape(identity_delta.shape[:-1] + (NUM_JOINTS * 3,)),
-        ],
-        dim=-1,
-    ).clamp(0.0, 1.0)
-
-    def weighted(value, weight):
-        expanded = torch.broadcast_to(weight, value.shape)
-        return (value * expanded).sum() / expanded.sum().clamp_min(1.0)
-
-    reconstruction = weighted(identity_delta.abs(), product_mask)
-    contact_weight = 0.25 + 0.75 * contact_mask.clamp(0.0, 1.0)
-    contact = weighted(
-        (prediction[..., :4] - clean[..., :4]).abs(),
-        contact_weight,
-    )
-    # Independent of the retired exact-repair tangent objective: switching that
-    # objective off must not silently disable clean-input temporal protection.
+    Product/contact errors use the same unweighted per-window coordinates as
+    the clean-input audit. FK jerk uses its relative p95/max allowances. The
+    full clean audit (including feet/support/rotations) remains authoritative;
+    this differentiable surrogate does not replace or relax that gate.
+    """
+    geometry_cap = float(cfg.checkpoint_validation_max_clean_identity_product_log_l1)
+    contact_cap = float(cfg.checkpoint_validation_max_clean_identity_contact_l1)
+    temporal_weight = float(cfg.product_refiner_clean_identity_temporal_weight)
+    if not all(np.isfinite(v) and v > 0 for v in (geometry_cap, contact_cap)):
+        raise ValueError("clean identity tolerances must be finite and positive")
+    if not np.isfinite(temporal_weight) or temporal_weight < 0:
+        raise ValueError("clean temporal constraint weight must be finite and nonnegative")
+    geometry_per_window = product_log_torch(clean, prediction).abs().mean(dim=(1, 2))
+    contact_per_window = (prediction[..., :4] - clean[..., :4]).abs().mean(dim=(1, 2))
+    geometry_excess = torch.relu(geometry_per_window / geometry_cap - 1.0).mean()
+    contact_excess = torch.relu(contact_per_window / contact_cap - 1.0).mean()
     joints = fk_24_torch(torch.cat([prediction, clean], dim=0))
     predicted_joints, clean_joints = joints.split(prediction.shape[0], dim=0)
-    fk_temporal = reconstruction.new_zeros(())
-    for order, scale, weight in ((1, 1.0, 1.0), (2, 10.0, 0.5), (3, 1000.0, 0.25)):
-        if prediction.shape[1] <= order:
-            continue
-        delta = (
-            torch.diff(predicted_joints, n=order, dim=1)
-            - torch.diff(clean_joints, n=order, dim=1)
-        ) * (float(cfg.fps)**order / scale)
-        norms = torch.linalg.vector_norm(delta, dim=-1).flatten(1)
-        # Include the worst edited joint/frame; a full-window mean alone can
-        # hide a short, high-jerk artifact that fails the identity audit.
-        fk_temporal = fk_temporal + weight * (
-            0.5 * norms.mean(dim=1) + 0.5 * norms.amax(dim=1)
-        ).mean()
+    fk_temporal, jerk_terms = _clean_jerk_tolerance_loss_torch(
+        predicted_joints, clean_joints, cfg
+    )
+    support_excess = _clean_support_tolerance_loss_torch(
+        predicted_joints, clean_joints, clean[..., :4], cfg
+    )
     total = (
-        reconstruction / max(float(cfg.checkpoint_validation_max_clean_identity_product_log_l1), 1e-6)
-        + float(cfg.product_refiner_clean_identity_temporal_weight) * fk_temporal
-        + 0.25 * contact
+        geometry_excess
+        + temporal_weight * fk_temporal
+        + 0.25 * contact_excess
+        + support_excess
     )
     return total, {
-        "reconstruction": reconstruction,
+        "reconstruction": geometry_per_window.mean(),
         "temporal": fk_temporal,
         "fk_temporal": fk_temporal,
-        "contact": contact,
+        "contact": contact_per_window.mean(),
+        "geometry_excess": geometry_excess,
+        "contact_excess": contact_excess,
+        "support_excess": support_excess,
+        **jerk_terms,
+    }
+
+
+def _masked_speed_stats_torch(speed, mask):
+    """Per-window masked p95/max with finite gradients for empty support."""
+    values, active = speed.flatten(1), mask.flatten(1)
+    count = active.sum(1)
+    ordered = torch.where(active, values, torch.full_like(values, float("inf"))).sort(dim=1).values
+    # Clear only padding, never nonfinite observations on real support.
+    positions = torch.arange(ordered.shape[1], device=ordered.device)[None]
+    ordered = torch.where(positions < count[:, None], ordered, torch.zeros_like(ordered))
+    rank = (count - 1).clamp_min(0).to(values.dtype) * 0.95
+    low, high = rank.floor().long(), rank.ceil().long()
+    first = ordered.gather(1, low[:, None])[:, 0]
+    second = ordered.gather(1, high[:, None])[:, 0]
+    p95 = first + (rank - low.to(rank.dtype)) * (second - first)
+    maximum = ordered.gather(1, (count - 1).clamp_min(0)[:, None])[:, 0]
+    return p95, maximum
+
+
+def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_contacts, cfg):
+    """Bound clean planted-foot speed without demanding zero foot motion.
+
+    Freeze support from the authentic input, so making a supported foot faster
+    or changing contact logits cannot remove its penalty. The final full audit
+    still reclassifies actual support independently.
+    """
+    if predicted_joints.shape[1] < 2:
+        return predicted_joints.sum() * 0.0
+    clean_feet = clean_joints.detach()[..., list(DEFAULT_FOOT_JOINTS), :]
+    pred_feet = predicted_joints[..., list(DEFAULT_FOOT_JOINTS), :]
+
+    def speed(feet):
+        delta = torch.diff(feet[..., (0, 2)], dim=1) * float(cfg.fps)
+        return F.pad(torch.linalg.vector_norm(delta, dim=-1), (0, 0, 1, 0))
+
+    baseline, candidate = speed(clean_feet), speed(pred_feet)
+    floor = torch.quantile(clean_feet[..., 1].flatten(1), 0.05, dim=1)
+    height = clean_feet[..., 1] <= floor[:, None, None] + 0.055
+    median_frames = max(1, int(round(float(cfg.fps) / 12.0)))
+    if median_frames % 2 == 0:
+        median_frames += 1
+    height = _median_bool_filter_torch(height, median_frames)
+    static = (height | (clean_contacts.detach() > 0.5)) & (
+        baseline <= ContactStateThresholds.from_environment().static_support_speed_mps
+    )
+    before = _masked_speed_stats_torch(baseline, static)
+    after = _masked_speed_stats_torch(candidate, static)
+    policy = StageAcceptancePolicy.from_environment()
+    penalties = []
+    for ref, pred, ratio, margin in zip(
+        before, after, (policy.skate_p95_ratio, policy.skate_max_ratio),
+        (policy.skate_p95_margin_mps, policy.skate_max_margin_mps),
+    ):
+        if not np.isfinite(ratio) or ratio < 1 or not np.isfinite(margin) or margin < 0:
+            raise ValueError("invalid clean foot-speed tolerance policy")
+        allowed = torch.maximum(ref * ratio, ref + margin)
+        penalties.append((torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4)).mean())
+    return 0.5 * sum(penalties)
+
+
+def _clean_jerk_statistics_torch(jerk_norm, fps):
+    """The five jerk statistics used by the clean audit, batched on device."""
+    def p95(values):
+        return torch.quantile(values.flatten(1), 0.95, dim=1)
+
+    def window_p95(values):
+        length = values.shape[1]
+        window = min(length, max(1, int(round(float(fps)))))
+        hop = max(1, window // 2)
+        starts = list(range(0, max(1, length - window + 1), hop))
+        if starts[-1] != length - window:
+            starts.append(length - window)
+        windows = torch.stack([values[:, i:i + window].flatten(1) for i in starts], dim=1)
+        return torch.quantile(windows, 0.95, dim=2).amax(dim=1)
+
+    extremities = jerk_norm[..., list(EXTREMITY_JOINTS)]
+    return {
+        "p95": p95(jerk_norm), "max": jerk_norm.flatten(1).amax(1),
+        "window_p95": window_p95(jerk_norm),
+        "extremity_p95": p95(extremities),
+        "extremity_window_p95": window_p95(extremities),
+    }
+
+
+def _clean_jerk_tolerance_loss_torch(predicted_joints, clean_joints, cfg):
+    """Penalize high-frequency excess using the unchanged clean-audit budget.
+
+    Promote FK coordinates before the third difference for numerical stability.
+    Quantiles/maxima are per window: a quiet sample cannot be hidden by
+    a vigorous sample elsewhere in the batch. No gradient flows into targets.
+    """
+    zero = predicted_joints.sum() * 0.0
+    if predicted_joints.shape[1] < 4:
+        return zero, {"jerk_p95_excess": zero, "jerk_max_excess": zero}
+    policy = StageAcceptancePolicy.from_environment()
+    predicted = torch.linalg.vector_norm(
+        torch.diff(predicted_joints.to(torch.float64), n=3, dim=1) * cfg.fps**3,
+        dim=-1,
+    )
+    target = torch.linalg.vector_norm(
+        torch.diff(clean_joints.detach().to(torch.float64), n=3, dim=1) * cfg.fps**3,
+        dim=-1,
+    )
+    predicted_stats = _clean_jerk_statistics_torch(predicted, cfg.fps)
+    target_stats = _clean_jerk_statistics_torch(target, cfg.fps)
+    terms = {}
+    for label in predicted_stats:
+        ratio = policy.jerk_max_ratio if label == "max" else policy.jerk_p95_ratio
+        margin = policy.jerk_max_margin_mps3 if label == "max" else policy.jerk_p95_margin_mps3
+        if not np.isfinite(ratio) or ratio < 1 or not np.isfinite(margin) or margin < 0:
+            raise ValueError("invalid clean jerk tolerance policy")
+        pred_stat, ref_stat = predicted_stats[label], target_stats[label]
+        allowed = torch.maximum(ref_stat * ratio, ref_stat + margin)
+        # Normalize only the excess. Inside the allowed region both the loss
+        # and its gradient are exactly zero; sparse spikes still hit max.
+        terms[f"jerk_{label}_excess"] = (
+            torch.relu(pred_stat - allowed) / (allowed - ref_stat).clamp_min(1.0)
+        ).mean().to(predicted_joints.dtype)
+    return sum(terms.values()) / len(terms), terms
+
+
+def _refiner_gradient_diagnostics(model, repair_loss, clean_loss, clean_weight):
+    """Measure gradients BEFORE clipping without mutating .grad or optimizer.
+
+    Cosine is null when either task has zero gradient; that is not a conflict.
+    The clean norm includes the actual training weight, so the ratio reflects
+    the update used by the optimizer rather than incomparable raw losses.
+    """
+    weight = float(clean_weight)
+    if not np.isfinite(weight) or weight < 0:
+        raise ValueError("clean loss weight must be finite and nonnegative")
+    params = [p for p in model.parameters() if p.requires_grad]
+    repair = torch.autograd.grad(repair_loss, params, retain_graph=True, allow_unused=True)
+    clean = torch.autograd.grad(clean_loss, params, retain_graph=True, allow_unused=True)
+    accumulator = repair_loss.new_zeros(3, dtype=torch.float64)
+    for g_repair, g_clean in zip(repair, clean):
+        if g_repair is not None:
+            accumulator[0] += g_repair.detach().double().square().sum()
+        if g_clean is not None:
+            accumulator[1] += g_clean.detach().double().square().sum()
+        if g_repair is not None and g_clean is not None:
+            accumulator[2] += (g_repair.detach().double() * g_clean.detach().double()).sum()
+    raw = accumulator.cpu().tolist()
+    if not all(np.isfinite(raw)):
+        raise RuntimeError("nonfinite Refiner task gradients")
+    repair_norm, clean_raw_norm = math.sqrt(raw[0]), math.sqrt(raw[1])
+    clean_norm, dot = weight * clean_raw_norm, weight * raw[2]
+    defined = repair_norm > 1e-12 and clean_norm > 1e-12
+    cosine = max(-1.0, min(1.0, dot / (repair_norm * clean_norm))) if defined else None
+    combined = math.sqrt(max(0.0, raw[0] + weight**2 * raw[1] + 2.0 * dot))
+    return {
+        "schema": "refiner_task_gradient_diagnostic_v1",
+        "before_gradient_clipping": True,
+        "repair_gradient_norm": repair_norm,
+        "clean_gradient_norm_unweighted": clean_raw_norm,
+        "clean_gradient_norm_weighted": clean_norm,
+        "clean_loss_weight": weight,
+        "clean_to_repair_norm_ratio": clean_norm / repair_norm if repair_norm > 1e-12 else None,
+        "gradient_cosine": cosine,
+        "conflicting": bool(cosine is not None and cosine < 0),
+        "combined_gradient_norm": combined,
+        "combined_to_sum_norm_ratio": combined / (repair_norm + clean_norm) if repair_norm + clean_norm > 1e-12 else None,
     }
 
 
@@ -5654,6 +5812,61 @@ def _resolve_training_snapshot_options(
     return snapshot_path, resume_path, interval
 
 
+def _prepare_refiner_batch(clean_np, bad_np, seam_np, cond_np, cfg, device, *, executor=None):
+    """One preprocessing path shared by random training and fixed-fit diagnosis."""
+    clean = torch.as_tensor(np.asarray(clean_np).copy(), dtype=torch.float32, device=device)
+    bad = torch.as_tensor(np.asarray(bad_np).copy(), dtype=torch.float32, device=device)
+    seam = torch.as_tensor(np.asarray(seam_np).copy(), dtype=torch.float32, device=device)
+    cond = torch.as_tensor(np.asarray(cond_np).copy(), dtype=torch.float32, device=device)
+    count = clean.shape[0]
+    if _gpu_preprocessing_enabled(cfg, device):
+        bad = _enforce_internal_batch_contract_torch(bad, cfg)
+        masks = _risk_masks_for_batch_torch(
+            torch.cat([bad, clean]), torch.cat([seam, seam]), cfg
+        )
+    else:
+        masks = tuple(torch.as_tensor(x, dtype=torch.float32, device=device) for x in
+                      _risk_masks_for_batch_np(
+                          np.concatenate([bad_np, clean_np]),
+                          np.concatenate([seam_np, seam_np]), cfg, executor=executor))
+    joint, root, contact = masks
+    return {
+        "clean": clean, "bad": bad, "seam": seam, "cond": cond,
+        "joint": joint[:count], "root": root[:count], "contact": contact[:count],
+        "clean_joint": joint[count:], "clean_root": root[count:], "clean_contact": contact[count:],
+    }
+
+
+def _refiner_batch_outputs(model, batch, cfg):
+    count = batch["clean"].shape[0]
+    outputs = model(
+        torch.cat([batch["bad"], batch["clean"]]),
+        torch.cat([batch["cond"], batch["cond"]]),
+        torch.cat([batch["seam"], batch["seam"]]),
+        torch.cat([batch["joint"], batch["clean_joint"]]),
+    )
+    pred = _decode_product_refiner_output(
+        batch["bad"], outputs[:count], batch["joint"], batch["root"], batch["contact"], cfg
+    )
+    identity = _decode_product_refiner_output(
+        batch["clean"], outputs[count:], batch["clean_joint"], batch["clean_root"], batch["clean_contact"], cfg
+    )
+    return pred, identity
+
+
+def _refiner_batch_objectives(model, batch, cfg):
+    pred, identity = _refiner_batch_outputs(model, batch, cfg)
+    repair, terms = _product_motion_losses(
+        pred, batch["clean"], batch["bad"], batch["joint"], batch["root"],
+        batch["contact"], cfg, seam_mask=batch["seam"],
+    )
+    protection, identity_terms = _product_refiner_clean_identity_loss(
+        identity, batch["clean"], batch["clean_joint"], batch["clean_root"],
+        batch["clean_contact"], cfg,
+    )
+    return repair, protection, terms, identity_terms
+
+
 def train_refiner(args: argparse.Namespace) -> int:
     if torch is None:
         raise RuntimeError("PyTorch is required for Motion Refiner training.")
@@ -5698,6 +5911,10 @@ def train_refiner(args: argparse.Namespace) -> int:
     )
     if validation_interval < 1:
         raise ValueError("training validation interval must be at least one step")
+    gradient_interval = int(cfg.training_gradient_diagnostic_interval_steps)
+    if gradient_interval < 1:
+        raise ValueError("gradient diagnostic interval must be at least one step")
+    gradient_log_path = out.with_name(f"{out.stem}.gradient_diagnostics.jsonl")
     suffix = out.suffix or ".pt"
     best_validation_path = out.with_name(
         f"{out.stem}.best_validation{suffix}"
@@ -5786,85 +6003,28 @@ def train_refiner(args: argparse.Namespace) -> int:
             bad_batch.append(bad)
             seam_batch.append(seam)
             cond_batch.append(desc_z[idx])
-        clean_np = np.stack(clean_batch)
-        bad_np = np.stack(bad_batch)
-        seam_np = np.stack(seam_batch)
-        clean_t = torch.from_numpy(clean_np).float().to(device)
-        bad_t = torch.from_numpy(bad_np).float().to(device)
-        seam_t = torch.from_numpy(seam_np).float().to(device)
-        cond_t = torch.from_numpy(np.stack(cond_batch)).float().to(device)
-        if gpu_preprocessing:
-            bad_t = _enforce_internal_batch_contract_torch(
-                bad_t,
-                cfg,
-            )
-            pair_motion = torch.cat([bad_t, clean_t], dim=0)
-            pair_seam = torch.cat([seam_t, seam_t], dim=0)
-            pair_joint, pair_root, pair_contact = _risk_masks_for_batch_torch(
-                pair_motion,
-                pair_seam,
-                cfg,
-            )
-            joint_t, clean_joint_t = pair_joint.split(bs, dim=0)
-            root_t, clean_root_t = pair_root.split(bs, dim=0)
-            contact_t, clean_contact_t = pair_contact.split(bs, dim=0)
-        else:
-            pair_np = np.concatenate([bad_np, clean_np], axis=0)
-            pair_seam_np = np.concatenate([seam_np, seam_np], axis=0)
-            pair_joint_np, pair_root_np, pair_contact_np = _risk_masks_for_batch_np(
-                pair_np,
-                pair_seam_np,
-                cfg,
-                executor=risk_executor,
-            )
-            joint_t = torch.from_numpy(pair_joint_np[:bs]).float().to(device)
-            clean_joint_t = torch.from_numpy(pair_joint_np[bs:]).float().to(device)
-            root_t = torch.from_numpy(pair_root_np[:bs]).float().to(device)
-            clean_root_t = torch.from_numpy(pair_root_np[bs:]).float().to(device)
-            contact_t = torch.from_numpy(pair_contact_np[:bs]).float().to(device)
-            clean_contact_t = torch.from_numpy(pair_contact_np[bs:]).float().to(device)
-            pair_motion = torch.cat([bad_t, clean_t], dim=0)
-            pair_seam = torch.cat([seam_t, seam_t], dim=0)
-        pair_output = model(
-            pair_motion,
-            torch.cat([cond_t, cond_t], dim=0),
-            pair_seam,
-            torch.cat([joint_t, clean_joint_t], dim=0),
+        batch = _prepare_refiner_batch(
+            np.stack(clean_batch), np.stack(bad_batch), np.stack(seam_batch),
+            np.stack(cond_batch), cfg, device, executor=risk_executor,
         )
-        output, clean_output = pair_output.split(bs, dim=0)
-        pred = _decode_product_refiner_output(
-            bad_t, output, joint_t, root_t, contact_t, cfg
-        )
-        clean_identity_pred = _decode_product_refiner_output(
-            clean_t,
-            clean_output,
-            clean_joint_t,
-            clean_root_t,
-            clean_contact_t,
-            cfg,
-        )
-        repair_loss, loss_terms = _product_motion_losses(
-            pred,
-            clean_t,
-            bad_t,
-            joint_t,
-            root_t,
-            contact_t,
-            cfg,
-            seam_mask=seam_t,
-        )
-        identity_loss, identity_terms = _product_refiner_clean_identity_loss(
-            clean_identity_pred,
-            clean_t,
-            clean_joint_t,
-            clean_root_t,
-            clean_contact_t,
-            cfg,
+        repair_loss, identity_loss, loss_terms, identity_terms = _refiner_batch_objectives(
+            model, batch, cfg
         )
         loss = repair_loss + float(
             cfg.product_refiner_clean_identity_weight
         ) * identity_loss
         rec = loss_terms["reconstruction"]
+        if step == start_step or (step + 1) % gradient_interval == 0:
+            gradient_report = {
+                "stage": "refiner_gradient_diagnostics", "completed_steps": step + 1,
+                **_refiner_gradient_diagnostics(
+                    model, repair_loss, identity_loss, cfg.product_refiner_clean_identity_weight
+                ),
+            }
+            gradient_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with gradient_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(gradient_report, allow_nan=False) + "\n")
+            print(json.dumps(gradient_report, allow_nan=False), flush=True)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -6034,7 +6194,12 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
         },
         "training_objective": {
-            "schema": "dimensionless_relative_repair_clean_fk_identity_v4",
+            "schema": "relative_repair_clean_tolerance_v6",
+            "clean_geometry_contact_constraint": "per_window_unweighted_dead_band",
+            "clean_jerk_constraint": "reference_relative_p95_max_same_audit_budget",
+            "clean_support_constraint": "frozen_clean_support_p95_max_speed_tolerance",
+            "clean_contact_state_thresholds": dataclasses.asdict(ContactStateThresholds.from_environment()),
+            "clean_jerk_policy": dataclasses.asdict(StageAcceptancePolicy.from_environment()),
             "repair_support": "unweighted_seam_core_same_as_validation",
             "geometry_repair_normalization": "per_window_degraded_error",
             "clean_identity_temporal_weight": float(cfg.product_refiner_clean_identity_temporal_weight),
@@ -6081,6 +6246,10 @@ def train_refiner(args: argparse.Namespace) -> int:
             "std": np.asarray(db["desc_std"], dtype=np.float32),
         },
         "training_resume": resume_info,
+        "gradient_diagnostics": {
+            "path": str(gradient_log_path), "interval_steps": gradient_interval,
+            "before_gradient_clipping": True,
+        },
         "training_snapshot": {
             "schema": TRAINING_RESUME_SNAPSHOT_SCHEMA,
             "interval_steps": int(snapshot_interval),

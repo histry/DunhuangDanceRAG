@@ -1,5 +1,9 @@
 # Refiner V5: objective alignment and staged training
 
+Historical protocol. V5 did not pass the supplied 1,000-step real-data pilot.
+The V5 launcher is retired; use [Refiner V6 diagnosis](refiner_v6_training.md).
+Do not resume V5 snapshots under the V6 objective.
+
 ## Why V4 was rejected
 
 The supplied server run at `4d33cf4` completed 8,000 updates but its best
