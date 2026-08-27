@@ -150,7 +150,7 @@ def test_diffusion_window_batching_preserves_seeded_result():
         checkpoint_path = Path(td) / "diffusion.pt"
         torch.save(
             {
-                "version": "reference_tangent_motion_diffusion_v2",
+                "version": models.DIFFUSION_MODEL_VERSION,
                 "diffusion_steps": 2,
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(
@@ -204,7 +204,7 @@ def test_cuda_diffusion_gpu_preprocessing_preserves_seeded_batching():
         checkpoint_path = Path(td) / "diffusion_cuda.pt"
         torch.save(
             {
-                "version": "reference_tangent_motion_diffusion_v2",
+                "version": models.DIFFUSION_MODEL_VERSION,
                 "diffusion_steps": 2,
                 "state_dict": model.state_dict(),
                 "motion_contract": models.motion_checkpoint_contract(

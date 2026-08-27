@@ -449,7 +449,7 @@ def test_cuda_formal_training_entrypoints_complete_one_step(tmp_path):
     refiner = models._trusted_torch_load(refiner_path, map_location="cpu")
     diffusion = models._trusted_torch_load(diffusion_path, map_location="cpu")
     assert refiner["version"] == models.REFINER_MODEL_VERSION
-    assert diffusion["version"] == "reference_tangent_motion_diffusion_v2"
+    assert diffusion["version"] == models.DIFFUSION_MODEL_VERSION
     assert refiner["validation"]["source_disjoint"]["overlap"] == []
     assert diffusion["validation"]["source_disjoint"]["overlap"] == []
     clean_identity = refiner["validation"]["metrics"]["physical_quality"][

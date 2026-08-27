@@ -145,11 +145,10 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
     )
     assert rejected["scientific_acceptance"] is False
     assert rejected["publish_allowed"] is False
-    assert "stage_repair_rate_too_low" in rejected["reasons"]
+    assert "observable_endpoint_rate_too_low" in rejected["reasons"]
 
-    # The strict multi-metric clean comparison is retained as a diagnostic,
-    # but product-manifold round trips must not be rejected after the bounded
-    # clean-reference fidelity gate and the real clean-input identity gate pass.
+    # An oracle clean round trip proves representation correctness, NOT that
+    # a model can repair actual cross-event boundaries without the hidden GT.
     exact_product_summary["clean_physical_non_regression"]["pass_rate"] = 0.0
     exact_product_summary["clean_input_identity"] = {"pass_rate": 1.0}
     accepted = _checkpoint_validation_decision(
@@ -160,8 +159,9 @@ def test_real_smpl14_clean_degradation_and_checkpoint_rejection(tmp_path):
         cfg,
         stage="refiner",
     )
-    assert accepted["scientific_acceptance"] is True
-    assert accepted["publish_allowed"] is True
+    assert accepted["scientific_acceptance"] is False
+    assert accepted["publish_allowed"] is False
+    assert "cross_event_validation_missing" in accepted["reasons"]
 
 
 def test_real_smpl14_zero_refiner_preserves_authentic_clean_motion(tmp_path):

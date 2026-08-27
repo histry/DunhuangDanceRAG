@@ -1,5 +1,9 @@
 # Refiner V6: tolerance constraints and fixed real-window diagnosis
 
+Historical protocol only. Its training entry point is retired; use
+[V7 observable full-bridge repair](refiner_v7_training.md) for new experiments.
+Existing V6 reports are preserved and are not comparable to V7 repair rates.
+
 V5's 1,000-step report at `d9b3c74` had 0/16 geometry and temporal validation
 passes, despite 16/16 clean-identity passes. Its 8 training probes also failed
 repair. That evidence established weak repair, not defective SMPL source data.

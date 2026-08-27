@@ -89,10 +89,15 @@ from support.event_identity import (
 )
 from motion_geometry.resampling import blend_edge151_geodesic_np
 from motion_geometry.physical import EXTREMITY_JOINTS, ContactStateThresholds
+from motion_geometry.boundary_observables import (
+    BOUNDARY_PROTOCOL, BOUNDARY_FEATURE_DIM, boundary_features_torch,
+    boundary_metrics_torch, observable_gate,
+)
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v6"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v7"
+DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v3"
 
 
 def now_tag() -> str:
@@ -437,11 +442,10 @@ class MotionGenerationConfig:
     product_refiner_seam_velocity_weight: float = 0.20
     product_refiner_seam_acceleration_weight: float = 0.25
     product_refiner_seam_jerk_weight: float = 0.30
-    # A full endpoint-only inbetween discards the unknown clean interior and
-    # makes source-disjoint reconstruction ill posed.  Retain half of the
-    # authentic local trajectory while injecting the same transition artifact
-    # seen by the boundary stage.
-    transition_bridge_mix: float = 0.50
+    # Used only by explicit historical corruption recipes. The formal
+    # full_bridge path always replaces the entire interior, matching inference;
+    # its repair objective does not require reconstructing a unique hidden clean.
+    transition_bridge_mix: float = 1.0  # explicit historical diagnostics only
     # Differentiable world-space supervision shared by Motion Refiner and Motion Generation.  The
     # acceleration/jerk residuals are normalized inside the loss, so these
     # weights are comparable to the product-manifold reconstruction term.
@@ -2375,7 +2379,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
             self.temporal_dilations
         )
         self.in_proj = nn.Conv1d(
-            motion_dim + cond_dim + 1 + NUM_JOINTS, hidden, 1
+            motion_dim + cond_dim + 1 + NUM_JOINTS + BOUNDARY_FEATURE_DIM, hidden, 1
         )
         self.net = nn.Sequential(
             nn.Conv1d(hidden, hidden, 5, padding=2, dilation=1),
@@ -2396,7 +2400,8 @@ class ProductManifoldTemporalRefiner(nn.Module):
         # x: B,T,151; cond: B,32 or B,T,32; seam: B,T,1.
         batch, frames, _ = x.shape
         c = _expand_temporal_condition_torch(cond, frames)
-        y = torch.cat([x, c, seam_mask, joint_mask], dim=-1).transpose(1, 2)
+        observed = boundary_features_torch(x, seam_mask)
+        y = torch.cat([x, c, seam_mask, joint_mask, observed], dim=-1).transpose(1, 2)
         h = self.in_proj(y)
         h = h + self.net(h)
         return self.out(h).transpose(1, 2)
@@ -4059,16 +4064,14 @@ def degrade_for_refiner(
     cfg: Optional[MotionGenerationConfig] = None,
     *,
     finalize_contract: bool = True,
-    mode: str = "mixed",
+    mode: str = "full_bridge",
     recipe: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Reference Inbetweening transition-masked corruption for Motion Refiner and Motion Diffusion training.
+    """Formal training uses the complete inference-time interpolation bridge.
 
-    Instead of arbitrary global drift only, corrupt a local transition region by
-    replacing it with a weak root-Hermite / rotation-SLERP inbetweening path plus
-    smooth product-manifold tangent perturbations. This matches the
-    inference-time transition-budget mask: the model learns to repair motion_ref
-    only near boundaries while preserving core clips exactly.
+    Historical mixed/tangent/half-bridge recipes are explicit diagnostics only.
+    The formal default never retains hidden clean interior or adds random
+    tangent targets. Source windows themselves remain unchanged on disk.
     """
     cfg = cfg or MotionGenerationConfig()
     x = np.asarray(clean, dtype=np.float32).copy()
@@ -4083,7 +4086,7 @@ def degrade_for_refiner(
     max_w = max(min_w, int(round(float(cfg.transition_train_max_seconds) * float(cfg.fps))))
     halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     max_w = max(min_w, min(max_w, max(4, T // 3)))
-    if mode not in {"bridge_only", "tangent_only", "mixed"}:
+    if mode not in {"full_bridge", "bridge_only", "tangent_only", "mixed"}:
         raise ValueError("unknown refiner corruption mode")
     if recipe is None:
         w = random.randint(max(4, min_w), max_w)
@@ -4106,11 +4109,17 @@ def degrade_for_refiner(
                 cfg,
                 finalize_contract=False,
             )
-            # Never add Euclidean noise directly to Rot6D.  Build one C1-tapered,
-            # temporally correlated tangent perturbation and retract it on
-            # R^3 x SO(3)^24.  This creates realistic boundary uncertainty
-            # without manufacturing frame-independent jerk across the song.
             span = int(bridge.shape[0])
+            if mode == "full_bridge":
+                x[a:b] = bridge
+                seam[max(0, a - halo):min(T, b + halo), 0] = 0.35
+                seam[a:b, 0] = 1.0
+                if finalize_contract:
+                    x, _ = enforce_edge151_contract_np(x, cfg, source_hint=BOUNDARY_PROTOCOL, derive_contact=True, project_rot=True)
+                return x.astype(np.float32), seam
+            # Historical diagnostics only: correlated tangent perturbations,
+            # never independent Euclidean noise on Rot6D. Formal full_bridge
+            # returns above without injecting synthetic tangent noise.
             tangent = (_refiner_tangent_noise_np(span, severity, cfg)
                        if recipe is None else np.asarray(recipe["tangent"], dtype=np.float32))
             if tangent.shape != (span, 3 + NUM_JOINTS * 3) or not np.all(np.isfinite(tangent)):
@@ -4405,6 +4414,10 @@ def _record_validation_physical_prediction(
         require_repair_gain=False,
         ignored_layers=("long_horizon_root_drift",),
     )
+    if seam_mask is not None:
+        observed = _observable_boundary_audit(predicted, damaged, seam_mask, cfg)
+        observed["physical_non_regression"] = degraded_physical_diagnostic
+        accumulator.setdefault("observable_boundary_gates", []).append(observed)
     fidelity_gate = evaluate_stage_reference_fidelity(
         clean_audit,
         prediction_audit,
@@ -4707,7 +4720,21 @@ def _summarize_validation_physical_metrics(
     def summarize_stage_detail(key: str) -> Dict[str, Optional[float]]:
         return summarize_gate_detail(stage_repair_gates, key)
 
+    observable = list(accumulator.get("observable_boundary_gates", []))
     return {
+        "observable_boundary": {
+            "schema": BOUNDARY_PROTOCOL, "num_windows": len(observable),
+            "endpoint": _summarize_validation_gates(observable, accepted_key="endpoint_accepted"),
+            "temporal": _summarize_validation_gates(observable, accepted_key="temporal_accepted"),
+            "physical_non_regression": _summarize_validation_gates(
+                [g["physical_non_regression"] for g in observable], accepted_key="accepted"),
+            "endpoint_informative": sum(g["endpoint_informative"] for g in observable),
+            "temporal_informative": sum(g["temporal_informative"] for g in observable),
+            "hidden_clean_used": False,
+            "reference_fk_p95_m": max((g["reference_fidelity"]["fk_p95_m"] for g in observable), default=None),
+            "reference_fk_max_m": max((g["reference_fidelity"]["fk_max_m"] for g in observable), default=None),
+            "reference_product_log_l1": max((g["reference_fidelity"]["product_log_l1"] for g in observable), default=None),
+        },
         "schema": "motion_checkpoint_stage_validation_v3",
         "num_windows": len(prediction_audits),
         "fk_position_error_m_mean": float(np.mean(errors)) if errors.size else None,
@@ -4802,7 +4829,7 @@ def _summarize_validation_physical_metrics(
             "checkpoint_criterion": False,
             "diagnostic_note": (
                 "full-window all-metric conjunction is diagnostic; checkpoint "
-                "publication uses separate local geometry and seam temporal gates"
+                "publication uses observed boundary gains and input-relative safety"
             ),
         },
         "clean_input_identity": {
@@ -4859,8 +4886,8 @@ def _summarize_validation_physical_metrics(
             "checkpoint_criterion": False,
             "diagnostic_note": (
                 "strict multi-metric stage comparison of repaired versus clean; "
-                "local geometry and seam FK temporal repair are the checkpoint "
-                "criteria"
+                "observed boundary gains and input-relative safety are the "
+                "checkpoint criteria"
             ),
         },
         "final_generation_gate_diagnostic": {
@@ -4886,11 +4913,115 @@ def _summarize_validation_physical_metrics(
         },
         "support_policy": "source_observation",
         "aggregation_note": (
-            "geometry and seam temporal repair are separate deterministic "
-            "validation gates; full-window fidelity and final-generation "
-            "absolute pass rate are diagnostic only"
+            "observable boundary gains, input-relative geometry/safety, clean "
+            "identity and cross-event validation govern publication; hidden-clean "
+            "reconstruction/derivative errors and final-generation absolute pass "
+            "rate are diagnostic only at this stage"
         ),
     }
+
+
+def _observable_boundary_audit(prediction, reference, seam, cfg):
+    try:
+        joints = np.stack([fk_24_np(reference), fk_24_np(prediction)])
+        metrics = boundary_metrics_torch(
+            torch.as_tensor(joints), torch.as_tensor(np.stack([seam, seam])), cfg.fps)
+        values = [{key: (bool(value[i]) if key == "valid" else float(value[i]))
+                   for key, value in metrics.items()} for i in range(2)]
+        gate = observable_gate(values[0], values[1], cfg)
+        error = np.linalg.norm(joints[1] - joints[0], axis=-1)
+        gate["reference_fidelity"] = {"fk_p95_m": float(np.percentile(error,95)),
+            "fk_max_m": float(np.max(error)), "product_log_l1": float(np.abs(product_log_np(reference,prediction)).mean())}
+        fidelity = gate["reference_fidelity"]
+        gate["reference_fidelity_accepted"] = bool(
+            fidelity["fk_p95_m"] <= cfg.checkpoint_validation_max_fk_p95_m
+            and fidelity["fk_max_m"] <= cfg.checkpoint_validation_max_fk_max_m
+            and fidelity["product_log_l1"] <= cfg.checkpoint_validation_max_refiner_product_log_l1)
+        return gate
+    except (ValueError, RuntimeError, FloatingPointError):
+        return {"schema": BOUNDARY_PROTOCOL, "accepted": False, "endpoint_accepted": False,
+                "temporal_accepted": False, "endpoint_informative": False,
+                "temporal_informative": False, "hidden_clean_used": False,
+                "reference_fidelity": {"fk_p95_m":float("inf"),"fk_max_m":float("inf"),"product_log_l1":float("inf")},
+                "reference_fidelity_accepted": False,
+                "reasons": ["invalid_observable_boundary_audit"]}
+
+
+def make_cross_event_boundary_np(left, right, left_cond, right_cond, cfg, *, start=None, width=None):
+    """Two observed clips, an actual inference bridge, and NO hidden clean label."""
+    frames = min(len(left), len(right))
+    width = int(width or min(round(.6 * cfg.fps), frames - 4))
+    a = int(start if start is not None else (frames - width) // 2)
+    b = a + width
+    if not 2 <= a < b <= frames - 2:
+        raise ValueError("cross-event seam requires two observed context frames per side")
+    tail = left[:a].copy()
+    head, _ = _align_core_to_previous(tail, right[b:frames].copy(), cfg)
+    bridge = reference_motion_inbetween_np(tail[-4:], head[:4], width, cfg)
+    reference = np.concatenate([tail, bridge, head]).astype(np.float32)
+    reference, _ = enforce_edge151_contract_np(reference, cfg, source_hint="cross_event_bridge", derive_contact=True, project_rot=True)
+    seam = np.zeros((frames, 1), dtype=np.float32)
+    halo = int(round(cfg.transition_mask_halo_seconds * cfg.fps))
+    seam[max(0, a - halo):min(frames, b + halo)] = .35
+    seam[a:b] = 1
+    phase = (np.arange(width, dtype=np.float32) + 1)[:, None] / (width + 1)
+    cond = np.concatenate([np.tile(left_cond, (a, 1)), (1 - phase) * left_cond + phase * right_cond,
+                           np.tile(right_cond, (frames - b, 1))]).astype(np.float32)
+    return reference, seam, cond
+
+
+def evaluate_cross_event_boundaries(model, db, train_db, cfg, device, *, stage="refiner", maximum=8, diffusion_steps=None):
+    """Source-role-preserving evaluation on genuine cross-event bridges.
+
+    No original interior exists for these cases. Only observed boundaries and
+    reference-relative physical safety are scored. This is separate from the
+    single-recording clean reconstruction diagnostic.
+    """
+    indices = _validation_indices(len(db["paths"]), maximum=maximum)
+    sources = np.asarray(db.get("source_uids", db["paths"])).astype(str)
+    cond = _descriptor_values_in_training_coordinates(db, train_db)
+    rows = []
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for position, index in enumerate(indices):
+                partner = next((other for other in indices if sources[other] != sources[index]), None)
+                if partner is None:
+                    continue
+                left = load_motion_window(db["paths"][index], cfg.window_len, cfg, random_crop=False)
+                right = load_motion_window(db["paths"][partner], cfg.window_len, cfg, random_crop=False)
+                reference, seam, condition = make_cross_event_boundary_np(left, right, cond[index], cond[partner], cfg)
+                batch = _prepare_refiner_batch(left[None], reference[None], seam[None], condition[None], cfg, device)
+                if stage == "refiner":
+                    output = model(batch["bad"], batch["cond"], batch["seam"], batch["joint"])
+                    prediction = _decode_product_refiner_output(batch["bad"], output,
+                        *_refiner_decode_masks(batch["joint"], batch["root"], batch["contact"], batch["seam"], cfg), cfg)
+                else:
+                    prediction = _sample_diffusion_boundary(model, batch["bad"], batch["cond"], batch["seam"],
+                        batch["joint"], batch["root"], batch["contact"], cfg, diffusion_steps, position + 10000)
+                before = batch["bad"][0].cpu().numpy()
+                after = prediction[0].cpu().numpy()
+                gate = _observable_boundary_audit(after, before, seam, cfg)
+                safety = evaluate_stage_candidate(
+                    _safe_validation_audit(before, cfg, role="cross_reference", support_policy="source_observation"),
+                    _safe_validation_audit(after, cfg, role="cross_prediction", support_policy="source_observation"),
+                    require_repair_gain=False, ignored_layers=("long_horizon_root_drift",))
+                if not gate["reference_fidelity_accepted"]:
+                    safety = {**safety,"accepted":False,"reasons":[*safety.get("reasons",[]),"cross_reference_geometry_budget_exceeded"]}
+                rows.append({"left_source": sources[index], "right_source": sources[partner],
+                             "hidden_clean_available": False, "observable": gate, "safety": safety})
+                print(json.dumps({"stage": "cross_event_validation", "model": stage,
+                                  "completed": len(rows), "requested": len(indices)}), flush=True)
+    finally:
+        model.train(was_training)
+    gates = [row["observable"] for row in rows]
+    return {"schema": BOUNDARY_PROTOCOL, "num_windows": len(rows), "hidden_clean_used": False,
+            "endpoint": _summarize_validation_gates(gates, accepted_key="endpoint_accepted"),
+            "temporal": _summarize_validation_gates(gates, accepted_key="temporal_accepted"),
+            "physical_non_regression": _summarize_validation_gates([row["safety"] for row in rows], accepted_key="accepted"),
+            "endpoint_informative": sum(g["endpoint_informative"] for g in gates),
+            "temporal_informative": sum(g["temporal_informative"] for g in gates), "windows": rows}
 
 
 def _evaluate_refiner_validation(
@@ -4974,14 +5105,12 @@ def _evaluate_refiner_validation(
                 )
                 output, clean_output = pair_output.split(1, dim=0)
                 pred = _decode_product_refiner_output(
-                    bad_t, output, joint_t, root_t, contact_t, cfg
+                    bad_t, output, *_refiner_decode_masks(joint_t, root_t, contact_t, seam_t, cfg), cfg
                 )
                 clean_identity_pred = _decode_product_refiner_output(
                     clean_t,
                     clean_output,
-                    clean_joint_t,
-                    clean_root_t,
-                    clean_contact_t,
+                    *_refiner_decode_masks(clean_joint_t, clean_root_t, clean_contact_t, seam_t, cfg),
                     cfg,
                 )
                 rec_values.append(
@@ -5017,6 +5146,7 @@ def _evaluate_refiner_validation(
                     "geometry": physical["stage_repair_gates"][-1],
                     "temporal": physical["temporal_repair_gates"][-1],
                     "clean_identity": physical["clean_identity_gates"][-1],
+                    "observable": physical["observable_boundary_gates"][-1],
                 })
     finally:
         random.setstate(python_state)
@@ -5034,6 +5164,7 @@ def _evaluate_refiner_validation(
         "descriptor_coordinates": "training_event_db",
         "physical_quality": _summarize_validation_physical_metrics(physical),
         "windows": window_details,
+        "cross_event": evaluate_cross_event_boundaries(model, validation_db, train_db, cfg, device, maximum=min(8, maximum_windows)),
     }
 
 
@@ -5131,6 +5262,12 @@ def _evaluate_diffusion_validation(
                     contact_t,
                     cfg,
                 )
+                # Teacher-forced one-step reconstruction contains the hidden
+                # target in x_t. It is a noise-loss diagnostic, NOT a sample.
+                decoded = _sample_diffusion_boundary(
+                    model, retr, cond_t, seam_t, joint_t, root_t, contact_t,
+                    cfg, diffusion_steps, sample_index,
+                )
                 velocity_values.append(
                     float(
                         F.smooth_l1_loss(
@@ -5161,8 +5298,11 @@ def _evaluate_diffusion_validation(
             float(np.mean(velocity_values)) if velocity_values else None
         ),
         "representation": "reference_tangent_product_manifold_79d",
+        "validation_sampling": "full_reverse_process_without_hidden_clean",
         "descriptor_coordinates": "training_event_db",
         "physical_quality": _summarize_validation_physical_metrics(physical),
+        "cross_event": evaluate_cross_event_boundaries(model, validation_db, train_db, cfg, device,
+            stage="diffusion", maximum=8, diffusion_steps=diffusion_steps),
     }
 
 
@@ -5201,8 +5341,8 @@ def _checkpoint_validation_decision(
     """Decide whether a neural-stage checkpoint may become a formal asset.
 
     This deliberately does not consume the strict final-generation diagnostic.
-    Refiner and diffusion checkpoints are accepted on two independent local
-    contracts: product-geometry repair and seam FK temporal repair.  The
+    Refiner and diffusion checkpoints require observable endpoint improvement,
+    actual seam dynamics, reference-relative safety and cross-event tests. The
     full-window all-metric clean comparison is retained as a diagnostic because
     it is an overly strict conjunction for a deliberately edited transition.
     The absolute whole-song physical gate remains downstream of repair, IK and
@@ -5227,6 +5367,15 @@ def _checkpoint_validation_decision(
         "fk_position_error_m_p95": physical.get("fk_position_error_m_p95"),
         "fk_position_error_m_max": physical.get("fk_position_error_m_max"),
     }
+    observable = physical.get("observable_boundary", {})
+    observed.update({
+        "observable_endpoint_rate": observable.get("endpoint", {}).get("pass_rate"),
+        "observable_temporal_rate": observable.get("temporal", {}).get("pass_rate"),
+        "observable_physical_non_regression_rate": observable.get("physical_non_regression", {}).get("pass_rate"),
+        "reference_fk_p95_m": observable.get("reference_fk_p95_m"),
+        "reference_fk_max_m": observable.get("reference_fk_max_m"),
+        "reference_product_log_l1": observable.get("reference_product_log_l1"),
+    })
     thresholds: Dict[str, float] = {
         "min_stage_repair_rate": float(
             cfg.checkpoint_validation_min_stage_repair_rate
@@ -5277,19 +5426,35 @@ def _checkpoint_validation_decision(
     if num_windows <= 0:
         reasons.append("validation_windows_missing")
     _require_min(
-        "stage_repair_rate",
+        "observable_endpoint_rate",
         thresholds["min_stage_repair_rate"],
     )
     _require_min(
-        "temporal_repair_rate",
+        "observable_temporal_rate",
         thresholds["min_temporal_repair_rate"],
     )
+    _require_min("observable_physical_non_regression_rate", thresholds["min_stage_repair_rate"])
+    if observable.get("schema") != BOUNDARY_PROTOCOL or observable.get("num_windows") != num_windows:
+        reasons.append("missing_or_mismatched_observable_protocol")
+    if not observable.get("endpoint_informative", 0) or not observable.get("temporal_informative", 0):
+        reasons.append("informative_boundary_cases_missing")
+    cross = metrics.get("cross_event", {})
+    if cross.get("schema") != BOUNDARY_PROTOCOL or not cross.get("num_windows", 0):
+        reasons.append("cross_event_validation_missing")
+    for key, threshold in (("endpoint", cfg.checkpoint_validation_min_stage_repair_rate),
+                           ("temporal", cfg.checkpoint_validation_min_temporal_repair_rate),
+                           ("physical_non_regression", cfg.checkpoint_validation_min_stage_repair_rate)):
+        name = f"cross_event_{key}_rate"
+        observed[name] = cross.get(key, {}).get("pass_rate")
+        _require_min(name, threshold)
+    if not cross.get("endpoint_informative", 0) or not cross.get("temporal_informative", 0):
+        reasons.append("informative_cross_event_cases_missing")
     _require_max(
-        "fk_position_error_m_p95",
+        "reference_fk_p95_m",
         thresholds["max_fk_position_error_m_p95"],
     )
     _require_max(
-        "fk_position_error_m_max",
+        "reference_fk_max_m",
         thresholds["max_fk_position_error_m_max"],
     )
 
@@ -5298,8 +5463,7 @@ def _checkpoint_validation_decision(
             "clean_identity_rate",
             thresholds["min_clean_identity_rate"],
         )
-        metric_name = "reconstruction_product_log_l1"
-        observed[metric_name] = metrics.get(metric_name)
+        metric_name = "reference_product_log_l1"
         thresholds["max_reconstruction_product_log_l1"] = float(
             cfg.checkpoint_validation_max_refiner_product_log_l1
         )
@@ -5313,7 +5477,9 @@ def _checkpoint_validation_decision(
     scientific_acceptance = not reasons
     fail_closed = bool(cfg.checkpoint_validation_fail_closed)
     return {
-        "schema": "motion_checkpoint_publication_decision_v2",
+        "schema": "motion_checkpoint_publication_decision_v3",
+        "boundary_protocol": BOUNDARY_PROTOCOL,
+        "clean_geometry_and_derivative_repair_rates_are_diagnostic": True,
         "stage": str(stage),
         "scientific_acceptance": bool(scientific_acceptance),
         "publish_allowed": bool(scientific_acceptance or not fail_closed),
@@ -5357,7 +5523,7 @@ def _training_stage_contract(stage: str) -> Tuple[str, str]:
     if stage == "refiner":
         return "boundary_refiner", REFINER_MODEL_VERSION
     if stage == "diffusion":
-        return "motion_diffusion", "reference_tangent_motion_diffusion_v2"
+        return "motion_diffusion", DIFFUSION_MODEL_VERSION
     raise ValueError(f"unsupported training snapshot stage: {stage!r}")
 
 
@@ -5468,12 +5634,13 @@ def _refiner_validation_score(
     """Rank deterministic validation candidates without hiding a failed gate."""
 
     physical = metrics.get("physical_quality", {})
+    observable = physical.get("observable_boundary", {})
     geometry_rate = _finite_score_value(
-        physical.get("stage_repair", {}).get("pass_rate"),
+        observable.get("endpoint", {}).get("pass_rate"),
         default=-1.0,
     )
     temporal_rate = _finite_score_value(
-        physical.get("temporal_repair", {}).get("pass_rate"),
+        observable.get("temporal", {}).get("pass_rate"),
         default=-1.0,
     )
     identity_rate = _finite_score_value(
@@ -5481,11 +5648,11 @@ def _refiner_validation_score(
         default=-1.0,
     )
     reconstruction = _finite_score_value(
-        metrics.get("reconstruction_product_log_l1"),
+        observable.get("reference_product_log_l1"),
         default=float("inf"),
     )
     fk_p95 = _finite_score_value(
-        physical.get("fk_position_error_m_p95"),
+        observable.get("reference_fk_p95_m"),
         default=float("inf"),
     )
     return (
@@ -5868,16 +6035,18 @@ def _refiner_batch_outputs(model, batch, cfg, *, trace=None):
     count = batch["clean"].shape[0]
     outputs = model(
         torch.cat([batch["bad"], batch["clean"]]),
-        torch.cat([batch["cond"], batch["cond"]]),
+        torch.cat([batch["cond"], batch.get("clean_cond", batch["cond"])]),
         torch.cat([batch["seam"], batch["seam"]]),
         torch.cat([batch["joint"], batch["clean_joint"]]),
     )
     pred = _decode_product_refiner_output(
-        batch["bad"], outputs[:count], batch["joint"], batch["root"], batch["contact"], cfg,
+        batch["bad"], outputs[:count], *_refiner_decode_masks(
+            batch["joint"], batch["root"], batch["contact"], batch["seam"], cfg), cfg,
         trace=None if trace is None else trace.setdefault("repair", {}),
     )
     identity = _decode_product_refiner_output(
-        batch["clean"], outputs[count:], batch["clean_joint"], batch["clean_root"], batch["clean_contact"], cfg,
+        batch["clean"], outputs[count:], *_refiner_decode_masks(
+            batch["clean_joint"], batch["clean_root"], batch["clean_contact"], batch["seam"], cfg), cfg,
         trace=None if trace is None else trace.setdefault("clean", {}),
     )
     if trace is not None:
@@ -5885,17 +6054,72 @@ def _refiner_batch_outputs(model, batch, cfg, *, trace=None):
     return pred, identity
 
 
+def _refiner_decode_masks(joint, root, contact, seam, cfg):
+    core = _inbetween_config_float(cfg, "refiner_core_strength", "MOTION_REFINER_CORE_STRENGTH", .02)
+    transition = _inbetween_config_float(cfg, "refiner_transition_strength", "MOTION_REFINER_TRANSITION_STRENGTH", 1.0)
+    strength = (core + (transition - core) * seam).clamp(0, 1)
+    return joint * strength, root * strength, contact * strength
+
+
 def _refiner_batch_objectives(model, batch, cfg):
     pred, identity = _refiner_batch_outputs(model, batch, cfg)
-    repair, terms = _product_motion_losses(
-        pred, batch["clean"], batch["bad"], batch["joint"], batch["root"],
-        batch["contact"], cfg, seam_mask=batch["seam"],
-    )
+    repair, terms = _observable_refiner_objective(pred, batch["bad"], batch["seam"], cfg)
     protection, identity_terms = _product_refiner_clean_identity_loss(
         identity, batch["clean"], batch["clean_joint"], batch["clean_root"],
         batch["clean_contact"], cfg,
     )
     return repair, protection, terms, identity_terms
+
+
+def _observable_refiner_objective(prediction, reference, seam, cfg):
+    """Repair observable boundary defects, with no hidden clean target.
+
+    The clean-input dead-band branch remains separate and unchanged. Physical
+    scale floors stabilize gradients; they do not change acceptance thresholds.
+    """
+    count = prediction.shape[0]
+    joints = fk_24_torch(torch.cat([prediction, reference.detach()]))
+    proposed_joints, reference_joints = joints.split(count)
+    proposed = boundary_metrics_torch(proposed_joints, seam, cfg.fps)
+    before = boundary_metrics_torch(reference_joints.detach(), seam, cfg.fps)
+    gain = cfg.product_refiner_training_target_repair_gain
+
+    def margin(key, floor):
+        baseline = before[key].detach()
+        return (torch.relu(proposed[key] - (1.0 - gain) * baseline)
+                / baseline.clamp_min(floor)).mean()
+
+    endpoint = margin("endpoint_velocity_jump_mps", 0.05)
+    temporal = margin("temporal_energy", 0.05)
+    jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
+            / before["seam_jerk_mps3"].clamp_min(1.0)).mean()
+    delta = product_log_torch(reference, prediction)
+    active = (seam >= .5).to(delta.dtype)
+    per_window = (delta.abs() * active).sum((1, 2)) / (active.sum((1, 2)) * delta.shape[-1]).clamp_min(1)
+    trust = torch.relu(per_window / cfg.checkpoint_validation_max_refiner_product_log_l1 - 1).mean()
+    outside = (delta.abs() * (1.0 - seam)).mean()
+    contact = (prediction[..., :4] - reference[..., :4]).square().mean()
+    support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg)
+    feet = list(DEFAULT_FOOT_JOINTS)
+    floor = torch.quantile(reference_joints[..., feet, 1].flatten(1), .05, dim=1).detach()
+    penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean()
+    reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean().detach()
+    penetration = torch.relu(penetration - reference_penetration)
+    physics = cfg.product_refiner_relative_temporal_weight * temporal + cfg.product_refiner_seam_jerk_weight * jerk + support + penetration
+    loss = cfg.product_refiner_repair_margin_weight * endpoint + physics + trust + outside + .2 * contact
+    zero = delta.sum() * 0
+    return loss, {
+        "reconstruction": delta.square().mean(), "active_reconstruction": per_window.mean(),
+        "repair_margin": endpoint, "clean_preservation": outside,
+        "temporal_supervision": temporal, "endpoint_continuity": endpoint,
+        "seam_velocity": proposed["endpoint_velocity_jump_mps"].mean(),
+        "seam_acceleration": proposed["seam_acceleration_mps2"].mean(),
+        "seam_jerk": proposed["seam_jerk_mps3"].mean(), "relative_temporal": temporal,
+        "physics": physics, "contact": contact, "outside": outside,
+        "jerk": jerk,
+        "observable_trust_excess": trust, "support_excess": support,
+        "tangent_supervision": zero, "degraded_active_product_l1": zero,
+    }
 
 
 def train_refiner(args: argparse.Namespace) -> int:
@@ -5993,6 +6217,8 @@ def train_refiner(args: argparse.Namespace) -> int:
         best_score = tuple(float(value) for value in best_validation["score"])
     validation_history: List[Dict[str, Any]] = []
     bs = min(cfg.batch_size, max(2, len(paths)))
+    source_ids = np.asarray(db.get("source_uids", paths)).astype(str)
+    cross_partners = [np.flatnonzero(source_ids != source) for source in source_ids]
     motion_pool = PreloadedMotionWindowPool.preload(
         paths,
         cfg.window_len,
@@ -6022,7 +6248,8 @@ def train_refiner(args: argparse.Namespace) -> int:
         bad_batch = []
         seam_batch = []
         cond_batch = []
-        for _ in range(bs):
+        clean_cond_batch = []
+        for sample_number in range(bs):
             idx = random.randrange(len(paths))
             clean = motion_pool.sample(idx)
             bad, seam = degrade_for_refiner(
@@ -6030,14 +6257,25 @@ def train_refiner(args: argparse.Namespace) -> int:
                 cfg=cfg,
                 finalize_contract=not gpu_preprocessing,
             )
+            condition = np.tile(desc_z[idx], (cfg.window_len, 1))
+            if sample_number % 2 and len(cross_partners[idx]):
+                partner = int(random.choice(cross_partners[idx]))
+                bad, seam, condition = make_cross_event_boundary_np(
+                    clean, motion_pool.sample(partner), desc_z[idx], desc_z[partner], cfg,
+                    start=int(np.clip(np.flatnonzero(seam[:, 0] >= .5)[0], 2,
+                                      cfg.window_len - int(np.sum(seam[:, 0] >= .5)) - 2)),
+                    width=int(np.sum(seam[:, 0] >= .5)),
+                )
             clean_batch.append(clean)
             bad_batch.append(bad)
             seam_batch.append(seam)
-            cond_batch.append(desc_z[idx])
+            cond_batch.append(condition)
+            clean_cond_batch.append(np.tile(desc_z[idx], (cfg.window_len, 1)))
         batch = _prepare_refiner_batch(
             np.stack(clean_batch), np.stack(bad_batch), np.stack(seam_batch),
             np.stack(cond_batch), cfg, device, executor=risk_executor,
         )
+        batch["clean_cond"] = torch.as_tensor(np.stack(clean_cond_batch), dtype=torch.float32, device=device)
         repair_loss, identity_loss, loss_terms, identity_terms = _refiner_batch_objectives(
             model, batch, cfg
         )
@@ -6225,23 +6463,26 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
         },
         "training_objective": {
-            "schema": "relative_repair_clean_tolerance_v6",
+            "schema": BOUNDARY_PROTOCOL,
+            "boundary_conditioning_dim": BOUNDARY_FEATURE_DIM,
+            "repair_target": "observable_endpoint_jump_and_actual_fk_dynamics",
+            "hidden_clean_interior_in_repair_loss": False,
             "clean_geometry_contact_constraint": "per_window_unweighted_dead_band",
             "clean_jerk_constraint": "reference_relative_p95_max_same_audit_budget",
             "clean_support_constraint": "frozen_clean_support_p95_max_speed_tolerance",
             "clean_contact_state_thresholds": dataclasses.asdict(ContactStateThresholds.from_environment()),
             "clean_jerk_policy": dataclasses.asdict(StageAcceptancePolicy.from_environment()),
-            "repair_support": "unweighted_seam_core_same_as_validation",
-            "geometry_repair_normalization": "per_window_degraded_error",
+            "repair_support": "observable_boundary_and_seam_derivative_stencils",
+            "geometry_repair_normalization": "observable_boundary_jump_with_physical_scale_floor",
             "clean_identity_temporal_weight": float(cfg.product_refiner_clean_identity_temporal_weight),
             "relative_temporal_weight": float(cfg.product_refiner_relative_temporal_weight),
             "residual_smoothing_passes": int(cfg.product_refiner_residual_smoothing_passes),
             "residual_taper_frames": int(cfg.product_refiner_residual_taper_frames),
-            "corruption_support": "synthetic_transition_seam",
-            "minimum_relative_geometry_gain": float(
+            "corruption_support": "complete_bridge_and_cross_event_join",
+            "diagnostic_minimum_clean_geometry_gain": float(
                 cfg.checkpoint_validation_min_geometry_repair_gain
             ),
-            "training_target_relative_geometry_gain": float(
+            "training_target_observable_repair_gain": float(
                 cfg.product_refiner_training_target_repair_gain
             ),
             "clean_identity_weight": float(
@@ -6264,7 +6505,10 @@ def train_refiner(args: argparse.Namespace) -> int:
             "tangent_mask_semantics": (
                 "soft_scale_then_cap_applied_tangent_v1"
             ),
-            "transition_bridge_mix": float(cfg.transition_bridge_mix),
+            "transition_bridge_mix": 1.0,
+            "random_tangent_in_formal_corruption": False,
+            "cross_event_training_fraction_when_multiple_sources": 0.5,
+            "cross_event_hidden_clean_target": False,
         },
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
@@ -6351,7 +6595,7 @@ class TangentDiffusionDenoiser(nn.Module):
             nn.Linear(hidden, hidden),
         )
         self.in_proj = nn.Conv1d(
-            tangent_dim + EDGE_DIM + 1 + NUM_JOINTS, hidden, 1
+            tangent_dim + EDGE_DIM + 1 + NUM_JOINTS + BOUNDARY_FEATURE_DIM, hidden, 1
         )
         self.blocks = nn.ModuleList(
             [
@@ -6379,10 +6623,13 @@ class TangentDiffusionDenoiser(nn.Module):
         )
         self.out = nn.Conv1d(hidden, tangent_dim, 1)
 
-    def forward(self, x_tangent, retrieval, cond, seam_mask, joint_mask, t):
+    def forward(self, x_tangent, retrieval, cond, seam_mask, joint_mask, t, *, boundary_features=None):
         frames = x_tangent.shape[1]
+        if boundary_features is None:
+            boundary_features = boundary_features_torch(retrieval, seam_mask)
         inp = torch.cat(
-            [x_tangent, retrieval, seam_mask, joint_mask], dim=-1
+            [x_tangent, retrieval, seam_mask, joint_mask,
+             boundary_features], dim=-1
         ).transpose(1, 2)
         h = self.in_proj(inp)
         te = self.time(t)
@@ -6396,6 +6643,37 @@ class TangentDiffusionDenoiser(nn.Module):
 def _contact_logit_torch(contact):
     value = contact.clamp(1.0e-4, 1.0 - 1.0e-4)
     return torch.log(value) - torch.log1p(-value)
+
+
+def _reverse_diffusion_state(model, retrieval, condition, raw_mask, joint,
+                             active, batch_noise, noise_scale, betas, alphas, abar):
+    """The same unconditional-on-clean reverse process in audit and generation."""
+    steps = len(betas)
+    state = float(noise_scale) * batch_noise[:, 0] * active
+    context = ({"boundary_features": boundary_features_torch(retrieval, raw_mask)}
+               if isinstance(model, TangentDiffusionDenoiser) else {})
+    for step in reversed(range(steps)):
+        timestep = torch.full((retrieval.shape[0],), step, device=retrieval.device, dtype=torch.long)
+        prediction = model(state, retrieval, condition, raw_mask, joint, timestep, **context) * active
+        mean = (state - betas[step] / torch.sqrt(1 - abar[step]).clamp_min(1e-6) * prediction) / torch.sqrt(alphas[step])
+        state = (mean + torch.sqrt(betas[step]) * batch_noise[:, steps - step] * .35 * active
+                 if step > 0 else mean) * active
+    return state
+
+
+def _sample_diffusion_boundary(model, retrieval, cond, seam, joint, root, contact, cfg, steps, index):
+    core = _inbetween_config_float(cfg, "diffusion_core_strength", "MOTION_DIFFUSION_CORE_STRENGTH", 0.0)
+    transition = _inbetween_config_float(cfg, "diffusion_transition_strength", "MOTION_DIFFUSION_TRANSITION_STRENGTH", .72)
+    noise_scale = _inbetween_config_float(cfg, "diffusion_reference_noise_scale", "MOTION_DIFFUSION_REFERENCE_NOISE_SCALE", .03)
+    strength = (core + (transition - core) * seam).clamp(0, 1)
+    effective = (joint * strength, root * strength, contact * strength)
+    active = (_tangent_state_mask(*effective) > 0).to(retrieval.dtype)
+    noise = _diffusion_noise_batch_torch(
+        range(index, index + len(retrieval)), base_seed=cfg.seed + 46001,
+        steps=steps, window=retrieval.shape[1], dtype=retrieval.dtype, device=retrieval.device)
+    state = _reverse_diffusion_state(model, retrieval, cond, seam, joint, active, noise,
+                                     noise_scale, *make_beta_schedule(steps, retrieval.device))
+    return _decode_reference_tangent_state(retrieval, state, *effective, cfg)
 
 
 def _encode_reference_tangent_state(reference, target):
@@ -6618,11 +6896,7 @@ def train_diffusion(args: argparse.Namespace) -> int:
             product_log_torch(decoded[:, :-1], decoded[:, 1:]),
             product_log_torch(x0[:, :-1], x0[:, 1:]),
         )
-        loss_physics, physics_terms = _world_space_physics_losses(
-            decoded,
-            x0,
-            cfg,
-        )
+        loss_physics, physics_terms = _observable_refiner_objective(decoded, retr, seam, cfg)
         loss = loss_noise + 0.10 * loss_vel + loss_physics
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -6672,14 +6946,15 @@ def train_diffusion(args: argparse.Namespace) -> int:
     validation_report["checkpoint_decision"] = decision
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": "reference_tangent_motion_diffusion_v2",
+        "version": DIFFUSION_MODEL_VERSION,
         "diffusion_space": "reference_point_product_tangent",
         "state_dim": PRODUCT_STATE_DIM,
         "joint_mask_conditioned": True,
         "training_corruption": {
-            "schema": "retained_clean_transition_bridge_v1",
-            "transition_bridge_mix": float(cfg.transition_bridge_mix),
-            "rotation_noise": "smooth_so3_tangent",
+            "schema": BOUNDARY_PROTOCOL,
+            "transition_bridge_mix": 1.0,
+            "rotation_noise": "none_in_reference_bridge",
+            "boundary_conditioning_dim": BOUNDARY_FEATURE_DIM,
         },
         "state_dict": model.state_dict(),
         "config": dataclasses.asdict(cfg),
@@ -7583,7 +7858,7 @@ def _cached_inference_model(
             model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(cfg.device)
             schedule = None
         elif role == "motion_diffusion":
-            expected_version = "reference_tangent_motion_diffusion_v2"
+            expected_version = DIFFUSION_MODEL_VERSION
             if str(checkpoint.get("version", "")) != expected_version:
                 raise RuntimeError(
                     "Formal generation rejects a non-tangent diffusion checkpoint"
@@ -7657,8 +7932,9 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
     Core regions are strongly locked.  By default only a tiny residual is allowed
     outside transition masks; transition regions receive the full correction.
     """
-    core_strength = _inbetween_config_float(cfg, "refiner_core_strength", "MOTION_REFINER_CORE_STRENGTH", 0.02)
-    trans_strength = _inbetween_config_float(cfg, "refiner_transition_strength", "MOTION_REFINER_TRANSITION_STRENGTH", 1.00)
+    # Also used by the final binary support lock (not a second soft scaling).
+    core_strength = _inbetween_config_float(cfg, "refiner_core_strength", "MOTION_REFINER_CORE_STRENGTH", .02)
+    trans_strength = _inbetween_config_float(cfg, "refiner_transition_strength", "MOTION_REFINER_TRANSITION_STRENGTH", 1.0)
     if torch is None or not ckpt_path or not Path(ckpt_path).exists():
         seam_centers = []
         for a, b in contiguous_regions(seam_mask[:, 0] > 0.5):
@@ -7771,7 +8047,6 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             sm = torch.from_numpy(mask_batch).float().to(cfg.device)
             if gpu_preprocessing:
                 x = _enforce_internal_batch_contract_torch(x, cfg)
-            strength = torch.clamp(float(core_strength) + (float(trans_strength) - float(core_strength)) * sm, 0.0, 1.0)
             if gpu_preprocessing:
                 joint_t, root_t, contact_t = _risk_masks_for_batch_torch(
                     x,
@@ -7792,9 +8067,7 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             y = _decode_product_refiner_output(
                 x,
                 output,
-                joint_t * strength,
-                root_t * strength,
-                contact_t * strength,
+                *_refiner_decode_masks(joint_t, root_t, contact_t, sm, cfg),
                 cfg,
             )
             if gpu_preprocessing:
@@ -8104,41 +8377,10 @@ def apply_diffusion_model(
                 dtype=retrieval.dtype,
                 device=cfg.device,
             )
-            state = (
-                float(noise_scale)
-                * batch_noise[:, 0]
-                * active
+            state = _reverse_diffusion_state(
+                model, retrieval, condition, raw_mask, joint, active, batch_noise,
+                noise_scale, betas, alphas, abar,
             )
-            for step in reversed(range(steps)):
-                timestep = torch.full(
-                    (len(batch_records),),
-                    step,
-                    device=cfg.device,
-                    dtype=torch.long,
-                )
-                prediction = model(
-                    state, retrieval, condition, raw_mask, joint, timestep
-                ) * active
-                beta = betas[step]
-                alpha = alphas[step]
-                cumulative = abar[step]
-                mean = (1 / torch.sqrt(alpha)) * (
-                    state
-                    - beta
-                    / torch.sqrt(1 - cumulative).clamp_min(1.0e-6)
-                    * prediction
-                )
-                if step > 0:
-                    state = (
-                        mean
-                        + torch.sqrt(beta)
-                        * batch_noise[:, steps - step]
-                        * 0.35
-                        * active
-                    )
-                else:
-                    state = mean
-                state = state * active
             proposals = _decode_reference_tangent_state(
                 retrieval,
                 state,

@@ -583,6 +583,7 @@ class MotionTrainingContractTests(unittest.TestCase):
                     clean,
                     cfg=cfg,
                     finalize_contract=False,
+                    mode="mixed",
                 )
 
     def test_authentic_event_travel_is_not_a_checkpoint_failure(self):
@@ -618,6 +619,7 @@ class MotionTrainingContractTests(unittest.TestCase):
                 clean,
                 cfg=cfg,
                 finalize_contract=False,
+                mode="mixed",
             )
         accumulator = _new_validation_physical_accumulator()
         _record_validation_physical_prediction(
@@ -653,6 +655,13 @@ class MotionTrainingContractTests(unittest.TestCase):
                 },
             },
         }
+        observable = {"schema": motion_runtime.BOUNDARY_PROTOCOL, "num_windows":16,
+                      "endpoint":{"pass_rate":1.0}, "temporal":{"pass_rate":1.0},
+                      "physical_non_regression":{"pass_rate":1.0},
+                      "endpoint_informative":16, "temporal_informative":16,
+                      "reference_fk_p95_m":.01,"reference_fk_max_m":.02,"reference_product_log_l1":.001}
+        metrics["physical_quality"]["observable_boundary"] = observable
+        metrics["cross_event"] = dict(observable)
         decision = _checkpoint_validation_decision(metrics, cfg, stage="refiner")
 
         self.assertTrue(decision["scientific_acceptance"])
@@ -661,21 +670,26 @@ class MotionTrainingContractTests(unittest.TestCase):
         self.assertTrue(decision["clean_non_regression_diagnostic_only"])
 
         metrics["physical_quality"]["stage_repair"]["pass_rate"] = 0.0
+        # Exact clean repair is diagnostic; observable repair remains mandatory.
+        self.assertTrue(_checkpoint_validation_decision(metrics, cfg, stage="refiner")["scientific_acceptance"])
+        observable["endpoint"]["pass_rate"] = 0.0
         rejected = _checkpoint_validation_decision(metrics, cfg, stage="refiner")
         self.assertFalse(rejected["scientific_acceptance"])
         self.assertFalse(rejected["publish_allowed"])
 
         metrics["physical_quality"]["stage_repair"]["pass_rate"] = 1.0
-        metrics["physical_quality"]["temporal_repair"]["pass_rate"] = 0.0
+        observable["endpoint"]["pass_rate"] = 1.0
+        observable["temporal"]["pass_rate"] = 0.0
         rejected_temporal = _checkpoint_validation_decision(
             metrics, cfg, stage="refiner"
         )
         self.assertIn(
-            "temporal_repair_rate_too_low",
+            "observable_temporal_rate_too_low",
             rejected_temporal["reasons"],
         )
 
         metrics["physical_quality"]["temporal_repair"]["pass_rate"] = 1.0
+        observable["temporal"]["pass_rate"] = 1.0
         metrics["physical_quality"]["clean_input_identity"]["pass_rate"] = 0.0
         rejected_identity = _checkpoint_validation_decision(
             metrics, cfg, stage="refiner"

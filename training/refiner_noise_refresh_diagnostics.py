@@ -417,6 +417,8 @@ def run(args):
 
 
 def main(argv=None):
+    if m.REFINER_MODEL_VERSION != "product_manifold_boundary_refiner_v6":
+        raise RuntimeError("V6 noise-refresh experiment retired; use training.refiner_bridge_diagnostics for V7")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/motion_model.json")
     parser.add_argument("--db", required=True)

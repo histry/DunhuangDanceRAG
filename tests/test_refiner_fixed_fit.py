@@ -247,6 +247,13 @@ def test_diagnostic_guard_rejects_stale_revision_and_changed_event(tmp_path, mon
         },
     }
     fingerprint = {"code_revision": "current"}
+    observable = {"schema":m.BOUNDARY_PROTOCOL,"num_windows":1,
+                  "endpoint":{"pass_rate":1},"temporal":{"pass_rate":1},
+                  "physical_non_regression":{"pass_rate":1},
+                  "endpoint_informative":1,"temporal_informative":1,
+                  "reference_fk_p95_m":.01,"reference_fk_max_m":.02,"reference_product_log_l1":.001}
+    metrics["physical_quality"]["observable_boundary"] = observable
+    metrics["cross_event"] = observable
     monkeypatch.setattr(d, "_fingerprint", lambda args, config: fingerprint)
     report = {
         "schema": d.SCHEMA, "role": "training_fit_diagnostic_only", "completed": True,

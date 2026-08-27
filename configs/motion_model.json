@@ -9,7 +9,7 @@
   "transition_train_max_seconds": 0.9333333333333333,
   "transition_mask_halo_seconds": 0.2,
   "transition_tangent_smoothing_passes": 4,
-  "transition_bridge_mix": 0.5,
+  "transition_bridge_mix": 1.0,
   "ik_enable": true,
   "ik_iters": 120,
   "ik_lr": 0.02,

@@ -88,7 +88,7 @@ def test_default_mixed_replays_with_captured_recipe_without_rng_side_effects(mon
     monkeypatch.setattr(m, "_refiner_tangent_noise_np", capture)
     random.seed(19)
     np.random.seed(20)
-    default, seam = m.degrade_for_refiner(clean, cfg=cfg)
+    default, seam = m.degrade_for_refiner(clean, cfg=cfg, mode="mixed")
     core = np.flatnonzero(seam[:, 0] >= .5)
     recipe = {"a": int(core[0]), "b": int(core[-1]) + 1, "tangent": saved[0]}
     state = (random.getstate(), np.random.get_state())
