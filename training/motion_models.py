@@ -2994,7 +2994,7 @@ def _enforce_internal_batch_contract_torch(
     return motion
 
 
-def _smooth_supported_residual_torch(value, support, cfg):
+def _smooth_supported_residual_torch(value, support, cfg, *, trace=None):
     """Smooth corrections (never source motion), with no support expansion.
 
     A hard 0 -> risk-mask jump used to turn even a constant network output
@@ -3025,7 +3025,11 @@ def _smooth_supported_residual_torch(value, support, cfg):
         distance = distance + eroded
     phase = distance / float(radius + 1)
     taper = phase.pow(3) * (10.0 - 15.0 * phase + 6.0 * phase.square())
-    return filtered.transpose(1, 2) * taper.transpose(1, 2) * active
+    result = filtered.transpose(1, 2) * taper.transpose(1, 2) * active
+    if trace is not None:
+        trace["after_smoothing"] = (filtered.transpose(1, 2) * active).detach()
+        trace["after_taper"] = result.detach()
+    return result
 
 
 def _decode_product_refiner_output(
@@ -3035,7 +3039,12 @@ def _decode_product_refiner_output(
     root_mask,
     contact_mask,
     cfg: MotionGenerationConfig,
+    *,
+    trace=None,
+    diagnostic_variant=None,
 ):
+    if diagnostic_variant not in {None, "full_confidence", "no_smoothing", "no_cap"}:
+        raise ValueError("unknown diagnostic decoder variant")
     if output.shape[-1] != PRODUCT_STATE_DIM:
         raise ValueError(
             f"product refiner output must be {PRODUCT_STATE_DIM}D, "
@@ -3049,6 +3058,9 @@ def _decode_product_refiner_output(
     if root_weight.ndim == output.ndim - 1:
         root_weight = root_weight.unsqueeze(-1)
     joint_weight = joint_mask.clamp(0.0, 1.0)
+    if diagnostic_variant == "full_confidence":
+        root_weight = (root_weight > 0).to(root_weight.dtype)
+        joint_weight = (joint_weight > 0).to(joint_weight.dtype)
     raw_tangent = output[..., 4:]
     scaled_tangent = torch.cat(
         [
@@ -3070,16 +3082,24 @@ def _decode_product_refiner_output(
              scaled_tangent.shape[:-1] + (NUM_JOINTS * 3,))],
         dim=-1,
     )
+    if trace is not None:
+        trace["raw"] = raw_tangent.detach()
+        trace["after_mask"] = scaled_tangent.detach()
+        trace["root_mask"] = root_weight.detach()
+        trace["joint_mask"] = joint_weight.detach()
+    smooth_cfg = (dataclasses.replace(cfg, product_refiner_residual_smoothing_passes=0)
+                  if diagnostic_variant == "no_smoothing" else cfg)
     scaled_tangent = _smooth_supported_residual_torch(
-        scaled_tangent, tangent_support, cfg
+        scaled_tangent, tangent_support, smooth_cfg, trace=trace
     )
     geometry = masked_retract_torch(
         reference,
         scaled_tangent,
         joint_mask=(joint_weight > 0.0).to(reference.dtype),
         root_mask=(root_weight > 0.0).to(reference.dtype),
-        max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
-        max_root_m=float(cfg.product_refiner_root_cap_m),
+        max_rotation_rad=(None if diagnostic_variant == "no_cap" else float(cfg.product_refiner_rotation_cap_rad)),
+        max_root_m=(None if diagnostic_variant == "no_cap" else float(cfg.product_refiner_root_cap_m)),
+        trace=trace,
     )
     contact_weight = contact_mask.clamp(0.0, 1.0)
     observed_contact = reference[..., :4].clamp(0.0, 1.0)
@@ -3088,7 +3108,11 @@ def _decode_product_refiner_output(
     # Absolute sigmoid logits used to replace clean 0/1 observations with 0.5.
     contact_delta = torch.sigmoid(contact_logits + output[..., :4]) - torch.sigmoid(contact_logits)
     contacts = (observed_contact + contact_weight * contact_delta).clamp(0.0, 1.0)
-    return torch.cat([contacts, geometry[..., 4:]], dim=-1)
+    result = torch.cat([contacts, geometry[..., 4:]], dim=-1)
+    if trace is not None:
+        with torch.no_grad():
+            trace["applied"] = product_log_torch(reference, result).detach()
+    return result
 
 
 def _derivative_support_torch(
@@ -3996,12 +4020,13 @@ def _smooth_standard_normal_time_np(
     shape: Tuple[int, ...],
     *,
     passes: int,
+    rng=None,
 ) -> np.ndarray:
     """Return temporally correlated, per-channel unit-RMS Gaussian noise."""
 
     if not shape or int(shape[0]) < 1:
         return np.zeros(shape, dtype=np.float32)
-    value = np.random.normal(0.0, 1.0, size=shape).astype(np.float32)
+    value = (np.random if rng is None else rng).normal(0.0, 1.0, size=shape).astype(np.float32)
     for _ in range(max(1, int(passes))):
         pad_width = [(1, 1)] + [(0, 0)] * (value.ndim - 1)
         padded = np.pad(value, pad_width, mode="edge")
@@ -4015,12 +4040,27 @@ def _smooth_standard_normal_time_np(
     return (value / np.maximum(rms, 1.0e-6)).astype(np.float32)
 
 
+def _refiner_tangent_noise_np(span, severity, cfg, *, rng=None):
+    """Shared perturbation; private RNGs make diagnostic recipes independent."""
+    phase = (np.arange(span, dtype=np.float32) + 1.0) / float(span + 1)
+    taper = (np.sin(np.pi * phase) ** 2).astype(np.float32)
+    passes = max(1, int(getattr(cfg, "transition_tangent_smoothing_passes", 4)))
+    root_noise = _smooth_standard_normal_time_np((span, 3), passes=passes, rng=rng)
+    joint_noise = _smooth_standard_normal_time_np((span, NUM_JOINTS, 3), passes=passes, rng=rng)
+    tangent = np.zeros((span, 3 + NUM_JOINTS * 3), dtype=np.float32)
+    tangent[:, :3] = root_noise * taper[:, None] * float(severity) * 0.18
+    tangent[:, 3:] = (joint_noise * taper[:, None, None] * float(severity) * 0.08).reshape(span, -1)
+    return tangent
+
+
 def degrade_for_refiner(
     clean: np.ndarray,
     severity: float = 0.06,
     cfg: Optional[MotionGenerationConfig] = None,
     *,
     finalize_contract: bool = True,
+    mode: str = "mixed",
+    recipe: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reference Inbetweening transition-masked corruption for Motion Refiner and Motion Diffusion training.
 
@@ -4043,11 +4083,18 @@ def degrade_for_refiner(
     max_w = max(min_w, int(round(float(cfg.transition_train_max_seconds) * float(cfg.fps))))
     halo = max(0, int(round(float(cfg.transition_mask_halo_seconds) * float(cfg.fps))))
     max_w = max(min_w, min(max_w, max(4, T // 3)))
-    w = random.randint(max(4, min_w), max_w)
-    c = random.randint(max(2, T // 5), max(3, 4 * T // 5))
-    a = max(1, c - w // 2)
-    b = min(T - 1, a + w)
-    a = max(1, b - w)
+    if mode not in {"bridge_only", "tangent_only", "mixed"}:
+        raise ValueError("unknown refiner corruption mode")
+    if recipe is None:
+        w = random.randint(max(4, min_w), max_w)
+        c = random.randint(max(2, T // 5), max(3, 4 * T // 5))
+        a = max(1, c - w // 2)
+        b = min(T - 1, a + w)
+        a = max(1, b - w)
+    else:
+        a, b = int(recipe["a"]), int(recipe["b"])
+        if not (1 <= a < b <= T - 1 and max(4, min_w) <= b - a <= max_w):
+            raise ValueError("paired corruption recipe has an invalid seam")
     if b - a >= 3:
         prev_tail = x[max(0, a - 4):a]
         curr_head = x[b:min(T, b + 4)]
@@ -4064,31 +4111,10 @@ def degrade_for_refiner(
             # R^3 x SO(3)^24.  This creates realistic boundary uncertainty
             # without manufacturing frame-independent jerk across the song.
             span = int(bridge.shape[0])
-            phase = (
-                (np.arange(span, dtype=np.float32) + 1.0)
-                / float(span + 1)
-            )
-            taper = (np.sin(np.pi * phase) ** 2).astype(np.float32)
-            passes = max(
-                1,
-                int(getattr(cfg, "transition_tangent_smoothing_passes", 4)),
-            )
-            root_noise = _smooth_standard_normal_time_np(
-                (span, 3), passes=passes
-            )
-            joint_noise = _smooth_standard_normal_time_np(
-                (span, NUM_JOINTS, 3), passes=passes
-            )
-            tangent = np.zeros((span, 3 + NUM_JOINTS * 3), dtype=np.float32)
-            tangent[:, :3] = (
-                root_noise * taper[:, None] * float(severity) * 0.18
-            )
-            tangent[:, 3:] = (
-                joint_noise
-                * taper[:, None, None]
-                * float(severity)
-                * 0.08
-            ).reshape(span, -1)
+            tangent = (_refiner_tangent_noise_np(span, severity, cfg)
+                       if recipe is None else np.asarray(recipe["tangent"], dtype=np.float32))
+            if tangent.shape != (span, 3 + NUM_JOINTS * 3) or not np.all(np.isfinite(tangent)):
+                raise ValueError("invalid paired tangent array")
             bridge_mix = float(getattr(cfg, "transition_bridge_mix", 0.50))
             if not np.isfinite(bridge_mix) or not 0.0 < bridge_mix <= 1.0:
                 raise ValueError(
@@ -4103,14 +4129,15 @@ def degrade_for_refiner(
                 joint_mask=np.ones((span, NUM_JOINTS), dtype=np.float32),
                 root_mask=np.ones((span, 1), dtype=np.float32),
             )
-            x[a:b] = masked_retract_np(
-                mixed_bridge,
+            perturbed = masked_retract_np(
+                clean_segment if mode == "tangent_only" else mixed_bridge,
                 tangent,
                 joint_mask=np.ones((span, NUM_JOINTS), dtype=np.float32),
                 root_mask=np.ones((span, 1), dtype=np.float32),
                 max_rotation_rad=max(1.0e-4, float(severity) * 0.20),
                 max_root_m=max(1.0e-4, float(severity) * 0.30),
             )
+            x[a:b] = mixed_bridge if mode == "bridge_only" else perturbed
             seam[max(0, a - halo):min(T, b + halo), 0] = 0.35
             seam[a:b, 0] = 1.0
     if finalize_contract:
@@ -5837,7 +5864,7 @@ def _prepare_refiner_batch(clean_np, bad_np, seam_np, cond_np, cfg, device, *, e
     }
 
 
-def _refiner_batch_outputs(model, batch, cfg):
+def _refiner_batch_outputs(model, batch, cfg, *, trace=None):
     count = batch["clean"].shape[0]
     outputs = model(
         torch.cat([batch["bad"], batch["clean"]]),
@@ -5846,11 +5873,15 @@ def _refiner_batch_outputs(model, batch, cfg):
         torch.cat([batch["joint"], batch["clean_joint"]]),
     )
     pred = _decode_product_refiner_output(
-        batch["bad"], outputs[:count], batch["joint"], batch["root"], batch["contact"], cfg
+        batch["bad"], outputs[:count], batch["joint"], batch["root"], batch["contact"], cfg,
+        trace=None if trace is None else trace.setdefault("repair", {}),
     )
     identity = _decode_product_refiner_output(
-        batch["clean"], outputs[count:], batch["clean_joint"], batch["clean_root"], batch["clean_contact"], cfg
+        batch["clean"], outputs[count:], batch["clean_joint"], batch["clean_root"], batch["clean_contact"], cfg,
+        trace=None if trace is None else trace.setdefault("clean", {}),
     )
+    if trace is not None:
+        trace["raw_output"] = outputs.detach()
     return pred, identity
 
 

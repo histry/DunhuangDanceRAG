@@ -593,6 +593,7 @@ def masked_retract_torch(
     root_mask: Optional["torch.Tensor"] = None,
     max_rotation_rad: Optional[float] = None,
     max_root_m: Optional[float] = None,
+    trace: Optional[dict] = None,
 ) -> "torch.Tensor":
     ref = _validate_edge_torch(reference, "reference")
     prefix = ref.shape[:-1]
@@ -619,6 +620,12 @@ def masked_retract_torch(
     joint_delta = (
         _cap_vectors_torch(joint_delta, max_rotation_rad) * joint[..., None]
     )
+    if trace is not None:
+        trace["after_cap"] = torch.cat(
+            [root_delta, joint_delta.reshape(prefix + (NUM_JOINTS * 3,))], dim=-1
+        ).detach()
+        trace["root_cap_m"] = max_root_m
+        trace["rotation_cap_rad"] = max_rotation_rad
     out = product_exp_torch(
         ref,
         torch.cat(
