@@ -22,7 +22,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v2"
+SCHEMA = "refiner_observable_bridge_diagnostic_v3"
 
 
 def fingerprint(args, cfg):
@@ -37,6 +37,7 @@ def fingerprint(args, cfg):
         "physical_quality": common.file_sha256(physical_quality.__file__),
     })
     value["retraction_protocol"] = product_manifold.RETRACTION_PROTOCOL
+    value["repair_safety_protocol"] = m.REFINER_REPAIR_SAFETY_PROTOCOL
     return value
 
 

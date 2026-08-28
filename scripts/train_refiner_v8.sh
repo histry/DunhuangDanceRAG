@@ -64,14 +64,18 @@ fi
 "$PY" -m training.refiner_bridge_diagnostics "${FIT_ARGS[@]}" \
   --check_report "$FIT_DIR/diagnostic_report.json"
 if [[ "$MODE" == generate ]]; then
-  "$PY" - "$OUT_ROOT/checkpoints/boundary_refiner.pt" "$OUT_ROOT/checkpoints/local_diffusion.pt" <<'PY'
-import sys
+  "$PY" - "$OUT_ROOT/checkpoints/boundary_refiner.pt" "$OUT_ROOT/checkpoints/local_diffusion.pt" "$REFINER" "$DIFFUSION" <<'PY'
+import hashlib,subprocess,sys
+from pathlib import Path
 from training.motion_models import _trusted_torch_load, REFINER_MODEL_VERSION, DIFFUSION_MODEL_VERSION, BOUNDARY_PROTOCOL
-for path,version in zip(sys.argv[1:],(REFINER_MODEL_VERSION,DIFFUSION_MODEL_VERSION)):
+revision=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+for path,candidate,version in zip(sys.argv[1:3],sys.argv[3:5],(REFINER_MODEL_VERSION,DIFFUSION_MODEL_VERSION)):
     p=_trusted_torch_load(path,map_location="cpu")
-    assert p['version']==version, path
+    assert p['version']==version and p['training_resume']['runtime_code_revision']==revision, path
     d=p['validation']['checkpoint_decision']
     assert d['scientific_acceptance'] and d['publish_allowed'] and d['boundary_protocol']==BOUNDARY_PROTOCOL, d
+    assert hashlib.sha256(Path(path).read_bytes()).digest()==hashlib.sha256(Path(candidate).read_bytes()).digest(), 'Formal model differs from this run candidate'
+    print('CURRENT_CANDIDATE_CONFIRMED:',path,flush=True)
 PY
   export OUT_ROOT RUN_TAG="${OUT_ROOT##*/run_}"
   export MUSIC_DIRS="${MUSIC_DIRS:-$ROOT_DIR/assets/music/train}"

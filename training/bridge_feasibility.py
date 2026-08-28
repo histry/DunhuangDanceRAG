@@ -8,6 +8,7 @@ written. Repair thresholds, masks, smoothing, caps and safety checks are shared.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import time
 from pathlib import Path
@@ -16,7 +17,8 @@ import numpy as np
 
 from training import motion_models as m
 
-SCHEMA = "bridge_foundation_feasibility_v2"
+SCHEMA = "bridge_foundation_feasibility_v3"
+DIRECT_SAFETY_PROTOCOL = "input_relative_safe_line_search_v1"
 
 
 def balanced_indices(role_count, rng):
@@ -69,6 +71,49 @@ def torch_norm(x):
     return m.torch.linalg.vector_norm(x,dim=-1)
 
 
+class _DirectSafetyChecker:
+    """Audit only loss-improving trials; retain the ORIGINAL input as reference.
+
+    Reference audits and bounded exact-content decisions are cached per case.
+    This avoids repeating unchanged CPU audits in a CUDA backtracking loop;
+    no approximation, batch-average safety or progressively relaxed budget is
+    used. Final candidates are freshly audited, without cache reuse.
+    """
+    def __init__(self, reference, cfg):
+        self.reference = reference.detach().cpu().numpy().copy()
+        self.cfg = cfg
+        self.before = [m._safe_validation_audit(x, cfg, role="direct_reference",
+            support_policy="source_observation") for x in self.reference]
+        self.cache = [{} for _ in self.reference]
+        self.audit_calls = 0
+        self.cache_hits = 0
+
+    def check(self, index, candidate, *, fresh=False):
+        key = hashlib.sha256(np.ascontiguousarray(candidate).tobytes()).digest()
+        cache = self.cache[index]
+        if not fresh and key in cache:
+            self.cache_hits += 1
+            return cache[key]
+        self.audit_calls += 1
+        try:
+            gate = m._fixed_support_stage_gate(self.reference[index], candidate, self.cfg,
+                before_audit=self.before[index])
+            reasons = list(gate["reasons"])
+            accepted = bool(gate["accepted"])
+            # A known physical rejection needs no additional SVD/log-map work.
+            if accepted:
+                _, accepted = m._observable_reference_fidelity(self.reference[index], candidate, self.cfg)
+                if not accepted:
+                    reasons.append("reference_geometry_budget_exceeded")
+            result = (bool(accepted), reasons)
+        except (ValueError, RuntimeError, FloatingPointError):
+            result = (False, ["invalid_direct_candidate_audit"])
+        if len(cache) >= 128:
+            cache.pop(next(iter(cache)))
+        cache[key] = result
+        return result
+
+
 def direct_optimize(bank,cfg,steps, *, label,log_path):
     """One free output tensor per case; no shared network, no hidden clean input."""
     torch = m.torch
@@ -76,6 +121,16 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
     optimizer = torch.optim.Adam([output],lr=0.003)
     masks = m._refiner_decode_masks(bank["joint"],bank["root"],bank["contact"],bank["seam"],cfg)
     started = time.perf_counter()
+    safety = _DirectSafetyChecker(bank["bad"], cfg)
+    safe_updates = np.zeros(len(output), dtype=int)
+    unsafe_trials = np.zeros(len(output), dtype=int)
+    rejection_reasons = [{} for _ in output]
+    for i, reference in enumerate(safety.reference):
+        accepted, reasons = safety.check(i, reference)
+        if not accepted:
+            raise RuntimeError(f"direct no-edit reference {i} failed safety: {reasons}")
+    print(json.dumps({"stage":"direct_safety_preflight", "group":label,
+        "cases":len(output), "protocol":DIRECT_SAFETY_PROTOCOL}), flush=True)
     for step in range(steps):
         prediction = m._decode_product_refiner_output(bank["bad"],output,*masks,cfg)
         losses,terms = m._observable_refiner_objective(prediction,bank["bad"],bank["seam"],cfg,reduction="none")
@@ -91,18 +146,44 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
         old = output.detach().clone()
         optimizer.step()
         # A fixed Adam step can overshoot quiet windows by orders of magnitude.
-        # Deterministic per-case backtracking keeps the feasibility control from
-        # confusing optimizer divergence with an unattainable repair target.
+        # A lower loss is necessary but insufficient: every accepted update
+        # must also pass the exact physical/fidelity audit against bank['bad'].
+        # A rejected trial leaves the last safe candidate intact.
         update = output.detach()-old
         selected = old.clone()
         pending = torch.ones(len(old),device=old.device,dtype=torch.bool)
         scale = torch.ones(len(old),device=old.device,dtype=old.dtype)
+        safety_rejections = 0
+        gpu_jerk_rejections = 0
         with torch.no_grad():
             for _ in range(12):
                 trial = old + update*scale[:,None,None]
                 motion = m._decode_product_refiner_output(bank["bad"],trial,*masks,cfg)
-                candidate,_ = m._observable_refiner_objective(motion,bank["bad"],bank["seam"],cfg,reduction="none")
+                candidate,candidate_terms = m._observable_refiner_objective(motion,bank["bad"],bank["seam"],cfg,reduction="none")
                 accepted = pending & torch.isfinite(candidate) & (candidate <= losses.detach()+1e-10)
+                # The batched loss has already computed these five constraints.
+                # Reject known tail violations on GPU; every survivor still
+                # passes the unchanged full CPU physical/fidelity audit below.
+                tail_rejected = accepted & (candidate_terms["jerk_safety_excess"] > 0)
+                for index in tail_rejected.nonzero(as_tuple=False).flatten().cpu().tolist():
+                    unsafe_trials[index] += 1
+                    counts = rejection_reasons[index]
+                    counts["gpu_jerk_budget_exceeded"] = counts.get("gpu_jerk_budget_exceeded", 0) + 1
+                    gpu_jerk_rejections += 1
+                accepted &= ~tail_rejected
+                indices = accepted.nonzero(as_tuple=False).flatten()
+                candidates = motion[indices].cpu().numpy()
+                for index, proposed in zip(indices.cpu().tolist(), candidates):
+                    is_safe, reasons = safety.check(index, proposed)
+                    if not is_safe:
+                        accepted[index] = False
+                        safety_rejections += 1
+                        unsafe_trials[index] += 1
+                        for reason in reasons:
+                            counts = rejection_reasons[index]
+                            counts[reason] = counts.get(reason, 0) + 1
+                    else:
+                        safe_updates[index] += 1
                 selected[accepted] = trial[accepted]
                 pending &= ~accepted
                 if not bool(pending.any()):
@@ -117,6 +198,10 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
                 "loss":float(loss.detach()),"endpoint_loss":float(terms["endpoint_continuity"].detach().mean()),
                 "temporal_loss":float(terms["temporal_supervision"].detach().mean()),"support_loss":float(terms["support_excess"].detach().mean()),
                 "line_search_rejected_cases":int(pending.sum()),"line_search_min_scale":float(scale.min()),
+                "jerk_safety_loss":float(terms["jerk_safety_excess"].detach().mean()),
+                "safety_rejected_trials":safety_rejections,
+                "gpu_jerk_rejected_trials":gpu_jerk_rejections,
+                "safety_audit_calls":safety.audit_calls,"safety_cache_hits":safety.cache_hits,
                 "elapsed_seconds":elapsed,"eta_seconds":elapsed/(step+1)*(steps-step-1)}
             with Path(log_path).open("a",encoding="utf8") as handle:
                 handle.write(json.dumps(row,allow_nan=False)+"\n")
@@ -124,7 +209,16 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
     with torch.no_grad():
         trace = {}
         prediction = m._decode_product_refiner_output(bank["bad"],output,*masks,cfg,trace=trace)
-    return prediction.detach(),decoder_summary(trace,bank["seam"])
+    summary = decoder_summary(trace,bank["seam"])
+    for i, candidate in enumerate(prediction.cpu().numpy()):
+        accepted, reasons = safety.check(i, candidate, fresh=True)
+        if not accepted:
+            raise RuntimeError(f"retained direct candidate {i} failed final safety: {reasons}")
+        summary[i].update(safety_protocol=DIRECT_SAFETY_PROTOCOL, safety_accepted=True,
+            safe_update_count=int(safe_updates[i]), unsafe_trial_count=int(unsafe_trials[i]),
+            unsafe_trial_reasons=rejection_reasons[i],
+            retained_no_edit=bool(np.array_equal(candidate, safety.reference[i])))
+    return prediction.detach(),summary
 
 
 def baseline_comparison(pure,banks,cfg):
@@ -209,6 +303,7 @@ def run_foundation(args,cfg,banks,pure,recipes,fingerprint,windows,separation):
     destination = Path(args.out_dir)
     destination.mkdir(parents=True,exist_ok=False)
     report = {"schema":SCHEMA,"fingerprint":fingerprint,"completed":False,"published":False,
+        "direct_safety_protocol":DIRECT_SAFETY_PROTOCOL,
         "direct_steps":args.direct_steps,"windows":windows,"recipes":recipes,"source_separation":separation,
         "direct_control_fits_probe_cases_separately":True,"generalization_evidence":False,
         "clean_identity_in_controls":"no_edit_only_not_a_learned_protection_result",

@@ -45,6 +45,7 @@ from motion_geometry.smpl24 import (
     FOOT_JOINTS as DEFAULT_FOOT_JOINTS,
     MOTION_DIM as EDGE_DIM,
     NUM_JOINTS,
+    JOINT_NAMES,
     OFFSETS,
     PARENTS,
     ROOT_X_IDX,
@@ -80,6 +81,7 @@ from contracts.physical_quality import (
     evaluate_physical_audit,
     evaluate_stage_candidate,
     evaluate_stage_reference_fidelity,
+    physical_metric_specs,
 )
 from support.event_identity import (
     assert_same_event_db_contract,
@@ -98,6 +100,7 @@ LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v8"
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
+REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_jerk_tail_constraints_v1"
 
 
 def now_tag() -> str:
@@ -3834,6 +3837,48 @@ def _clean_jerk_tolerance_loss_torch(predicted_joints, clean_joints, cfg):
     return sum(terms.values()) / len(terms), terms
 
 
+def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
+    """Per-case tail/peak constraints against the OBSERVED damaged input.
+
+    The five statistics, ratio-plus-margin budget, absolute ceiling and numeric
+    epsilon match the physical stage registry. Unlike mean seam jerk, a sparse
+    spike cannot disappear into a joint/time average. Inside every budget both
+    loss and gradient are zero. No gradient flows into the reference.
+
+    Temporal training uses float64 FK/differences on device. The independent
+    float32 physical auditor remains authoritative for accepting actual edits.
+    """
+    zero = predicted_joints.sum((1, 2, 3)) * 0.0
+    labels = {
+        "p95": "joint_jerk_mps3_p95", "max": "joint_jerk_mps3_max",
+        "window_p95": "joint_jerk_window_p95_max_mps3",
+        "extremity_p95": "extremity_jerk_mps3_p95",
+        "extremity_window_p95": "extremity_jerk_window_p95_max_mps3",
+    }
+    if predicted_joints.shape[1] < 4:
+        return zero, {f"repair_jerk_{label}_excess": zero for label in labels}
+
+    def stats(joints):
+        jerk = torch.diff(joints.to(torch.float64), n=3, dim=1) * float(cfg.fps)**3
+        return _clean_jerk_statistics_torch(torch.linalg.vector_norm(jerk, dim=-1), cfg.fps)
+
+    after, before = stats(predicted_joints), stats(reference_joints.detach())
+    specs = {spec.key: spec for spec in physical_metric_specs(
+        PhysicalQualityLimits.from_environment(), StageAcceptancePolicy.from_environment())}
+    terms = {}
+    for label, key in labels.items():
+        spec, baseline = specs[key], before[label]
+        if (not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1
+                or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0):
+            raise ValueError("invalid repair jerk stage policy")
+        allowed = torch.where(baseline <= spec.absolute_limit,
+            (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(spec.absolute_limit), baseline)
+        epsilon = (baseline.abs() * 1e-6).clamp_min(max(1e-8, abs(spec.absolute_limit)*1e-9))
+        terms[f"repair_jerk_{label}_excess"] = (
+            torch.relu(after[label] - allowed - epsilon) / (allowed - baseline).clamp_min(1.0))
+    return sum(terms.values()), terms
+
+
 def _refiner_gradient_diagnostics(model, repair_loss, clean_loss, clean_weight):
     """Measure gradients BEFORE clipping without mutating .grad or optimizer.
 
@@ -3879,23 +3924,25 @@ def _refiner_gradient_diagnostics(model, repair_loss, clean_loss, clean_weight):
 
 
 def _refiner_component_gradients(model, terms, cfg):
-    """Weighted endpoint/temporal/support gradients, before optimizer clipping."""
+    """Weighted endpoint/temporal/support/tail gradients before clipping."""
     losses = {"endpoint":cfg.product_refiner_repair_margin_weight * terms["endpoint_continuity"],
               "temporal":cfg.product_refiner_relative_temporal_weight * terms["temporal_supervision"]
                            + cfg.product_refiner_seam_jerk_weight * terms["jerk"],
-              "support":terms["support_excess"]}
+              "support":terms["support_excess"],
+              "jerk_safety":terms.get("jerk_safety_excess", terms["jerk"] * 0)}
     params = [p for p in model.parameters() if p.requires_grad]
     gradients = {key:torch.autograd.grad(value,params,retain_graph=True,allow_unused=True)
                  for key,value in losses.items()}
     norms = {key:math.sqrt(sum(float(g.detach().double().square().sum()) for g in row if g is not None))
              for key,row in gradients.items()}
     pairs = {}
-    for a,b in (("endpoint","temporal"),("endpoint","support"),("temporal","support")):
+    for a,b in (("endpoint","temporal"),("endpoint","support"),("temporal","support"),
+                ("endpoint","jerk_safety"),("temporal","jerk_safety"),("support","jerk_safety")):
         dot = sum(float((x.detach().double()*y.detach().double()).sum())
                   for x,y in zip(gradients[a],gradients[b]) if x is not None and y is not None)
         cosine = float(np.clip(dot/(norms[a]*norms[b]),-1,1)) if norms[a]*norms[b] > 1e-12 else None
         pairs[f"{a}/{b}"] = {"cosine":cosine,"conflicting":cosine is not None and cosine < 0}
-    return {"schema":"refiner_objective_gradient_v1","norms":norms,"pairs":pairs,"before_clipping":True}
+    return {"schema":"refiner_objective_gradient_v2","norms":norms,"pairs":pairs,"before_clipping":True}
 
 
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
@@ -5005,6 +5052,42 @@ def _observable_boundary_joints_torch(motion):
     return fk_24_torch(motion.to(dtype=torch.float64))
 
 
+def _observable_reference_fidelity(reference, prediction, cfg, *, joints=None):
+    if joints is None:
+        joints = np.stack([fk_24_np(reference), fk_24_np(prediction)])
+    error = np.linalg.norm(joints[1] - joints[0], axis=-1)
+    fidelity = {"fk_p95_m": float(np.percentile(error, 95)),
+        "fk_max_m": float(np.max(error)),
+        "product_log_l1": float(np.abs(product_log_np(reference, prediction)).mean())}
+    accepted = bool(
+        fidelity["fk_p95_m"] <= cfg.checkpoint_validation_max_fk_p95_m
+        and fidelity["fk_max_m"] <= cfg.checkpoint_validation_max_fk_max_m
+        and fidelity["product_log_l1"] <= cfg.checkpoint_validation_max_refiner_product_log_l1)
+    return fidelity, accepted
+
+
+def _jerk_peak_diagnostic_np(joints, seam, fps):
+    """Locate the physical auditor's peak, with an unambiguous 4-frame stencil.
+
+    This deliberately uses its unchanged float32 FK/difference convention,
+    not the mean/float64 observable metric. Indices are zero-based in the
+    validation window (NOT absolute indices in the original SMPL recording).
+    """
+    values = np.linalg.norm(np.diff(joints, n=3, axis=1) * float(fps)**3, axis=-1)
+    core = np.asarray(seam).reshape(-1) >= .5
+    rows = []
+    for i, label in enumerate(("before", "after")):
+        frame, joint = np.unravel_index(np.argmax(values[i]), values[i].shape)
+        rows.append((label, {"value_mps3": float(values[i, frame, joint]),
+            "joint_index": int(joint), "joint_name": JOINT_NAMES[joint],
+            "stencil_start_frame": int(frame), "stencil_end_frame": int(frame + 3),
+            "touches_seam_core": bool(core[frame:frame + 4].any()),
+            "other_motion_at_same_stencil_mps3": float(values[1-i, frame, joint])}))
+    return {"schema": "physical_jerk_peak_location_v1", "index_origin": 0,
+        "metric": "joint_jerk_mps3_max", "coordinate_dtype": str(joints.dtype),
+        "derivative_order": 3, **dict(rows)}
+
+
 def _observable_boundary_audit(prediction, reference, seam, cfg):
     try:
         with torch.no_grad():
@@ -5017,14 +5100,9 @@ def _observable_boundary_audit(prediction, reference, seam, cfg):
         gate = observable_gate(values[0], values[1], cfg)
         gate["numeric_contract"] = "float64_fk_before_temporal_differences_v1"
         joints = np.stack([fk_24_np(reference), fk_24_np(prediction)])
-        error = np.linalg.norm(joints[1] - joints[0], axis=-1)
-        gate["reference_fidelity"] = {"fk_p95_m": float(np.percentile(error,95)),
-            "fk_max_m": float(np.max(error)), "product_log_l1": float(np.abs(product_log_np(reference,prediction)).mean())}
-        fidelity = gate["reference_fidelity"]
-        gate["reference_fidelity_accepted"] = bool(
-            fidelity["fk_p95_m"] <= cfg.checkpoint_validation_max_fk_p95_m
-            and fidelity["fk_max_m"] <= cfg.checkpoint_validation_max_fk_max_m
-            and fidelity["product_log_l1"] <= cfg.checkpoint_validation_max_refiner_product_log_l1)
+        gate["reference_fidelity"], gate["reference_fidelity_accepted"] = (
+            _observable_reference_fidelity(reference, prediction, cfg, joints=joints))
+        gate["jerk_peak_diagnostic"] = _jerk_peak_diagnostic_np(joints, seam, cfg.fps)
         return gate
     except (ValueError, RuntimeError, FloatingPointError):
         return {"schema": BOUNDARY_PROTOCOL, "accepted": False, "endpoint_accepted": False,
@@ -6157,7 +6235,7 @@ def _refiner_batch_objectives(model, batch, cfg):
         for index,label in enumerate(("single_short","single_long","cross_short","cross_long")):
             selected = batch["group"] == index
             if bool(selected.any()):
-                for key in ("endpoint_continuity","temporal_supervision","support_excess"):
+                for key in ("endpoint_continuity","temporal_supervision","support_excess","jerk_safety_excess"):
                     terms[f"group_{label}_{key}"] = case_terms[key][selected].mean()
     protection, identity_terms = _product_refiner_clean_identity_loss(
         identity, batch["clean"], batch["clean_joint"], batch["clean_root"],
@@ -6195,6 +6273,8 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     temporal = margin("temporal_energy")
     jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
             / before["seam_jerk_mps3"].clamp_min(1.0))
+    jerk_safety, jerk_safety_terms = _repair_jerk_safety_loss_torch(
+        proposed_metric_joints, reference_metric_joints, cfg)
     delta = product_log_torch(reference, prediction)
     active = (seam >= .5).to(delta.dtype)
     per_window = (delta.abs() * active).sum((1, 2)) / (active.sum((1, 2)) * delta.shape[-1]).clamp_min(1)
@@ -6207,7 +6287,8 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean((1,2))
     reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean((1,2)).detach()
     penetration = torch.relu(penetration - reference_penetration)
-    physics = cfg.product_refiner_relative_temporal_weight * temporal + cfg.product_refiner_seam_jerk_weight * jerk + support + penetration
+    physics = (cfg.product_refiner_relative_temporal_weight * temporal
+        + cfg.product_refiner_seam_jerk_weight * jerk + jerk_safety + support + penetration)
     loss = cfg.product_refiner_repair_margin_weight * endpoint + physics + trust + outside + .2 * contact
     zero = delta.sum((1,2)) * 0
     terms = {
@@ -6219,6 +6300,7 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         "seam_jerk": proposed["seam_jerk_mps3"], "relative_temporal": temporal,
         "physics": physics, "contact": contact, "outside": outside,
         "jerk": jerk,
+        "jerk_safety_excess": jerk_safety, **jerk_safety_terms,
         "observable_trust_excess": trust, "support_excess": support,
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }

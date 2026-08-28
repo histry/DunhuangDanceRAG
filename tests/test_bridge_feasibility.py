@@ -157,6 +157,10 @@ def test_v8_shell_dependency_order_and_no_asset_retraining():
     assert '--check_report "$FIT_DIR/diagnostic_report.json"' in script
     assert script.index('--check_report') < script.index('"$MODE" == pilot')
     assert script.index('SOURCE_DISJOINT_PILOT_ACCEPTED') < script.index('train-diffusion')
+    generation = script[script.index('"$MODE" == generate'):script.index('REF_ARGS=')]
+    assert "runtime_code_revision" in generation and "hashlib.sha256" in generation
+    assert '"$REFINER" "$DIFFUSION"' in generation
+    assert "CURRENT_CANDIDATE_CONFIRMED" in generation
     for name in ("RETARGET_CACHE","EVENT_DB"):
         assert f"RETARGET_CLEAN_REBUILD_{name}=0" in script
     for name in ("ROUTER","DURATION","PLANNER"):
