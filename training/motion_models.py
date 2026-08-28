@@ -102,8 +102,8 @@ FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v9"
 REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_v1"
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
-REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_jerk_tail_constraints_v1"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_support_v1"
+REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_jerk_root_constraints_v2"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_support_root_v2"
 
 
 def now_tag() -> str:
@@ -3920,6 +3920,50 @@ def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
     return sum(terms.values()), terms
 
 
+def _root_vertical_statistics_torch(motion, cfg):
+    """Match the independent auditor's float32 root differences/linear quantiles."""
+    y = motion[..., ROOT_Y_IDX].float()
+    speed = (torch.diff(y,dim=1).abs() * float(cfg.fps)).double()
+    if y.shape[1] < 2:
+        speed = y.double() * 0.0
+    y = y.double()
+    return {"root_y_robust_range_m":torch.quantile(y,.99,dim=1)-torch.quantile(y,.01,dim=1),
+            "root_vertical_speed_mps_p95":torch.quantile(speed,.95,dim=1),
+            "root_vertical_speed_mps_max":speed.amax(dim=1)}
+
+
+def _repair_root_vertical_safety_loss_torch(prediction, reference, cfg):
+    """Observed-input non-regression, NOT a penalty on natural vertical motion.
+
+    Root P95/range/max are separate from FK jerk and horizontal foot support.
+    Reuse the unchanged stage budgets including the absolute ceiling and epsilon.
+    """
+    before = _root_vertical_statistics_torch(reference.detach(),cfg)
+    after = _root_vertical_statistics_torch(prediction,cfg)
+    terms = {}
+    for spec in physical_metric_specs(PhysicalQualityLimits.from_environment(),
+                                      StageAcceptancePolicy.from_environment()):
+        if spec.layer != "root_vertical":
+            continue
+        if not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1 or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0:
+            raise ValueError("invalid repair root vertical policy")
+        baseline = before[spec.key]
+        allowed = torch.where(baseline <= spec.absolute_limit,
+            (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(spec.absolute_limit),baseline)
+        epsilon = (baseline.abs()*1e-6).clamp_min(max(1e-8,abs(spec.absolute_limit)*1e-9))
+        # Already-over-limit references have zero *acceptance* headroom, not
+        # zero optimization scale. Dividing a linear hinge by 1e-4 here made
+        # sub-mm edits cause a gradient cliff and stalled the real bank at step
+        # 5. Use the existing policy margin only as a normalization scale;
+        # allowed/epsilon remain exactly unchanged. The one-sided quadratic
+        # shoulder has zero gradient at the boundary and bounded outer slope.
+        scale = (allowed-baseline).clamp_min(max(1e-4,spec.stage_margin))
+        gap = torch.relu(after[spec.key]-allowed-epsilon) / scale
+        shoulder = gap.clamp_max(1.0)
+        terms[f"repair_{spec.key}_excess"] = .5*shoulder.square() + gap - shoulder
+    return sum(terms.values()),terms
+
+
 def _refiner_gradient_diagnostics(model, repair_loss, clean_loss, clean_weight):
     """Measure gradients BEFORE clipping without mutating .grad or optimizer.
 
@@ -3970,20 +4014,21 @@ def _refiner_component_gradients(model, terms, cfg):
               "temporal":cfg.product_refiner_relative_temporal_weight * terms["temporal_supervision"]
                            + cfg.product_refiner_seam_jerk_weight * terms["jerk"],
               "support":terms["support_excess"],
-              "jerk_safety":terms.get("jerk_safety_excess", terms["jerk"] * 0)}
+              "jerk_safety":terms.get("jerk_safety_excess", terms["jerk"] * 0),
+              "root_vertical":terms.get("root_vertical_safety_excess",terms["jerk"] * 0)}
     params = [p for p in model.parameters() if p.requires_grad]
     gradients = {key:torch.autograd.grad(value,params,retain_graph=True,allow_unused=True)
                  for key,value in losses.items()}
     norms = {key:math.sqrt(sum(float(g.detach().double().square().sum()) for g in row if g is not None))
              for key,row in gradients.items()}
     pairs = {}
-    for a,b in (("endpoint","temporal"),("endpoint","support"),("temporal","support"),
-                ("endpoint","jerk_safety"),("temporal","jerk_safety"),("support","jerk_safety")):
+    keys = list(losses)
+    for a,b in ((keys[i],keys[j]) for i in range(len(keys)) for j in range(i+1,len(keys))):
         dot = sum(float((x.detach().double()*y.detach().double()).sum())
                   for x,y in zip(gradients[a],gradients[b]) if x is not None and y is not None)
         cosine = float(np.clip(dot/(norms[a]*norms[b]),-1,1)) if norms[a]*norms[b] > 1e-12 else None
         pairs[f"{a}/{b}"] = {"cosine":cosine,"conflicting":cosine is not None and cosine < 0}
-    return {"schema":"refiner_objective_gradient_v2","norms":norms,"pairs":pairs,"before_clipping":True}
+    return {"schema":"refiner_objective_gradient_v3","norms":norms,"pairs":pairs,"before_clipping":True}
 
 
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
@@ -5768,6 +5813,9 @@ def _training_config_sha256(
     }
     if stage == "refiner":
         payload["optimizer_update_protocol"] = REFINER_UPDATE_PROTOCOL
+        payload["observable_objective_protocol"] = REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
+        payload["repair_safety_protocol"] = REFINER_REPAIR_SAFETY_PROTOCOL
+        payload["input_protocol"] = REFINER_INPUT_PROTOCOL
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -6278,7 +6326,7 @@ def _refiner_batch_objectives(model, batch, cfg):
         for index,label in enumerate(("single_short","single_long","cross_short","cross_long")):
             selected = batch["group"] == index
             if bool(selected.any()):
-                for key in ("endpoint_continuity","temporal_supervision","support_excess","jerk_safety_excess"):
+                for key in ("endpoint_continuity","temporal_supervision","support_excess","jerk_safety_excess","root_vertical_safety_excess"):
                     terms[f"group_{label}_{key}"] = case_terms[key][selected].mean()
     protection, identity_terms = _product_refiner_clean_identity_loss(
         identity, batch["clean"], batch["clean_joint"], batch["clean_root"],
@@ -6339,6 +6387,7 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
             / before["seam_jerk_mps3"].clamp_min(1.0))
     jerk_safety, jerk_safety_terms = _repair_jerk_safety_loss_torch(
         proposed_metric_joints, reference_metric_joints, cfg)
+    root_safety, root_safety_terms = _repair_root_vertical_safety_loss_torch(prediction,reference,cfg)
     delta = product_log_torch(reference, prediction)
     active = (seam >= .5).to(delta.dtype)
     per_window = (delta.abs() * active).sum((1, 2)) / (active.sum((1, 2)) * delta.shape[-1]).clamp_min(1)
@@ -6353,7 +6402,7 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean((1,2)).detach()
     penetration = torch.relu(penetration - reference_penetration)
     physics = (cfg.product_refiner_relative_temporal_weight * temporal
-        + cfg.product_refiner_seam_jerk_weight * jerk + jerk_safety + support + penetration)
+        + cfg.product_refiner_seam_jerk_weight * jerk + jerk_safety + root_safety + support + penetration)
     loss = cfg.product_refiner_repair_margin_weight * endpoint + physics + trust + outside + .2 * contact
     zero = delta.sum((1,2)) * 0
     terms = {
@@ -6367,6 +6416,7 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         "physics": physics, "contact": contact, "outside": outside,
         "jerk": jerk,
         "jerk_safety_excess": jerk_safety, **jerk_safety_terms,
+        "root_vertical_safety_excess":root_safety, **root_safety_terms,
         "observable_trust_excess": trust, "support_excess": support,
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }
@@ -6558,9 +6608,10 @@ def train_refiner(args: argparse.Namespace) -> int:
             }
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+        clip_norm = float(nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True))
         update_report = checked_refiner_step(
-            opt, loss, lambda: _refiner_total_batch_loss(model, batch, cfg))
+            opt, loss, lambda: _refiner_total_batch_loss(model, batch, cfg),
+            gradient_unscale=max(1.0,clip_norm+1.0e-6))
         record_update(optimizer_updates, update_report)
         if logging_update:
             gradient_report["optimizer_update"] = update_report

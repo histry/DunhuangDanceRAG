@@ -15,13 +15,15 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "same_batch_descent_backtracking_v2_bounded_scale"
+REFINER_UPDATE_PROTOCOL = "same_batch_armijo_quadratic_v3"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
-MIN_TRIAL_SCALE = 2.0 ** (1 - MAX_BACKTRACK_TRIALS)
+ARMIJO_FACTOR = 1.0e-4
+MIN_RELATIVE_DECREASE = 1.0e-7  # optimization progress, NOT a motion-quality gate
 _SCALE_KEY = "refiner_trial_scale"  # persisted by optimizer.state_dict()
 
 
-def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_TRIALS):
+def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_TRIALS,
+                         gradient_unscale=1.0):
     """After backward/gradient clipping, accept only a finite strict decrease.
 
     Try the Adam proposal first, then current steepest descent if momentum is
@@ -29,9 +31,14 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
     An accepted scaled Adam proposal retains its gradient moments. An accepted
     steepest-descent rescue resets stale moments. A rejected/exceptional update
     restores BOTH parameters and complete optimizer state, including scale.
+    gradient_unscale must invert any uniform gradient clipping performed by
+    the caller: quadratic interpolation needs the derivative of LOSS, not the
+    clipped derivative. The Adam proposal still uses the clipped gradients.
     """
     if not 1 <= int(max_trials) <= MAX_BACKTRACK_TRIALS:
         raise ValueError(f"max_trials must be in [1,{MAX_BACKTRACK_TRIALS}]")
+    if not math.isfinite(gradient_unscale) or gradient_unscale < 1.0:
+        raise ValueError("gradient_unscale must be finite and >= 1")
     before = float(loss.detach())
     if not math.isfinite(before):
         raise FloatingPointError("nonfinite Refiner loss before optimizer update")
@@ -46,6 +53,8 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
     gradients = [p.grad.detach().clone() for p in parameters]
     if not bool(torch.stack([torch.isfinite(g).all() for g in gradients]).all()):
         raise FloatingPointError("nonfinite Refiner gradient before optimizer update")
+    minimum_decrease = max(abs(before), torch.finfo(loss.dtype).tiny) * max(
+        MIN_RELATIVE_DECREASE, 8.0 * torch.finfo(loss.dtype).eps)
     report = {
         "protocol": REFINER_UPDATE_PROTOCOL, "loss_before": before,
         "loss_after": before, "optimizer_update_accepted": False,
@@ -55,7 +64,9 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
         "resolution_limited_trials": 0, "first_trial_loss": None,
         "adam_directional_derivative": None, "used_gradient_rescue": False,
         "max_trials_per_direction": int(max_trials), "scientific_acceptance": False,
-        "minimum_trial_scale": MIN_TRIAL_SCALE, "scale_floor_hits": 0,
+        "minimum_loss_decrease": minimum_decrease, "armijo_factor": ARMIJO_FACTOR,
+        "gradient_unscale": float(gradient_unscale), "insufficient_decrease_trials": 0,
+        "trials": [],
     }
     maximum_gradient = torch.stack([g.abs().max() for g in gradients]).max()
     if float(maximum_gradient) == 0:
@@ -71,7 +82,8 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
         optimizer.load_state_dict(saved_optimizer)
 
     def derivative(direction):
-        return float(torch.stack([(g * delta).sum() for g, delta in zip(gradients, direction)]).sum())
+        return float(torch.stack([(g.double() * delta.double()).sum()
+            for g, delta in zip(gradients, direction)]).sum()) * gradient_unscale
 
     def search(direction, scale, name):
         slope = derivative(direction)
@@ -79,13 +91,6 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
             return False
         with torch.no_grad():
             for _ in range(int(max_trials)):
-                # Reusing a previous accepted scale must not turn a finite
-                # 12-trial search into unbounded shrinkage across training steps.
-                # Below this fixed grid try the CURRENT gradient at full scale,
-                # rather than count float-roundoff-sized Adam moves as progress.
-                if scale < MIN_TRIAL_SCALE:
-                    report["scale_floor_hits"] += 1
-                    break
                 changed = False
                 for parameter, value, delta in zip(parameters, original, direction):
                     candidate = value + scale * delta
@@ -100,15 +105,29 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
                     continue
                 candidate_loss = float(closure().detach())
                 report["trial_evaluations"] += 1
+                required = max(minimum_decrease, -ARMIJO_FACTOR * scale * slope)
+                report["trials"].append({"direction":name,"scale":scale,
+                    "loss":candidate_loss if math.isfinite(candidate_loss) else None,
+                    "required_decrease":required,"directional_derivative":slope})
                 if report["trial_evaluations"] == 1:
                     report["first_trial_loss"] = candidate_loss if math.isfinite(candidate_loss) else None
-                if math.isfinite(candidate_loss) and candidate_loss < before:
+                if math.isfinite(candidate_loss) and before - candidate_loss >= required:
                     report.update(loss_after=candidate_loss, optimizer_update_accepted=True,
                                   direction=name, step_scale=scale, reason="same_batch_loss_decreased")
                     return True
                 report["loss_rejected_trials"] += 1
                 report["nonfinite_trials"] += int(not math.isfinite(candidate_loss))
-                scale *= .5
+                report["insufficient_decrease_trials"] += int(
+                    math.isfinite(candidate_loss) and candidate_loss < before)
+                # Fit f(a)=f(0)+a*f'(0)+c*a^2 from the rejected trial. Unlike
+                # a fixed dimensionless floor, this adapts to curvature and
+                # parameterization. Safeguards + the unchanged trial budget
+                # prevent infinite search; meaningful loss decrease and actual
+                # parameter movement prevent counting roundoff as progress.
+                curvature = candidate_loss - before - scale * slope
+                proposal = (-slope * scale * scale / (2.0 * curvature)
+                    if math.isfinite(curvature) and curvature > 0 else scale * .5)
+                scale = min(scale * .5, max(scale * .01, proposal))
         return False
 
     try:
@@ -116,9 +135,10 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
         direction = [p.detach() - value for p, value in zip(parameters, original)]
         slope = derivative(direction)
         report["adam_directional_derivative"] = slope if math.isfinite(slope) else None
-        prior_scale = min(float(group.get(_SCALE_KEY, 1.0)) for group in optimizer.param_groups)
-        if not math.isfinite(prior_scale) or not MIN_TRIAL_SCALE <= prior_scale <= 1:
+        saved_scales = [float(group.get(_SCALE_KEY, 1.0)) for group in optimizer.param_groups]
+        if any(not math.isfinite(scale) or not 0 < scale <= 1 for scale in saved_scales):
             raise ValueError("invalid persisted Refiner trial scale")
+        prior_scale = min(saved_scales)
         accepted = search(direction, min(1.0, 2.0 * prior_scale), "adam")
         if not accepted:
             report["used_gradient_rescue"] = True
@@ -148,7 +168,7 @@ def record_update(summary, update):
         "gradient_rescue_steps": int(update["used_gradient_rescue"]),
         "trial_evaluations": int(update["trial_evaluations"]),
         "nonfinite_trials": int(update["nonfinite_trials"]),
-        "scale_floor_hits": int(update.get("scale_floor_hits", 0)),
+        "insufficient_decrease_trials": int(update.get("insufficient_decrease_trials", 0)),
         "accepted_non_descent_steps": int(update["optimizer_update_accepted"] and
                                            update["loss_after"] >= update["loss_before"]),
     }

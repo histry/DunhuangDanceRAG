@@ -168,7 +168,7 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
         if "endpoint_relative_gap" in terms and "temporal_relative_gap" in terms:
             achieved = torch.ones_like(target_satisfied)
             for key in ("endpoint_relative_gap", "temporal_relative_gap", "jerk",
-                        "jerk_safety_excess", "support_excess", "observable_trust_excess"):
+                        "jerk_safety_excess", "root_vertical_safety_excess", "support_excess", "observable_trust_excess"):
                 achieved &= torch.isfinite(terms[key]) & (terms[key] == 0)
             target_satisfied |= achieved
         active = ~(target_satisfied | search_stalled)

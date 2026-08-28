@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from training.refiner_optimizer import checked_refiner_step, REFINER_UPDATE_PROTOCOL
-from training.refiner_optimizer import MIN_TRIAL_SCALE
 
 
 def assert_state_equal(a, b):
@@ -91,7 +90,7 @@ def test_uphill_momentum_uses_current_gradient_not_ascent(device):
     assert float(objective()) < float(loss)
 
 
-def test_tiny_downhill_adam_steps_cannot_evade_the_fixed_search_range(device):
+def test_roundoff_sized_adam_gain_uses_meaningful_gradient_rescue(device):
     # Stale momentum has a large component along a highly curved coordinate.
     # Its dot product with the current gradient is negative, but shrinking it
     # indefinitely would accept a near-no-op instead of the useful x direction.
@@ -99,28 +98,59 @@ def test_tiny_downhill_adam_steps_cannot_evade_the_fixed_search_range(device):
     opt=torch.optim.AdamW([p],lr=.01,weight_decay=0.)
     (-p[1]).backward(); opt.step()
     with torch.no_grad(): p.zero_()
-    opt.param_groups[0]['refiner_trial_scale']=MIN_TRIAL_SCALE
+    opt.param_groups[0]['refiner_trial_scale']=2.0**-11
     opt.zero_grad(set_to_none=True)
     def objective(): return 1+p[0]+.5*p[0].square()+1e6*p[1].square()
     loss=objective(); loss.backward()
     report=checked_refiner_step(opt,loss,objective)
     assert report['adam_directional_derivative'] < 0
-    assert report['scale_floor_hits'] > 0
     assert report['direction']=='current_gradient'
     assert report['loss_before']-report['loss_after'] > .009
-    assert MIN_TRIAL_SCALE <= report['step_scale'] <= 1
+    assert 0 < report['step_scale'] <= 1
     assert p[1]==0 and not opt.state
 
 
 def test_out_of_range_persisted_scale_is_rejected_and_restored(device):
     p=torch.nn.Parameter(torch.ones(1,device=device))
     opt=torch.optim.AdamW([p],lr=.1)
-    opt.param_groups[0]['refiner_trial_scale']=MIN_TRIAL_SCALE/2
+    opt.param_groups[0]['refiner_trial_scale']=0
     loss=p.square().sum(); loss.backward()
     state=copy.deepcopy(opt.state_dict())
     with pytest.raises(ValueError,match='persisted Refiner trial scale'):
         checked_refiner_step(opt,loss,lambda:p.square().sum())
     assert p==1
+    assert_state_equal(opt.state_dict(),state)
+
+
+def test_curved_objective_can_take_meaningful_step_below_old_scale_floor(device):
+    # The old 2^-11 floor rejects every trial here although the optimum is
+    # representable and reduces loss by nearly 100%, not a numerical no-op.
+    p=torch.nn.Parameter(torch.zeros(1,device=device,dtype=torch.float64))
+    opt=torch.optim.AdamW([p],lr=1e-3,weight_decay=0.)
+    def objective(): return (1e8*p-1).square().sum()
+    loss=objective(); loss.backward()
+    norm=float(torch.nn.utils.clip_grad_norm_([p],1.))
+    report=checked_refiner_step(opt,loss,objective,gradient_unscale=max(1.,norm+1e-6))
+    assert report['optimizer_update_accepted']
+    assert 0 < report['step_scale'] < 2.0**-11
+    assert report['loss_after'] < .01
+    assert report['trial_evaluations'] <= 24
+    first=report['trials'][0]
+    assert first['directional_derivative'] == pytest.approx(-2e5,rel=1e-5)
+    assert report['trials'][-1]['required_decrease'] <= report['loss_before']-report['loss_after']
+
+
+def test_tiny_loss_change_is_not_progress_even_when_parameters_change(device):
+    p=torch.nn.Parameter(torch.zeros(1,device=device,dtype=torch.float64))
+    opt=torch.optim.AdamW([p],lr=1e-13,weight_decay=0.)
+    def objective(): return (1+p).sum()
+    loss=objective(); loss.backward()
+    state=copy.deepcopy(opt.state_dict())
+    report=checked_refiner_step(opt,loss,objective)
+    assert not report['optimizer_update_accepted']
+    assert report['insufficient_decrease_trials'] > 0
+    assert report['trial_evaluations'] <= 24
+    assert p==0
     assert_state_equal(opt.state_dict(),state)
 
 
@@ -189,12 +219,14 @@ def test_diagnostic_and_formal_training_share_checked_update():
     assert REFINER_UPDATE_PROTOCOL == m.REFINER_UPDATE_PROTOCOL
 
 
-def test_update_protocol_invalidates_refiner_resume_hash_not_diffusion(monkeypatch):
+@pytest.mark.parametrize('protocol_name',['REFINER_UPDATE_PROTOCOL',
+    'REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL','REFINER_REPAIR_SAFETY_PROTOCOL','REFINER_INPUT_PROTOCOL'])
+def test_update_protocol_invalidates_refiner_resume_hash_not_diffusion(monkeypatch,protocol_name):
     from training import motion_models as m
     cfg=m.MotionGenerationConfig()
     a=m._training_config_sha256(cfg,stage='refiner')
     b=m._training_config_sha256(cfg,stage='diffusion')
-    monkeypatch.setattr(m,'REFINER_UPDATE_PROTOCOL','old_unchecked_update')
+    monkeypatch.setattr(m,protocol_name,'old_protocol')
     assert m._training_config_sha256(cfg,stage='refiner') != a
     assert m._training_config_sha256(cfg,stage='diffusion') == b
 
@@ -229,8 +261,8 @@ def test_real_refiner_objective_replays_same_batch_and_keeps_finite_gradients(de
         opt.zero_grad(set_to_none=True)
         loss=objective()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
-        report=checked_refiner_step(opt,loss,objective)
+        norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True))
+        report=checked_refiner_step(opt,loss,objective,gradient_unscale=max(1.,norm+1e-6))
         with torch.no_grad(): after=float(objective())
         assert after <= float(loss)
         assert report['loss_after'] == after

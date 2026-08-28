@@ -85,7 +85,7 @@ def test_clean_identity_does_not_inherit_the_repair_stage_support_budget():
 
 def objective(prediction, reference, seam, cfg, **kwargs):
     loss = (prediction[:,20:24,4]-reference[:,20:24,4]-.002).square().mean(1)
-    return loss, {k:loss*0 for k in ('endpoint_continuity','temporal_supervision','support_excess','jerk_safety_excess')}
+    return loss, {k:loss*0 for k in ('endpoint_continuity','temporal_supervision','support_excess','jerk_safety_excess','root_vertical_safety_excess')}
 
 
 def test_independent_direct_case_gradient_does_not_depend_on_batch_size(tmp_path):
@@ -155,6 +155,14 @@ def test_only_achieved_training_targets_stop_a_case_early(tmp_path):
     with mock.patch.object(m,'_observable_refiner_objective',side_effect=not_at_training_target):
         _,summary = f.direct_optimize(b,cfg,3,label='not-target',log_path=tmp_path/'more.jsonl')
     assert not summary[0]['target_satisfied'] and summary[0]['attempted_optimizer_steps'] == 3
+
+    def at_targets_but_vertical_violation(*args,**kwargs):
+        loss,terms=targeted(*args,**kwargs)
+        terms['root_vertical_safety_excess']=loss*0+.01
+        return loss,terms
+    with mock.patch.object(m,'_observable_refiner_objective',side_effect=at_targets_but_vertical_violation):
+        _,summary=f.direct_optimize(b,cfg,3,label='root-unsafe',log_path=tmp_path/'root.jsonl')
+    assert not summary[0]['target_satisfied'] and summary[0]['attempted_optimizer_steps']==3
 
 
 def test_stalled_search_is_reported_and_does_not_count_no_edit_as_repair(tmp_path):

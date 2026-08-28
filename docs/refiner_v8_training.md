@@ -4,7 +4,77 @@ This change repairs artificial joins, not original SMPL14 assets. Existing
 retarget cache, train/val/test Event-DB, Router/Duration/Planner and generation
 index stay read-only. No external pretrained model is introduced.
 
-## Latest diagnostic: full-bank fitting and bounded step scale
+## Latest repair: curvature-aware search, vertical safety, portable diagnostics
+
+The full `055d85e` server report is now available. Foundation passed all eight
+groups, but the network stopped at attempt 19 (18 accepted, 84 trial forwards).
+All 64 temporal cases failed. This is NOT a completed 400-step experiment or
+evidence of damaged original SMPL. Its loss dropped from 0.0625 to 0.0347613,
+while the temporal loss increased from 0.0500 to 0.0558140. At step 1 the
+weighted endpoint/temporal gradient norms were 139.22/4.59 and cosine -0.421;
+step 19 lacked component gradients. One sampled conflict cannot establish the
+complete cause of the neural generalization failure.
+
+Three concrete issues are corrected without relaxing acceptance:
+
+- The preceding 2^-11 step floor was not scale-invariant. A high-curvature
+  quadratic regression test shows it can forbid representable steps that
+  remove nearly all loss. Replace blind halving/floor exclusion with safeguarded
+  quadratic interpolation and an Armijo sufficient-decrease check. There are
+  still at most 12 trials per direction (24 total), finite-state checks and
+  transactional rollback. Clipping is explicitly undone for the directional
+  derivative calculation, not for the Adam proposal. Loss decrease must exceed
+  both the Armijo amount and max(1e-7, 8*loss-dtype-epsilon) relative to initial
+  loss magnitude. A 1e-13 numerical gain cannot count as useful progress.
+  This is an optimizer tolerance, NOT a change to physical quality thresholds.
+- Repair loss previously guarded jerk tails and horizontal foot support but
+  omitted root vertical range/speed. The uploaded cross-event case 12 has
+  root-speed P95 1.464076 -> 1.466682 m/s (seen) and 1.465710 -> 1.468365 (new).
+  Both references exceed the 1.25 m/s absolute ceiling, so the unchanged stage
+  policy allows identity but no additional budget beyond numerical tolerance.
+  Add per-case root robust range, vertical P95 and maximum excess losses using
+  the same stage registry, ratio-plus-margin, ceiling and epsilon. These losses
+  and gradients are zero inside the permitted region. Their statistics match
+  the independent float32 root-difference auditor. Final audits are unchanged.
+  A linear penalty divided by 1e-4 on zero-headroom inputs was rejected after
+  a local control stalled at step 5. The adopted one-sided quadratic shoulder
+  has zero slope at the boundary; the existing policy margin sets only its
+  normalization scale and NEVER enlarges the permitted metric value.
+- At an unlogged stall, recompute endpoint/temporal/support/jerk/root gradient
+  diagnostics on the retained model and SAME TRAIN bank. Save every update's
+  trials in `optimizer_updates.jsonl`. Save `fit_bank.pt` (only the exact seen
+  TRAIN inputs, masks, descriptors and provenance) plus rolling
+  `diagnostic_state.pt` (model + optimizer state, including search scale).
+  Local Event-DB files did not match the eight uploaded window hashes; same
+  filenames cannot justify replay claims. These artifacts are explicitly
+  diagnostic-only and cannot be used as formal training/resume checkpoints.
+
+The optimizer-only local control (before adding the vertical-loss term) reached
+392 attempts/391 accepted, loss 0.00302907, versus the preceding local control's
+143/142 and 0.00401173. Both use eight local TRAIN windows, NOT the exact server
+events. At 392, seen single-recording temporal passed 16/16 but new-position
+single-recording remained 0/16; new cross-event passed 4/16. This supports an
+optimization correction, NOT repaired generalization or authorization to train.
+No old model, safety threshold or original asset is overwritten by this audit.
+
+The final integrated local smoke control (80-step budget, new root constraint)
+stopped at attempt 77/76 accepted, loss 0.01308330. Seen single/short temporal
+passed 5/8; all other temporal groups failed, including new-position 0/32.
+Vertical-speed rejections were absent in this smoke result, but foot safety
+and learned repair still failed. It is neither a successful 400-step diagnostic
+nor an independent validation result. The extra root protection is an objective
+alignment fix, NOT evidence of increased overall repair quality.
+
+Diagnostic schema is v8, update protocol `same_batch_armijo_quadratic_v3`,
+repair safety `stage_registry_jerk_root_constraints_v2`. Model architecture
+remains V9. Use a new `refiner_v9_armijo_*` tag and regenerate foundation under
+the current objective. An early stop or any failed subgroup still blocks pilot,
+full training and Diffusion. No external pretrained model is downloaded.
+Refiner resume fingerprints now include input, objective and safety protocols
+as well as optimizer protocol; changing a loss cannot silently resume old
+training moments simply because the model tensor shapes remain V9-compatible.
+
+## Previous diagnostic: full-bank fitting and bounded step scale
 
 The server's `5fad394` run completed the control and neural diagnostic normally.
 All 64 zero-edit cases were exact identities; the eight foundation groups passed.
@@ -53,8 +123,9 @@ long-seam groups; it is NOT adopted here as a validated architectural solution.
 Neural generalization remains unverified. Do not infer successful training from
 loss descent or run 8000 steps directly after pulling this change.
 
-Neural diagnostic schema is v7, fitting protocol `complete_seen_bank_descent_v1`,
-and update protocol `same_batch_descent_backtracking_v2_bounded_scale`.
+That revision used neural diagnostic schema v7, fitting protocol
+`complete_seen_bank_descent_v1`, and update protocol
+`same_batch_descent_backtracking_v2_bounded_scale` (superseded above).
 Reports/optimizer snapshots from the earlier protocol cannot authorize or resume
 a fresh run. Use a new `refiner_v9_fullbank_*` tag. All source/scheduler assets
 remain reusable and no external model is downloaded.
@@ -156,7 +227,7 @@ If diagnosis fails, supply this new summary together with the console log;
 do not substitute a historical same-name JSON from another revision.
 
 The script name `scripts/train_refiner_v8.sh` is intentionally retained, with
-the dependency order unchanged. Use a new `refiner_v9_fullbank_*` tag. Source
+the dependency order unchanged. Use a new `refiner_v9_armijo_*` tag. Source
 assets are reusable; old foundation/diagnostic authorizations and trained
 Refiner weights are not silently migrated across source fingerprints.
 
@@ -256,7 +327,7 @@ jerk stencil before/after editing. Frame indices are local to the diagnostic
 window, zero-based, not absolute SMPL recording frames. Separate jerk-safety
 gradient norms/conflicts are logged alongside endpoint/temporal/support terms.
 
-Foundation is v4; the latest neural diagnostic is v7. Old reports/snapshots
+Foundation is v4; the latest neural diagnostic is v8. Old reports/snapshots
 must not authorize a new run: use a fresh tag and rerun foundation. Passing
 safe direct optimization still does not demonstrate neural generalization.
 Generation verifies the current code revision and byte-identical promotion
@@ -323,7 +394,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v9_fullbank_trial1
+export TAG=refiner_v9_armijo_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```
