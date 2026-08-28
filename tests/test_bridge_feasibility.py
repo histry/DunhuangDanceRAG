@@ -136,12 +136,14 @@ def test_smoke_incomplete_groups_and_bad_roundtrip_never_authorize_fitting():
               "direct":{s:passing_metrics() for s in ("seen","new_position")},
               "interpolation_vs_ik":{f"{s}/{r}":{"cases":16,"preserved":16}
                     for s in ("seen","new_position") for r in ("single_recording","cross_event")},
-              "roundtrip":{"rejected_count":0}}
+              "roundtrip":{"rejected_count":0,"cases":64,"exact_identity_count":64}}
     assert f.foundation_decision(report,cfg)["ready_for_network_diagnostic"]
     bad = copy.deepcopy(report); bad["direct_steps"]=2
     assert not f.foundation_decision(bad,cfg)["ready_for_network_diagnostic"]
     bad = copy.deepcopy(report); bad["roundtrip"]["rejected_count"]=1
     assert not f.foundation_decision(bad,cfg)["ready_for_network_diagnostic"]
+    bad = copy.deepcopy(report); bad["roundtrip"]["exact_identity_count"]=63
+    assert "no_edit_decode_not_identity" in f.foundation_decision(bad,cfg)["reasons"]
     bad = copy.deepcopy(report); bad["interpolation_vs_ik"]={}
     assert not f.foundation_decision(bad,cfg)["ready_for_network_diagnostic"]
     bad = copy.deepcopy(report); del bad["direct"]["new_position"]

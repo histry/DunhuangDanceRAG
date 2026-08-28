@@ -49,6 +49,28 @@ Refiner: `product_manifold_boundary_refiner_v8`; Diffusion:
 `reference_tangent_motion_diffusion_v4`; boundary protocol:
 `observable_duration_c2_bridge_v2`. V7 reports/models/snapshots are incompatible.
 
+## Zero-edit numerical contract fix
+
+The retraction protocol is now `zero_centered_rot6d_action_v1`. Both NumPy and
+Torch rotate the original 6D columns by an increment, rather than re-encoding
+the reference even when the requested correction is zero. Zero output keeps
+all motion values exactly equal while retaining tangent and reference gradients;
+nonzero output still implements the same body-frame SO(3) action. This does not
+sanitize invalid inputs or relax physical tolerances. The observable temporal
+objective and its CPU audit now both use float64 from FK onwards; promoting
+only already-rounded float32 joint positions left CPU/CUDA discrepancies at
+the 2% jerk boundary. Gradients still flow to the float32 model on GPU.
+Independent physical/fidelity audits and all acceptance thresholds are unchanged.
+
+Foundation schema v2 records exact identity counts and per-case changed values
+as well as FK errors. The 64-case no-edit check runs before direct optimization
+and fails closed immediately if identity or physical non-regression fails.
+Retraction and physical-auditor source hashes are included in the fingerprint.
+Reports from the previous commit must not have their acceptance flags edited:
+start a NEW tag and rerun the 200-step foundation control under the new code.
+The nonzero decoder changed numerically too, so old direct-control pass counts
+cannot simply be copied into a fresh report. Source/scheduler assets are reused.
+
 ## Foreground server workflow (no tmux)
 
 After pulling the reviewed release on main, initialize the current shell:
@@ -57,7 +79,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v8_foundation_trial1
+export TAG=refiner_v8_identity_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```
@@ -80,6 +102,10 @@ case directly for 200 steps. Inspect `interpolation_vs_ik`, `roundtrip`, `direct
 
 Exit 2 means completed but not ready, not automatically a crash. Check the
 first traceback if present. Do not continue after a failed gate.
+The first `bridge_zero_edit_preflight` line must show `cases=64`,
+`exact_identity_count=64`, `rejected_count=0`, `max_fk_roundtrip_m=0`.
+That line alone does NOT authorize fitting: the final decision must still have
+`ready_for_network_diagnostic=true` after the direct control.
 
 ### 2. Only after foundation passes: 400-step network diagnostic
 

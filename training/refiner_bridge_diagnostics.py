@@ -18,6 +18,8 @@ from training import motion_models as m
 from training import refiner_diagnostics as common
 from motion_geometry import boundary_observables
 from motion_geometry import inbetween
+from motion_geometry import product_manifold, physical
+from contracts import physical_quality
 
 
 SCHEMA = "refiner_observable_bridge_diagnostic_v2"
@@ -30,7 +32,11 @@ def fingerprint(args, cfg):
         "boundary_observables": common.file_sha256(boundary_observables.__file__),
         "inbetween": common.file_sha256(inbetween.__file__),
         "bridge_feasibility": common.file_sha256(Path(__file__).with_name("bridge_feasibility.py")),
+        "product_manifold": common.file_sha256(product_manifold.__file__),
+        "physical_geometry": common.file_sha256(physical.__file__),
+        "physical_quality": common.file_sha256(physical_quality.__file__),
     })
+    value["retraction_protocol"] = product_manifold.RETRACTION_PROTOCOL
     return value
 
 

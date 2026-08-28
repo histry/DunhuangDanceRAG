@@ -4995,14 +4995,28 @@ def _summarize_validation_physical_metrics(
     }
 
 
+def _observable_boundary_joints_torch(motion):
+    """Promote BEFORE FK, not after float32 joint-position cancellation.
+
+    Used by both the CUDA repair objective and the CPU observable audit. Their
+    third derivatives must agree at the strict 2% jerk boundary. Storage and
+    the independent physical/fidelity audits keep their existing contracts.
+    """
+    return fk_24_torch(motion.to(dtype=torch.float64))
+
+
 def _observable_boundary_audit(prediction, reference, seam, cfg):
     try:
-        joints = np.stack([fk_24_np(reference), fk_24_np(prediction)])
-        metrics = boundary_metrics_torch(
-            torch.as_tensor(joints), torch.as_tensor(np.stack([seam, seam])), cfg.fps)
+        with torch.no_grad():
+            metric_joints = _observable_boundary_joints_torch(
+                torch.as_tensor(np.stack([reference, prediction])))
+            metrics = boundary_metrics_torch(
+                metric_joints, torch.as_tensor(np.stack([seam, seam])), cfg.fps)
         values = [{key: (bool(value[i]) if key == "valid" else float(value[i]))
                    for key, value in metrics.items()} for i in range(2)]
         gate = observable_gate(values[0], values[1], cfg)
+        gate["numeric_contract"] = "float64_fk_before_temporal_differences_v1"
+        joints = np.stack([fk_24_np(reference), fk_24_np(prediction)])
         error = np.linalg.norm(joints[1] - joints[0], axis=-1)
         gate["reference_fidelity"] = {"fk_p95_m": float(np.percentile(error,95)),
             "fk_max_m": float(np.max(error)), "product_log_l1": float(np.abs(product_log_np(reference,prediction)).mean())}
@@ -6164,8 +6178,12 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         raise ValueError("invalid observable loss reduction")
     joints = fk_24_torch(torch.cat([prediction, reference.detach()]))
     proposed_joints, reference_joints = joints.split(count)
-    proposed = boundary_metrics_torch(proposed_joints, seam, cfg.fps)
-    before = boundary_metrics_torch(reference_joints.detach(), seam, cfg.fps)
+    # Support/penetration use their existing physical-loss coordinates. Only
+    # observable temporal metrics share the higher-precision audit FK path.
+    metric_joints = _observable_boundary_joints_torch(torch.cat([prediction, reference.detach()]))
+    proposed_metric_joints, reference_metric_joints = metric_joints.split(count)
+    proposed = boundary_metrics_torch(proposed_metric_joints, seam, cfg.fps)
+    before = boundary_metrics_torch(reference_metric_joints.detach(), seam, cfg.fps)
     gain = cfg.product_refiner_training_target_repair_gain
 
     def margin(key):

@@ -16,7 +16,7 @@ import numpy as np
 
 from training import motion_models as m
 
-SCHEMA = "bridge_foundation_feasibility_v1"
+SCHEMA = "bridge_foundation_feasibility_v2"
 
 
 def balanced_indices(role_count, rng):
@@ -145,18 +145,23 @@ def baseline_comparison(pure,banks,cfg):
 
 
 def roundtrip_diagnostic(banks,cfg):
-    """Measure no-edit decode/FK numerical error; NEVER enlarge tolerances here."""
+    """Require exact zero-edit values and audit them; NEVER enlarge tolerances."""
     rows = []
     for key,bank in banks.items():
         with m.torch.no_grad():
             output = bank["bad"].new_zeros((*bank["bad"].shape[:-1],m.PRODUCT_STATE_DIM))
             decoded = m._decode_product_refiner_output(bank["bad"],output,
                 *m._refiner_decode_masks(bank["joint"],bank["root"],bank["contact"],bank["seam"],cfg),cfg)
-        for reference,candidate in zip(bank["bad"].cpu().numpy(),decoded.cpu().numpy()):
+        for case_index,(reference,candidate) in enumerate(zip(bank["bad"].cpu().numpy(),decoded.cpu().numpy())):
             gate = m._fixed_support_stage_gate(reference,candidate,cfg)
-            rows.append({"group":"/".join(key),"gate":gate,
+            error = float(np.abs(reference-candidate).max())
+            rows.append({"group":"/".join(key),"case_index":case_index,"gate":gate,
+                "exact_identity":bool(np.array_equal(reference,candidate)),
+                "changed_values":int(np.count_nonzero(reference!=candidate)),
+                "max_motion_abs_error":error if np.isfinite(error) else None,
                 "max_fk_roundtrip_m":float(np.abs(m.fk_24_np(reference)-m.fk_24_np(candidate)).max())})
     return {"policy":"measurement_only_no_tolerance_changes","windows":rows,
+            "cases":len(rows),"exact_identity_count":sum(r["exact_identity"] for r in rows),
             "max_fk_roundtrip_m":max(r["max_fk_roundtrip_m"] for r in rows),
             "rejected_count":sum(not r["gate"]["accepted"] for r in rows)}
 
@@ -175,6 +180,8 @@ def foundation_decision(report,cfg):
     if not complete: reasons.append("incomplete_or_smoke_protocol")
     if not baseline_pass: reasons.append("contact_ik_baseline_regression")
     if report["roundtrip"]["rejected_count"]: reasons.append("no_edit_roundtrip_rejected")
+    if report["roundtrip"].get("cases")!=64 or report["roundtrip"].get("exact_identity_count")!=64:
+        reasons.append("no_edit_decode_not_identity")
     if not direct_pass: reasons.append("finite_direct_optimizer_did_not_demonstrate_repair_headroom")
     return {"ready_for_network_diagnostic":not reasons,"reasons":reasons,"groups":groups,
         "scientific_acceptance":False,"publish_allowed":False,
@@ -206,11 +213,23 @@ def run_foundation(args,cfg,banks,pure,recipes,fingerprint,windows,separation):
         "direct_control_fits_probe_cases_separately":True,"generalization_evidence":False,
         "clean_identity_in_controls":"no_edit_only_not_a_learned_protection_result",
         "pure_interpolation":{},"interpolation_ik":{},"direct":{},"decoder":{}}
+    # Run the no-edit contract before spending the direct-optimization budget.
+    # Keep every failure's metrics, not merely a final aggregate reason.
+    report["roundtrip"] = roundtrip_diagnostic(banks,cfg)
+    rt = report["roundtrip"]
+    print(json.dumps({"stage":"bridge_zero_edit_preflight",**{
+        k:rt[k] for k in ("cases","exact_identity_count","rejected_count","max_fk_roundtrip_m")}},allow_nan=False),flush=True)
+    if rt["rejected_count"] or rt["exact_identity_count"]!=rt["cases"]:
+        report["blocked_before_direct_optimization"] = True
+        report["failure_reasons"] = ["no_edit_roundtrip_rejected"]
+        m.save_json(report,destination/"foundation_report.json")
+        print(json.dumps({"stage":"bridge_foundation_blocked","report":str(destination/"foundation_report.json"),
+            "ready_for_network_diagnostic":False,"reasons":report["failure_reasons"]}),flush=True)
+        return 2
     for split in ("seen","new_position"):
         report["pure_interpolation"][split] = evaluate(None,pure,split,cfg)
         report["interpolation_ik"][split] = evaluate(None,banks,split,cfg)
     report["interpolation_vs_ik"] = baseline_comparison(pure,banks,cfg)
-    report["roundtrip"] = roundtrip_diagnostic(banks,cfg)
     m.save_json(report,destination/"foundation_report.json")
     predictions = {}
     for key,bank in banks.items():

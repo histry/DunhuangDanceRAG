@@ -18,7 +18,6 @@ from typing import Any, Optional
 import numpy as np
 
 from motion_geometry.rotations import (
-    matrix_to_rot6d_np,
     rot6d_to_matrix_np,
     so3_exp_np,
     so3_log_np,
@@ -39,6 +38,7 @@ except Exception:  # pragma: no cover
 
 TANGENT_DIM = 3 + NUM_JOINTS * 3
 PRODUCT_STATE_DIM = 4 + TANGENT_DIM
+RETRACTION_PROTOCOL = "zero_centered_rot6d_action_v1"
 _EPS = 1.0e-8
 
 
@@ -91,8 +91,28 @@ def product_log_np(reference: np.ndarray, target: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _so3_increment_np(value: np.ndarray) -> np.ndarray:
+    """Exp(value) - I, without subtracting two almost equal matrices."""
+    v = np.asarray(value, dtype=np.float64)
+    theta = np.linalg.norm(v, axis=-1)
+    x, y, z = np.moveaxis(v, -1, 0)
+    zero = np.zeros_like(x)
+    skew = np.stack([zero, -z, y, z, zero, -x, -y, x, zero], axis=-1)
+    skew = skew.reshape(v.shape[:-1] + (3, 3))
+    a = np.sinc(theta / np.pi)[..., None, None]
+    b = (0.5 * np.sinc(theta / (2.0 * np.pi)) ** 2)[..., None, None]
+    return (a * skew + b * (skew @ skew)).astype(np.float32)
+
+
 def product_exp_np(reference: np.ndarray, tangent: np.ndarray) -> np.ndarray:
-    """Retract a 75D tangent at ``reference`` back to valid EDGE-151 motion."""
+    """Retract a tangent, preserving the reference's Rot6D gauge at zero.
+
+    If Q is the decoded reference rotation, left-rotating both original 6D
+    columns by Exp(Q v) decodes to Q Exp(v). This preserves column norms/shear
+    as well as orientation, rather than re-encoding Q on a no-edit call.
+    Compute the increment directly so zero tangent is exactly the identity.
+    Invalid input is not sanitized; validity belongs to the input contract.
+    """
     ref = _validate_edge_np(reference, "reference")
     delta = _validate_tangent_np(tangent)
     if ref.shape[:-1] != delta.shape[:-1]:
@@ -103,8 +123,12 @@ def product_exp_np(reference: np.ndarray, tangent: np.ndarray) -> np.ndarray:
     out[..., ROOT] = ref[..., ROOT] + delta[..., :3]
     ref_r = _edge_rotations_np(ref)
     rotvec = delta[..., 3:].reshape(ref.shape[:-1] + (NUM_JOINTS, 3))
-    out_r = ref_r @ so3_exp_np(rotvec)
-    out[..., ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(out_r).reshape(
+    world_rotvec = (ref_r @ rotvec[..., None])[..., 0]
+    columns = ref[..., ROT6D_START:ROT6D_END].reshape(
+        ref.shape[:-1] + (NUM_JOINTS, 2, 3)
+    ).swapaxes(-1, -2)
+    rotated = columns + _so3_increment_np(world_rotvec) @ columns
+    out[..., ROT6D_START:ROT6D_END] = rotated.swapaxes(-1, -2).reshape(
         ref.shape[:-1] + (NUM_JOINTS * 6,)
     )
     return out.astype(np.float32)
@@ -427,10 +451,6 @@ def _rot6d_to_matrix_torch(value: "torch.Tensor") -> "torch.Tensor":
     return torch.stack([b1, b2, b3], dim=-1)
 
 
-def _matrix_to_rot6d_torch(value: "torch.Tensor") -> "torch.Tensor":
-    return torch.cat([value[..., :, 0], value[..., :, 1]], dim=-1)
-
-
 def _so3_log_torch(value: "torch.Tensor") -> "torch.Tensor":
     # atan2 formulation is stable near the identity; the pi branch uses the
     # diagonal of (R + I) / 2 and keeps gradients finite for training inputs.
@@ -471,7 +491,8 @@ def _skew_torch(value: "torch.Tensor") -> "torch.Tensor":
     ).reshape(value.shape[:-1] + (3, 3))
 
 
-def _so3_exp_torch(value: "torch.Tensor") -> "torch.Tensor":
+def _so3_increment_torch(value: "torch.Tensor") -> "torch.Tensor":
+    """Stable Exp(value) - I, with a nonzero first derivative at zero."""
     theta_sq = (value * value).sum(dim=-1, keepdim=True)
     theta = torch.sqrt(theta_sq.clamp_min(_EPS))
     a = torch.where(
@@ -485,8 +506,12 @@ def _so3_exp_torch(value: "torch.Tensor") -> "torch.Tensor":
         0.5 - theta_sq / 24.0 + theta_sq * theta_sq / 720.0,
     )
     skew = _skew_torch(value)
+    return a[..., None] * skew + b[..., None] * (skew @ skew)
+
+
+def _so3_exp_torch(value: "torch.Tensor") -> "torch.Tensor":
     identity = torch.eye(3, dtype=value.dtype, device=value.device)
-    return identity + a[..., None] * skew + b[..., None] * (skew @ skew)
+    return identity + _so3_increment_torch(value)
 
 
 def product_log_torch(
@@ -516,6 +541,11 @@ def product_log_torch(
 def product_exp_torch(
     reference: "torch.Tensor", tangent: "torch.Tensor"
 ) -> "torch.Tensor":
+    """Differentiable zero-centered action; see ``product_exp_np``.
+
+    There is no zero-output branch or detached correction: gradients through
+    zero-initialized Refiner/Diffusion heads and through the reference survive.
+    """
     ref = _validate_edge_torch(reference, "reference")
     if tangent.shape[-1] != TANGENT_DIM or ref.shape[:-1] != tangent.shape[:-1]:
         raise ValueError("tangent must be prefix-compatible and end in 75")
@@ -524,12 +554,16 @@ def product_exp_torch(
         ref[..., ROT6D_START:ROT6D_END].reshape(prefix + (NUM_JOINTS, 6))
     )
     rotvec = tangent[..., 3:].reshape(prefix + (NUM_JOINTS, 3))
-    out_r = ref_r @ _so3_exp_torch(rotvec)
+    world_rotvec = (ref_r @ rotvec[..., None]).squeeze(-1)
+    columns = ref[..., ROT6D_START:ROT6D_END].reshape(
+        prefix + (NUM_JOINTS, 2, 3)
+    ).transpose(-1, -2)
+    rotated = columns + _so3_increment_torch(world_rotvec) @ columns
     return torch.cat(
         [
             ref[..., CONTACT],
             ref[..., ROOT] + tangent[..., :3],
-            _matrix_to_rot6d_torch(out_r).reshape(
+            rotated.transpose(-1, -2).reshape(
                 prefix + (NUM_JOINTS * 6,)
             ),
         ],
@@ -683,6 +717,7 @@ def masked_retract(reference: Any, tangent: Any, **kwargs: Any) -> Any:
 
 __all__ = [
     "PRODUCT_STATE_DIM",
+    "RETRACTION_PROTOCOL",
     "TANGENT_DIM",
     "masked_retract",
     "masked_retract_np",
