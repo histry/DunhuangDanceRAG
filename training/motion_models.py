@@ -96,8 +96,8 @@ from motion_geometry.boundary_observables import (
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v7"
-DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v3"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v8"
+DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 
 
 def now_tag() -> str:
@@ -348,6 +348,10 @@ class MotionGenerationConfig:
     overlap: int = 12
     transition_train_min_seconds: float = 10.0 / 30.0
     transition_train_max_seconds: float = 28.0 / 30.0
+    transition_root_tangent_max_mps: float = 1.35
+    transition_root_vertical_tangent_max_mps: float = 0.9
+    transition_angular_speed_max_rps: float = 8.0
+    transition_root_tangent_margin_m: float = 0.12
     transition_mask_halo_seconds: float = 6.0 / 30.0
     transition_tangent_smoothing_passes: int = 4
     ik_enable: bool = True
@@ -605,6 +609,11 @@ class MotionGenerationConfig:
             "MOTION_OVERLAP": ("overlap", int),
             "MOTION_TRANSITION_TRAIN_MIN_SECONDS": ("transition_train_min_seconds", float),
             "MOTION_TRANSITION_TRAIN_MAX_SECONDS": ("transition_train_max_seconds", float),
+            "ROUTING_SAFETY_TRANSITION_ROOT_XZ_SPEED_CAP_MPS": ("transition_root_tangent_max_mps", float),
+            "ROUTING_SAFETY_TRANSITION_ROOT_Y_SPEED_CAP_MPS": ("transition_root_vertical_tangent_max_mps", float),
+            "ROUTING_SAFETY_TRANSITION_ANGULAR_SPEED_CAP_RADPS": ("transition_angular_speed_max_rps", float),
+            "ROUTING_SAFETY_TRANSITION_ROOT_TANGENT_MARGIN_M": ("transition_root_tangent_margin_m", float),
+            "MOTION_TRANSITION_ROOT_TANGENT_MAX_MPS": ("transition_root_tangent_max_mps", float),
             "MOTION_TRANSITION_MASK_HALO_SECONDS": ("transition_mask_halo_seconds", float),
             "MOTION_TRANSITION_TANGENT_SMOOTHING_PASSES": (
                 "transition_tangent_smoothing_passes",
@@ -3678,15 +3687,12 @@ def _masked_speed_stats_torch(speed, mask):
     return p95, maximum
 
 
-def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_contacts, cfg):
-    """Bound clean planted-foot speed without demanding zero foot motion.
+def _reference_support_statistics_torch(predicted_joints, clean_joints, clean_contacts, cfg):
+    """Same reference support frames/segments for loss AND relative audit.
 
-    Freeze support from the authentic input, so making a supported foot faster
-    or changing contact logits cannot remove its penalty. The final full audit
-    still reclassifies actual support independently.
+    Segment anchors are gathered on device; no per-frame Python/GPU sync loop.
+    Candidate speed/contact changes cannot remove frames from the comparison.
     """
-    if predicted_joints.shape[1] < 2:
-        return predicted_joints.sum() * 0.0
     clean_feet = clean_joints.detach()[..., list(DEFAULT_FOOT_JOINTS), :]
     pred_feet = predicted_joints[..., list(DEFAULT_FOOT_JOINTS), :]
 
@@ -3704,19 +3710,67 @@ def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_co
     static = (height | (clean_contacts.detach() > 0.5)) & (
         baseline <= ContactStateThresholds.from_environment().static_support_speed_mps
     )
-    before = _masked_speed_stats_torch(baseline, static)
-    after = _masked_speed_stats_torch(candidate, static)
+    index = torch.arange(static.shape[1], device=static.device)[None, :, None].expand_as(static)
+    starts = static & ~F.pad(static[:, :-1], (0, 0, 1, 0), value=False)
+    anchors = torch.where(starts, index, torch.zeros_like(index)).cummax(1).values
+
+    def stats(feet, speed_values):
+        xz = feet[..., (0, 2)].to(torch.float64)
+        anchor = xz.gather(1, anchors[..., None].expand(-1, -1, -1, 2))
+        drift = torch.linalg.vector_norm(xz - anchor, dim=-1)
+        speed_stats = _masked_speed_stats_torch(speed_values, static)
+        drift_stats = _masked_speed_stats_torch(drift, static)
+        return dict(zip(("foot_skate_mps_p95", "foot_skate_mps_max",
+                         "foot_support_drift_m_p95", "foot_support_drift_m_max"),
+                        (*speed_stats, *drift_stats)))
+    return stats(clean_feet, baseline), stats(pred_feet, candidate), static
+
+
+def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_contacts, cfg, *, reduction="mean"):
+    """Tolerance-only loss, using fixed reference speed AND segment drift."""
+    if predicted_joints.shape[1] < 2:
+        return predicted_joints.sum() * 0.0
+    before, after, _ = _reference_support_statistics_torch(predicted_joints, clean_joints, clean_contacts, cfg)
     policy = StageAcceptancePolicy.from_environment()
+    from contracts.physical_quality import physical_metric_specs, PhysicalQualityLimits
     penalties = []
-    for ref, pred, ratio, margin in zip(
-        before, after, (policy.skate_p95_ratio, policy.skate_max_ratio),
-        (policy.skate_p95_margin_mps, policy.skate_max_margin_mps),
-    ):
+    for spec in physical_metric_specs(PhysicalQualityLimits.from_environment(), policy):
+        if spec.key not in before:
+            continue
+        ref, pred, ratio, margin = before[spec.key], after[spec.key], spec.stage_ratio, spec.stage_margin
         if not np.isfinite(ratio) or ratio < 1 or not np.isfinite(margin) or margin < 0:
             raise ValueError("invalid clean foot-speed tolerance policy")
-        allowed = torch.maximum(ref * ratio, ref + margin)
-        penalties.append((torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4)).mean())
-    return 0.5 * sum(penalties)
+        # Match the stage registry: an already-over-limit source cannot regress.
+        allowed = torch.where(ref > spec.absolute_limit, ref,
+            torch.minimum(torch.maximum(ref * ratio, ref + margin), ref.new_tensor(spec.absolute_limit)))
+        penalties.append(torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4))
+    loss = sum(penalties) / max(1, len(penalties))
+    return loss if reduction=="none" else loss.mean()
+
+
+def _fixed_support_stage_gate(reference, prediction, cfg, *, before_audit=None, after_audit=None):
+    """Relative audit freezes foot samples; independent audits remain visible.
+
+    This helper is for EVENT/TRAINING comparisons only. It cannot replace the
+    whole-song final_fail_closed physical gate after IK.
+    """
+    before_audit = before_audit or _safe_validation_audit(reference,cfg,role="support_reference",support_policy="source_observation")
+    after_audit = after_audit or _safe_validation_audit(prediction,cfg,role="support_prediction",support_policy="source_observation")
+    with torch.no_grad():
+        ref_joints, pred_joints = fk_24_np(reference), fk_24_np(prediction)
+        contacts, _, _, _ = derive_contacts_np(reference,cfg,precomputed_joints=ref_joints)
+        before, after, support = _reference_support_statistics_torch(
+            torch.as_tensor(pred_joints[None]),torch.as_tensor(ref_joints[None]),
+            torch.as_tensor(contacts[None]),cfg)
+    fixed_before = {**before_audit,**{k:float(v[0]) for k,v in before.items()}}
+    fixed_after = {**after_audit,**{k:float(v[0]) for k,v in after.items()}}
+    gate = evaluate_stage_candidate(fixed_before,fixed_after,require_repair_gain=False,
+                                    ignored_layers=("long_horizon_root_drift",))
+    gate["support_comparison"] = {"schema":"fixed_reference_support_v1","frames":int(support.sum()),
+        "before":{k:fixed_before[k] for k in before},"after":{k:fixed_after[k] for k in after}}
+    gate["independent_support_diagnostic"] = evaluate_stage_candidate(before_audit,after_audit,
+        require_repair_gain=False,ignored_layers=("long_horizon_root_drift",))
+    return gate
 
 
 def _clean_jerk_statistics_torch(jerk_norm, fps):
@@ -3822,6 +3876,26 @@ def _refiner_gradient_diagnostics(model, repair_loss, clean_loss, clean_weight):
         "combined_gradient_norm": combined,
         "combined_to_sum_norm_ratio": combined / (repair_norm + clean_norm) if repair_norm + clean_norm > 1e-12 else None,
     }
+
+
+def _refiner_component_gradients(model, terms, cfg):
+    """Weighted endpoint/temporal/support gradients, before optimizer clipping."""
+    losses = {"endpoint":cfg.product_refiner_repair_margin_weight * terms["endpoint_continuity"],
+              "temporal":cfg.product_refiner_relative_temporal_weight * terms["temporal_supervision"]
+                           + cfg.product_refiner_seam_jerk_weight * terms["jerk"],
+              "support":terms["support_excess"]}
+    params = [p for p in model.parameters() if p.requires_grad]
+    gradients = {key:torch.autograd.grad(value,params,retain_graph=True,allow_unused=True)
+                 for key,value in losses.items()}
+    norms = {key:math.sqrt(sum(float(g.detach().double().square().sum()) for g in row if g is not None))
+             for key,row in gradients.items()}
+    pairs = {}
+    for a,b in (("endpoint","temporal"),("endpoint","support"),("temporal","support")):
+        dot = sum(float((x.detach().double()*y.detach().double()).sum())
+                  for x,y in zip(gradients[a],gradients[b]) if x is not None and y is not None)
+        cosine = float(np.clip(dot/(norms[a]*norms[b]),-1,1)) if norms[a]*norms[b] > 1e-12 else None
+        pairs[f"{a}/{b}"] = {"cosine":cosine,"conflicting":cosine is not None and cosine < 0}
+    return {"schema":"refiner_objective_gradient_v1","norms":norms,"pairs":pairs,"before_clipping":True}
 
 
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
@@ -4066,6 +4140,8 @@ def degrade_for_refiner(
     finalize_contract: bool = True,
     mode: str = "full_bridge",
     recipe: Optional[Mapping[str, Any]] = None,
+    contact_ik: bool = True,
+    bridge_report: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Formal training uses the complete inference-time interpolation bridge.
 
@@ -4108,6 +4184,8 @@ def degrade_for_refiner(
                 b - a,
                 cfg,
                 finalize_contract=False,
+                contact_ik=contact_ik,
+                report=bridge_report,
             )
             span = int(bridge.shape[0])
             if mode == "full_bridge":
@@ -4408,12 +4486,8 @@ def _record_validation_physical_prediction(
         role="degraded_input",
         support_policy="source_observation",
     )
-    degraded_physical_diagnostic = evaluate_stage_candidate(
-        degraded_audit,
-        prediction_audit,
-        require_repair_gain=False,
-        ignored_layers=("long_horizon_root_drift",),
-    )
+    degraded_physical_diagnostic = _fixed_support_stage_gate(damaged,predicted,cfg,
+        before_audit=degraded_audit,after_audit=prediction_audit)
     if seam_mask is not None:
         observed = _observable_boundary_audit(predicted, damaged, seam_mask, cfg)
         observed["physical_non_regression"] = degraded_physical_diagnostic
@@ -4947,7 +5021,8 @@ def _observable_boundary_audit(prediction, reference, seam, cfg):
                 "reasons": ["invalid_observable_boundary_audit"]}
 
 
-def make_cross_event_boundary_np(left, right, left_cond, right_cond, cfg, *, start=None, width=None):
+def make_cross_event_boundary_np(left, right, left_cond, right_cond, cfg, *, start=None, width=None,
+                                  contact_ik=True, bridge_report=None):
     """Two observed clips, an actual inference bridge, and NO hidden clean label."""
     frames = min(len(left), len(right))
     width = int(width or min(round(.6 * cfg.fps), frames - 4))
@@ -4956,8 +5031,10 @@ def make_cross_event_boundary_np(left, right, left_cond, right_cond, cfg, *, sta
     if not 2 <= a < b <= frames - 2:
         raise ValueError("cross-event seam requires two observed context frames per side")
     tail = left[:a].copy()
-    head, _ = _align_core_to_previous(tail, right[b:frames].copy(), cfg)
-    bridge = reference_motion_inbetween_np(tail[-4:], head[:4], width, cfg)
+    head, alignment = _align_core_to_previous(tail, right[b:frames].copy(), cfg, transition_frames=width)
+    bridge = reference_motion_inbetween_np(tail[-4:], head[:4], width, cfg, contact_ik=contact_ik,report=bridge_report)
+    if bridge_report is not None:
+        bridge_report["alignment"] = alignment
     reference = np.concatenate([tail, bridge, head]).astype(np.float32)
     reference, _ = enforce_edge151_contract_np(reference, cfg, source_hint="cross_event_bridge", derive_contact=True, project_rot=True)
     seam = np.zeros((frames, 1), dtype=np.float32)
@@ -5003,10 +5080,7 @@ def evaluate_cross_event_boundaries(model, db, train_db, cfg, device, *, stage="
                 before = batch["bad"][0].cpu().numpy()
                 after = prediction[0].cpu().numpy()
                 gate = _observable_boundary_audit(after, before, seam, cfg)
-                safety = evaluate_stage_candidate(
-                    _safe_validation_audit(before, cfg, role="cross_reference", support_policy="source_observation"),
-                    _safe_validation_audit(after, cfg, role="cross_prediction", support_policy="source_observation"),
-                    require_repair_gain=False, ignored_layers=("long_horizon_root_drift",))
+                safety = _fixed_support_stage_gate(before, after, cfg)
                 if not gate["reference_fidelity_accepted"]:
                     safety = {**safety,"accepted":False,"reasons":[*safety.get("reasons",[]),"cross_reference_geometry_budget_exceeded"]}
                 rows.append({"left_source": sources[index], "right_source": sources[partner],
@@ -6063,7 +6137,14 @@ def _refiner_decode_masks(joint, root, contact, seam, cfg):
 
 def _refiner_batch_objectives(model, batch, cfg):
     pred, identity = _refiner_batch_outputs(model, batch, cfg)
-    repair, terms = _observable_refiner_objective(pred, batch["bad"], batch["seam"], cfg)
+    per_case, case_terms = _observable_refiner_objective(pred, batch["bad"], batch["seam"], cfg,reduction="none")
+    repair, terms = per_case.mean(), {k:v.mean() for k,v in case_terms.items()}
+    if "group" in batch:
+        for index,label in enumerate(("single_short","single_long","cross_short","cross_long")):
+            selected = batch["group"] == index
+            if bool(selected.any()):
+                for key in ("endpoint_continuity","temporal_supervision","support_excess"):
+                    terms[f"group_{label}_{key}"] = case_terms[key][selected].mean()
     protection, identity_terms = _product_refiner_clean_identity_loss(
         identity, batch["clean"], batch["clean_joint"], batch["clean_root"],
         batch["clean_contact"], cfg,
@@ -6071,55 +6152,59 @@ def _refiner_batch_objectives(model, batch, cfg):
     return repair, protection, terms, identity_terms
 
 
-def _observable_refiner_objective(prediction, reference, seam, cfg):
+def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction="mean"):
     """Repair observable boundary defects, with no hidden clean target.
 
     The clean-input dead-band branch remains separate and unchanged. Physical
-    scale floors stabilize gradients; they do not change acceptance thresholds.
+    normalization uses only a numerical floor, not a motion-dependent .05 floor.
+    Thus equal fractional violations in quiet/active windows have equal weight.
     """
     count = prediction.shape[0]
+    if reduction not in {"mean","none"}:
+        raise ValueError("invalid observable loss reduction")
     joints = fk_24_torch(torch.cat([prediction, reference.detach()]))
     proposed_joints, reference_joints = joints.split(count)
     proposed = boundary_metrics_torch(proposed_joints, seam, cfg.fps)
     before = boundary_metrics_torch(reference_joints.detach(), seam, cfg.fps)
     gain = cfg.product_refiner_training_target_repair_gain
 
-    def margin(key, floor):
+    def margin(key):
         baseline = before[key].detach()
         return (torch.relu(proposed[key] - (1.0 - gain) * baseline)
-                / baseline.clamp_min(floor)).mean()
+                / baseline.clamp_min(1e-6))
 
-    endpoint = margin("endpoint_velocity_jump_mps", 0.05)
-    temporal = margin("temporal_energy", 0.05)
+    endpoint = margin("endpoint_velocity_jump_mps")
+    temporal = margin("temporal_energy")
     jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
-            / before["seam_jerk_mps3"].clamp_min(1.0)).mean()
+            / before["seam_jerk_mps3"].clamp_min(1.0))
     delta = product_log_torch(reference, prediction)
     active = (seam >= .5).to(delta.dtype)
     per_window = (delta.abs() * active).sum((1, 2)) / (active.sum((1, 2)) * delta.shape[-1]).clamp_min(1)
-    trust = torch.relu(per_window / cfg.checkpoint_validation_max_refiner_product_log_l1 - 1).mean()
-    outside = (delta.abs() * (1.0 - seam)).mean()
-    contact = (prediction[..., :4] - reference[..., :4]).square().mean()
-    support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg)
+    trust = torch.relu(per_window / cfg.checkpoint_validation_max_refiner_product_log_l1 - 1)
+    outside = (delta.abs() * (1.0 - seam)).mean((1,2))
+    contact = (prediction[..., :4] - reference[..., :4]).square().mean((1,2))
+    support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg,reduction="none")
     feet = list(DEFAULT_FOOT_JOINTS)
     floor = torch.quantile(reference_joints[..., feet, 1].flatten(1), .05, dim=1).detach()
-    penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean()
-    reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean().detach()
+    penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean((1,2))
+    reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean((1,2)).detach()
     penetration = torch.relu(penetration - reference_penetration)
     physics = cfg.product_refiner_relative_temporal_weight * temporal + cfg.product_refiner_seam_jerk_weight * jerk + support + penetration
     loss = cfg.product_refiner_repair_margin_weight * endpoint + physics + trust + outside + .2 * contact
-    zero = delta.sum() * 0
-    return loss, {
-        "reconstruction": delta.square().mean(), "active_reconstruction": per_window.mean(),
+    zero = delta.sum((1,2)) * 0
+    terms = {
+        "reconstruction": delta.square().mean((1,2)), "active_reconstruction": per_window,
         "repair_margin": endpoint, "clean_preservation": outside,
         "temporal_supervision": temporal, "endpoint_continuity": endpoint,
-        "seam_velocity": proposed["endpoint_velocity_jump_mps"].mean(),
-        "seam_acceleration": proposed["seam_acceleration_mps2"].mean(),
-        "seam_jerk": proposed["seam_jerk_mps3"].mean(), "relative_temporal": temporal,
+        "seam_velocity": proposed["endpoint_velocity_jump_mps"],
+        "seam_acceleration": proposed["seam_acceleration_mps2"],
+        "seam_jerk": proposed["seam_jerk_mps3"], "relative_temporal": temporal,
         "physics": physics, "contact": contact, "outside": outside,
         "jerk": jerk,
         "observable_trust_excess": trust, "support_excess": support,
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }
+    return (loss,terms) if reduction=="none" else (loss.mean(),{k:v.mean() for k,v in terms.items()})
 
 
 def train_refiner(args: argparse.Namespace) -> int:
@@ -6249,16 +6334,26 @@ def train_refiner(args: argparse.Namespace) -> int:
         seam_batch = []
         cond_batch = []
         clean_cond_batch = []
+        group_batch = []
         for sample_number in range(bs):
             idx = random.randrange(len(paths))
             clean = motion_pool.sample(idx)
+            minimum = max(4,round(cfg.transition_train_min_seconds * cfg.fps))
+            maximum = max(minimum,min(round(cfg.transition_train_max_seconds * cfg.fps),cfg.window_len//3))
+            middle = (minimum + maximum)//2
+            # Equal sampling of role x short/long; positions still refresh each batch.
+            group_number = (sample_number + step * bs) % 4
+            width = random.randint(minimum,middle) if group_number < 2 or middle==maximum else random.randint(middle+1,maximum)
+            start = random.randint(2,cfg.window_len-width-2)
             bad, seam = degrade_for_refiner(
                 clean,
                 cfg=cfg,
                 finalize_contract=not gpu_preprocessing,
+                recipe={"a":start,"b":start+width},
             )
             condition = np.tile(desc_z[idx], (cfg.window_len, 1))
-            if sample_number % 2 and len(cross_partners[idx]):
+            cross = bool(group_number % 2 and len(cross_partners[idx]))
+            if cross:
                 partner = int(random.choice(cross_partners[idx]))
                 bad, seam, condition = make_cross_event_boundary_np(
                     clean, motion_pool.sample(partner), desc_z[idx], desc_z[partner], cfg,
@@ -6271,11 +6366,13 @@ def train_refiner(args: argparse.Namespace) -> int:
             seam_batch.append(seam)
             cond_batch.append(condition)
             clean_cond_batch.append(np.tile(desc_z[idx], (cfg.window_len, 1)))
+            group_batch.append(2*int(cross) + int(width>middle))
         batch = _prepare_refiner_batch(
             np.stack(clean_batch), np.stack(bad_batch), np.stack(seam_batch),
             np.stack(cond_batch), cfg, device, executor=risk_executor,
         )
         batch["clean_cond"] = torch.as_tensor(np.stack(clean_cond_batch), dtype=torch.float32, device=device)
+        batch["group"] = torch.as_tensor(group_batch,device=device)
         repair_loss, identity_loss, loss_terms, identity_terms = _refiner_batch_objectives(
             model, batch, cfg
         )
@@ -6289,6 +6386,7 @@ def train_refiner(args: argparse.Namespace) -> int:
                 **_refiner_gradient_diagnostics(
                     model, repair_loss, identity_loss, cfg.product_refiner_clean_identity_weight
                 ),
+                "components":_refiner_component_gradients(model,loss_terms,cfg),
             }
             gradient_log_path.parent.mkdir(parents=True, exist_ok=True)
             with gradient_log_path.open("a", encoding="utf-8") as handle:
@@ -7302,50 +7400,8 @@ def transition_len_for_boundary(prev: np.ndarray, curr: np.ndarray, target_len: 
 
 def motion_inbetween_np(left_ctx: np.ndarray, right_ctx: np.ndarray, length: int, cfg: MotionGenerationConfig,
                         source_hint: str = "reference_inbetween") -> np.ndarray:
-    """Generate a kinematic transition in EDGE-151D space.
-
-    The bridge interpolates root trajectory with cubic Hermite and rotations with
-    quaternion shortest-path interpolation.  Contact channels are rebuilt by FK in
-    enforce_edge151_contract_np, so no invalid gray contacts are preserved.
-    """
-    L = int(length)
-    if L <= 0:
-        return np.zeros((0, EDGE_DIM), dtype=np.float32)
-    a = np.asarray(left_ctx[-1], dtype=np.float32).copy()
-    b = np.asarray(right_ctx[0], dtype=np.float32).copy()
-    out = np.repeat(a[None, :], L, axis=0).astype(np.float32)
-
-    # Phase excludes exact endpoints to avoid duplicating previous last or next first.
-    u = (np.arange(1, L + 1, dtype=np.float32) / float(L + 1))[:, None]
-    h00 = 2 * u ** 3 - 3 * u ** 2 + 1
-    h10 = u ** 3 - 2 * u ** 2 + u
-    h01 = -2 * u ** 3 + 3 * u ** 2
-    h11 = u ** 3 - u ** 2
-
-    p0 = a[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
-    p1 = b[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
-    v0 = _root_velocity(left_ctx, at_end=True)
-    v1 = _root_velocity(right_ctx, at_end=False)
-    # Limit velocity to prevent a transition budget from launching the body.
-    vmax = _transition_env_float("MOTION_TRANSITION_ROOT_VEL_CLAMP_MPF", 0.055)
-    v0 = np.clip(v0, -vmax, vmax)
-    v1 = np.clip(v1, -vmax, vmax)
-    root = h00 * p0[None] + h10 * (L * v0[None]) + h01 * p1[None] + h11 * (L * v1[None])
-    out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
-
-    # Rotation SLERP for all joints.
-    Ra = rot6d_to_matrix_np(a[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
-    Rb = rot6d_to_matrix_np(b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6))[0]
-    qa = matrix_to_quat_np(Ra)[None, :, :]
-    qb = matrix_to_quat_np(Rb)[None, :, :]
-    q = quat_slerp_np(np.repeat(qa, L, axis=0), np.repeat(qb, L, axis=0), u[:, None, :])
-    R = quat_to_matrix_np(q)
-    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(R).reshape(L, -1)
-
-    # Contacts are not linearly interpolated. Rebuild from FK/contact thresholds.
-    out[:, 0:4] = 0.0
-    out, _ = enforce_edge151_contract_np(out, cfg, source_hint=source_hint, derive_contact=True, project_rot=True)
-    return out.astype(np.float32)
+    """Compatibility name; no second interpolation implementation."""
+    return reference_motion_inbetween_np(left_ctx, right_ctx, length, cfg)
 
 
 def align_event_core_to_prev_np(prev: np.ndarray, curr: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
@@ -7476,95 +7532,33 @@ def _slerp_quaternion_np(q0: np.ndarray, q1: np.ndarray, t: np.ndarray) -> np.nd
 
 
 def reference_motion_inbetween_np(
-    prev_tail: np.ndarray,
-    curr_head: np.ndarray,
-    n_frames: int,
-    cfg: MotionGenerationConfig,
-    *,
-    finalize_contract: bool = True,
+    prev_tail: np.ndarray, curr_head: np.ndarray, n_frames: int,
+    cfg: MotionGenerationConfig, *, finalize_contract: bool = True,
+    contact_ik: bool = True,
+    report: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
-    """Kinematic inbetweening in EDGE-151D: root Hermite + per-joint rotation SLERP.
-
-    prev_tail and curr_head are short clips. The generated bridge excludes both
-    endpoints, so it can be inserted between previous core and current core
-    without duplicating boundary frames.
-    """
-    n = int(n_frames)
-    if n <= 0:
-        return np.zeros((0, EDGE_DIM), dtype=np.float32)
-    a_clip = np.asarray(prev_tail, dtype=np.float32)
-    b_clip = np.asarray(curr_head, dtype=np.float32)
-    a = a_clip[-1].copy()
-    b = b_clip[0].copy()
-    out = np.zeros((n, EDGE_DIM), dtype=np.float32)
-    phase = (np.arange(n, dtype=np.float32) + 1.0) / float(n + 1)
-    s = phase[:, None]
-    smooth = (s * s * (3.0 - 2.0 * s)).astype(np.float32)
-
-    # Contact channels are re-derived after FK; keep them as conservative blends here.
-    out[:, 0:4] = ((1.0 - smooth) * a[None, 0:4] + smooth * b[None, 0:4]).astype(np.float32)
-
-    # Root position: C1 Hermite using local endpoint velocities.
-    p0 = a[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
-    p1 = b[[ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].astype(np.float32)
-    v0 = np.zeros(3, dtype=np.float32)
-    v1 = np.zeros(3, dtype=np.float32)
-    if a_clip.shape[0] >= 2:
-        v0 = (a_clip[-1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - a_clip[-2, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
-    if b_clip.shape[0] >= 2:
-        v1 = (b_clip[1, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - b_clip[0, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]).astype(np.float32)
-    # Bound bridge tangents to avoid long-range root launches at mismatched clips.
-    fps = max(float(cfg.fps), 1.0e-8)
-    v0 *= fps
-    v1 *= fps
-    max_step = _inbetween_config_float(cfg, "transition_root_tangent_max_mps", "MOTION_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35)
-    for vv in (v0, v1):
-        norm = float(np.linalg.norm(vv[[0, 2]]))
-        if norm > max_step:
-            vv[[0, 2]] *= max_step / max(norm, 1e-8)
-    tt = phase[:, None]
-    h00 = 2 * tt ** 3 - 3 * tt ** 2 + 1
-    h10 = tt ** 3 - 2 * tt ** 2 + tt
-    h01 = -2 * tt ** 3 + 3 * tt ** 2
-    h11 = tt ** 3 - tt ** 2
-    scale = float(n + 1) / fps
-    root = h00 * p0[None] + h10 * (v0[None] * scale) + h01 * p1[None] + h11 * (v1[None] * scale)
-    out[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root.astype(np.float32)
-
-    # Rotation: joint-wise quaternion SLERP, then convert back to legal Rot6D.
-    Ra = rot6d_to_matrix_np(
-        a[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6),
-        project=False,
-    )[0]
-    Rb = rot6d_to_matrix_np(
-        b[ROT6D_START:ROT6D_END].reshape(1, NUM_JOINTS, 6),
-        project=False,
-    )[0]
-    qa = matrix_to_quat_np(Ra)
-    qb = matrix_to_quat_np(Rb)
-    q = _slerp_quaternion_np(qa, qb, phase.reshape(n, 1, 1))
-    R = quat_to_matrix_np(q)
-    out[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(
-        R,
-        project=False,
-    ).reshape(n, -1)
-
-    if not finalize_contract:
-        return out.astype(np.float32)
-    out, _ = enforce_edge151_contract_np(
-        out,
-        cfg,
-        source_hint="inbetween_motion_inbetween",
-        derive_contact=True,
-        project_rot=True,
-    )
+    """Shared duration/C2/SO(3) bridge for training, diagnostics and generation."""
+    from motion_geometry.inbetween import build_inbetween
+    out, bridge_report = build_inbetween(prev_tail, curr_head, int(n_frames), float(cfg.fps),
+        max_root_speed=_inbetween_config_float(cfg, "transition_root_tangent_max_mps",
+            "MOTION_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35), contact_ik=contact_ik,
+        max_vertical_speed=cfg.transition_root_vertical_tangent_max_mps,
+        max_angular_speed=cfg.transition_angular_speed_max_rps,
+        root_tangent_margin=cfg.transition_root_tangent_margin_m)
+    if report is not None:
+        report.update(bridge_report)
+    if finalize_contract and len(out):
+        out, _ = enforce_edge151_contract_np(out, cfg, source_hint=BOUNDARY_PROTOCOL,
+                                             derive_contact=True, project_rot=True)
     return out.astype(np.float32)
 
 
-def _align_core_to_previous(prev_piece: np.ndarray, core: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
-    """Align current core to previous endpoint in yaw and XZ only."""
+def _align_core_to_previous(prev_piece: np.ndarray, core: np.ndarray, cfg: MotionGenerationConfig,
+                            *, transition_frames: int = 0) -> Tuple[np.ndarray, dict]:
+    """Yaw/XZ alignment with an explicit, duration-aware landing position."""
+    from motion_geometry.inbetween import INBETWEEN_PROTOCOL, duration_displacement
     out = core.copy().astype(np.float32)
-    report: Dict[str, object] = {"mode": "yaw_xz_to_previous_endpoint_no_root_y_ramp"}
+    report: Dict[str, object] = {"mode": INBETWEEN_PROTOCOL}
     if prev_piece.size == 0 or out.size == 0:
         return out, report
     try:
@@ -7574,11 +7568,16 @@ def _align_core_to_previous(prev_piece: np.ndarray, core: np.ndarray, cfg: Motio
     except Exception:
         yaw_prev, yaw_core, dyaw = 0.0, 0.0, 0.0
     out = rotate_motion_around_y_np(out, dyaw, pivot_xz=out[0, [ROOT_X_IDX, ROOT_Z_IDX]])
-    delta = prev_piece[-1, [ROOT_X_IDX, ROOT_Z_IDX]] - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
+    landing, landing_report = duration_displacement(prev_piece, out, transition_frames, cfg.fps,
+        _inbetween_config_float(cfg, "transition_root_tangent_max_mps", "MOTION_TRANSITION_ROOT_TANGENT_MAX_MPS", 1.35))
+    delta = prev_piece[-1, [ROOT_X_IDX, ROOT_Z_IDX]] + landing - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
     out[:, ROOT_X_IDX] += float(delta[0])
     out[:, ROOT_Z_IDX] += float(delta[1])
     out, contract = enforce_edge151_contract_np(out, cfg, source_hint="inbetween_align_core_to_prev", derive_contact=True, project_rot=True)
     report.update({
+        "landing_displacement_xz_m": landing.tolist(),
+        "landing": landing_report,
+        "transition_frames": int(transition_frames),
         "yaw_prev": float(yaw_prev),
         "yaw_core_before": float(yaw_core),
         "dyaw_applied": float(dyaw),
@@ -7620,9 +7619,9 @@ def _choose_core_and_transition_lengths(source_len: int, target_len: int, has_pr
         core = desired
         trans = target_len - core
 
-    if trans < 0:
-        trans = 0
-        core = target_len
+    # Natural-duration preference must not create an untrained long bridge.
+    trans = min(max(0,trans),max_trans)
+    core = target_len-trans
     info = {
         "target_len": int(target_len),
         "source_len": int(source_len),
@@ -7642,7 +7641,7 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
     This constructs a strong reference motion stream (motion_ref): each music
     slot contributes exactly target_frames.  For non-first slots, part of the
     slot is reserved as transition budget; the core event is lightly resampled,
-    aligned in yaw/XZ, and connected through root-Hermite + rotation-SLERP
+    aligned with a duration-aware landing and connected through the shared C2/SO(3)
     inbetweening.  The generated transition spans are reported so generate()
     can build a precise transition mask for Motion Refiner and Motion Diffusion.
     """
@@ -7673,10 +7672,11 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
         transition_span = None
 
         if has_prev and trans_len > 0 and _inbetween_config_bool(cfg, "transition_inbetween_enable", "MOTION_TRANSITION_INBETWEEN_ENABLE", True):
-            core, align_report = _align_core_to_previous(pieces[-1], core, cfg)
+            core, align_report = _align_core_to_previous(pieces[-1], core, cfg, transition_frames=trans_len)
             prev_tail_n = min(max(2, trans_len // 2), len(pieces[-1]))
             curr_head_n = min(max(2, trans_len // 2), len(core))
-            bridge = reference_motion_inbetween_np(pieces[-1][-prev_tail_n:], core[:curr_head_n], trans_len, cfg)
+            geometry_report: Dict[str, Any] = {}
+            bridge = reference_motion_inbetween_np(pieces[-1][-prev_tail_n:], core[:curr_head_n], trans_len, cfg,report=geometry_report)
             start = cursor
             end = cursor + int(bridge.shape[0])
             transition_span = [int(start), int(end)]
@@ -7685,7 +7685,8 @@ def concat_events(event_paths: Sequence[str], target_durations: Sequence[float],
             cursor += int(bridge.shape[0])
             bridge_report = {
                 "enabled": True,
-                "mode": "root_hermite_rotation_slerp_motion_space_inbetweening",
+                "mode": BOUNDARY_PROTOCOL,
+                "geometry":geometry_report,
                 "frames": int(bridge.shape[0]),
                 "span": transition_span,
                 "prev_tail_frames": int(prev_tail_n),

@@ -17,7 +17,7 @@ except ImportError:  # Geometry-only data inspection remains usable without Torc
 from motion_geometry.product_manifold import product_log_torch
 
 
-BOUNDARY_PROTOCOL = "observable_full_bridge_v1"
+BOUNDARY_PROTOCOL = "observable_duration_c2_bridge_v2"
 BOUNDARY_FEATURE_DIM = 302  # phase/core + two relative poses + two endpoint velocities
 
 
@@ -92,7 +92,13 @@ def boundary_metrics_torch(joints, seam, fps):
         support = torch.stack([core[:, i:i + length] for i in range(order + 1)]).any(0)
         value = torch.linalg.vector_norm(torch.diff(coords, n=order, dim=1) * float(fps)**order, dim=-1).mean(-1)
         result[key] = (value * support).sum(1) / support.sum(1).clamp_min(1)
+        # Descriptive headroom evidence, NOT a new pass/fail threshold. Natural
+        # dynamics outside the seam are observable; nonzero energy is not itself
+        # evidence that an authentic movement needs to be flattened.
+        context = ~support
+        result["context_"+key] = (value*context).sum(1)/context.sum(1).clamp_min(1)
     result["temporal_energy"] = result["seam_acceleration_mps2"] / 10.0 + result["seam_jerk_mps3"] / 1000.0
+    result["context_temporal_energy"] = result["context_seam_acceleration_mps2"]/10.0+result["context_seam_jerk_mps3"]/1000.0
     return result
 
 
@@ -126,5 +132,7 @@ def observable_gate(before, after, cfg):
             "endpoint_informative": before["endpoint_velocity_jump_mps"] > floor,
             "temporal_informative": before["temporal_energy"] > floor,
             "endpoint_gain": endpoint_gain, "temporal_gain": temporal_gain,
+            "endpoint_gain_only":valid and endpoint_gain>=cfg.checkpoint_validation_min_endpoint_repair_gain,
+            "temporal_gain_only":valid and temporal_gain>=cfg.checkpoint_validation_min_temporal_repair_gain,
             "jerk_non_regression": jerk_ok, "before": before, "after": after,
             "hidden_clean_used": False, "reasons": reasons}

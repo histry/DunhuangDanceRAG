@@ -1,5 +1,9 @@
 # V7: observable full-bridge repair
 
+**Historical, rejected diagnostic protocol. Do not execute the commands below.**
+V8 supersedes the endpoint-coincident Hermite/SLERP bridge; see
+[V8 foundation-first workflow](refiner_v8_training.md). Old snapshots are incompatible.
+
 Original Chang-E SMPL14 files, retarget cache, Event-DB, Router, Duration,
 Planner and generation index are preserved. This is a NEW repair protocol, not
 a claim that the original motion data were defective or that training is now

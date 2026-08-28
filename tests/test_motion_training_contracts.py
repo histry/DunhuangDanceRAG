@@ -434,7 +434,10 @@ class MotionTrainingContractTests(unittest.TestCase):
     def test_degradation_is_local_smooth_and_stays_on_product_manifold(self):
         cfg = MotionGenerationConfig()
         clean = self._identity_motion(120)
-        clean[:, 4] = np.linspace(0.0, 0.6, len(clean), dtype=np.float32)
+        # Constant-speed motion is reproduced exactly by a correct C2 bridge;
+        # use a curved observed trajectory to test actual occlusion instead.
+        phase = np.linspace(0.0, 1.0, len(clean), dtype=np.float32)
+        clean[:, 4] = 0.6 * phase + 0.02 * np.sin(phase * 4 * np.pi)
         with mock.patch.object(motion_runtime.random, "randint", side_effect=[24, 60]):
             np.random.seed(20260824)
             degraded, seam = degrade_for_refiner(

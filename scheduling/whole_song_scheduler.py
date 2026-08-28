@@ -70,6 +70,7 @@ from support.motion_geometry import (
     project_transition_floor_np,
     recompute_transition_contacts_np,
 )
+from motion_geometry.inbetween import duration_displacement, INBETWEEN_PROTOCOL
 from scheduling.event_resampling import resample_event
 from scheduling.duration_alignment import allocate_whole_song_durations
 from scheduling.hierarchical_graph_scheduler import (
@@ -1088,7 +1089,7 @@ def generate_one(
     contents: List[np.ndarray] = []
     resampling_reports: List[Dict[str, Any]] = []
     stage_cursor_xz = np.zeros((2,), dtype=np.float32)
-    for idx, target_len in zip(selected_state.selected, allocation["content_lengths"]):
+    for slot, (idx, target_len) in enumerate(zip(selected_state.selected, allocation["content_lengths"])):
         content, report = resample_event(
             motions[idx],
             int(target_len),
@@ -1114,9 +1115,14 @@ def generate_one(
                 args.event_max_floor_penetration_m
             ),
         )
+        landing = np.zeros(2)
+        landing_report = {}
+        if contents:
+            landing,landing_report = duration_displacement(contents[-1],content,int(transition_lengths[slot]),
+                float(args.fps),float(args.transition_root_horizontal_speed_cap_mps))
         content, stage_contract = compose_event_root_xz_np(
             content,
-            stage_cursor_xz,
+            stage_cursor_xz + landing,
         )
         stage_cursor_xz = content[-1, [ROOT_X, ROOT_Z]].astype(np.float32)
         contents.append(content)
@@ -1126,9 +1132,9 @@ def generate_one(
                 "root_trajectory_contract": {
                     **root_contract,
                     **stage_contract,
-                    "policy": (
-                        "event_first_xz_localization_then_previous_endpoint_composition"
-                    ),
+                    "policy": INBETWEEN_PROTOCOL,
+                    "landing_displacement_xz_m":landing.tolist(),
+                    "landing":landing_report,
                 },
             }
         )

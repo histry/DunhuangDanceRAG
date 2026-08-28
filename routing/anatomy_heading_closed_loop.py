@@ -122,6 +122,7 @@ def _align_heading_core(
     stage_heading_rad: float,
     cfg: Any,
     event_id: int,
+    *, transition_frames: int = 0,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     # Normalize every event independently before applying planner-owned stage
     # heading and cumulative XZ placement.  Only a constant Root-Y/XZ
@@ -142,13 +143,14 @@ def _align_heading_core(
         stage_heading_rad,
         cfg,
         event_id,
+        transition_frames=transition_frames,
     )
     out = base.enforce_contract(motion_runtime, out, cfg, source_hint=f"anatomy_heading_floor_align:{event_id}")
     report = dict(report or {})
     report["anatomy_heading_support_floor_alignment"] = floor_report
     report["root_y_ramp_applied"] = False
     report["root_trajectory_policy"] = (
-        "event-local first-frame XZ + cumulative stage endpoint"
+        "event-local first-frame XZ + duration-aware landing"
     )
     report["root_y_policy"] = (
         "one event-wide FK floor offset; internal posture height is preserved"
@@ -156,25 +158,27 @@ def _align_heading_core(
     return out.astype(np.float32), report
 
 
-def _build_heading_bridge(motion_runtime: Any, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any) -> np.ndarray:
+def _build_heading_bridge(motion_runtime: Any, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any,
+                          *, report: Optional[Dict[str, Any]] = None) -> np.ndarray:
     trans_len = int(trans_len)
     if trans_len <= 0:
         return np.zeros((0, 151), dtype=np.float32)
     if not env_bool("RETARGET_RIEMANNIAN_BRIDGE_ENABLE", True):
-        return base._RETARGET_ORIG_BUILD_BRIDGE(motion_runtime, prev, core, trans_len, cfg)
+        return base._RETARGET_ORIG_BUILD_BRIDGE(motion_runtime, prev, core, trans_len, cfg,report=report)
     fps = float(getattr(cfg, "fps", 30.0))
     bridge = make_so3_transition(
         prev,
         core,
         trans_len,
         fps=fps,
+        report=report,
         angular_speed_cap_radps=env_float(
             "ROUTING_SAFETY_TRANSITION_ANGULAR_SPEED_CAP_RADPS",
             8.0,
         ),
         root_horizontal_speed_cap_mps=env_float(
             "ROUTING_SAFETY_TRANSITION_ROOT_XZ_SPEED_CAP_MPS",
-            1.5,
+            1.35,
         ),
         root_vertical_speed_cap_mps=env_float(
             "ROUTING_SAFETY_TRANSITION_ROOT_Y_SPEED_CAP_MPS",

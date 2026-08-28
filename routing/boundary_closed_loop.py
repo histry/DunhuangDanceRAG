@@ -321,17 +321,18 @@ def choose_transition_lengths(motion_runtime, prev: Optional[np.ndarray], source
     target_len = max(1, int(target_len))
     source_len = max(1, int(source_len))
     has_prev = prev is not None and len(prev) > 0
+    supported_max = int(round(float(getattr(cfg,"transition_train_max_seconds",28/30))*float(getattr(cfg,"fps",30))))
+    configured_max = env_int("MOTION_TRANSITION_MAX_FRAMES",supported_max)
+    if configured_max > supported_max:
+        raise ValueError("generation bridge exceeds the trained seam length; change and revalidate the protocol first")
     if hasattr(motion_runtime, "_choose_core_and_transition_lengths"):
-        try:
-            core_len, trans_len, info = motion_runtime._choose_core_and_transition_lengths(source_len, target_len, has_prev, cfg)
-            info = dict(info)
-        except Exception:
-            core_len, trans_len, info = target_len, 0, {"reason": "fallback_exception"}
+        core_len, trans_len, info = motion_runtime._choose_core_and_transition_lengths(source_len, target_len, has_prev, cfg)
+        info = dict(info)
     else:
         if not has_prev:
             return target_len, 0, {"reason": "first_slot_no_transition"}
         min_trans = env_int("MOTION_TRANSITION_MIN_FRAMES", 10)
-        max_trans = env_int("MOTION_TRANSITION_MAX_FRAMES", 28)
+        max_trans = configured_max
         trans_len = int(round(target_len * env_float("MOTION_TRANSITION_RATIO", 0.18)))
         trans_len = max(min_trans, min(max_trans, trans_len))
         core_len = target_len - trans_len
@@ -347,7 +348,7 @@ def choose_transition_lengths(motion_runtime, prev: Optional[np.ndarray], source
     rough_core = resample_motion(motion_runtime, raw_curr, max(1, int(core_len)))
     rough_core = enforce_contract(motion_runtime, rough_core, cfg, source_hint="boundary_closed_loop_transition_len_rough_core")
     # Align for a more realistic yaw/root measurement.
-    aligned, align_info = align_core_to_prev(motion_runtime, prev, rough_core, cfg)
+    aligned, align_info = align_core_to_prev(motion_runtime, prev, rough_core, cfg, transition_frames=trans_len)
     feats = estimate_boundary_features(motion_runtime, prev, aligned, cfg)
 
     extra = 0.0
@@ -370,7 +371,7 @@ def choose_transition_lengths(motion_runtime, prev: Optional[np.ndarray], source
         extra -= env_float("BOUNDARY_TLEN_ACCENT_REDUCE", 2.0)
 
     min_trans = env_int("MOTION_TRANSITION_MIN_FRAMES", 10)
-    max_trans = env_int("MOTION_TRANSITION_MAX_FRAMES", 36)
+    max_trans = configured_max
     min_core = env_int("MOTION_TRANSITION_MIN_CORE_FRAMES", 30)
     trans_len2 = int(round(float(trans_len) + np.clip(extra, -4.0, env_float("BOUNDARY_TLEN_EXTRA_MAX", 14.0))))
     trans_len2 = max(min_trans, min(max_trans, trans_len2))
@@ -388,10 +389,15 @@ def choose_transition_lengths(motion_runtime, prev: Optional[np.ndarray], source
     return int(core_len2), int(trans_len2), info
 
 
-def align_core_to_prev(motion_runtime, prev: np.ndarray, core: np.ndarray, cfg: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+def align_core_to_prev(motion_runtime, prev: np.ndarray, core: np.ndarray, cfg: Any,
+                       *, transition_frames: int = 0) -> Tuple[np.ndarray, Dict[str, Any]]:
     p = _as_motion_array(prev)
     c = _as_motion_array(core)
-    for name in ("_align_core_to_previous", "align_event_core_to_prev_np"):
+    formal = getattr(motion_runtime, "_align_core_to_previous", None)
+    if formal is not None:
+        out, rep = formal(p, c, cfg, transition_frames=transition_frames)
+        return enforce_contract(motion_runtime, out, cfg, source_hint="boundary_closed_loop_align:duration"), dict(rep)
+    for name in ("align_event_core_to_prev_np",):
         fn = getattr(motion_runtime, name, None)
         if fn is not None:
             try:
@@ -407,13 +413,19 @@ def align_core_to_prev(motion_runtime, prev: np.ndarray, core: np.ndarray, cfg: 
     return out, {"mode": "fallback_xz_only", "delta_xz_applied": [float(delta[0]), float(delta[1])]}
 
 
-def build_bridge(motion_runtime, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any) -> np.ndarray:
+def build_bridge(motion_runtime, prev: np.ndarray, core: np.ndarray, trans_len: int, cfg: Any,
+                 *, report: Optional[Dict[str, Any]] = None) -> np.ndarray:
     trans_len = int(trans_len)
     if trans_len <= 0:
         return np.zeros((0, EDGE_DIM), dtype=np.float32)
     prev_tail_n = min(max(2, trans_len // 2), len(prev))
     curr_head_n = min(max(2, trans_len // 2), len(core))
-    for name in ("reference_motion_inbetween_np", "motion_inbetween_np"):
+    formal = getattr(motion_runtime, "reference_motion_inbetween_np", None)
+    if formal is not None:
+        # An error in the formal algorithm must never silently select legacy SLERP.
+        bridge = formal(prev[-prev_tail_n:], core[:curr_head_n], trans_len, cfg, report=report)
+        return enforce_contract(motion_runtime, bridge, cfg, source_hint="boundary_closed_loop_bridge:duration_c2")
+    for name in ("motion_inbetween_np",):
         fn = getattr(motion_runtime, name, None)
         if fn is not None:
             try:
@@ -467,8 +479,10 @@ def build_candidate_proposal(
     align_report: Dict[str, Any] = {"mode": "none"}
     bridge = np.zeros((0, EDGE_DIM), dtype=np.float32)
     if has_prev:
-        core, align_report = align_core_to_prev(motion_runtime, prev_motion, core, cfg)
-        bridge = build_bridge(motion_runtime, prev_motion, core, trans_len, cfg)
+        core, align_report = align_core_to_prev(motion_runtime, prev_motion, core, cfg, transition_frames=trans_len)
+        bridge_report: Dict[str, Any] = {}
+        bridge = build_bridge(motion_runtime, prev_motion, core, trans_len, cfg, report=bridge_report)
+        align_report["bridge"] = bridge_report
         risk = transition_risk(motion_runtime, prev_motion[-4:], bridge, core[:4], fps=float(getattr(cfg, "fps", 30.0)))
     else:
         risk = {"total": 0.0, "boundary_joint_jerk_max": 0.0, "exit_fk_jump": 0.0, "exit_rotation_step_rad": 0.0, "foot_slip": 0.0, "foot_penetration": 0.0, "contact_switch": 0.0}

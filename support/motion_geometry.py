@@ -14,7 +14,7 @@ there, and projected back to valid 6D rotations.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -159,227 +159,31 @@ def angular_velocity_np(motion: np.ndarray) -> np.ndarray:
     return vel.cpu().numpy().astype(np.float32)
 
 
-def _so3_hermite_rotations(
-    r0: torch.Tensor,
-    r1: torch.Tensor,
-    start_velocity: torch.Tensor,
-    end_velocity: torch.Tensor,
-    length: int,
-) -> torch.Tensor:
-    """Cubic Hermite interpolation in the tangent space at the first endpoint."""
-    k = max(0, int(length))
-    if k == 0:
-        return r0.new_zeros((0, *r0.shape))
-    relative = torch.matmul(r0.transpose(-1, -2), r1)
-    delta = matrix_to_axis_angle(relative)
-    scale = float(k + 1)
-
-    # Limit endpoint tangents to avoid large Hermite overshoot.
-    max_tangent = torch.linalg.vector_norm(delta, dim=-1, keepdim=True) + 0.35
-    m0 = start_velocity * scale
-
-    # ``end_velocity`` is a body tangent at R1, whereas the Hermite polynomial
-    # lives in log coordinates at R0.  Map the requested endpoint derivative
-    # through the inverse SO(3) right Jacobian so the generated curve has the
-    # intended physical angular velocity at u=1.
-    theta = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
-    x, y, z = delta.unbind(dim=-1)
-    zero = torch.zeros_like(x)
-    hat = torch.stack(
-        (
-            zero,
-            -z,
-            y,
-            z,
-            zero,
-            -x,
-            -y,
-            x,
-            zero,
-        ),
-        dim=-1,
-    ).reshape(*delta.shape[:-1], 3, 3)
-    theta2 = theta * theta
-    small = theta < 1e-4
-    coefficient = torch.where(
-        small,
-        1.0 / 12.0 + theta2 / 720.0,
-        1.0 / theta2.clamp_min(1e-8)
-        - 1.0
-        / (
-            2.0
-            * theta.clamp_min(1e-8)
-            * torch.tan(0.5 * theta).clamp_min(1e-8)
-        ),
-    )
-    identity = torch.eye(3, dtype=delta.dtype, device=delta.device)
-    identity = identity.expand(*delta.shape[:-1], 3, 3)
-    right_jacobian_inverse = (
-        identity + 0.5 * hat + coefficient[..., None] * torch.matmul(hat, hat)
-    )
-    m1 = torch.matmul(
-        right_jacobian_inverse,
-        (end_velocity * scale).unsqueeze(-1),
-    )[..., 0]
-    m0_norm = torch.linalg.vector_norm(m0, dim=-1, keepdim=True).clamp_min(1e-8)
-    m1_norm = torch.linalg.vector_norm(m1, dim=-1, keepdim=True).clamp_min(1e-8)
-    m0 = m0 * torch.minimum(torch.ones_like(m0_norm), max_tangent / m0_norm)
-    m1 = m1 * torch.minimum(torch.ones_like(m1_norm), max_tangent / m1_norm)
-
-    u = torch.linspace(
-        1.0 / (k + 1), k / (k + 1), k,
-        device=r0.device, dtype=r0.dtype,
-    ).reshape(k, *([1] * (delta.ndim)))
-    h10 = u**3 - 2.0 * u**2 + u
-    h01 = -2.0 * u**3 + 3.0 * u**2
-    h11 = u**3 - u**2
-    tangent = h10 * m0.unsqueeze(0) + h01 * delta.unsqueeze(0) + h11 * m1.unsqueeze(0)
-
-    # A final norm cap prevents pathological random pseudo-pairs from wrapping.
-    delta_norm = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
-    tangent_norm = torch.linalg.vector_norm(tangent, dim=-1, keepdim=True).clamp_min(1e-8)
-    cap = delta_norm.unsqueeze(0) + 0.5
-    tangent = tangent * torch.minimum(torch.ones_like(tangent_norm), cap / tangent_norm)
-    return torch.matmul(r0.unsqueeze(0), axis_angle_to_matrix(tangent))
-
-
-def _clip_vector_norm_torch(value: torch.Tensor, maximum: float) -> torch.Tensor:
-    limit = max(float(maximum), 0.0)
-    if limit <= 0.0:
-        return torch.zeros_like(value)
-    norm = torch.linalg.vector_norm(value, dim=-1, keepdim=True).clamp_min(1e-8)
-    return value * torch.minimum(torch.ones_like(norm), value.new_tensor(limit) / norm)
-
-
-def _clip_root_velocity_np(
-    velocity: np.ndarray,
-    *,
-    fps: float,
-    horizontal_speed_cap_mps: float,
-    vertical_speed_cap_mps: float,
-) -> np.ndarray:
-    value = np.asarray(velocity, dtype=np.float32).copy()
-    rate = max(float(fps), 1e-6)
-    horizontal = value[[0, 2]]
-    horizontal_norm = float(np.linalg.norm(horizontal))
-    horizontal_limit = max(float(horizontal_speed_cap_mps), 0.0) / rate
-    if horizontal_norm > horizontal_limit > 0.0:
-        value[[0, 2]] *= horizontal_limit / max(horizontal_norm, 1e-8)
-    elif horizontal_limit <= 0.0:
-        value[[0, 2]] = 0.0
-    value[1] = float(
-        np.clip(
-            value[1],
-            -max(float(vertical_speed_cap_mps), 0.0) / rate,
-            max(float(vertical_speed_cap_mps), 0.0) / rate,
-        )
-    )
-    return value
 
 
 def make_so3_transition(
-    prev: np.ndarray,
-    nxt: np.ndarray,
-    length: int,
-    *,
-    fps: float = 30.0,
-    angular_speed_cap_radps: float = 8.0,
-    root_horizontal_speed_cap_mps: float = 1.5,
-    root_vertical_speed_cap_mps: float = 0.9,
-    root_tangent_margin_m: float = 0.12,
+    prev: np.ndarray, nxt: np.ndarray, length: int, *, fps: float = 30.0,
+    angular_speed_cap_radps: float = 8.0, root_horizontal_speed_cap_mps: float = 1.35,
+    root_vertical_speed_cap_mps: float = 0.9, root_tangent_margin_m: float = 0.12,
+    report: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
-    """Generate an endpoint-velocity-aware SO(3) transition.
+    """Scheduler adapter for the SAME duration/C2/contact bridge as training.
 
-    The first argument may contain one or more preceding frames; the second may
-    contain one or more following frames.  Endpoint angular and root velocities
-    are estimated when context frames are available.
+    Event placement is owned by the caller, which must include the inserted
+    duration. Keep CLI derivative caps; no hidden second Hermite/SLERP path.
     """
-    a = _validate_motion_np(prev)
-    b = _validate_motion_np(nxt)
-    k = max(0, int(length))
-    if k == 0:
-        return np.zeros((0, MOTION_DIM), dtype=np.float32)
-
-    with torch.no_grad():
-        a_t = torch.from_numpy(a)
-        b_t = torch.from_numpy(b)
-        a_rot = motion_rotation_matrices_torch(a_t)
-        b_rot = motion_rotation_matrices_torch(b_t)
-        r0 = a_rot[-1]
-        r1 = b_rot[0]
-
-        if len(a) >= 2:
-            start_v = matrix_to_axis_angle(
-                torch.matmul(a_rot[-2].transpose(-1, -2), a_rot[-1])
-            )
-        else:
-            start_v = torch.zeros((NUM_JOINTS, 3), dtype=a_t.dtype)
-        if len(b) >= 2:
-            end_v = matrix_to_axis_angle(
-                torch.matmul(b_rot[0].transpose(-1, -2), b_rot[1])
-            )
-        else:
-            end_v = torch.zeros((NUM_JOINTS, 3), dtype=b_t.dtype)
-        per_frame_angular_cap = max(float(angular_speed_cap_radps), 0.0) / max(
-            float(fps), 1e-6
-        )
-        start_v = _clip_vector_norm_torch(start_v, per_frame_angular_cap)
-        end_v = _clip_vector_norm_torch(end_v, per_frame_angular_cap)
-
-        rotations = _so3_hermite_rotations(r0, r1, start_v, end_v, k)
-        rot6d = matrix_to_rotation_6d(rotations).reshape(k, NUM_JOINTS * 6)
-
-    u = np.linspace(1.0 / (k + 1), k / (k + 1), k, dtype=np.float32)
-    h00 = 2.0 * u**3 - 3.0 * u**2 + 1.0
-    h10 = u**3 - 2.0 * u**2 + u
-    h01 = -2.0 * u**3 + 3.0 * u**2
-    h11 = u**3 - u**2
-    root0 = a[-1, ROOT]
-    root1 = b[0, ROOT]
-    root_v0 = a[-1, ROOT] - a[-2, ROOT] if len(a) >= 2 else np.zeros((3,), np.float32)
-    root_v1 = b[1, ROOT] - b[0, ROOT] if len(b) >= 2 else np.zeros((3,), np.float32)
-    root_v0 = _clip_root_velocity_np(
-        root_v0,
-        fps=fps,
-        horizontal_speed_cap_mps=root_horizontal_speed_cap_mps,
-        vertical_speed_cap_mps=root_vertical_speed_cap_mps,
-    )
-    root_v1 = _clip_root_velocity_np(
-        root_v1,
-        fps=fps,
-        horizontal_speed_cap_mps=root_horizontal_speed_cap_mps,
-        vertical_speed_cap_mps=root_vertical_speed_cap_mps,
-    )
-    root_delta = root1 - root0
-    tangent_limit = float(np.linalg.norm(root_delta)) + max(
-        float(root_tangent_margin_m), 0.0
-    )
-    for velocity in (root_v0, root_v1):
-        tangent = velocity * float(k + 1)
-        tangent_norm = float(np.linalg.norm(tangent))
-        if tangent_norm > tangent_limit > 0.0:
-            velocity *= tangent_limit / max(tangent_norm, 1e-8)
-        elif tangent_limit <= 0.0:
-            velocity[:] = 0.0
-    roots = (
-        h00[:, None] * root0[None]
-        + h10[:, None] * float(k + 1) * root_v0[None]
-        + h01[:, None] * root1[None]
-        + h11[:, None] * float(k + 1) * root_v1[None]
-    )
-
-    contact_alpha = smootherstep01(u)[:, None]
-    contacts = np.where(
-        contact_alpha < 0.5,
-        a[-1, CONTACT][None],
-        b[0, CONTACT][None],
-    )
-
-    out = np.zeros((k, MOTION_DIM), dtype=np.float32)
-    out[:, CONTACT] = contacts
-    out[:, ROOT] = roots
-    out[:, ROT] = rot6d.cpu().numpy().astype(np.float32)
-    return project_motion_rotations_np(out)
+    from motion_geometry.inbetween import build_inbetween
+    out, detail = build_inbetween(_validate_motion_np(prev), _validate_motion_np(nxt), int(length), fps,
+        max_root_speed=root_horizontal_speed_cap_mps, max_vertical_speed=root_vertical_speed_cap_mps,
+        max_angular_speed=angular_speed_cap_radps, root_tangent_margin=root_tangent_margin_m)
+    if report is not None:
+        report.update(detail)
+    if len(out):
+        # Preserve this public adapter's discrete-contact convention. Production
+        # recomputes contacts after its floor projection, as before.
+        phase = (np.arange(len(out))+1)/(len(out)+1)
+        out[:,:4] = np.where(phase[:,None]<.5,prev[-1,:4],nxt[0,:4])
+    return out
 
 
 def canonicalize_event_root_np(

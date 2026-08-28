@@ -142,6 +142,7 @@ def _align_core_to_stage_heading(
     stage_heading_rad: float,
     cfg: Any,
     event_id: int,
+    *, transition_frames: int = 0,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     out = np.asarray(core, dtype=np.float32).copy()
     if len(out) == 0:
@@ -157,9 +158,14 @@ def _align_core_to_stage_heading(
         out = rotate_motion_constant_yaw_np(out, dyaw, pivot_xz=pivot)
 
     delta_xz = np.zeros(2, dtype=np.float32)
+    landing_report = {}
     if prev is not None and len(prev):
+        from motion_geometry.inbetween import duration_displacement
+        landing,landing_report = duration_displacement(prev,out,transition_frames,cfg.fps,
+            float(getattr(cfg,"transition_root_tangent_max_mps",1.35)))
         delta_xz = (
             np.asarray(prev[-1, [ROOT_X_IDX, ROOT_Z_IDX]], dtype=np.float32)
+            + landing
             - out[0, [ROOT_X_IDX, ROOT_Z_IDX]]
         )
         out[:, ROOT_X_IDX] += float(delta_xz[0])
@@ -183,6 +189,7 @@ def _align_core_to_stage_heading(
         "dyaw_applied_rad": float(dyaw),
         "dyaw_applied_deg": float(np.degrees(dyaw)),
         "delta_xz_applied": [float(delta_xz[0]), float(delta_xz[1])],
+        "landing":landing_report,
         "root_y_ramp_applied": False,
     }
 
@@ -240,6 +247,7 @@ def _build_heading_proposal(
         stage_heading_rad,
         cfg,
         event_id,
+        transition_frames=trans_len,
     )
 
     # Candidate activity is measured after duration resampling and heading
