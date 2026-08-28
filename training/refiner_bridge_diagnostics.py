@@ -22,10 +22,11 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v3"
+SCHEMA = "refiner_observable_bridge_diagnostic_v4"
 
 
 def fingerprint(args, cfg):
+    from training.bridge_feasibility import DIRECT_OPTIMIZER_PROTOCOL
     value = common._fingerprint(args, cfg)
     value["implementation_sha256"].update({
         "bridge_diagnostic": common.file_sha256(__file__),
@@ -38,6 +39,8 @@ def fingerprint(args, cfg):
     })
     value["retraction_protocol"] = product_manifold.RETRACTION_PROTOCOL
     value["repair_safety_protocol"] = m.REFINER_REPAIR_SAFETY_PROTOCOL
+    value["observable_objective_protocol"] = m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
+    value["direct_optimizer_protocol"] = DIRECT_OPTIMIZER_PROTOCOL
     return value
 
 

@@ -101,6 +101,7 @@ FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v8"
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_jerk_tail_constraints_v1"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_support_v1"
 
 
 def now_tag() -> str:
@@ -3729,7 +3730,7 @@ def _reference_support_statistics_torch(predicted_joints, clean_joints, clean_co
     return stats(clean_feet, baseline), stats(pred_feet, candidate), static
 
 
-def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_contacts, cfg, *, reduction="mean"):
+def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_contacts, cfg, *, reduction="mean", stage_relative=False):
     """Tolerance-only loss, using fixed reference speed AND segment drift."""
     if predicted_joints.shape[1] < 2:
         return predicted_joints.sum() * 0.0
@@ -3743,10 +3744,19 @@ def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_co
         ref, pred, ratio, margin = before[spec.key], after[spec.key], spec.stage_ratio, spec.stage_margin
         if not np.isfinite(ratio) or ratio < 1 or not np.isfinite(margin) or margin < 0:
             raise ValueError("invalid clean foot-speed tolerance policy")
-        # Match the stage registry: an already-over-limit source cannot regress.
-        allowed = torch.where(ref > spec.absolute_limit, ref,
-            torch.minimum(torch.maximum(ref * ratio, ref + margin), ref.new_tensor(spec.absolute_limit)))
-        penalties.append(torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4))
+        if stage_relative:
+            # Repair-input budget: match ratio PLUS margin and epsilon from
+            # evaluate_stage_candidate. Do not apply this to clean identity,
+            # whose separate fidelity audit uses max(ratio, margin).
+            allowed = torch.where(ref > spec.absolute_limit, ref,
+                (ref * ratio + margin).clamp_max(spec.absolute_limit))
+            epsilon = (ref.abs() * 1e-6).clamp_min(max(1e-8, abs(spec.absolute_limit)*1e-9))
+        else:
+            # Keep the existing clean-protection surrogate unchanged.
+            allowed = torch.where(ref > spec.absolute_limit, ref,
+                torch.minimum(torch.maximum(ref * ratio, ref + margin), ref.new_tensor(spec.absolute_limit)))
+            epsilon = 0.0
+        penalties.append(torch.relu(pred - allowed - epsilon) / (allowed - ref).clamp_min(1e-4))
     loss = sum(penalties) / max(1, len(penalties))
     return loss if reduction=="none" else loss.mean()
 
@@ -6244,6 +6254,24 @@ def _refiner_batch_objectives(model, batch, cfg):
     return repair, protection, terms, identity_terms
 
 
+def _smooth_observable_margin(proposed, baseline, gain):
+    """One-sided Huber penalty with the original target and exact dead band.
+
+    At the target the linear hinge's gradient jumps from one to zero. Combined
+    with a temporal objective and finite backtracking, that cusp could trap a
+    case at ~10% endpoint gain while temporal repair remained below 3%. The
+    quadratic shoulder goes continuously to zero; large violations retain the
+    original linear slope (not an unbounded squared loss). This changes the
+    optimization surrogate, NEVER the observable gate or its pass threshold.
+    """
+    if not np.isfinite(gain) or not 0 < gain < 1:
+        raise ValueError("observable repair target gain must be finite in (0, 1)")
+    baseline = baseline.detach()
+    gap = torch.relu(proposed - (1.0 - gain) * baseline) / baseline.clamp_min(1e-6)
+    shoulder = gap.clamp_max(gain)
+    return shoulder.square() / (2.0 * gain) + (gap - shoulder), gap
+
+
 def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction="mean"):
     """Repair observable boundary defects, with no hidden clean target.
 
@@ -6264,13 +6292,10 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     before = boundary_metrics_torch(reference_metric_joints.detach(), seam, cfg.fps)
     gain = cfg.product_refiner_training_target_repair_gain
 
-    def margin(key):
-        baseline = before[key].detach()
-        return (torch.relu(proposed[key] - (1.0 - gain) * baseline)
-                / baseline.clamp_min(1e-6))
-
-    endpoint = margin("endpoint_velocity_jump_mps")
-    temporal = margin("temporal_energy")
+    endpoint, endpoint_gap = _smooth_observable_margin(
+        proposed["endpoint_velocity_jump_mps"], before["endpoint_velocity_jump_mps"], gain)
+    temporal, temporal_gap = _smooth_observable_margin(
+        proposed["temporal_energy"], before["temporal_energy"], gain)
     jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
             / before["seam_jerk_mps3"].clamp_min(1.0))
     jerk_safety, jerk_safety_terms = _repair_jerk_safety_loss_torch(
@@ -6281,7 +6306,8 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     trust = torch.relu(per_window / cfg.checkpoint_validation_max_refiner_product_log_l1 - 1)
     outside = (delta.abs() * (1.0 - seam)).mean((1,2))
     contact = (prediction[..., :4] - reference[..., :4]).square().mean((1,2))
-    support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg,reduction="none")
+    support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg,
+        reduction="none", stage_relative=True)
     feet = list(DEFAULT_FOOT_JOINTS)
     floor = torch.quantile(reference_joints[..., feet, 1].flatten(1), .05, dim=1).detach()
     penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean((1,2))
@@ -6295,6 +6321,7 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         "reconstruction": delta.square().mean((1,2)), "active_reconstruction": per_window,
         "repair_margin": endpoint, "clean_preservation": outside,
         "temporal_supervision": temporal, "endpoint_continuity": endpoint,
+        "endpoint_relative_gap": endpoint_gap, "temporal_relative_gap": temporal_gap,
         "seam_velocity": proposed["endpoint_velocity_jump_mps"],
         "seam_acceleration": proposed["seam_acceleration_mps2"],
         "seam_jerk": proposed["seam_jerk_mps3"], "relative_temporal": temporal,

@@ -62,7 +62,7 @@ only already-rounded float32 joint positions left CPU/CUDA discrepancies at
 the 2% jerk boundary. Gradients still flow to the float32 model on GPU.
 Independent physical/fidelity audits and all acceptance thresholds are unchanged.
 
-Foundation schema v3 records exact identity counts and per-case changed values
+Foundation schema v4 records exact identity counts and per-case changed values
 as well as FK errors. The 64-case no-edit check runs before direct optimization
 and fails closed immediately if identity or physical non-regression fails.
 Retraction and physical-auditor source hashes are included in the fingerprint.
@@ -100,7 +100,7 @@ jerk stencil before/after editing. Frame indices are local to the diagnostic
 window, zero-based, not absolute SMPL recording frames. Separate jerk-safety
 gradient norms/conflicts are logged alongside endpoint/temporal/support terms.
 
-Both foundation and neural diagnostic schemas are v3. Old reports/snapshots
+Both foundation and neural diagnostic schemas are v4. Old reports/snapshots
 must not authorize a new run: use a fresh tag and rerun foundation. Passing
 safe direct optimization still does not demonstrate neural generalization.
 Generation verifies the current code revision and byte-identical promotion
@@ -108,6 +108,56 @@ from this tag's accepted Refiner/Diffusion candidates; an older accepted V8
 model with the same architecture name cannot silently substitute for them.
 "Network diagnostic" below means a locally trained NEURAL network test, not
 an Internet connectivity check or model download.
+
+## Per-case descent and smooth target margins
+
+The `4d9f255` server control kept all 64 candidates safe, but the new-position
+10-frame cross-event group only passed temporal repair in 4/8 cases. Three of
+its failures stopped at approximately 10% endpoint gain with no unsafe trials;
+one retained the exact input with no unsafe trials. This is different from a
+peak-jerk violation and does not establish a defect in the original recordings.
+
+The optimizer and shared repair surrogate now address these concrete risks:
+
+- Differentiate a SUM of independent case losses before per-case clipping and
+  Adam, while logging the mean. A batch mean made the clipping/Adam epsilon
+  depend on the number of unrelated cases in this direct control.
+- Use a one-sided Huber shoulder for the same 10% relative training targets.
+  The derivative tends continuously to zero at the target instead of changing
+  abruptly at a linear-hinge cusp. The loss remains exactly zero after reaching
+  the target and keeps a bounded linear slope for large violations. The 3%
+  evaluation thresholds, 2% jerk guard and 75% pass rates are UNCHANGED.
+- Check that Adam's proposed direction is downhill; retry exhausted searches
+  with the current steepest-descent direction. Up to 24 backtracks evaluate
+  only pending cases, reuse the previous accepted step scale, and distinguish
+  loss rejection from storage-resolution no-ops. Only strictly lower loss AND
+  the unchanged full physical/fidelity audit can accept an actual motion edit.
+- Stop updating a case only after BOTH original 10% training targets and the
+  differentiable safety/trust constraints are satisfied at an already-audited
+  state. Other cases retain their full budget. The 200 steps are a per-case
+  maximum, not a requirement to waste trials after reaching the targets. The
+  report records actual `attempted_optimizer_steps` and `target_satisfied`;
+  evaluation pass/fail labels are not used for optimizer stopping.
+- Three consecutive iterations with no accepted update after both available
+  search directions mark a case `search_stalled` and stop that finite search.
+  This is NOT convergence or repair acceptance. Its retained candidate still
+  has to pass every unchanged metric, and a failed subgroup still blocks fitting.
+- Match REPAIR support-loss budgets to the auditor's ratio PLUS margin, ceiling and
+  numerical epsilon. The old max(ratio, margin) surrogate was stricter than the
+  repair acceptance rule. The clean-identity branch keeps its separate original
+  budget; it must not inherit the repair-stage allowance. Neither audit changes.
+
+`decoder` records `loss_rejected_trial_count`, `resolution_limited_trial_count`,
+`non_descent_adam_steps`, `gradient_fallback_attempts/updates`, `search_stalled`, and last pre-update gradient
+norm alongside the safety counters. Training logs keep the smooth losses and
+the raw `endpoint_relative_gap`/`temporal_relative_gap` separately. A zero edit
+or equal objective value is no longer counted as an accepted optimization step.
+New objective/optimizer protocol identifiers and source fingerprints prevent
+v3 reports from authorizing fitting under the changed optimization protocol.
+
+The direct control is still finite, independent per case, and non-neural. Its
+failure is not a proof of impossibility; its success is not generalization.
+Start a new tag; do not reuse the peak-safe trial report or an older snapshot.
 
 ## Foreground server workflow (no tmux)
 
@@ -117,7 +167,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v8_peak_safe_trial1
+export TAG=refiner_v8_descent_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```
@@ -134,7 +184,7 @@ bash scripts/train_refiner_v8.sh foundation "$OUT_ROOT" "$TAG"
 
 Eight fixed TRAIN windows, widths 10/28, seen/new positions. Compare pure
 interpolation with contact IK, measure no-edit roundtrip, then optimize each
-case directly for 200 steps. Inspect `interpolation_vs_ik`, `roundtrip`, `direct`,
+case directly for at most 200 steps. Inspect `interpolation_vs_ik`, `roundtrip`, `direct`,
 `decoder`, and `decision` in:
 `$OUT_ROOT/checkpoints/$TAG/foundation_diagnostic/foundation_report.json`.
 
