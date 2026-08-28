@@ -4,7 +4,60 @@ This change repairs artificial joins, not original SMPL14 assets. Existing
 retarget cache, train/val/test Event-DB, Router/Duration/Planner and generation
 index stay read-only. No external pretrained model is introduced.
 
-## Latest neural diagnostic and bounded repair
+## Latest diagnostic: checked Refiner parameter updates
+
+The `a12f877` server run passed the foundation control but failed the 400-step
+neural gate: seen single-recording temporal repair was 4/16, and the other three
+split/role temporal totals were 0/16. All 64 physical non-regression checks
+passed, clean identity passed, and no decoder caps were active. This is a
+learning/generalization failure, not a program crash or evidence of corrupt SMPL.
+
+A local eight-TRAIN-window audit confirmed a separate optimization problem:
+with the same initialization/minibatches, the first unchecked Adam step raised
+the actual same-batch objective from 0.0625 to 5.6164264 despite a downhill
+first-order direction and gradient clipping. Ten of the first 25 updates raised
+the same-batch loss. This local database is NOT the server's exact event set,
+and this mechanism is NOT established as the sole cause of its failed gate.
+
+Both the 400-step diagnostic and formal Refiner now use
+`same_batch_descent_backtracking_v1`:
+
+- Form the Adam proposal, then evaluate the SAME fixed minibatch after the
+  proposed update. The trial never regenerates corruption or reads probe/val
+  data. Only a finite, strictly smaller total objective accepts an update.
+- Try at most 12 step scales per direction. If Adam momentum is uphill or its
+  search fails, try the current gradient; accepted rescue clears stale moments.
+  If both searches fail, retain parameters AND the complete optimizer state.
+  Exceptions also roll back. Zero gradients do not silently apply weight decay.
+- Persist the adaptive trial scale in the optimizer snapshot. The training
+  configuration fingerprint rejects snapshots from the old unchecked protocol.
+  Model V9, inputs, targets, masks, caps, safety thresholds and Diffusion updates
+  are unchanged. Use a new tag, not an old training snapshot.
+- Log `optimizer_update.loss_before/loss_after`, `step_scale`, `direction` and
+  `trial_evaluations`. `optimizer_updates` counts EVERY step, including those
+  between printed samples. `accepted_non_descent_steps` must remain zero;
+  `retained_steps` are attempted steps with no accepted parameter update.
+  Formal training counters explicitly cover the current invocation from
+  `start_step`, not unrecorded updates from before a resume.
+
+Backtracking costs extra forward evaluations (at most 24 per attempted step);
+it is bounded, not a speed-up guarantee. In the local 400-step mechanism check,
+the paired unchecked run increased same-batch loss in 42/400 steps; all 400
+checked updates reduced it with 499 trial evaluations. Both runs used the same
+eight local TRAIN windows, initialization, minibatches and fixed 400-step budget.
+New-position temporal repair was 0/32 in BOTH arms; seen single/10 passed 2/8
+unchecked versus 3/8 checked, with the other temporal subgroups at zero.
+Neither arm meets the diagnostic gate. Thus this fixes blind
+overshooting, NOT the unresolved generalization problem. A decreasing weighted
+minibatch loss does not guarantee each window, temporal component or physical
+metric improves. Independent validation and the original role/width gates are
+still required; never use this optimizer acceptance as scientific acceptance.
+
+Foundation schema remains v4; neural diagnostic schema is now v6 and records
+the optimizer source hash/protocol. Old reports cannot authorize a fresh pilot.
+Rerun the bounded foundation/400-step checks before considering more training.
+
+## Previous V9 input-locality repair
 
 The server's `bbb2aaf` run passed all eight foundation groups, then completed
 400 neural steps and correctly STOPPED. Single-recording temporal repair was
@@ -48,7 +101,7 @@ If diagnosis fails, supply this new summary together with the console log;
 do not substitute a historical same-name JSON from another revision.
 
 The script name `scripts/train_refiner_v8.sh` is intentionally retained, with
-the dependency order unchanged. Use a new `refiner_v9_local_*` tag. Source
+the dependency order unchanged. Use a new `refiner_v9_checked_*` tag. Source
 assets are reusable; old foundation/diagnostic authorizations and trained
 Refiner weights are not silently migrated across source fingerprints.
 
@@ -148,7 +201,7 @@ jerk stencil before/after editing. Frame indices are local to the diagnostic
 window, zero-based, not absolute SMPL recording frames. Separate jerk-safety
 gradient norms/conflicts are logged alongside endpoint/temporal/support terms.
 
-Both foundation and neural diagnostic schemas are v4. Old reports/snapshots
+Foundation is v4; the latest neural diagnostic is v6. Old reports/snapshots
 must not authorize a new run: use a fresh tag and rerun foundation. Passing
 safe direct optimization still does not demonstrate neural generalization.
 Generation verifies the current code revision and byte-identical promotion
@@ -215,7 +268,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v9_local_trial1
+export TAG=refiner_v9_checked_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```
@@ -252,7 +305,8 @@ bash scripts/train_refiner_v8.sh diagnose "$OUT_ROOT" "$TAG"
 Fits only seen TRAIN positions; new positions are held out from fitting. Fresh
 initialization, balanced four-group batches, no direct-control warm start.
 Inspect `bridge_diagnostic/diagnostic_report.json` and `gradients.jsonl` in the
-candidate directory. Fixed final step decides readiness, not best probes.
+candidate directory, plus `summary.json` for all-step optimizer accounting and
+role/width failure counts. Fixed final step decides readiness, not best probes.
 
 ### 3. Only after diagnosis passes: fresh source-disjoint pilot
 

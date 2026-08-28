@@ -10,6 +10,7 @@ import argparse
 import dataclasses
 import json
 import random
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -17,13 +18,14 @@ import numpy as np
 
 from training import motion_models as m
 from training import refiner_diagnostics as common
+from training.refiner_optimizer import record_update, validate_update_summary
 from motion_geometry import boundary_observables
 from motion_geometry import inbetween
 from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v5"
+SCHEMA = "refiner_observable_bridge_diagnostic_v6"
 
 
 def fingerprint(args, cfg):
@@ -37,12 +39,14 @@ def fingerprint(args, cfg):
         "product_manifold": common.file_sha256(product_manifold.__file__),
         "physical_geometry": common.file_sha256(physical.__file__),
         "physical_quality": common.file_sha256(physical_quality.__file__),
+        "refiner_optimizer": common.file_sha256(Path(__file__).with_name("refiner_optimizer.py")),
     })
     value["retraction_protocol"] = product_manifold.RETRACTION_PROTOCOL
     value["repair_safety_protocol"] = m.REFINER_REPAIR_SAFETY_PROTOCOL
     value["observable_objective_protocol"] = m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
     value["direct_optimizer_protocol"] = DIRECT_OPTIMIZER_PROTOCOL
     value["refiner_input_protocol"] = m.REFINER_INPUT_PROTOCOL
+    value["refiner_update_protocol"] = m.REFINER_UPDATE_PROTOCOL
     return value
 
 
@@ -174,6 +178,7 @@ def run(args):
         if (report.get("target_steps") != 400 or report.get("completed_steps") != 400
                 or len(report.get("windows",[])) != args.windows or args.windows != 8):
             raise RuntimeError("pilot requires the complete 8-window, 400-step protocol; smoke runs cannot authorize training")
+        validate_update_summary(report.get("optimizer_updates", {}), 400)
         from training.bridge_feasibility import check_foundation_report, group_decisions
         check_foundation_report(report["foundation_report"],fingerprint(args,cfg),cfg)
         for role in ("seen", "new_position"):
@@ -239,6 +244,8 @@ def run(args):
         report["baseline"][split] = evaluate(None,banks,split,cfg)
     m.save_json(report,destination / "diagnostic_report.json")
     rng = np.random.default_rng(cfg.seed + 9001)
+    report["optimizer_updates"] = {}
+    started = time.perf_counter()
     for step in range(1,args.steps + 1):
         indices = balanced_indices(len(train["clean"])//2,rng)
         batch = {k:v[indices] for k,v in train.items()}
@@ -250,12 +257,17 @@ def run(args):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         norm = float(m.torch.nn.utils.clip_grad_norm_(model.parameters(),1,error_if_nonfinite=True))
-        optimizer.step()
+        update = m.checked_refiner_step(
+            optimizer, loss, lambda:m._refiner_total_batch_loss(model,batch,cfg))
+        record_update(report["optimizer_updates"], update)
         if logging:
             row = {"stage":"observable_bridge_fit","step":step,"target_steps":args.steps,
                    "repair":float(repair.detach()),"clean":float(protection.detach()),
                    "terms":{k:float(v.detach()) for k,v in terms.items()},"gradient":gradient,
-                   "component_gradients":components,"clip_norm_before":norm}
+                   "component_gradients":components,"clip_norm_before":norm,
+                   "optimizer_update":update,
+                   "elapsed_seconds":time.perf_counter()-started,
+                   "optimizer_updates":dict(report["optimizer_updates"])}
             with (destination / "gradients.jsonl").open("a",encoding="utf8") as handle:
                 handle.write(json.dumps(row,allow_nan=False) + "\n")
             print(json.dumps(row,allow_nan=False),flush=True)
@@ -276,6 +288,7 @@ def run(args):
             m.save_json({"schema":SCHEMA,"fingerprint":report["fingerprint"],
                          "completed_steps":step,"diagnostic_ready":report["diagnostic_ready"],
                          "group_decisions":groups,"failure_breakdown":breakdown,
+                         "optimizer_updates":report["optimizer_updates"],
                          "scientific_acceptance":False,"publish_allowed":False},
                         destination / "summary.json")
             print(json.dumps({"stage":"bridge_readiness",**report["history"][-1]}),flush=True)

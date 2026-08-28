@@ -95,6 +95,7 @@ from motion_geometry.boundary_observables import (
     BOUNDARY_PROTOCOL, BOUNDARY_FEATURE_DIM, boundary_features_torch,
     boundary_metrics_torch, observable_gate,
 )
+from training.refiner_optimizer import checked_refiner_step, record_update, REFINER_UPDATE_PROTOCOL
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
@@ -5765,6 +5766,8 @@ def _training_config_sha256(
             None if diffusion_steps is None else int(diffusion_steps)
         ),
     }
+    if stage == "refiner":
+        payload["optimizer_update_protocol"] = REFINER_UPDATE_PROTOCOL
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -6284,6 +6287,12 @@ def _refiner_batch_objectives(model, batch, cfg):
     return repair, protection, terms, identity_terms
 
 
+def _refiner_total_batch_loss(model, batch, cfg):
+    """The same deterministic objective for post-update trials; no resampling."""
+    repair, protection, _, _ = _refiner_batch_objectives(model, batch, cfg)
+    return repair + cfg.product_refiner_clean_identity_weight * protection
+
+
 def _smooth_observable_margin(proposed, baseline, gain):
     """One-sided Huber penalty with the original target and exact dead band.
 
@@ -6447,6 +6456,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         )
     if stop_after is not None and stop_after <= start_step:
         raise ValueError("--stop_after_steps must be after the resumed step")
+    optimizer_updates = {"scope": "current_invocation", "start_step": start_step}
     best_validation: Optional[Dict[str, Any]] = None
     best_score: Optional[Tuple[float, ...]] = None
     if resume_path is not None and best_validation_path.exists():
@@ -6537,7 +6547,8 @@ def train_refiner(args: argparse.Namespace) -> int:
             cfg.product_refiner_clean_identity_weight
         ) * identity_loss
         rec = loss_terms["reconstruction"]
-        if step == start_step or (step + 1) % gradient_interval == 0:
+        logging_update = step == start_step or (step + 1) % gradient_interval == 0
+        if logging_update:
             gradient_report = {
                 "stage": "refiner_gradient_diagnostics", "completed_steps": step + 1,
                 **_refiner_gradient_diagnostics(
@@ -6545,14 +6556,19 @@ def train_refiner(args: argparse.Namespace) -> int:
                 ),
                 "components":_refiner_component_gradients(model,loss_terms,cfg),
             }
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+        update_report = checked_refiner_step(
+            opt, loss, lambda: _refiner_total_batch_loss(model, batch, cfg))
+        record_update(optimizer_updates, update_report)
+        if logging_update:
+            gradient_report["optimizer_update"] = update_report
+            gradient_report["optimizer_updates"] = dict(optimizer_updates)
             gradient_log_path.parent.mkdir(parents=True, exist_ok=True)
             with gradient_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(gradient_report, allow_nan=False) + "\n")
             print(json.dumps(gradient_report, allow_nan=False), flush=True)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
         completed_steps = step + 1
         pausing = stop_after is not None and completed_steps >= stop_after
         if (
@@ -6627,6 +6643,7 @@ def train_refiner(args: argparse.Namespace) -> int:
                 "validation": periodic_metrics,
                 "checkpoint_decision": periodic_decision,
                 "training_probe": train_probe,
+                "optimizer_updates": dict(optimizer_updates),
             }, out.with_name(f"{out.stem}.validation_step_{completed_steps:06d}.json"))
             print(
                 json.dumps(
@@ -6660,6 +6677,9 @@ def train_refiner(args: argparse.Namespace) -> int:
                 steps,
                 training_started_at,
                 loss=loss.item(),
+                loss_after_update=update_report["loss_after"],
+                update_accepted=int(update_report["optimizer_update_accepted"]),
+                update_trials=update_report["trial_evaluations"],
                 rec=rec.item(),
                 active=loss_terms["active_reconstruction"].item(),
                 repair=loss_terms["repair_margin"].item(),
@@ -6779,6 +6799,9 @@ def train_refiner(args: argparse.Namespace) -> int:
         "gradient_diagnostics": {
             "path": str(gradient_log_path), "interval_steps": gradient_interval,
             "before_gradient_clipping": True,
+            "optimizer_update_protocol": REFINER_UPDATE_PROTOCOL,
+            "post_update_same_batch_loss_checked": True,
+            "optimizer_updates": dict(optimizer_updates),
         },
         "training_snapshot": {
             "schema": TRAINING_RESUME_SNAPSHOT_SCHEMA,
