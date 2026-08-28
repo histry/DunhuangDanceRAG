@@ -25,7 +25,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v6"
+SCHEMA = "refiner_observable_bridge_diagnostic_v7"
+FIT_PROTOCOL = "complete_seen_bank_descent_v1"
 
 
 def fingerprint(args, cfg):
@@ -47,7 +48,45 @@ def fingerprint(args, cfg):
     value["direct_optimizer_protocol"] = DIRECT_OPTIMIZER_PROTOCOL
     value["refiner_input_protocol"] = m.REFINER_INPUT_PROTOCOL
     value["refiner_update_protocol"] = m.REFINER_UPDATE_PROTOCOL
+    value["fit_protocol"] = FIT_PROTOCOL
     return value
+
+
+def fixed_fit_bank(banks):
+    """Use EVERY seen TRAIN case; held-out positions never enter an update.
+
+    Checking only a randomly selected 8/32 cases allowed an accepted step to
+    undo gains on the other fixed cases. That is a legitimate SGD behavior,
+    but confounds a tiny fixed-bank learnability diagnostic. This diagnostic
+    uses the complete bank for BOTH gradients and post-update line search.
+    Formal random-window training is deliberately unchanged.
+    """
+    roles = [banks[("seen", role)] for role in ("single_recording", "cross_event")]
+    count = len(roles[0]["clean"])
+    if count < 2 or count % 2 or len(roles[1]["clean"]) != count:
+        raise ValueError("fixed fit bank requires equally sized paired role/width cases")
+    train = {key: m.torch.cat([role[key] for role in roles]) for key in roles[0]}
+    train["group"] = m.torch.as_tensor(
+        [i % 2 for i in range(count)] + [2 + i % 2 for i in range(count)],
+        device=train["clean"].device)
+    return train
+
+
+def fit_bank_contract(windows):
+    return {"protocol": FIT_PROTOCOL, "cases_per_update": 4 * windows,
+            "cases_per_role_width": windows, "gradient_scope": "complete_seen_bank",
+            "line_search_scope": "complete_seen_bank", "probe_used_for_updates": False}
+
+
+def fixed_bank_stalled(update):
+    """No state change + no new inputs cannot justify repeating the same search.
+
+    Only this deterministic fixed-bank control stops early. Formal training
+    draws a new minibatch next time, so a single retained update must not stop it.
+    An early stop never authorizes pilot, even if some metrics already pass.
+    """
+    return (not update["optimizer_update_accepted"]
+            and update["reason"] in {"bounded_search_no_descent", "zero_gradient"})
 
 
 def build_banks(clean, cond, sources, cfg, device, *, contact_ik=True):
@@ -175,10 +214,14 @@ def run(args):
             raise RuntimeError("bridge diagnostic protocol/config/code/database mismatch")
         if not report.get("completed") or report.get("published") is not False:
             raise RuntimeError("diagnostic not completed or incorrectly published")
+        if report.get("stopped_early"):
+            raise RuntimeError("fixed TRAIN-bank optimization stalled; review the diagnostic, do not train")
         if (report.get("target_steps") != 400 or report.get("completed_steps") != 400
                 or len(report.get("windows",[])) != args.windows or args.windows != 8):
             raise RuntimeError("pilot requires the complete 8-window, 400-step protocol; smoke runs cannot authorize training")
         validate_update_summary(report.get("optimizer_updates", {}), 400)
+        if report.get("fit_bank") != fit_bank_contract(args.windows):
+            raise RuntimeError("diagnostic did not use the complete predefined TRAIN fit bank")
         from training.bridge_feasibility import check_foundation_report, group_decisions
         check_foundation_report(report["foundation_report"],fingerprint(args,cfg),cfg)
         for role in ("seen", "new_position"):
@@ -200,7 +243,7 @@ def run(args):
     destination = Path(args.out_dir)
     if destination.exists():
         raise FileExistsError(destination)
-    from training.bridge_feasibility import run_foundation, check_foundation_report, balanced_indices, group_decisions
+    from training.bridge_feasibility import run_foundation, check_foundation_report, group_decisions
     if not getattr(args,"baseline_only",False):
         if not getattr(args,"foundation_report",None):
             raise RuntimeError("run --baseline_only first and review the direct-optimization control; --foundation_report is required")
@@ -226,10 +269,7 @@ def run(args):
         pure,_ = build_banks(clean,cond,sources,cfg,device,contact_ik=False)
         return run_foundation(args,cfg,banks,pure,recipes,fingerprint(args,cfg),
             [{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],separation)
-    train = {key:m.torch.cat([banks[("seen",role)][key] for role in ("single_recording","cross_event")])
-             for key in banks[("seen","single_recording")]}
-    role_count = len(banks[("seen","single_recording")]["clean"])
-    train["group"] = m.torch.as_tensor([i%2 for i in range(role_count)]+[2+i%2 for i in range(role_count)],device=device)
+    train = fixed_fit_bank(banks)
     model = m.ProductManifoldTemporalRefiner().to(device)
     optimizer = m.torch.optim.AdamW(model.parameters(),lr=cfg.lr,weight_decay=1e-4)
     destination.mkdir(parents=True)
@@ -237,18 +277,17 @@ def run(args):
               "completed":False,"published":False,"independent_validation":False,
               "formal_training_must_start_fresh":True,"selection":"fixed_final_step",
               "foundation_report":str(Path(args.foundation_report).resolve()),
+              "fit_bank":fit_bank_contract(args.windows),
               "source_separation":separation,"recipes":recipes,"target_steps":args.steps,
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[]}
     for split in ("seen","new_position"):
         report["baseline"][split] = evaluate(None,banks,split,cfg)
     m.save_json(report,destination / "diagnostic_report.json")
-    rng = np.random.default_rng(cfg.seed + 9001)
     report["optimizer_updates"] = {}
     started = time.perf_counter()
     for step in range(1,args.steps + 1):
-        indices = balanced_indices(len(train["clean"])//2,rng)
-        batch = {k:v[indices] for k,v in train.items()}
+        batch = train
         repair,protection,terms,identity = m._refiner_batch_objectives(model,batch,cfg)
         loss = repair + cfg.product_refiner_clean_identity_weight * protection
         logging = step == 1 or step % 25 == 0 or step == args.steps
@@ -260,18 +299,22 @@ def run(args):
         update = m.checked_refiner_step(
             optimizer, loss, lambda:m._refiner_total_batch_loss(model,batch,cfg))
         record_update(report["optimizer_updates"], update)
-        if logging:
+        stopped_early = fixed_bank_stalled(update) and step < args.steps
+        report["stopped_early"] = stopped_early
+        report["termination_reason"] = update["reason"] if stopped_early else None
+        if logging or stopped_early:
             row = {"stage":"observable_bridge_fit","step":step,"target_steps":args.steps,
                    "repair":float(repair.detach()),"clean":float(protection.detach()),
                    "terms":{k:float(v.detach()) for k,v in terms.items()},"gradient":gradient,
                    "component_gradients":components,"clip_norm_before":norm,
                    "optimizer_update":update,
+                   "fit_bank":report["fit_bank"],
                    "elapsed_seconds":time.perf_counter()-started,
                    "optimizer_updates":dict(report["optimizer_updates"])}
             with (destination / "gradients.jsonl").open("a",encoding="utf8") as handle:
                 handle.write(json.dumps(row,allow_nan=False) + "\n")
             print(json.dumps(row,allow_nan=False),flush=True)
-        if step % args.eval_every == 0 or step == args.steps:
+        if step % args.eval_every == 0 or step == args.steps or stopped_early:
             final = {split:evaluate(model,banks,split,cfg) for split in ("seen","new_position")}
             decisions = {split:m._checkpoint_validation_decision(metrics,cfg,stage="refiner") for split,metrics in final.items()}
             groups = {split:group_decisions(metrics,cfg) for split,metrics in final.items()}
@@ -289,6 +332,9 @@ def run(args):
                          "completed_steps":step,"diagnostic_ready":report["diagnostic_ready"],
                          "group_decisions":groups,"failure_breakdown":breakdown,
                          "optimizer_updates":report["optimizer_updates"],
+                         "fit_bank":report["fit_bank"],
+                         "stopped_early":stopped_early,
+                         "termination_reason":report["termination_reason"],
                          "scientific_acceptance":False,"publish_allowed":False},
                         destination / "summary.json")
             print(json.dumps({"stage":"bridge_readiness",**report["history"][-1]}),flush=True)
@@ -296,11 +342,17 @@ def run(args):
                 for group, row in rows.items():
                     print(json.dumps({"stage":"bridge_failure_breakdown","step":step,
                                       "split":split,"group":group,**row},allow_nan=False),flush=True)
+        if stopped_early:
+            print(json.dumps({"stage":"bridge_fixed_bank_stalled","completed_steps":step,
+                              "target_steps":args.steps,"reason":report["termination_reason"],
+                              "state_retained":True,"published":False}),flush=True)
+            break
     report["completed"] = True
     m.save_json(report,destination / "diagnostic_report.json")
     m._atomic_torch_save({"version":"observable_bridge_diagnostic_only_v2","formal_checkpoint":False,
                          "publish_allowed":False,"model_state_dict":model.state_dict()},destination / "diagnostic_weights.pt")
     print(json.dumps({"stage":"bridge_diagnostic_complete","ready_for_fresh_pilot":report["diagnostic_ready"],
+                      "completed_steps":report["completed_steps"],"stopped_early":report["stopped_early"],
                       "published":False,"report":str(destination / "diagnostic_report.json")}),flush=True)
     return 0 if report["diagnostic_ready"] else 2
 

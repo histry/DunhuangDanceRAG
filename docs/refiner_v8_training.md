@@ -4,7 +4,62 @@ This change repairs artificial joins, not original SMPL14 assets. Existing
 retarget cache, train/val/test Event-DB, Router/Duration/Planner and generation
 index stay read-only. No external pretrained model is introduced.
 
-## Latest diagnostic: checked Refiner parameter updates
+## Latest diagnostic: full-bank fitting and bounded step scale
+
+The server's `5fad394` run completed the control and neural diagnostic normally.
+All 64 zero-edit cases were exact identities; the eight foundation groups passed.
+All 400 neural updates decreased their CURRENT minibatch loss (491 forward
+trials), but temporal repair was only 3/16 for seen single-recording cases and
+0/16 for each other split/role. Clean identity and physical non-regression
+passed. Neither the previous Adam-overshoot fix nor those safety passes prove
+learned temporal repair. Original SMPL files are not implicated by this report.
+
+The following diagnostic/optimization issues are addressed:
+
+- The small fixed-bank diagnostic previously drew only 8 of its 32 seen cases
+  each step. A decrease on that subset does not bound the loss on the other 24.
+  It now uses ALL 32 seen TRAIN cases for both gradients and trial evaluation,
+  with equal role/width coverage. New-position probes and independent validation
+  remain excluded. The formal random-window training sampler is unchanged.
+  This is a changed diagnostic protocol: 400 full-bank steps expose four times
+  as many cases as the old 400 minibatch steps, not an equal-compute comparison.
+- The persistent line-search scale previously could halve across successive
+  steps without a global lower bound. A local full-bank control reached scale
+  9.31e-10 and counted an approximately 1e-13 loss decrease as progress at step
+  150. The 12-trial grid is now bounded below by 2^-11. Hitting this floor tries
+  the current-gradient direction; failure restores the prior model/optimizer.
+  It does not loosen any motion-quality threshold or force a harmful update.
+  The unbounded local control was stopped after observing this plateau; it
+  did not produce a completed 400-step result.
+- If BOTH directions fail on the fixed bank (or its gradient is zero), diagnosis
+  stops, evaluates and saves the retained model, and returns nonzero before the
+  400-step budget. No new sample or optimizer state would justify repeatedly
+  trying the same failed search. Actual `completed_steps`, `stopped_early` and
+  `termination_reason` are reported; an early stop cannot authorize pilot.
+  Formal random-minibatch training does NOT stop on a single retained update.
+
+The bounded local full-bank control stopped at attempt 143 (142 accepted
+updates), with loss 0.0625 -> 0.00401173. On its eight local TRAIN windows,
+seen single-recording temporal repair passed 16/16, but new-position
+single-recording repair passed 0/16; cross-event temporal repair passed 4/16
+seen and 3/16 new-position. Some cross-event physical checks also failed.
+This is a local optimization control, NOT the exact server case set, a completed
+400-step diagnostic, independent validation, or permission to train a pilot.
+It supports improved fixed-bank fitting, not repaired generalization.
+
+The model remains V9. A separate local FK-derivative-input control improved
+new-position short cross-event temporal repair from 0/8 to 3/8, but failed the
+long-seam groups; it is NOT adopted here as a validated architectural solution.
+Neural generalization remains unverified. Do not infer successful training from
+loss descent or run 8000 steps directly after pulling this change.
+
+Neural diagnostic schema is v7, fitting protocol `complete_seen_bank_descent_v1`,
+and update protocol `same_batch_descent_backtracking_v2_bounded_scale`.
+Reports/optimizer snapshots from the earlier protocol cannot authorize or resume
+a fresh run. Use a new `refiner_v9_fullbank_*` tag. All source/scheduler assets
+remain reusable and no external model is downloaded.
+
+## Previous repair: checked Refiner parameter updates
 
 The `a12f877` server run passed the foundation control but failed the 400-step
 neural gate: seen single-recording temporal repair was 4/16, and the other three
@@ -19,8 +74,8 @@ first-order direction and gradient clipping. Ten of the first 25 updates raised
 the same-batch loss. This local database is NOT the server's exact event set,
 and this mechanism is NOT established as the sole cause of its failed gate.
 
-Both the 400-step diagnostic and formal Refiner now use
-`same_batch_descent_backtracking_v1`:
+That revision introduced `same_batch_descent_backtracking_v1` for both the
+400-step diagnostic and formal Refiner (superseded by bounded-scale v2 above):
 
 - Form the Adam proposal, then evaluate the SAME fixed minibatch after the
   proposed update. The trial never regenerates corruption or reads probe/val
@@ -53,7 +108,7 @@ minibatch loss does not guarantee each window, temporal component or physical
 metric improves. Independent validation and the original role/width gates are
 still required; never use this optimizer acceptance as scientific acceptance.
 
-Foundation schema remains v4; neural diagnostic schema is now v6 and records
+Foundation schema remains v4; that neural diagnostic schema was v6 and recorded
 the optimizer source hash/protocol. Old reports cannot authorize a fresh pilot.
 Rerun the bounded foundation/400-step checks before considering more training.
 
@@ -101,7 +156,7 @@ If diagnosis fails, supply this new summary together with the console log;
 do not substitute a historical same-name JSON from another revision.
 
 The script name `scripts/train_refiner_v8.sh` is intentionally retained, with
-the dependency order unchanged. Use a new `refiner_v9_checked_*` tag. Source
+the dependency order unchanged. Use a new `refiner_v9_fullbank_*` tag. Source
 assets are reusable; old foundation/diagnostic authorizations and trained
 Refiner weights are not silently migrated across source fingerprints.
 
@@ -201,7 +256,7 @@ jerk stencil before/after editing. Frame indices are local to the diagnostic
 window, zero-based, not absolute SMPL recording frames. Separate jerk-safety
 gradient norms/conflicts are logged alongside endpoint/temporal/support terms.
 
-Foundation is v4; the latest neural diagnostic is v6. Old reports/snapshots
+Foundation is v4; the latest neural diagnostic is v7. Old reports/snapshots
 must not authorize a new run: use a fresh tag and rerun foundation. Passing
 safe direct optimization still does not demonstrate neural generalization.
 Generation verifies the current code revision and byte-identical promotion
@@ -268,7 +323,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v9_checked_trial1
+export TAG=refiner_v9_fullbank_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```
@@ -302,11 +357,12 @@ That line alone does NOT authorize fitting: the final decision must still have
 bash scripts/train_refiner_v8.sh diagnose "$OUT_ROOT" "$TAG"
 ```
 
-Fits only seen TRAIN positions; new positions are held out from fitting. Fresh
-initialization, balanced four-group batches, no direct-control warm start.
+Fits the complete seen TRAIN bank; new positions are held out from fitting.
+Fresh initialization, all four groups in each update, no direct-control warm start.
 Inspect `bridge_diagnostic/diagnostic_report.json` and `gradients.jsonl` in the
 candidate directory, plus `summary.json` for all-step optimizer accounting and
 role/width failure counts. Fixed final step decides readiness, not best probes.
+An early fixed-bank search stall saves the actual step and rejects continuation.
 
 ### 3. Only after diagnosis passes: fresh source-disjoint pilot
 

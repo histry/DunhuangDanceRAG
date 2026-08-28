@@ -15,8 +15,9 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "same_batch_descent_backtracking_v1"
+REFINER_UPDATE_PROTOCOL = "same_batch_descent_backtracking_v2_bounded_scale"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
+MIN_TRIAL_SCALE = 2.0 ** (1 - MAX_BACKTRACK_TRIALS)
 _SCALE_KEY = "refiner_trial_scale"  # persisted by optimizer.state_dict()
 
 
@@ -54,6 +55,7 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
         "resolution_limited_trials": 0, "first_trial_loss": None,
         "adam_directional_derivative": None, "used_gradient_rescue": False,
         "max_trials_per_direction": int(max_trials), "scientific_acceptance": False,
+        "minimum_trial_scale": MIN_TRIAL_SCALE, "scale_floor_hits": 0,
     }
     maximum_gradient = torch.stack([g.abs().max() for g in gradients]).max()
     if float(maximum_gradient) == 0:
@@ -77,6 +79,13 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
             return False
         with torch.no_grad():
             for _ in range(int(max_trials)):
+                # Reusing a previous accepted scale must not turn a finite
+                # 12-trial search into unbounded shrinkage across training steps.
+                # Below this fixed grid try the CURRENT gradient at full scale,
+                # rather than count float-roundoff-sized Adam moves as progress.
+                if scale < MIN_TRIAL_SCALE:
+                    report["scale_floor_hits"] += 1
+                    break
                 changed = False
                 for parameter, value, delta in zip(parameters, original, direction):
                     candidate = value + scale * delta
@@ -108,7 +117,7 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
         slope = derivative(direction)
         report["adam_directional_derivative"] = slope if math.isfinite(slope) else None
         prior_scale = min(float(group.get(_SCALE_KEY, 1.0)) for group in optimizer.param_groups)
-        if not math.isfinite(prior_scale) or not 0 < prior_scale <= 1:
+        if not math.isfinite(prior_scale) or not MIN_TRIAL_SCALE <= prior_scale <= 1:
             raise ValueError("invalid persisted Refiner trial scale")
         accepted = search(direction, min(1.0, 2.0 * prior_scale), "adam")
         if not accepted:
@@ -139,6 +148,7 @@ def record_update(summary, update):
         "gradient_rescue_steps": int(update["used_gradient_rescue"]),
         "trial_evaluations": int(update["trial_evaluations"]),
         "nonfinite_trials": int(update["nonfinite_trials"]),
+        "scale_floor_hits": int(update.get("scale_floor_hits", 0)),
         "accepted_non_descent_steps": int(update["optimizer_update_accepted"] and
                                            update["loss_after"] >= update["loss_before"]),
     }

@@ -57,7 +57,8 @@ if [[ "$MODE" == foundation ]]; then
 fi
 if [[ "$MODE" == diagnose ]]; then
   echo "[DIAGNOSTIC] 400-step neural fit, not a network/download check."
-  echo "[OPTIMIZER] Checked same-batch updates; loss descent is not repair acceptance."
+  echo "[OPTIMIZER] Complete 32-case TRAIN-bank descent, bounded step scale; no probe fitting."
+  echo "[STOP] A fixed-bank search stall saves reports and blocks all later stages."
   echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."
   "$PY" -u -m training.refiner_bridge_diagnostics "${FIT_ARGS[@]}" \
     --out_dir "$FIT_DIR" --windows 8 --steps 400 --eval_every 200 --foundation_report "$FOUNDATION" \

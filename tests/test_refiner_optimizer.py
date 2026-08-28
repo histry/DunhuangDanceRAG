@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from training.refiner_optimizer import checked_refiner_step, REFINER_UPDATE_PROTOCOL
+from training.refiner_optimizer import MIN_TRIAL_SCALE
 
 
 def assert_state_equal(a, b):
@@ -88,6 +89,39 @@ def test_uphill_momentum_uses_current_gradient_not_ascent(device):
     assert report['used_gradient_rescue'] and report['optimizer_update_accepted']
     assert not opt.state  # stale moments must not be resumed after rescue
     assert float(objective()) < float(loss)
+
+
+def test_tiny_downhill_adam_steps_cannot_evade_the_fixed_search_range(device):
+    # Stale momentum has a large component along a highly curved coordinate.
+    # Its dot product with the current gradient is negative, but shrinking it
+    # indefinitely would accept a near-no-op instead of the useful x direction.
+    p=torch.nn.Parameter(torch.zeros(2,device=device))
+    opt=torch.optim.AdamW([p],lr=.01,weight_decay=0.)
+    (-p[1]).backward(); opt.step()
+    with torch.no_grad(): p.zero_()
+    opt.param_groups[0]['refiner_trial_scale']=MIN_TRIAL_SCALE
+    opt.zero_grad(set_to_none=True)
+    def objective(): return 1+p[0]+.5*p[0].square()+1e6*p[1].square()
+    loss=objective(); loss.backward()
+    report=checked_refiner_step(opt,loss,objective)
+    assert report['adam_directional_derivative'] < 0
+    assert report['scale_floor_hits'] > 0
+    assert report['direction']=='current_gradient'
+    assert report['loss_before']-report['loss_after'] > .009
+    assert MIN_TRIAL_SCALE <= report['step_scale'] <= 1
+    assert p[1]==0 and not opt.state
+
+
+def test_out_of_range_persisted_scale_is_rejected_and_restored(device):
+    p=torch.nn.Parameter(torch.ones(1,device=device))
+    opt=torch.optim.AdamW([p],lr=.1)
+    opt.param_groups[0]['refiner_trial_scale']=MIN_TRIAL_SCALE/2
+    loss=p.square().sum(); loss.backward()
+    state=copy.deepcopy(opt.state_dict())
+    with pytest.raises(ValueError,match='persisted Refiner trial scale'):
+        checked_refiner_step(opt,loss,lambda:p.square().sum())
+    assert p==1
+    assert_state_equal(opt.state_dict(),state)
 
 
 def test_resume_replays_scaled_update_and_optimizer_state(device):
