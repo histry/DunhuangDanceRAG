@@ -10,6 +10,7 @@ import argparse
 import dataclasses
 import json
 import random
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v4"
+SCHEMA = "refiner_observable_bridge_diagnostic_v5"
 
 
 def fingerprint(args, cfg):
@@ -41,6 +42,7 @@ def fingerprint(args, cfg):
     value["repair_safety_protocol"] = m.REFINER_REPAIR_SAFETY_PROTOCOL
     value["observable_objective_protocol"] = m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
     value["direct_optimizer_protocol"] = DIRECT_OPTIMIZER_PROTOCOL
+    value["refiner_input_protocol"] = m.REFINER_INPUT_PROTOCOL
     return value
 
 
@@ -93,27 +95,33 @@ def evaluate(model, banks, split, cfg, *, predictions=None):
         bank = banks[(split, role)]
         for start in range(0, len(bank["clean"]), 8):
             batch = {k: v[start:start + 8] for k,v in bank.items()}
+            decoder_rows = [None] * len(batch["clean"])
             with m.torch.no_grad():
                 if predictions is not None:
                     pred, identity = predictions[(split,role)][start:start+8], batch["clean"]
                 elif model is None:
                     pred, identity = batch["bad"], batch["clean"]
                 else:
-                    pred, identity = m._refiner_batch_outputs(model, batch, cfg)
+                    trace = {}
+                    pred, identity = m._refiner_batch_outputs(model, batch, cfg, trace=trace)
+                    from training.bridge_feasibility import decoder_summary
+                    decoder_rows = decoder_summary(trace["repair"], batch["seam"])
             arrays = [x.detach().cpu().numpy() for x in (pred, identity, batch["bad"], batch["clean"], batch["seam"])]
-            for prediction, clean_prediction, reference, clean, seam in zip(*arrays):
+            for case, (prediction, clean_prediction, reference, clean, seam) in enumerate(zip(*arrays)):
                 if role == "single_recording":
                     m._record_validation_physical_prediction(physical, prediction, clean, cfg, degraded=reference, seam_mask=seam)
                     m._record_validation_clean_identity_prediction(physical, clean_prediction, clean, cfg)
                     errors.append(float(np.abs(m.product_log_np(clean, prediction)).mean()))
-                    details.append({"width":int(np.sum(seam >= .5)),"observable": physical["observable_boundary_gates"][-1],
+                    details.append({"case_index":start+case,"decoder":decoder_rows[case],
+                                    "width":int(np.sum(seam >= .5)),"observable": physical["observable_boundary_gates"][-1],
                                     "clean_identity": physical["clean_identity_gates"][-1]})
                 else:
                     gate = m._observable_boundary_audit(prediction, reference, seam, cfg)
                     safety = m._fixed_support_stage_gate(reference,prediction,cfg)
                     if not gate["reference_fidelity_accepted"]:
                         safety = {**safety,"accepted":False,"reasons":[*safety.get("reasons",[]),"cross_reference_geometry_budget_exceeded"]}
-                    cross.append({"width":int(np.sum(seam >= .5)),"observable": gate, "safety": safety, "hidden_clean_used": False})
+                    cross.append({"case_index":start+case,"decoder":decoder_rows[case],
+                                  "width":int(np.sum(seam >= .5)),"observable": gate, "safety": safety, "hidden_clean_used": False})
             print(json.dumps({"stage": "bridge_probe", "split": split, "role": role,
                               "completed": min(start + 8, len(bank["clean"])), "total": len(bank["clean"])}), flush=True)
     gates = [row["observable"] for row in cross]
@@ -125,6 +133,34 @@ def evaluate(model, banks, split, cfg, *, predictions=None):
                 "physical_non_regression": m._summarize_validation_gates([r["safety"] for r in cross],accepted_key="accepted"),
                 "endpoint_informative": sum(g["endpoint_informative"] for g in gates),
                 "temporal_informative": sum(g["temporal_informative"] for g in gates), "windows": cross}}
+
+
+def failure_breakdown(metrics):
+    """Small console/report evidence; never a second, looser acceptance rule."""
+    groups = {}
+    for role, rows in (("single_recording", metrics["windows"]),
+                       ("cross_event", metrics["cross_event"]["windows"])):
+        for width in sorted({row["width"] for row in rows}):
+            selected = [row for row in rows if row["width"] == width]
+            gates = [row["observable"] for row in selected]
+            reasons = Counter(reason for row in selected for reason in
+                (row.get("safety") or row["observable"]["physical_non_regression"]).get("reasons", []))
+            decoder = [row["decoder"] for row in selected if row.get("decoder") is not None]
+            groups[f"{role}/{width}"] = {
+                "cases": len(selected),
+                "endpoint_pass": sum(bool(g["endpoint_accepted"]) for g in gates),
+                "temporal_pass": sum(bool(g["temporal_accepted"]) for g in gates),
+                "temporal_gain_pass": sum(bool(g["temporal_gain_only"]) for g in gates),
+                "jerk_non_regression_pass": sum(bool(g["jerk_non_regression"]) for g in gates),
+                "endpoint_gain_median": float(np.median([g["endpoint_gain"] for g in gates])),
+                "temporal_gain_median": float(np.median([g["temporal_gain"] for g in gates])),
+                "physical_failure_reasons": dict(sorted(reasons.items())),
+                "decoder_means": ({key: float(np.mean([row[key] for row in decoder]))
+                    for key in ("raw_tangent_rms", "applied_tangent_rms", "root_mask_mean",
+                                "joint_mask_mean", "root_cap_fraction", "joint_cap_fraction")}
+                    if decoder else None),
+            }
+    return groups
 
 
 def run(args):
@@ -232,10 +268,21 @@ def run(args):
                 and all(d["scientific_acceptance"] for d in decisions.values())
                 and all(g["passed"] for split in groups.values() for g in split.values())))
             report["group_decisions"] = groups
+            breakdown = {split:failure_breakdown(metrics) for split,metrics in final.items()}
+            report["failure_breakdown"] = breakdown
             # These decisions only judge train-window readiness, never publication.
             report["history"].append({"step":step,"readiness":{s:{"passed":d["scientific_acceptance"],"reasons":d["reasons"],"observed":d["observed"]} for s,d in decisions.items()}})
             m.save_json(report,destination / "diagnostic_report.json")
+            m.save_json({"schema":SCHEMA,"fingerprint":report["fingerprint"],
+                         "completed_steps":step,"diagnostic_ready":report["diagnostic_ready"],
+                         "group_decisions":groups,"failure_breakdown":breakdown,
+                         "scientific_acceptance":False,"publish_allowed":False},
+                        destination / "summary.json")
             print(json.dumps({"stage":"bridge_readiness",**report["history"][-1]}),flush=True)
+            for split, rows in breakdown.items():
+                for group, row in rows.items():
+                    print(json.dumps({"stage":"bridge_failure_breakdown","step":step,
+                                      "split":split,"group":group,**row},allow_nan=False),flush=True)
     report["completed"] = True
     m.save_json(report,destination / "diagnostic_report.json")
     m._atomic_torch_save({"version":"observable_bridge_diagnostic_only_v2","formal_checkpoint":False,

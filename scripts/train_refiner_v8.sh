@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Isolated, foreground V8 workflow. Existing source and scheduler assets are read-only.
+# V8 foundation + V9 local Refiner. Keep this entrypoint for existing runbooks.
+# Existing source and scheduler assets are read-only.
 set -Eeuo pipefail
 if [[ $# -ne 3 || ! "$1" =~ ^(foundation|diagnose|pilot|resume|generate)$ || ! "$3" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   echo "Usage: bash scripts/train_refiner_v8.sh foundation|diagnose|pilot|resume|generate EXISTING_OUT_ROOT NEW_TAG" >&2
@@ -55,6 +56,8 @@ if [[ "$MODE" == foundation ]]; then
   exit 0
 fi
 if [[ "$MODE" == diagnose ]]; then
+  echo "[DIAGNOSTIC] 400-step neural fit, not a network/download check."
+  echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."
   "$PY" -u -m training.refiner_bridge_diagnostics "${FIT_ARGS[@]}" \
     --out_dir "$FIT_DIR" --windows 8 --steps 400 --eval_every 200 --foundation_report "$FOUNDATION" \
     2>&1 | tee "$CANDIDATES/console.bridge_diagnostic_$STAMP.log"

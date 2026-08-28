@@ -101,6 +101,7 @@ def test_refiner_cache_rejects_changed_decoder_configuration(tmp_path):
         "product_manifold_boundary_refiner_v3",
         "product_manifold_boundary_refiner_v4",
         "product_manifold_boundary_refiner_v5",
+        "product_manifold_boundary_refiner_v8",
     ],
 )
 def test_formal_refiner_rejects_legacy_checkpoint(legacy_version):

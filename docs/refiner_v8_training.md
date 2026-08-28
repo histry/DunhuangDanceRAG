@@ -1,8 +1,56 @@
-# V8: validate the interpolation foundation before learning
+# V8 foundation / V9 local Refiner: validate before learning
 
 This change repairs artificial joins, not original SMPL14 assets. Existing
 retarget cache, train/val/test Event-DB, Router/Duration/Planner and generation
 index stay read-only. No external pretrained model is introduced.
+
+## Latest neural diagnostic and bounded repair
+
+The server's `bbb2aaf` run passed all eight foundation groups, then completed
+400 neural steps and correctly STOPPED. Single-recording temporal repair was
+6/16 at seen positions and 0/16 at new positions; cross-event temporal repair
+was 0/16 in both splits. All 17 sampled clean-loss gradients were zero. This is
+neither an interpolation-control failure nor evidence of damaged SMPL assets.
+It also does not establish one unique cause of the neural generalization gap.
+
+Two reproducible architecture defects are corrected in V9:
+
+- `GroupNorm` on `[B,C,T]` used statistics over the entire time window, so remote
+  frames changed the same seam's output. Per-frame channel LayerNorm removes
+  this dependence. The convolutional field is 33 frames; the local horizontal
+  difference reads one preceding frame, and boundary conditioning explicitly
+  reads the supplied external anchors. No claim of a purely 33-frame total
+  dependency is made.
+- Raw world X/Z made correction depend on arbitrary route placement. The neural
+  input now contains local horizontal displacement in metres/frame instead.
+  Height, joint rotations and observed boundary features remain available;
+  the original motion is unchanged as the geometric decoder reference.
+
+CPU/CUDA tests use NONZERO heads, translations, remote-frame perturbations,
+consistent crops and backpropagation. A zero head alone is not an invariance
+test. Model version and input contract reject V8 checkpoints/snapshots.
+The physical objectives, interpolation, masks, smoothing, caps, clean tolerance,
+3% improvement gates and 75% pass rates are unchanged. These structural fixes
+are NOT a claim that a new 400-step experiment will pass.
+
+A local 400-step two-TRAIN-window probe (eight fitted role/width cases, fixed
+initialization and objectives) still failed to improve temporal energy on the
+four held-out single-recording seam positions, for both V8 and V9. It is a
+mechanism check, not the server's eight-window experiment or an independent
+validation result. Thus generalization remains unresolved; do not proceed
+directly to pilot, 8000-step training or Diffusion after pulling this repair.
+
+`bridge_diagnostic/summary.json` and `bridge_failure_breakdown` console rows now
+separate temporal-energy improvement from jerk non-regression, for every
+role/width/split, and include raw/applied tangent RMS, mask and cap statistics.
+The complete report retains individual cases and all original safety checks.
+If diagnosis fails, supply this new summary together with the console log;
+do not substitute a historical same-name JSON from another revision.
+
+The script name `scripts/train_refiner_v8.sh` is intentionally retained, with
+the dependency order unchanged. Use a new `refiner_v9_local_*` tag. Source
+assets are reusable; old foundation/diagnostic authorizations and trained
+Refiner weights are not silently migrated across source fingerprints.
 
 ## Geometry and scientific boundaries
 
@@ -45,7 +93,7 @@ index stay read-only. No external pretrained model is introduced.
   is no blanket "already smooth => repaired" rule. If controls do not establish
   repair headroom, stop and inspect instead of running 8000 steps blindly.
 
-Refiner: `product_manifold_boundary_refiner_v8`; Diffusion:
+Refiner: `product_manifold_boundary_refiner_v9`; Diffusion:
 `reference_tangent_motion_diffusion_v4`; boundary protocol:
 `observable_duration_c2_bridge_v2`. V7 reports/models/snapshots are incompatible.
 
@@ -167,7 +215,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v8_descent_trial1
+export TAG=refiner_v9_local_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```

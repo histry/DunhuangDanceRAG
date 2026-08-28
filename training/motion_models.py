@@ -98,7 +98,8 @@ from motion_geometry.boundary_observables import (
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v8"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v9"
+REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_v1"
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_jerk_tail_constraints_v1"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_support_v1"
@@ -795,6 +796,7 @@ def motion_checkpoint_contract(cfg: MotionGenerationConfig, role: str) -> Dict[s
         contract["refiner_tangent_mask_semantics"] = (
             "soft_scale_then_cap_applied_tangent_v1"
         )
+        contract["refiner_input_protocol"] = REFINER_INPUT_PROTOCOL
     return contract
 
 
@@ -832,12 +834,12 @@ def assert_motion_checkpoint_contract(
                 f"window_len: checkpoint={actual.get('window_len')!r}, runtime={expected['window_len']!r}"
             )
     if role == "boundary_refiner":
-        key = "refiner_tangent_mask_semantics"
-        if actual.get(key) != expected[key]:
-            mismatches.append(
-                f"{key}: checkpoint={actual.get(key)!r}, "
-                f"runtime={expected[key]!r}"
-            )
+        for key in ("refiner_tangent_mask_semantics", "refiner_input_protocol"):
+            if actual.get(key) != expected[key]:
+                mismatches.append(
+                    f"{key}: checkpoint={actual.get(key)!r}, "
+                    f"runtime={expected[key]!r}"
+                )
     if mismatches:
         raise RuntimeError(
             f"Checkpoint contract mismatch for {path}: " + "; ".join(mismatches)
@@ -2367,6 +2369,32 @@ def build_frame_local_conditioning(
     return ((frame_condition - mean[None]) / np.maximum(std[None], 1.0e-8)).astype(np.float32)
 
 
+class FramewiseChannelNorm(nn.LayerNorm):
+    """Normalize channels of each frame, never statistics over window time.
+
+    GroupNorm on [B,C,T] also reduces T. That made an arbitrary distant frame
+    change a seam's prediction and invalidated the claimed local receptive
+    field. LayerNorm on [B,T,C] is independent of both time and batch members.
+    """
+
+    def forward(self, value):
+        return super().forward(value.transpose(1, 2)).transpose(1, 2)
+
+
+def _refiner_motion_features(x):
+    """Observed pose/height plus horizontal displacement in m/frame.
+
+    Absolute world X/Z is not repair evidence: the same event can be translated
+    anywhere by routing. Do not rebase to a crop-dependent first frame either.
+    A local backward difference preserves horizontal translation invariance
+    and crop locality. Height and every joint rotation remain observable.
+    The original motion is still used unchanged as the decoder reference.
+    """
+    velocity = F.pad(x[:, 1:, 4:7] - x[:, :-1, 4:7], (0, 0, 1, 0))
+    return torch.cat([x[..., :4], velocity[..., :1], x[..., 5:6],
+                      velocity[..., 2:3], x[..., 7:]], dim=-1)
+
+
 class ProductManifoldTemporalRefiner(nn.Module):
     """Boundary refiner with a joint-risk-conditioned 79D geometric output.
 
@@ -2383,7 +2411,9 @@ class ProductManifoldTemporalRefiner(nn.Module):
         hidden: int = 256,
     ):
         super().__init__()
-        # Kernel-5 dilations [1,2,5] give a 33-frame receptive field. A
+        # Kernel-5 dilations [1,2,5] give a 33-frame convolutional field. The
+        # local horizontal difference needs one additional preceding frame;
+        # explicit boundary features also read the two supplied anchors. A
         # 28-frame corrupted seam needs both external clean endpoints, not
         # merely 28 in-seam frames; the former 29-frame field missed one
         # endpoint at the centre of a maximum-length transition.
@@ -2396,13 +2426,13 @@ class ProductManifoldTemporalRefiner(nn.Module):
         )
         self.net = nn.Sequential(
             nn.Conv1d(hidden, hidden, 5, padding=2, dilation=1),
-            nn.GroupNorm(8, hidden),
+            FramewiseChannelNorm(hidden),
             nn.SiLU(),
             nn.Conv1d(hidden, hidden, 5, padding=4, dilation=2),
-            nn.GroupNorm(8, hidden),
+            FramewiseChannelNorm(hidden),
             nn.SiLU(),
             nn.Conv1d(hidden, hidden, 5, padding=10, dilation=5),
-            nn.GroupNorm(8, hidden),
+            FramewiseChannelNorm(hidden),
             nn.SiLU(),
         )
         self.out = nn.Conv1d(hidden, PRODUCT_STATE_DIM, 1)
@@ -2414,7 +2444,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
         batch, frames, _ = x.shape
         c = _expand_temporal_condition_torch(cond, frames)
         observed = boundary_features_torch(x, seam_mask)
-        y = torch.cat([x, c, seam_mask, joint_mask, observed], dim=-1).transpose(1, 2)
+        y = torch.cat([_refiner_motion_features(x), c, seam_mask, joint_mask, observed], dim=-1).transpose(1, 2)
         h = self.in_proj(y)
         h = h + self.net(h)
         return self.out(h).transpose(1, 2)
