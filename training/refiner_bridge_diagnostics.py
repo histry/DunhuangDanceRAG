@@ -25,7 +25,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v9"
+SCHEMA = "refiner_observable_bridge_diagnostic_v10"
 FIT_PROTOCOL = "complete_seen_bank_descent_v1"
 PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
 
@@ -118,12 +118,49 @@ def save_fit_bank(destination, batch, report, cfg):
             "cases":len(batch["clean"]),"train_only":True}
 
 
+def save_probe_bank(destination, banks, report, cfg):
+    """Save exact held-out local contexts for replay, never for updates.
+
+    V9 saved only the fitted bank, so its held-out failure could not be replayed
+    away from the server Event-DB. The explicit probe-only contract makes the
+    artifact auditable without turning validation inputs into training data.
+    """
+    path = destination / "probe_bank.pt"
+    probe = {
+        role: _cpu_tree(banks[("new_position", role)])
+        for role in ("single_recording", "cross_event")
+    }
+    m._atomic_torch_save(
+        {
+            "schema": "refiner_local_context_probe_bank_v1",
+            "probe_only": True,
+            "updates_forbidden": True,
+            "formal_checkpoint": False,
+            "publish_allowed": False,
+            "hidden_clean_single_recording_diagnostic_only": True,
+            "fingerprint": report["fingerprint"],
+            "windows": report["windows"],
+            "config": dataclasses.asdict(cfg),
+            "banks": probe,
+        },
+        path,
+    )
+    return {
+        "file": path.name,
+        "sha256": common.file_sha256(path),
+        "cases": sum(len(row["clean"]) for row in probe.values()),
+        "probe_only": True,
+        "updates_forbidden": True,
+    }
+
+
 def save_diagnostic_state(destination, model, optimizer, report, step):
     """Exact retained state, explicitly incompatible with formal resume loaders."""
     m._atomic_torch_save({"schema":"refiner_diagnostic_state_v1",
         "formal_checkpoint":False,"publish_allowed":False,
         "completed_steps":step,"fingerprint":report["fingerprint"],
         "fit_bank_artifact":report["fit_bank_artifact"],
+        "probe_bank_artifact":report.get("probe_bank_artifact"),
         "model_state_dict":_cpu_tree(model.state_dict()),
         "optimizer_state_dict":_cpu_tree(optimizer.state_dict()),
         "torch_rng":m.torch.get_rng_state()},destination / "diagnostic_state.pt")
@@ -312,7 +349,7 @@ def run(args):
         return run_foundation(args,cfg,banks,pure,recipes,fingerprint(args,cfg),
             [{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],separation)
     train = fixed_fit_bank(banks)
-    model = m.ProductManifoldTemporalRefiner().to(device)
+    model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
     optimizer = m.torch.optim.AdamW(model.parameters(),lr=cfg.lr,weight_decay=1e-4)
     destination.mkdir(parents=True)
     report = {"schema":SCHEMA,"protocol":m.BOUNDARY_PROTOCOL,"fingerprint":fingerprint(args,cfg),
@@ -325,6 +362,9 @@ def run(args):
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[]}
     report["fit_bank_artifact"] = save_fit_bank(destination,train,report,cfg)
+    report["probe_bank_artifact"] = save_probe_bank(
+        destination, banks, report, cfg
+    )
     save_diagnostic_state(destination,model,optimizer,report,0)
     for split in ("seen","new_position"):
         report["baseline"][split] = evaluate(None,banks,split,cfg)

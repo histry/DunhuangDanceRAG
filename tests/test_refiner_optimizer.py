@@ -41,7 +41,7 @@ def test_clipped_adam_can_overshoot_but_checked_step_decreases(device):
     assert report['adam_directional_derivative'] < 0
     assert report['optimizer_update_accepted']
     assert 0 < report['step_scale'] < 1
-    assert float(objective()) < float(loss)
+    assert float(objective().detach()) < float(loss.detach())
     assert report['loss_after'] == float(objective())
     assert report['scientific_acceptance'] is False
 

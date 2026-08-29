@@ -47,6 +47,39 @@ def test_world_translation_does_not_change_repair_direction(setup):
                            m._refiner_motion_features(elevated)[..., 5])
 
 
+def test_fk_dynamics_features_match_gate_units_and_have_no_hidden_target():
+    x, _, seam, _ = sample("cpu")
+    features = m._refiner_fk_dynamics_features(x, seam, 30.0)
+    assert features.shape == (
+        x.shape[0], x.shape[1], m.REFINER_FK_DYNAMICS_FEATURE_DIM
+    )
+    assert torch.isfinite(features).all()
+    assert torch.count_nonzero(features[:, :40]) == 0
+    shifted = x.clone()
+    shifted[..., 4] += 8.0
+    shifted[..., 6] -= 3.0
+    torch.testing.assert_close(
+        features,
+        m._refiner_fk_dynamics_features(shifted, seam, 30.0),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    changed = x.clone()
+    changed[:, 50, 7:13] += 0.05
+    assert not torch.equal(
+        features[:, 48:54],
+        m._refiner_fk_dynamics_features(changed, seam, 30.0)[:, 48:54],
+    )
+
+
+def test_temporal_objective_waits_for_observable_endpoint_feasibility():
+    before = torch.tensor([1.0, 1.0, 0.0])
+    proposed = torch.tensor([1.0, 0.985, 0.0], requires_grad=True)
+    gate = m._endpoint_feasibility_gate(proposed, before, 0.03)
+    torch.testing.assert_close(gate, torch.tensor([0.0, 0.5, 1.0]))
+    assert not gate.requires_grad
+
+
 def test_distant_context_does_not_change_the_local_seam(setup):
     model, (x, cond, seam, joint) = setup
     changed = x.clone()
@@ -90,6 +123,12 @@ def test_input_protocol_is_checked_not_just_stored():
     cfg = m.MotionGenerationConfig()
     contract = m.motion_checkpoint_contract(cfg, 'boundary_refiner')
     assert contract['refiner_input_protocol'] == m.REFINER_INPUT_PROTOCOL
+    assert m.REFINER_INPUT_PROTOCOL.endswith('fk_dynamics_v2')
+    model = m.ProductManifoldTemporalRefiner(hidden=16)
+    assert model.in_proj.in_channels == (
+        m.EDGE_DIM + 32 + 1 + m.NUM_JOINTS
+        + m.BOUNDARY_FEATURE_DIM + m.REFINER_FK_DYNAMICS_FEATURE_DIM
+    )
     contract.pop('refiner_input_protocol')
     with pytest.raises(RuntimeError, match='refiner_input_protocol'):
         m.assert_motion_checkpoint_contract({'motion_contract':contract}, cfg, 'old.pt', 'boundary_refiner')

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# V8 foundation + V9 local Refiner. Keep this entrypoint for existing runbooks.
+# Foundation + current V10 local Refiner. Keep this entrypoint for existing runbooks.
 # Existing source and scheduler assets are read-only.
 set -Eeuo pipefail
 if [[ $# -ne 3 || ! "$1" =~ ^(foundation|diagnose|pilot|resume|generate)$ || ! "$3" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -61,7 +61,7 @@ if [[ "$MODE" == diagnose ]]; then
   echo "[PROBE] New cuts also change local motion context; they are not a pure position-shift test."
   echo "[STOP] A fixed-bank search stall saves reports and blocks all later stages."
   echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."
-  echo "[REPLAY] Exact TRAIN inputs in fit_bank.pt, retained state in diagnostic_state.pt; diagnostic only."
+  echo "[REPLAY] Exact TRAIN inputs in fit_bank.pt, held-out inputs in probe_bank.pt, retained state in diagnostic_state.pt; diagnostic only."
   "$PY" -u -m training.refiner_bridge_diagnostics "${FIT_ARGS[@]}" \
     --out_dir "$FIT_DIR" --windows 8 --steps 400 --eval_every 200 --foundation_report "$FOUNDATION" \
     2>&1 | tee "$CANDIDATES/console.bridge_diagnostic_$STAMP.log"

@@ -99,11 +99,13 @@ from training.refiner_optimizer import checked_refiner_step, record_update, REFI
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v9"
-REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_v1"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v10"
+REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_v2"
+REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_v1"
+REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_tail_support_root_v4"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "endpoint_feasible_smooth_relative_margin_stage_tail_support_root_v5"
 
 
 def now_tag() -> str:
@@ -2396,6 +2398,63 @@ def _refiner_motion_features(x):
                       velocity[..., 2:3], x[..., 7:]], dim=-1)
 
 
+def _refiner_fk_dynamics_features(x, seam_mask, fps):
+    """Observable FK derivatives used by the objective and acceptance gate.
+
+    The former input exposed product-space poses and endpoint tangents, while
+    the repair objective judged world-space FK velocity, acceleration and
+    jerk. With a tiny SMPL14 bank the network therefore had to infer the
+    skeleton Jacobian before it could infer a repair direction. These features
+    are computed only from the candidate motion and supplied seam: no hidden
+    clean interior, target correction or validation signal is included.
+
+    Derivatives use the same physical units/scales as the observable loss.
+    Masking them to the edit support preserves the declared local context and
+    prevents unrelated natural dynamics from becoming a source identifier.
+    """
+    if not np.isfinite(float(fps)) or float(fps) <= 0:
+        raise ValueError("Refiner FK feature fps must be finite and positive")
+    if seam_mask.ndim == 2:
+        seam_mask = seam_mask.unsqueeze(-1)
+    if seam_mask.ndim != 3 or seam_mask.shape[:2] != x.shape[:2]:
+        raise ValueError("Refiner FK features require an event-aligned seam mask")
+    # Horizontal root velocity is already an explicit, translation-invariant
+    # motion feature. Remove absolute X/Z before FK so high-order differences
+    # cannot amplify float32 cancellation after a routed clip is translated far
+    # from the origin. The resulting body-relative FK dynamics plus the existing
+    # root displacement channels still cover the complete observable motion.
+    kinematic = x.clone()
+    kinematic[..., ROOT_X_IDX] = 0.0
+    kinematic[..., ROOT_Z_IDX] = 0.0
+    joints = fk_24_torch(kinematic)
+    velocity = torch.zeros_like(joints)
+    acceleration = torch.zeros_like(joints)
+    jerk = torch.zeros_like(joints)
+    if joints.shape[1] > 1:
+        velocity[:, 1:] = torch.diff(joints, dim=1) * float(fps)
+    if joints.shape[1] > 2:
+        acceleration[:, 2:] = torch.diff(joints, n=2, dim=1) * float(fps) ** 2
+    if joints.shape[1] > 3:
+        jerk[:, 3:] = torch.diff(joints, n=3, dim=1) * float(fps) ** 3
+    active = seam_mask.amax(dim=-1, keepdim=True) > 0.0
+    core = seam_mask.amax(dim=-1) >= 0.5
+    duration = (
+        core.sum(dim=1, keepdim=True).to(x.dtype) / float(fps)
+    )[:, None, :].expand(-1, x.shape[1], -1)
+    features = torch.cat(
+        [
+            velocity.flatten(2),
+            acceleration.flatten(2) / 10.0,
+            jerk.flatten(2) / 1000.0,
+            duration,
+        ],
+        dim=-1,
+    )
+    if features.shape[-1] != REFINER_FK_DYNAMICS_FEATURE_DIM:
+        raise RuntimeError("Refiner FK dynamics feature layout mismatch")
+    return torch.where(active, features, torch.zeros_like(features))
+
+
 class ProductManifoldTemporalRefiner(nn.Module):
     """Boundary refiner with a joint-risk-conditioned 79D geometric output.
 
@@ -2410,8 +2469,12 @@ class ProductManifoldTemporalRefiner(nn.Module):
         motion_dim: int = EDGE_DIM,
         cond_dim: int = 32,
         hidden: int = 256,
+        fps: float = 30.0,
     ):
         super().__init__()
+        if not np.isfinite(float(fps)) or float(fps) <= 0:
+            raise ValueError("Refiner fps must be finite and positive")
+        self.fps = float(fps)
         # Kernel-5 dilations [1,2,5] give a 33-frame convolutional field. The
         # local horizontal difference needs one additional preceding frame;
         # explicit boundary features also read the two supplied anchors. A
@@ -2423,7 +2486,14 @@ class ProductManifoldTemporalRefiner(nn.Module):
             self.temporal_dilations
         )
         self.in_proj = nn.Conv1d(
-            motion_dim + cond_dim + 1 + NUM_JOINTS + BOUNDARY_FEATURE_DIM, hidden, 1
+            motion_dim
+            + cond_dim
+            + 1
+            + NUM_JOINTS
+            + BOUNDARY_FEATURE_DIM
+            + REFINER_FK_DYNAMICS_FEATURE_DIM,
+            hidden,
+            1,
         )
         self.net = nn.Sequential(
             nn.Conv1d(hidden, hidden, 5, padding=2, dilation=1),
@@ -2445,7 +2515,18 @@ class ProductManifoldTemporalRefiner(nn.Module):
         batch, frames, _ = x.shape
         c = _expand_temporal_condition_torch(cond, frames)
         observed = boundary_features_torch(x, seam_mask)
-        y = torch.cat([_refiner_motion_features(x), c, seam_mask, joint_mask, observed], dim=-1).transpose(1, 2)
+        fk_dynamics = _refiner_fk_dynamics_features(x, seam_mask, self.fps)
+        y = torch.cat(
+            [
+                _refiner_motion_features(x),
+                c,
+                seam_mask,
+                joint_mask,
+                observed,
+                fk_dynamics,
+            ],
+            dim=-1,
+        ).transpose(1, 2)
         h = self.in_proj(y)
         h = h + self.net(h)
         return self.out(h).transpose(1, 2)
@@ -6365,6 +6446,26 @@ def _smooth_observable_margin(proposed, baseline, gain):
     return shoulder.square() / (2.0 * gain) + (gap - shoulder), gap
 
 
+def _endpoint_feasibility_gate(proposed, baseline, minimum_gain):
+    """Detach an endpoint-first active-set gate for temporal optimization.
+
+    A weighted sum allowed temporal improvement to buy an endpoint regression;
+    the uploaded V9 run exhibited exactly that failure for every held-out
+    28-frame cross-event bridge. Temporal repair becomes fully active after
+    the endpoint reaches the real acceptance gain and remains inactive while
+    the endpoint is worsening. The endpoint loss itself still targets the
+    stricter training gain, so this is not a relaxed scientific gate.
+    """
+    if not np.isfinite(float(minimum_gain)) or not 0 < float(minimum_gain) < 1:
+        raise ValueError("endpoint acceptance gain must be finite in (0, 1)")
+    baseline = baseline.detach()
+    informative = baseline > 1.0e-6
+    relative_gain = (baseline - proposed) / baseline.clamp_min(1.0e-6)
+    progress = (relative_gain / float(minimum_gain)).clamp(0.0, 1.0)
+    zero_scale_safe = (proposed <= baseline + 1.0e-6).to(proposed.dtype)
+    return torch.where(informative, progress, zero_scale_safe).detach()
+
+
 def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction="mean"):
     """Repair observable boundary defects, with no hidden clean target.
 
@@ -6387,8 +6488,14 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
 
     endpoint, endpoint_gap = _smooth_observable_margin(
         proposed["endpoint_velocity_jump_mps"], before["endpoint_velocity_jump_mps"], gain)
-    temporal, temporal_gap = _smooth_observable_margin(
+    temporal_raw, temporal_gap = _smooth_observable_margin(
         proposed["temporal_energy"], before["temporal_energy"], gain)
+    temporal_priority_gate = _endpoint_feasibility_gate(
+        proposed["endpoint_velocity_jump_mps"],
+        before["endpoint_velocity_jump_mps"],
+        cfg.checkpoint_validation_min_endpoint_repair_gain,
+    )
+    temporal = temporal_raw * temporal_priority_gate
     jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
             / before["seam_jerk_mps3"].clamp_min(1.0))
     jerk_safety, jerk_safety_terms = _repair_jerk_safety_loss_torch(
@@ -6414,7 +6521,9 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     terms = {
         "reconstruction": delta.square().mean((1,2)), "active_reconstruction": per_window,
         "repair_margin": endpoint, "clean_preservation": outside,
-        "temporal_supervision": temporal, "endpoint_continuity": endpoint,
+        "temporal_supervision": temporal, "temporal_supervision_raw": temporal_raw,
+        "temporal_priority_gate": temporal_priority_gate,
+        "endpoint_continuity": endpoint,
         "endpoint_relative_gap": endpoint_gap, "temporal_relative_gap": temporal_gap,
         "seam_velocity": proposed["endpoint_velocity_jump_mps"],
         "seam_acceleration": proposed["seam_acceleration_mps2"],
@@ -6450,7 +6559,7 @@ def train_refiner(args: argparse.Namespace) -> int:
         "source_disjoint": _validate_source_disjoint(db, validation_db),
     }
     device = torch.device(cfg.device)
-    model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(device)
+    model = ProductManifoldTemporalRefiner(EDGE_DIM, 32, fps=cfg.fps).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
     if steps < 1:
@@ -6797,6 +6906,9 @@ def train_refiner(args: argparse.Namespace) -> int:
         "training_objective": {
             "schema": BOUNDARY_PROTOCOL,
             "boundary_conditioning_dim": BOUNDARY_FEATURE_DIM,
+            "fk_dynamics_conditioning_dim": REFINER_FK_DYNAMICS_FEATURE_DIM,
+            "fk_dynamics_conditioning_protocol": REFINER_FK_DYNAMICS_PROTOCOL,
+            "temporal_priority": "endpoint_acceptance_active_set",
             "repair_target": "observable_endpoint_jump_and_actual_fk_dynamics",
             "hidden_clean_interior_in_repair_loss": False,
             "clean_geometry_contact_constraint": "per_window_unweighted_dead_band",
@@ -8093,7 +8205,9 @@ def _cached_inference_model(
                 raise RuntimeError(
                     "Formal generation rejects a non-product refiner checkpoint"
                 )
-            model = ProductManifoldTemporalRefiner(EDGE_DIM, 32).to(cfg.device)
+            model = ProductManifoldTemporalRefiner(
+                EDGE_DIM, 32, fps=cfg.fps
+            ).to(cfg.device)
             schedule = None
         elif role == "motion_diffusion":
             expected_version = DIFFUSION_MODEL_VERSION

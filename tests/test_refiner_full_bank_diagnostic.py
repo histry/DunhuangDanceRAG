@@ -88,14 +88,28 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
     batch={'clean':torch.arange(32.).reshape(32,1,1)}
     report={'fingerprint':{'test':'exact'},'windows':[], 'fit_bank':d.fit_bank_contract(8)}
     report['fit_bank_artifact']=d.save_fit_bank(tmp_path,batch,report,m.MotionGenerationConfig())
+    probe_batch={
+        'clean':torch.zeros(16,1,1),
+        'bad':torch.ones(16,1,1),
+    }
+    banks={('new_position',role):probe_batch for role in ('single_recording','cross_event')}
+    report['probe_bank_artifact']=d.save_probe_bank(
+        tmp_path,banks,report,m.MotionGenerationConfig()
+    )
     d.save_diagnostic_state(tmp_path,model,optimizer,report,19)
     bank=m._trusted_torch_load(tmp_path/'fit_bank.pt',map_location='cpu')
+    probe=m._trusted_torch_load(tmp_path/'probe_bank.pt',map_location='cpu')
     state=m._trusted_torch_load(tmp_path/'diagnostic_state.pt',map_location='cpu')
     assert bank['train_only'] and not bank['formal_checkpoint'] and not state['publish_allowed']
+    assert probe['probe_only'] and probe['updates_forbidden']
+    assert not probe['formal_checkpoint'] and not probe['publish_allowed']
+    assert set(probe['banks'])=={'single_recording','cross_event'}
     assert set(bank['batch'])=={'clean'}
     assert bank['batch']['clean'].device.type=='cpu'
     assert state['completed_steps']==19
     assert report['fit_bank_artifact']['sha256']==d.common.file_sha256(tmp_path/'fit_bank.pt')
+    assert report['probe_bank_artifact']['sha256']==d.common.file_sha256(tmp_path/'probe_bank.pt')
+    assert state['probe_bank_artifact']==report['probe_bank_artifact']
     assert state['optimizer_state_dict']['state']
     assert 'training_resume' not in state and 'version' not in state
 
@@ -117,13 +131,15 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(tmp_path,m
     monkeypatch.setattr(m,'_validate_source_disjoint',lambda *a:{'verified':True})
     monkeypatch.setattr(m,'load_motion_window',lambda *a,**k:np.zeros((8,151)))
     monkeypatch.setattr(m,'_descriptor_values_in_training_coordinates',lambda *a:np.zeros((8,32)))
-    banks={('seen',role):{'clean':torch.zeros(16,1,1)} for role in ('single_recording','cross_event')}
+    banks={(split,role):{'clean':torch.zeros(16,1,1)}
+           for split in ('seen','new_position')
+           for role in ('single_recording','cross_event')}
     monkeypatch.setattr(d,'build_banks',lambda *a:(banks,{}))
     monkeypatch.setattr(d,'fingerprint',lambda *a:{})
     monkeypatch.setattr(d.common,'file_sha256',lambda path:'test-digest')
     monkeypatch.setattr(f,'check_foundation_report',lambda *a:None)
     monkeypatch.setattr(f,'group_decisions',lambda *a:{'group':{'passed':False}})
-    monkeypatch.setattr(m,'ProductManifoldTemporalRefiner',lambda:torch.nn.Linear(1,1))
+    monkeypatch.setattr(m,'ProductManifoldTemporalRefiner',lambda **kwargs:torch.nn.Linear(1,1))
     def objective(model,batch,cfg):
         r=sum(p.square().sum() for p in model.parameters())
         return r,r*0,{'endpoint':r},{}

@@ -46,7 +46,10 @@ def test_observable_normalization_does_not_downweight_quiet_windows():
     with mock.patch.object(m,"boundary_metrics_torch",side_effect=[after,before]):
         losses,terms = m._observable_refiner_objective(x,x,seam,cfg,reduction="none")
     torch.testing.assert_close(terms["endpoint_continuity"],torch.full_like(base,.15))
-    torch.testing.assert_close(terms["temporal_supervision"],torch.full_like(base,.15))
+    torch.testing.assert_close(terms["temporal_supervision_raw"],torch.full_like(base,.15))
+    # Endpoint regression is not allowed to buy a temporal improvement.
+    torch.testing.assert_close(terms["temporal_priority_gate"],torch.zeros_like(base))
+    torch.testing.assert_close(terms["temporal_supervision"],torch.zeros_like(base))
     torch.testing.assert_close(terms["endpoint_relative_gap"],torch.full_like(base,.2))
     torch.testing.assert_close(terms["temporal_relative_gap"],torch.full_like(base,.2))
     assert losses.shape == (2,)

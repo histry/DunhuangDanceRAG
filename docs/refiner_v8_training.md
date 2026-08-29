@@ -335,9 +335,32 @@ Refiner weights are not silently migrated across source fingerprints.
   is no blanket "already smooth => repaired" rule. If controls do not establish
   repair headroom, stop and inspect instead of running 8000 steps blindly.
 
-Refiner: `product_manifold_boundary_refiner_v9`; Diffusion:
+Refiner: `product_manifold_boundary_refiner_v10`; Diffusion:
 `reference_tangent_motion_diffusion_v4`; boundary protocol:
-`observable_duration_c2_bridge_v2`. V7 reports/models/snapshots are incompatible.
+`observable_duration_c2_bridge_v2`. V9 and earlier reports/models/snapshots are incompatible.
+
+## V10 observable conditioning and endpoint-feasible objective
+
+The V9 smooth-safety run completed all 400 accepted optimizer updates and fit
+every seen subgroup, but failed held-out local contexts. Its final endpoint and
+temporal parameter gradients had cosine `-0.612`; every held-out 28-frame
+cross-event case reduced temporal energy while worsening endpoint continuity.
+This is evidence of an objective/representation mismatch, not SMPL corruption.
+
+V10 adds root-relative FK velocity, acceleration and jerk plus seam duration to
+the Refiner input. They are derived only from the candidate motion and seam and
+use the same units/scales as the observable objective. Absolute horizontal root
+position is removed before FK differencing; the existing motion channels retain
+root displacement, so routed world translation cannot create high-order input
+noise. The temporal repair term uses an endpoint-first active set: it ramps from
+zero to full weight as the real 3% endpoint acceptance gain is reached. The
+stricter 10% endpoint training target and every external acceptance threshold
+remain unchanged.
+
+Diagnostics now save `probe_bank.pt` with `probe_only=true` and
+`updates_forbidden=true`. This makes held-out failures exactly replayable without
+allowing probe tensors into optimizer updates. A new foundation and 400-step
+diagnostic are mandatory; these code changes are not evidence that V10 passes.
 
 ## Zero-edit numerical contract fix
 
