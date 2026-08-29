@@ -26,7 +26,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v13"
+SCHEMA = "refiner_observable_bridge_diagnostic_v14"
 FIT_PROTOCOL = "full_context_cycle_transaction_v1"
 PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
 FIT_CONTEXT_COUNT = 5
