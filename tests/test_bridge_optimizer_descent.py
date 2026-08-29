@@ -10,6 +10,46 @@ from tests.test_bridge_feasibility import bank
 from training import bridge_feasibility as f
 from training import motion_models as m
 
+
+def v15_terms(loss, *, scientific_gap=None, legacy_gap=None):
+    """Complete V15.1 direct-optimizer mock terms.
+
+    Ordinary optimizer tests must remain ACTIVE, so the default scientific
+    gap is deliberately positive rather than zero. Tests that exercise
+    scientific early stopping override it explicitly.
+    """
+    zero = loss * 0
+
+    if scientific_gap is None:
+        scientific_gap = zero + 0.1
+
+    if legacy_gap is None:
+        legacy_gap = scientific_gap
+
+    return {
+        # Historical V12/V13 diagnostics.
+        "endpoint_continuity": zero,
+        "temporal_supervision": zero,
+        "temporal_supervision_raw": zero,
+        "endpoint_relative_gap": legacy_gap,
+        "temporal_relative_gap": legacy_gap,
+
+        # V15 authoritative scientific quantities.
+        "endpoint_scientific_deficit": scientific_gap,
+        "temporal_scientific_deficit": scientific_gap,
+        "joint_scientific_deficit": scientific_gap,
+        "endpoint_scientific_relative_gap": scientific_gap,
+        "temporal_scientific_relative_gap": scientific_gap,
+
+        # Foundation physical/safety stopping contract.
+        "jerk": zero,
+        "jerk_safety_excess": zero,
+        "root_vertical_safety_excess": zero,
+        "support_excess": zero,
+        "observable_trust_excess": zero,
+    }
+
+
 torch = m.torch
 
 
@@ -102,7 +142,7 @@ def test_clean_identity_does_not_inherit_the_repair_stage_support_budget():
 
 def objective(prediction, reference, seam, cfg, **kwargs):
     loss = (prediction[:,20:24,4]-reference[:,20:24,4]-.002).square().mean(1)
-    return loss, {k:loss*0 for k in ('endpoint_continuity','temporal_supervision','support_excess','jerk_safety_excess','root_vertical_safety_excess')}
+    return loss, v15_terms(loss)
 
 
 def test_independent_direct_case_gradient_does_not_depend_on_batch_size(tmp_path):
@@ -141,7 +181,7 @@ def test_zero_gradient_is_not_reported_as_a_successful_edit(tmp_path):
     b,cfg = bank()
     def zero(prediction,*args,**kwargs):
         loss = prediction.flatten(1).sum(1)*0
-        return loss, {k:loss for k in ('endpoint_continuity','temporal_supervision','support_excess','jerk_safety_excess')}
+        return loss, v15_terms(loss)
     with mock.patch.object(m,'_observable_refiner_objective',side_effect=zero):
         pred,summary = f.direct_optimize(b,cfg,2,label='zero',log_path=tmp_path/'log.jsonl')
     assert torch.equal(pred,b['bad'])
@@ -149,29 +189,76 @@ def test_zero_gradient_is_not_reported_as_a_successful_edit(tmp_path):
     assert summary[0]['resolution_limited_trial_count'] > 0
 
 
-def test_only_achieved_training_targets_stop_a_case_early(tmp_path):
+def test_only_achieved_scientific_targets_stop_a_case_early(tmp_path):
     b,cfg = bank()
     def targeted(prediction, reference, seam, cfg, **kwargs):
         loss, terms = objective(prediction,reference,seam,cfg,**kwargs)
         changed = (prediction != reference).flatten(1).any(1)
         gap = (~changed).to(loss.dtype)*.1
-        terms.update(endpoint_relative_gap=gap,temporal_relative_gap=gap,
-                     jerk=loss*0,observable_trust_excess=loss*0)
+        terms.update(
+            endpoint_relative_gap=gap,
+            temporal_relative_gap=gap,
+
+            # V15.1 authoritative stopping quantities.
+            endpoint_scientific_relative_gap=gap,
+            temporal_scientific_relative_gap=gap,
+            endpoint_scientific_deficit=gap,
+            temporal_scientific_deficit=gap,
+            joint_scientific_deficit=gap,
+
+            jerk=loss * 0,
+            jerk_safety_excess=loss * 0,
+            root_vertical_safety_excess=loss * 0,
+            support_excess=loss * 0,
+            observable_trust_excess=loss * 0,
+        )
         return loss,terms
     with mock.patch.object(m,'_observable_refiner_objective',side_effect=targeted):
         pred,summary = f.direct_optimize(b,cfg,20,label='target',log_path=tmp_path/'log.jsonl')
     assert summary[0]['target_satisfied'] and summary[0]['attempted_optimizer_steps'] == 1
     assert summary[0]['safe_update_count'] == 1 and not summary[0]['retained_no_edit']
 
-    def not_at_training_target(*args,**kwargs):
-        loss,terms = targeted(*args,**kwargs)
-        # A 5% deficit to the 10% training target is NOT a stopping criterion,
-        # even though its 5% improvement would clear the 3% evaluation gate.
-        terms.update(endpoint_relative_gap=loss*0+.05,temporal_relative_gap=loss*0+.05)
-        return loss,terms
-    with mock.patch.object(m,'_observable_refiner_objective',side_effect=not_at_training_target):
-        _,summary = f.direct_optimize(b,cfg,3,label='not-target',log_path=tmp_path/'more.jsonl')
-    assert not summary[0]['target_satisfied'] and summary[0]['attempted_optimizer_steps'] == 3
+    def not_at_scientific_target(*args, **kwargs):
+        loss, terms = targeted(*args, **kwargs)
+
+        # V15.1 stopping MUST follow the authoritative scientific fields,
+        # not the historical 10% diagnostic margin.
+        #
+        # Deliberately make the legacy margin look fully satisfied while the
+        # scientific feasibility deficit remains positive.  The direct
+        # optimizer must therefore continue rather than freeze this case.
+        scientific_gap = loss * 0 + .05
+
+        terms.update(
+            # Historical 10% diagnostics: satisfied.
+            endpoint_relative_gap=loss * 0,
+            temporal_relative_gap=loss * 0,
+
+            # Authoritative V15.1 scientific contract: not satisfied.
+            endpoint_scientific_relative_gap=scientific_gap,
+            temporal_scientific_relative_gap=scientific_gap,
+            endpoint_scientific_deficit=scientific_gap,
+            temporal_scientific_deficit=scientific_gap,
+            joint_scientific_deficit=scientific_gap,
+        )
+
+        return loss, terms
+
+    with mock.patch.object(
+        m,
+        '_observable_refiner_objective',
+        side_effect=not_at_scientific_target,
+    ):
+        _, summary = f.direct_optimize(
+            b,
+            cfg,
+            3,
+            label='not-scientific-target',
+            log_path=tmp_path/'more.jsonl',
+        )
+
+    assert not summary[0]['target_satisfied']
+    assert summary[0]['attempted_optimizer_steps'] == 3
 
     def at_targets_but_vertical_violation(*args,**kwargs):
         loss,terms=targeted(*args,**kwargs)
@@ -186,7 +273,7 @@ def test_stalled_search_is_reported_and_does_not_count_no_edit_as_repair(tmp_pat
     b,cfg = bank()
     def constant(prediction,*args,**kwargs):
         loss = prediction.flatten(1).sum(1)*0+.1
-        return loss, {k:loss*0 for k in ('endpoint_continuity','temporal_supervision','support_excess','jerk_safety_excess')}
+        return loss, v15_terms(loss)
     with mock.patch.object(m,'_observable_refiner_objective',side_effect=constant):
         pred,summary = f.direct_optimize(b,cfg,200,label='stalled',log_path=tmp_path/'log.jsonl')
     case = summary[0]
@@ -207,8 +294,23 @@ def test_frozen_case_retains_last_actual_gradient_in_its_report(tmp_path):
         gap = loss*0+.1
         if len(loss)==2 and changed[0]:
             gap[0] = 0
-        terms.update(endpoint_relative_gap=gap,temporal_relative_gap=gap,
-                     jerk=loss*0,observable_trust_excess=loss*0)
+        terms.update(
+            endpoint_relative_gap=gap,
+            temporal_relative_gap=gap,
+
+            # V15.1 authoritative stopping quantities.
+            endpoint_scientific_relative_gap=gap,
+            temporal_scientific_relative_gap=gap,
+            endpoint_scientific_deficit=gap,
+            temporal_scientific_deficit=gap,
+            joint_scientific_deficit=gap,
+
+            jerk=loss * 0,
+            jerk_safety_excess=loss * 0,
+            root_vertical_safety_excess=loss * 0,
+            support_excess=loss * 0,
+            observable_trust_excess=loss * 0,
+        )
         return loss,terms
     with mock.patch.object(m,'_observable_refiner_objective',side_effect=partial):
         _,summary = f.direct_optimize(b,cfg,3,label='last-gradient',log_path=tmp_path/'log.jsonl')

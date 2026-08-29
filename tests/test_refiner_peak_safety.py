@@ -11,6 +11,48 @@ from training import motion_models as m
 from tests.test_bridge_feasibility import bank
 from tests.test_duration_inbetween import motion
 
+
+def _v15_direct_terms(
+    loss,
+    *,
+    jerk_safety=None,
+    scientific_gap=None,
+):
+    """Complete active V15.1 mock terms for direct safety tests."""
+    zero = loss * 0
+
+    # Safety tests must reach the line search instead of freezing as already
+    # scientifically satisfied.
+    if scientific_gap is None:
+        scientific_gap = zero + 0.1
+
+    if jerk_safety is None:
+        jerk_safety = zero
+
+    return {
+        # Historical diagnostics.
+        "endpoint_continuity": zero,
+        "temporal_supervision": zero,
+        "temporal_supervision_raw": zero,
+        "endpoint_relative_gap": scientific_gap,
+        "temporal_relative_gap": scientific_gap,
+
+        # V15 authoritative scientific quantities.
+        "endpoint_scientific_deficit": scientific_gap,
+        "temporal_scientific_deficit": scientific_gap,
+        "joint_scientific_deficit": scientific_gap,
+        "endpoint_scientific_relative_gap": scientific_gap,
+        "temporal_scientific_relative_gap": scientific_gap,
+
+        # Physical/safety contract.
+        "jerk": zero,
+        "jerk_safety_excess": jerk_safety,
+        "root_vertical_safety_excess": zero,
+        "support_excess": zero,
+        "observable_trust_excess": zero,
+    }
+
+
 torch = m.torch
 
 
@@ -179,8 +221,7 @@ def test_direct_optimizer_keeps_last_safe_candidate_instead_of_lower_unsafe_loss
     def objective(prediction, reference, seam, cfg, **kwargs):
         # Isolate the line-search rule from how hard the real repair task is.
         loss = (prediction[:, 20:24, 4] - reference[:, 20:24, 4] - .002).square().mean(1)
-        return loss, {key:loss*0 for key in ("endpoint_continuity", "temporal_supervision",
-                                            "support_excess", "jerk_safety_excess")}
+        return loss, _v15_direct_terms(loss)
     def gate(reference, candidate, *args, **kwargs):
         # Identity and the first safe improvement are admissible; subsequent
         # novel proposals represent lower-loss but physically unsafe edits.
@@ -229,8 +270,10 @@ def test_gpu_tail_prefilter_does_not_send_known_violations_to_cpu_auditor(tmp_pa
     def objective(prediction, reference, seam, cfg, **kwargs):
         loss = (prediction[:, 20:24, 4] - reference[:, 20:24, 4] - .002).square().mean(1)
         violation = (prediction != reference).flatten(1).any(1).to(loss.dtype)
-        return loss, {"endpoint_continuity":loss*0, "temporal_supervision":loss*0,
-                      "support_excess":loss*0, "jerk_safety_excess":violation}
+        return loss, _v15_direct_terms(
+            loss,
+            jerk_safety=violation,
+        )
     def audit(reference, candidate, *args, **kwargs):
         np.testing.assert_array_equal(candidate, reference)
         return {"accepted":True, "reasons":[]}

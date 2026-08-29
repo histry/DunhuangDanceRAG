@@ -19,7 +19,7 @@ from training import motion_models as m
 
 SCHEMA = "bridge_foundation_feasibility_v4"
 DIRECT_SAFETY_PROTOCOL = "input_relative_safe_line_search_v1"
-DIRECT_OPTIMIZER_PROTOCOL = "per_case_sum_descent_backtracking_v1"
+DIRECT_OPTIMIZER_PROTOCOL = "per_case_scientific_feasibility_backtracking_v2"
 DIRECT_BACKTRACK_STEPS = 24
 DIRECT_STALL_PATIENCE = 3
 
@@ -161,16 +161,48 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
         prediction = m._decode_product_refiner_output(bank["bad"],output,*masks,cfg)
         losses,terms = m._observable_refiner_objective(prediction,bank["bad"],bank["seam"],cfg,reduction="none")
         loss = losses.mean()
-        # A reachability control need not keep optimizing already achieved
-        # TRAINING targets (10%, not the weaker 3% evaluation threshold).
-        # Every current state is already safe. Freeze such cases, never use
-        # probe pass/fail labels for stopping, and report actual attempted steps.
-        if "endpoint_relative_gap" in terms and "temporal_relative_gap" in terms:
-            achieved = torch.ones_like(target_satisfied)
-            for key in ("endpoint_relative_gap", "temporal_relative_gap", "jerk",
-                        "jerk_safety_excess", "root_vertical_safety_excess", "support_excess", "observable_trust_excess"):
-                achieved &= torch.isfinite(terms[key]) & (terms[key] == 0)
-            target_satisfied |= achieved
+        # V15.1 Foundation reachability contract.
+        #
+        # The direct control must stop as soon as the CURRENT retained state
+        # reaches the same endpoint/temporal scientific feasibility region used
+        # by final checkpoint acceptance.  Continuing toward the historical 10%
+        # diagnostic margin can move an already-scientifically-feasible case
+        # back out of the 3% feasible region and therefore does not constitute
+        # a valid V15 reachability control.
+        #
+        # Physical/safety zero-excess requirements remain unchanged.
+        required = (
+            "endpoint_scientific_relative_gap",
+            "temporal_scientific_relative_gap",
+            "jerk",
+            "jerk_safety_excess",
+            "root_vertical_safety_excess",
+            "support_excess",
+            "observable_trust_excess",
+        )
+
+        missing = [
+            key
+            for key in required
+            if key not in terms
+        ]
+
+        if missing:
+            raise RuntimeError(
+                "V15 Foundation objective missing scientific feasibility "
+                "terms: "
+                + ", ".join(missing)
+            )
+
+        achieved = torch.ones_like(target_satisfied)
+
+        for key in required:
+            achieved &= (
+                torch.isfinite(terms[key])
+                & (terms[key] == 0)
+            )
+
+        target_satisfied |= achieved
         active = ~(target_satisfied | search_stalled)
         if not bool(active.any()):
             print(json.dumps({"stage":"direct_search_complete", "group":label,
@@ -282,9 +314,39 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
                 optimizer.state[output][state_key][pending | used_fallback] = 0
         if step==0 or (step+1)%25==0 or step+1==steps:
             elapsed = time.perf_counter()-started
-            row = {"stage":"direct_bridge_optimization","group":label,"step":step+1,"steps":steps,
-                "loss":float(loss.detach()),"endpoint_loss":float(terms["endpoint_continuity"].detach().mean()),
-                "temporal_loss":float(terms["temporal_supervision"].detach().mean()),"support_loss":float(terms["support_excess"].detach().mean()),
+            row = {
+                "stage": "direct_bridge_optimization",
+                "group": label,
+                "step": step + 1,
+                "steps": steps,
+
+                # Authoritative V15 optimization quantities.
+                "loss": float(loss.detach()),
+                "endpoint_scientific_deficit": float(
+                    terms["endpoint_scientific_deficit"].detach().mean()
+                ),
+                "temporal_scientific_deficit": float(
+                    terms["temporal_scientific_deficit"].detach().mean()
+                ),
+                "joint_scientific_deficit": float(
+                    terms["joint_scientific_deficit"].detach().mean()
+                ),
+
+                # Historical V12/V13 10% diagnostics remain available only
+                # for cross-version comparison.
+                "legacy_endpoint_margin10_loss": float(
+                    terms["endpoint_continuity"].detach().mean()
+                ),
+                "legacy_temporal_margin10_gated_loss": float(
+                    terms["temporal_supervision"].detach().mean()
+                ),
+                "legacy_temporal_margin10_raw_loss": float(
+                    terms["temporal_supervision_raw"].detach().mean()
+                ),
+
+                "support_loss": float(
+                    terms["support_excess"].detach().mean()
+                ),
                 "line_search_rejected_cases":int(pending.sum()),"line_search_min_scale":float(scale.min()),
                 "jerk_safety_loss":float(terms["jerk_safety_excess"].detach().mean()),
                 "safety_rejected_trials":safety_rejections,
@@ -321,7 +383,8 @@ def direct_optimize(bank,cfg,steps, *, label,log_path):
             gradient_fallback_updates=int(fallback_updates[i]),
             last_pre_update_gradient_norm=float(last_gradient_norm[i]),
             attempted_optimizer_steps=int(attempted_steps[i]),
-            target_satisfied=bool(target_satisfied[i]),
+            scientific_target_satisfied=bool(target_satisfied[i]),
+            target_satisfied=bool(target_satisfied[i]),  # compatibility alias
             search_stalled=bool(search_stalled[i]),
             retained_no_edit=bool(np.array_equal(candidate, safety.reference[i])))
     return prediction.detach(),summary
