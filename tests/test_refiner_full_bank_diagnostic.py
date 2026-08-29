@@ -6,20 +6,38 @@ import torch
 from training import refiner_bridge_diagnostics as d
 
 
-def test_fixed_fit_uses_all_seen_cases_and_never_reads_probe():
+@pytest.mark.parametrize('width,recipe_id', [(10,0),(28,1)])
+def test_fit_context_starts_are_deterministic_and_exclude_probe_guard(width,recipe_id):
+    seen,probe=d._seen_and_probe_starts(120,width,recipe_id)
+    starts=d._context_fit_starts(120,width,recipe_id)
+    assert len(starts)==d.FIT_CONTEXT_COUNT
+    assert len(set(starts))==len(starts)
+    assert seen not in starts and probe not in starts
+    assert all(abs(start-probe)>d.PROBE_START_GUARD_FRAMES for start in starts)
+    assert starts==d._context_fit_starts(120,width,recipe_id)
+
+
+def test_anchored_context_replay_uses_all_seen_cases_and_never_reads_probe():
     class SeenOnly(dict):
         def __getitem__(self, key):
-            assert key[0] == 'seen', 'held-out position leaked into fitting'
+            assert key[0] != 'new_position', 'held-out position leaked into fitting'
             return super().__getitem__(key)
     def role(offset):
         x=torch.arange(offset,offset+16)[:,None,None].float()
         return {'clean':x,'bad':x+100,'cond':x+200,'clean_cond':x+300}
-    banks=SeenOnly({('seen','single_recording'):role(0),('seen','cross_event'):role(16)})
-    batch=d.fixed_fit_bank(banks)
-    torch.testing.assert_close(batch['clean'].flatten(),torch.arange(32).float())
-    torch.testing.assert_close(batch['bad'].flatten(),torch.arange(100,132).float())
-    assert torch.bincount(batch['group']).tolist()==[8,8,8,8]
-    assert len(batch['clean_cond'])==32
+    banks=SeenOnly({('seen','single_recording'):role(0),
+                    ('seen','cross_event'):role(16)})
+    for context in range(d.FIT_CONTEXT_COUNT):
+        banks[(f'fit_context_{context}','single_recording')]=role(32+32*context)
+        banks[(f'fit_context_{context}','cross_event')]=role(48+32*context)
+    batches=d.anchored_context_replay_banks(banks)
+    assert len(batches)==d.FIT_CONTEXT_COUNT
+    for context,batch in enumerate(batches):
+        torch.testing.assert_close(batch['clean'][:32].flatten(),torch.arange(32).float())
+        torch.testing.assert_close(
+            batch['clean'][32:].flatten(),torch.arange(32+32*context,64+32*context).float())
+        assert torch.bincount(batch['group']).tolist()==[16,16,16,16]
+        assert len(batch['clean_cond'])==64
 
 
 def test_fixed_bank_rejects_missing_or_unpaired_role_cases():
@@ -32,13 +50,19 @@ def test_fixed_bank_rejects_missing_or_unpaired_role_cases():
 
 def test_fit_contract_counts_examples_not_just_iterations():
     contract=d.fit_bank_contract(8)
-    assert contract['cases_per_update']==32
-    assert contract['cases_per_role_width']==8
-    assert contract['gradient_scope']==contract['line_search_scope']=='complete_seen_bank'
+    assert contract['cases_per_update']==64
+    assert contract['seen_anchor_cases_per_update']==32
+    assert contract['context_cases_per_update']==32
+    assert contract['context_banks_per_cycle']==d.FIT_CONTEXT_COUNT
+    assert contract['cases_per_role_width']==16
+    assert contract['cases_per_role_width_per_bank']==8
+    assert contract['gradient_scope']=='complete_seen_anchor_plus_one_context_bank'
+    assert contract['line_search_scope']=='seen_anchor_plus_one_context_bank'
     assert contract['probe_used_for_updates'] is False
     source=inspect.getsource(d.run)
     assert 'balanced_indices(' not in source
-    assert 'batch = train' in source
+    assert 'batch = train_cycle[fit_context_index]' in source
+    assert 'include_fit_contexts=not getattr(args,"baseline_only",False)' in source
     assert 'fit_bank_contract(args.windows)' in source
     assert d.PROBE_SCOPE == 'unfitted_local_motion_context_within_train_windows'
     assert '"probe_scope":PROBE_SCOPE' in source
@@ -76,7 +100,7 @@ def test_complete_step_count_without_complete_fit_bank_cannot_authorize_pilot(tm
             'accepted_steps':400,'retained_steps':0,'trial_evaluations':400,
             'accepted_non_descent_steps':0}}))
     monkeypatch.setattr(d,'fingerprint',lambda *args:{})
-    with pytest.raises(RuntimeError,match='complete predefined TRAIN fit bank'):
+    with pytest.raises(RuntimeError,match='complete predefined TRAIN context cycle'):
         d.run(Namespace(config='configs/motion_model.json',check_report=str(report),windows=8))
 
 
@@ -85,9 +109,10 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
     model=torch.nn.Linear(1,1)
     optimizer=torch.optim.AdamW(model.parameters())
     model(torch.ones(1,1)).sum().backward(); optimizer.step()
-    batch={'clean':torch.arange(32.).reshape(32,1,1)}
+    batches=[{'clean':torch.arange(64.).reshape(64,1,1)}
+             for _ in range(d.FIT_CONTEXT_COUNT)]
     report={'fingerprint':{'test':'exact'},'windows':[], 'fit_bank':d.fit_bank_contract(8)}
-    report['fit_bank_artifact']=d.save_fit_bank(tmp_path,batch,report,m.MotionGenerationConfig())
+    report['fit_bank_artifact']=d.save_fit_bank(tmp_path,batches,report,m.MotionGenerationConfig())
     probe_batch={
         'clean':torch.zeros(16,1,1),
         'bad':torch.ones(16,1,1),
@@ -104,8 +129,9 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
     assert probe['probe_only'] and probe['updates_forbidden']
     assert not probe['formal_checkpoint'] and not probe['publish_allowed']
     assert set(probe['banks'])=={'single_recording','cross_event'}
-    assert set(bank['batch'])=={'clean'}
-    assert bank['batch']['clean'].device.type=='cpu'
+    assert len(bank['batches'])==d.FIT_CONTEXT_COUNT
+    assert set(bank['batches'][0])=={'clean'}
+    assert bank['batches'][0]['clean'].device.type=='cpu'
     assert state['completed_steps']==19
     assert report['fit_bank_artifact']['sha256']==d.common.file_sha256(tmp_path/'fit_bank.pt')
     assert report['probe_bank_artifact']['sha256']==d.common.file_sha256(tmp_path/'probe_bank.pt')
@@ -132,9 +158,10 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(tmp_path,m
     monkeypatch.setattr(m,'load_motion_window',lambda *a,**k:np.zeros((8,151)))
     monkeypatch.setattr(m,'_descriptor_values_in_training_coordinates',lambda *a:np.zeros((8,32)))
     banks={(split,role):{'clean':torch.zeros(16,1,1)}
-           for split in ('seen','new_position')
+           for split in ('seen','new_position',
+                         *(f'fit_context_{i}' for i in range(d.FIT_CONTEXT_COUNT)))
            for role in ('single_recording','cross_event')}
-    monkeypatch.setattr(d,'build_banks',lambda *a:(banks,{}))
+    monkeypatch.setattr(d,'build_banks',lambda *a,**k:(banks,{}))
     monkeypatch.setattr(d,'fingerprint',lambda *a:{})
     monkeypatch.setattr(d.common,'file_sha256',lambda path:'test-digest')
     monkeypatch.setattr(f,'check_foundation_report',lambda *a:None)
@@ -165,8 +192,13 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(tmp_path,m
     report=json.loads((out/'diagnostic_report.json').read_text())
     logs=[json.loads(row) for row in (out/'gradients.jsonl').read_text().splitlines()]
     state=m._trusted_torch_load(out/'diagnostic_state.pt',map_location='cpu')
-    assert result==2 and len(calls)==2
-    assert report['stopped_early'] and report['completed_steps']==2 and not report['diagnostic_ready']
-    assert logs[-1]['step']==2 and logs[-1]['gradient']['recorded'] and logs[-1]['component_gradients']['recorded']
-    assert state['completed_steps']==2 and not state['formal_checkpoint']
-    assert len((out/'optimizer_updates.jsonl').read_text().splitlines())==2
+    assert result==2 and len(calls)==1+d.FIT_CONTEXT_COUNT
+    assert report['stopped_early']
+    assert report['completed_steps']==1+d.FIT_CONTEXT_COUNT
+    assert not report['diagnostic_ready']
+    assert logs[-1]['step']==1+d.FIT_CONTEXT_COUNT
+    assert logs[-1]['gradient']['recorded']
+    assert logs[-1]['component_gradients']['recorded']
+    assert state['completed_steps']==1+d.FIT_CONTEXT_COUNT
+    assert not state['formal_checkpoint']
+    assert len((out/'optimizer_updates.jsonl').read_text().splitlines())==1+d.FIT_CONTEXT_COUNT

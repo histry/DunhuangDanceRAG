@@ -1,8 +1,9 @@
 """Training-only full-bridge learnability gate; never a formal checkpoint.
 
-Eight source-balanced TRAIN windows; seen and held-out seam positions; both
-single-recording occlusion and cross-event joins. Validation motion is never
-loaded. The final fixed step, not the best probe result, decides readiness.
+Eight source-balanced TRAIN windows; anchored context replay and held-out seam
+positions; both single-recording occlusion and cross-event joins. Validation
+motion is never loaded. The final fixed step, not the best probe result,
+decides readiness.
 """
 from __future__ import annotations
 
@@ -25,9 +26,11 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v10"
-FIT_PROTOCOL = "complete_seen_bank_descent_v1"
+SCHEMA = "refiner_observable_bridge_diagnostic_v11"
+FIT_PROTOCOL = "anchored_context_replay_descent_v2"
 PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
+FIT_CONTEXT_COUNT = 3
+PROBE_START_GUARD_FRAMES = 6
 
 
 def fingerprint(args, cfg):
@@ -54,7 +57,7 @@ def fingerprint(args, cfg):
     return value
 
 
-def fixed_fit_bank(banks):
+def fixed_fit_bank(banks, split="seen"):
     """Use EVERY seen TRAIN case; held-out positions never enter an update.
 
     Checking only a randomly selected 8/32 cases allowed an accepted step to
@@ -63,7 +66,9 @@ def fixed_fit_bank(banks):
     uses the complete bank for BOTH gradients and post-update line search.
     Formal random-window training is deliberately unchanged.
     """
-    roles = [banks[("seen", role)] for role in ("single_recording", "cross_event")]
+    if split == "new_position":
+        raise ValueError("held-out new_position probe cannot be used for fitting")
+    roles = [banks[(split, role)] for role in ("single_recording", "cross_event")]
     count = len(roles[0]["clean"])
     if count < 2 or count % 2 or len(roles[1]["clean"]) != count:
         raise ValueError("fixed fit bank requires equally sized paired role/width cases")
@@ -74,18 +79,49 @@ def fixed_fit_bank(banks):
     return train
 
 
+def _concat_fit_batches(anchor, context):
+    if set(anchor) != set(context):
+        raise ValueError("anchor/context fit batch layouts do not match")
+    return {key: m.torch.cat([anchor[key], context[key]]) for key in anchor}
+
+
+def anchored_context_replay_banks(banks):
+    """Keep every original seen case while rotating non-probe local contexts.
+
+    V10 repeated one 32-case location bank although formal training redraws
+    seam positions every batch.  Cycling context-only banks fixed that mismatch
+    but allowed a later context to forget the original long seams.  Every
+    diagnostic update therefore contains the complete 32-case seen anchor plus
+    one complete 32-case context bank.  The held-out probe is never indexed.
+    """
+    anchor = fixed_fit_bank(banks, "seen")
+    replay = []
+    for context_index in range(FIT_CONTEXT_COUNT):
+        context = fixed_fit_bank(banks, f"fit_context_{context_index}")
+        replay.append(_concat_fit_batches(anchor, context))
+    return replay
+
+
 def fit_bank_contract(windows):
-    return {"protocol": FIT_PROTOCOL, "cases_per_update": 4 * windows,
-            "cases_per_role_width": windows, "gradient_scope": "complete_seen_bank",
-            "line_search_scope": "complete_seen_bank", "probe_used_for_updates": False}
+    return {"protocol": FIT_PROTOCOL, "cases_per_update": 8 * windows,
+            "cases_per_role_width": 2 * windows,
+            "cases_per_role_width_per_bank": windows,
+            "gradient_scope": "complete_seen_anchor_plus_one_context_bank",
+            "line_search_scope": "seen_anchor_plus_one_context_bank",
+            "seen_anchor_cases_per_update": 4 * windows,
+            "context_cases_per_update": 4 * windows,
+            "context_banks_per_cycle": FIT_CONTEXT_COUNT,
+            "probe_start_guard_frames": PROBE_START_GUARD_FRAMES,
+            "probe_used_for_updates": False}
 
 
 def fixed_bank_stalled(update):
-    """No state change + no new inputs cannot justify repeating the same search.
+    """Classify one retained context update; the caller audits a full cycle.
 
-    Only this deterministic fixed-bank control stops early. Formal training
-    draws a new minibatch next time, so a single retained update must not stop it.
-    An early stop never authorizes pilot, even if some metrics already pass.
+    A single retained update cannot stop context replay because the next bank is
+    different.  The diagnostic stops only after every context in one complete
+    cycle stalls consecutively.  Formal random-minibatch training remains
+    unchanged.  Any early stop still blocks pilot.
     """
     return (not update["optimizer_update_accepted"]
             and update["reason"] in {"bounded_search_no_descent", "zero_gradient"})
@@ -101,21 +137,25 @@ def _cpu_tree(value):
     return value
 
 
-def save_fit_bank(destination, batch, report, cfg):
+def save_fit_bank(destination, batches, report, cfg):
     """Portable exact TRAIN inputs for failure analysis, never a training asset.
 
     Do not reconstruct server cases from similarly named local Event-DB files:
     descriptor statistics, event cuts and normalized coordinates may differ.
-    The only caller passes fixed_fit_bank(), never probe/validation tensors.
+    The only caller passes anchored_context_replay_banks(), never
+    probe/validation tensors.
     """
+    if len(batches) != FIT_CONTEXT_COUNT:
+        raise ValueError("portable fit artifact requires the complete context cycle")
     path = destination / "fit_bank.pt"
-    m._atomic_torch_save({"schema":"refiner_train_fit_bank_v1", "train_only":True,
+    m._atomic_torch_save({"schema":"refiner_train_context_replay_bank_v2", "train_only":True,
         "formal_checkpoint":False, "publish_allowed":False,
         "fingerprint":report["fingerprint"], "windows":report["windows"],
         "contract":report["fit_bank"], "config":dataclasses.asdict(cfg),
-        "batch":_cpu_tree(batch)},path)
+        "batches":_cpu_tree(batches)},path)
     return {"file":path.name,"sha256":common.file_sha256(path),
-            "cases":len(batch["clean"]),"train_only":True}
+            "cases_per_update":len(batches[0]["clean"]),
+            "context_banks":len(batches),"train_only":True}
 
 
 def save_probe_bank(destination, banks, report, cfg):
@@ -166,10 +206,83 @@ def save_diagnostic_state(destination, model, optimizer, report, step):
         "torch_rng":m.torch.get_rng_state()},destination / "diagnostic_state.pt")
 
 
-def build_banks(clean, cond, sources, cfg, device, *, contact_ik=True):
+def _seen_and_probe_starts(frames, width, recipe_id):
+    seen = max(3, (frames - width) // 2 + (-8 if recipe_id else 8))
+    probe = seen + (7 if recipe_id else -7)
+    return seen, probe
+
+
+def _context_fit_starts(frames, width, recipe_id, count=FIT_CONTEXT_COUNT):
+    """Deterministic, separated TRAIN cuts; never return the probe cut.
+
+    Farthest-point selection spans the available window without tuning starts
+    to the uploaded V10 failures.  The exact held-out start and a six-frame
+    guard are excluded.  Interval overlap is allowed: this is a local-context
+    holdout within the same TRAIN window, not source-disjoint validation.
+    """
+    seen, probe = _seen_and_probe_starts(frames, width, recipe_id)
+    eligible = [
+        start
+        for start in range(3, frames - width - 1)
+        if start != seen and abs(start - probe) > PROBE_START_GUARD_FRAMES
+    ]
+    if len(eligible) < count:
+        raise ValueError("motion window cannot support separated fit contexts")
+    selected = []
+    while len(selected) < count:
+        anchors = [seen, probe, *selected]
+        choice = max(
+            eligible,
+            key=lambda start: (
+                min(abs(start - anchor) for anchor in anchors),
+                abs(start - probe),
+                -start,
+            ),
+        )
+        selected.append(choice)
+        eligible.remove(choice)
+    if probe in selected or any(
+        abs(start - probe) <= PROBE_START_GUARD_FRAMES for start in selected
+    ):
+        raise RuntimeError("fit context selection leaked into the probe guard")
+    return tuple(selected)
+
+
+def _split_start(split, frames, width, recipe_id):
+    seen, probe = _seen_and_probe_starts(frames, width, recipe_id)
+    if split == "seen":
+        return seen
+    if split == "new_position":
+        return probe
+    prefix = "fit_context_"
+    if not split.startswith(prefix):
+        raise ValueError(f"unknown bridge diagnostic split: {split}")
+    context_index = int(split[len(prefix):])
+    starts = _context_fit_starts(frames, width, recipe_id)
+    if not 0 <= context_index < len(starts):
+        raise ValueError(f"invalid fit context index: {context_index}")
+    return starts[context_index]
+
+
+def build_banks(
+    clean,
+    cond,
+    sources,
+    cfg,
+    device,
+    *,
+    contact_ik=True,
+    include_fit_contexts=False,
+):
     banks = {}
     recipes = {}
-    for split in ("seen", "new_position"):
+    splits = ["seen", "new_position"]
+    if include_fit_contexts:
+        splits.extend(
+            f"fit_context_{context_index}"
+            for context_index in range(FIT_CONTEXT_COUNT)
+        )
+    for split in splits:
         for role in ("single_recording", "cross_event"):
             clean_rows, bad_rows, seams, conditions, identities, rows = [], [], [], [], [], []
             for index, original in enumerate(clean):
@@ -181,9 +294,7 @@ def build_banks(clean, cond, sources, cfg, device, *, contact_ik=True):
                     # content too. This is NOT a pure translation-equivariance
                     # test, nor independent source-disjoint validation.
                     width = min(width, len(original) - 8)
-                    a = max(3, (len(original) - width) // 2 + (-8 if recipe_id else 8))
-                    if split == "new_position":
-                        a += 7 if recipe_id else -7
+                    a = _split_start(split, len(original), width, recipe_id)
                     b = a + width
                     bridge_info = {}
                     if role == "single_recording":
@@ -294,13 +405,13 @@ def run(args):
         if not report.get("completed") or report.get("published") is not False:
             raise RuntimeError("diagnostic not completed or incorrectly published")
         if report.get("stopped_early"):
-            raise RuntimeError("fixed TRAIN-bank optimization stalled; review the diagnostic, do not train")
+            raise RuntimeError("TRAIN context-cycle optimization stalled; review the diagnostic, do not train")
         if (report.get("target_steps") != 400 or report.get("completed_steps") != 400
                 or len(report.get("windows",[])) != args.windows or args.windows != 8):
             raise RuntimeError("pilot requires the complete 8-window, 400-step protocol; smoke runs cannot authorize training")
         validate_update_summary(report.get("optimizer_updates", {}), 400)
         if report.get("fit_bank") != fit_bank_contract(args.windows):
-            raise RuntimeError("diagnostic did not use the complete predefined TRAIN fit bank")
+            raise RuntimeError("diagnostic did not use the complete predefined TRAIN context cycle")
         from training.bridge_feasibility import check_foundation_report, group_decisions
         check_foundation_report(report["foundation_report"],fingerprint(args,cfg),cfg)
         for role in ("seen", "new_position"):
@@ -343,12 +454,19 @@ def run(args):
     m.torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
-    banks, recipes = build_banks(clean,cond,sources,cfg,device)
+    banks, recipes = build_banks(
+        clean,
+        cond,
+        sources,
+        cfg,
+        device,
+        include_fit_contexts=not getattr(args,"baseline_only",False),
+    )
     if getattr(args,"baseline_only",False):
         pure,_ = build_banks(clean,cond,sources,cfg,device,contact_ik=False)
         return run_foundation(args,cfg,banks,pure,recipes,fingerprint(args,cfg),
             [{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],separation)
-    train = fixed_fit_bank(banks)
+    train_cycle = anchored_context_replay_banks(banks)
     model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
     optimizer = m.torch.optim.AdamW(model.parameters(),lr=cfg.lr,weight_decay=1e-4)
     destination.mkdir(parents=True)
@@ -361,7 +479,7 @@ def run(args):
               "source_separation":separation,"recipes":recipes,"target_steps":args.steps,
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[]}
-    report["fit_bank_artifact"] = save_fit_bank(destination,train,report,cfg)
+    report["fit_bank_artifact"] = save_fit_bank(destination,train_cycle,report,cfg)
     report["probe_bank_artifact"] = save_probe_bank(
         destination, banks, report, cfg
     )
@@ -371,8 +489,10 @@ def run(args):
     m.save_json(report,destination / "diagnostic_report.json")
     report["optimizer_updates"] = {}
     started = time.perf_counter()
+    consecutive_context_stalls = 0
     for step in range(1,args.steps + 1):
-        batch = train
+        fit_context_index = (step - 1) % len(train_cycle)
+        batch = train_cycle[fit_context_index]
         repair,protection,terms,identity = m._refiner_batch_objectives(model,batch,cfg)
         loss = repair + cfg.product_refiner_clean_identity_weight * protection
         logging = step == 1 or step % 25 == 0 or step == args.steps
@@ -387,7 +507,15 @@ def run(args):
         record_update(report["optimizer_updates"], update)
         with (destination / "optimizer_updates.jsonl").open("a",encoding="utf8") as handle:
             handle.write(json.dumps({"step":step,**update},allow_nan=False) + "\n")
-        stopped_early = fixed_bank_stalled(update) and step < args.steps
+        consecutive_context_stalls = (
+            consecutive_context_stalls + 1
+            if fixed_bank_stalled(update)
+            else 0
+        )
+        stopped_early = (
+            consecutive_context_stalls >= len(train_cycle)
+            and step < args.steps
+        )
         report["stopped_early"] = stopped_early
         report["termination_reason"] = update["reason"] if stopped_early else None
         if stopped_early and not logging:
@@ -403,6 +531,8 @@ def run(args):
                    "terms":{k:float(v.detach()) for k,v in terms.items()},"gradient":gradient,
                    "component_gradients":components,"clip_norm_before":norm,
                    "optimizer_update":update,
+                   "fit_context_index":fit_context_index,
+                   "consecutive_context_stalls":consecutive_context_stalls,
                    "fit_bank":report["fit_bank"],
                    "elapsed_seconds":time.perf_counter()-started,
                    "optimizer_updates":dict(report["optimizer_updates"])}
@@ -439,7 +569,7 @@ def run(args):
                     print(json.dumps({"stage":"bridge_failure_breakdown","step":step,
                                       "split":split,"group":group,**row},allow_nan=False),flush=True)
         if stopped_early:
-            print(json.dumps({"stage":"bridge_fixed_bank_stalled","completed_steps":step,
+            print(json.dumps({"stage":"bridge_context_cycle_stalled","completed_steps":step,
                               "target_steps":args.steps,"reason":report["termination_reason"],
                               "state_retained":True,"published":False}),flush=True)
             break

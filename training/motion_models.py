@@ -99,9 +99,9 @@ from training.refiner_optimizer import checked_refiner_step, record_update, REFI
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v10"
-REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_v2"
-REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_v1"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v11"
+REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_support_v3"
+REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_support_v2"
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
@@ -2411,6 +2411,9 @@ def _refiner_fk_dynamics_features(x, seam_mask, fps):
     Derivatives use the same physical units/scales as the observable loss.
     Masking them to the edit support preserves the declared local context and
     prevents unrelated natural dynamics from becoming a source identifier.
+    The union with a three-frame core dilation is an explicit contract for the
+    third differences used by the acceptance metric.  It must not depend on a
+    particular configuration happening to request a sufficiently wide halo.
     """
     if not np.isfinite(float(fps)) or float(fps) <= 0:
         raise ValueError("Refiner FK feature fps must be finite and positive")
@@ -2436,8 +2439,15 @@ def _refiner_fk_dynamics_features(x, seam_mask, fps):
         acceleration[:, 2:] = torch.diff(joints, n=2, dim=1) * float(fps) ** 2
     if joints.shape[1] > 3:
         jerk[:, 3:] = torch.diff(joints, n=3, dim=1) * float(fps) ** 3
-    active = seam_mask.amax(dim=-1, keepdim=True) > 0.0
     core = seam_mask.amax(dim=-1) >= 0.5
+    declared_support = seam_mask.amax(dim=-1) > 0.0
+    third_difference_support = F.max_pool1d(
+        core.to(x.dtype).unsqueeze(1),
+        kernel_size=7,
+        stride=1,
+        padding=3,
+    ).squeeze(1) > 0.0
+    active = (declared_support | third_difference_support).unsqueeze(-1)
     duration = (
         core.sum(dim=1, keepdim=True).to(x.dtype) / float(fps)
     )[:, None, :].expand(-1, x.shape[1], -1)

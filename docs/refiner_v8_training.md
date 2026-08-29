@@ -1,4 +1,4 @@
-# V8 foundation / V9 local Refiner: validate before learning
+# Current foundation / V11 local Refiner: validate before learning
 
 This change repairs artificial joins, not original SMPL14 assets. Existing
 retarget cache, train/val/test Event-DB, Router/Duration/Planner and generation
@@ -335,9 +335,44 @@ Refiner weights are not silently migrated across source fingerprints.
   is no blanket "already smooth => repaired" rule. If controls do not establish
   repair headroom, stop and inspect instead of running 8000 steps blindly.
 
-Refiner: `product_manifold_boundary_refiner_v10`; Diffusion:
+Refiner: `product_manifold_boundary_refiner_v11`; Diffusion:
 `reference_tangent_motion_diffusion_v4`; boundary protocol:
-`observable_duration_c2_bridge_v2`. V9 and earlier reports/models/snapshots are incompatible.
+`observable_duration_c2_bridge_v2`. V10 and earlier reports/models/snapshots are incompatible.
+
+## V11 anchored context replay and explicit derivative support
+
+The exact server V10 run (`b89c36f`, tag
+`refiner_v10_fk_endpoint_20260829_103152`) completed normally: 658 tests passed,
+all eight direct-foundation groups passed, and all 400 neural updates decreased
+their current objective.  The fixed seen positions passed endpoint 32/32 and
+temporal 31/32.  Held-out local contexts still failed: single-recording
+endpoint/temporal were 4/16 and 0/16; cross-event 28-frame endpoint/temporal
+were 0/8 and 3/8.  Decoder caps were inactive.  This is a rejected diagnostic,
+not evidence of damaged SMPL14 data or permission to run a pilot.
+
+The diagnostic repeated one 32-case location bank although formal training
+draws new seam positions every batch.  Controlled replay of four non-probe
+contexts reduced the held-out cross/28 endpoint median regression from about
+33% to about 2%, but cycling contexts alone forgot some original long seams.
+Reducing hidden width to 64 and training without the 32-D condition did not
+solve the single-recording holdout.  Those architecture ablations are not
+adopted.  V11 instead uses each 64-case diagnostic update as the complete
+32-case seen anchor plus one rotating 32-case context bank.  Three deterministic
+context banks span the window, exclude the exact probe start and a six-frame
+start guard, and are saved in `fit_bank.pt`.  `probe_bank.pt` remains marked
+`updates_forbidden=true`; it is evaluated only after updates.
+
+FK dynamics were not actually missing at the V10 right boundary: the resolved
+configuration supplied a six-frame seam halo, enough for a third difference.
+The implementation nevertheless now unions declared seam support with an
+explicit three-frame dilation of the seam core.  Future configuration changes
+therefore cannot silently remove velocity/acceleration/jerk evidence required
+by the unchanged gate.  This support repair changes no acceptance threshold and
+uses no hidden clean trajectory or external pretrained model.
+
+V11 is a changed diagnostic and input protocol, not a successful result.  Start
+a new tag, regenerate foundation, and run the 400-step gate.  Any failed role,
+width, seen or held-out-context gate still blocks pilot and Diffusion.
 
 ## V10 observable conditioning and endpoint-feasible objective
 
@@ -514,14 +549,17 @@ That line alone does NOT authorize fitting: the final decision must still have
 bash scripts/train_refiner_v8.sh diagnose "$OUT_ROOT" "$TAG"
 ```
 
-Fits the complete seen TRAIN bank; new local contexts are held out from fitting.
+Every update fits the complete seen TRAIN anchor plus one rotating, separated
+TRAIN context bank; new local contexts are held out from fitting.
 The report key `new_position` retains its historical name, but moving the cut
 also changes local motion content. It is not a pure tensor-shift test.
-Fresh initialization, all four groups in each update, no direct-control warm start.
+Fresh initialization, all four groups in each 64-case update, no direct-control warm start.
 Inspect `bridge_diagnostic/diagnostic_report.json` and `gradients.jsonl` in the
 candidate directory, plus `summary.json` for all-step optimizer accounting and
 role/width failure counts. Fixed final step decides readiness, not best probes.
-An early fixed-bank search stall saves the actual step and rejects continuation.
+Three consecutive stalled context updates (one complete cycle) save the actual
+step and reject continuation; a single retained context update does not stop
+the run because the next update has different TRAIN inputs.
 
 ### 3. Only after diagnosis passes: fresh source-disjoint pilot
 

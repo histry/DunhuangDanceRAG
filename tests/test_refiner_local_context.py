@@ -72,6 +72,21 @@ def test_fk_dynamics_features_match_gate_units_and_have_no_hidden_target():
     )
 
 
+def test_fk_dynamics_explicitly_cover_third_difference_support_without_config_halo():
+    x, _, _, _ = sample("cpu")
+    seam = torch.zeros((2, x.shape[1], 1))
+    seam[:, 44:72] = 1.0
+    changed = x.clone()
+    changed[:, 72:75, 7:13] += torch.tensor([0.03, -0.02, 0.01, 0, 0, 0])
+    features = m._refiner_fk_dynamics_features(changed, seam, 30.0)
+    # Core [44,71] needs three observed frames on either side for jerk.  This
+    # contract must hold even when the configured seam carries no soft halo.
+    assert features[:, 41:44].abs().sum() > 0
+    assert features[:, 72:75].abs().sum() > 0
+    assert torch.count_nonzero(features[:, :41]) == 0
+    assert torch.count_nonzero(features[:, 75:]) == 0
+
+
 def test_temporal_objective_waits_for_observable_endpoint_feasibility():
     before = torch.tensor([1.0, 1.0, 0.0])
     proposed = torch.tensor([1.0, 0.985, 0.0], requires_grad=True)
@@ -123,7 +138,7 @@ def test_input_protocol_is_checked_not_just_stored():
     cfg = m.MotionGenerationConfig()
     contract = m.motion_checkpoint_contract(cfg, 'boundary_refiner')
     assert contract['refiner_input_protocol'] == m.REFINER_INPUT_PROTOCOL
-    assert m.REFINER_INPUT_PROTOCOL.endswith('fk_dynamics_v2')
+    assert m.REFINER_INPUT_PROTOCOL.endswith('fk_dynamics_support_v3')
     model = m.ProductManifoldTemporalRefiner(hidden=16)
     assert model.in_proj.in_channels == (
         m.EDGE_DIM + 32 + 1 + m.NUM_JOINTS
