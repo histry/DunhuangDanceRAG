@@ -105,7 +105,7 @@ REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleratio
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "endpoint_feasible_minimum_edit_severity_floor_v6"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "scientific_feasibility_balanced_observable_v7"
 
 
 def now_tag() -> str:
@@ -4141,26 +4141,146 @@ def _refiner_gradient_diagnostics(model, repair_loss, clean_loss, clean_weight):
 
 
 def _refiner_component_gradients(model, terms, cfg):
-    """Weighted endpoint/temporal/support/tail gradients before clipping."""
-    losses = {"endpoint":cfg.product_refiner_repair_margin_weight * terms["endpoint_continuity"],
-              "temporal":cfg.product_refiner_relative_temporal_weight * terms["temporal_supervision"]
-                           + cfg.product_refiner_seam_jerk_weight * terms["jerk"],
-              "support":terms["support_excess"],
-              "jerk_safety":terms.get("jerk_safety_excess", terms["jerk"] * 0),
-              "root_vertical":terms.get("root_vertical_safety_excess",terms["jerk"] * 0)}
-    params = [p for p in model.parameters() if p.requires_grad]
-    gradients = {key:torch.autograd.grad(value,params,retain_graph=True,allow_unused=True)
-                 for key,value in losses.items()}
-    norms = {key:math.sqrt(sum(float(g.detach().double().square().sum()) for g in row if g is not None))
-             for key,row in gradients.items()}
+    """V15 scientific endpoint/temporal/safety gradients before clipping."""
+
+    # Prefer the authoritative V15 scientific deficits.
+    #
+    # Explicit branching is intentional: using
+    # ``terms.get(key, terms[legacy_key])`` evaluates the legacy lookup
+    # eagerly and breaks diagnostic/test callers that provide only one
+    # representation of the component.
+    if "endpoint_scientific_deficit" in terms:
+        endpoint = terms["endpoint_scientific_deficit"]
+    elif "endpoint_continuity" in terms:
+        endpoint = terms["endpoint_continuity"]
+    else:
+        raise KeyError(
+            "missing endpoint scientific/legacy diagnostic objective"
+        )
+
+    if "temporal_scientific_deficit" in terms:
+        temporal = terms["temporal_scientific_deficit"]
+    elif "temporal_supervision_raw" in terms:
+        temporal = terms["temporal_supervision_raw"]
+    elif "temporal_supervision" in terms:
+        # Historical diagnostic callers before V13 may expose only the
+        # gated temporal component.  Keep this as the final compatibility
+        # fallback; V15 production batches always provide the scientific
+        # deficit above.
+        temporal = terms["temporal_supervision"]
+    else:
+        raise KeyError(
+            "missing temporal scientific/legacy diagnostic objective"
+        )
+
+    losses = {
+        "endpoint":
+            cfg.product_refiner_repair_margin_weight
+            * endpoint,
+
+        "temporal":
+            cfg.product_refiner_repair_margin_weight
+            * temporal,
+
+        "support":
+            terms["support_excess"],
+
+        "jerk_safety":
+            terms.get(
+                "jerk_safety_excess",
+                terms["jerk"] * 0,
+            ),
+
+        "root_vertical":
+            terms.get(
+                "root_vertical_safety_excess",
+                terms["jerk"] * 0,
+            ),
+    }
+
+    params = [
+        p
+        for p in model.parameters()
+        if p.requires_grad
+    ]
+
+    gradients = {
+        key: torch.autograd.grad(
+            value,
+            params,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        for key, value in losses.items()
+    }
+
+    norms = {
+        key: math.sqrt(
+            sum(
+                float(
+                    g.detach()
+                    .double()
+                    .square()
+                    .sum()
+                )
+                for g in row
+                if g is not None
+            )
+        )
+        for key, row in gradients.items()
+    }
+
     pairs = {}
+
     keys = list(losses)
-    for a,b in ((keys[i],keys[j]) for i in range(len(keys)) for j in range(i+1,len(keys))):
-        dot = sum(float((x.detach().double()*y.detach().double()).sum())
-                  for x,y in zip(gradients[a],gradients[b]) if x is not None and y is not None)
-        cosine = float(np.clip(dot/(norms[a]*norms[b]),-1,1)) if norms[a]*norms[b] > 1e-12 else None
-        pairs[f"{a}/{b}"] = {"cosine":cosine,"conflicting":cosine is not None and cosine < 0}
-    return {"schema":"refiner_objective_gradient_v3","norms":norms,"pairs":pairs,"before_clipping":True}
+
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            a = keys[i]
+            b = keys[j]
+
+            dot = sum(
+                float(
+                    (
+                        ga.detach().double()
+                        * gb.detach().double()
+                    ).sum()
+                )
+                for ga, gb in zip(
+                    gradients[a],
+                    gradients[b],
+                )
+                if ga is not None
+                and gb is not None
+            )
+
+            cosine = (
+                float(
+                    np.clip(
+                        dot / (norms[a] * norms[b]),
+                        -1.0,
+                        1.0,
+                    )
+                )
+                if norms[a] * norms[b] > 1e-12
+                else None
+            )
+
+            pairs[f"{a}/{b}"] = {
+                "cosine": cosine,
+                "conflicting":
+                    cosine is not None
+                    and cosine < 0.0,
+            }
+
+    return {
+        "schema":
+            "refiner_scientific_objective_gradient_v4",
+        "norms": norms,
+        "pairs": pairs,
+        "before_clipping": True,
+    }
+
 
 
 def sample_motion_window(paths: np.ndarray, target_len: int, cfg: Optional[MotionGenerationConfig] = None) -> np.ndarray:
@@ -6465,9 +6585,17 @@ def _refiner_batch_objectives(model, batch, cfg):
             if bool(selected.any()):
                 terms[f"group_{label}_repair_total"] = per_case[selected].mean()
                 for key in (
+                    # Historical comparison fields.
                     "endpoint_continuity",
                     "temporal_supervision",
                     "temporal_supervision_raw",
+
+                    # V15 authoritative feasibility fields.
+                    "endpoint_scientific_deficit",
+                    "temporal_scientific_deficit",
+                    "joint_scientific_deficit",
+
+                    # Safety diagnostics.
                     "support_excess",
                     "jerk_safety_excess",
                     "root_vertical_safety_excess",
@@ -6485,60 +6613,56 @@ def _refiner_batch_objectives(model, batch, cfg):
 
 
 def _refiner_group_repair_losses(terms, *, require_all=False):
-    """Return component-wise subgroup objectives for transactional guarding.
+    """V15 subgroup repair-total + joint-feasibility transactional guards.
 
-    Every subgroup present in the deterministic batch contributes three guards:
+    Every present role/width subgroup contributes two protected quantities:
 
-    1. total repair objective;
-    2. endpoint-continuity objective;
-    3. raw temporal objective before priority gating.
+      1. the complete subgroup repair objective;
+      2. the joint endpoint/temporal scientific deficit.
 
-    Raw temporal supervision is guarded instead of the gated temporal term.
-    Otherwise an initially-zero priority-gated temporal loss would incorrectly
-    forbid its later activation.
-
-    Formal stochastic training protects every subgroup present in its minibatch.
-    The fixed-bank diagnostic passes ``require_all=True`` because every full-cycle
-    transaction must contain all four role/width groups.
+    Endpoint and temporal are deliberately not guarded independently in V15:
+    useful slack trading is allowed as long as joint scientific feasibility
+    improves without buying it through subgroup-level total deterioration.
     """
     values = {}
     missing = []
 
     for label in REFINER_GROUP_LABELS:
-        keys = {
-            "total": f"group_{label}_repair_total",
-            "endpoint": f"group_{label}_endpoint_continuity",
-            "temporal": f"group_{label}_temporal_supervision_raw",
-        }
+        total_key = f"group_{label}_repair_total"
+        feasibility_key = (
+            f"group_{label}_joint_scientific_deficit"
+        )
 
-        present = {
-            name: key in terms
-            for name, key in keys.items()
-        }
+        total_present = total_key in terms
+        feasibility_present = feasibility_key in terms
 
-        if any(present.values()) and not all(present.values()):
-            absent = [
-                name
-                for name, exists in present.items()
-                if not exists
-            ]
+        if total_present != feasibility_present:
+            absent = []
+
+            if not total_present:
+                absent.append("total")
+
+            if not feasibility_present:
+                absent.append("feasibility")
+
             raise RuntimeError(
                 f"incomplete Refiner subgroup objectives for {label}: "
                 + ", ".join(absent)
             )
 
-        if all(present.values()):
-            # Keep the historical plain subgroup key for the total objective,
-            # then add two component guards.
-            values[label] = terms[keys["total"]]
-            values[f"{label}.endpoint"] = terms[keys["endpoint"]]
-            values[f"{label}.temporal"] = terms[keys["temporal"]]
+        if total_present:
+            values[label] = terms[total_key]
+
+            values[
+                f"{label}.feasibility"
+            ] = terms[feasibility_key]
         else:
             missing.append(label)
 
     if require_all and missing:
         raise RuntimeError(
-            "missing Refiner subgroup objectives: " + ", ".join(missing)
+            "missing Refiner subgroup objectives: "
+            + ", ".join(missing)
         )
 
     if not values:
@@ -6547,6 +6671,7 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
         )
 
     return values
+
 
 
 def _refiner_total_batch_loss(model, batch, cfg):
@@ -6610,6 +6735,24 @@ def _smooth_observable_margin(proposed, baseline, gain, *, scale_floor=None):
     shoulder = gap.clamp_max(gain)
     return shoulder.square() / (2.0 * gain) + (gap - shoulder), gap
 
+
+def _joint_scientific_deficit(endpoint_deficit, temporal_deficit):
+    """Worst remaining endpoint/temporal scientific deficit per TRAIN case.
+
+    Both inputs are one-sided non-negative feasibility deficits.  Their
+    maximum is zero iff both observable acceptance requirements are met.
+    """
+    if endpoint_deficit.shape != temporal_deficit.shape:
+        raise ValueError(
+            "endpoint/temporal scientific deficits must have identical shapes"
+        )
+
+    return torch.maximum(
+        endpoint_deficit,
+        temporal_deficit,
+    )
+
+
 def _endpoint_feasibility_gate(proposed, baseline, minimum_gain):
     """Detach an endpoint-first active-set gate for temporal optimization.
 
@@ -6648,30 +6791,92 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     proposed_metric_joints, reference_metric_joints = metric_joints.split(count)
     proposed = boundary_metrics_torch(proposed_metric_joints, seam, cfg.fps)
     before = boundary_metrics_torch(reference_metric_joints.detach(), seam, cfg.fps)
-    gain = cfg.product_refiner_training_target_repair_gain
+    # Historical 10% margin is retained only for V12/V13 comparison.
+    training_gain = float(
+        cfg.product_refiner_training_target_repair_gain
+    )
+
+    # V15 authoritative targets are the actual scientific acceptance gains.
+    endpoint_scientific_gain = float(
+        cfg.checkpoint_validation_min_endpoint_repair_gain
+    )
+    temporal_scientific_gain = float(
+        cfg.checkpoint_validation_min_temporal_repair_gain
+    )
+
+    for name, value in (
+        ("training_gain", training_gain),
+        ("endpoint_scientific_gain", endpoint_scientific_gain),
+        ("temporal_scientific_gain", temporal_scientific_gain),
+    ):
+        if not np.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(
+                f"{name} must be finite in (0,1), got {value!r}"
+            )
 
     endpoint_floor = _observable_scale_floor(
-        before["endpoint_velocity_jump_mps"], cfg
+        before["endpoint_velocity_jump_mps"],
+        cfg,
     )
-    temporal_floor = _observable_scale_floor(before["temporal_energy"], cfg)
+
+    temporal_floor = _observable_scale_floor(
+        before["temporal_energy"],
+        cfg,
+    )
+
+    # ------------------------------------------------------------
+    # Historical 10% V12/V13 diagnostics.
+    # ------------------------------------------------------------
     endpoint, endpoint_gap = _smooth_observable_margin(
         proposed["endpoint_velocity_jump_mps"],
         before["endpoint_velocity_jump_mps"],
-        gain,
+        training_gain,
         scale_floor=endpoint_floor,
     )
+
     temporal_raw, temporal_gap = _smooth_observable_margin(
         proposed["temporal_energy"],
         before["temporal_energy"],
-        gain,
+        training_gain,
         scale_floor=temporal_floor,
     )
+
+    # Historical endpoint-first gate remains observable in logs only.
     temporal_priority_gate = _endpoint_feasibility_gate(
         proposed["endpoint_velocity_jump_mps"],
         before["endpoint_velocity_jump_mps"],
-        cfg.checkpoint_validation_min_endpoint_repair_gain,
+        endpoint_scientific_gain,
     )
+
     temporal = temporal_raw * temporal_priority_gate
+
+    # ------------------------------------------------------------
+    # V15 authoritative scientific deficits.
+    # ------------------------------------------------------------
+    (
+        endpoint_scientific,
+        endpoint_scientific_gap,
+    ) = _smooth_observable_margin(
+        proposed["endpoint_velocity_jump_mps"],
+        before["endpoint_velocity_jump_mps"],
+        endpoint_scientific_gain,
+        scale_floor=endpoint_floor,
+    )
+
+    (
+        temporal_scientific,
+        temporal_scientific_gap,
+    ) = _smooth_observable_margin(
+        proposed["temporal_energy"],
+        before["temporal_energy"],
+        temporal_scientific_gain,
+        scale_floor=temporal_floor,
+    )
+
+    joint_scientific = _joint_scientific_deficit(
+        endpoint_scientific,
+        temporal_scientific,
+    )
     jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
             / before["seam_jerk_mps3"].clamp_min(1.0))
     jerk_safety, jerk_safety_terms = _repair_jerk_safety_loss_torch(
@@ -6695,18 +6900,50 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean((1,2))
     reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean((1,2)).detach()
     penetration = torch.relu(penetration - reference_penetration)
-    physics = (cfg.product_refiner_relative_temporal_weight * temporal
-        + cfg.product_refiner_seam_jerk_weight * jerk + jerk_safety + root_safety + support + penetration)
-    loss = (cfg.product_refiner_repair_margin_weight * endpoint + physics + trust
-            + outside + .2 * contact + minimum_edit_weight * minimum_edit)
+    # V15 observable optimization is ungated.  The worse scientific
+    # deficit is the bottleneck; endpoint/temporal slack may therefore trade
+    # while the joint feasibility deficit decreases.
+    scientific_observable = joint_scientific
+
+    physics = (
+        cfg.product_refiner_seam_jerk_weight * jerk
+        + jerk_safety
+        + root_safety
+        + support
+        + penetration
+    )
+
+    loss = (
+        cfg.product_refiner_repair_margin_weight
+        * scientific_observable
+        + physics
+        + trust
+        + outside
+        + .2 * contact
+        + minimum_edit_weight * minimum_edit
+    )
     zero = delta.sum((1,2)) * 0
     terms = {
         "reconstruction": delta.square().mean((1,2)), "active_reconstruction": per_window,
-        "repair_margin": endpoint, "clean_preservation": outside,
-        "temporal_supervision": temporal, "temporal_supervision_raw": temporal_raw,
+        # Historical 10% V12/V13 diagnostics.
+        "repair_margin": endpoint,
+        "clean_preservation": outside,
+        "temporal_supervision": temporal,
+        "temporal_supervision_raw": temporal_raw,
         "temporal_priority_gate": temporal_priority_gate,
         "endpoint_continuity": endpoint,
-        "endpoint_relative_gap": endpoint_gap, "temporal_relative_gap": temporal_gap,
+        "endpoint_relative_gap": endpoint_gap,
+        "temporal_relative_gap": temporal_gap,
+
+        # V15 authoritative scientific-feasibility fields.
+        "endpoint_scientific_deficit": endpoint_scientific,
+        "temporal_scientific_deficit": temporal_scientific,
+        "joint_scientific_deficit": joint_scientific,
+        "endpoint_scientific_relative_gap":
+            endpoint_scientific_gap,
+        "temporal_scientific_relative_gap":
+            temporal_scientific_gap,
+        "scientific_observable": scientific_observable,
         "endpoint_scale_floor": endpoint_floor.expand_as(
             proposed["endpoint_velocity_jump_mps"]
         ),
@@ -7126,9 +7363,18 @@ def train_refiner(args: argparse.Namespace) -> int:
             "diagnostic_minimum_clean_geometry_gain": float(
                 cfg.checkpoint_validation_min_geometry_repair_gain
             ),
+            # Historical 10% training margin remains diagnostic-only.
             "training_target_observable_repair_gain": float(
                 cfg.product_refiner_training_target_repair_gain
             ),
+            "endpoint_scientific_repair_gain": float(
+                cfg.checkpoint_validation_min_endpoint_repair_gain
+            ),
+            "temporal_scientific_repair_gain": float(
+                cfg.checkpoint_validation_min_temporal_repair_gain
+            ),
+            "observable_objective_protocol":
+                REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL,
             "clean_identity_weight": float(
                 cfg.product_refiner_clean_identity_weight
             ),

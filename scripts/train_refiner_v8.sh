@@ -57,7 +57,7 @@ if [[ "$MODE" == foundation ]]; then
 fi
 if [[ "$MODE" == diagnose ]]; then
   echo "[DIAGNOSTIC] Up to 400 neural fitting steps, not an Internet/download check."
-  echo "[OPTIMIZER] One equal-weight 192-case TRAIN transaction with total+endpoint+raw-temporal subgroup guard: 32 seen + 5x32 context; no probe fitting."
+  echo "[OPTIMIZER] One equal-weight 192-case TRAIN transaction with subgroup-total + joint-scientific-feasibility guard: 32 seen + 5x32 context; no probe fitting."
   echo "[PROBE] New cuts also change local motion context; they are not a pure position-shift test."
   echo "[STOP] A full-cycle transaction stall saves reports and blocks all later stages."
   echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."

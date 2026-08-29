@@ -15,7 +15,7 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "full_cycle_component_guard_armijo_v6"
+REFINER_UPDATE_PROTOCOL = "full_cycle_feasibility_guard_armijo_v7"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
 ARMIJO_FACTOR = 1.0e-4
 MIN_RELATIVE_DECREASE = 1.0e-8  # optimization progress, NOT a motion-quality gate
@@ -223,7 +223,7 @@ def checked_refiner_step(
                         direction=name,
                         step_scale=scale,
                         reason=(
-                            "full_cycle_group_guard_loss_decreased"
+                            "full_cycle_feasibility_guard_loss_decreased"
                             if guard_enabled
                             else "same_batch_loss_decreased"
                         ),
