@@ -173,6 +173,8 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(tmp_path,m
         terms={'endpoint':r}
         for label in m.REFINER_GROUP_LABELS:
             terms[f'group_{label}_repair_total']=r
+            terms[f'group_{label}_endpoint_continuity']=r
+            terms[f'group_{label}_temporal_supervision_raw']=r
         return r,r*0,terms,{}
     monkeypatch.setattr(m,'_refiner_batch_objectives',objective)
     monkeypatch.setattr(m,'_refiner_gradient_diagnostics',lambda *a:{'recorded':True})

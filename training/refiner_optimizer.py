@@ -15,7 +15,7 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "full_cycle_group_guard_armijo_v5"
+REFINER_UPDATE_PROTOCOL = "full_cycle_component_guard_armijo_v6"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
 ARMIJO_FACTOR = 1.0e-4
 MIN_RELATIVE_DECREASE = 1.0e-8  # optimization progress, NOT a motion-quality gate
@@ -38,7 +38,8 @@ def checked_refiner_step(
     With ``group_guard_before`` disabled this is the V11 same-batch optimizer.
     With the guard enabled, ``closure`` MUST return ``(loss, group_losses)``.
     A trial is accepted only when the scalar Armijo condition passes AND every
-    named subgroup stays within its pre-update relative/absolute allowance.
+    named subgroup/component guard stays within its pre-update
+    relative/absolute allowance.
     Parameters and the complete optimizer state are restored on rejection.
     """
     if not 1 <= int(max_trials) <= MAX_BACKTRACK_TRIALS:

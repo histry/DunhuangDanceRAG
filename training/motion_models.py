@@ -6467,6 +6467,7 @@ def _refiner_batch_objectives(model, batch, cfg):
                 for key in (
                     "endpoint_continuity",
                     "temporal_supervision",
+                    "temporal_supervision_raw",
                     "support_excess",
                     "jerk_safety_excess",
                     "root_vertical_safety_excess",
@@ -6484,28 +6485,67 @@ def _refiner_batch_objectives(model, batch, cfg):
 
 
 def _refiner_group_repair_losses(terms, *, require_all=False):
-    """Return subgroup objectives present in the current deterministic batch.
+    """Return component-wise subgroup objectives for transactional guarding.
 
-    Formal stochastic training can use small batches that contain only a subset
-    of the four role/width groups. Its line search protects every group that is
-    actually present in that batch. The fixed-bank V12 diagnostic passes
-    ``require_all=True`` because its 128-case transaction must contain all four
-    groups; missing one there is a contract violation, not a sampling event.
+    Every subgroup present in the deterministic batch contributes three guards:
+
+    1. total repair objective;
+    2. endpoint-continuity objective;
+    3. raw temporal objective before priority gating.
+
+    Raw temporal supervision is guarded instead of the gated temporal term.
+    Otherwise an initially-zero priority-gated temporal loss would incorrectly
+    forbid its later activation.
+
+    Formal stochastic training protects every subgroup present in its minibatch.
+    The fixed-bank diagnostic passes ``require_all=True`` because every full-cycle
+    transaction must contain all four role/width groups.
     """
     values = {}
     missing = []
+
     for label in REFINER_GROUP_LABELS:
-        key = f"group_{label}_repair_total"
-        if key in terms:
-            values[label] = terms[key]
+        keys = {
+            "total": f"group_{label}_repair_total",
+            "endpoint": f"group_{label}_endpoint_continuity",
+            "temporal": f"group_{label}_temporal_supervision_raw",
+        }
+
+        present = {
+            name: key in terms
+            for name, key in keys.items()
+        }
+
+        if any(present.values()) and not all(present.values()):
+            absent = [
+                name
+                for name, exists in present.items()
+                if not exists
+            ]
+            raise RuntimeError(
+                f"incomplete Refiner subgroup objectives for {label}: "
+                + ", ".join(absent)
+            )
+
+        if all(present.values()):
+            # Keep the historical plain subgroup key for the total objective,
+            # then add two component guards.
+            values[label] = terms[keys["total"]]
+            values[f"{label}.endpoint"] = terms[keys["endpoint"]]
+            values[f"{label}.temporal"] = terms[keys["temporal"]]
         else:
             missing.append(label)
+
     if require_all and missing:
         raise RuntimeError(
             "missing Refiner subgroup objectives: " + ", ".join(missing)
         )
+
     if not values:
-        raise RuntimeError("current Refiner batch has no subgroup objectives")
+        raise RuntimeError(
+            "current Refiner batch has no subgroup objectives"
+        )
+
     return values
 
 
