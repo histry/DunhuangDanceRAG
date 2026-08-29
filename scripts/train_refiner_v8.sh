@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Foundation + current V11 local Refiner. Keep this entrypoint for existing runbooks.
+# Foundation + current V12 full-cycle local Refiner. Keep this entrypoint for existing runbooks.
 # Existing source and scheduler assets are read-only.
 set -Eeuo pipefail
 if [[ $# -ne 3 || ! "$1" =~ ^(foundation|diagnose|pilot|resume|generate)$ || ! "$3" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -57,11 +57,11 @@ if [[ "$MODE" == foundation ]]; then
 fi
 if [[ "$MODE" == diagnose ]]; then
   echo "[DIAGNOSTIC] Up to 400 neural fitting steps, not an Internet/download check."
-  echo "[OPTIMIZER] 32-case seen anchor + rotating 32-case TRAIN context bank; no probe fitting."
+  echo "[OPTIMIZER] One equal-weight 128-case TRAIN transaction: 32 seen + 3x32 context; no probe fitting."
   echo "[PROBE] New cuts also change local motion context; they are not a pure position-shift test."
-  echo "[STOP] A complete context-cycle stall saves reports and blocks all later stages."
+  echo "[STOP] A full-cycle transaction stall saves reports and blocks all later stages."
   echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."
-  echo "[REPLAY] Exact anchored context-cycle inputs in fit_bank.pt, held-out inputs in probe_bank.pt, retained state in diagnostic_state.pt; diagnostic only."
+  echo "[REPLAY] Exact equal-weight full-cycle TRAIN input in fit_bank.pt; held-out probe remains updates_forbidden."
   "$PY" -u -m training.refiner_bridge_diagnostics "${FIT_ARGS[@]}" \
     --out_dir "$FIT_DIR" --windows 8 --steps 400 --eval_every 200 --foundation_report "$FOUNDATION" \
     2>&1 | tee "$CANDIDATES/console.bridge_diagnostic_$STAMP.log"

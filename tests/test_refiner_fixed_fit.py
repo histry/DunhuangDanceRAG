@@ -26,7 +26,7 @@ def clean_loss(pred, clean):
     return m._product_refiner_clean_identity_loss(pred, clean, joint, root, root, m.MotionGenerationConfig(device="cpu"))
 
 
-def test_clean_safe_region_has_zero_loss_and_zero_gradient():
+def test_clean_safe_region_keeps_hard_constraints_zero_but_noop_prior_is_active():
     clean = motion()
     pred = clean.clone()
     pred[..., 4] += 0.002
@@ -34,7 +34,22 @@ def test_clean_safe_region_has_zero_loss_and_zero_gradient():
     pred.requires_grad_(True)
     loss, terms = clean_loss(pred, clean)
     assert terms["reconstruction"] > 0
-    assert loss.item() == pytest.approx(0, abs=1e-10)
+    # Formal safety dead-bands are unchanged, but V12 intentionally adds a
+    # small always-on no-op prior for every nonzero unnecessary edit.
+    assert terms["geometry_excess"].item() == pytest.approx(0, abs=1e-10)
+    assert terms["contact_excess"].item() == pytest.approx(0, abs=1e-10)
+    assert terms["noop"] > 0
+    assert loss > 0
+    loss.backward()
+    assert pred.grad.abs().sum() > 0
+
+
+def test_exact_clean_identity_still_has_zero_loss_and_zero_gradient():
+    clean = motion()
+    pred = clean.clone().requires_grad_(True)
+    loss, terms = clean_loss(pred, clean)
+    assert terms["noop"].item() == pytest.approx(0, abs=1e-12)
+    assert loss.item() == pytest.approx(0, abs=1e-12)
     loss.backward()
     assert pred.grad.abs().max() == 0
 

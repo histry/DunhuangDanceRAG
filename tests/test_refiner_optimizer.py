@@ -242,7 +242,7 @@ def test_diagnostic_and_formal_training_share_checked_update():
     for fn in (m.train_refiner,d.run):
         source=inspect.getsource(fn)
         assert 'checked_refiner_step(' in source
-        assert '_refiner_total_batch_loss(model' in source
+        assert '_refiner_guarded_total_batch_loss(' in source
     assert REFINER_UPDATE_PROTOCOL == m.REFINER_UPDATE_PROTOCOL
 
 
@@ -309,3 +309,41 @@ def test_report_without_complete_update_accounting_cannot_authorize_pilot(tmp_pa
     monkeypatch.setattr(d,'fingerprint',lambda *args:{})
     with pytest.raises(RuntimeError,match='optimizer update protocol'):
         d.run(Namespace(config='configs/motion_model.json',check_report=str(path),windows=8))
+
+
+def test_group_guard_rejects_scalar_descent_that_regresses_subgroup():
+    p=torch.nn.Parameter(torch.zeros(1,dtype=torch.float64))
+    opt=torch.optim.SGD([p],lr=.1)
+    def objective():
+        value=(p-1).square().sum()
+        return value, {'single_short': p.square().sum()}
+    loss,_=objective(); loss.backward()
+    before=p.detach().clone(); state=copy.deepcopy(opt.state_dict())
+    report=checked_refiner_step(
+        opt,loss,objective,
+        group_guard_before={'single_short':0.0},
+        group_guard_relative_tolerance=0.0,
+        group_guard_absolute_tolerance=0.0,
+        max_trials=3,
+    )
+    assert not report['optimizer_update_accepted']
+    assert report['group_guard_rejected_trials']>0
+    torch.testing.assert_close(p,before,atol=0,rtol=0)
+    assert_state_equal(opt.state_dict(),state)
+
+
+def test_group_guard_accepts_non_regressing_subgroup():
+    p=torch.nn.Parameter(torch.zeros(1,dtype=torch.float64))
+    opt=torch.optim.SGD([p],lr=.1)
+    def objective():
+        value=(p-1).square().sum()
+        return value, {'single_short': -p.sum()}
+    loss,_=objective(); loss.backward()
+    report=checked_refiner_step(
+        opt,loss,objective,
+        group_guard_before={'single_short':0.0},
+        group_guard_relative_tolerance=0.0,
+        group_guard_absolute_tolerance=0.0,
+    )
+    assert report['optimizer_update_accepted']
+    assert report['group_guard_after']['single_short']<=0.0

@@ -35,7 +35,7 @@ def test_direct_control_cannot_read_clean_or_run_network_and_backtracks(tmp_path
     assert not list(tmp_path.glob("*.pt"))
 
 
-def test_observable_normalization_does_not_downweight_quiet_windows():
+def test_observable_severity_floor_downweights_tiny_defect_without_changing_gate_target():
     b,cfg = bank()
     x = b["bad"].expand(2,-1,-1)
     seam = b["seam"].expand(2,-1,-1)
@@ -45,13 +45,33 @@ def test_observable_normalization_does_not_downweight_quiet_windows():
     after = {**before,"endpoint_velocity_jump_mps":base*1.1,"temporal_energy":base*1.1}
     with mock.patch.object(m,"boundary_metrics_torch",side_effect=[after,before]):
         losses,terms = m._observable_refiner_objective(x,x,seam,cfg,reduction="none")
-    torch.testing.assert_close(terms["endpoint_continuity"],torch.full_like(base,.15))
-    torch.testing.assert_close(terms["temporal_supervision_raw"],torch.full_like(base,.15))
-    # Endpoint regression is not allowed to buy a temporal improvement.
+
+    floor = m._observable_scale_floor(base,cfg)
+    assert floor > base[0]
+    assert floor < base[1]
+    # The active case keeps the original relative normalization (.15 loss for
+    # a 20% normalized gap with gain=.10), while the tiny defect is deliberately
+    # downweighted by the TRAIN-reference severity floor.
+    assert terms["endpoint_continuity"][0] < terms["endpoint_continuity"][1]
+    assert terms["endpoint_continuity"][1].item() == pytest.approx(.15)
+    torch.testing.assert_close(
+        terms["temporal_supervision_raw"], terms["endpoint_continuity"]
+    )
+    torch.testing.assert_close(
+        terms["endpoint_scale_floor"], torch.full_like(base,float(floor))
+    )
+    torch.testing.assert_close(
+        terms["temporal_scale_floor"], torch.full_like(base,float(floor))
+    )
+    # Endpoint regression is still forbidden from buying temporal improvement;
+    # V12 changes only optimization scaling, never the formal observable gate.
     torch.testing.assert_close(terms["temporal_priority_gate"],torch.zeros_like(base))
     torch.testing.assert_close(terms["temporal_supervision"],torch.zeros_like(base))
-    torch.testing.assert_close(terms["endpoint_relative_gap"],torch.full_like(base,.2))
-    torch.testing.assert_close(terms["temporal_relative_gap"],torch.full_like(base,.2))
+    assert terms["endpoint_relative_gap"][0] < terms["endpoint_relative_gap"][1]
+    assert terms["endpoint_relative_gap"][1].item() == pytest.approx(.2)
+    torch.testing.assert_close(
+        terms["temporal_relative_gap"], terms["endpoint_relative_gap"]
+    )
     assert losses.shape == (2,)
 
 

@@ -31,14 +31,11 @@ def test_anchored_context_replay_uses_all_seen_cases_and_never_reads_probe():
         banks[(f'fit_context_{context}','single_recording')]=role(32+32*context)
         banks[(f'fit_context_{context}','cross_event')]=role(48+32*context)
     batches=d.anchored_context_replay_banks(banks)
-    assert len(batches)==d.FIT_CONTEXT_COUNT
-    for context,batch in enumerate(batches):
-        torch.testing.assert_close(batch['clean'][:32].flatten(),torch.arange(32).float())
-        torch.testing.assert_close(
-            batch['clean'][32:].flatten(),torch.arange(32+32*context,64+32*context).float())
-        assert torch.bincount(batch['group']).tolist()==[16,16,16,16]
-        assert len(batch['clean_cond'])==64
-
+    assert len(batches)==1
+    batch=batches[0]
+    torch.testing.assert_close(batch['clean'].flatten(),torch.arange(128).float())
+    assert torch.bincount(batch['group']).tolist()==[32,32,32,32]
+    assert len(batch['clean_cond'])==128
 
 def test_fixed_bank_rejects_missing_or_unpaired_role_cases():
     a={'clean':torch.zeros(16,1,1)}
@@ -50,14 +47,15 @@ def test_fixed_bank_rejects_missing_or_unpaired_role_cases():
 
 def test_fit_contract_counts_examples_not_just_iterations():
     contract=d.fit_bank_contract(8)
-    assert contract['cases_per_update']==64
+    assert contract['cases_per_update']==128
     assert contract['seen_anchor_cases_per_update']==32
-    assert contract['context_cases_per_update']==32
+    assert contract['context_cases_per_update']==96
     assert contract['context_banks_per_cycle']==d.FIT_CONTEXT_COUNT
-    assert contract['cases_per_role_width']==16
+    assert contract['cases_per_role_width']==32
     assert contract['cases_per_role_width_per_bank']==8
-    assert contract['gradient_scope']=='complete_seen_anchor_plus_one_context_bank'
-    assert contract['line_search_scope']=='seen_anchor_plus_one_context_bank'
+    assert contract['gradient_scope']=='complete_seen_plus_all_context_banks'
+    assert contract['line_search_scope']=='complete_seen_plus_all_context_banks'
+    assert contract['all_contexts_per_update'] is True
     assert contract['probe_used_for_updates'] is False
     source=inspect.getsource(d.run)
     assert 'balanced_indices(' not in source
@@ -66,7 +64,6 @@ def test_fit_contract_counts_examples_not_just_iterations():
     assert 'fit_bank_contract(args.windows)' in source
     assert d.PROBE_SCOPE == 'unfitted_local_motion_context_within_train_windows'
     assert '"probe_scope":PROBE_SCOPE' in source
-
 
 def test_fixed_bank_stall_is_not_counted_as_400_steps_or_pilot_acceptance():
     for reason in ('bounded_search_no_descent','zero_gradient'):
@@ -109,8 +106,7 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
     model=torch.nn.Linear(1,1)
     optimizer=torch.optim.AdamW(model.parameters())
     model(torch.ones(1,1)).sum().backward(); optimizer.step()
-    batches=[{'clean':torch.arange(64.).reshape(64,1,1)}
-             for _ in range(d.FIT_CONTEXT_COUNT)]
+    batches=[{'clean':torch.arange(128.).reshape(128,1,1)}]
     report={'fingerprint':{'test':'exact'},'windows':[], 'fit_bank':d.fit_bank_contract(8)}
     report['fit_bank_artifact']=d.save_fit_bank(tmp_path,batches,report,m.MotionGenerationConfig())
     probe_batch={
@@ -129,7 +125,7 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
     assert probe['probe_only'] and probe['updates_forbidden']
     assert not probe['formal_checkpoint'] and not probe['publish_allowed']
     assert set(probe['banks'])=={'single_recording','cross_event'}
-    assert len(bank['batches'])==d.FIT_CONTEXT_COUNT
+    assert len(bank['batches'])==1
     assert set(bank['batches'][0])=={'clean'}
     assert bank['batches'][0]['clean'].device.type=='cpu'
     assert state['completed_steps']==19
@@ -169,7 +165,10 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(tmp_path,m
     monkeypatch.setattr(m,'ProductManifoldTemporalRefiner',lambda **kwargs:torch.nn.Linear(1,1))
     def objective(model,batch,cfg):
         r=sum(p.square().sum() for p in model.parameters())
-        return r,r*0,{'endpoint':r},{}
+        terms={'endpoint':r}
+        for label in m.REFINER_GROUP_LABELS:
+            terms[f'group_{label}_repair_total']=r
+        return r,r*0,terms,{}
     monkeypatch.setattr(m,'_refiner_batch_objectives',objective)
     monkeypatch.setattr(m,'_refiner_gradient_diagnostics',lambda *a:{'recorded':True})
     monkeypatch.setattr(m,'_refiner_component_gradients',lambda *a:{'recorded':True})
@@ -192,13 +191,13 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(tmp_path,m
     report=json.loads((out/'diagnostic_report.json').read_text())
     logs=[json.loads(row) for row in (out/'gradients.jsonl').read_text().splitlines()]
     state=m._trusted_torch_load(out/'diagnostic_state.pt',map_location='cpu')
-    assert result==2 and len(calls)==1+d.FIT_CONTEXT_COUNT
+    assert result==2 and len(calls)==2
     assert report['stopped_early']
-    assert report['completed_steps']==1+d.FIT_CONTEXT_COUNT
+    assert report['completed_steps']==2
     assert not report['diagnostic_ready']
-    assert logs[-1]['step']==1+d.FIT_CONTEXT_COUNT
+    assert logs[-1]['step']==2
     assert logs[-1]['gradient']['recorded']
     assert logs[-1]['component_gradients']['recorded']
-    assert state['completed_steps']==1+d.FIT_CONTEXT_COUNT
+    assert state['completed_steps']==2
     assert not state['formal_checkpoint']
-    assert len((out/'optimizer_updates.jsonl').read_text().splitlines())==1+d.FIT_CONTEXT_COUNT
+    assert len((out/'optimizer_updates.jsonl').read_text().splitlines())==2

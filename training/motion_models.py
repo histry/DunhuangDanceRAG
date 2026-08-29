@@ -99,13 +99,13 @@ from training.refiner_optimizer import checked_refiner_step, record_update, REFI
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v11"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v12"
 REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_support_v3"
 REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_support_v2"
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "endpoint_feasible_smooth_relative_margin_stage_tail_support_root_v5"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "endpoint_feasible_minimum_edit_severity_floor_v6"
 
 
 def now_tag() -> str:
@@ -447,6 +447,16 @@ class MotionGenerationConfig:
     # branch uses the same seam/risk contract with authentic clean input.
     product_refiner_clean_identity_weight: float = 0.50
     product_refiner_clean_identity_temporal_weight: float = 1.0
+    # V12: no dead-band for unnecessary edits; the formal clean gate is unchanged.
+    product_refiner_clean_noop_weight: float = 0.03
+    # V12: prefer the minimum repair tangent that satisfies observable repair.
+    product_refiner_minimum_edit_weight: float = 0.01
+    # V12: numerical/severity scale floor is TRAIN-reference-only; target gain is unchanged.
+    product_refiner_observable_floor_quantile: float = 0.25
+    product_refiner_observable_floor_ratio: float = 0.50
+    # V12: a scalar Armijo decrease may not buy progress by regressing one subgroup.
+    product_refiner_group_guard_relative_tolerance: float = 0.005
+    product_refiner_group_guard_absolute_tolerance: float = 1.0e-6
     product_refiner_relative_temporal_weight: float = 0.25
     product_refiner_residual_smoothing_passes: int = 2
     product_refiner_residual_taper_frames: int = 3
@@ -570,6 +580,24 @@ class MotionGenerationConfig:
             ),
             "MOTION_PRODUCT_REFINER_CLEAN_IDENTITY_TEMPORAL_WEIGHT": (
                 "product_refiner_clean_identity_temporal_weight", float,
+            ),
+            "MOTION_PRODUCT_REFINER_CLEAN_NOOP_WEIGHT": (
+                "product_refiner_clean_noop_weight", float,
+            ),
+            "MOTION_PRODUCT_REFINER_MINIMUM_EDIT_WEIGHT": (
+                "product_refiner_minimum_edit_weight", float,
+            ),
+            "MOTION_PRODUCT_REFINER_OBSERVABLE_FLOOR_QUANTILE": (
+                "product_refiner_observable_floor_quantile", float,
+            ),
+            "MOTION_PRODUCT_REFINER_OBSERVABLE_FLOOR_RATIO": (
+                "product_refiner_observable_floor_ratio", float,
+            ),
+            "MOTION_PRODUCT_REFINER_GROUP_GUARD_RELATIVE_TOLERANCE": (
+                "product_refiner_group_guard_relative_tolerance", float,
+            ),
+            "MOTION_PRODUCT_REFINER_GROUP_GUARD_ABSOLUTE_TOLERANCE": (
+                "product_refiner_group_guard_absolute_tolerance", float,
             ),
             "MOTION_PRODUCT_REFINER_RELATIVE_TEMPORAL_WEIGHT": (
                 "product_refiner_relative_temporal_weight", float,
@@ -3752,24 +3780,28 @@ def _product_refiner_clean_identity_loss(
     contact_mask,
     cfg: MotionGenerationConfig,
 ):
-    """A dead-band constraint, not a second objective pulling every edit to zero.
-
-    Product/contact errors use the same unweighted per-window coordinates as
-    the clean-input audit. FK jerk uses its relative p95/max allowances. The
-    full clean audit (including feet/support/rotations) remains authoritative;
-    this differentiable surrogate does not replace or relax that gate.
-    """
+    """Formal dead-band safety plus a small no-dead-band minimum-edit prior."""
     geometry_cap = float(cfg.checkpoint_validation_max_clean_identity_product_log_l1)
     contact_cap = float(cfg.checkpoint_validation_max_clean_identity_contact_l1)
     temporal_weight = float(cfg.product_refiner_clean_identity_temporal_weight)
+    noop_weight = float(cfg.product_refiner_clean_noop_weight)
     if not all(np.isfinite(v) and v > 0 for v in (geometry_cap, contact_cap)):
         raise ValueError("clean identity tolerances must be finite and positive")
     if not np.isfinite(temporal_weight) or temporal_weight < 0:
         raise ValueError("clean temporal constraint weight must be finite and nonnegative")
+    if not np.isfinite(noop_weight) or noop_weight < 0:
+        raise ValueError("clean no-op weight must be finite and nonnegative")
+
     geometry_per_window = product_log_torch(clean, prediction).abs().mean(dim=(1, 2))
     contact_per_window = (prediction[..., :4] - clean[..., :4]).abs().mean(dim=(1, 2))
     geometry_excess = torch.relu(geometry_per_window / geometry_cap - 1.0).mean()
     contact_excess = torch.relu(contact_per_window / contact_cap - 1.0).mean()
+    # Unlike the dead-band constraints, this term is active for every nonzero
+    # unnecessary edit. Exact identity correctly has zero loss/gradient.
+    noop_geometry = geometry_per_window.mean() / geometry_cap
+    noop_contact = contact_per_window.mean() / contact_cap
+    noop = noop_geometry + 0.25 * noop_contact
+
     joints = fk_24_torch(torch.cat([prediction, clean], dim=0))
     predicted_joints, clean_joints = joints.split(prediction.shape[0], dim=0)
     fk_temporal, jerk_terms = _clean_jerk_tolerance_loss_torch(
@@ -3783,6 +3815,7 @@ def _product_refiner_clean_identity_loss(
         + temporal_weight * fk_temporal
         + 0.25 * contact_excess
         + support_excess
+        + noop_weight * noop
     )
     return total, {
         "reconstruction": geometry_per_window.mean(),
@@ -3792,9 +3825,11 @@ def _product_refiner_clean_identity_loss(
         "geometry_excess": geometry_excess,
         "contact_excess": contact_excess,
         "support_excess": support_excess,
+        "noop": noop,
+        "noop_geometry": noop_geometry,
+        "noop_contact": noop_contact,
         **jerk_terms,
     }
-
 
 def _masked_speed_stats_torch(speed, mask):
     """Per-window masked p95/max with finite gradients for empty support."""
@@ -6415,21 +6450,63 @@ def _refiner_decode_masks(joint, root, contact, seam, cfg):
     return joint * strength, root * strength, contact * strength
 
 
+REFINER_GROUP_LABELS = ("single_short", "single_long", "cross_short", "cross_long")
+
+
 def _refiner_batch_objectives(model, batch, cfg):
     pred, identity = _refiner_batch_outputs(model, batch, cfg)
-    per_case, case_terms = _observable_refiner_objective(pred, batch["bad"], batch["seam"], cfg,reduction="none")
-    repair, terms = per_case.mean(), {k:v.mean() for k,v in case_terms.items()}
+    per_case, case_terms = _observable_refiner_objective(
+        pred, batch["bad"], batch["seam"], cfg, reduction="none"
+    )
+    repair, terms = per_case.mean(), {k: v.mean() for k, v in case_terms.items()}
     if "group" in batch:
-        for index,label in enumerate(("single_short","single_long","cross_short","cross_long")):
+        for index, label in enumerate(REFINER_GROUP_LABELS):
             selected = batch["group"] == index
             if bool(selected.any()):
-                for key in ("endpoint_continuity","temporal_supervision","support_excess","jerk_safety_excess","root_vertical_safety_excess"):
+                terms[f"group_{label}_repair_total"] = per_case[selected].mean()
+                for key in (
+                    "endpoint_continuity",
+                    "temporal_supervision",
+                    "support_excess",
+                    "jerk_safety_excess",
+                    "root_vertical_safety_excess",
+                ):
                     terms[f"group_{label}_{key}"] = case_terms[key][selected].mean()
     protection, identity_terms = _product_refiner_clean_identity_loss(
-        identity, batch["clean"], batch["clean_joint"], batch["clean_root"],
-        batch["clean_contact"], cfg,
+        identity,
+        batch["clean"],
+        batch["clean_joint"],
+        batch["clean_root"],
+        batch["clean_contact"],
+        cfg,
     )
     return repair, protection, terms, identity_terms
+
+
+def _refiner_group_repair_losses(terms, *, require_all=False):
+    """Return subgroup objectives present in the current deterministic batch.
+
+    Formal stochastic training can use small batches that contain only a subset
+    of the four role/width groups. Its line search protects every group that is
+    actually present in that batch. The fixed-bank V12 diagnostic passes
+    ``require_all=True`` because its 128-case transaction must contain all four
+    groups; missing one there is a contract violation, not a sampling event.
+    """
+    values = {}
+    missing = []
+    for label in REFINER_GROUP_LABELS:
+        key = f"group_{label}_repair_total"
+        if key in terms:
+            values[label] = terms[key]
+        else:
+            missing.append(label)
+    if require_all and missing:
+        raise RuntimeError(
+            "missing Refiner subgroup objectives: " + ", ".join(missing)
+        )
+    if not values:
+        raise RuntimeError("current Refiner batch has no subgroup objectives")
+    return values
 
 
 def _refiner_total_batch_loss(model, batch, cfg):
@@ -6438,23 +6515,60 @@ def _refiner_total_batch_loss(model, batch, cfg):
     return repair + cfg.product_refiner_clean_identity_weight * protection
 
 
-def _smooth_observable_margin(proposed, baseline, gain):
-    """One-sided Huber penalty with the original target and exact dead band.
+def _refiner_guarded_total_batch_loss(
+    model,
+    batch,
+    cfg,
+    *,
+    require_all_groups=False,
+):
+    """Return scalar objective plus stable subgroup objectives for Armijo guard.
 
-    At the target the linear hinge's gradient jumps from one to zero. Combined
-    with a temporal objective and finite backtracking, that cusp could trap a
-    case at ~10% endpoint gain while temporal repair remained below 3%. The
-    quadratic shoulder goes continuously to zero; large violations retain the
-    original linear slope (not an unbounded squared loss). This changes the
-    optimization surrogate, NEVER the observable gate or its pass threshold.
+    Small formal minibatches guard every subgroup they contain. The V12
+    fixed-bank diagnostic requests all four groups explicitly.
     """
+    repair, protection, terms, _ = _refiner_batch_objectives(model, batch, cfg)
+    total = repair + cfg.product_refiner_clean_identity_weight * protection
+    return total, _refiner_group_repair_losses(
+        terms,
+        require_all=require_all_groups,
+    )
+
+
+def _observable_scale_floor(baseline, cfg):
+    """TRAIN-reference-only numerical/severity floor for relative objectives.
+
+    The acceptance target remains ``(1-gain)*baseline``. Only the denominator
+    is floored so a tiny already-smooth defect does not demand an oversized
+    correction gradient. No probe/clean target is read.
+    """
+    q = float(cfg.product_refiner_observable_floor_quantile)
+    ratio = float(cfg.product_refiner_observable_floor_ratio)
+    if not np.isfinite(q) or not 0.0 <= q <= 1.0:
+        raise ValueError("observable floor quantile must be finite in [0,1]")
+    if not np.isfinite(ratio) or ratio < 0.0:
+        raise ValueError("observable floor ratio must be finite and non-negative")
+    values = baseline.detach().abs()
+    positive = values[values > 1.0e-6]
+    if positive.numel() == 0 or ratio == 0.0:
+        return values.new_tensor(1.0e-6)
+    return (torch.quantile(positive, q) * ratio).clamp_min(1.0e-6)
+
+
+def _smooth_observable_margin(proposed, baseline, gain, *, scale_floor=None):
+    """One-sided Huber penalty with unchanged target and V12 severity scaling."""
     if not np.isfinite(gain) or not 0 < gain < 1:
         raise ValueError("observable repair target gain must be finite in (0, 1)")
     baseline = baseline.detach()
-    gap = torch.relu(proposed - (1.0 - gain) * baseline) / baseline.clamp_min(1e-6)
+    floor = baseline.new_tensor(1.0e-6)
+    if scale_floor is not None:
+        floor = torch.as_tensor(
+            scale_floor, dtype=baseline.dtype, device=baseline.device
+        ).clamp_min(1.0e-6)
+    denominator = torch.maximum(baseline.abs(), floor)
+    gap = torch.relu(proposed - (1.0 - gain) * baseline) / denominator
     shoulder = gap.clamp_max(gain)
     return shoulder.square() / (2.0 * gain) + (gap - shoulder), gap
-
 
 def _endpoint_feasibility_gate(proposed, baseline, minimum_gain):
     """Detach an endpoint-first active-set gate for temporal optimization.
@@ -6496,10 +6610,22 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     before = boundary_metrics_torch(reference_metric_joints.detach(), seam, cfg.fps)
     gain = cfg.product_refiner_training_target_repair_gain
 
+    endpoint_floor = _observable_scale_floor(
+        before["endpoint_velocity_jump_mps"], cfg
+    )
+    temporal_floor = _observable_scale_floor(before["temporal_energy"], cfg)
     endpoint, endpoint_gap = _smooth_observable_margin(
-        proposed["endpoint_velocity_jump_mps"], before["endpoint_velocity_jump_mps"], gain)
+        proposed["endpoint_velocity_jump_mps"],
+        before["endpoint_velocity_jump_mps"],
+        gain,
+        scale_floor=endpoint_floor,
+    )
     temporal_raw, temporal_gap = _smooth_observable_margin(
-        proposed["temporal_energy"], before["temporal_energy"], gain)
+        proposed["temporal_energy"],
+        before["temporal_energy"],
+        gain,
+        scale_floor=temporal_floor,
+    )
     temporal_priority_gate = _endpoint_feasibility_gate(
         proposed["endpoint_velocity_jump_mps"],
         before["endpoint_velocity_jump_mps"],
@@ -6515,6 +6641,11 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     active = (seam >= .5).to(delta.dtype)
     per_window = (delta.abs() * active).sum((1, 2)) / (active.sum((1, 2)) * delta.shape[-1]).clamp_min(1)
     trust = torch.relu(per_window / cfg.checkpoint_validation_max_refiner_product_log_l1 - 1)
+    edit_cap = max(float(cfg.checkpoint_validation_max_refiner_product_log_l1), 1.0e-6)
+    minimum_edit = per_window / edit_cap
+    minimum_edit_weight = float(cfg.product_refiner_minimum_edit_weight)
+    if not np.isfinite(minimum_edit_weight) or minimum_edit_weight < 0.0:
+        raise ValueError("minimum-edit weight must be finite and non-negative")
     outside = (delta.abs() * (1.0 - seam)).mean((1,2))
     contact = (prediction[..., :4] - reference[..., :4]).square().mean((1,2))
     support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg,
@@ -6526,7 +6657,8 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     penetration = torch.relu(penetration - reference_penetration)
     physics = (cfg.product_refiner_relative_temporal_weight * temporal
         + cfg.product_refiner_seam_jerk_weight * jerk + jerk_safety + root_safety + support + penetration)
-    loss = cfg.product_refiner_repair_margin_weight * endpoint + physics + trust + outside + .2 * contact
+    loss = (cfg.product_refiner_repair_margin_weight * endpoint + physics + trust
+            + outside + .2 * contact + minimum_edit_weight * minimum_edit)
     zero = delta.sum((1,2)) * 0
     terms = {
         "reconstruction": delta.square().mean((1,2)), "active_reconstruction": per_window,
@@ -6535,6 +6667,13 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         "temporal_priority_gate": temporal_priority_gate,
         "endpoint_continuity": endpoint,
         "endpoint_relative_gap": endpoint_gap, "temporal_relative_gap": temporal_gap,
+        "endpoint_scale_floor": endpoint_floor.expand_as(
+            proposed["endpoint_velocity_jump_mps"]
+        ),
+        "temporal_scale_floor": temporal_floor.expand_as(
+            proposed["temporal_energy"]
+        ),
+        "minimum_edit": minimum_edit,
         "seam_velocity": proposed["endpoint_velocity_jump_mps"],
         "seam_acceleration": proposed["seam_acceleration_mps2"],
         "seam_jerk": proposed["seam_jerk_mps3"], "relative_temporal": temporal,
@@ -6734,9 +6873,20 @@ def train_refiner(args: argparse.Namespace) -> int:
         opt.zero_grad(set_to_none=True)
         loss.backward()
         clip_norm = float(nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True))
+        group_guard_before = _refiner_group_repair_losses(loss_terms)
         update_report = checked_refiner_step(
-            opt, loss, lambda: _refiner_total_batch_loss(model, batch, cfg),
-            gradient_unscale=max(1.0,clip_norm+1.0e-6))
+            opt,
+            loss,
+            lambda: _refiner_guarded_total_batch_loss(model, batch, cfg),
+            gradient_unscale=max(1.0, clip_norm + 1.0e-6),
+            group_guard_before=group_guard_before,
+            group_guard_relative_tolerance=float(
+                cfg.product_refiner_group_guard_relative_tolerance
+            ),
+            group_guard_absolute_tolerance=float(
+                cfg.product_refiner_group_guard_absolute_tolerance
+            ),
+        )
         record_update(optimizer_updates, update_report)
         if logging_update:
             gradient_report["optimizer_update"] = update_report

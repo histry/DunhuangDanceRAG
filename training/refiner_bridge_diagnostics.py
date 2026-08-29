@@ -1,6 +1,6 @@
 """Training-only full-bridge learnability gate; never a formal checkpoint.
 
-Eight source-balanced TRAIN windows; anchored context replay and held-out seam
+Eight source-balanced TRAIN windows; full-cycle TRAIN fitting and held-out seam
 positions; both single-recording occlusion and cross-event joins. Validation
 motion is never loaded. The final fixed step, not the best probe result,
 decides readiness.
@@ -26,8 +26,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v11"
-FIT_PROTOCOL = "anchored_context_replay_descent_v2"
+SCHEMA = "refiner_observable_bridge_diagnostic_v12"
+FIT_PROTOCOL = "full_context_cycle_transaction_v1"
 PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
 FIT_CONTEXT_COUNT = 3
 PROBE_START_GUARD_FRAMES = 6
@@ -86,46 +86,47 @@ def _concat_fit_batches(anchor, context):
 
 
 def anchored_context_replay_banks(banks):
-    """Keep every original seen case while rotating non-probe local contexts.
+    """Return ONE equal-weight full-cycle TRAIN batch.
 
-    V10 repeated one 32-case location bank although formal training redraws
-    seam positions every batch.  Cycling context-only banks fixed that mismatch
-    but allowed a later context to forget the original long seams.  Every
-    diagnostic update therefore contains the complete 32-case seen anchor plus
-    one complete 32-case context bank.  The held-out probe is never indexed.
+    V11 optimized ``seen + one context`` at a time. Its Armijo proof therefore
+    said nothing about the other contexts and counted every seen example three
+    times per cycle. V12 concatenates seen + all three non-probe contexts once,
+    so each unique TRAIN case has equal weight and every line-search trial is a
+    transaction over the complete context set. The held-out probe is untouched.
+    A one-element list preserves the existing diagnostic loop/artifact API.
     """
-    anchor = fixed_fit_bank(banks, "seen")
-    replay = []
-    for context_index in range(FIT_CONTEXT_COUNT):
-        context = fixed_fit_bank(banks, f"fit_context_{context_index}")
-        replay.append(_concat_fit_batches(anchor, context))
-    return replay
-
+    parts = [fixed_fit_bank(banks, "seen")]
+    parts.extend(
+        fixed_fit_bank(banks, f"fit_context_{context_index}")
+        for context_index in range(FIT_CONTEXT_COUNT)
+    )
+    full = parts[0]
+    for part in parts[1:]:
+        full = _concat_fit_batches(full, part)
+    return [full]
 
 def fit_bank_contract(windows):
-    return {"protocol": FIT_PROTOCOL, "cases_per_update": 8 * windows,
-            "cases_per_role_width": 2 * windows,
-            "cases_per_role_width_per_bank": windows,
-            "gradient_scope": "complete_seen_anchor_plus_one_context_bank",
-            "line_search_scope": "seen_anchor_plus_one_context_bank",
-            "seen_anchor_cases_per_update": 4 * windows,
-            "context_cases_per_update": 4 * windows,
-            "context_banks_per_cycle": FIT_CONTEXT_COUNT,
-            "probe_start_guard_frames": PROBE_START_GUARD_FRAMES,
-            "probe_used_for_updates": False}
-
+    return {
+        "protocol": FIT_PROTOCOL,
+        "cases_per_update": 4 * windows * (1 + FIT_CONTEXT_COUNT),
+        "cases_per_role_width": windows * (1 + FIT_CONTEXT_COUNT),
+        "cases_per_role_width_per_bank": windows,
+        "gradient_scope": "complete_seen_plus_all_context_banks",
+        "line_search_scope": "complete_seen_plus_all_context_banks",
+        "seen_anchor_cases_per_update": 4 * windows,
+        "context_cases_per_update": 4 * windows * FIT_CONTEXT_COUNT,
+        "context_banks_per_cycle": FIT_CONTEXT_COUNT,
+        "all_contexts_per_update": True,
+        "probe_start_guard_frames": PROBE_START_GUARD_FRAMES,
+        "probe_used_for_updates": False,
+    }
 
 def fixed_bank_stalled(update):
-    """Classify one retained context update; the caller audits a full cycle.
-
-    A single retained update cannot stop context replay because the next bank is
-    different.  The diagnostic stops only after every context in one complete
-    cycle stalls consecutively.  Formal random-minibatch training remains
-    unchanged.  Any early stop still blocks pilot.
-    """
-    return (not update["optimizer_update_accepted"]
-            and update["reason"] in {"bounded_search_no_descent", "zero_gradient"})
-
+    """A retained V12 update already represents the complete context cycle."""
+    return (
+        not update["optimizer_update_accepted"]
+        and update["reason"] in {"bounded_search_no_descent", "zero_gradient"}
+    )
 
 def _cpu_tree(value):
     if isinstance(value, m.torch.Tensor):
@@ -138,25 +139,32 @@ def _cpu_tree(value):
 
 
 def save_fit_bank(destination, batches, report, cfg):
-    """Portable exact TRAIN inputs for failure analysis, never a training asset.
-
-    Do not reconstruct server cases from similarly named local Event-DB files:
-    descriptor statistics, event cuts and normalized coordinates may differ.
-    The only caller passes anchored_context_replay_banks(), never
-    probe/validation tensors.
-    """
-    if len(batches) != FIT_CONTEXT_COUNT:
-        raise ValueError("portable fit artifact requires the complete context cycle")
+    """Save the exact one-batch full TRAIN cycle; never a formal asset."""
+    if len(batches) != 1:
+        raise ValueError("portable V12 fit artifact requires one full-cycle batch")
     path = destination / "fit_bank.pt"
-    m._atomic_torch_save({"schema":"refiner_train_context_replay_bank_v2", "train_only":True,
-        "formal_checkpoint":False, "publish_allowed":False,
-        "fingerprint":report["fingerprint"], "windows":report["windows"],
-        "contract":report["fit_bank"], "config":dataclasses.asdict(cfg),
-        "batches":_cpu_tree(batches)},path)
-    return {"file":path.name,"sha256":common.file_sha256(path),
-            "cases_per_update":len(batches[0]["clean"]),
-            "context_banks":len(batches),"train_only":True}
-
+    m._atomic_torch_save(
+        {
+            "schema": "refiner_train_full_context_cycle_bank_v3",
+            "train_only": True,
+            "formal_checkpoint": False,
+            "publish_allowed": False,
+            "fingerprint": report["fingerprint"],
+            "windows": report["windows"],
+            "contract": report["fit_bank"],
+            "config": dataclasses.asdict(cfg),
+            "batches": _cpu_tree(batches),
+        },
+        path,
+    )
+    return {
+        "file": path.name,
+        "sha256": common.file_sha256(path),
+        "cases_per_update": len(batches[0]["clean"]),
+        "context_banks": FIT_CONTEXT_COUNT,
+        "full_cycle_batches": 1,
+        "train_only": True,
+    }
 
 def save_probe_bank(destination, banks, report, cfg):
     """Save exact held-out local contexts for replay, never for updates.
@@ -501,9 +509,24 @@ def run(args):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         norm = float(m.torch.nn.utils.clip_grad_norm_(model.parameters(),1,error_if_nonfinite=True))
+        group_guard_before = m._refiner_group_repair_losses(
+            terms, require_all=True
+        )
         update = m.checked_refiner_step(
-            optimizer, loss, lambda:m._refiner_total_batch_loss(model,batch,cfg),
-            gradient_unscale=max(1.0,norm+1.0e-6))
+            optimizer,
+            loss,
+            lambda: m._refiner_guarded_total_batch_loss(
+                model, batch, cfg, require_all_groups=True
+            ),
+            gradient_unscale=max(1.0, norm + 1.0e-6),
+            group_guard_before=group_guard_before,
+            group_guard_relative_tolerance=float(
+                cfg.product_refiner_group_guard_relative_tolerance
+            ),
+            group_guard_absolute_tolerance=float(
+                cfg.product_refiner_group_guard_absolute_tolerance
+            ),
+        )
         record_update(report["optimizer_updates"], update)
         with (destination / "optimizer_updates.jsonl").open("a",encoding="utf8") as handle:
             handle.write(json.dumps({"step":step,**update},allow_nan=False) + "\n")
@@ -532,6 +555,7 @@ def run(args):
                    "component_gradients":components,"clip_norm_before":norm,
                    "optimizer_update":update,
                    "fit_context_index":fit_context_index,
+                   "full_cycle_transaction":True,
                    "consecutive_context_stalls":consecutive_context_stalls,
                    "fit_bank":report["fit_bank"],
                    "elapsed_seconds":time.perf_counter()-started,
