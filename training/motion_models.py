@@ -105,7 +105,7 @@ REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleratio
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "scientific_feasibility_balanced_observable_v7"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "scientific_feasibility_smooth_bottleneck_observable_v8"
 
 
 def now_tag() -> str:
@@ -6736,20 +6736,50 @@ def _smooth_observable_margin(proposed, baseline, gain, *, scale_floor=None):
     return shoulder.square() / (2.0 * gain) + (gap - shoulder), gap
 
 
-def _joint_scientific_deficit(endpoint_deficit, temporal_deficit):
-    """Worst remaining endpoint/temporal scientific deficit per TRAIN case.
+SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 
-    Both inputs are one-sided non-negative feasibility deficits.  Their
-    maximum is zero iff both observable acceptance requirements are met.
+
+def _joint_scientific_deficit(endpoint_deficit, temporal_deficit):
+    """V15.2 zero-preserving smooth scientific bottleneck.
+
+    This replaces the V15 hard max while preserving the same endpoint and
+    temporal scientific deficits and therefore the same 3% feasibility
+    thresholds.  Near a tie, both components receive continuous gradient;
+    far from a tie, the larger scientific deficit remains dominant.
+
+    The exact (0, 0) state is explicitly mapped to zero so a scientifically
+    satisfied case has no residual observable penalty.
     """
     if endpoint_deficit.shape != temporal_deficit.shape:
         raise ValueError(
             "endpoint/temporal scientific deficits must have identical shapes"
         )
 
-    return torch.maximum(
-        endpoint_deficit,
-        temporal_deficit,
+    eps = endpoint_deficit.new_tensor(
+        SCIENTIFIC_BOTTLENECK_SMOOTH_EPS
+    )
+
+    delta = endpoint_deficit - temporal_deficit
+
+    smooth = 0.5 * (
+        endpoint_deficit
+        + temporal_deficit
+        + torch.sqrt(
+            delta.square()
+            + eps.square()
+        )
+        - eps
+    )
+
+    both_satisfied = (
+        (endpoint_deficit == 0)
+        & (temporal_deficit == 0)
+    )
+
+    return torch.where(
+        both_satisfied,
+        torch.zeros_like(smooth),
+        smooth,
     )
 
 

@@ -50,7 +50,7 @@ def test_v15_three_percent_scientific_margin():
     assert float(loss[1]) > 0.0
 
 
-def test_v15_joint_deficit_is_worst_requirement():
+def test_v15_2_joint_deficit_is_smooth_worst_requirement():
     endpoint = torch.tensor(
         [0.00, 0.20, 0.10],
         dtype=torch.float64,
@@ -66,15 +66,36 @@ def test_v15_joint_deficit_is_worst_requirement():
         temporal,
     )
 
-    expected = torch.tensor(
-        [0.30, 0.20, 0.10],
-        dtype=torch.float64,
+    hard = torch.maximum(
+        endpoint,
+        temporal,
     )
 
-    torch.testing.assert_close(
-        result,
-        expected,
+    eps = m.SCIENTIFIC_BOTTLENECK_SMOOTH_EPS
+
+    # V15.2 deliberately smooths the hard max from below while
+    # preserving the same zero-feasibility set.
+    assert torch.all(
+        result <= hard + 1.0e-14
     )
+
+    assert torch.all(
+        result >= hard - eps / 2.0 - 1.0e-14
+    )
+
+    # When the two scientific deficits are tied, the smooth
+    # bottleneck equals the original hard worst requirement exactly.
+    torch.testing.assert_close(
+        result[2],
+        hard[2],
+        rtol=0,
+        atol=1.0e-14,
+    )
+
+    # Unequal requirements are intentionally smoothed rather than
+    # remaining exactly equal to torch.maximum(...).
+    assert result[0] < hard[0]
+    assert result[1] < hard[1]
 
 
 def test_v15_joint_deficit_allows_slack_trade():
@@ -167,5 +188,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "scientific_feasibility_balanced_observable_v7"
+        == "scientific_feasibility_smooth_bottleneck_observable_v8"
     )
