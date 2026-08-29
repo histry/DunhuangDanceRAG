@@ -15,90 +15,11 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "full_cycle_component_guard_pareto_rescue_v7"
+REFINER_UPDATE_PROTOCOL = "full_cycle_component_guard_armijo_v6"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
 ARMIJO_FACTOR = 1.0e-4
 MIN_RELATIVE_DECREASE = 1.0e-8  # optimization progress, NOT a motion-quality gate
 _SCALE_KEY = "refiner_trial_scale"  # persisted by optimizer.state_dict()
-
-
-PARETO_MAX_ITERATIONS = 96
-PARETO_WEIGHT_EPS = 1.0e-8
-PARETO_NORM_EPS = 1.0e-10
-PARETO_COMMON_DOT_EPS = 1.0e-8
-
-
-def _minimum_norm_simplex_weights(
-    gram,
-    *,
-    max_iterations=PARETO_MAX_ITERATIONS,
-):
-    """Minimum-norm convex combination from a small gradient Gram matrix.
-
-    Deterministic Frank-Wolfe is sufficient here because the Refiner guard
-    contributes at most 12 subgroup/component objectives plus the global loss.
-    """
-    gram = torch.as_tensor(
-        gram,
-        dtype=torch.float64,
-        device="cpu",
-    )
-
-    if gram.ndim != 2 or gram.shape[0] != gram.shape[1]:
-        raise ValueError("Pareto Gram matrix must be square")
-
-    count = int(gram.shape[0])
-
-    if count < 1:
-        raise ValueError("Pareto Gram matrix cannot be empty")
-
-    if not bool(torch.isfinite(gram).all()):
-        raise FloatingPointError("nonfinite Pareto Gram matrix")
-
-    # Remove tiny numerical asymmetry from independently accumulated dots.
-    gram = 0.5 * (gram + gram.T)
-
-    alpha = torch.zeros(count, dtype=torch.float64)
-
-    # Deterministic initial vertex: smallest individual gradient norm.
-    alpha[int(torch.argmin(torch.diag(gram)))] = 1.0
-
-    for _ in range(int(max_iterations)):
-        gram_alpha = gram @ alpha
-
-        # Frank-Wolfe linear minimization oracle on the simplex.
-        vertex = int(torch.argmin(gram_alpha))
-
-        direction = -alpha.clone()
-        direction[vertex] += 1.0
-
-        gram_direction = gram @ direction
-
-        denominator = float(direction @ gram_direction)
-
-        if denominator <= 1.0e-18:
-            break
-
-        numerator = -float(direction @ gram_alpha)
-
-        gamma = max(
-            0.0,
-            min(1.0, numerator / denominator),
-        )
-
-        if gamma <= 1.0e-12:
-            break
-
-        alpha = alpha + gamma * direction
-
-    alpha = alpha.clamp_min(0.0)
-
-    total = float(alpha.sum())
-
-    if not total > 0.0:
-        raise RuntimeError("invalid Pareto simplex weights")
-
-    return alpha / total
 
 
 def checked_refiner_step(
@@ -191,13 +112,6 @@ def checked_refiner_step(
         "group_guard_after": None,
         "group_guard_rejected_trials": 0,
         "group_guard_last_violations": {},
-        "pareto_rescue_attempted": False,
-        "pareto_rescue_feasible": None,
-        "pareto_rescue_accepted": False,
-        "pareto_rescue_objectives": [],
-        "pareto_rescue_coefficients": {},
-        "pareto_rescue_min_norm_sq": None,
-        "pareto_rescue_worst_normalized_dot": None,
         "trials": [],
     }
     maximum_gradient = torch.stack([g.abs().max() for g in gradients]).max()
@@ -260,241 +174,6 @@ def checked_refiner_step(
                 }
         return violations
 
-    def pareto_common_descent_direction():
-        """Construct a first-order common descent direction for all guards.
-
-        The direction is only a proposal. The existing full-cycle Armijo and
-        component guard still make the final transactional decision.
-        """
-        if not guard_enabled:
-            return None
-
-        report["pareto_rescue_attempted"] = True
-
-        # Adam/backtracking may currently leave parameters at a rejected
-        # candidate. Pareto gradients must be evaluated at the exact original
-        # transaction state.
-        restore()
-
-        result = closure()
-
-        if not isinstance(result, tuple) or len(result) != 2:
-            raise RuntimeError(
-                "Pareto Refiner closure must return (loss, subgroup_losses)"
-            )
-
-        total_loss, raw_groups = result
-
-        if not torch.is_tensor(total_loss):
-            raise RuntimeError(
-                "Pareto Refiner total loss must be a tensor"
-            )
-
-        if not hasattr(raw_groups, "items"):
-            raise RuntimeError(
-                "Pareto Refiner subgroup output must be a mapping"
-            )
-
-        if set(str(k) for k in raw_groups) != set(guard_before):
-            raise RuntimeError(
-                "Refiner subgroup guard keys changed during Pareto rescue"
-            )
-
-        # Confirm that the differentiable rescue closure is the exact same
-        # deterministic transaction as the pre-update guard snapshot.
-        for key, tensor_value in raw_groups.items():
-            key = str(key)
-            observed = scalar(tensor_value)
-            baseline = guard_before[key]
-            tolerance = max(
-                1.0e-10,
-                abs(baseline) * 1.0e-8,
-            )
-
-            if (
-                not math.isfinite(observed)
-                or abs(observed - baseline) > tolerance
-            ):
-                raise RuntimeError(
-                    f"Pareto rescue closure changed guard baseline: {key}"
-                )
-
-        objectives = [
-            ("global_total", total_loss),
-            *[
-                (str(key), raw_groups[key])
-                for key in sorted(raw_groups, key=str)
-            ],
-        ]
-
-        normalized_rows = []
-        active_names = []
-
-        for name, objective in objectives:
-            if not torch.is_tensor(objective):
-                raise RuntimeError(
-                    f"Pareto objective {name!r} is not a tensor"
-                )
-
-            if not objective.requires_grad:
-                continue
-
-            raw = torch.autograd.grad(
-                objective,
-                parameters,
-                retain_graph=True,
-                allow_unused=True,
-            )
-
-            row = [
-                (
-                    gradient.detach()
-                    if gradient is not None
-                    else torch.zeros_like(parameter)
-                )
-                for parameter, gradient in zip(parameters, raw)
-            ]
-
-            norm_sq = sum(
-                float(
-                    gradient.double().square().sum()
-                )
-                for gradient in row
-            )
-
-            if not math.isfinite(norm_sq):
-                raise FloatingPointError(
-                    f"nonfinite Pareto gradient norm for {name}"
-                )
-
-            if norm_sq <= 1.0e-24:
-                # Zero-gradient constraint cannot define a useful first-order
-                # half-space. The post-update exact guard still protects it.
-                continue
-
-            norm = math.sqrt(norm_sq)
-
-            normalized_rows.append([
-                gradient / norm
-                for gradient in row
-            ])
-            active_names.append(name)
-
-        report["pareto_rescue_objectives"] = list(active_names)
-
-        if len(normalized_rows) < 2:
-            report["pareto_rescue_feasible"] = False
-            return None
-
-        count = len(normalized_rows)
-
-        gram = torch.empty(
-            (count, count),
-            dtype=torch.float64,
-        )
-
-        for i in range(count):
-            for j in range(i, count):
-                dot = sum(
-                    float(
-                        (
-                            left.double()
-                            * right.double()
-                        ).sum()
-                    )
-                    for left, right in zip(
-                        normalized_rows[i],
-                        normalized_rows[j],
-                    )
-                )
-
-                gram[i, j] = dot
-                gram[j, i] = dot
-
-        weights = _minimum_norm_simplex_weights(gram)
-
-        gram_weights = gram @ weights
-
-        min_norm_sq = float(
-            weights @ gram_weights
-        )
-
-        worst_dot = float(
-            torch.min(gram_weights)
-        )
-
-        report["pareto_rescue_min_norm_sq"] = min_norm_sq
-        report["pareto_rescue_worst_normalized_dot"] = worst_dot
-
-        report["pareto_rescue_coefficients"] = {
-            name: float(weight)
-            for name, weight in zip(active_names, weights)
-            if float(weight) > PARETO_WEIGHT_EPS
-        }
-
-        # For the minimum-norm convex combination g*, a strict common
-        # descent direction -g* requires every normalized objective gradient
-        # to have positive dot product with g*.
-        feasible = (
-            math.isfinite(min_norm_sq)
-            and math.isfinite(worst_dot)
-            and min_norm_sq > PARETO_NORM_EPS
-            and worst_dot > PARETO_COMMON_DOT_EPS
-        )
-
-        report["pareto_rescue_feasible"] = bool(feasible)
-
-        if not feasible:
-            return None
-
-        mixed = []
-
-        for parameter_index, parameter in enumerate(parameters):
-            value = torch.zeros_like(parameter)
-
-            for weight, row in zip(weights, normalized_rows):
-                value = value + float(weight) * row[parameter_index]
-
-            mixed.append(value)
-
-        maximum = max(
-            float(value.abs().max())
-            for value in mixed
-        )
-
-        if not math.isfinite(maximum) or maximum <= 0.0:
-            report["pareto_rescue_feasible"] = False
-            return None
-
-        positive_rates = [
-            rate for rate in rates
-            if math.isfinite(rate) and rate > 0.0
-        ]
-
-        if not positive_rates:
-            raise RuntimeError(
-                "Refiner optimizer has no positive learning rate"
-            )
-
-        # A single positive scalar preserves every common-descent sign.
-        # Backtracking remains responsible for selecting the actual step.
-        base_rate = min(positive_rates)
-
-        direction = [
-            -base_rate * value / maximum
-            for value in mixed
-        ]
-
-        # Fail closed if numerical reconstruction lost global descent.
-        slope = derivative(direction)
-
-        if not math.isfinite(slope) or slope >= 0.0:
-            report["pareto_rescue_feasible"] = False
-            return None
-
-        return direction
-
-
     def search(direction, scale, name):
         slope = derivative(direction)
         if not math.isfinite(slope) or slope >= 0:
@@ -544,7 +223,7 @@ def checked_refiner_step(
                         direction=name,
                         step_scale=scale,
                         reason=(
-                            "full_cycle_component_guard_loss_decreased"
+                            "full_cycle_group_guard_loss_decreased"
                             if guard_enabled
                             else "same_batch_loss_decreased"
                         ),
@@ -583,40 +262,12 @@ def checked_refiner_step(
         accepted = search(direction, 1.0, "adam")
         if not accepted:
             report["used_gradient_rescue"] = True
-
-            pareto_direction = pareto_common_descent_direction()
-
-            if pareto_direction is not None:
-                accepted = search(
-                    pareto_direction,
-                    1.0,
-                    "pareto_common_descent",
-                )
-
-                report["pareto_rescue_accepted"] = bool(accepted)
-
-                if accepted:
-                    # This update did not follow Adam's moment direction.
-                    optimizer.state.clear()
-
-            if not accepted:
-                # Preserve the V13 current-gradient rescue as the final
-                # fallback. Start again from the exact transaction state.
-                restore()
-
-                direction = [
-                    -rate * g / maximum_gradient
-                    for rate, g in zip(rates, gradients)
-                ]
-
-                accepted = search(
-                    direction,
-                    1.0,
-                    "current_gradient",
-                )
-
-                if accepted:
-                    optimizer.state.clear()
+            direction = [
+                -rate * g / maximum_gradient for rate, g in zip(rates, gradients)
+            ]
+            accepted = search(direction, 1.0, "current_gradient")
+            if accepted:
+                optimizer.state.clear()
         if accepted:
             for group in optimizer.param_groups:
                 group[_SCALE_KEY] = report["step_scale"]
@@ -640,9 +291,6 @@ def record_update(summary, update):
         "nonfinite_trials": int(update["nonfinite_trials"]),
         "insufficient_decrease_trials": int(update.get("insufficient_decrease_trials", 0)),
         "group_guard_rejected_trials": int(update.get("group_guard_rejected_trials", 0)),
-        "pareto_rescue_steps": int(bool(update.get("pareto_rescue_attempted", False))),
-        "pareto_feasible_steps": int(bool(update.get("pareto_rescue_feasible", False))),
-        "pareto_accepted_steps": int(bool(update.get("pareto_rescue_accepted", False))),
         "accepted_non_descent_steps": int(update["optimizer_update_accepted"] and
                                            update["loss_after"] >= update["loss_before"]),
     }
