@@ -29,7 +29,7 @@ from contracts import physical_quality
 SCHEMA = "refiner_observable_bridge_diagnostic_v12"
 FIT_PROTOCOL = "full_context_cycle_transaction_v1"
 PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
-FIT_CONTEXT_COUNT = 3
+FIT_CONTEXT_COUNT = 5
 PROBE_START_GUARD_FRAMES = 6
 
 

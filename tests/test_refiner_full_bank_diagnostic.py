@@ -33,9 +33,14 @@ def test_anchored_context_replay_uses_all_seen_cases_and_never_reads_probe():
     batches=d.anchored_context_replay_banks(banks)
     assert len(batches)==1
     batch=batches[0]
-    torch.testing.assert_close(batch['clean'].flatten(),torch.arange(128).float())
-    assert torch.bincount(batch['group']).tolist()==[32,32,32,32]
-    assert len(batch['clean_cond'])==128
+    expected_cases = 4 * 8 * (1 + d.FIT_CONTEXT_COUNT)
+    torch.testing.assert_close(
+        batch['clean'].flatten(),
+        torch.arange(expected_cases).float(),
+    )
+    expected_per_group = 8 * (1 + d.FIT_CONTEXT_COUNT)
+    assert torch.bincount(batch['group']).tolist() == [expected_per_group] * 4
+    assert len(batch['clean_cond']) == expected_cases
 
 def test_fixed_bank_rejects_missing_or_unpaired_role_cases():
     a={'clean':torch.zeros(16,1,1)}
@@ -47,11 +52,11 @@ def test_fixed_bank_rejects_missing_or_unpaired_role_cases():
 
 def test_fit_contract_counts_examples_not_just_iterations():
     contract=d.fit_bank_contract(8)
-    assert contract['cases_per_update']==128
+    assert contract['cases_per_update']==4*8*(1+d.FIT_CONTEXT_COUNT)
     assert contract['seen_anchor_cases_per_update']==32
-    assert contract['context_cases_per_update']==96
+    assert contract['context_cases_per_update']==4*8*d.FIT_CONTEXT_COUNT
     assert contract['context_banks_per_cycle']==d.FIT_CONTEXT_COUNT
-    assert contract['cases_per_role_width']==32
+    assert contract['cases_per_role_width']==8*(1+d.FIT_CONTEXT_COUNT)
     assert contract['cases_per_role_width_per_bank']==8
     assert contract['gradient_scope']=='complete_seen_plus_all_context_banks'
     assert contract['line_search_scope']=='complete_seen_plus_all_context_banks'
