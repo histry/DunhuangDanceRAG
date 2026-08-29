@@ -25,8 +25,9 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v8"
+SCHEMA = "refiner_observable_bridge_diagnostic_v9"
 FIT_PROTOCOL = "complete_seen_bank_descent_v1"
+PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
 
 
 def fingerprint(args, cfg):
@@ -49,6 +50,7 @@ def fingerprint(args, cfg):
     value["refiner_input_protocol"] = m.REFINER_INPUT_PROTOCOL
     value["refiner_update_protocol"] = m.REFINER_UPDATE_PROTOCOL
     value["fit_protocol"] = FIT_PROTOCOL
+    value["probe_scope"] = PROBE_SCOPE
     return value
 
 
@@ -138,7 +140,9 @@ def build_banks(clean, cond, sources, cfg, device, *, contact_ik=True):
                 if role == "cross_event" and partner is None:
                     raise RuntimeError("cross-event diagnosis needs multiple training sources")
                 for recipe_id, width in enumerate((10, 28)):
-                    # Fixed positions differ across splits without accessing validation motion.
+                    # Moving the cut within original changes its local motion
+                    # content too. This is NOT a pure translation-equivariance
+                    # test, nor independent source-disjoint validation.
                     width = min(width, len(original) - 8)
                     a = max(3, (len(original) - width) // 2 + (-8 if recipe_id else 8))
                     if split == "new_position":
@@ -313,6 +317,7 @@ def run(args):
     destination.mkdir(parents=True)
     report = {"schema":SCHEMA,"protocol":m.BOUNDARY_PROTOCOL,"fingerprint":fingerprint(args,cfg),
               "completed":False,"published":False,"independent_validation":False,
+              "probe_scope":PROBE_SCOPE,
               "formal_training_must_start_fresh":True,"selection":"fixed_final_step",
               "foundation_report":str(Path(args.foundation_report).resolve()),
               "fit_bank":fit_bank_contract(args.windows),

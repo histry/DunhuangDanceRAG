@@ -52,7 +52,8 @@ def test_support_surrogate_uses_stage_ratio_plus_margin_epsilon_and_ceiling(abov
         epsilon = max(1e-8,abs(value)*1e-6,abs(spec.absolute_limit)*1e-9)
         before[key] = torch.tensor([value,value],dtype=torch.float64)
         after[key] = torch.tensor([allowed+epsilon*.5,allowed+epsilon+.001],dtype=torch.float64,requires_grad=True)
-        expected.append(torch.tensor([0., .001/max(allowed-value,1e-4)],dtype=torch.float64))
+        gap = .001/max(allowed-value,spec.stage_margin,1e-4)
+        expected.append(torch.tensor([0., .5*min(gap,1.)**2+gap-min(gap,1.)],dtype=torch.float64))
     joints = torch.zeros((2,8,24,3),dtype=torch.float64)
     with mock.patch.object(m,'_reference_support_statistics_torch',return_value=(before,after,None)):
         loss = m._clean_support_tolerance_loss_torch(joints,joints,joints[...,0,0],cfg,reduction='none',stage_relative=True)
@@ -60,6 +61,22 @@ def test_support_surrogate_uses_stage_ratio_plus_margin_epsilon_and_ceiling(abov
     loss.sum().backward()
     for value in after.values():
         assert value.grad[0] == 0 and value.grad[1] > 0
+
+
+def test_above_limit_support_boundary_has_no_linear_gradient_cliff():
+    cfg=m.MotionGenerationConfig(device='cpu')
+    spec=next(s for s in physical_metric_specs(m.PhysicalQualityLimits.from_environment(),
+        m.StageAcceptancePolicy.from_environment()) if s.key=='foot_skate_mps_max')
+    baseline=torch.tensor([spec.absolute_limit*1.2],dtype=torch.float64)
+    epsilon=max(1e-8,float(baseline[0])*1e-6,abs(spec.absolute_limit)*1e-9)
+    candidate=(baseline+epsilon+1e-9).requires_grad_(True)
+    before={spec.key:baseline}; after={spec.key:candidate}
+    joints=torch.zeros((1,8,24,3),dtype=torch.float64)
+    with mock.patch.object(m,'_reference_support_statistics_torch',return_value=(before,after,None)):
+        loss=m._clean_support_tolerance_loss_torch(joints,joints,joints[...,0,0],cfg,
+            reduction='none',stage_relative=True)
+    loss.sum().backward()
+    assert 0 < candidate.grad.item() < 1e-4
 
 
 def test_clean_identity_does_not_inherit_the_repair_stage_support_budget():

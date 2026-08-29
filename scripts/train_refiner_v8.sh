@@ -58,6 +58,7 @@ fi
 if [[ "$MODE" == diagnose ]]; then
   echo "[DIAGNOSTIC] Up to 400 neural fitting steps, not an Internet/download check."
   echo "[OPTIMIZER] Complete 32-case TRAIN bank, curvature-aware sufficient decrease; no probe fitting."
+  echo "[PROBE] New cuts also change local motion context; they are not a pure position-shift test."
   echo "[STOP] A fixed-bank search stall saves reports and blocks all later stages."
   echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."
   echo "[REPLAY] Exact TRAIN inputs in fit_bank.pt, retained state in diagnostic_state.pt; diagnostic only."

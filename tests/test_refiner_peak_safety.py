@@ -86,7 +86,12 @@ def test_all_five_loss_budgets_match_stage_registry_including_absolute_ceiling(f
         eps = max(1e-8, abs(value)*1e-6, abs(spec.absolute_limit)*1e-9)
         before[label] = torch.tensor([value, value], dtype=torch.float64)
         after[label] = torch.tensor([allowed, allowed + eps + .5], dtype=torch.float64)
-        expected[label] = torch.tensor([0., .5 / max(1., allowed - value)], dtype=torch.float64)
+        scale = max(allowed - value, 1e-4, spec.stage_margin)
+        gap = .5 / scale
+        expected[label] = torch.tensor(
+            [0., .5 * min(gap, 1.) ** 2 + gap - min(gap, 1.)],
+            dtype=torch.float64,
+        )
     x = torch.zeros((2, 8, 24, 3), dtype=torch.float64)
     with mock.patch.object(m, "_clean_jerk_statistics_torch", side_effect=[after, before]):
         loss, terms = m._repair_jerk_safety_loss_torch(x, x, cfg)
@@ -121,10 +126,51 @@ def test_uploaded_three_peak_regressions_receive_positive_loss_without_changing_
          mock.patch.object(m.PhysicalQualityLimits, "from_environment", return_value=m.PhysicalQualityLimits()), \
          mock.patch.object(m, "_clean_jerk_statistics_torch", side_effect=[after, before]):
         loss, terms = m._repair_jerk_safety_loss_torch(x, x, cfg)
-    expected = (candidate-allowed-reference*1e-6)/(allowed-reference)
+    eps = torch.maximum(
+        reference.abs() * 1e-6,
+        torch.full_like(reference, max(1e-8, m.PhysicalQualityLimits().joint_jerk_mps3_max * 1e-9)),
+    )
+    scale = torch.maximum(
+        allowed - reference,
+        torch.full_like(reference, m.StageAcceptancePolicy().jerk_max_margin_mps3),
+    )
+    gap = torch.relu(candidate - allowed - eps) / scale
+    shoulder = gap.clamp_max(1.)
+    expected = .5 * shoulder.square() + gap - shoulder
     torch.testing.assert_close(loss, expected)
     torch.testing.assert_close(terms["repair_jerk_max_excess"], expected)
     assert torch.all(loss > 0)
+
+
+def test_above_limit_tiny_jerk_regression_has_smooth_near_zero_gradient():
+    """Strict audit budget is unchanged; its training surrogate has no cliff."""
+    cfg = m.MotionGenerationConfig(device="cpu")
+    spec = next(s for s in physical_metric_specs(
+        m.PhysicalQualityLimits.from_environment(),
+        m.StageAcceptancePolicy.from_environment(),
+    ) if s.key == "joint_jerk_mps3_max")
+    baseline = torch.tensor([spec.absolute_limit * 1.2], dtype=torch.float64)
+    epsilon = max(abs(float(baseline)) * 1e-6, abs(spec.absolute_limit) * 1e-9, 1e-8)
+    predicted = torch.tensor(
+        [float(baseline) + epsilon + 1e-5], dtype=torch.float64, requires_grad=True
+    )
+    loss = m._smooth_stage_safety_excess(predicted, baseline, spec).sum()
+    loss.backward()
+    assert 0 < float(loss) < 1e-10
+    assert 0 < float(predicted.grad) < 1e-5
+
+
+def test_smooth_safety_does_not_cancel_its_small_quadratic_value():
+    from types import SimpleNamespace
+    spec = SimpleNamespace(absolute_limit=1., stage_ratio=1., stage_margin=0.)
+    baseline = torch.tensor([0.], dtype=torch.float64)
+    predicted = torch.tensor([1e-8 + 1e-18], dtype=torch.float64, requires_grad=True)
+    loss = m._smooth_stage_safety_excess(predicted, baseline, spec)
+    gap = (predicted - 1e-8) / 1e-4
+    torch.testing.assert_close(loss, .5 * gap.square(), atol=0, rtol=1e-12)
+    assert float(loss) > 0
+    loss.sum().backward()
+    assert float(predicted.grad) > 0
 
 
 def test_direct_optimizer_keeps_last_safe_candidate_instead_of_lower_unsafe_loss(tmp_path):

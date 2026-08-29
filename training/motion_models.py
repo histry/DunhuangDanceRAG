@@ -102,8 +102,8 @@ FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v9"
 REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_v1"
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
-REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_jerk_root_constraints_v2"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_support_root_v2"
+REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "smooth_relative_margin_stage_tail_support_root_v4"
 
 
 def now_tag() -> str:
@@ -3779,15 +3779,12 @@ def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_co
             # Repair-input budget: match ratio PLUS margin and epsilon from
             # evaluate_stage_candidate. Do not apply this to clean identity,
             # whose separate fidelity audit uses max(ratio, margin).
-            allowed = torch.where(ref > spec.absolute_limit, ref,
-                (ref * ratio + margin).clamp_max(spec.absolute_limit))
-            epsilon = (ref.abs() * 1e-6).clamp_min(max(1e-8, abs(spec.absolute_limit)*1e-9))
+            penalties.append(_smooth_stage_safety_excess(pred, ref, spec))
         else:
             # Keep the existing clean-protection surrogate unchanged.
             allowed = torch.where(ref > spec.absolute_limit, ref,
                 torch.minimum(torch.maximum(ref * ratio, ref + margin), ref.new_tensor(spec.absolute_limit)))
-            epsilon = 0.0
-        penalties.append(torch.relu(pred - allowed - epsilon) / (allowed - ref).clamp_min(1e-4))
+            penalties.append(torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4))
     loss = sum(penalties) / max(1, len(penalties))
     return loss if reduction=="none" else loss.mean()
 
@@ -3878,6 +3875,35 @@ def _clean_jerk_tolerance_loss_torch(predicted_joints, clean_joints, cfg):
     return sum(terms.values()) / len(terms), terms
 
 
+def _smooth_stage_safety_excess(predicted, baseline, spec):
+    """Differentiable surrogate with the stage registry's UNCHANGED budget.
+
+    Above-limit references have zero acceptance headroom, but must not have an
+    effectively zero normalization scale. A linear hinge at that strict edge
+    creates a large, discontinuous gradient for floating-point-sized changes in
+    third differences or support metrics. The quadratic shoulder is zero, with
+    zero slope, inside the exact budget. Its normalization margin is never added
+    to the acceptance budget; the independent stage audit remains authoritative.
+    """
+    if (not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1
+            or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0):
+        raise ValueError("invalid repair safety policy")
+    baseline = baseline.detach()
+    allowed = torch.where(
+        baseline <= spec.absolute_limit,
+        (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(spec.absolute_limit),
+        baseline,
+    )
+    epsilon = (baseline.abs() * 1e-6).clamp_min(
+        max(1e-8, abs(spec.absolute_limit) * 1e-9)
+    )
+    scale = (allowed - baseline).clamp_min(max(1e-4, spec.stage_margin))
+    gap = torch.relu(predicted - allowed - epsilon) / scale
+    shoulder = gap.clamp_max(1.0)
+    # Keep the small quadratic term out of the gap-minus-shoulder cancellation.
+    return 0.5 * shoulder.square() + (gap - shoulder)
+
+
 def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
     """Per-case tail/peak constraints against the OBSERVED damaged input.
 
@@ -3909,14 +3935,9 @@ def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
     terms = {}
     for label, key in labels.items():
         spec, baseline = specs[key], before[label]
-        if (not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1
-                or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0):
-            raise ValueError("invalid repair jerk stage policy")
-        allowed = torch.where(baseline <= spec.absolute_limit,
-            (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(spec.absolute_limit), baseline)
-        epsilon = (baseline.abs() * 1e-6).clamp_min(max(1e-8, abs(spec.absolute_limit)*1e-9))
-        terms[f"repair_jerk_{label}_excess"] = (
-            torch.relu(after[label] - allowed - epsilon) / (allowed - baseline).clamp_min(1.0))
+        terms[f"repair_jerk_{label}_excess"] = _smooth_stage_safety_excess(
+            after[label], baseline, spec
+        )
     return sum(terms.values()), terms
 
 
@@ -3945,22 +3966,7 @@ def _repair_root_vertical_safety_loss_torch(prediction, reference, cfg):
                                       StageAcceptancePolicy.from_environment()):
         if spec.layer != "root_vertical":
             continue
-        if not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1 or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0:
-            raise ValueError("invalid repair root vertical policy")
-        baseline = before[spec.key]
-        allowed = torch.where(baseline <= spec.absolute_limit,
-            (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(spec.absolute_limit),baseline)
-        epsilon = (baseline.abs()*1e-6).clamp_min(max(1e-8,abs(spec.absolute_limit)*1e-9))
-        # Already-over-limit references have zero *acceptance* headroom, not
-        # zero optimization scale. Dividing a linear hinge by 1e-4 here made
-        # sub-mm edits cause a gradient cliff and stalled the real bank at step
-        # 5. Use the existing policy margin only as a normalization scale;
-        # allowed/epsilon remain exactly unchanged. The one-sided quadratic
-        # shoulder has zero gradient at the boundary and bounded outer slope.
-        scale = (allowed-baseline).clamp_min(max(1e-4,spec.stage_margin))
-        gap = torch.relu(after[spec.key]-allowed-epsilon) / scale
-        shoulder = gap.clamp_max(1.0)
-        terms[f"repair_{spec.key}_excess"] = .5*shoulder.square() + gap - shoulder
+        terms[f"repair_{spec.key}_excess"] = _smooth_stage_safety_excess(after[spec.key],before[spec.key],spec)
     return sum(terms.values()),terms
 
 

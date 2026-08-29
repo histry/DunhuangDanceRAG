@@ -4,7 +4,70 @@ This change repairs artificial joins, not original SMPL14 assets. Existing
 retarget cache, train/val/test Event-DB, Router/Duration/Planner and generation
 index stay read-only. No external pretrained model is introduced.
 
-## Latest repair: curvature-aware search, vertical safety, portable diagnostics
+## Latest repair: smooth safety boundaries and fresh search curvature
+
+The uploaded `02e449a` / `refiner_v9_armijo_20260828_223139` run passed all
+eight foundation groups, then stopped at attempt 382: 381 accepted updates,
+671 trial evaluations and no accepted non-descent update. Fitted positions
+passed 30/32 temporal cases; unfitted local contexts passed only 10/32. This
+is an optimization stall plus unverified generalization, not a damaged-SMPL
+finding and not permission to train a pilot or Diffusion.
+
+The uploaded `fit_bank.pt` and `diagnostic_state.pt` enabled an exact TRAIN-input
+replay. The repair support surrogate still used a linear hinge divided by 1e-4
+on already-over-limit references. Its loss was about 2.19e-6 but the total
+gradient norm was 25.43. A zero-slope quadratic shoulder reduced that contribution
+to about 3.08e-10 and the total norm to 0.388; a same-bank directional probe then
+decreased the objective. A separate controlled seam-bank probe exposed the same
+problem in the jerk-tail hinge: a roughly 6.25e-6 safety loss produced a total
+gradient norm around 2200. Merely adjusting the search floor did not resolve it.
+
+Corrections in this release:
+
+- Support, jerk peak/window quantiles and root-vertical safety now share one
+  one-sided quadratic shoulder. The metric budget, absolute ceiling, ratio,
+  margin and numerical epsilon are UNCHANGED. Inside the permitted region,
+  both loss and gradient are zero; larger violations still incur a bounded
+  linear penalty. The existing stage margin sets normalization, not tolerance.
+  Parenthesized subtraction preserves tiny quadratic values without cancellation.
+- Every deterministic optimizer update re-estimates curvature from the full Adam
+  proposal. The previous accepted scale is provenance, not a permanent upper
+  bound for the next step. At most 12 trials per direction, strict Armijo decrease,
+  finite checks and full parameter/optimizer rollback remain enforced. Useful
+  decrease is `max(1e-8, 8*loss-dtype-epsilon)` relative to loss magnitude; a
+  representable 2e-8 relative decrease is no longer rejected, while a 1e-13
+  roundoff-sized decrease cannot count as progress. This is NOT a physical gate.
+- The report explicitly identifies `new_position` as an unfitted LOCAL MOTION
+  CONTEXT within the same TRAIN windows: moving the cut changes its content as
+  well as its position. It is neither a pure translation-equivariance test nor
+  independent source-disjoint validation. The original 32-case fit bank and
+  all per-role/per-width acceptance gates remain unchanged.
+
+Two-position fitting and an input variant excluding absolute poses/music
+conditions were tested locally but did not establish generalization. A 400-step
+bracketed-position variant completed with 400 descending updates, yet passed
+only 8/32 new-context temporal cases (single-recording 0/16). Those experimental
+architecture/sampling changes were therefore NOT adopted. Model architecture
+remains V9; do not attribute the variant's numbers to the released model.
+
+A fresh local V9 control using the uploaded exact 32-case TRAIN tensor bank
+completed 400/400 descending updates (880 trial evaluations, zero nonfinite
+trials), reducing loss from 0.0625 to 0.00155109. Fitted temporal cases passed
+28/32; reconstructed unfitted local contexts passed 9/32: single/10 0/8,
+single/28 0/8, cross/10 7/8, cross/28 2/8. Clean identity passed 16/16 in both
+splits. The fit inputs/masks were exact uploaded tensors; the probe was rebuilt
+from those uploaded clean TRAIN windows on the local GPU, not claimed to be
+bitwise identical to the server's unsaved probe tensors. This verifies removal
+of the observed optimization stall, NOT improved generalization or scientific
+acceptance. The new-context gate correctly remains closed.
+
+Diagnostic schema is v9, update protocol `same_batch_fresh_curvature_armijo_v4`,
+repair safety `stage_registry_smooth_tail_support_root_v4`. Use a NEW
+`refiner_v9_smooth_safety_*` tag, regenerate foundation, then rerun the gated
+400-step diagnostic. Old reports/snapshots cannot authorize current training.
+Source/scheduler assets remain reusable; no external pretrained model is added.
+
+## Previous repair: curvature-aware search, vertical safety, portable diagnostics
 
 The full `055d85e` server report is now available. Foundation passed all eight
 groups, but the network stopped at attempt 19 (18 accepted, 84 trial forwards).
@@ -394,7 +457,7 @@ After pulling the reviewed release on main, initialize the current shell:
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 export PY=/home/disk/lsm/conda_envs/edge/bin/python
 export OUT_ROOT=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export TAG=refiner_v9_armijo_trial1
+export TAG=refiner_v9_smooth_safety_trial1
 git rev-parse HEAD
 # Set EXPECTED_COMMIT to the literal reviewed SHA from the release message.
 ```
@@ -428,7 +491,9 @@ That line alone does NOT authorize fitting: the final decision must still have
 bash scripts/train_refiner_v8.sh diagnose "$OUT_ROOT" "$TAG"
 ```
 
-Fits the complete seen TRAIN bank; new positions are held out from fitting.
+Fits the complete seen TRAIN bank; new local contexts are held out from fitting.
+The report key `new_position` retains its historical name, but moving the cut
+also changes local motion content. It is not a pure tensor-shift test.
 Fresh initialization, all four groups in each update, no direct-control warm start.
 Inspect `bridge_diagnostic/diagnostic_report.json` and `gradients.jsonl` in the
 candidate directory, plus `summary.json` for all-step optimizer accounting and

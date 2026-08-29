@@ -40,6 +40,8 @@ def test_fit_contract_counts_examples_not_just_iterations():
     assert 'balanced_indices(' not in source
     assert 'batch = train' in source
     assert 'fit_bank_contract(args.windows)' in source
+    assert d.PROBE_SCOPE == 'unfitted_local_motion_context_within_train_windows'
+    assert '"probe_scope":PROBE_SCOPE' in source
 
 
 def test_fixed_bank_stall_is_not_counted_as_400_steps_or_pilot_acceptance():

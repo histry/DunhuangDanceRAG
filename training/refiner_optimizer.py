@@ -15,10 +15,10 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "same_batch_armijo_quadratic_v3"
+REFINER_UPDATE_PROTOCOL = "same_batch_fresh_curvature_armijo_v4"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
 ARMIJO_FACTOR = 1.0e-4
-MIN_RELATIVE_DECREASE = 1.0e-7  # optimization progress, NOT a motion-quality gate
+MIN_RELATIVE_DECREASE = 1.0e-8  # optimization progress, NOT a motion-quality gate
 _SCALE_KEY = "refiner_trial_scale"  # persisted by optimizer.state_dict()
 
 
@@ -138,8 +138,12 @@ def checked_refiner_step(optimizer, loss, closure, *, max_trials=MAX_BACKTRACK_T
         saved_scales = [float(group.get(_SCALE_KEY, 1.0)) for group in optimizer.param_groups]
         if any(not math.isfinite(scale) or not 0 < scale <= 1 for scale in saved_scales):
             raise ValueError("invalid persisted Refiner trial scale")
-        prior_scale = min(saved_scales)
-        accepted = search(direction, min(1.0, 2.0 * prior_scale), "adam")
+        # The accepted scale is useful provenance, not a bound on the next
+        # update. Persistently starting at 2*prior made scale shrink one-way:
+        # the bracketed real bank reached 3.6e-11 by step 7 and could no longer
+        # sample a meaningful Adam proposal after curvature changed. Re-estimate
+        # curvature from the complete proposal on every deterministic batch.
+        accepted = search(direction, 1.0, "adam")
         if not accepted:
             report["used_gradient_rescue"] = True
             direction = [-rate * g / maximum_gradient for rate, g in zip(rates, gradients)]

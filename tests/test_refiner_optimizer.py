@@ -140,6 +140,22 @@ def test_curved_objective_can_take_meaningful_step_below_old_scale_floor(device)
     assert report['trials'][-1]['required_decrease'] <= report['loss_before']-report['loss_after']
 
 
+def test_tiny_previous_scale_does_not_cap_next_changed_curvature(device):
+    p=torch.nn.Parameter(torch.zeros(1,device=device,dtype=torch.float64))
+    opt=torch.optim.AdamW([p],lr=1e-3,weight_decay=0.)
+    def steep(): return (1e8*p-1).square().sum()
+    loss=steep(); loss.backward()
+    norm=float(torch.nn.utils.clip_grad_norm_([p],1.))
+    first=checked_refiner_step(opt,loss,steep,gradient_unscale=max(1.,norm+1e-6))
+    assert first['optimizer_update_accepted'] and first['step_scale'] < 2e-4
+    opt.zero_grad(set_to_none=True)
+    def shallow(): return (p-1).square().sum()
+    loss=shallow(); loss.backward()
+    second=checked_refiner_step(opt,loss,shallow)
+    assert second['trials'][0]['scale']==1.
+    assert second['optimizer_update_accepted']
+
+
 def test_tiny_loss_change_is_not_progress_even_when_parameters_change(device):
     p=torch.nn.Parameter(torch.zeros(1,device=device,dtype=torch.float64))
     opt=torch.optim.AdamW([p],lr=1e-13,weight_decay=0.)
@@ -152,6 +168,17 @@ def test_tiny_loss_change_is_not_progress_even_when_parameters_change(device):
     assert report['trial_evaluations'] <= 24
     assert p==0
     assert_state_equal(opt.state_dict(),state)
+
+
+def test_representable_one_in_fifty_million_decrease_is_progress(device):
+    p=torch.nn.Parameter(torch.zeros(1,device=device,dtype=torch.float64))
+    opt=torch.optim.SGD([p],lr=2e-8)
+    def objective(): return (1+p).sum()
+    loss=objective(); loss.backward()
+    report=checked_refiner_step(opt,loss,objective)
+    assert report['optimizer_update_accepted']
+    assert report['loss_before']-report['loss_after'] == pytest.approx(2e-8)
+    assert report['minimum_loss_decrease'] == pytest.approx(1e-8)
 
 
 def test_resume_replays_scaled_update_and_optimizer_state(device):
