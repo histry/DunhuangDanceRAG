@@ -6573,12 +6573,278 @@ def _refiner_decode_masks(joint, root, contact, seam, cfg):
 REFINER_GROUP_LABELS = ("single_short", "single_long", "cross_short", "cross_long")
 
 
+
+def _refiner_scientific_tail_risk(
+    values,
+    *,
+    tail_fraction=None,
+    tail_mix=None,
+):
+    """Blend the ordinary mean with empirical upper-tail CVaR.
+
+    ``values`` contains the authoritative per-case V15.2 smooth joint
+    scientific deficits. Larger values mean that a case is farther from
+    scientific feasibility.
+
+    torch.topk selects the current empirical difficult tail; gradients flow
+    through the selected values.
+    """
+    if values.ndim != 1:
+        raise ValueError(
+            "scientific tail risk expects a rank-1 case tensor"
+        )
+
+    count = int(values.numel())
+
+    if count < 1:
+        raise ValueError(
+            "scientific tail risk requires at least one case"
+        )
+
+    if tail_fraction is None:
+        tail_fraction = REFINER_SCIENTIFIC_TAIL_FRACTION
+
+    if tail_mix is None:
+        tail_mix = REFINER_SCIENTIFIC_TAIL_MIX
+
+    fraction = float(tail_fraction)
+    mix = float(tail_mix)
+
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(
+            "scientific tail fraction must lie in (0, 1]"
+        )
+
+    if not (0.0 <= mix <= 1.0):
+        raise ValueError(
+            "scientific tail mix must lie in [0, 1]"
+        )
+
+    if not bool(torch.isfinite(values).all()):
+        raise FloatingPointError(
+            "scientific tail values must be finite"
+        )
+
+    # Scientific deficits are one-sided by construction.
+    if bool((values < -1.0e-12).any()):
+        raise ValueError(
+            "scientific tail values must be non-negative"
+        )
+
+    tail_count = max(
+        1,
+        min(
+            count,
+            int(math.ceil(count * fraction)),
+        ),
+    )
+
+    ordinary_mean = values.mean()
+
+    tail_cvar = torch.topk(
+        values,
+        k=tail_count,
+        largest=True,
+        sorted=False,
+    ).values.mean()
+
+    risk = (
+        (1.0 - mix) * ordinary_mean
+        + mix * tail_cvar
+    )
+
+    return (
+        risk,
+        ordinary_mean,
+        tail_cvar,
+        tail_count,
+    )
+
+
+def _refiner_group_balanced_scientific_tail(
+    scientific,
+    group,
+):
+    """Equal-group V15.3 mean/CVaR scientific aggregation.
+
+    No case is created or resampled here.  This function only reweights TRAIN
+    cases that are already part of the fixed full-cycle diagnostic or formal
+    stochastic training batch.
+
+    Held-out new_position/probe cases never enter this function.
+    """
+    if scientific.ndim != 1:
+        raise ValueError(
+            "scientific case objective must be rank-1"
+        )
+
+    if group.ndim != 1:
+        raise ValueError(
+            "refiner group ids must be rank-1"
+        )
+
+    if scientific.shape[0] != group.shape[0]:
+        raise ValueError(
+            "scientific cases and group ids must have identical length"
+        )
+
+    group_risks = []
+    stats = {}
+
+    for index, label in enumerate(
+        REFINER_SCIENTIFIC_GROUP_LABELS
+    ):
+        selected = group == index
+
+        if not bool(selected.any()):
+            continue
+
+        values = scientific[selected]
+
+        (
+            risk,
+            ordinary_mean,
+            tail_cvar,
+            tail_count,
+        ) = _refiner_scientific_tail_risk(
+            values
+        )
+
+        group_risks.append(risk)
+
+        stats[label] = {
+            "mean": ordinary_mean,
+            "tail_cvar": tail_cvar,
+            "risk": risk,
+            "tail_count": tail_count,
+            "case_count": int(values.numel()),
+        }
+
+    if not group_risks:
+        raise RuntimeError(
+            "V15.3 aggregation found no valid refiner groups"
+        )
+
+    # Every present role/width group receives equal weight.
+    balanced = torch.stack(
+        group_risks,
+        dim=0,
+    ).mean()
+
+    return balanced, stats
+
+
 def _refiner_batch_objectives(model, batch, cfg):
     pred, identity = _refiner_batch_outputs(model, batch, cfg)
     per_case, case_terms = _observable_refiner_objective(
         pred, batch["bad"], batch["seam"], cfg, reduction="none"
     )
-    repair, terms = per_case.mean(), {k: v.mean() for k, v in case_terms.items()}
+    terms = {
+        key: value.mean()
+        for key, value in case_terms.items()
+    }
+
+    if "scientific_observable" not in case_terms:
+        raise RuntimeError(
+            "V15.3 requires per-case scientific_observable"
+        )
+
+    scientific = case_terms[
+        "scientific_observable"
+    ]
+
+    if scientific.shape != per_case.shape:
+        raise RuntimeError(
+            "scientific_observable must match per-case loss shape"
+        )
+
+    scientific_weight = float(
+        cfg.product_refiner_repair_margin_weight
+    )
+
+    if not math.isfinite(scientific_weight):
+        raise ValueError(
+            "product_refiner_repair_margin_weight must be finite"
+        )
+
+    # --------------------------------------------------------
+    # Keep every V15.2 non-scientific term at its original
+    # ordinary per-case mean.
+    #
+    # V15.2:
+    #
+    # per_case =
+    #     scientific_weight * scientific_observable
+    #   + physical / trust / outside / contact / min-edit ...
+    #
+    # V15.3 changes ONLY aggregation of the scientific term.
+    # --------------------------------------------------------
+
+    non_scientific = (
+        per_case
+        - scientific_weight * scientific
+    )
+
+    if "group" in batch:
+        (
+            scientific_tail,
+            tail_stats,
+        ) = _refiner_group_balanced_scientific_tail(
+            scientific,
+            batch["group"],
+        )
+
+        repair = (
+            non_scientific.mean()
+            + scientific_weight * scientific_tail
+        )
+
+        terms[
+            "scientific_batch_mean"
+        ] = scientific.mean()
+
+        terms[
+            "scientific_tail_objective"
+        ] = scientific_tail
+
+        terms[
+            "scientific_tail_uplift"
+        ] = (
+            scientific_tail
+            - scientific.mean()
+        )
+
+        for label, stat in tail_stats.items():
+            terms[
+                f"group_{label}_scientific_tail_mean"
+            ] = stat["mean"]
+
+            terms[
+                f"group_{label}_scientific_tail_cvar"
+            ] = stat["tail_cvar"]
+
+            terms[
+                f"group_{label}_scientific_tail_risk"
+            ] = stat["risk"]
+
+    else:
+        # Compatibility for callers without the explicit TRAIN group
+        # contract. Formal Refiner training and bridge diagnostic both
+        # provide batch["group"].
+        repair = per_case.mean()
+
+        terms[
+            "scientific_batch_mean"
+        ] = scientific.mean()
+
+        terms[
+            "scientific_tail_objective"
+        ] = scientific.mean()
+
+        terms[
+            "scientific_tail_uplift"
+        ] = scientific.mean() * 0
+
     if "group" in batch:
         for index, label in enumerate(REFINER_GROUP_LABELS):
             selected = batch["group"] == index
@@ -6737,6 +7003,42 @@ def _smooth_observable_margin(proposed, baseline, gain, *, scale_floor=None):
 
 
 SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
+
+# ------------------------------------------------------------------
+# V15.3: tail-aware NETWORK batch aggregation.
+#
+# IMPORTANT:
+# The V15.2 per-case scientific objective remains completely unchanged.
+# V15.3 modifies only how per-case scientific deficits are aggregated
+# for shared-network optimization.
+# ------------------------------------------------------------------
+
+REFINER_BATCH_AGGREGATION_PROTOCOL = (
+    "group_balanced_scientific_mean_cvar_v1"
+)
+
+# One-variable V15.3 experimental contract.
+#
+# q = 0.25:
+#   use the hardest 25 percent of TRAIN cases inside every
+#   single/cross x short/long group.
+#
+# lambda = 0.50:
+#   scientific group risk =
+#       0.5 * ordinary group mean
+#     + 0.5 * upper-tail CVaR.
+#
+# Keep these as source constants for the initial experiment.
+# Do NOT expose them as tunable environment variables yet.
+REFINER_SCIENTIFIC_TAIL_FRACTION = 0.25
+REFINER_SCIENTIFIC_TAIL_MIX = 0.50
+
+REFINER_SCIENTIFIC_GROUP_LABELS = (
+    "single_short",
+    "single_long",
+    "cross_short",
+    "cross_long",
+)
 
 
 def _joint_scientific_deficit(endpoint_deficit, temporal_deficit):

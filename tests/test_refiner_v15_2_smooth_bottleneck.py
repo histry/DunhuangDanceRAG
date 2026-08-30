@@ -13,7 +13,7 @@ def test_v15_2_protocol_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_2"
+        == "refiner_observable_bridge_diagnostic_v15_3"
     )
 
     assert (
