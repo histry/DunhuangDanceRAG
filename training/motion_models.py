@@ -6918,8 +6918,9 @@ def _refiner_group_balanced_scientific_tail(
     return balanced, stats
 
 
-def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None):
-    pred, identity = _refiner_batch_outputs(model, batch, cfg)
+def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace=None):
+    # Optional detached decoder measurements; no extra forward or changed loss.
+    pred, identity = _refiner_batch_outputs(model, batch, cfg, trace=trace)
     per_case, case_terms = _observable_refiner_objective(
         pred, batch["bad"], batch["seam"], cfg, reduction="none"
     )

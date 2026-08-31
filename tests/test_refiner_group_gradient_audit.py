@@ -135,6 +135,35 @@ def test_legacy_strengths_cannot_be_silently_guessed(frozen):
         a.load_transaction(frozen[0], a.LEGACY_COMMIT, 0)
 
 
+@pytest.mark.parametrize("anchor_has_clean_cond", [False, True])
+def test_mixed_clean_condition_fields_cannot_be_dropped(frozen, anchor_has_clean_cond):
+    path, bank, state, report = frozen
+    # Preserve each individual bank's valid schema but make its optional clean
+    # conditioning inconsistent. Previously the anchor keys silently won.
+    bank["anchor"] = dict(bank["anchor"])
+    bank["context_reservoir"] = {k: dict(v) for k, v in bank["context_reservoir"].items()}
+    targets = [bank["anchor"]] if anchor_has_clean_cond else list(bank["context_reservoir"].values())
+    for part in targets:
+        part["clean_cond"] = part["cond"] + 1
+    torch.save(bank, path / "fit_bank.pt")
+    report["fit_bank_artifact"]["sha256"] = a.file_sha256(path / "fit_bank.pt")
+    torch.save(state, path / "diagnostic_state.pt")
+    (path / "diagnostic_report.json").write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="identical fields"):
+        load(path)
+
+
+def test_same_direction_clean_tasks_can_still_oppose_repair():
+    # Clean-to-clean cosine=+1 is NOT evidence about clean-vs-repair cosine.
+    repair, clean = torch.tensor([1., 0.]), torch.tensor([-2., 0.])
+    report = a._clean_repair_pair(repair, .5 * clean)
+    assert report["cosine"] == -1
+    assert report["combined_norm"] == 0
+    assert report["weighted_clean_to_repair_ratio"] == 1
+    report = a._clean_repair_pair(repair, 0 * clean)
+    assert report["cosine"] is None and report["weighted_clean_to_repair_ratio"] == 0
+
+
 def test_saved_policy_and_strengths_override_and_restore_caller_environment(monkeypatch):
     monkeypatch.setenv("PHYSICAL_STAGE_JERK_MAX_RATIO", "999")
     monkeypatch.setenv("MOTION_REFINER_CORE_STRENGTH", "0.9")

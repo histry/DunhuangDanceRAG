@@ -6,7 +6,7 @@ The negative V15.5 binary-backward experiment is not a compatible source.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import dataclasses
 import json
 import os
@@ -170,6 +170,8 @@ def load_transaction(source, expected_commit, transaction_index, *,
     parts = [bank["anchor"]] + [reservoir[str(i)] for i in selected]
     for part in parts:
         _validate_bank(part, cfg)
+    if any(set(part) != set(parts[0]) for part in parts[1:]):
+        raise ValueError("TRAIN banks must have identical fields; cannot drop clean_cond")
     batch = {key: torch.cat([p[key] for p in parts]) for key in parts[0]}
     if batch["group"].numel() != 192:
         raise ValueError("frozen transaction must have exactly 192 cases")
@@ -192,7 +194,7 @@ def _cosine_table(vectors):
          for j, b in enumerate(vectors)] for i, a in enumerate(vectors)]}
 
 
-def compute_geometry(model, batch, cfg):
+def compute_geometry(model, batch, cfg, *, observer=None):
     """Unclipped true parameter gradients; autograd.grad never populates .grad.
 
     Equal 48-case groups make the mean of training_total gradients equal to
@@ -214,19 +216,25 @@ def compute_geometry(model, batch, cfg):
     values = {}
     try:
         model.eval()
-        with torch.enable_grad():
+        with torch.enable_grad(), (nullcontext() if observer is None else observer.capture()):
             grouped = {}
-            m._refiner_batch_objectives(model, batch, cfg, group_objectives=grouped)
+            kwargs = {} if observer is None else {"trace": observer.trace}
+            full_objectives = m._refiner_batch_objectives(model, batch, cfg, group_objectives=grouped, **kwargs)
             if set(grouped) != set(GROUPS):
                 raise ValueError("incomplete full-transaction group objectives")
+            targets = parameters + ([] if observer is None else observer.targets())
             for group, label in enumerate(GROUPS):
                 objectives = grouped[label]
+                if set(objectives) != set(COMPONENTS):
+                    raise ValueError("incomplete group objective components")
                 values[label] = {}
                 for component, objective in objectives.items():
                     if not bool(torch.isfinite(objective)):
                         raise FloatingPointError(f"nonfinite {label}/{component} objective")
-                    gradients = (torch.autograd.grad(objective, parameters, retain_graph=True, allow_unused=True)
-                                 if objective.requires_grad else [None] * len(parameters))
+                    gradients = (torch.autograd.grad(objective, targets, retain_graph=True, allow_unused=True)
+                                 if objective.requires_grad else [None] * len(targets))
+                    if observer is not None:
+                        observer.record(label, component, gradients[:len(parameters)], gradients[len(parameters):])
                     flat = [(torch.zeros_like(p) if g is None else g).detach().cpu().double().reshape(-1)
                             for p, g in zip(parameters, gradients)]
                     if not all(bool(torch.isfinite(g).all()) for g in flat):
@@ -236,12 +244,16 @@ def compute_geometry(model, batch, cfg):
                         vectors[component][scope].append(torch.cat(items) if items else torch.empty(0, dtype=torch.float64))
                     values[label][component] = float(objective.detach())
                 del objectives, objective, gradients
+            if observer is not None:
+                total = full_objectives[0] + cfg.product_refiner_clean_identity_weight * full_objectives[1]
+                expected = torch.stack(vectors["training_total"]["all_parameters"]).mean(0)
+                observer.finish(total, targets, expected)
         if any(not torch.equal(states[name], tensor) for name, tensor in model.state_dict().items()):
             raise RuntimeError("read-only gradient audit changed model state")
     finally:
         for module, mode in modes.items():
             module.training = mode
-    return {
+    result = {
         "group_order": list(GROUPS), "losses": values,
         "geometry": {key: {scope: _cosine_table(v) for scope, v in by_scope.items()}
                      for key, by_scope in vectors.items()},
@@ -249,9 +261,37 @@ def compute_geometry(model, batch, cfg):
         "component_note": "endpoint/temporal are unweighted deficit means, not additive CVaR contributions",
         "before_clipping": True, "zero_gradient_cosine": None,
     }
+    weight = float(cfg.product_refiner_clean_identity_weight)
+    if not 0 <= weight < float("inf"):
+        raise ValueError("clean loss weight must be finite and nonnegative")
+    result["clean_loss_weight"] = weight
+    # Within-group clean-to-clean cosines cannot answer clean-vs-repair conflict.
+    result["clean_vs_repair"] = {}
+    for scope in scopes:
+        repairs = vectors["repair_objective"][scope]
+        cleans = vectors["clean_identity"][scope]
+        result["clean_vs_repair"][scope] = {
+            label: _clean_repair_pair(repair, clean * weight)
+            for label, repair, clean in zip(GROUPS, repairs, cleans)
+        }
+        result["clean_vs_repair"][scope]["full_transaction"] = _clean_repair_pair(
+            torch.stack(repairs).mean(0), weight * torch.stack(cleans).mean(0))
+    if observer is not None:
+        result["layer_details"] = observer.report
+    return result
 
 
-def run(args):
+def _clean_repair_pair(repair, weighted_clean):
+    table = _cosine_table([repair, weighted_clean])
+    rn, cn = table["norms"]
+    combined = float((repair + weighted_clean).norm())
+    return {"repair_norm": rn, "weighted_clean_norm": cn,
+            "weighted_clean_to_repair_ratio": cn / rn if rn else None,
+            "cosine": table["cosine"][0][1], "combined_norm": combined,
+            "combined_to_sum_norm_ratio": combined / (rn + cn) if rn + cn else None}
+
+
+def run(args, *, compute=None, schema=SCHEMA, audit_file=__file__):
     output, source = Path(args.output).resolve(), Path(args.state_dir).resolve()
     if output.exists() or output.is_relative_to(source):
         raise FileExistsError("write a new audit JSON outside the frozen source directory")
@@ -268,21 +308,22 @@ def run(args):
         model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
         model.load_state_dict(state["model_state_dict"], strict=True)
         batch = {key: tensor.to(device) for key, tensor in batch.items()}
-        result = compute_geometry(model, batch, cfg)
+        result = (compute or compute_geometry)(model, batch, cfg)
     for name, digest in metadata["source_sha256"].items():
         if file_sha256(source / name) != digest:
             raise RuntimeError("frozen artifact changed during read-only audit")
-    result.update(schema=SCHEMA, completed=True, source=metadata,
+    result.update(schema=schema, completed=True, source=metadata,
                   runtime_commit=m._training_code_revision(), device=str(device),
                   tangent_gradient_protocol=m.REFINER_TANGENT_GRADIENT_PROTOCOL,
-                  implementation_sha256={"audit": file_sha256(__file__), "motion_models": file_sha256(m.__file__)},
+                  implementation_sha256={"audit": file_sha256(audit_file),
+                      "group_audit": file_sha256(__file__), "motion_models": file_sha256(m.__file__)},
                   optimizer_steps=0, probe_loaded=False, scientific_acceptance=False,
                   publish_allowed=False, pilot_allowed=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, allow_nan=False, indent=2)
         handle.write("\n")
-    print(json.dumps({"stage": "group_gradient_audit_complete", "output": str(output),
+    print(json.dumps({"stage": "group_gradient_audit_complete", "schema": schema, "output": str(output),
                       "optimizer_steps": 0, "probe_loaded": False, "pilot_allowed": False}))
     return 0
 

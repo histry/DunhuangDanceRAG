@@ -41,6 +41,11 @@ diagnostic authorizations cannot silently carry over. Its source commit remains
 in history. No alternative backward gain, loss reweighting, larger network or
 extra training budget is introduced.
 
+The subsequent group audit has now executed on the server. Its scope-limited
+interpretation and the next read-only layer audit are documented in
+[refiner_frozen_layer_gradient_audit.md](refiner_frozen_layer_gradient_audit.md).
+Head-dominated parameter norms alone do not prove long-term trunk starvation.
+
 The next operation is a read-only group-gradient audit. Use the frozen **V15.4.1**
 state from `6e73e0eda9f349d3a611864f4719b22807ee5952`, not the rejected V15.5 state.
 The audit verifies state/report/bank fingerprints, the fit-bank SHA-256, all
