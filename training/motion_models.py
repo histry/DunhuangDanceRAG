@@ -6579,15 +6579,21 @@ def _refiner_scientific_tail_risk(
     *,
     tail_fraction=None,
     tail_mix=None,
+    temperature=None,
 ):
-    """Blend the ordinary mean with empirical upper-tail CVaR.
+    """V15.3.1 smooth upper-tail CVaR.
 
-    ``values`` contains the authoritative per-case V15.2 smooth joint
-    scientific deficits. Larger values mean that a case is farther from
-    scientific feasibility.
+    V15.3 used a discrete empirical top-k tail. At neural initialization,
+    many scientific deficits can be exactly tied, making the selected tail
+    an arbitrary active set. Infinitesimal parameter changes can then switch
+    that set and invalidate a local Armijo descent direction.
 
-    torch.topk selects the current empirical difficult tail; gradients flow
-    through the selected values.
+    V15.3.1 preserves q and lambda but replaces that discrete selection with
+    the entropy-smoothed Rockafellar-Uryasev CVaR envelope.
+
+    The CVaR threshold is solved on detached case values. By the envelope
+    theorem, its derivative is not needed when differentiating the minimized
+    envelope with respect to the case deficits.
     """
     if values.ndim != 1:
         raise ValueError(
@@ -6602,13 +6608,23 @@ def _refiner_scientific_tail_risk(
         )
 
     if tail_fraction is None:
-        tail_fraction = REFINER_SCIENTIFIC_TAIL_FRACTION
+        tail_fraction = (
+            REFINER_SCIENTIFIC_TAIL_FRACTION
+        )
 
     if tail_mix is None:
-        tail_mix = REFINER_SCIENTIFIC_TAIL_MIX
+        tail_mix = (
+            REFINER_SCIENTIFIC_TAIL_MIX
+        )
+
+    if temperature is None:
+        temperature = (
+            REFINER_SCIENTIFIC_TAIL_TEMPERATURE
+        )
 
     fraction = float(tail_fraction)
     mix = float(tail_mix)
+    tau_value = float(temperature)
 
     if not (0.0 < fraction <= 1.0):
         raise ValueError(
@@ -6620,44 +6636,183 @@ def _refiner_scientific_tail_risk(
             "scientific tail mix must lie in [0, 1]"
         )
 
+    if not (
+        math.isfinite(tau_value)
+        and tau_value > 0.0
+    ):
+        raise ValueError(
+            "scientific tail temperature must be finite and positive"
+        )
+
     if not bool(torch.isfinite(values).all()):
         raise FloatingPointError(
             "scientific tail values must be finite"
         )
 
-    # Scientific deficits are one-sided by construction.
     if bool((values < -1.0e-12).any()):
         raise ValueError(
             "scientific tail values must be non-negative"
         )
 
-    tail_count = max(
+    nominal_tail_count = max(
         1,
         min(
             count,
-            int(math.ceil(count * fraction)),
+            int(
+                math.ceil(
+                    count * fraction
+                )
+            ),
         ),
     )
 
     ordinary_mean = values.mean()
 
-    tail_cvar = torch.topk(
-        values,
-        k=tail_count,
-        largest=True,
-        sorted=False,
-    ).values.mean()
+    # q=1 means every case belongs to the tail.
+    if fraction >= 1.0 - 1.0e-12:
+        return (
+            ordinary_mean,
+            ordinary_mean,
+            ordinary_mean,
+            count,
+        )
+
+    # A completely feasible group must stay exactly zero and have zero
+    # scientific gradient.
+    if bool((values == 0).all()):
+        zero = values.sum() * 0
+
+        return (
+            zero,
+            zero,
+            zero,
+            nominal_tail_count,
+        )
+
+    tau = values.new_tensor(
+        tau_value
+    )
+
+    detached = values.detach()
+
+    # --------------------------------------------------------
+    # Solve the smooth CVaR threshold eta:
+    #
+    # mean(sigmoid((D_i - eta) / tau)) = q
+    #
+    # This is the first-order condition of
+    #
+    # eta + (1/q) E[tau softplus((D_i-eta)/tau)].
+    # --------------------------------------------------------
+
+    with torch.no_grad():
+        margin = 40.0 * tau
+
+        low = (
+            detached.min()
+            - margin
+        )
+
+        high = (
+            detached.max()
+            + margin
+        )
+
+        for _ in range(64):
+            eta_mid = 0.5 * (
+                low + high
+            )
+
+            occupancy = torch.sigmoid(
+                (
+                    detached
+                    - eta_mid
+                )
+                / tau
+            ).mean()
+
+            # Occupancy monotonically decreases with eta.
+            if float(occupancy) > fraction:
+                low = eta_mid
+            else:
+                high = eta_mid
+
+        eta = 0.5 * (
+            low + high
+        )
+
+    smooth_excess = (
+        tau
+        * F.softplus(
+            (
+                values
+                - eta
+            )
+            / tau
+        )
+    )
+
+    smooth_cvar = (
+        eta
+        + smooth_excess.mean()
+        / fraction
+    )
+
+    # --------------------------------------------------------
+    # Value-preserving normalization.
+    #
+    # Entropic smoothing otherwise adds a q/tau-dependent constant
+    # when every D_i is equal. Subtract the analytical offset so:
+    #
+    # smooth_cvar([c,...,c]) == c
+    #
+    # This changes only the scalar value offset, not the gradient.
+    # --------------------------------------------------------
+
+    log_q = math.log(
+        fraction
+    )
+
+    log_one_minus_q = math.log(
+        1.0 - fraction
+    )
+
+    equal_value_offset = (
+        tau
+        * (
+            -log_q
+            + (
+                1.0
+                - 1.0 / fraction
+            )
+            * log_one_minus_q
+        )
+    )
+
+    smooth_cvar = (
+        smooth_cvar
+        - equal_value_offset
+    )
+
+    # Numerical protection only. The exact all-zero scientific state was
+    # already handled above.
+    smooth_cvar = torch.maximum(
+        smooth_cvar,
+        ordinary_mean * 0,
+    )
 
     risk = (
-        (1.0 - mix) * ordinary_mean
-        + mix * tail_cvar
+        (1.0 - mix)
+        * ordinary_mean
+        + mix
+        * smooth_cvar
     )
 
     return (
         risk,
         ordinary_mean,
-        tail_cvar,
-        tail_count,
+        smooth_cvar,
+        nominal_tail_count,
     )
 
 
@@ -7014,7 +7169,7 @@ SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "group_balanced_scientific_mean_cvar_v1"
+    "group_balanced_scientific_mean_smooth_cvar_v2"
 )
 
 # One-variable V15.3 experimental contract.
@@ -7032,6 +7187,13 @@ REFINER_BATCH_AGGREGATION_PROTOCOL = (
 # Do NOT expose them as tunable environment variables yet.
 REFINER_SCIENTIFIC_TAIL_FRACTION = 0.25
 REFINER_SCIENTIFIC_TAIL_MIX = 0.50
+
+# V15.3.1:
+# Replace the discrete empirical top-k CVaR active set with a smooth
+# Rockafellar-Uryasev upper-tail envelope.
+#
+# q=.25 and lambda=.50 stay exactly unchanged.
+REFINER_SCIENTIFIC_TAIL_TEMPERATURE = 1.0e-3
 
 REFINER_SCIENTIFIC_GROUP_LABELS = (
     "single_short",
