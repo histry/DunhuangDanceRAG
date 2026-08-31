@@ -26,7 +26,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_4"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_4_1"
 FIT_PROTOCOL = "safe_start_context_reservoir_transaction_v2"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
@@ -234,6 +234,81 @@ def _reservoir_transaction_schedule(banks):
     return tuple(schedule)
 
 
+def _reservoir_transaction_batch(
+    banks,
+    selected_context_indices,
+):
+    """Materialize exactly ONE C5 optimizer transaction.
+
+    The returned 192-case batch is fixed for the entire optimizer
+    transaction: gradient, Armijo closure and group guard all consume
+    this same object. No other reservoir transaction is materialized.
+    """
+    selected = tuple(
+        int(index)
+        for index in selected_context_indices
+    )
+
+    if len(selected) != FIT_CONTEXT_COUNT:
+        raise ValueError(
+            "lazy reservoir transaction must contain exactly C5 contexts"
+        )
+
+    if len(set(selected)) != FIT_CONTEXT_COUNT:
+        raise ValueError(
+            "lazy reservoir transaction contains duplicate contexts"
+        )
+
+    available = set(
+        _fit_context_indices(banks)
+    )
+
+    if not set(selected).issubset(available):
+        raise ValueError(
+            "lazy transaction requested an unavailable context bank"
+        )
+
+    batch = fixed_fit_bank(
+        banks,
+        "seen",
+    )
+
+    anchor_cases = len(
+        batch["clean"]
+    )
+
+    for index in selected:
+        context = fixed_fit_bank(
+            banks,
+            f"fit_context_{index}",
+        )
+
+        if len(context["clean"]) != anchor_cases:
+            raise RuntimeError(
+                "context bank size differs from seen anchor"
+            )
+
+        batch = _concat_fit_batches(
+            batch,
+            context,
+        )
+
+    expected_cases = (
+        anchor_cases
+        * (
+            1
+            + FIT_CONTEXT_COUNT
+        )
+    )
+
+    if len(batch["clean"]) != expected_cases:
+        raise RuntimeError(
+            "lazy V15.4.1 transaction changed cases/update"
+        )
+
+    return batch
+
+
 def anchored_context_replay_banks(banks):
     """Build fixed per-step C5 transactions from a larger safe reservoir.
 
@@ -401,7 +476,6 @@ def _cpu_tree(value):
 
 def save_fit_bank(
     destination,
-    batches,
     report,
     cfg,
     *,
@@ -471,11 +545,6 @@ def save_fit_bank(
             "serialized reservoir schedule does not match deterministic contract"
         )
 
-    if len(batches) != len(schedule):
-        raise ValueError(
-            "transaction cycle and reservoir schedule lengths differ"
-        )
-
     expected_transaction_count = (
         1
         if len(context_indices) == FIT_CONTEXT_COUNT
@@ -510,15 +579,6 @@ def save_fit_bank(
             + FIT_CONTEXT_COUNT
         )
     )
-
-    if any(
-        len(batch["clean"])
-        != expected_cases
-        for batch in batches
-    ):
-        raise RuntimeError(
-            "serialized V15.4 transaction changed cases/update"
-        )
 
     path = destination / "fit_bank.pt"
 
@@ -1100,15 +1160,15 @@ def run(args):
         pure,_ = build_banks(clean,cond,sources,cfg,device,contact_ik=False)
         return run_foundation(args,cfg,banks,pure,recipes,fingerprint(args,cfg),
             [{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],separation)
-    train_cycle = anchored_context_replay_banks(banks)
     train_schedule = _reservoir_transaction_schedule(banks)
+    train_cycle_length = len(train_schedule)
 
-    if len(train_cycle) != len(train_schedule):
+    if train_cycle_length < 1:
         raise RuntimeError(
-            "V15.4 transaction cycle/schedule mismatch"
+            "empty V15.4.1 reservoir transaction schedule"
         )
 
-    if args.steps == 400 and len(train_cycle) > args.steps:
+    if args.steps == 400 and train_cycle_length > args.steps:
         raise RuntimeError(
             "400-step scientific diagnostic cannot cover one "
             "complete safe-start reservoir cycle"
@@ -1127,7 +1187,6 @@ def run(args):
               "baseline":{},"history":[]}
     report["fit_bank_artifact"] = save_fit_bank(
         destination,
-        train_cycle,
         report,
         cfg,
         banks=banks,
@@ -1144,8 +1203,21 @@ def run(args):
     started = time.perf_counter()
     consecutive_context_stalls = 0
     for step in range(1,args.steps + 1):
-        fit_context_index = (step - 1) % len(train_cycle)
-        batch = train_cycle[fit_context_index]
+        fit_context_index = (
+            (step - 1)
+            % train_cycle_length
+        )
+
+        selected_context_indices = (
+            train_schedule[
+                fit_context_index
+            ]
+        )
+
+        batch = _reservoir_transaction_batch(
+            banks,
+            selected_context_indices,
+        )
         repair,protection,terms,identity = m._refiner_batch_objectives(model,batch,cfg)
         loss = repair + cfg.product_refiner_clean_identity_weight * protection
         logging = step == 1 or step % 25 == 0 or step == args.steps
@@ -1181,7 +1253,7 @@ def run(args):
             else 0
         )
         stopped_early = (
-            consecutive_context_stalls >= len(train_cycle)
+            consecutive_context_stalls >= train_cycle_length
             and step < args.steps
         )
         report["stopped_early"] = stopped_early
@@ -1202,9 +1274,10 @@ def run(args):
                    "fit_context_index":fit_context_index,
                    "fit_reservoir_transaction_index":fit_context_index,
                    "fit_reservoir_context_indices":list(
-                       train_schedule[fit_context_index]
+                       selected_context_indices
                    ),
-                   "fit_reservoir_cycle_length":len(train_cycle),
+                   "fit_reservoir_cycle_length":train_cycle_length,
+                   "fit_transaction_materialization":"lazy_current_step_only",
                    "full_cycle_transaction":True,
                    "consecutive_context_stalls":consecutive_context_stalls,
                    "fit_bank":report["fit_bank"],

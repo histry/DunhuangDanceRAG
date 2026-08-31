@@ -12,7 +12,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_4"
+        == "refiner_observable_bridge_diagnostic_v15_4_1"
     )
 
     assert (
@@ -436,3 +436,30 @@ def test_exact_c5_reservoir_has_one_unique_transaction():
     assert len(
         replay[0]["clean"]
     ) == 24
+
+
+def test_production_run_materializes_only_current_reservoir_transaction():
+    import inspect
+
+    source = inspect.getsource(
+        d.run
+    )
+
+    assert (
+        "anchored_context_replay_banks(banks)"
+        not in source
+    )
+
+    assert (
+        "_reservoir_transaction_batch("
+        in source
+    )
+
+    assert "train_cycle[" not in source
+
+    compact = "".join(source.split())
+
+    assert (
+        '"fit_transaction_materialization":"lazy_current_step_only"'
+        in compact
+    )

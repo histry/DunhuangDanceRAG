@@ -55,7 +55,7 @@ def test_fit_contract_counts_examples_not_just_iterations():
 
     contract = d.fit_bank_contract(8)
 
-    # Transaction size stays exactly V15.3.1:
+    # Transaction size is frozen:
     # 32 seen + 5*32 context = 192.
     assert contract["cases_per_update"] == 192
     assert contract["seen_anchor_cases_per_update"] == 32
@@ -63,7 +63,7 @@ def test_fit_contract_counts_examples_not_just_iterations():
     assert contract["cases_per_role_width"] == 48
     assert contract["cases_per_role_width_per_bank"] == 8
 
-    # C5 is PER UPDATE, not total reservoir size.
+    # C5 remains PER UPDATE; the reservoir itself is larger.
     assert contract["context_banks_per_update"] == d.FIT_CONTEXT_COUNT
     assert contract["context_reservoir_cycle_length"] > d.FIT_CONTEXT_COUNT
 
@@ -96,27 +96,43 @@ def test_fit_contract_counts_examples_not_just_iterations():
     assert contract["probe_used_for_updates"] is False
 
     source = inspect.getsource(d.run)
-    compact = " ".join(source.split())
+    compact = "".join(source.split())
 
     assert "balanced_indices(" not in source
 
-    # The batch is fixed before gradient + checked_refiner_step.
-    assert "batch = train_cycle[fit_context_index]" in source
-
-    # Armijo closure still consumes that exact same local variable.
+    # V15.4.1 must NOT materialize the complete transaction cycle.
     assert (
-        "model, batch, cfg, require_all_groups=True"
+        "anchored_context_replay_banks(banks)"
+        not in source
+    )
+
+    assert "train_cycle[" not in source
+
+    # One C5 transaction is selected and materialized for this step only.
+    assert (
+        "selected_context_indices="
         in compact
     )
 
     assert (
-        "include_fit_contexts=not "
+        "batch=_reservoir_transaction_batch("
+        in compact
+    )
+
+    # Armijo closure still uses the SAME local batch object.
+    assert (
+        "model,batch,cfg,require_all_groups=True"
+        in compact
+    )
+
+    assert (
+        "include_fit_contexts=not"
         'getattr(args,"baseline_only",False)'
         in compact
     )
 
     assert (
-        "fit_bank_contract(args.windows, cfg)"
+        "fit_bank_contract(args.windows,cfg)"
         in compact
     )
 
@@ -125,7 +141,10 @@ def test_fit_contract_counts_examples_not_just_iterations():
         == "unfitted_local_motion_context_within_train_windows"
     )
 
-    assert '"probe_scope":PROBE_SCOPE' in source
+    assert (
+        '"probe_scope":PROBE_SCOPE'
+        in compact
+    )
 
 def test_fixed_bank_stall_is_not_counted_as_400_steps_or_pilot_acceptance():
     for reason in ('bounded_search_no_descent','zero_gradient'):
@@ -231,30 +250,30 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
             2 * index + 1
         )
 
-    batches = (
-        d.anchored_context_replay_banks(
-            banks
-        )
-    )
-
     schedule = (
         d._reservoir_transaction_schedule(
             banks
         )
     )
 
+    assert len(schedule) == reservoir_count
+
     report = {
         "fingerprint": {
             "test": "exact",
         },
+
         "windows": [],
-        "fit_bank": contract,
+
+        "fit_bank":
+            contract,
     }
 
+    # V15.4.1 stores unique reservoir banks + deterministic schedule.
+    # It deliberately does NOT serialize eagerly concatenated transactions.
     report["fit_bank_artifact"] = (
         d.save_fit_bank(
             tmp_path,
-            batches,
             report,
             cfg,
             banks=banks,
@@ -330,21 +349,36 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
         == "refiner_train_safe_start_context_reservoir_v4"
     )
 
-    assert set(
-        bank
-    ) >= {
+    assert set(bank) >= {
         "anchor",
         "context_reservoir",
         "transaction_schedule",
     }
 
-    assert len(
-        bank["context_reservoir"]
-    ) == reservoir_count
+    # The exact reservoir is stored once.
+    assert (
+        len(bank["context_reservoir"])
+        == reservoir_count
+    )
 
-    assert len(
-        bank["transaction_schedule"]
-    ) == reservoir_count
+    # The exact deterministic transaction sequence is replayable.
+    assert (
+        len(bank["transaction_schedule"])
+        == reservoir_count
+    )
+
+    assert (
+        tuple(
+            tuple(int(i) for i in row)
+            for row in bank[
+                "transaction_schedule"
+            ]
+        )
+        == tuple(schedule)
+    )
+
+    # No old eager transaction list is serialized.
+    assert "batches" not in bank
 
     assert (
         bank["anchor"]["clean"].device.type
@@ -370,7 +404,10 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
         "cross_event",
     }
 
-    assert state["completed_steps"] == 19
+    assert (
+        state["completed_steps"]
+        == 19
+    )
 
     assert (
         report[
@@ -406,7 +443,9 @@ def test_portable_bank_and_optimizer_state_are_diagnostic_only(tmp_path):
 
     assert (
         state["probe_bank_artifact"]
-        == report["probe_bank_artifact"]
+        == report[
+            "probe_bank_artifact"
+        ]
     )
 
     assert state[
