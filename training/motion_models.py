@@ -2515,10 +2515,13 @@ class ProductManifoldTemporalRefiner(nn.Module):
         cond_dim: int = 32,
         hidden: int = 256,
         fps: float = 30.0,
+        output_init_std: float = 0.0,
     ):
         super().__init__()
         if not np.isfinite(float(fps)) or float(fps) <= 0:
             raise ValueError("Refiner fps must be finite and positive")
+        if not np.isfinite(float(output_init_std)) or float(output_init_std) < 0:
+            raise ValueError("Refiner output initialization std must be finite and nonnegative")
         self.fps = float(fps)
         # Kernel-5 dilations [1,2,5] give a 33-frame convolutional field. The
         # local horizontal difference needs one additional preceding frame;
@@ -2552,7 +2555,14 @@ class ProductManifoldTemporalRefiner(nn.Module):
             nn.SiLU(),
         )
         self.out = nn.Conv1d(hidden, PRODUCT_STATE_DIM, 1)
-        nn.init.zeros_(self.out.weight)
+        # Production remains exact-zero safe-start. A separate, nonpublishing
+        # paired diagnostic may opt into small Gaussian weights. Its initial
+        # decoded motion must pass the existing safety gates before any update;
+        # a nonzero standard deviation alone is NOT an identity guarantee.
+        if float(output_init_std) == 0.0:
+            nn.init.zeros_(self.out.weight)
+        else:
+            nn.init.normal_(self.out.weight, mean=0.0, std=float(output_init_std))
         nn.init.zeros_(self.out.bias)
 
     def forward(self, x, cond, seam_mask, joint_mask):

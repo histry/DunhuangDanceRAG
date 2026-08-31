@@ -87,8 +87,9 @@ def _validate_bank(batch, cfg):
         raise ValueError("TRAIN group labels do not match seam widths")
 
 
-def load_transaction(source, expected_commit, transaction_index, *,
-                     legacy_core_strength=None, legacy_transition_strength=None):
+def load_frozen_source(source, expected_commit, *,
+                       legacy_core_strength=None, legacy_transition_strength=None):
+    """Validate artifact provenance once; never load the probe artifact."""
     source = Path(source)
     report_path, state_path, bank_path = (source / name for name in
         ("diagnostic_report.json", "diagnostic_state.pt", "fit_bank.pt"))
@@ -164,10 +165,22 @@ def load_transaction(source, expected_commit, transaction_index, *,
                          [[(i + j) % count for j in range(5)] for i in range(count)])
     if [list(row) for row in bank["transaction_schedule"]] != expected_schedule:
         raise ValueError("TRAIN transaction schedule mismatch")
-    if not 0 <= transaction_index < len(expected_schedule):
+    metadata = {
+        "source_commit": expected_commit, "source_schema": report["schema"],
+        "source_completed_steps": 400,
+        "decoder_strengths": strengths, "decoder_strength_evidence": strength_evidence,
+        "source_sha256": source_hashes,
+        "source_directory": str(source.resolve()),
+    }
+    return state, bank, cfg, metadata
+
+
+def materialize_transaction(bank, cfg, transaction_index):
+    """Build only the current validated 192-case TRAIN transaction."""
+    schedule = bank["transaction_schedule"]
+    if not 0 <= transaction_index < len(schedule):
         raise ValueError("transaction index outside frozen schedule")
-    selected = expected_schedule[transaction_index]
-    parts = [bank["anchor"]] + [reservoir[str(i)] for i in selected]
+    parts = [bank["anchor"]] + [bank["context_reservoir"][str(i)] for i in schedule[transaction_index]]
     for part in parts:
         _validate_bank(part, cfg)
     if any(set(part) != set(parts[0]) for part in parts[1:]):
@@ -175,14 +188,18 @@ def load_transaction(source, expected_commit, transaction_index, *,
     batch = {key: torch.cat([p[key] for p in parts]) for key in parts[0]}
     if batch["group"].numel() != 192:
         raise ValueError("frozen transaction must have exactly 192 cases")
-    metadata = {
-        "source_commit": expected_commit, "source_schema": report["schema"],
-        "source_completed_steps": 400, "transaction_index": transaction_index,
-        "context_indices": selected, "cases": 192, "cases_per_group": 48,
-        "decoder_strengths": strengths, "decoder_strength_evidence": strength_evidence,
-        "source_sha256": source_hashes,
-        "source_directory": str(source.resolve()),
-    }
+    return batch
+
+
+def load_transaction(source, expected_commit, transaction_index, *,
+                     legacy_core_strength=None, legacy_transition_strength=None):
+    state, bank, cfg, metadata = load_frozen_source(
+        source, expected_commit, legacy_core_strength=legacy_core_strength,
+        legacy_transition_strength=legacy_transition_strength)
+    batch = materialize_transaction(bank, cfg, transaction_index)
+    metadata.update(transaction_index=transaction_index,
+                    context_indices=list(bank["transaction_schedule"][transaction_index]),
+                    cases=192, cases_per_group=48)
     return state, batch, cfg, metadata
 
 

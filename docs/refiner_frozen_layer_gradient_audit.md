@@ -127,3 +127,7 @@ Validation for this change: **738 tests passed, 1 existing PyTorch Transformer
 warning**, including CPU and CUDA checks; both audit shell wrappers passed
 `bash -n`, and `git diff --check` was clean. The full local test log is retained
 outside tracked source at `output/audits/layer_gradient_recovery/pytest_full.log`.
+
+A later explicit implementation request adds an optional paired initialization
+candidate; see [refiner_safe_start_plan.md](refiner_safe_start_plan.md). It does
+not retroactively prove starvation or replace the production zero default.
