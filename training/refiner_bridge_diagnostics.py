@@ -26,7 +26,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_5"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_5_1"
 FIT_PROTOCOL = "safe_start_context_reservoir_transaction_v2"
 
 CONTEXT_RESERVOIR_PROTOCOL = (

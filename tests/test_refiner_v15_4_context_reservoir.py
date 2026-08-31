@@ -12,7 +12,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_5"
+        == "refiner_observable_bridge_diagnostic_v15_5_1"
     )
 
     assert (

@@ -101,7 +101,7 @@ LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v12"
 REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_support_v3"
-REFINER_TANGENT_GRADIENT_PROTOCOL = "soft_confidence_forward_support_backward_v1"
+REFINER_TANGENT_GRADIENT_PROTOCOL = "soft_confidence_true_chain_rule_v2"
 REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_support_v2"
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
@@ -428,6 +428,10 @@ class MotionGenerationConfig:
     # contact/root/joint-tangent state.
     product_refiner_rotation_cap_rad: float = 0.35
     product_refiner_root_cap_m: float = 0.08
+    # Resolved regional decoder strengths are experiment state, not an
+    # unrecorded environment-only override (including for frozen replay).
+    refiner_core_strength: float = 0.02
+    refiner_transition_strength: float = 1.0
     product_refiner_outside_weight: float = 0.25
     # The synthetic transition occupies only a minority of a training window.
     # Keep a small whole-window fidelity term, but normalize the main geometry
@@ -546,6 +550,8 @@ class MotionGenerationConfig:
             "MOTION_ENABLE_DIFFUSION": ("diffusion_enable", lambda x: bool(int(x))),
             "MOTION_PRODUCT_REFINER_ROTATION_CAP_RAD": ("product_refiner_rotation_cap_rad", float),
             "MOTION_PRODUCT_REFINER_ROOT_CAP_M": ("product_refiner_root_cap_m", float),
+            "MOTION_REFINER_CORE_STRENGTH": ("refiner_core_strength", float),
+            "MOTION_REFINER_TRANSITION_STRENGTH": ("refiner_transition_strength", float),
             "MOTION_PRODUCT_REFINER_OUTSIDE_WEIGHT": ("product_refiner_outside_weight", float),
             "MOTION_PRODUCT_REFINER_GLOBAL_RECONSTRUCTION_WEIGHT": (
                 "product_refiner_global_reconstruction_weight",
@@ -3202,49 +3208,6 @@ def _smooth_supported_residual_torch(value, support, cfg, *, trace=None):
 
 
 
-if torch is not None:
-    class _SoftConfidenceForwardSupportBackward(torch.autograd.Function):
-        """Preserve soft-confidence forward values without gradient attenuation.
-
-        Scientific contract:
-          forward = raw * confidence
-          d(forward)/d(raw) = 1 where confidence > 0
-          d(forward)/d(raw) = 0 where confidence == 0
-
-        The confidence tensor is observable, deterministic support metadata,
-        not a learned model output.  Its gradient is intentionally undefined.
-
-        This operator changes only the backward Jacobian.  Decoder forward
-        motion, soft localization, smoothing, caps and retraction are unchanged.
-        """
-
-        @staticmethod
-        def forward(ctx, raw, confidence):
-            support = torch.broadcast_to(
-                (confidence > 0.0).to(dtype=raw.dtype),
-                raw.shape,
-            )
-            ctx.save_for_backward(support)
-            return raw * confidence
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            (support,) = ctx.saved_tensors
-            return grad_output * support, None
-
-
-def _soft_confidence_forward_support_backward(raw, confidence):
-    if torch is None:
-        raise RuntimeError(
-            "PyTorch is required for refiner tangent decoding"
-        )
-
-    return _SoftConfidenceForwardSupportBackward.apply(
-        raw,
-        confidence,
-    )
-
-
 def _decode_product_refiner_output(
     reference,
     output,
@@ -3276,19 +3239,17 @@ def _decode_product_refiner_output(
         joint_weight = (joint_weight > 0).to(joint_weight.dtype)
     raw_tangent = output[..., 4:]
 
-    root_tangent = _soft_confidence_forward_support_backward(
-        raw_tangent[..., :3],
-        root_weight,
-    )
+    # V15.5's binary-support surrogate was not the derivative of this forward
+    # objective, so checked_refiner_step could mislabel an uphill direction as
+    # descent. Restore the true chain rule, including the soft confidence.
+    # Forward values, edit support, smoothing, caps and retraction are unchanged.
+    root_tangent = raw_tangent[..., :3] * root_weight
 
     joint_tangent_raw = raw_tangent[..., 3:].reshape(
         raw_tangent.shape[:-1] + (NUM_JOINTS, 3)
     )
 
-    joint_tangent = _soft_confidence_forward_support_backward(
-        joint_tangent_raw,
-        joint_weight[..., None],
-    )
+    joint_tangent = joint_tangent_raw * joint_weight[..., None]
 
     scaled_tangent = torch.cat(
         [
@@ -6124,6 +6085,7 @@ def _training_config_sha256(
         payload["repair_safety_protocol"] = REFINER_REPAIR_SAFETY_PROTOCOL
         payload["input_protocol"] = REFINER_INPUT_PROTOCOL
         payload["tangent_gradient_protocol"] = REFINER_TANGENT_GRADIENT_PROTOCOL
+        payload["refiner_decode_strengths"] = _refiner_decode_strengths(cfg)
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -6619,9 +6581,20 @@ def _refiner_batch_outputs(model, batch, cfg, *, trace=None):
     return pred, identity
 
 
+def _refiner_decode_strengths(cfg):
+    values = {}
+    for key, env in (("core", "MOTION_REFINER_CORE_STRENGTH"),
+                     ("transition", "MOTION_REFINER_TRANSITION_STRENGTH")):
+        value = float(os.environ.get(env, getattr(cfg, f"refiner_{key}_strength")))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{env} must be finite in [0,1]")
+        values[key] = value
+    return values
+
+
 def _refiner_decode_masks(joint, root, contact, seam, cfg):
-    core = _inbetween_config_float(cfg, "refiner_core_strength", "MOTION_REFINER_CORE_STRENGTH", .02)
-    transition = _inbetween_config_float(cfg, "refiner_transition_strength", "MOTION_REFINER_TRANSITION_STRENGTH", 1.0)
+    values = _refiner_decode_strengths(cfg)
+    core, transition = values["core"], values["transition"]
     strength = (core + (transition - core) * seam).clamp(0, 1)
     return joint * strength, root * strength, contact * strength
 
@@ -6945,7 +6918,7 @@ def _refiner_group_balanced_scientific_tail(
     return balanced, stats
 
 
-def _refiner_batch_objectives(model, batch, cfg):
+def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None):
     pred, identity = _refiner_batch_outputs(model, batch, cfg)
     per_case, case_terms = _observable_refiner_objective(
         pred, batch["bad"], batch["seam"], cfg, reduction="none"
@@ -7086,6 +7059,29 @@ def _refiner_batch_objectives(model, batch, cfg):
         batch["clean_contact"],
         cfg,
     )
+    if group_objectives is not None:
+        # Read-only audits must slice the SAME full-transaction computation.
+        # Calling this function separately on four sub-batches would recompute
+        # the TRAIN-reference quantile floors and measure different objectives.
+        if "group" not in batch:
+            raise ValueError("group objective audit requires explicit group ids")
+        for index, label in enumerate(REFINER_GROUP_LABELS):
+            selected = batch["group"] == index
+            if not bool(selected.any()):
+                continue
+            group_repair = (non_scientific[selected].mean()
+                            + scientific_weight * tail_stats[label]["risk"])
+            group_clean, _ = _product_refiner_clean_identity_loss(
+                identity[selected], batch["clean"][selected],
+                batch["clean_joint"][selected], batch["clean_root"][selected],
+                batch["clean_contact"][selected], cfg)
+            group_objectives[label] = {
+                "repair_objective": group_repair,
+                "endpoint_deficit_mean": case_terms["endpoint_scientific_deficit"][selected].mean(),
+                "temporal_deficit_mean": case_terms["temporal_scientific_deficit"][selected].mean(),
+                "clean_identity": group_clean,
+                "training_total": group_repair + cfg.product_refiner_clean_identity_weight * group_clean,
+            }
     return repair, protection, terms, identity_terms
 
 
@@ -9281,8 +9277,8 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
     outside transition masks; transition regions receive the full correction.
     """
     # Also used by the final binary support lock (not a second soft scaling).
-    core_strength = _inbetween_config_float(cfg, "refiner_core_strength", "MOTION_REFINER_CORE_STRENGTH", .02)
-    trans_strength = _inbetween_config_float(cfg, "refiner_transition_strength", "MOTION_REFINER_TRANSITION_STRENGTH", 1.0)
+    strengths = _refiner_decode_strengths(cfg)
+    core_strength, trans_strength = strengths["core"], strengths["transition"]
     if torch is None or not ckpt_path or not Path(ckpt_path).exists():
         seam_centers = []
         for a, b in contiguous_regions(seam_mask[:, 0] > 0.5):

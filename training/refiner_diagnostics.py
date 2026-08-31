@@ -139,6 +139,7 @@ def _fingerprint(args, cfg):
             "refiner_diagnostics": file_sha256(Path(__file__)),
         },
         "config_sha256": m._training_config_sha256(cfg, stage="refiner"),
+        "refiner_decode_strengths": m._refiner_decode_strengths(cfg),
         "train_db": str(Path(args.db).resolve()), "train_db_sha256": file_sha256(args.db),
         "validation_db": str(Path(args.val_db).resolve()),
         "validation_db_sha256": file_sha256(args.val_db),
