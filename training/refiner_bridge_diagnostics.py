@@ -26,9 +26,15 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_3_1"
-FIT_PROTOCOL = "full_context_cycle_transaction_v1"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_4"
+FIT_PROTOCOL = "safe_start_context_reservoir_transaction_v2"
+
+CONTEXT_RESERVOIR_PROTOCOL = (
+    "all_probe_safe_farthest_order_rotating_c5_v1"
+)
 PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
+# Number of context banks inside ONE optimizer transaction.
+# V15.4 does not increase this value.
 FIT_CONTEXT_COUNT = 5
 PROBE_START_GUARD_FRAMES = 6
 
@@ -54,6 +60,7 @@ def fingerprint(args, cfg):
     value["refiner_input_protocol"] = m.REFINER_INPUT_PROTOCOL
     value["refiner_update_protocol"] = m.REFINER_UPDATE_PROTOCOL
     value["fit_protocol"] = FIT_PROTOCOL
+    value["context_reservoir_protocol"] = CONTEXT_RESERVOIR_PROTOCOL
     value["probe_scope"] = PROBE_SCOPE
     return value
 
@@ -86,40 +93,293 @@ def _concat_fit_batches(anchor, context):
     return {key: m.torch.cat([anchor[key], context[key]]) for key in anchor}
 
 
-def anchored_context_replay_banks(banks):
-    """Return ONE equal-weight full-cycle TRAIN batch.
+def _fit_context_indices(banks):
+    """Return the contiguous set of materialized reservoir-bank indices."""
+    by_index = {}
 
-    V11 optimized ``seen + one context`` at a time. Its Armijo proof therefore
-    said nothing about the other contexts and counted every seen example three
-    times per cycle. V12 concatenates seen + all three non-probe contexts once,
-    so each unique TRAIN case has equal weight and every line-search trial is a
-    transaction over the complete context set. The held-out probe is untouched.
-    A one-element list preserves the existing diagnostic loop/artifact API.
-    """
-    parts = [fixed_fit_bank(banks, "seen")]
-    parts.extend(
-        fixed_fit_bank(banks, f"fit_context_{context_index}")
-        for context_index in range(FIT_CONTEXT_COUNT)
+    for key in banks:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+        ):
+            continue
+
+        split, role = key
+
+        if not isinstance(split, str):
+            continue
+
+        prefix = "fit_context_"
+
+        if not split.startswith(prefix):
+            continue
+
+        index = int(
+            split[len(prefix):]
+        )
+
+        by_index.setdefault(
+            index,
+            set(),
+        ).add(role)
+
+    if not by_index:
+        raise RuntimeError(
+            "no fit-context reservoir banks were materialized"
+        )
+
+    indices = sorted(
+        by_index
     )
-    full = parts[0]
-    for part in parts[1:]:
-        full = _concat_fit_batches(full, part)
-    return [full]
 
-def fit_bank_contract(windows):
+    if indices != list(
+        range(len(indices))
+    ):
+        raise RuntimeError(
+            "fit-context reservoir indices must be contiguous from zero"
+        )
+
+    expected_roles = {
+        "single_recording",
+        "cross_event",
+    }
+
+    for index in indices:
+        if by_index[index] != expected_roles:
+            raise RuntimeError(
+                f"reservoir bank {index} does not contain both roles"
+            )
+
+    if len(indices) < FIT_CONTEXT_COUNT:
+        raise RuntimeError(
+            "reservoir has fewer than five context banks"
+        )
+
+    return tuple(indices)
+
+
+def _reservoir_transaction_schedule(banks):
+    """Deterministic rotating-C5 schedule over the safe-start reservoir.
+
+    If the reservoir contains exactly C5 banks, there is only ONE unique
+    full-C5 transaction. Returning five cyclic permutations would repeat the
+    exact same cases and would not increase local-context coverage.
+
+    For a larger reservoir R > C5, transaction t receives:
+        t, t+1, ..., t+4  (mod R)
+
+    Thus every optimizer step still contains exactly five context banks, while
+    every reservoir bank is visited in a deterministic exposure-balanced cycle.
+    """
+    indices = _fit_context_indices(
+        banks
+    )
+
+    count = len(indices)
+
+    if count < FIT_CONTEXT_COUNT:
+        raise RuntimeError(
+            "reservoir contains fewer than C5 context banks"
+        )
+
+    # Degenerate legacy-compatible case:
+    # all available context banks already fit in one transaction.
+    if count == FIT_CONTEXT_COUNT:
+        return (
+            tuple(indices),
+        )
+
+    schedule = []
+
+    for offset in range(count):
+        row = tuple(
+            indices[
+                (offset + delta) % count
+            ]
+            for delta in range(
+                FIT_CONTEXT_COUNT
+            )
+        )
+
+        if len(row) != FIT_CONTEXT_COUNT:
+            raise RuntimeError(
+                "reservoir transaction does not contain C5 contexts"
+            )
+
+        if len(set(row)) != FIT_CONTEXT_COUNT:
+            raise RuntimeError(
+                "reservoir transaction duplicated a context bank"
+            )
+
+        schedule.append(row)
+
+    appearances = {
+        index: 0
+        for index in indices
+    }
+
+    for row in schedule:
+        for index in row:
+            appearances[index] += 1
+
+    # For R>C5, every bank must occur exactly C5 times during one
+    # complete rotating schedule.
+    if set(appearances.values()) != {
+        FIT_CONTEXT_COUNT
+    }:
+        raise RuntimeError(
+            "reservoir schedule is not exposure-balanced"
+        )
+
+    return tuple(schedule)
+
+
+def anchored_context_replay_banks(banks):
+    """Build fixed per-step C5 transactions from a larger safe reservoir.
+
+    The returned list is the deterministic transaction cycle.  Each returned
+    batch is immutable for the duration of one optimizer transaction: gradient,
+    Armijo closure and subgroup guard all consume that SAME batch.
+    """
+    anchor = fixed_fit_bank(
+        banks,
+        "seen",
+    )
+
+    context_indices = _fit_context_indices(
+        banks
+    )
+
+    context_banks = {
+        index: fixed_fit_bank(
+            banks,
+            f"fit_context_{index}",
+        )
+        for index in context_indices
+    }
+
+    schedule = _reservoir_transaction_schedule(
+        banks
+    )
+
+    replay = []
+
+    anchor_cases = len(
+        anchor["clean"]
+    )
+
+    for selected in schedule:
+        batch = anchor
+
+        for index in selected:
+            batch = _concat_fit_batches(
+                batch,
+                context_banks[index],
+            )
+
+        expected_cases = (
+            anchor_cases
+            * (
+                1
+                + FIT_CONTEXT_COUNT
+            )
+        )
+
+        if len(batch["clean"]) != expected_cases:
+            raise RuntimeError(
+                "V15.4 transaction changed the fixed C5 batch size"
+            )
+
+        replay.append(batch)
+
+    expected_transaction_count = (
+        1
+        if len(context_indices) == FIT_CONTEXT_COUNT
+        else len(context_indices)
+    )
+
+    if len(replay) != expected_transaction_count:
+        raise RuntimeError(
+            "reservoir replay transaction count mismatch"
+        )
+
+    if len(replay) != len(schedule):
+        raise RuntimeError(
+            "reservoir replay/schedule length mismatch"
+        )
+
+    return replay
+
+def fit_bank_contract(
+    windows,
+    cfg=None,
+):
+    """Auditable V15.4 reservoir transaction contract."""
+    if cfg is None:
+        cfg = m.MotionGenerationConfig()
+
+    reservoir_cycle_length = (
+        _context_reservoir_cycle_length(
+            cfg.window_len
+        )
+    )
+
     return {
         "protocol": FIT_PROTOCOL,
-        "cases_per_update": 4 * windows * (1 + FIT_CONTEXT_COUNT),
-        "cases_per_role_width": windows * (1 + FIT_CONTEXT_COUNT),
-        "cases_per_role_width_per_bank": windows,
-        "gradient_scope": "complete_seen_plus_all_context_banks",
-        "line_search_scope": "complete_seen_plus_all_context_banks",
-        "seen_anchor_cases_per_update": 4 * windows,
-        "context_cases_per_update": 4 * windows * FIT_CONTEXT_COUNT,
-        "context_banks_per_cycle": FIT_CONTEXT_COUNT,
-        "all_contexts_per_update": True,
-        "probe_start_guard_frames": PROBE_START_GUARD_FRAMES,
-        "probe_used_for_updates": False,
+
+        # Keep V15.3.1 transaction size exactly unchanged.
+        "cases_per_update":
+            4
+            * windows
+            * (
+                1
+                + FIT_CONTEXT_COUNT
+            ),
+
+        "cases_per_role_width":
+            windows
+            * (
+                1
+                + FIT_CONTEXT_COUNT
+            ),
+
+        "cases_per_role_width_per_bank":
+            windows,
+
+        "gradient_scope":
+            "complete_seen_plus_rotating_c5_safe_context_reservoir",
+
+        "line_search_scope":
+            "same_complete_seen_plus_rotating_c5_transaction",
+
+        "seen_anchor_cases_per_update":
+            4 * windows,
+
+        "context_cases_per_update":
+            4
+            * windows
+            * FIT_CONTEXT_COUNT,
+
+        "context_banks_per_update":
+            FIT_CONTEXT_COUNT,
+
+        "context_reservoir_cycle_length":
+            reservoir_cycle_length,
+
+        "context_reservoir_protocol":
+            CONTEXT_RESERVOIR_PROTOCOL,
+
+        "reservoir_every_legal_start_seen_per_cycle":
+            True,
+
+        "transaction_batch_fixed_within_step":
+            True,
+
+        "probe_start_guard_frames":
+            PROBE_START_GUARD_FRAMES,
+
+        "probe_used_for_updates":
+            False,
     }
 
 def fixed_bank_stalled(update):
@@ -139,32 +399,188 @@ def _cpu_tree(value):
     return value
 
 
-def save_fit_bank(destination, batches, report, cfg):
-    """Save the exact one-batch full TRAIN cycle; never a formal asset."""
-    if len(batches) != 1:
-        raise ValueError("portable V12 fit artifact requires one full-cycle batch")
+def save_fit_bank(
+    destination,
+    batches,
+    report,
+    cfg,
+    *,
+    banks=None,
+    schedule=None,
+):
+    """Save exact V15.4 TRAIN reservoir and deterministic transaction schedule.
+
+    The artifact stores:
+      * the seen anchor once;
+      * every unique materialized context bank once;
+      * the exact rotating-C5 transaction schedule.
+
+    It deliberately does NOT duplicate the anchor and five context banks inside
+    every serialized transaction.
+    """
+    if banks is None or schedule is None:
+        raise ValueError(
+            "V15.4 fit artifact requires banks and reservoir schedule"
+        )
+
+    context_indices = _fit_context_indices(
+        banks
+    )
+
+    contract = report.get(
+        "fit_bank",
+        {},
+    )
+
+    contract_cycle = int(
+        contract.get(
+            "context_reservoir_cycle_length",
+            -1,
+        )
+    )
+
+    if contract_cycle != len(context_indices):
+        raise RuntimeError(
+            "serialized context reservoir length does not match "
+            "the diagnostic fit-bank contract"
+        )
+
+    if int(
+        contract.get(
+            "context_banks_per_update",
+            -1,
+        )
+    ) != FIT_CONTEXT_COUNT:
+        raise RuntimeError(
+            "serialized fit-bank contract changed C5 contexts/update"
+        )
+
+    expected_schedule = (
+        _reservoir_transaction_schedule(
+            banks
+        )
+    )
+
+    schedule = tuple(
+        tuple(int(i) for i in row)
+        for row in schedule
+    )
+
+    if schedule != expected_schedule:
+        raise RuntimeError(
+            "serialized reservoir schedule does not match deterministic contract"
+        )
+
+    if len(batches) != len(schedule):
+        raise ValueError(
+            "transaction cycle and reservoir schedule lengths differ"
+        )
+
+    expected_transaction_count = (
+        1
+        if len(context_indices) == FIT_CONTEXT_COUNT
+        else len(context_indices)
+    )
+
+    if len(schedule) != expected_transaction_count:
+        raise RuntimeError(
+            "serialized transaction schedule length violates "
+            "the deterministic reservoir contract"
+        )
+
+    anchor = fixed_fit_bank(
+        banks,
+        "seen",
+    )
+
+    reservoir = {
+        str(index): _cpu_tree(
+            fixed_fit_bank(
+                banks,
+                f"fit_context_{index}",
+            )
+        )
+        for index in context_indices
+    }
+
+    expected_cases = (
+        len(anchor["clean"])
+        * (
+            1
+            + FIT_CONTEXT_COUNT
+        )
+    )
+
+    if any(
+        len(batch["clean"])
+        != expected_cases
+        for batch in batches
+    ):
+        raise RuntimeError(
+            "serialized V15.4 transaction changed cases/update"
+        )
+
     path = destination / "fit_bank.pt"
+
     m._atomic_torch_save(
         {
-            "schema": "refiner_train_full_context_cycle_bank_v3",
-            "train_only": True,
-            "formal_checkpoint": False,
-            "publish_allowed": False,
-            "fingerprint": report["fingerprint"],
-            "windows": report["windows"],
-            "contract": report["fit_bank"],
-            "config": dataclasses.asdict(cfg),
-            "batches": _cpu_tree(batches),
+            "schema":
+                "refiner_train_safe_start_context_reservoir_v4",
+
+            "train_only":
+                True,
+
+            "formal_checkpoint":
+                False,
+
+            "publish_allowed":
+                False,
+
+            "fingerprint":
+                report["fingerprint"],
+
+            "windows":
+                report["windows"],
+
+            "contract":
+                report["fit_bank"],
+
+            "config":
+                dataclasses.asdict(cfg),
+
+            "anchor":
+                _cpu_tree(anchor),
+
+            "context_reservoir":
+                reservoir,
+
+            "transaction_schedule":
+                schedule,
         },
         path,
     )
+
     return {
-        "file": path.name,
-        "sha256": common.file_sha256(path),
-        "cases_per_update": len(batches[0]["clean"]),
-        "context_banks": FIT_CONTEXT_COUNT,
-        "full_cycle_batches": 1,
-        "train_only": True,
+        "file":
+            path.name,
+
+        "sha256":
+            common.file_sha256(path),
+
+        "cases_per_update":
+            expected_cases,
+
+        "contexts_per_update":
+            FIT_CONTEXT_COUNT,
+
+        "reservoir_banks":
+            len(context_indices),
+
+        "transactions_per_cycle":
+            len(schedule),
+
+        "train_only":
+            True,
     }
 
 def save_probe_bank(destination, banks, report, cfg):
@@ -221,56 +637,240 @@ def _seen_and_probe_starts(frames, width, recipe_id):
     return seen, probe
 
 
-def _context_fit_starts(frames, width, recipe_id, count=FIT_CONTEXT_COUNT):
-    """Deterministic, separated TRAIN cuts; never return the probe cut.
+def _all_probe_safe_context_starts(
+    frames,
+    width,
+    recipe_id,
+):
+    """Return every legal TRAIN context in deterministic spread-first order.
 
-    Farthest-point selection spans the available window without tuning starts
-    to the uploaded V10 failures.  The exact held-out start and a six-frame
-    guard are excluded.  Interval overlap is allowed: this is a local-context
-    holdout within the same TRAIN window, not source-disjoint validation.
+    V15.3.1 permanently fitted only the first five farthest-point contexts.
+    V15.4 keeps those same safety rules but extends the deterministic ordering
+    until EVERY legal non-probe start has been included.
+
+    The exact probe start and its +/-6-frame guard remain forbidden.
     """
-    seen, probe = _seen_and_probe_starts(frames, width, recipe_id)
+    seen, probe = _seen_and_probe_starts(
+        frames,
+        width,
+        recipe_id,
+    )
+
     eligible = [
         start
-        for start in range(3, frames - width - 1)
-        if start != seen and abs(start - probe) > PROBE_START_GUARD_FRAMES
+        for start in range(
+            3,
+            frames - width - 1,
+        )
+        if (
+            start != seen
+            and abs(start - probe)
+            > PROBE_START_GUARD_FRAMES
+        )
     ]
-    if len(eligible) < count:
-        raise ValueError("motion window cannot support separated fit contexts")
+
+    if len(eligible) < FIT_CONTEXT_COUNT:
+        raise ValueError(
+            "motion window cannot support the required "
+            "probe-safe C5 context transaction"
+        )
+
+    remaining = list(eligible)
     selected = []
-    while len(selected) < count:
-        anchors = [seen, probe, *selected]
+
+    # Preserve the established V12-V15.3 farthest-point criterion.
+    # The only V15.4 difference is that selection continues to exhaustion
+    # instead of stopping after five.
+    while remaining:
+        anchors = [
+            seen,
+            probe,
+            *selected,
+        ]
+
         choice = max(
-            eligible,
+            remaining,
             key=lambda start: (
-                min(abs(start - anchor) for anchor in anchors),
+                min(
+                    abs(start - anchor)
+                    for anchor in anchors
+                ),
                 abs(start - probe),
                 -start,
             ),
         )
+
         selected.append(choice)
-        eligible.remove(choice)
-    if probe in selected or any(
-        abs(start - probe) <= PROBE_START_GUARD_FRAMES for start in selected
+        remaining.remove(choice)
+
+    if len(selected) != len(set(selected)):
+        raise RuntimeError(
+            "safe-start reservoir contains duplicate starts"
+        )
+
+    if set(selected) != set(eligible):
+        raise RuntimeError(
+            "safe-start reservoir does not cover every legal TRAIN start"
+        )
+
+    if probe in selected:
+        raise RuntimeError(
+            "probe start leaked into TRAIN reservoir"
+        )
+
+    if any(
+        abs(start - probe)
+        <= PROBE_START_GUARD_FRAMES
+        for start in selected
     ):
-        raise RuntimeError("fit context selection leaked into the probe guard")
+        raise RuntimeError(
+            "TRAIN reservoir leaked into the probe guard"
+        )
+
     return tuple(selected)
 
 
-def _split_start(split, frames, width, recipe_id):
-    seen, probe = _seen_and_probe_starts(frames, width, recipe_id)
+def _context_fit_starts(
+    frames,
+    width,
+    recipe_id,
+    count=FIT_CONTEXT_COUNT,
+):
+    """Compatibility view of the deterministic safe-start reservoir.
+
+    Existing callers requesting C5 continue to receive exactly five
+    spread-first TRAIN cuts.  V15.4 reservoir construction uses the complete
+    ordering through ``_all_probe_safe_context_starts``.
+    """
+    starts = _all_probe_safe_context_starts(
+        frames,
+        width,
+        recipe_id,
+    )
+
+    if count is None:
+        return starts
+
+    count = int(count)
+
+    if count < 1:
+        raise ValueError(
+            "fit context count must be positive"
+        )
+
+    if len(starts) < count:
+        raise ValueError(
+            "motion window cannot support separated fit contexts"
+        )
+
+    return tuple(
+        starts[:count]
+    )
+
+
+def _context_reservoir_cycle_length(frames):
+    """Common deterministic reservoir cycle for all role/width groups.
+
+    Width-specific reservoirs can have slightly different legal-start counts.
+    A common cycle equal to their maximum length guarantees that every legal
+    start of every group appears at least once.  Shorter reservoirs wrap
+    deterministically; no probe context is introduced.
+    """
+    frames = int(frames)
+
+    lengths = []
+
+    for recipe_id, requested_width in enumerate(
+        (10, 28)
+    ):
+        width = min(
+            requested_width,
+            frames - 8,
+        )
+
+        starts = _all_probe_safe_context_starts(
+            frames,
+            width,
+            recipe_id,
+        )
+
+        if len(starts) < FIT_CONTEXT_COUNT:
+            raise ValueError(
+                "reservoir cannot provide five contexts per transaction"
+            )
+
+        lengths.append(
+            len(starts)
+        )
+
+    cycle = max(lengths)
+
+    if cycle < FIT_CONTEXT_COUNT:
+        raise RuntimeError(
+            "invalid safe-start reservoir cycle"
+        )
+
+    return cycle
+
+
+def _split_start(
+    split,
+    frames,
+    width,
+    recipe_id,
+):
+    seen, probe = _seen_and_probe_starts(
+        frames,
+        width,
+        recipe_id,
+    )
+
     if split == "seen":
         return seen
+
     if split == "new_position":
         return probe
+
     prefix = "fit_context_"
+
     if not split.startswith(prefix):
-        raise ValueError(f"unknown bridge diagnostic split: {split}")
-    context_index = int(split[len(prefix):])
-    starts = _context_fit_starts(frames, width, recipe_id)
-    if not 0 <= context_index < len(starts):
-        raise ValueError(f"invalid fit context index: {context_index}")
-    return starts[context_index]
+        raise ValueError(
+            f"unknown bridge diagnostic split: {split}"
+        )
+
+    context_index = int(
+        split[len(prefix):]
+    )
+
+    if context_index < 0:
+        raise ValueError(
+            f"invalid fit context index: {context_index}"
+        )
+
+    starts = _all_probe_safe_context_starts(
+        frames,
+        width,
+        recipe_id,
+    )
+
+    if not starts:
+        raise RuntimeError(
+            "empty TRAIN context reservoir"
+        )
+
+    start = starts[
+        context_index % len(starts)
+    ]
+
+    if start == probe or (
+        abs(start - probe)
+        <= PROBE_START_GUARD_FRAMES
+    ):
+        raise RuntimeError(
+            "reservoir replay selected a probe-guard start"
+        )
+
+    return start
 
 
 def build_banks(
@@ -287,9 +887,34 @@ def build_banks(
     recipes = {}
     splits = ["seen", "new_position"]
     if include_fit_contexts:
+        if len(clean) < 1:
+            raise ValueError(
+                "cannot build context reservoir from an empty TRAIN bank"
+            )
+
+        frames = int(
+            len(clean[0])
+        )
+
+        if any(
+            len(original) != frames
+            for original in clean
+        ):
+            raise ValueError(
+                "V15.4 reservoir requires equal-length TRAIN windows"
+            )
+
+        reservoir_count = (
+            _context_reservoir_cycle_length(
+                frames
+            )
+        )
+
         splits.extend(
             f"fit_context_{context_index}"
-            for context_index in range(FIT_CONTEXT_COUNT)
+            for context_index in range(
+                reservoir_count
+            )
         )
     for split in splits:
         for role in ("single_recording", "cross_event"):
@@ -419,7 +1044,7 @@ def run(args):
                 or len(report.get("windows",[])) != args.windows or args.windows != 8):
             raise RuntimeError("pilot requires the complete 8-window, 400-step protocol; smoke runs cannot authorize training")
         validate_update_summary(report.get("optimizer_updates", {}), 400)
-        if report.get("fit_bank") != fit_bank_contract(args.windows):
+        if report.get("fit_bank") != fit_bank_contract(args.windows, cfg):
             raise RuntimeError("diagnostic did not use the complete predefined TRAIN context cycle")
         from training.bridge_feasibility import check_foundation_report, group_decisions
         check_foundation_report(report["foundation_report"],fingerprint(args,cfg),cfg)
@@ -476,6 +1101,18 @@ def run(args):
         return run_foundation(args,cfg,banks,pure,recipes,fingerprint(args,cfg),
             [{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],separation)
     train_cycle = anchored_context_replay_banks(banks)
+    train_schedule = _reservoir_transaction_schedule(banks)
+
+    if len(train_cycle) != len(train_schedule):
+        raise RuntimeError(
+            "V15.4 transaction cycle/schedule mismatch"
+        )
+
+    if args.steps == 400 and len(train_cycle) > args.steps:
+        raise RuntimeError(
+            "400-step scientific diagnostic cannot cover one "
+            "complete safe-start reservoir cycle"
+        )
     model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
     optimizer = m.torch.optim.AdamW(model.parameters(),lr=cfg.lr,weight_decay=1e-4)
     destination.mkdir(parents=True)
@@ -484,11 +1121,18 @@ def run(args):
               "probe_scope":PROBE_SCOPE,
               "formal_training_must_start_fresh":True,"selection":"fixed_final_step",
               "foundation_report":str(Path(args.foundation_report).resolve()),
-              "fit_bank":fit_bank_contract(args.windows),
+              "fit_bank":fit_bank_contract(args.windows, cfg),
               "source_separation":separation,"recipes":recipes,"target_steps":args.steps,
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[]}
-    report["fit_bank_artifact"] = save_fit_bank(destination,train_cycle,report,cfg)
+    report["fit_bank_artifact"] = save_fit_bank(
+        destination,
+        train_cycle,
+        report,
+        cfg,
+        banks=banks,
+        schedule=train_schedule,
+    )
     report["probe_bank_artifact"] = save_probe_bank(
         destination, banks, report, cfg
     )
@@ -556,6 +1200,11 @@ def run(args):
                    "component_gradients":components,"clip_norm_before":norm,
                    "optimizer_update":update,
                    "fit_context_index":fit_context_index,
+                   "fit_reservoir_transaction_index":fit_context_index,
+                   "fit_reservoir_context_indices":list(
+                       train_schedule[fit_context_index]
+                   ),
+                   "fit_reservoir_cycle_length":len(train_cycle),
                    "full_cycle_transaction":True,
                    "consecutive_context_stalls":consecutive_context_stalls,
                    "fit_bank":report["fit_bank"],
