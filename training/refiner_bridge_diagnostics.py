@@ -26,7 +26,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_4_1"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_5"
 FIT_PROTOCOL = "safe_start_context_reservoir_transaction_v2"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
@@ -44,6 +44,7 @@ def fingerprint(args, cfg):
     value = common._fingerprint(args, cfg)
     value["implementation_sha256"].update({
         "bridge_diagnostic": common.file_sha256(__file__),
+        "motion_models": common.file_sha256(Path(m.__file__)),
         "boundary_observables": common.file_sha256(boundary_observables.__file__),
         "inbetween": common.file_sha256(inbetween.__file__),
         "bridge_feasibility": common.file_sha256(Path(__file__).with_name("bridge_feasibility.py")),
@@ -58,6 +59,7 @@ def fingerprint(args, cfg):
     value["refiner_batch_aggregation_protocol"] = m.REFINER_BATCH_AGGREGATION_PROTOCOL
     value["direct_optimizer_protocol"] = DIRECT_OPTIMIZER_PROTOCOL
     value["refiner_input_protocol"] = m.REFINER_INPUT_PROTOCOL
+    value["refiner_tangent_gradient_protocol"] = m.REFINER_TANGENT_GRADIENT_PROTOCOL
     value["refiner_update_protocol"] = m.REFINER_UPDATE_PROTOCOL
     value["fit_protocol"] = FIT_PROTOCOL
     value["context_reservoir_protocol"] = CONTEXT_RESERVOIR_PROTOCOL

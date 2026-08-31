@@ -101,6 +101,7 @@ LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v12"
 REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_support_v3"
+REFINER_TANGENT_GRADIENT_PROTOCOL = "soft_confidence_forward_support_backward_v1"
 REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_support_v2"
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
@@ -3200,6 +3201,50 @@ def _smooth_supported_residual_torch(value, support, cfg, *, trace=None):
     return result
 
 
+
+if torch is not None:
+    class _SoftConfidenceForwardSupportBackward(torch.autograd.Function):
+        """Preserve soft-confidence forward values without gradient attenuation.
+
+        Scientific contract:
+          forward = raw * confidence
+          d(forward)/d(raw) = 1 where confidence > 0
+          d(forward)/d(raw) = 0 where confidence == 0
+
+        The confidence tensor is observable, deterministic support metadata,
+        not a learned model output.  Its gradient is intentionally undefined.
+
+        This operator changes only the backward Jacobian.  Decoder forward
+        motion, soft localization, smoothing, caps and retraction are unchanged.
+        """
+
+        @staticmethod
+        def forward(ctx, raw, confidence):
+            support = torch.broadcast_to(
+                (confidence > 0.0).to(dtype=raw.dtype),
+                raw.shape,
+            )
+            ctx.save_for_backward(support)
+            return raw * confidence
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (support,) = ctx.saved_tensors
+            return grad_output * support, None
+
+
+def _soft_confidence_forward_support_backward(raw, confidence):
+    if torch is None:
+        raise RuntimeError(
+            "PyTorch is required for refiner tangent decoding"
+        )
+
+    return _SoftConfidenceForwardSupportBackward.apply(
+        raw,
+        confidence,
+    )
+
+
 def _decode_product_refiner_output(
     reference,
     output,
@@ -3230,15 +3275,25 @@ def _decode_product_refiner_output(
         root_weight = (root_weight > 0).to(root_weight.dtype)
         joint_weight = (joint_weight > 0).to(joint_weight.dtype)
     raw_tangent = output[..., 4:]
+
+    root_tangent = _soft_confidence_forward_support_backward(
+        raw_tangent[..., :3],
+        root_weight,
+    )
+
+    joint_tangent_raw = raw_tangent[..., 3:].reshape(
+        raw_tangent.shape[:-1] + (NUM_JOINTS, 3)
+    )
+
+    joint_tangent = _soft_confidence_forward_support_backward(
+        joint_tangent_raw,
+        joint_weight[..., None],
+    )
+
     scaled_tangent = torch.cat(
         [
-            raw_tangent[..., :3] * root_weight,
-            (
-                raw_tangent[..., 3:].reshape(
-                    raw_tangent.shape[:-1] + (NUM_JOINTS, 3)
-                )
-                * joint_weight[..., None]
-            ).reshape(
+            root_tangent,
+            joint_tangent.reshape(
                 raw_tangent.shape[:-1] + (NUM_JOINTS * 3,)
             ),
         ],
@@ -6068,6 +6123,7 @@ def _training_config_sha256(
         payload["observable_objective_protocol"] = REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
         payload["repair_safety_protocol"] = REFINER_REPAIR_SAFETY_PROTOCOL
         payload["input_protocol"] = REFINER_INPUT_PROTOCOL
+        payload["tangent_gradient_protocol"] = REFINER_TANGENT_GRADIENT_PROTOCOL
     encoded = json.dumps(
         payload,
         sort_keys=True,
