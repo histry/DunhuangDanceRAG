@@ -1,6 +1,5 @@
 import inspect
 import json
-from pathlib import Path
 
 import pytest
 import torch
@@ -56,6 +55,7 @@ def parity_fixture():
         single, cross = [], []
         for role, target in (("single_recording", single), ("cross_event", cross)):
             for index in range(16):
+                width = 10 if index % 2 == 0 else 28
                 observable = {"after": {"temporal_energy": 2.0,
                                          "endpoint_velocity_jump_mps": 3.0},
                               "temporal_gain": .01, "endpoint_gain": .02,
@@ -63,14 +63,15 @@ def parity_fixture():
                               "reference_fidelity_accepted": True,
                               "reference_fidelity": {"fk_p95_m": 0.0, "fk_max_m": 0.0,
                                                      "product_log_l1": 0.0}}
-                expected = {"case_index": index, "observable": observable}
+                expected = {"case_index": index, "width": width, "observable": observable}
                 if role == "single_recording":
                     observable["physical_non_regression"] = {"accepted": True}
                     expected["clean_identity"] = {"accepted": True}
                 else:
                     expected["safety"] = {"accepted": True}
                 target.append(expected)
-                actual.append({"split": split, "role": role, "bank_case_index": index,
+                actual.append({"split": split, "role": role, "width": width,
+                    "bank_case_index": index,
                     "responses": {"1.00": {
                         "authoritative_observable": {"temporal_metric": 2.0, "endpoint_metric": 3.0,
                             "temporal_repair_gain": .01, "endpoint_repair_gain": .02,
@@ -244,6 +245,94 @@ def test_fixed_final_layout_has_64_and_eight_cells():
     assert len({(row["split"], row["role"], row["width"]) for row in metadata}) == 8
 
 
+def test_train_transaction_stays_one_full_192_case_forward(monkeypatch):
+    calls = []
+
+    def fake_audit(_model, batch, _cfg, metadata, source):
+        calls.append((source, int(batch["clean"].shape[0]), len(metadata)))
+        return {"model_forward_calls": 1}
+
+    monkeypatch.setattr(s, "audit_batch", fake_audit)
+    batch = {"clean": torch.zeros(192, 1, 151)}
+    result = s.audit_train_transaction_0(None, batch, None, [{}] * 192)
+    assert result["model_forward_calls"] == 1
+    assert calls == [("train", 192, 192)]
+
+
+def test_final_replays_eight_historical_chunks_with_stable_case_mapping(monkeypatch):
+    metadata = []
+    seam = torch.zeros(64, 32, 1)
+    offset = 0
+    for split, role in s.FINAL_BLOCK_ORDER:
+        for bank_case_index in range(16):
+            width = 10 if bank_case_index % 2 == 0 else 28
+            seam[offset + bank_case_index, :width] = 1
+            metadata.append({
+                "split": split,
+                "role": role,
+                "width": width,
+                "group": f"{role}/{width}",
+                "case_index": bank_case_index // 2,
+                "bank_case_index": bank_case_index,
+            })
+        offset += 16
+    calls = []
+
+    def fake_audit(_model, batch, _cfg, chunk_metadata, source):
+        calls.append((
+            source,
+            len(chunk_metadata),
+            chunk_metadata[0]["split"],
+            chunk_metadata[0]["role"],
+            chunk_metadata[0]["bank_case_index"],
+        ))
+        scopes = s._scope_masks(chunk_metadata, "final")
+        derivatives = {
+            key: {
+                objective: {scope: 1.0 for scope in scopes}
+                for objective in ("temporal", "endpoint")
+            }
+            for key in s.ALPHA_KEYS
+        }
+        return {
+            "case_level": [dict(row) for row in chunk_metadata],
+            "derivatives": derivatives,
+            "alpha_one_parity": {
+                "prediction_max_abs_error": 0.0,
+                "clean_prediction_max_abs_error": 0.0,
+                "rtol": 0.0,
+                "atol": s.PARITY_ATOL_CPU,
+            },
+            "alpha_zero_contract": {
+                "contact_channels_unchanged": True,
+                "scaled_geometry_matches_alpha": True,
+                "geometric_applied_abs_max": 0.0,
+            },
+            "model_forward_calls": 1,
+        }
+
+    monkeypatch.setattr(s, "audit_batch", fake_audit)
+    result = s.audit_final_in_historical_chunks(
+        None, {"clean": torch.zeros(64, 32, 151), "seam": seam}, None, metadata
+    )
+    assert len(calls) == result["model_forward_calls"] == 8
+    assert all(source == "final" and count == 8 for source, count, *_ in calls)
+    assert [(split, role, start) for _, _, split, role, start in calls] == [
+        (split, role, start)
+        for split, role in s.FINAL_BLOCK_ORDER
+        for start in (0, 8)
+    ]
+    assert len(result["case_level"]) == 64
+    assert result["historical_final_replay"] == {
+        "chunk_size": 8,
+        "chunks": 8,
+        "cases": 64,
+        "block_order": [f"{split}/{role}" for split, role in s.FINAL_BLOCK_ORDER],
+        "one_forward_per_chunk": True,
+        "alphas_share_fixed_raw_action_per_chunk": True,
+    }
+
+
 def test_scope_masks_cover_split_role_width_and_group():
     metadata = [{"split": split, "role": role, "width": width}
                 for split in ("seen", "new_position")
@@ -294,8 +383,20 @@ def test_alpha_one_final_metric_parity_checks_all_64_cases():
 def test_alpha_one_final_metric_mismatch_fails_closed():
     actual, trajectory = parity_fixture()
     actual[0]["responses"]["1.00"]["authoritative_observable"]["temporal_metric"] = 9
-    with pytest.raises(RuntimeError, match="metric parity"):
+    with pytest.raises(RuntimeError) as error:
         s.validate_alpha_one_final_metrics(actual, trajectory)
+    message = str(error.value)
+    for field in (
+        "split=seen",
+        "role=single_recording",
+        "width=10",
+        "bank_case_index=0",
+        "metric=temporal_metric",
+        "actual=9",
+        "expected=2.0",
+        "absolute_error=7.0",
+    ):
+        assert field in message
 
 
 def test_actual_cpu_response_uses_one_forward_and_restores_state_mode_grad_hooks():
@@ -312,6 +413,7 @@ def test_actual_cpu_response_uses_one_forward_and_restores_state_mode_grad_hooks
     with failure.preserve_model_runtime(model), torch.enable_grad():
         result = s.audit_batch(model, batch, cfg, metadata, "train")
     assert result["model_forward_calls"] == 1 and len(result["case_level"][0]["responses"]) == 7
+    assert tuple(result["case_level"][0]["responses"]) == s.ALPHA_KEYS
     assert result["alpha_zero_contract"]["geometric_applied_abs_max"] == 0
     assert result["alpha_one_parity"]["prediction_max_abs_error"] == 0
     assert model.training and len(model.out._forward_hooks) == hooks

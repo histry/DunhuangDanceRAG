@@ -34,6 +34,13 @@ PARITY_ATOL_CUDA = 2.0e-6
 FINAL_METRIC_RTOL = 2.0e-5
 FINAL_METRIC_ATOL = 2.0e-6
 DECODER_PROTOCOL = "soft_scale_then_cap_applied_tangent_v1"
+FINAL_CHUNK_SIZE = 8
+FINAL_BLOCK_SIZE = 16
+FINAL_BLOCK_ORDER = tuple(
+    (split, role)
+    for split in ("seen", "new_position")
+    for role in ("single_recording", "cross_event")
+)
 
 
 def _finite(value, label):
@@ -388,9 +395,144 @@ def audit_batch(model, batch, cfg, metadata, source):
             "model_forward_calls": raw["model_forward_calls"]}
 
 
+def audit_train_transaction_0(model, batch, cfg, metadata):
+    """Keep the historical TRAIN transaction intact as one 192-case audit batch."""
+    if int(batch["clean"].shape[0]) != 192 or len(metadata) != 192:
+        raise ValueError("TRAIN transaction 0 must remain one complete 192-case batch")
+    result = audit_batch(model, batch, cfg, metadata, "train")
+    if result["model_forward_calls"] != 1:
+        raise RuntimeError("TRAIN transaction 0 must use exactly one model forward")
+    return result
+
+
+def _merge_final_chunk_results(chunks):
+    expected_chunks = len(FINAL_BLOCK_ORDER) * (FINAL_BLOCK_SIZE // FINAL_CHUNK_SIZE)
+    if len(chunks) != expected_chunks:
+        raise ValueError("fixed final audit requires exactly eight historical chunks")
+    rows = [row for chunk in chunks for row in chunk["case_level"]]
+    if len(rows) != 64:
+        raise ValueError("fixed final historical chunks must contain exactly 64 cases")
+    derivatives = {}
+    for key in ALPHA_KEYS:
+        derivatives[key] = {}
+        for objective in ("temporal", "endpoint"):
+            weighted, counts = Counter(), Counter()
+            for chunk in chunks:
+                scopes = _scope_masks(chunk["case_level"], "final")
+                for scope, mask in scopes.items():
+                    count = int(mask.sum())
+                    weighted[scope] += (
+                        float(chunk["derivatives"][key][objective][scope]) * count
+                    )
+                    counts[scope] += count
+            derivatives[key][objective] = {
+                scope: weighted[scope] / counts[scope] for scope in sorted(counts)
+            }
+    parity_rows = [chunk["alpha_one_parity"] for chunk in chunks]
+    zero_rows = [chunk["alpha_zero_contract"] for chunk in chunks]
+    return {
+        "case_level": rows,
+        "derivatives": derivatives,
+        "alpha_one_parity": {
+            "prediction_max_abs_error": max(
+                row["prediction_max_abs_error"] for row in parity_rows
+            ),
+            "clean_prediction_max_abs_error": max(
+                row["clean_prediction_max_abs_error"] for row in parity_rows
+            ),
+            "rtol": 0.0,
+            "atol": max(row["atol"] for row in parity_rows),
+        },
+        "alpha_zero_contract": {
+            "contact_channels_unchanged": all(
+                row["contact_channels_unchanged"] for row in zero_rows
+            ),
+            "scaled_geometry_matches_alpha": all(
+                row["scaled_geometry_matches_alpha"] for row in zero_rows
+            ),
+            "geometric_applied_abs_max": max(
+                row["geometric_applied_abs_max"] for row in zero_rows
+            ),
+        },
+        "model_forward_calls": sum(chunk["model_forward_calls"] for chunk in chunks),
+        "historical_final_replay": {
+            "chunk_size": FINAL_CHUNK_SIZE,
+            "chunks": len(chunks),
+            "cases": len(rows),
+            "block_order": [f"{split}/{role}" for split, role in FINAL_BLOCK_ORDER],
+            "one_forward_per_chunk": True,
+            "alphas_share_fixed_raw_action_per_chunk": True,
+        },
+    }
+
+
+def audit_final_in_historical_chunks(model, batch, cfg, metadata):
+    """Replay final evaluation with the exact historical 8-case forward layout."""
+    if int(batch["clean"].shape[0]) != 64 or len(metadata) != 64:
+        raise ValueError("fixed final audit must contain exactly 64 cases")
+    seam_widths = (
+        (batch["seam"][..., 0] >= 0.5).sum(1).detach().cpu().tolist()
+    )
+    chunks = []
+    offset = 0
+    for split, role in FINAL_BLOCK_ORDER:
+        block_metadata = metadata[offset:offset + FINAL_BLOCK_SIZE]
+        if len(block_metadata) != FINAL_BLOCK_SIZE or any(
+            row["split"] != split or row["role"] != role for row in block_metadata
+        ):
+            raise ValueError(
+                f"fixed final block order mismatch for split={split} role={role}"
+            )
+        if [int(row["bank_case_index"]) for row in block_metadata] != list(
+            range(FINAL_BLOCK_SIZE)
+        ):
+            raise ValueError(
+                f"bank_case_index mismatch for split={split} role={role}"
+            )
+        for local_start in range(0, FINAL_BLOCK_SIZE, FINAL_CHUNK_SIZE):
+            start = offset + local_start
+            stop = start + FINAL_CHUNK_SIZE
+            chunk_metadata = metadata[start:stop]
+            for position, row in enumerate(chunk_metadata, start=start):
+                if int(row["width"]) != int(seam_widths[position]):
+                    raise ValueError(
+                        "fixed final width mapping mismatch: "
+                        f"split={split} role={role} "
+                        f"bank_case_index={row['bank_case_index']} "
+                        f"metadata_width={row['width']} seam_width={seam_widths[position]}"
+                    )
+            chunk_batch = {key: value[start:stop] for key, value in batch.items()}
+            result = audit_batch(model, chunk_batch, cfg, chunk_metadata, "final")
+            if result["model_forward_calls"] != 1:
+                raise RuntimeError(
+                    "each historical final 8-case chunk must use exactly one model forward"
+                )
+            chunks.append(result)
+        offset += FINAL_BLOCK_SIZE
+    return _merge_final_chunk_results(chunks)
+
+
 def _close(actual, expected):
     return math.isclose(float(actual), float(expected), rel_tol=FINAL_METRIC_RTOL,
                         abs_tol=FINAL_METRIC_ATOL)
+
+
+def _raise_alpha_one_parity(row, metric, actual, expected):
+    try:
+        absolute_error = abs(float(actual) - float(expected))
+        relative_error = (
+            absolute_error / abs(float(expected)) if float(expected) != 0.0 else None
+        )
+    except (TypeError, ValueError):
+        absolute_error = None
+        relative_error = None
+    raise RuntimeError(
+        "alpha=1 parity failed: "
+        f"split={row['split']} role={row['role']} width={row['width']} "
+        f"bank_case_index={row['bank_case_index']} metric={metric} "
+        f"actual={actual!r} expected={expected!r} "
+        f"absolute_error={absolute_error!r} relative_error={relative_error!r}"
+    )
 
 
 def validate_alpha_one_final_metrics(rows, trajectory_final):
@@ -403,49 +545,85 @@ def validate_alpha_one_final_metrics(rows, trajectory_final):
                 expected[(split, role, int(row["case_index"]))] = row
     if len(expected) != 64:
         raise ValueError("trajectory final metric layout is not 64 cases")
+    observed = [
+        (row["split"], row["role"], int(row["bank_case_index"])) for row in rows
+    ]
+    if len(observed) != 64 or len(set(observed)) != 64 or set(observed) != set(expected):
+        raise ValueError("scale audit case mapping does not match trajectory final cases")
     max_error = 0.0
     for row in rows:
         response = row["responses"]["1.00"]
         reference = expected[(row["split"], row["role"], row["bank_case_index"])]
+        if int(reference["case_index"]) != int(row["bank_case_index"]):
+            _raise_alpha_one_parity(
+                row, "case_index", row["bank_case_index"], reference["case_index"]
+            )
+        if int(reference["width"]) != int(row["width"]):
+            _raise_alpha_one_parity(row, "width", row["width"], reference["width"])
         actual_obs, expected_obs = response["authoritative_observable"], reference["observable"]
-        pairs = ((actual_obs["temporal_metric"], expected_obs["after"]["temporal_energy"]),
-                 (actual_obs["endpoint_metric"], expected_obs["after"]["endpoint_velocity_jump_mps"]),
-                 (actual_obs["temporal_repair_gain"], expected_obs["temporal_gain"]),
-                 (actual_obs["endpoint_repair_gain"], expected_obs["endpoint_gain"]))
-        for actual, target in pairs:
+        pairs = (
+            ("temporal_metric", actual_obs["temporal_metric"], expected_obs["after"]["temporal_energy"]),
+            ("endpoint_metric", actual_obs["endpoint_metric"], expected_obs["after"]["endpoint_velocity_jump_mps"]),
+            ("temporal_repair_gain", actual_obs["temporal_repair_gain"], expected_obs["temporal_gain"]),
+            ("endpoint_repair_gain", actual_obs["endpoint_repair_gain"], expected_obs["endpoint_gain"]),
+        )
+        for metric, actual, target in pairs:
             max_error = max(max_error, abs(float(actual) - float(target)))
             if not _close(actual, target):
-                raise RuntimeError("alpha=1 authoritative final metric parity failed")
-        if (actual_obs["temporal_gate_pass"] != bool(expected_obs["temporal_accepted"])
-                or actual_obs["endpoint_gate_pass"] != bool(expected_obs["endpoint_accepted"])
-                or response["geometry"]["accepted"] != bool(expected_obs["reference_fidelity_accepted"])):
-            raise RuntimeError("alpha=1 final observable/geometry gate parity failed")
+                _raise_alpha_one_parity(row, metric, actual, target)
+        gate_pairs = (
+            ("temporal_gate_pass", actual_obs["temporal_gate_pass"], bool(expected_obs["temporal_accepted"])),
+            ("endpoint_gate_pass", actual_obs["endpoint_gate_pass"], bool(expected_obs["endpoint_accepted"])),
+            ("reference_fidelity_accepted", response["geometry"]["accepted"],
+             bool(expected_obs["reference_fidelity_accepted"])),
+        )
+        for metric, actual, target in gate_pairs:
+            if actual != target:
+                _raise_alpha_one_parity(row, metric, actual, target)
         expected_physical = (expected_obs["physical_non_regression"] if row["role"] == "single_recording"
                              else reference["safety"])
         if response["physical"]["accepted"] != bool(expected_physical["accepted"]):
-            raise RuntimeError("alpha=1 final physical gate parity failed")
+            _raise_alpha_one_parity(
+                row, "physical_accepted", response["physical"]["accepted"],
+                bool(expected_physical["accepted"])
+            )
         if list(response["physical"]["reasons"]) != list(expected_physical.get("reasons", [])):
-            raise RuntimeError("alpha=1 final physical reason parity failed")
+            _raise_alpha_one_parity(
+                row, "physical_reasons", response["physical"]["reasons"],
+                expected_physical.get("reasons", [])
+            )
         actual_support = response["physical"]["authoritative_gate"].get("support_comparison", {})
         expected_support = expected_physical.get("support_comparison", {})
         for phase in ("before", "after"):
             for key, target in expected_support.get(phase, {}).items():
                 if key not in actual_support.get(phase, {}) or not _close(
                         actual_support[phase][key], target):
-                    raise RuntimeError("alpha=1 final physical metric parity failed")
+                    _raise_alpha_one_parity(
+                        row, f"physical_support.{phase}.{key}",
+                        actual_support.get(phase, {}).get(key), target
+                    )
         actual_fidelity = response["geometry"]["reference_fidelity"]
         expected_fidelity = expected_obs["reference_fidelity"]
         for key in ("fk_p95_m", "fk_max_m", "product_log_l1"):
             if not _close(actual_fidelity[key], expected_fidelity[key]):
-                raise RuntimeError("alpha=1 final geometry metric parity failed")
+                _raise_alpha_one_parity(
+                    row, f"reference_fidelity.{key}", actual_fidelity[key],
+                    expected_fidelity[key]
+                )
         if row["role"] == "single_recording":
             expected_identity = reference["clean_identity"]
             if response["clean_identity"]["accepted"] != bool(expected_identity["accepted"]):
-                raise RuntimeError("alpha=1 final clean identity parity failed")
+                _raise_alpha_one_parity(
+                    row, "clean_identity.accepted", response["clean_identity"]["accepted"],
+                    bool(expected_identity["accepted"])
+                )
             detail = expected_identity.get("identity_detail", expected_identity)
             for key in ("product_log_l1", "contact_l1"):
                 if key in detail and not _close(response["clean_identity"][key], detail[key]):
-                    raise RuntimeError("alpha=1 final clean identity metric parity failed")
+                    _raise_alpha_one_parity(
+                        row, f"clean_identity.{key}", response["clean_identity"][key],
+                        detail[key]
+                    )
     return {"verified": True, "cases": 64, "max_absolute_metric_error": max_error,
             "rtol": FINAL_METRIC_RTOL, "atol": FINAL_METRIC_ATOL}
 
@@ -686,6 +864,56 @@ def scientific_answers(final_curves, aggregates):
     }
 
 
+def print_report_sections(report, output):
+    final_curves = report["group_response_curves"]["fixed_final"]
+    overall = report["group_response_curves"]["fixed_final_aggregates"]["overall"]
+    temporal_counts = {
+        name: [
+            {
+                "alpha": point["alpha"],
+                "cases": point["cases"],
+                "temporal_gate_pass_cases": point["temporal_gate_pass_cases"],
+            }
+            for point in curve["points"]
+        ]
+        for name, curve in final_curves.items()
+    }
+    safety_counts = {
+        name: [
+            {
+                "alpha": point["alpha"],
+                "cases": point["cases"],
+                "physical_pass_cases": point["physical_pass_cases"],
+                "geometry_pass_cases": point["geometry_pass_cases"],
+                "clean_pass_cases": point["clean_pass_cases"],
+                "all_diagnostic_conditions_cases": point[
+                    "all_diagnostic_conditions_cases"
+                ],
+            }
+            for point in curve["points"]
+        ]
+        for name, curve in final_curves.items()
+    }
+    sections = (
+        ("SCIENTIFIC ANSWERS", report["scientific_answers"]),
+        ("ALPHA RESPONSE OVERALL", overall),
+        ("GROUP RESPONSE", final_curves),
+        (
+            "NEW_POSITION_SINGLE_28",
+            report["scientific_answers"]["new_position_single_recording_28"],
+        ),
+        ("DECODER ATTENUATION", report["decoder_attenuation"]),
+        ("CAP SATURATION", report["cap_saturation"]),
+        ("TEMPORAL GATE COUNTS", temporal_counts),
+        ("SAFETY COUNTS", safety_counts),
+    )
+    for heading, payload in sections:
+        print(heading, flush=True)
+        print(json.dumps(payload, ensure_ascii=False, allow_nan=False), flush=True)
+    print(f"REPORT {output}", flush=True)
+    print("PILOT_ALLOWED False", flush=True)
+
+
 def load_alignment_report(path, traj_hashes, traj_report, source_hashes, probe_hash):
     path = Path(path).resolve()
     digest = group_audit.file_sha256(path)
@@ -775,8 +1003,12 @@ def run(args):
         final_batch, final_metadata = alignment.combine_final_banks(failure.final_banks(bank, probe, cfg))
         final_batch = {key: value.to(device) for key, value in final_batch.items()}
         with failure.preserve_model_runtime(model), torch.enable_grad():
-            train = audit_batch(model, train_batch, cfg, alignment.train_metadata(train_batch), "train")
-            final = audit_batch(model, final_batch, cfg, final_metadata, "final")
+            train = audit_train_transaction_0(
+                model, train_batch, cfg, alignment.train_metadata(train_batch)
+            )
+            final = audit_final_in_historical_chunks(
+                model, final_batch, cfg, final_metadata
+            )
         after_hash = safe.state_hash(model.state_dict())
     if before_hash != after_hash or after_hash != traj_report["final_state_sha256"]:
         raise RuntimeError("read-only scale-response audit changed model state")
@@ -835,6 +1067,7 @@ def run(args):
     if group_audit.file_sha256(alignment_path) != alignment_metadata["sha256"]:
         raise RuntimeError("alignment report changed during read-only audit")
     failure._exclusive_json(output, report)
+    print_report_sections(report, output)
     print(json.dumps({"stage": "refiner_temporal_scale_response_audit_complete",
                       "output": str(output), "fixed_alpha_grid": list(ALPHAS),
                       "optimizer_steps": 0, "scale_selection_performed": False,
