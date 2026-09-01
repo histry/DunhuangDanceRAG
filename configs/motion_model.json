@@ -101,6 +101,8 @@
   "inference_window_batch_size": 16,
   "gpu_preprocessing": true,
   "diffusion_noise_batch_max_mib": 256.0,
+  "gar_evaluation_trace_enable": false,
+  "gar_evaluation_method_variant_id": "current_boundary_closed_loop",
   "lr": 0.0002,
   "seed": 42,
   "device": "cuda"

@@ -526,6 +526,10 @@ class MotionGenerationConfig:
     # float values; the runtime further caps the configured inference batch so
     # this temporary tensor cannot grow without limit.
     diffusion_noise_batch_max_mib: float = 256.0
+    # Passive Paper 1/GAR primitive tracing. These fields are metadata-only and
+    # are never read by retrieval, candidate ranking, repair, or generation.
+    gar_evaluation_trace_enable: bool = False
+    gar_evaluation_method_variant_id: str = "current_boundary_closed_loop"
     lr: float = 2e-4
     seed: int = 42
     device: str = "cuda"

@@ -49,9 +49,10 @@ import os
 import random
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 # MOTION_ACTIVITY_INTEGRATION_BEGIN
@@ -62,6 +63,7 @@ from evaluation.motion_activity_analysis import (
 )
 # MOTION_ACTIVITY_INTEGRATION_END
 from contracts.boundary_continuity import (
+    BoundaryContinuityLimits,
     boundary_risk_reasons,
     evaluate_boundary_continuity,
 )
@@ -89,6 +91,15 @@ from scheduling.schedule_hard_constraints import (
     assert_schedule_hard_constraints,
     final_selection_constraint_rows,
 )
+from evaluation.gar_evaluation_readiness import (
+    GAR_READINESS_INTERFACE_SCHEMA,
+    behavior_config_fingerprint,
+    build_closed_loop_trace,
+    canonical_fingerprint,
+    checkpoint_bundle_fingerprint,
+    current_git_commit,
+    write_trace as write_gar_trace,
+)
 
 
 EDGE_DIM = 151
@@ -98,6 +109,14 @@ ROOT_Y_IDX = 5
 ROOT_Z_IDX = 6
 ROT6D_START = 7
 ROT6D_END = 151
+
+GAR_SELECTION_POLICY_ID = (
+    "boundary_closed_loop_first_safe_minimum_risk_post_audit_reselection_v1"
+)
+GAR_GENERATOR_ID = "edge151_motion_generation_pipeline"
+GAR_GENERATOR_VERSION = "edge151_refiner_diffusion_ik_pipeline_v1"
+GAR_REPAIR_OPERATOR_ID = "so3_endpoint_velocity_bridge"
+GAR_REPAIR_OPERATOR_VERSION = "so3_endpoint_velocity_bridge_v1"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -975,7 +994,8 @@ def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequen
         bridge = motion[t0:t1]
         following = motion[c0:min(c1, c0 + 4)]
         risk = transition_risk(motion_runtime, previous, bridge, following, fps=float(getattr(cfg, "fps", 30.0)))
-        safe = risk_safe(risk)
+        failure_reasons = boundary_risk_reasons(risk)
+        safe = not failure_reasons
         pred = assembly_report[i].get("risk_predicted", {})
         row = {
             "slot": int(i),
@@ -1014,6 +1034,7 @@ def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequen
             ),
             "actual_contact_switch": float(risk.get("contact_switch", 0.0)),
             "safe": bool(safe),
+            "failure_reasons": list(failure_reasons),
             "risk": risk,
             "decision": str(assembly_report[i].get("decision", "")),
             "transition_len": int(max(0, t1 - t0)),
@@ -1365,10 +1386,204 @@ def load_slots_and_candidates(motion_runtime, args: argparse.Namespace, cfg: Any
     return db, list(slots), np.asarray(slot_feat, dtype=np.float32), list(map(int, path_idx)), list(retrieval_report), candidate_lists
 
 
+def gar_evaluation_trace_context(
+    motion_runtime: Any,
+    args: argparse.Namespace,
+    cfg: Any,
+    db: Mapping[str, Any],
+    assembly_report: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve provenance only after the production decision path has finished."""
+
+    if dataclasses.is_dataclass(cfg):
+        config = dataclasses.asdict(cfg)
+    elif hasattr(cfg, "__dict__"):
+        config = dict(jsonable(vars(cfg)))
+    elif isinstance(cfg, Mapping):
+        config = dict(jsonable(cfg))
+    else:
+        raise TypeError("GAR trace requires a mapping-like resolved configuration")
+    runtime_environment = {
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key.startswith(
+            (
+                "BOUNDARY_",
+                "ROUTING_SAFETY_",
+                "GENERATION_",
+                "MOTION_ACTIVITY_",
+                "GROUNDING_",
+                "GRAPH_ROUTE_",
+                "EVENT_HEADING_",
+                "ROUTING_BUDGET_",
+            )
+        )
+    }
+    refiner_active = bool(getattr(cfg, "refiner_enable", False)) and env_bool(
+        "BOUNDARY_USE_REFINER", True
+    )
+    diffusion_active = bool(getattr(cfg, "diffusion_enable", False)) and env_bool(
+        "BOUNDARY_USE_DIFFUSION", True
+    )
+    ik_active = bool(getattr(cfg, "ik_enable", False)) and env_bool(
+        "BOUNDARY_USE_IK", True
+    )
+    generator_config = {
+        "pipeline": GAR_GENERATOR_VERSION,
+        "refiner_active": refiner_active,
+        "diffusion_active": diffusion_active,
+        "ik_active": ik_active,
+        "refiner_model_version": getattr(
+            motion_runtime, "REFINER_MODEL_VERSION", None
+        ),
+        "diffusion_model_version": getattr(
+            motion_runtime, "DIFFUSION_MODEL_VERSION", None
+        ),
+        "behavior_config_fingerprint": behavior_config_fingerprint(
+            config, runtime_environment=runtime_environment
+        ),
+    }
+    checkpoint_fingerprint = checkpoint_bundle_fingerprint(
+        {
+            "refiner": getattr(args, "refiner", None) if refiner_active else None,
+            "diffusion": (
+                getattr(args, "diffusion", None) if diffusion_active else None
+            ),
+        }
+    )
+    repair_config = {
+        "operator": GAR_REPAIR_OPERATOR_ID,
+        "transition_train_min_seconds": getattr(
+            cfg, "transition_train_min_seconds", None
+        ),
+        "transition_train_max_seconds": getattr(
+            cfg, "transition_train_max_seconds", None
+        ),
+        "transition_root_tangent_max_mps": getattr(
+            cfg, "transition_root_tangent_max_mps", None
+        ),
+        "transition_root_vertical_tangent_max_mps": getattr(
+            cfg, "transition_root_vertical_tangent_max_mps", None
+        ),
+        "transition_angular_speed_max_rps": getattr(
+            cfg, "transition_angular_speed_max_rps", None
+        ),
+        "transition_root_tangent_margin_m": getattr(
+            cfg, "transition_root_tangent_margin_m", None
+        ),
+        "transition_tangent_smoothing_passes": getattr(
+            cfg, "transition_tangent_smoothing_passes", None
+        ),
+        "risk_adaptive_transition_enabled": env_bool(
+            "BOUNDARY_RISK_ADAPT_TRANSITION_ENABLE", True
+        ),
+        "boundary_environment": {
+            key: value
+            for key, value in runtime_environment.items()
+            if key.startswith("BOUNDARY_")
+        },
+    }
+    event_db_contract = make_event_db_contract(db["event_uids"])
+    row_methods = {
+        str(row.get("method", "")).strip()
+        for row in assembly_report
+        if str(row.get("method", "")).strip()
+    }
+    geometry_grounding_present = any(
+        isinstance(row.get("risk_predicted"), Mapping)
+        and "event_geometry_grounding" in row.get("risk_predicted", {})
+        for row in assembly_report
+    )
+    if geometry_grounding_present and env_bool(
+        "GROUNDING_GLOBAL_ROUTE_ENABLE", True
+    ):
+        selection_policy_id = (
+            "fisher_rao_graph_sb_preorder_viability_aware_"
+            "boundary_reselection_v1"
+        )
+        inferred_method_variant_id = "current_geometry_aware_routing"
+    elif row_methods:
+        selection_policy_id = "viability_aware_dynamic_beam_boundary_reselection_v1"
+        inferred_method_variant_id = "current_viability_aware_routing"
+    else:
+        selection_policy_id = GAR_SELECTION_POLICY_ID
+        inferred_method_variant_id = "current_boundary_closed_loop"
+    configured_method_variant_id = str(
+        getattr(
+            cfg,
+            "gar_evaluation_method_variant_id",
+            "current_boundary_closed_loop",
+        )
+    )
+    method_variant_id = (
+        inferred_method_variant_id
+        if configured_method_variant_id == "current_boundary_closed_loop"
+        else configured_method_variant_id
+    )
+    return {
+        "runtime_commit": current_git_commit(Path(__file__).resolve().parents[1]),
+        "config_fingerprint": behavior_config_fingerprint(
+            config, runtime_environment=runtime_environment
+        ),
+        "retrieval_index_fingerprint": str(
+            event_db_contract["ordered_event_uid_sha256"]
+        ),
+        "generator_id": GAR_GENERATOR_ID,
+        "generator_version": GAR_GENERATOR_VERSION,
+        "generator_checkpoint_fingerprint": checkpoint_fingerprint,
+        "generator_config_fingerprint": canonical_fingerprint(generator_config),
+        "repair_operator_id": GAR_REPAIR_OPERATOR_ID,
+        "repair_operator_version": GAR_REPAIR_OPERATOR_VERSION,
+        "repair_config_fingerprint": canonical_fingerprint(repair_config),
+        "selection_policy_id": selection_policy_id,
+        "method_variant_id": method_variant_id,
+        "random_seed": int(getattr(cfg, "seed", 0)),
+        "risk_threshold_value": None,
+        "risk_threshold_source": (
+            "contracts.boundary_continuity."
+            "BoundaryContinuityLimits.from_environment"
+        ),
+        "risk_thresholds": dataclasses.asdict(
+            BoundaryContinuityLimits.from_environment()
+        ),
+        "capabilities": {
+            "candidate_simulation_enabled": True,
+            "adaptive_transition_enabled": env_bool(
+                "BOUNDARY_RISK_ADAPT_TRANSITION_ENABLE", True
+            ),
+            "post_audit_enabled": True,
+            "reselection_enabled": env_bool("BOUNDARY_RESELECT_ENABLE", True),
+        },
+    }
+
+
+def _gar_add_runtime(
+    runtime: Dict[str, Optional[float]],
+    key: str,
+    started_at: Optional[float],
+) -> None:
+    if started_at is None:
+        return
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    previous = runtime.get(key)
+    runtime[key] = float(elapsed_ms + (0.0 if previous is None else previous))
+
+
 def generate_closed_loop(args: argparse.Namespace) -> int:
     motion_runtime = import_motion_runtime()
     cfg = motion_runtime.MotionGenerationConfig.from_json(args.config).apply_env()
     set_cfg_runtime_knobs(cfg)
+    gar_trace_enabled = bool(getattr(cfg, "gar_evaluation_trace_enable", False))
+    gar_sequence_started = time.perf_counter() if gar_trace_enabled else None
+    gar_runtime: Dict[str, Optional[float]] = {
+        "retrieval_runtime_ms": None,
+        "candidate_simulation_runtime_ms": None,
+        "generation_runtime_ms": None,
+        "post_audit_runtime_ms": None,
+        "reselection_runtime_ms": None,
+        "sequence_total_runtime_ms": None,
+    }
+    gar_round_records: List[Dict[str, Any]] = []
 
     seed = int(getattr(cfg, "seed", 1234))
     random.seed(seed)
@@ -1379,7 +1594,9 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         except Exception:
             pass
 
+    gar_stage_started = time.perf_counter() if gar_trace_enabled else None
     db, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(motion_runtime, args, cfg)
+    _gar_add_runtime(gar_runtime, "retrieval_runtime_ms", gar_stage_started)
 
     banned: Dict[int, set] = {}
     rounds: List[Dict[str, Any]] = []
@@ -1388,7 +1605,11 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     enable_reselect = env_bool("BOUNDARY_RESELECT_ENABLE", True)
 
     for round_id in range(max_rounds + 1):
+        gar_stage_started = time.perf_counter() if gar_trace_enabled else None
         motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(motion_runtime, slots, candidate_lists, db, cfg, banned=banned)
+        _gar_add_runtime(
+            gar_runtime, "candidate_simulation_runtime_ms", gar_stage_started
+        )
         cond = compute_condition(
             motion_runtime,
             slot_feat,
@@ -1403,6 +1624,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             assembly_report,
             motion_ref.shape[0],
         )
+        gar_stage_started = time.perf_counter() if gar_trace_enabled else None
         motion, stage_reports = apply_generators(
             motion_runtime,
             motion_ref,
@@ -1412,6 +1634,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             cfg,
             sliding_support_eligible=slide_eligible,
         )
+        _gar_add_runtime(gar_runtime, "generation_runtime_ms", gar_stage_started)
         stage_reports["sliding_support_eligibility"] = slide_report
         conditioning_contract = (
             str(assembly_report[0].get("conditioning_contract", "unknown"))
@@ -1438,7 +1661,9 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             if conditioning_contract == "selected_event_motion_descriptor_v1"
             else None,
         }
+        gar_stage_started = time.perf_counter() if gar_trace_enabled else None
         boundary_rows = audit_boundaries(motion_runtime, motion, assembly_report, cfg)
+        _gar_add_runtime(gar_runtime, "post_audit_runtime_ms", gar_stage_started)
         unsafe_rows = [r for r in boundary_rows if not bool(r.get("safe"))]
         round_summary = {
             "round": int(round_id),
@@ -1451,6 +1676,15 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "final_frames": int(motion.shape[0]),
         }
         rounds.append(round_summary)
+        if gar_trace_enabled:
+            gar_round_records.append(
+                {
+                    "round": int(round_id),
+                    "assembly_report": jsonable(assembly_report),
+                    "boundary_rows": jsonable(boundary_rows),
+                    "selected_pairs": jsonable(selected_pairs),
+                }
+            )
         payload = {
             "round": round_id,
             "motion_ref": motion_ref,
@@ -1471,12 +1705,14 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             best_payload = payload
             break
         # Ban the current event for the worst unsafe current slot and rerun whole assembly.
+        gar_stage_started = time.perf_counter() if gar_trace_enabled else None
         worst = max(unsafe_rows, key=lambda r: float(r.get("actual_risk_score", 0.0)))
         slot = int(worst.get("slot", -1))
         curr = int(worst.get("curr_event_id", -1))
         if slot < 0 or curr < 0:
             break
         banned.setdefault(slot, set()).add(curr)
+        _gar_add_runtime(gar_runtime, "reselection_runtime_ms", gar_stage_started)
         # Stop if we have exhausted candidates for this slot.
         remaining = [x for x in candidate_lists[slot] if x not in banned.get(slot, set())]
         if not remaining:
@@ -1605,6 +1841,55 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     selected_event_indices = [int(x[0]) for x in best_payload["selected_pairs"]]
     selected_paths = [str(paths[i]) for i in selected_event_indices]
 
+    gar_trace_path: Optional[str] = None
+    gar_method_variant_id = str(
+        getattr(
+            cfg,
+            "gar_evaluation_method_variant_id",
+            "current_boundary_closed_loop",
+        )
+    )
+    if gar_trace_enabled:
+        _gar_add_runtime(
+            gar_runtime, "sequence_total_runtime_ms", gar_sequence_started
+        )
+        gar_context = gar_evaluation_trace_context(
+            motion_runtime,
+            args,
+            cfg,
+            db,
+            best_payload["assembly_report"],
+        )
+        gar_trace = build_closed_loop_trace(
+            audio=args.audio,
+            slots=slots,
+            db=db,
+            event_uids=db["event_uids"],
+            candidate_lists=candidate_lists,
+            retrieval_report=retrieval_report,
+            round_records=gar_round_records,
+            final_round=int(best_payload["round"]),
+            runtime=gar_runtime,
+            **gar_context,
+        )
+        gar_trace_path = str(
+            out.with_name(out.stem + ".gar_selection_trace.json")
+        )
+        write_gar_trace(gar_trace, gar_trace_path)
+        gar_method_variant_id = gar_trace.method_variant_id
+
+    gar_readiness = {
+        "schema": GAR_READINESS_INTERFACE_SCHEMA,
+        "trace_enabled": gar_trace_enabled,
+        "trace_path": gar_trace_path,
+        "method_variant_id": gar_method_variant_id,
+        "paper1_experiments_implemented": False,
+        "oracle_implemented": False,
+        "statistical_tests_implemented": False,
+        "long_horizon_benchmark_implemented": False,
+        "production_selection_behavior_changed": False,
+    }
+
     report = {
         "version": "boundary_closed_loop_boundary_simulated_closed_loop_scheduler",
         "audio": args.audio,
@@ -1624,6 +1909,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "boundary_audit_json": audit_json_path,
         "motion_activity_json": motion_activity_path,
         "motion_activity": final_motion_activity,
+        "gar_evaluation_readiness": gar_readiness,
         "heading_contract": {
             "schema": "formal_boundary_aligned_heading_v1",
             "authoritative_reference": "motion_ref_path",
@@ -1707,6 +1993,7 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "json": json_path,
         "boundary_audit_csv": audit_csv_path,
         "motion_activity_json": motion_activity_path,
+        "gar_selection_trace_json": gar_trace_path,
         "frames": int(best_payload["motion"].shape[0]),
         "boundary_audit_summary": report["boundary_audit_summary"],
         "final_audit": report["final_audit"],
