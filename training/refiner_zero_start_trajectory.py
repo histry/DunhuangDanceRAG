@@ -242,7 +242,7 @@ def detailed_snapshot(model, batch, cfg, initial, step, compact=None):
         output_gradient = torch.zeros_like(activation["output"]) if output_gradient is None else output_gradient
         expected = F.conv_transpose1d(output_gradient, model.out.weight)
         hn, zn = float(hidden_gradient.double().norm()), float(output_gradient.double().norm())
-        vjp_error = float((hidden_gradient - expected).double().norm())
+        vjp_error = (hidden_gradient - expected).detach().double().norm().item()
         records = {}
         for (name, parameter), gradient in zip(named, parameter_gradients):
             gradient = torch.zeros_like(parameter) if gradient is None else gradient
