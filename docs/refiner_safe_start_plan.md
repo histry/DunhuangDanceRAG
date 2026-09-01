@@ -173,3 +173,15 @@ Local logs are retained outside tracked source in
 `pytest_final_regression.log`, and `real_update_smoke.log`. The real frozen
 server banks, full hidden=256 paired run and scientific outcome remain untested
 locally; no Pilot was run and no diagnostic state was promoted.
+
+## Server outcome and next diagnostic
+
+The server preflight later confirmed A0 safe on all 2,976 checks and rejected
+A1 (`sigma=1e-5`, seed 42) on 217 checks across every bank. The dominant causes
+were joint/extremity jerk regression, support drift and penetration; this
+rejects that fixed candidate under this contract, not Gaussian initialization
+in general. No optimizer or probe ran.
+
+There will be no sigma/seed sweep or threshold change. The next reviewed step is
+the single-arm [fresh exact-zero trajectory diagnostic](refiner_zero_start_trajectory.md),
+which measures true gradients separately from retained updates and displacement.
