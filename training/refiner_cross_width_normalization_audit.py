@@ -850,8 +850,11 @@ def _evaluate_chunk(
             "active_statistics": active,
             "effective_weight_statistics": weights,
             "support_retention_ratio": _ratio(
-                _finite(projected_adapter.norm(), "projected adapter norm"),
-                _finite(raw_adapter.norm(), "raw adapter norm"),
+                # Match RCSP _support_case_rows exactly: cast each case to
+                # float64 before the L2 reduction, rather than reducing the
+                # original float32 adapter output.
+                _finite(projected_adapter.double().norm(), "projected adapter norm"),
+                _finite(raw_adapter.double().norm(), "raw adapter norm"),
             ),
             "projected_outside_support_max": _finite(projected_outside.abs().max(), "projected outside support max"),
             "decoder_stage_statistics": stages,
