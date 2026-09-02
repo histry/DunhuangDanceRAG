@@ -882,7 +882,8 @@ def _attach_frozen_covariates(
     direction_rows: Mapping[str, Any],
     support_rows: Mapping[str, Any],
     tolerance: float = PARITY_ATOL,
-) -> None:
+) -> dict[str, Any]:
+    mismatches = []
     for row in rows:
         key = _identity_key(row)
         direction = direction_rows[key]
@@ -898,9 +899,52 @@ def _attach_frozen_covariates(
         }
         reported = support.get("projection_retention_ratio")
         computed = row["support_retention_ratio"]
-        if reported is not None and computed is not None and abs(float(reported) - float(computed)) > tolerance:
-            raise RuntimeError(f"support retention parity failed for {key}")
+        error = (
+            abs(float(reported) - float(computed))
+            if reported is not None and computed is not None
+            else None
+        )
+        parity_verified = error is not None and error <= tolerance
+        if error is not None and not parity_verified:
+            mismatch = {
+                "identity": key,
+                "role": row["role"],
+                "reported": float(reported),
+                "recomputed": float(computed),
+                "abs_error": float(error),
+                "tolerance": tolerance,
+                "excluded_from_primary_analysis": row["role"] != "cross_event",
+            }
+            mismatches.append(mismatch)
+            if row["role"] == "cross_event":
+                raise RuntimeError(
+                    "support retention parity failed for "
+                    f"{key}: reported={float(reported)!r}, "
+                    f"recomputed={float(computed)!r}, abs_error={float(error)!r}, "
+                    f"tolerance={tolerance!r}"
+                )
+        row["support_retention_ratio_recomputed"] = computed
+        row["support_retention_parity"] = {
+            "reported": reported,
+            "recomputed": computed,
+            "abs_error": error,
+            "verified": parity_verified,
+            "source": "RCSP report projection_retention_ratio plus Phase 2 recomputation",
+        }
+        # The frozen RCSP report is authoritative for this covariate.  The
+        # recomputed value remains available for explicit parity reporting.
+        row["support_retention_ratio"] = reported if reported is not None else computed
         row["support_projection_report_retention_ratio"] = reported
+    return {
+        "cases": len(rows),
+        "verified": not mismatches,
+        "primary_cases_verified": not any(
+            item["role"] == "cross_event" for item in mismatches
+        ),
+        "excluded_control_mismatches_allowed": True,
+        "tolerance": tolerance,
+        "mismatches": mismatches,
+    }
 
 
 def _validate_rcsp_metric_parity(
@@ -1261,7 +1305,9 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError("Phase 2 did not evaluate exactly 64 fixed final cases")
             direction_rows = _direction_map(rcsp_artifacts["report"])
             support_rows = _support_map(rcsp_artifacts["report"])
-            _attach_frozen_covariates(all_rows, direction_rows, support_rows)
+            support_retention_parity = _attach_frozen_covariates(
+                all_rows, direction_rows, support_rows
+            )
             _add_efficiency(all_rows)
             primary_rows, excluded_rows = _metadata_scopes(all_rows)
             authoritative_report_parity = _validate_rcsp_metric_parity(all_rows, rcsp_artifacts["report"])
@@ -1274,9 +1320,10 @@ def run(args: argparse.Namespace) -> int:
                     "max_abs_error": max(part["temporal_reduction_parity"][state]["max_abs_error"] for part in parity_rows for state in ("BASE", "RCSP")),
                 },
                 "rcsp_alpha": 1.0,
-                "verified": all(part["temporal_reduction_parity"][state]["verified"] for part in parity_rows for state in ("BASE", "RCSP")) and authoritative_report_parity["verified"],
+                "verified": all(part["temporal_reduction_parity"][state]["verified"] for part in parity_rows for state in ("BASE", "RCSP")) and authoritative_report_parity["verified"] and support_retention_parity["primary_cases_verified"],
                 "atol": PARITY_ATOL,
                 "rtol": PARITY_RTOL,
+                "support_retention": support_retention_parity,
             }
             if not parity["verified"]:
                 raise RuntimeError("authoritative metric parity failed")

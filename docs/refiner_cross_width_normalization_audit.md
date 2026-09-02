@@ -70,6 +70,11 @@ For RCSP it additionally records `raw_adapter` and
 `binary_projected_adapter`. Effective weight mass is read from the production
 `root_weight` and `joint_weight`; effective count is `(sum(w)^2)/sum(w^2)`.
 No synthetic weight or proxy temporal error is introduced.
+For support retention, the frozen RCSP `projection_retention_ratio` is the
+authoritative covariate; Phase 2 also records a recomputation and its parity
+error. A mismatch in a primary `cross_event` case fails closed. A mismatch
+only in the excluded `single_recording` control is retained as an explicit
+excluded-control mismatch and cannot enter the scientific summary.
 
 ## Server command
 
