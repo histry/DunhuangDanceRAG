@@ -9,7 +9,7 @@ from training import refiner_cross_width_normalization_audit as a
 
 def test_schema_baseline_and_primary_contract():
     assert a.SCHEMA == "refiner_cross_width_normalization_audit_v1"
-    assert a.EXPECTED_MAIN_COMMIT == "a9fbff524e46b0e13ab5e902f09c608e43cfb40f"
+    assert a.FROZEN_ARTIFACT_COMMIT == "a9fbff524e46b0e13ab5e902f09c608e43cfb40f"
     assert a.PARENT_COMMIT == "a33b17a78909bdf7125aa690d672f3991b7e5867"
     assert a.PRIMARY_CASES == 32
     assert a.GROUP_ORDER == (

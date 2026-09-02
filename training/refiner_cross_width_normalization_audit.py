@@ -36,7 +36,10 @@ from training import refiner_temporal_action_alignment_audit as alignment
 
 
 SCHEMA = "refiner_cross_width_normalization_audit_v1"
-EXPECTED_MAIN_COMMIT = "a9fbff524e46b0e13ab5e902f09c608e43cfb40f"
+# Frozen upstream reports were produced from this formal baseline.  The
+# Phase 2 implementation itself is allowed to live in a later audit commit;
+# its current runtime commit is checked against --expected-main-commit.
+FROZEN_ARTIFACT_COMMIT = "a9fbff524e46b0e13ab5e902f09c608e43cfb40f"
 PARENT_COMMIT = "a33b17a78909bdf7125aa690d672f3991b7e5867"
 PRIMARY_CASES = 32
 FINAL_CASES = 64
@@ -556,11 +559,11 @@ def _validate_json_report(path: Path, schema: str, label: str) -> tuple[dict[str
     return value, _file_sha256(path)
 
 
-def _validate_phase1(path: Path, expected_main_commit: str) -> tuple[dict[str, Any], str]:
+def _validate_phase1(path: Path, expected_artifact_commit: str) -> tuple[dict[str, Any], str]:
     report, digest = _validate_json_report(path, phase1.SCHEMA, "Phase 1 report")
     if (
         report.get("completed") is not True
-        or report.get("provenance", {}).get("runtime_commit") != expected_main_commit
+        or report.get("provenance", {}).get("runtime_commit") != expected_artifact_commit
         or report.get("optimizer_steps") != 0
         or report.get("parameter_update_performed") is not False
         or report.get("production_model_modified") is not False
@@ -1163,11 +1166,13 @@ def run(args: argparse.Namespace) -> int:
     parameter_report, parameter_hash = _validate_parameter_report(
         Path(args.parameter_attribution_report).resolve(), rcsp_artifacts["hashes"]["report.json"]
     )
-    phase1_report, phase1_hash = _validate_phase1(Path(args.phase1_report).resolve(), args.expected_main_commit)
+    phase1_report, phase1_hash = _validate_phase1(
+        Path(args.phase1_report).resolve(), FROZEN_ARTIFACT_COMMIT
+    )
     single_report, single_hash = _validate_json_report(Path(args.single_decomposition_report).resolve(), phase1.SCHEMA, "single decomposition report")
     if (
         single_report.get("completed") is not True
-        or single_report.get("provenance", {}).get("runtime_commit") != args.expected_main_commit
+        or single_report.get("provenance", {}).get("runtime_commit") != FROZEN_ARTIFACT_COMMIT
         or single_report.get("optimizer_steps") != 0
         or single_report.get("parameter_update_performed") is not False
         or single_report.get("pilot_allowed") is not False
@@ -1178,8 +1183,6 @@ def run(args: argparse.Namespace) -> int:
     runtime_commit = m._training_code_revision()
     if runtime_commit != args.expected_main_commit:
         raise ValueError("runtime commit does not match --expected-main-commit")
-    if args.expected_main_commit != EXPECTED_MAIN_COMMIT:
-        raise ValueError("this Phase 2 implementation requires the formal a9fbff baseline")
     output = Path(args.output_dir).resolve()
     immutable_roots = (source, trajectory, rcsp_artifacts["directory"], Path(args.parameter_attribution_report).resolve().parent)
     if output.exists() or any(output.is_relative_to(path) for path in immutable_roots):
@@ -1298,6 +1301,7 @@ def run(args: argparse.Namespace) -> int:
             "provenance": {
                 "runtime_commit": runtime_commit,
                 "expected_main_commit": args.expected_main_commit,
+                "frozen_artifact_commit": FROZEN_ARTIFACT_COMMIT,
                 "parent_commit": PARENT_COMMIT,
                 "root": str(root),
                 "source": str(source),

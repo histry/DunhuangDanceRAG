@@ -73,25 +73,27 @@ No synthetic weight or proxy temporal error is introduced.
 
 ## Server command
 
-After the commit is on `main`, synchronize the server and run:
+After the Phase 2 audit commit is on `main`, synchronize the server and run.
+`EXPECTED_MAIN_COMMIT` must be the full SHA of that current Phase 2 checkout;
+the frozen Phase 1 and single-decomposition reports remain lineage-checked
+against the formal artifact baseline `a9fbff524e46b0e13ab5e902f09c608e43cfb40f`.
 
 ```bash
 cd /home/disk/lsm/storage/DunhuangDanceRAG
 git fetch origin main
-test "$(git rev-parse HEAD)" = "a9fbff524e46b0e13ab5e902f09c608e43cfb40f"
-test "$(git rev-parse origin/main)" = "a9fbff524e46b0e13ab5e902f09c608e43cfb40f"
+export EXPECTED_MAIN_COMMIT='<full SHA of the Phase 2 audit commit>'
+test "$(git rev-parse HEAD)" = "$EXPECTED_MAIN_COMMIT"
+test "$(git rev-parse origin/main)" = "$EXPECTED_MAIN_COMMIT"
 test -z "$(git status --porcelain)"
 
 export ROOT_DIR=/home/disk/lsm/storage/DunhuangDanceRAG/outputs/run_smpl14_formal_20260822_163915
-export EXPECTED_MAIN_COMMIT=a9fbff524e46b0e13ab5e902f09c608e43cfb40f
 export PYTHON=/home/disk/lsm/conda_envs/edge/bin/python
-export LEGACY_CORE_STRENGTH='<recorded source core strength>'
-export LEGACY_TRANSITION_STRENGTH='<recorded source transition strength>'
+export LEGACY_CORE_STRENGTH='0.02'
+export LEGACY_TRANSITION_STRENGTH='1.0'
 bash scripts/audit_refiner_cross_width_normalization.sh 2>&1 | tee "$ROOT_DIR/audits/phase2_console.log"
 ```
 
-The placeholders must be replaced by the values recorded in the frozen source
-contract. Do not invent them. The audit creates a fresh
+The audit creates a fresh
 `audits/cross_width_normalization_<timestamp>_<random>/result/report.json`.
 After report acceptance checks, stop. Do not automatically intervene, train,
 run a Pilot, or claim a causal root cause.

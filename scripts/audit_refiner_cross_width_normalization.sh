@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/home/disk/lsm/storage/DunhuangDanceRAG}"
 PYTHON="${PYTHON:-/home/disk/lsm/conda_envs/edge/bin/python}"
 ROOT_DIR="${ROOT_DIR:?set ROOT_DIR to outputs/run_smpl14_formal_20260822_163915}"
-EXPECTED_MAIN_COMMIT="${EXPECTED_MAIN_COMMIT:?set EXPECTED_MAIN_COMMIT to a9fbff524e46b0e13ab5e902f09c608e43cfb40f}"
+EXPECTED_MAIN_COMMIT="${EXPECTED_MAIN_COMMIT:?set EXPECTED_MAIN_COMMIT to the full SHA of the checked-out Phase 2 audit commit}"
 STATE_DIR="${STATE_DIR:-$ROOT_DIR/checkpoints/refiner_v15_4_1_lazy_reservoir_foundation_20260831_235832/bridge_diagnostic}"
 TRAJECTORY_DIR="${TRAJECTORY_DIR:-$ROOT_DIR/audits/zero_start_trajectory_20260901_112920_vpO8Lh/trajectory}"
 RCSP_DIR="${RCSP_DIR:-$ROOT_DIR/audits/role_conditioned_support_projection_20260902_132948_qu1hYg/result}"
