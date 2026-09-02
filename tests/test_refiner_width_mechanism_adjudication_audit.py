@@ -73,7 +73,7 @@ def test_schema_and_frozen_constants_are_exact():
 
 def test_phase2_lineage_requires_exact_schema_and_completed(tmp_path):
     path = tmp_path / "report.json"
-    path.write_text(json.dumps({"schema": audit.SCHEMA, "completed": False}), encoding="utf-8")
+    path.write_text(json.dumps({"schema": "refiner_cross_width_normalization_audit_v1", "completed": False}), encoding="utf-8")
     with pytest.raises(ValueError, match="completed=true"):
         audit._validate_phase2_lineage(path)
 
@@ -81,14 +81,14 @@ def test_phase2_lineage_requires_exact_schema_and_completed(tmp_path):
 def test_phase2_lineage_requires_frozen_runtime_commit(tmp_path):
     path = tmp_path / "report.json"
     path.write_text(json.dumps({"schema": "refiner_cross_width_normalization_audit_v1", "completed": True}), encoding="utf-8")
-    with pytest.raises(ValueError, match="schema mismatch"):
+    with pytest.raises(ValueError, match="frozen upstream"):
         audit._validate_phase2_lineage(path)
 
 
 def test_phase2_lineage_requires_read_only_integrity(tmp_path):
     path = tmp_path / "report.json"
     payload = {
-        "schema": audit.SCHEMA,
+        "schema": "refiner_cross_width_normalization_audit_v1",
         "completed": True,
         "provenance": {"runtime_commit": "not-frozen"},
     }
@@ -128,7 +128,7 @@ def test_applied_action_uses_final_geometric_75d_and_excludes_contact():
     base = torch.zeros((1, 2, 79), dtype=torch.float32)
     rcsp = base.clone()
     rcsp[..., :4] = 100.0
-    rcsp[..., audit.GEOMETRIC_TANGENT_START] = 3.0
+    rcsp[..., 4] = 3.0
     norm = audit.applied_action_delta_norm(rcsp, base)
     assert norm.item() == pytest.approx(3.0 * 2.0 ** 0.5)
     assert audit.GEOMETRIC_TANGENT_END - audit.GEOMETRIC_TANGENT_START == 75

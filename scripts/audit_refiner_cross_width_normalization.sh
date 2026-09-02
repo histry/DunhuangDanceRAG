@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Read-only Phase 2. No optimizer, no parameter update, no Pilot.
+# Frozen formal artifact lineage remains anchored at a9fbff524e46b0e13ab5e902f09c608e43cfb40f.
 REPO_DIR="${REPO_DIR:-/home/disk/lsm/storage/DunhuangDanceRAG}"
 PYTHON="${PYTHON:-/home/disk/lsm/conda_envs/edge/bin/python}"
 ROOT_DIR="${ROOT_DIR:?set ROOT_DIR to outputs/run_smpl14_formal_20260822_163915}"
