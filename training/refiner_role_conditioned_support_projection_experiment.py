@@ -38,7 +38,7 @@ from training.refiner_optimizer import (
 )
 
 
-SCHEMA = "refiner_role_conditioned_support_projection_experiment_v1"
+SCHEMA = "refiner_role_conditioned_support_projection_experiment_v2"
 MODEL_VERSION = "rcsp_adapter_diagnostic_only_v1"
 STEPS = 400
 GEOMETRY_DIM = 75
@@ -1118,25 +1118,53 @@ def scientific_answers(base_summary, rcsp_summary, comparison):
         )
         for name, row in comparison["groups"].items()
     }
-    single_10 = any(
-        improved
-        for name, improved in group_improved.items()
-        if "/single_recording/10" in name
-    )
-    single_28 = any(
-        improved
-        for name, improved in group_improved.items()
-        if "/single_recording/28" in name
-    )
-    cross_10 = any(
-        improved for name, improved in group_improved.items() if "/cross_event/10" in name
-    )
-    cross_28 = any(
-        improved for name, improved in group_improved.items() if "/cross_event/28" in name
-    )
-    if single_pass_increased and single_deficit_improved and not safety_regression:
+    group_gate_rescue = {
+        name: (
+            row["RCSP"]["temporal_gate_pass_cases"]
+            > row["BASE"]["temporal_gate_pass_cases"]
+        )
+        for name, row in comparison["groups"].items()
+    }
+    group_gate_delta = {
+        name: int(row["delta_rcsp_minus_base"]["temporal_gate_pass_cases"])
+        for name, row in comparison["groups"].items()
+    }
+    group_relative_deficit_improvement = {}
+    for name, row in comparison["groups"].items():
+        base_value = float(row["BASE"]["temporal_scientific_deficit_mean"])
+        rcsp_value = float(row["RCSP"]["temporal_scientific_deficit_mean"])
+        group_relative_deficit_improvement[name] = (
+            (base_value - rcsp_value) / base_value if base_value != 0.0 else None
+        )
+
+    role_gate_delta = {
+        role: sum(
+            value for name, value in group_gate_delta.items() if f"/{role}/" in name
+        )
+        for role in ROLE_MAPPING
+    }
+    width_gate_delta = {
+        str(width): sum(
+            value for name, value in group_gate_delta.items() if name.endswith(f"/{width}")
+        )
+        for width in (10, 28)
+    }
+    if any(value < 0 for value in width_gate_delta.values()):
+        width_pattern = "TEMPORAL_GATE_REGRESSION_PRESENT"
+    elif width_gate_delta["10"] > 0 and width_gate_delta["28"] == 0:
+        width_pattern = "WIDTH_10_ONLY"
+    elif width_gate_delta["28"] > 0 and width_gate_delta["10"] == 0:
+        width_pattern = "WIDTH_28_ONLY"
+    elif width_gate_delta["10"] > 0 and width_gate_delta["28"] > 0:
+        width_pattern = "BOTH_WIDTHS"
+    else:
+        width_pattern = "NO_TEMPORAL_GATE_RESCUE"
+
+    if safety_regression:
+        classification = "REJECTED_SAFETY_REGRESSION"
+    elif single_pass_increased and single_deficit_improved:
         classification = "SUPPORTED_BY_DIAGNOSTIC_EXPERIMENT"
-    elif (single_10 and not single_28) or (cross_10 and not cross_28):
+    elif width_pattern in ("WIDTH_10_ONLY", "WIDTH_28_ONLY"):
         classification = "ROLE_CONDITIONING_USEFUL_BUT_WIDTH_DEPENDENT_MECHANISM_REMAINS"
     elif cross_improved and not single_pass_increased:
         classification = "ROLE_CONDITIONING_ALONE_INSUFFICIENT"
@@ -1162,6 +1190,14 @@ def scientific_answers(base_summary, rcsp_summary, comparison):
         ),
         "physical_geometry_or_clean_regression": safety_regression,
         "group_descriptive_improvement": group_improved,
+        "group_temporal_gate_rescue": group_gate_rescue,
+        "temporal_gate_pass_delta_by_group": group_gate_delta,
+        "temporal_gate_pass_delta_by_role": role_gate_delta,
+        "temporal_gate_pass_delta_by_width": width_gate_delta,
+        "temporal_gate_rescue_width_pattern": width_pattern,
+        "relative_temporal_deficit_improvement_by_group": (
+            group_relative_deficit_improvement
+        ),
         "claim_boundary": (
             "Descriptive fixed-step diagnostic comparison only. It does not prove a root cause, "
             "select a checkpoint or scale, change production architecture, or authorize Pilot."

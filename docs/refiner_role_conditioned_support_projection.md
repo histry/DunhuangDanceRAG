@@ -2,7 +2,7 @@
 
 ## Scope
 
-`refiner_role_conditioned_support_projection_experiment_v1` is a diagnostic
+`refiner_role_conditioned_support_projection_experiment_v2` is a diagnostic
 rescue experiment on the immutable, completed 400-step A0 Refiner trajectory.
 It does not modify `ProductManifoldTemporalRefiner`, the production decoder,
 formal inference, GAR, contact, confidence masks, smoothing, taper, caps,
@@ -106,3 +106,31 @@ bash scripts/run_refiner_role_conditioned_support_projection.sh \
 ```
 
 Do not run Pilot after this experiment. Review `result/report.json` first.
+
+## Reporting-logic correction for completed v1 artifacts
+
+The first completed server artifact used the v1 report schema. Its case-level
+measurements, BASE/RCSP summaries, direction VJP, and support statistics are
+valid. The v1 headline classifier nevertheless mixed two different events:
+
+- any decrease in the continuous temporal scientific deficit;
+- an actual increase in the fixed 3% temporal gate pass count.
+
+That made small deficit decreases in both widths hide a gate-level width
+asymmetry. Schema v2 separates descriptive deficit improvement from gate
+rescue and records gate deltas by group, role, and width. A completed v1 run
+must not be retrained merely to obtain the corrected classification. Review it
+directly with the read-only reviewer:
+
+```bash
+bash scripts/review_refiner_role_conditioned_support_projection.sh \
+  "$REPORT" "$REVIEW_JSON"
+```
+
+The reviewer hashes the source report, recomputes all stored summaries from
+the 64 BASE and 64 RCSP case rows, verifies the diagnostic-only flags and zero
+support escape, and prints the already-recorded direction/support summaries.
+It creates no optimizer, does not load the adapter checkpoint, changes no
+measurement or threshold, and cannot authorize publication or Pilot. Because
+the reporting rule was corrected after the v1 result existed, the review
+artifact labels itself `post_run_reporting_logic_correction`.

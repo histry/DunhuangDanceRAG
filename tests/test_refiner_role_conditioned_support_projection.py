@@ -31,7 +31,7 @@ def nonzero_base(hidden=4):
 
 
 def test_schema_steps_roles_and_geometry_contract_are_fixed():
-    assert r.SCHEMA == "refiner_role_conditioned_support_projection_experiment_v1"
+    assert r.SCHEMA == "refiner_role_conditioned_support_projection_experiment_v2"
     assert r.STEPS == 400
     assert r.GEOMETRY_DIM == 75
     assert r.ROLE_MAPPING == {"single_recording": 0, "cross_event": 1}
@@ -295,6 +295,43 @@ def test_scientific_answer_can_describe_single_rescue_without_accepting_science(
     )
     assert answer["any_single_recording_case_crossed_temporal_gate"]
     assert "does not prove a root cause" in answer["claim_boundary"]
+
+
+def test_scientific_answer_separates_deficit_improvement_from_width_gate_rescue():
+    base_rows = synthetic_case_rows()
+    rcsp_rows = []
+    for row in base_rows:
+        rescued = row["role"] == "cross_event" and row["width"] == 10
+        rcsp_rows.append(
+            {
+                **row,
+                "temporal_gate_pass": rescued,
+                "endpoint_gate_pass": rescued,
+                "all_diagnostic_conditions": rescued,
+                "temporal_scientific_deficit": 0.8,
+                "endpoint_scientific_deficit": 0.9,
+                "temporal_repair_gain": 0.2,
+                "endpoint_repair_gain": 0.1,
+            }
+        )
+    base = r.fixed_final_summary(base_rows)
+    rcsp = r.fixed_final_summary(rcsp_rows)
+    comparison = r.baseline_comparison(base, rcsp)
+    answer = r.scientific_answers(
+        {**base, "case_level": base_rows},
+        {**rcsp, "case_level": rcsp_rows},
+        comparison,
+    )
+    assert all(answer["group_descriptive_improvement"].values())
+    assert answer["temporal_gate_rescue_width_pattern"] == "WIDTH_10_ONLY"
+    assert answer["temporal_gate_pass_delta_by_width"] == {"10": 4, "28": 0}
+    assert answer["temporal_gate_pass_delta_by_role"] == {
+        "single_recording": 0,
+        "cross_event": 4,
+    }
+    assert answer["role_conditioned_direction_rescue"] == (
+        "ROLE_CONDITIONING_USEFUL_BUT_WIDTH_DEPENDENT_MECHANISM_REMAINS"
+    )
 
 
 def test_direction_summary_uses_medians_and_all_required_scopes_are_declared():
