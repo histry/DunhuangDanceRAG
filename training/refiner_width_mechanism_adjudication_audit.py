@@ -571,7 +571,7 @@ def _add_cf_rows(
         cf28["metric_ratio_before_28_over_10"] = _ratio(cf28["M_before"], cf10["M_before"])
         cf28["metric_ratio_base_28_over_10"] = _ratio(cf28["M_base"], cf10["M_base"])
         cf28["metric_ratio_rcsp_28_over_10"] = _ratio(cf28["M_rcsp"], cf10["M_rcsp"])
-        cf28["delta_G_counterfactual"] = float(cf28["G_rcsp"]) - float(cf10["G_rcsp"])
+        row["counterfactual"]["delta_G_counterfactual"] = float(cf28["G_rcsp"]) - float(cf10["G_rcsp"])
     return rows
 
 
