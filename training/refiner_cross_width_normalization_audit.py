@@ -677,26 +677,37 @@ def _evaluate_chunk(
     masks = m._refiner_decode_masks(batch["joint"], batch["root"], batch["contact"], batch["seam"], cfg)
     soft_mask = _geometry_soft_mask(masks[0], masks[1])
     binary = (soft_mask > 0).to(soft_mask.dtype)
-    role_id = rcsp.role_ids_from_metadata(metadata, batch["bad"].device)
+    count = len(metadata)
     with torch.no_grad():
-        base_raw = base(batch["bad"], batch["cond"], batch["seam"], batch["joint"])
-        rcsp_raw = model.forward_explicit(
-            batch["bad"], batch["cond"], batch["seam"], batch["joint"],
-            role_id, masks[0], masks[1], capture_details=True,
+        # Reuse the authoritative bad+clean batch wrapper used by the frozen
+        # RCSP report.  Running only the bad half changes GPU kernel/batch
+        # behavior and can perturb the diagnostic adapter norms by a few ppm.
+        base_trace: dict[str, Any] = {}
+        base_prediction, _ = m._refiner_batch_outputs(
+            base, batch, cfg, trace=base_trace
+        )
+        rcsp_trace: dict[str, Any] = {}
+        rcsp_prediction, _ = rcsp.rcsp_batch_outputs(
+            model, batch, cfg, trace=rcsp_trace, capture_details=True
         )
         details = model.last_details
+        base_raw = base_trace["raw_output"][:count]
+        rcsp_raw = details["raw_adapted"][:count]
         if not torch.equal(base_raw[..., :4], rcsp_raw[..., :4]):
             raise RuntimeError("RCSP changed contact channels")
-        if _finite((base_raw - details["raw_base"]).abs().max(), "base raw parity") != 0.0:
+        if _finite(
+            (base_raw - details["raw_base"][:count]).abs().max(),
+            "base raw parity",
+        ) != 0.0:
             raise RuntimeError("RCSP wrapper base raw parity failed")
-        traces: dict[str, dict[str, Any]] = {}
-        predictions: dict[str, torch.Tensor] = {}
-        for state, raw in (("BASE", base_raw), ("RCSP", rcsp_raw)):
-            trace: dict[str, Any] = {}
-            predictions[state] = m._decode_product_refiner_output(
-                batch["bad"], raw, *masks, cfg, trace=trace
-            )
-            traces[state] = trace
+        traces: dict[str, dict[str, Any]] = {
+            "BASE": base_trace["repair"],
+            "RCSP": rcsp_trace["repair"],
+        }
+        predictions: dict[str, torch.Tensor] = {
+            "BASE": base_prediction,
+            "RCSP": rcsp_prediction,
+        }
         _, base_terms = m._observable_refiner_objective(
             predictions["BASE"], batch["bad"], batch["seam"], cfg, reduction="none"
         )
