@@ -678,17 +678,21 @@ def _evaluate_chunk(
     soft_mask = _geometry_soft_mask(masks[0], masks[1])
     binary = (soft_mask > 0).to(soft_mask.dtype)
     count = len(metadata)
+    routed_batch = dict(batch)
+    routed_batch["role_id"] = rcsp.role_ids_from_metadata(
+        metadata, batch["bad"].device
+    )
     with torch.no_grad():
         # Reuse the authoritative bad+clean batch wrapper used by the frozen
         # RCSP report.  Running only the bad half changes GPU kernel/batch
         # behavior and can perturb the diagnostic adapter norms by a few ppm.
         base_trace: dict[str, Any] = {}
         base_prediction, _ = m._refiner_batch_outputs(
-            base, batch, cfg, trace=base_trace
+            base, routed_batch, cfg, trace=base_trace
         )
         rcsp_trace: dict[str, Any] = {}
         rcsp_prediction, _ = rcsp.rcsp_batch_outputs(
-            model, batch, cfg, trace=rcsp_trace, capture_details=True
+            model, routed_batch, cfg, trace=rcsp_trace, capture_details=True
         )
         details = model.last_details
         base_raw = base_trace["raw_output"][:count]
