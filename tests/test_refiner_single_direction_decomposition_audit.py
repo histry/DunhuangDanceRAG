@@ -5,9 +5,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from training import refiner_single_direction_decomposition_audit as d
+from tests.test_refiner_role_conditioned_support_projection import (
+    nonzero_base,
+    tiny_batch,
+)
 from training import refiner_role_conditioned_support_projection_experiment as rcsp
-from tests.test_refiner_role_conditioned_support_projection import nonzero_base, tiny_batch
+from training import refiner_single_direction_decomposition_audit as d
 
 
 def block_row(signed=1.0, cosine=0.5):
