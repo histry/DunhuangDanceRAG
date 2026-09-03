@@ -25,7 +25,8 @@ touches_outside = any(not core over the same stencil)
 BCTR_support_k = touches_core AND touches_outside
 ```
 
-In report shorthand, the same core rule is written as `seam >= 0.5`.
+In report shorthand, the same core rule is written as `seam >= 0.5`, and the
+derived mask is named `crossing_support`.
 
 The derivative values are exactly the production decomposition: FK joints in
 `float64`, `diff(J, n=k) * fps**k`, the L2 norm over coordinates and the mean
