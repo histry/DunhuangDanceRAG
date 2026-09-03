@@ -92,7 +92,7 @@ def _integrated_secdr_fixture():
     with torch.no_grad():
         rcsp_model.adapter.cross_adapter.bias.fill_(0.02)
     model = audit.SECDRModel(rcsp_model, 0.25, 0.5)
-    calibration = {"s_min": 0.25, "s_max": 0.5}
+    calibration = {"s_min": 0.0, "s_max": 1.0}
     return cfg, batch, model, calibration
 
 
