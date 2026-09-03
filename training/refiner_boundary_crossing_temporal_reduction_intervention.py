@@ -117,11 +117,16 @@ def _validate_phase21_lineage(path: Path) -> tuple[dict[str, Any], str, dict[str
         raise ValueError("Phase 2.1 expected main commit mismatch")
     if adjudication.get("adjudicated_primary_mechanism") != "MIXED_WIDTH_MECHANISM":
         raise ValueError("Phase 2.1 mechanism is not MIXED_WIDTH_MECHANISM")
-    for field in ("normalization_evidence", "temporal_spreading_evidence", "width_conditioned_direction_evidence"):
+    expected_evidence = {
+        "normalization_evidence": True,
+        "temporal_spreading_evidence": False,
+        "width_conditioned_direction_evidence": True,
+    }
+    for field, expected in expected_evidence.items():
         values = adjudication.get(field, {})
-        if values.get("seen") is not (field == "normalization_evidence"):
+        if values.get("seen") is not expected:
             raise ValueError(f"Phase 2.1 {field}.seen mismatch")
-        if values.get("new_position") is not (field == "normalization_evidence"):
+        if values.get("new_position") is not expected:
             raise ValueError(f"Phase 2.1 {field}.new_position mismatch")
     if adjudication.get("primary_intervention_order") != [
         "metric/support-time intervention", "direction intervention"
