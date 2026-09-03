@@ -58,8 +58,8 @@ G = (before-after)/before,                         if before > 1e-6
 The pass threshold is read from
 `cfg.checkpoint_validation_min_temporal_repair_gain`; no `0.03` is embedded
 in the intervention.  Endpoint values and endpoint acceptance are original
-production values.  The jerk non-regression guard uses the original
-full-support `seam_jerk_mps3`, never BCTR jerk.  Candidate overall acceptance
+production values.  The jerk non-regression guard uses the original full-support
+`seam_jerk_mps3`, never BCTR jerk.  Candidate overall acceptance
 is original endpoint acceptance AND candidate temporal acceptance.
 
 BASE and RCSP outputs are the same frozen outputs used for the current metric.
