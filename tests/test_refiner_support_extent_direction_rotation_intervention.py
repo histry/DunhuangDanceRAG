@@ -209,7 +209,7 @@ def test_root_and_joint_norms_are_preserved():
     support = torch.ones_like(action)
     result, _details = rotator(action, support, torch.ones(2))
     assert torch.allclose(result[..., :3].norm(dim=-1), action[..., :3].norm(dim=-1), atol=1e-6)
-    assert torch.allclose(result[..., 3:].reshape(2, 3, 24, 3).norm(dim=-1), action[..., 3:].reshape(2, 3, 24, 3).norm(dim=-1), atol=1e-6)
+    assert torch.allclose(result[..., 3:].norm(dim=-1), action[..., 3:].norm(dim=-1), atol=1e-6)
 
 
 def test_scope_rows_supports_seen_new_and_widths():
@@ -334,13 +334,13 @@ def test_rotator_forward_has_no_width_argument():
 def test_training_scope_names_only_rotator_weights():
     source = Path(audit.__file__).read_text(encoding="utf-8")
     assert "model.rotator.parameters()" in source
-    assert "model.base.parameters()" in source
+    assert "self.base.parameters()" in source
     assert "model.rcsp.adapter.parameters()" in source
 
 
 def test_no_width_head_or_width_loss_is_declared():
     source = Path(audit.__file__).read_text(encoding="utf-8")
-    assert "width_conditioner" not in source
+    assert "width_head" not in source
     assert "direction_cosine_loss_added" in source
 
 

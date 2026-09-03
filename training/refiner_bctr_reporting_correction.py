@@ -209,6 +209,8 @@ def _validate_source(report: Mapping[str, Any]) -> tuple[list[dict[str, Any]], d
     stored_decision = report.get("decision")
     if not isinstance(stored_decision, Mapping):
         raise ValueError("source BCTR decision is missing")
+    if stored_decision.get("result") != EXPECTED_DECISION:
+        raise ValueError("frozen BCTR decision is not the required NOT_SUPPORTED result")
     recomputed = recompute_decision(decision_inputs)
     for field in (
         "result",
@@ -222,8 +224,6 @@ def _validate_source(report: Mapping[str, Any]) -> tuple[list[dict[str, Any]], d
     ):
         if stored_decision.get(field) != recomputed[field]:
             raise ValueError(f"source BCTR decision input mismatch: {field}")
-    if stored_decision.get("result") != EXPECTED_DECISION:
-        raise ValueError("frozen BCTR decision is not the required NOT_SUPPORTED result")
     if stored_decision.get("next_action") != EXPECTED_NEXT_ACTION:
         raise ValueError("frozen BCTR next action mismatch")
     for field in (
