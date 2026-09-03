@@ -27,7 +27,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from motion_geometry.boundary_observables import observable_gate
+from motion_geometry.boundary_observables import boundary_metrics_torch, observable_gate
 from training import motion_models as m
 from training import refiner_bctr_reporting_correction as correction
 from training import refiner_boundary_crossing_temporal_reduction_intervention as bctr
@@ -837,20 +837,19 @@ def _zero_parity(
     fields["temporal_observable"] = _tensor_max_error(rcsp_terms["temporal_scientific_deficit"], secdr_terms["temporal_scientific_deficit"], "zero temporal observable")
     fields["endpoint_observable"] = _tensor_max_error(rcsp_terms["endpoint_scientific_deficit"], secdr_terms["endpoint_scientific_deficit"], "zero endpoint observable")
     metric_joints = m._observable_boundary_joints_torch(torch.cat((rcsp_prediction, secdr_prediction)))
-    metric_rows = phase2._metric_rows(
+    metric_values = boundary_metrics_torch(
         metric_joints,
         torch.cat((batch["seam"], batch["seam"])),
         cfg.fps,
     )
-    rcsp_metric = metric_rows[: int(batch["clean"].shape[0])]
-    secdr_metric = metric_rows[int(batch["clean"].shape[0]) :]
-    fields["current_temporal_metric"] = max(
-        abs(float(left["temporal_energy"]) - float(right["temporal_energy"]))
-        for left, right in zip(rcsp_metric, secdr_metric)
+    count = int(batch["clean"].shape[0])
+    rcsp_metric = {key: value[:count] for key, value in metric_values.items()}
+    secdr_metric = {key: value[count:] for key, value in metric_values.items()}
+    fields["current_temporal_metric"] = _tensor_max_error(
+        rcsp_metric["temporal_energy"], secdr_metric["temporal_energy"], "zero current temporal metric"
     )
-    fields["current_endpoint_metric"] = max(
-        abs(float(left["endpoint_velocity_jump_mps"]) - float(right["endpoint_velocity_jump_mps"]))
-        for left, right in zip(rcsp_metric, secdr_metric)
+    fields["current_endpoint_metric"] = _tensor_max_error(
+        rcsp_metric["endpoint_velocity_jump_mps"], secdr_metric["endpoint_velocity_jump_mps"], "zero current endpoint metric"
     )
     exact = all(value == 0.0 for value in fields.values())
     if not exact:
