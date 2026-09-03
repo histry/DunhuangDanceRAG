@@ -6,12 +6,15 @@ architecture, support/q math, decision tree, and reporting boundary.
 from __future__ import annotations
 
 import inspect
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from training import motion_models as m
+from training import refiner_role_conditioned_support_projection_experiment as rcsp
 from training import refiner_support_extent_direction_rotation_intervention as audit
 
 
@@ -56,12 +59,49 @@ def _mechanism(value):
     return {"supported": value}
 
 
+def _integrated_secdr_fixture():
+    cfg = m.MotionGenerationConfig(device="cpu")
+    frames = cfg.window_len
+    clean = torch.zeros(2, frames, 151)
+    clean[..., 7:] = torch.tensor(m.identity6d_np()).repeat(24)
+    clean[..., 5] = 0.95
+    bad = clean.clone()
+    phase = torch.linspace(0.0, 1.0, frames)
+    bad[..., 4] += 0.02 * phase.sin()
+    seam = torch.zeros(2, frames, 1)
+    seam[0, 30:40] = 1.0
+    seam[1, 30:58] = 1.0
+    joint = seam.expand(2, frames, 24).clone() * 0.18
+    root = seam.clone() * 0.18
+    batch = {
+        "clean": clean,
+        "bad": bad,
+        "seam": seam,
+        "cond": torch.zeros(2, frames, 32),
+        "group": torch.tensor([1, 3]),
+        "joint": joint,
+        "root": root,
+        "contact": root.clone(),
+        "clean_joint": joint.clone(),
+        "clean_root": root.clone(),
+        "clean_contact": root.clone(),
+    }
+    batch = audit.attach_train_role_ids(batch)
+    base = m.ProductManifoldTemporalRefiner(hidden=4, fps=cfg.fps)
+    rcsp_model = rcsp.FrozenBaseRCSPModel(base)
+    with torch.no_grad():
+        rcsp_model.adapter.cross_adapter.bias.fill_(0.02)
+    model = audit.SECDRModel(rcsp_model, 0.25, 0.5)
+    calibration = {"s_min": 0.25, "s_max": 0.5}
+    return cfg, batch, model, calibration
+
+
 def test_schema_is_exact():
     assert audit.SCHEMA == "refiner_support_extent_conditioned_direction_rotation_intervention_v1"
 
 
 def test_frozen_parent_is_exact():
-    assert audit.IMPLEMENTATION_PARENT_COMMIT == "b0cd4437cfb0144046b1408397cc5dad72471cf9"
+    assert audit.IMPLEMENTATION_PARENT_COMMIT == "83aa72a59508f4bba21d684648a55a63b13141ab"
 
 
 def test_phase21_commit_is_exact():
@@ -180,6 +220,72 @@ def test_zero_rotator_is_exact_identity_for_action():
     result, _details = rotator(action, support, q)
     assert torch.equal(result[0], action[0])
     assert torch.equal(result[1], action[1])
+
+
+def test_zero_initialized_rotator_has_nonzero_eligible_gradient():
+    rotator = audit.TangentDirectionRotator()
+    action = torch.linspace(-0.4, 0.6, 2 * 3 * 75).reshape(2, 3, 75)
+    support = torch.ones_like(action)
+    q = torch.ones(2)
+    result, _details = rotator(action, support, q)
+    assert torch.equal(result, action)
+    target = action.clone()
+    target[..., :3] += 0.07
+    target[..., 3:] -= 0.03
+    loss = (result - target).square().mean()
+    loss.backward()
+    root_gradient = rotator.root.weight.grad
+    joint_gradient = rotator.joint.weight.grad
+    assert root_gradient is not None
+    assert joint_gradient is not None
+    assert bool(torch.isfinite(root_gradient).all())
+    assert bool(torch.isfinite(joint_gradient).all())
+    total = math.sqrt(
+        float(root_gradient.detach().double().norm()) ** 2
+        + float(joint_gradient.detach().double().norm()) ** 2
+    )
+    assert total > audit.GRADIENT_NUMERICAL_TOL
+    for parameter in rotator.parameters():
+        parameter.grad = None
+
+
+def test_integrated_secdr_objective_has_zero_start_gradient_without_step():
+    _cfg, batch, model, calibration = _integrated_secdr_fixture()
+    repair, clean, _terms, _identity_terms = audit.secdr_batch_objectives(
+        model, batch, _cfg, calibration, capture_details=True
+    )
+    loss = repair + _cfg.product_refiner_clean_identity_weight * clean
+    loss.backward()
+    root_gradient = model.rotator.root.weight.grad
+    joint_gradient = model.rotator.joint.weight.grad
+    assert root_gradient is not None
+    assert joint_gradient is not None
+    assert bool(torch.isfinite(root_gradient).all())
+    assert bool(torch.isfinite(joint_gradient).all())
+    assert max(
+        float(root_gradient.detach().double().norm()),
+        float(joint_gradient.detach().double().norm()),
+    ) > audit.GRADIENT_NUMERICAL_TOL
+    for parameter in model.rotator.parameters():
+        parameter.grad = None
+    model.clear_last_details()
+
+
+def test_zero_start_preflight_fails_closed_without_a_gradient(monkeypatch):
+    _cfg, batch, model, calibration = _integrated_secdr_fixture()
+
+    def zero_objective(*_args, **_kwargs):
+        return torch.zeros(()), torch.zeros(()), {}, {}
+
+    monkeypatch.setattr(audit, "secdr_batch_objectives", zero_objective)
+    result = audit.zero_start_trainability_preflight(model, batch, _cfg, calibration)
+    assert result["passed"] is False
+    assert result["optimizer_constructed"] is False
+    assert result["optimizer_steps"] == 0
+    assert result["parameter_update_attempted"] is False
+    assert result["any_gradient_nonzero"] is False
+    assert result["parameters_unchanged_after_probe"] is True
+    assert result["gradients_cleared_after_probe"] is True
 
 
 def test_zero_action_remains_zero():
@@ -336,6 +442,7 @@ def test_training_scope_names_only_rotator_weights():
     assert "model.rotator.parameters()" in source
     assert "self.base.parameters()" in source
     assert "self.rcsp.adapter.parameters()" in source
+    assert "update_zero" not in source
 
 
 def test_no_width_head_or_width_loss_is_declared():
@@ -376,6 +483,7 @@ def test_server_script_requires_explicit_lineage_inputs():
     assert "PHASE21_REPORT" in source
     assert "BCTR_REPORT" in source
     assert "BCTR_CORRECTION_REPORT" in source
+    assert "PREVIOUS_SECDR_REPORT" in source
     assert "latest-artifact discovery" in source.lower()
 
 

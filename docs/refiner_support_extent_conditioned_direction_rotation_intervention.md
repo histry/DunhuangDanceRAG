@@ -8,10 +8,17 @@ production metric and gate.
 ## Frozen inputs and model boundary
 
 The command consumes one explicit Phase 2.1 report, one explicit frozen BCTR
-report, and the separately generated BCTR reporting-correction artifact.  It
-follows every source, trajectory, RCSP, Phase 1, decomposition, parameter
-attribution, and adapter-checkpoint path recorded in the Phase 2.1 lineage.
-No latest-artifact search is performed.
+report, the separately generated BCTR reporting-correction artifact, and the
+historical defective SECDR report.  It follows every source, trajectory, RCSP,
+Phase 1, decomposition, parameter attribution, and adapter-checkpoint path
+recorded in the Phase 2.1 lineage.  No latest-artifact search is performed.
+
+The historical report
+`interventions/secdr_direction_rotation_20260903_111428_bazm2q/result/report.json`
+is read-only provenance.  It is not edited, overwritten, or scientifically
+reused.  The corrected run records its SHA-256, runtime commit
+`534da47fe5939a9b09eb998c68537f49f9adf70d`, and prior result
+`WIDTH_CONDITIONED_DIRECTION_INTERVENTION_NOT_SUPPORTED`.
 
 The A0 step-400 `ProductManifoldTemporalRefiner` and the completed RCSP adapter
 are loaded and frozen.  SECDR adds only
@@ -39,8 +46,10 @@ v = a + q(s) u_perp
 a' = v ||a|| / max(||v||, 1e-12)
 ```
 
-Zero blocks return unchanged.  The binary support is reapplied after the
-rotation.  Temporal alignment uses the existing authoritative
+Zero blocks return unchanged.  The zero-initialized rotator keeps this forward
+identity while retaining a differentiable path from the objective to `W`; no
+`u==0` or weight-based forward bypass is used.  The binary support is reapplied
+after the rotation.  Temporal alignment uses the existing authoritative
 `refiner_temporal_action_alignment_audit` gradient; no new direction,
 cosine, width, or rank loss is introduced.
 
@@ -52,6 +61,15 @@ exactly 400 checked AdamW/Armijo/rollback attempts.  The existing RCSP
 components are reused without changing weights or thresholds.  The fixed
 64-case final bank is held out for evaluation and includes 32 primary
 cross-event cases (four 8-case groups) plus 32 single-recording controls.
+
+Before the 400 formal attempts, a read-only zero-start trainability preflight
+runs the authoritative objective on exactly the 96 cross-event TRAIN
+transaction-0 cases.  It records loss, root/joint/total gradient norms,
+finite/nonzero status, exact parameter immutability, and gradient cleanup.  A
+failed probe stops before optimizer construction and before step 1.  The report
+also distinguishes optimizer construction, attempted steps, accepted and
+rolled-back steps, retained parameter updates, and the backward-compatible
+`parameter_update_performed` field (which means retained update only).
 
 The report includes case-level BASE/RCSP/SECDR metrics and gates, support
 extent/q, action norms, temporal alignment, block-norm preservation, support
@@ -65,8 +83,8 @@ intervention search is authorized after SECDR.
 ## Server execution
 
 Run on the RTX 4090 server after the final `main` commit has been pushed.  The
-correction is created in a fresh directory and the original BCTR report is not
-overwritten.
+corrected SECDR output is created in a fresh directory.  The historical SECDR
+report, original BCTR report, and BCTR correction report are not overwritten.
 
 ```bash
 cd /home/disk/lsm/storage/DunhuangDanceRAG
@@ -82,6 +100,7 @@ export LEGACY_CORE_STRENGTH=0.02
 export LEGACY_TRANSITION_STRENGTH=1.0
 export PHASE21_REPORT="$ROOT_DIR/audits/width_mechanism_adjudication_20260903_074314_6Vs6w5/result/report.json"
 export BCTR_REPORT="$ROOT_DIR/interventions/bctr_temporal_reduction_20260903_092435_wPdK3U/result/report.json"
+export PREVIOUS_SECDR_REPORT="$ROOT_DIR/interventions/secdr_direction_rotation_20260903_111428_bazm2q/result/report.json"
 
 test "$(git branch --show-current)" = "main"
 test -z "$(git status --porcelain)"
@@ -89,6 +108,7 @@ test "$(git rev-parse HEAD)" = "$EXPECTED_MAIN_COMMIT"
 test "$(git rev-parse origin/main)" = "$EXPECTED_MAIN_COMMIT"
 test -f "$PHASE21_REPORT"
 test -f "$BCTR_REPORT"
+test -f "$PREVIOUS_SECDR_REPORT"
 
 "$PY" -m pytest -q \
   tests/test_refiner_bctr_reporting_correction.py \
@@ -136,7 +156,7 @@ assert sha256(bctr_path) == bctr_before
 print("BCTR_CORRECTION_VERIFICATION_OK")
 PY
 
-RUN_DIR="$(mktemp -d "$ROOT_DIR/interventions/secdr_direction_rotation_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
+RUN_DIR="$(mktemp -d "$ROOT_DIR/interventions/secdr_direction_rotation_corrected_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
 bash scripts/run_refiner_support_extent_direction_rotation_intervention.sh \
   "$PHASE21_REPORT" "$BCTR_REPORT" "$BCTR_CORRECTION_REPORT" "$RUN_DIR"
 
@@ -155,6 +175,8 @@ assert r["training"]["transaction_index"] == 0
 assert r["training"]["cross_event_cases"] == 96
 assert r["training"]["accepted_plus_rollback_equals_steps"] is True
 assert r["training"]["steps"] == 400
+assert r["training"]["optimizer_constructed"] is True
+assert r["training"]["parameter_update_attempted"] is True
 assert r["initial_parity"]["train_cross_event_transaction_0"]["verified"] is True
 assert r["initial_parity"]["fixed_final_64"]["verified"] is True
 assert r["control"]["exact_rcsp_parity"] is True
@@ -168,6 +190,15 @@ assert r["scientific_acceptance"] is False
 assert r["publish_allowed"] is False
 assert r["pilot_allowed"] is False
 assert r["no_further_intervention_search"] is True
+assert r["zero_start_trainability_preflight"]["passed"] is True
+assert r["zero_start_trainability_preflight"]["all_finite"] is True
+assert r["zero_start_trainability_preflight"]["any_gradient_nonzero"] is True
+assert r["zero_start_trainability_preflight"]["parameters_unchanged_after_probe"] is True
+assert r["zero_start_trainability_preflight"]["gradients_cleared_after_probe"] is True
+assert r["implementation_correction"]["defect_corrected"] is True
+assert r["implementation_correction"]["previous_runtime_commit"] == "534da47fe5939a9b09eb998c68537f49f9adf70d"
+assert r["implementation_correction"]["previous_result_scientifically_reused"] is False
+assert r["training"]["parameter_update_performed"] == r["training"]["retained_parameter_update_performed"]
 for scope in ("overall", "seen", "new"):
     assert scope in r["summaries"]
 for group in (

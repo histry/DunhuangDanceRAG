@@ -47,7 +47,9 @@ from training.refiner_optimizer import (
 SCHEMA = "refiner_support_extent_conditioned_direction_rotation_intervention_v1"
 FROZEN_PHASE21_COMMIT = "c461ba44689103cd0690488267e3bd42507ad7ab"
 FROZEN_BCTR_COMMIT = "b0cd4437cfb0144046b1408397cc5dad72471cf9"
-IMPLEMENTATION_PARENT_COMMIT = FROZEN_BCTR_COMMIT
+IMPLEMENTATION_PARENT_COMMIT = "83aa72a59508f4bba21d684648a55a63b13141ab"
+PREVIOUS_SECDR_RUNTIME_COMMIT = "534da47fe5939a9b09eb998c68537f49f9adf70d"
+PREVIOUS_SECDR_RESULT = "WIDTH_CONDITIONED_DIRECTION_INTERVENTION_NOT_SUPPORTED"
 PRIMARY_CASES = 32
 FINAL_CASES = 64
 CASES_PER_GROUP = 8
@@ -58,6 +60,8 @@ ROOT_DIM = 3
 JOINT_DIM = 72
 ROTATOR_PARAMETER_COUNT = ROOT_DIM * ROOT_DIM + JOINT_DIM * JOINT_DIM
 ROTATOR_EPS = 1.0e-12
+GRADIENT_NUMERICAL_TOL = 1.0e-14
+ROTATION_NUMERICAL_TOL = 1.0e-14
 MAJOR_GAP_FRACTION = 0.50
 PARITY_ATOL = phase2.PARITY_ATOL
 PARITY_RTOL = phase2.PARITY_RTOL
@@ -254,6 +258,22 @@ def _validate_correction_report(
     return report, report_hash
 
 
+def _validate_previous_defective_secdr_report(path: Path) -> tuple[dict[str, Any], str]:
+    """Read-only lineage check for the historical zero-gradient artifact."""
+    if not path.is_file():
+        raise FileNotFoundError(f"previous defective SECDR report does not exist: {path}")
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report_hash = _file_sha256(path)
+    if report.get("schema") != SCHEMA or report.get("completed") is not True:
+        raise ValueError("previous SECDR report schema/completed mismatch")
+    provenance = report.get("provenance", {})
+    if provenance.get("runtime_commit") != PREVIOUS_SECDR_RUNTIME_COMMIT:
+        raise ValueError("previous SECDR runtime commit mismatch")
+    if report.get("decision", {}).get("result") != PREVIOUS_SECDR_RESULT:
+        raise ValueError("previous SECDR decision result mismatch")
+    return report, report_hash
+
+
 def support_extent_fraction(joint_weight: torch.Tensor, root_weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return authoritative binary support, active-frame count and s=N_active/T."""
     support = rcsp.binary_geometry_support(joint_weight, root_weight)
@@ -366,10 +386,11 @@ class TangentDirectionRotator(nn.Module):
         v = action + q[:, None, None] * u_perp
         v_norm = v.norm(dim=-1, keepdim=True)
         action_norm = action.norm(dim=-1, keepdim=True)
-        rotated = v * action_norm / v_norm.clamp_min(ROTATOR_EPS)
+        # Keep the mathematically equivalent scale grouped so the zero-init
+        # forward remains bit-identical while the expression stays connected
+        # to W for the first gradient probe.
+        rotated = v * (action_norm / v_norm.clamp_min(ROTATOR_EPS))
         rotated = torch.where(action_norm <= ROTATOR_EPS, action, rotated)
-        update_zero = u.abs().sum(dim=-1, keepdim=True) == 0.0
-        rotated = torch.where(update_zero, action, rotated)
         # q=0 is an exact bypass, including single_recording controls and the
         # lower calibration endpoint.  This also avoids numerical drift in
         # the zero-initialized parity contract.
@@ -602,6 +623,90 @@ def _cross_train_batch(batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Ten
     return {key: value[selected] for key, value in batch.items()}
 
 
+def zero_start_trainability_preflight(
+    model: SECDRModel,
+    train_batch: Mapping[str, torch.Tensor],
+    cfg: Any,
+    calibration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Probe the authoritative TRAIN objective before constructing AdamW."""
+    model.validate_parameter_scope()
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.rotator.named_parameters()
+    }
+    before_hash = safe.state_hash(model.rotator.state_dict())
+    loss_value = None
+    backward_error = None
+    try:
+        repair, clean, _terms, _identity_terms = secdr_batch_objectives(
+            model, train_batch, cfg, calibration, capture_details=True
+        )
+        loss = repair + cfg.product_refiner_clean_identity_weight * clean
+        loss_value = _finite(loss, "SECDR zero-start trainability loss")
+        model.clear_last_details()
+        for parameter in model.rotator.parameters():
+            parameter.grad = None
+        if not loss.requires_grad:
+            backward_error = "authoritative TRAIN loss does not require grad"
+        else:
+            loss.backward()
+    finally:
+        model.clear_last_details()
+
+    gradients = {
+        "root": model.rotator.root.weight.grad,
+        "joint": model.rotator.joint.weight.grad,
+    }
+    all_finite = True
+    gradient_norms: dict[str, float | None] = {}
+    for name, gradient in gradients.items():
+        if gradient is None:
+            all_finite = False
+            gradient_norms[name] = 0.0
+            continue
+        finite = bool(torch.isfinite(gradient).all())
+        all_finite = all_finite and finite
+        gradient_norms[name] = _finite(gradient.detach().double().norm(), f"{name} zero-start gradient norm") if finite else None
+    total_gradient_norm = (
+        math.sqrt(sum(float(value) * float(value) for value in gradient_norms.values() if value is not None))
+        if all_finite else None
+    )
+    any_gradient_nonzero = bool(total_gradient_norm is not None and total_gradient_norm > GRADIENT_NUMERICAL_TOL)
+    parameters_unchanged = before_hash == safe.state_hash(model.rotator.state_dict()) and all(
+        torch.equal(parameter.detach(), before[name])
+        for name, parameter in model.rotator.named_parameters()
+    )
+    for parameter in model.rotator.parameters():
+        parameter.grad = None
+    gradients_cleared = all(parameter.grad is None for parameter in model.rotator.parameters())
+    passed = bool(
+        all_finite
+        and any_gradient_nonzero
+        and parameters_unchanged
+        and gradients_cleared
+        and backward_error is None
+    )
+    return {
+        "scope": "TRAIN transaction 0 cross_event only",
+        "cases": int(train_batch["clean"].shape[0]),
+        "optimizer_constructed": False,
+        "optimizer_steps": 0,
+        "parameter_update_attempted": False,
+        "loss": loss_value,
+        "root_gradient_norm": gradient_norms["root"],
+        "joint_gradient_norm": gradient_norms["joint"],
+        "total_gradient_norm": total_gradient_norm,
+        "numerical_zero_tolerance": GRADIENT_NUMERICAL_TOL,
+        "all_finite": all_finite,
+        "any_gradient_nonzero": any_gradient_nonzero,
+        "parameters_unchanged_after_probe": parameters_unchanged,
+        "gradients_cleared_after_probe": gradients_cleared,
+        "backward_error": backward_error,
+        "passed": passed,
+    }
+
+
 def _update_norms(model: SECDRModel, before: Mapping[str, torch.Tensor]) -> dict[str, float]:
     values = [
         (parameter.detach().double() - before[name].double()).square().sum()
@@ -631,6 +736,10 @@ def _compact_update(update: Mapping[str, Any]) -> dict[str, Any]:
 def train_rotator(model: SECDRModel, train_batch: Mapping[str, torch.Tensor], cfg: Any, calibration: Mapping[str, Any], destination: Path) -> dict[str, Any]:
     updates_path = destination / "updates.jsonl"
     updates_path.touch(exist_ok=False)
+    initial_state = {
+        name: parameter.detach().clone()
+        for name, parameter in model.rotator.named_parameters()
+    }
     optimizer = torch.optim.AdamW(model.rotator.parameters(), lr=cfg.lr, weight_decay=1.0e-4)
     summary: dict[str, Any] = {}
     started = time.perf_counter()
@@ -688,11 +797,20 @@ def train_rotator(model: SECDRModel, train_batch: Mapping[str, torch.Tensor], cf
                 "elapsed_seconds": time.perf_counter() - started,
             }, allow_nan=False), flush=True)
     validate_update_summary(summary, STEPS)
+    parameter_displacement_norm = _update_norms(model, initial_state)["total"]
+    retained_parameter_update_performed = bool(
+        parameter_displacement_norm > GRADIENT_NUMERICAL_TOL
+    )
     return {
         "optimizer_summary": summary,
+        "optimizer_constructed": True,
         "optimizer_steps": STEPS,
+        "parameter_update_attempted": STEPS > 0,
         "accepted_steps": int(summary["accepted_steps"]),
         "rollback_steps": int(summary["retained_steps"]),
+        "retained_parameter_update_performed": retained_parameter_update_performed,
+        "parameter_update_performed": retained_parameter_update_performed,
+        "parameter_displacement_norm": parameter_displacement_norm,
         "final_rotator_parameter_norm": _rotator_norms(model),
         "train_transaction_index": 0,
         "train_cases": int(train_batch["clean"].shape[0]),
@@ -1166,7 +1284,11 @@ def _mechanism(rows: list[Mapping[str, Any]], split: str, rotator_norm: Mapping[
         "cosine_strictly_improved": bool(med_secdr_cos is not None and med_rcsp_cos is not None and med_secdr_cos > med_rcsp_cos),
         "efficiency_strictly_improved": bool(med_secdr_eff is not None and med_rcsp_eff is not None and med_secdr_eff > med_rcsp_eff),
         "rotator_parameter_norm_positive": bool(rotator_norm["total"] > 0.0),
-        "at_least_one_defined_rotation": any(row.get("rotation_one_minus_cosine") is not None and row["rotation_one_minus_cosine"] > 0.0 for row in selected),
+        "at_least_one_defined_rotation": any(
+            row.get("rotation_one_minus_cosine") is not None
+            and row["rotation_one_minus_cosine"] > ROTATION_NUMERICAL_TOL
+            for row in selected
+        ),
         "root_joint_norm_preservation": all(
             float(row["predecoder_norm_preservation_error"]["root_max_abs_error"]) <= PARITY_ATOL
             and float(row["predecoder_norm_preservation_error"]["joint_max_abs_error"]) <= PARITY_ATOL
@@ -1241,16 +1363,22 @@ def run(args: argparse.Namespace) -> int:
     phase21_path = Path(args.phase21_report).resolve()
     bctr_path = Path(args.bctr_report).resolve()
     correction_path = Path(args.bctr_correction_report).resolve()
+    previous_secdr_path = Path(args.previous_defective_secdr_report).resolve()
     output = Path(args.output_dir).resolve()
     phase21_report, phase21_hash, lineage_paths, upstream = bctr._validate_phase21_lineage(phase21_path)
     if phase21_report.get("provenance", {}).get("runtime_commit") != FROZEN_PHASE21_COMMIT:
         raise ValueError("Phase 2.1 runtime commit is not frozen")
     bctr_report, bctr_hash = _validate_bctr_report(bctr_path, phase21_path, phase21_hash)
     correction_report, correction_hash = _validate_correction_report(correction_path, bctr_path, bctr_hash)
+    previous_secdr_report, previous_secdr_hash = _validate_previous_defective_secdr_report(previous_secdr_path)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError("SECDR output directory must be a fresh empty directory")
     immutable = bctr._immutable_paths(lineage_paths, phase21_path)
-    immutable.update({"bctr/report.json": bctr_path, "bctr_correction/report.json": correction_path})
+    immutable.update({
+        "bctr/report.json": bctr_path,
+        "bctr_correction/report.json": correction_path,
+        "previous_defective_secdr/report.json": previous_secdr_path,
+    })
     if any(output == path or output.is_relative_to(path) for path in immutable.values()):
         raise FileExistsError("SECDR output overlaps immutable lineage input")
     runtime_commit = m._training_code_revision()
@@ -1274,6 +1402,7 @@ def run(args: argparse.Namespace) -> int:
     implementation_before = {name: _file_sha256(path) for name, path in implementation_paths.items()}
     state = bank = cfg = source_metadata = None
     base = rcsp_model = secdr_model = None
+    zero_start_trainability = None
     try:
         trajectory, trajectory_paths, trajectory_hashes, trajectory_report, _experiment, _checkpoint = failure._load_trajectory(
             lineage_paths["trajectory"], failure.TRAJECTORY_COMMIT
@@ -1301,6 +1430,11 @@ def run(args: argparse.Namespace) -> int:
             secdr_model = SECDRModel(rcsp_model, calibration["s_min"], calibration["s_max"]).to(device)
             zero_init = secdr_model.validate_zero_initialization()
             train_parity = _zero_parity(base, rcsp_model, secdr_model, train_batch, cfg, calibration)
+            zero_start_trainability = zero_start_trainability_preflight(
+                secdr_model, train_batch, cfg, calibration
+            )
+            if not zero_start_trainability["passed"]:
+                raise RuntimeError("zero_start_trainability_preflight failed closed")
             probe, probe_hash = safe.load_probe(lineage_paths["source"], state, bank, cfg)
             final_batch, final_metadata = alignment.combine_final_banks(failure.final_banks(bank, probe, cfg))
             final_batch = rcsp._move_batch(final_batch, device)
@@ -1376,13 +1510,19 @@ def run(args: argparse.Namespace) -> int:
             "base_unchanged": base_after == base_hash,
             "rcsp_adapter_unchanged": adapter_after == adapter_hash,
             "frozen_input_artifacts_unchanged": before_files == source_after,
+            "previous_defective_secdr_report_unchanged": before_files["previous_defective_secdr/report.json"] == source_after["previous_defective_secdr/report.json"],
             "production_source_unchanged": implementation_before == implementation_after,
             "base_and_rcsp_gradients_none": grads_none,
             "only_rotator_parameters_trainable": True,
             "optimizer_parameter_scope_exact": True,
             "optimizer_steps": STEPS,
-            "optimizer_constructed": True,
-            "parameter_update_performed": True,
+            "optimizer_constructed": training["optimizer_constructed"],
+            "parameter_update_attempted": training["parameter_update_attempted"],
+            "accepted_steps": training["accepted_steps"],
+            "rollback_steps": training["rollback_steps"],
+            "retained_parameter_update_performed": training["retained_parameter_update_performed"],
+            "parameter_update_performed": training["parameter_update_performed"],
+            "trial_evaluations": int(training["optimizer_summary"].get("trial_evaluations", 0)),
             "checkpoint_selection_performed": False,
             "scale_selection_performed": False,
             "architecture_selection_performed": False,
@@ -1407,6 +1547,8 @@ def run(args: argparse.Namespace) -> int:
                 "bctr_report_sha256": bctr_hash,
                 "bctr_correction_report": str(correction_path),
                 "bctr_correction_report_sha256": correction_hash,
+                "previous_defective_secdr_report": str(previous_secdr_path),
+                "previous_defective_secdr_report_sha256": previous_secdr_hash,
                 "source": str(lineage_paths["source"]),
                 "trajectory": str(trajectory),
                 "rcsp_directory": str(lineage_paths["rcsp_directory"]),
@@ -1439,6 +1581,25 @@ def run(args: argparse.Namespace) -> int:
                 "bctr_unsupported": True,
                 "metric_search_stopped": True,
                 "only_direction_intervention": True,
+            },
+            "implementation_correction": {
+                "type": "ZERO_GRADIENT_DEADLOCK",
+                "defect_corrected": True,
+                "previous_runtime_commit": PREVIOUS_SECDR_RUNTIME_COMMIT,
+                "previous_report": str(previous_secdr_path),
+                "previous_report_sha256": previous_secdr_hash,
+                "previous_result": previous_secdr_report["decision"]["result"],
+                "previous_result_scientifically_reused": False,
+                "defect": "zero-initialized u=W*a was used as a forward bypass, disconnecting the rotator from the authoritative objective",
+                "experiment_design_changed": False,
+                "architecture_changed": False,
+                "objective_changed": False,
+                "optimizer_changed": False,
+                "data_changed": False,
+                "conditioner_changed": False,
+                "metric_changed": False,
+                "gate_changed": False,
+                "decision_rule_changed": False,
             },
             "intervention": {
                 "name": "Support-Extent Conditioned Direction Rotation",
@@ -1474,6 +1635,7 @@ def run(args: argparse.Namespace) -> int:
                 "parameter_count": ROTATOR_PARAMETER_COUNT,
                 "initialization": zero_init,
                 "epsilon_numerical_only": ROTATOR_EPS,
+                "rotation_numerical_tolerance": ROTATION_NUMERICAL_TOL,
                 "zero_action_behavior": "return original block when norm <= eps",
                 "orthogonal_residual": "u_perp=u-a*(a^T u)/(||a||^2+eps)",
                 "norm_preservation": "a_prime=v*||a||/max(||v||,eps)",
@@ -1498,9 +1660,16 @@ def run(args: argparse.Namespace) -> int:
                 "direction_cosine_loss_added": False,
                 "width_loss_added": False,
                 "optimizer": "authoritative AdamW + checked Armijo + rollback",
+                "optimizer_constructed": training["optimizer_constructed"],
                 "steps": STEPS,
+                "optimizer_steps": training["optimizer_steps"],
+                "parameter_update_attempted": training["parameter_update_attempted"],
                 "accepted_steps": training["accepted_steps"],
                 "rollback_steps": training["rollback_steps"],
+                "retained_parameter_update_performed": training["retained_parameter_update_performed"],
+                "parameter_update_performed": training["parameter_update_performed"],
+                "parameter_displacement_norm": training["parameter_displacement_norm"],
+                "trial_evaluations": int(training["optimizer_summary"].get("trial_evaluations", 0)),
                 "accepted_plus_rollback_equals_steps": training["accepted_steps"] + training["rollback_steps"] == STEPS,
                 "attempt_accounting": training["optimizer_summary"],
                 "updates_artifact": training["updates_artifact"],
@@ -1512,6 +1681,7 @@ def run(args: argparse.Namespace) -> int:
                 "current_temporal_metric_and_endpoint_metric_verified": True,
                 "contact_raw_correction_projected_action_final_tangent_decoded_observable_current_temporal_endpoint": True,
             },
+            "zero_start_trainability_preflight": zero_start_trainability,
             "cohort": {
                 "primary_cases": PRIMARY_CASES,
                 "groups": {group: CASES_PER_GROUP for group in GROUP_ORDER},
@@ -1537,8 +1707,14 @@ def run(args: argparse.Namespace) -> int:
             "mechanism": mechanism,
             "decision": decision,
             "state_integrity": integrity,
-            "optimizer_steps": STEPS,
-            "parameter_update_performed": True,
+            "optimizer_constructed": training["optimizer_constructed"],
+            "optimizer_steps": training["optimizer_steps"],
+            "parameter_update_attempted": training["parameter_update_attempted"],
+            "accepted_steps": training["accepted_steps"],
+            "rollback_steps": training["rollback_steps"],
+            "retained_parameter_update_performed": training["retained_parameter_update_performed"],
+            "parameter_update_performed": training["parameter_update_performed"],
+            "trial_evaluations": int(training["optimizer_summary"].get("trial_evaluations", 0)),
             "production_model_modified": False,
             "production_inference_modified": False,
             "scientific_acceptance": False,
@@ -1571,11 +1747,27 @@ def run(args: argparse.Namespace) -> int:
                 "completed": False,
                 "error": {"type": type(error).__name__, "message": str(error)},
                 "optimizer_steps": 0,
+                "optimizer_constructed": False,
+                "parameter_update_attempted": False,
+                "accepted_steps": 0,
+                "rollback_steps": 0,
+                "retained_parameter_update_performed": False,
+                "parameter_update_performed": False,
                 "production_model_modified": False,
                 "production_inference_modified": False,
                 "scientific_acceptance": False,
                 "publish_allowed": False,
                 "pilot_allowed": False,
+                "implementation_correction": {
+                    "type": "ZERO_GRADIENT_DEADLOCK",
+                    "defect_corrected": True,
+                    "previous_runtime_commit": PREVIOUS_SECDR_RUNTIME_COMMIT,
+                    "previous_report": str(previous_secdr_path),
+                    "previous_report_sha256": previous_secdr_hash,
+                    "previous_result": PREVIOUS_SECDR_RESULT,
+                    "previous_result_scientifically_reused": False,
+                },
+                "zero_start_trainability_preflight": zero_start_trainability,
             })
         raise
 
@@ -1585,6 +1777,7 @@ def main() -> int:
     parser.add_argument("--phase21-report", required=True)
     parser.add_argument("--bctr-report", required=True)
     parser.add_argument("--bctr-correction-report", required=True)
+    parser.add_argument("--previous-defective-secdr-report", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected-main-commit", required=True)
     parser.add_argument("--device", default="cuda")
