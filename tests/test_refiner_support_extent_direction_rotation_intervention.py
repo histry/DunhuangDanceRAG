@@ -335,7 +335,7 @@ def test_training_scope_names_only_rotator_weights():
     source = Path(audit.__file__).read_text(encoding="utf-8")
     assert "model.rotator.parameters()" in source
     assert "self.base.parameters()" in source
-    assert "model.rcsp.adapter.parameters()" in source
+    assert "self.rcsp.adapter.parameters()" in source
 
 
 def test_no_width_head_or_width_loss_is_declared():
