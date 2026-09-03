@@ -706,9 +706,9 @@ def train_rotator(model: SECDRModel, train_batch: Mapping[str, torch.Tensor], cf
     }
 
 
-def _base_outputs(base, batch, cfg):
+def _base_outputs(base, batch, cfg, *, trace=None):
     with alignment._capture_model_output(base) as captured:
-        prediction, identity = m._refiner_batch_outputs(base, batch, cfg)
+        prediction, identity = m._refiner_batch_outputs(base, batch, cfg, trace=trace)
     if len(captured) != 1:
         raise RuntimeError("BASE output capture requires exactly one forward")
     return prediction, identity, captured[0].transpose(1, 2).detach()
@@ -716,7 +716,7 @@ def _base_outputs(base, batch, cfg):
 
 def _block_norms(action: torch.Tensor) -> dict[str, Any]:
     root = action[..., :3].double().norm(dim=-1)
-    joint = action[..., 3:].reshape(action.shape[:-1] + (24, 3)).double().norm(dim=-1)
+    joint = action[..., 3:].double().norm(dim=-1)
     return {
         "root_max": _finite(root.max(), "root action norm"),
         "root_mean": _finite(root.mean(), "root action norm mean"),
@@ -728,8 +728,8 @@ def _block_norms(action: torch.Tensor) -> dict[str, Any]:
 def _block_norm_error(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
     left_root = left[..., :3].double().norm(dim=-1)
     right_root = right[..., :3].double().norm(dim=-1)
-    left_joint = left[..., 3:].reshape(left.shape[:-1] + (24, 3)).double().norm(dim=-1)
-    right_joint = right[..., 3:].reshape(right.shape[:-1] + (24, 3)).double().norm(dim=-1)
+    left_joint = left[..., 3:].double().norm(dim=-1)
+    right_joint = right[..., 3:].double().norm(dim=-1)
     return {
         "root_max_abs_error": _finite((left_root - right_root).abs().max(), "root norm preservation error"),
         "joint_max_abs_error": _finite((left_joint - right_joint).abs().max(), "joint norm preservation error"),
@@ -883,7 +883,9 @@ def _evaluate_chunk(
     rcsp_trace: dict[str, Any] = {}
     secdr_trace: dict[str, Any] = {}
     with torch.no_grad():
-        base_prediction, base_identity, _base_raw = _base_outputs(base, batch, cfg)
+        base_prediction, base_identity, _base_raw = _base_outputs(
+            base, batch, cfg, trace=base_trace
+        )
         rcsp_prediction, rcsp_identity = rcsp.rcsp_batch_outputs(
             rcsp_model, batch, cfg, trace=rcsp_trace, capture_details=True
         )
