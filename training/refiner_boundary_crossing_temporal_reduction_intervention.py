@@ -537,8 +537,8 @@ def _scope_summary(rows: list[Mapping[str, Any]], scope: str) -> dict[str, Any]:
     bctr_gap = _gap(bctr10, bctr28)
     current_pass = sum(bool(row["current"]["temporal_pass_rcsp"]) for row in rows)
     bctr_pass = sum(bool(row["bctr"]["candidate_temporal_pass_rcsp"]) for row in rows)
-    current_base_pass = sum(bool(row["current"]["temporal_pass_base"]) for row in rows)
-    bctr_base_pass = sum(bool(row["bctr"]["candidate_temporal_pass_base"]) for row in rows)
+    current_base_pass = sum(bool(row["current"].get("temporal_pass_base", False)) for row in rows)
+    bctr_base_pass = sum(bool(row["bctr"].get("candidate_temporal_pass_base", False)) for row in rows)
     newly_rescued = [row["identity"] for row in rows if not row["current"]["temporal_pass_rcsp"] and row["bctr"]["candidate_temporal_pass_rcsp"]]
     width10_lost = [row["identity"] for row in rows if int(row["width"]) == 10 and row["current"]["temporal_pass_rcsp"] and not row["bctr"]["candidate_temporal_pass_rcsp"]]
     delta10 = None if bctr10 is None or current10 is None else float(bctr10 - current10)

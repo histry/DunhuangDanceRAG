@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from training import refiner_boundary_crossing_temporal_reduction_intervention as audit
+from training import refiner_width_mechanism_adjudication_audit as phase21
 
 
 def _cfg(threshold: float = 0.03):
@@ -107,7 +108,7 @@ def test_crossing_support_has_no_width_parameter():
 
 def test_crossing_support_selects_mixed_stencils_only():
     seam = torch.tensor([[[0.0], [0.0], [1.0], [1.0], [1.0], [0.0]]])
-    assert audit.boundary_crossing_support(seam, 2).tolist() == [[True, False, True]]
+    assert audit.boundary_crossing_support(seam, 2).tolist() == [[True, True, False, True]]
 
 
 def test_crossing_support_rejects_pure_core_and_pure_outside_stencils():
@@ -290,14 +291,14 @@ def test_validate_phase21_rejects_wrong_schema(tmp_path):
 
 def test_validate_phase21_rejects_uncompleted_report(tmp_path):
     path = tmp_path / "report.json"
-    path.write_text(json.dumps({"schema": audit.SCHEMA, "completed": False}), encoding="utf-8")
+    path.write_text(json.dumps({"schema": phase21.SCHEMA, "completed": False}), encoding="utf-8")
     with pytest.raises(ValueError, match="completed"):
         audit._validate_phase21_lineage(path)
 
 
 def test_validate_phase21_rejects_wrong_frozen_runtime(tmp_path):
     path = tmp_path / "report.json"
-    path.write_text(json.dumps({"schema": audit.SCHEMA, "completed": True, "provenance": {"runtime_commit": "old"}}), encoding="utf-8")
+    path.write_text(json.dumps({"schema": phase21.SCHEMA, "completed": True, "provenance": {"runtime_commit": "old"}}), encoding="utf-8")
     with pytest.raises(ValueError, match="frozen parent"):
         audit._validate_phase21_lineage(path)
 
