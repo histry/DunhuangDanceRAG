@@ -150,7 +150,7 @@ from pathlib import Path
 r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert r["schema"] == "refiner_support_extent_conditioned_direction_rotation_intervention_v1"
 assert r["completed"] is True
-assert r["primary_cohort"]["cases"] == 32
+assert r["cohort"]["primary_cases"] == 32
 assert r["training"]["transaction_index"] == 0
 assert r["training"]["cross_event_cases"] == 96
 assert r["training"]["accepted_plus_rollback_equals_steps"] is True
