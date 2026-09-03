@@ -245,6 +245,20 @@ def test_scope_summary_allows_non_degraded_width10_median():
     assert summary["width10_median_gain_non_degraded"] is True
 
 
+def test_scope_summary_reports_all_and_width_specific_rescue_lists():
+    rows = [
+        _row("seen", 10, 0, 0.01, 0.04),
+        _row("seen", 28, 1, 0.01, 0.04),
+        _row("seen", 28, 2, 0.04, 0.04),
+    ]
+    summary = audit._scope_summary(rows, "seen")
+    assert summary["newly_rescued_cases"] == [
+        "seen/cross_event/10/0", "seen/cross_event/28/1"
+    ]
+    assert summary["width10_newly_rescued_cases"] == ["seen/cross_event/10/0"]
+    assert summary["width28_newly_rescued_cases"] == ["seen/cross_event/28/1"]
+
+
 def test_make_summaries_has_overall_seen_and_new_only():
     rows = [_row(split, width, index, 0.2 if width == 10 else 0.3, 0.2 if width == 10 else 0.4)
             for split in ("seen", "new_position") for width in (10, 28) for index in range(8)]

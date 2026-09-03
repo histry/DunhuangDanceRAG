@@ -544,7 +544,26 @@ def _scope_summary(rows: list[Mapping[str, Any]], scope: str) -> dict[str, Any]:
     bctr_pass = sum(bool(row["bctr"]["candidate_temporal_pass_rcsp"]) for row in rows)
     current_base_pass = sum(bool(row["current"].get("temporal_pass_base", False)) for row in rows)
     bctr_base_pass = sum(bool(row["bctr"].get("candidate_temporal_pass_base", False)) for row in rows)
-    newly_rescued = [row["identity"] for row in rows if not row["current"]["temporal_pass_rcsp"] and row["bctr"]["candidate_temporal_pass_rcsp"]]
+    newly_rescued = [
+        row["identity"]
+        for row in rows
+        if not row["current"]["temporal_pass_rcsp"]
+        and row["bctr"]["candidate_temporal_pass_rcsp"]
+    ]
+    width10_newly_rescued = [
+        row["identity"]
+        for row in rows
+        if not row["current"]["temporal_pass_rcsp"]
+        and row["bctr"]["candidate_temporal_pass_rcsp"]
+        and int(row["width"]) == 10
+    ]
+    width28_newly_rescued = [
+        row["identity"]
+        for row in rows
+        if not row["current"]["temporal_pass_rcsp"]
+        and row["bctr"]["candidate_temporal_pass_rcsp"]
+        and int(row["width"]) == 28
+    ]
     width10_lost = [row["identity"] for row in rows if int(row["width"]) == 10 and row["current"]["temporal_pass_rcsp"] and not row["bctr"]["candidate_temporal_pass_rcsp"]]
     delta10 = None if bctr10 is None or current10 is None else float(bctr10 - current10)
     delta28 = None if bctr28 is None or current28 is None else float(bctr28 - current28)
@@ -573,7 +592,9 @@ def _scope_summary(rows: list[Mapping[str, Any]], scope: str) -> dict[str, Any]:
         "bctr_gap_shrink_fraction": gap_shrink,
         "bctr_temporal_pass_count_rcsp": bctr_pass,
         "bctr_temporal_pass_count_base": bctr_base_pass,
-        "width28_newly_rescued_cases": newly_rescued,
+        "newly_rescued_cases": newly_rescued,
+        "width10_newly_rescued_cases": width10_newly_rescued,
+        "width28_newly_rescued_cases": width28_newly_rescued,
         "width10_lost_cases": width10_lost,
         "delta_width28_gain": delta28,
         "delta_width10_gain": delta10,
