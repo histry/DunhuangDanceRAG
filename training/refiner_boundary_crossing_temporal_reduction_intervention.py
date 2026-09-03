@@ -139,7 +139,10 @@ def _validate_phase21_lineage(path: Path) -> tuple[dict[str, Any], str, dict[str
         "scientific_acceptance", "publish_allowed", "pilot_allowed",
     ):
         _bool_exact(report.get(field), False, f"Phase 2.1 {field}")
-    for field in ("parameter_update_performed", "production_model_modified"):
+    for field in (
+        "parameter_update_performed", "production_model_modified", "production_inference_modified",
+        "scientific_acceptance", "publish_allowed", "pilot_allowed",
+    ):
         _bool_exact(integrity.get(field), False, f"Phase 2.1 state_integrity.{field}")
     _bool_exact(integrity.get("base_unchanged"), True, "Phase 2.1 base_unchanged")
     _bool_exact(integrity.get("adapter_unchanged"), True, "Phase 2.1 adapter_unchanged")
@@ -778,6 +781,7 @@ def _run(args: argparse.Namespace) -> int:
                 "single_decomposition_report": str(lineage_paths["single_decomposition_report"]),
                 "parameter_attribution_report": str(lineage_paths["parameter_attribution_report"]),
                 "phase21_immutable_input_sha256": before_files,
+                "immutable_input_sha256": before_files,
                 "implementation_sha256_before": implementation_before,
                 "implementation_sha256_after": implementation_after,
             },
