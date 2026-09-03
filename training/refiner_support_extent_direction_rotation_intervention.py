@@ -963,6 +963,7 @@ def _evaluate_chunk(
             "support_extent_fraction": _finite(fraction[index], "support extent fraction"),
             "active_support_frames": int(active[index]),
             "conditioner_q": _finite(q[index], "conditioner q"),
+            "q": _finite(q[index], "conditioner q"),
             "M_before": current["M_before"],
             "M_base": current["M_base"],
             "M_rcsp": current["M_rcsp"],
