@@ -254,7 +254,9 @@ def _validate_phase2(
     _exact(report.get("schema"), PHASE2_SCHEMA, "Phase 2 schema")
     _validate_read_only(report, "Phase 2", optimizer_steps=0)
     _exact(_get(report, "primary_cohort", "cases"), 32, "Phase 2 primary cases")
-    _exact(_get(report, "primary_cohort", "role"), "cross_event", "Phase 2 primary role")
+    primary_roles = _get(report, "primary_cohort", "roles")
+    if not isinstance(primary_roles, list) or "cross_event" not in primary_roles:
+        raise EvidenceIntegrityError("Phase 2 primary cohort does not declare cross_event")
     _exact(report.get("fake_case_pairing_performed"), False, "Phase 2 fake pairing")
     _exact(_get(report, "provenance", "rcsp_directory"), str(rcsp_directory), "Phase 2 RCSP directory")
     _same_path(_get(report, "provenance", "parameter_attribution_report"), parameter_path, "Phase 2 parameter report")
