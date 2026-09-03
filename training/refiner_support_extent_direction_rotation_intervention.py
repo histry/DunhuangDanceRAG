@@ -525,7 +525,10 @@ class SECDRModel(nn.Module):
             # full base geometry.  Keep it for the report and clear it after
             # the consuming batch.
             _ = rotation_details
-        output = self.out(raw_output)
+        # Keep the output-head hook layout identical to the production
+        # Conv1d head: the alignment audit captures [B,C,T] and transposes it
+        # back to the public [B,T,C] refiner layout.
+        output = self.out(raw_output.transpose(1, 2)).transpose(1, 2)
         if capture_details:
             self._last_details = {
                 "role_id": role_id.detach(),
