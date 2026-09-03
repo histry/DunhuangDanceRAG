@@ -1,5 +1,7 @@
 # RPA-LRTA: Role–Phase–Anatomy Conditioned Low-Rank Tangent Adaptation
 
+> Implementation correction: deterministic no-descent fixed-point termination (v2). The scientific RPA-LRTA architecture and optimizer acceptance rules are unchanged.
+
 ## Scope
 
 RPA-LRTA is a research-method candidate layered on the frozen A0
@@ -169,3 +171,56 @@ I. cross/28 total-action temporal alignment improves
 
 Even `RPA_LRTA_CANDIDATE_ADVANCE_REVIEW` does **not** authorize Pilot or
 production integration.
+
+
+## Deterministic no-descent fixed-point correction
+
+The original v1 formal run exposed a deterministic rejection loop after the
+RPA state reached an optimization plateau. With frozen TRAIN transaction 0,
+a rejected `checked_refiner_step` restores both parameters and the complete
+AdamW state. Repeating the next outer step from that exact state therefore
+recomputes the same gradient and can reproduce the same bounded Armijo failure.
+
+RPA-LRTA v2 does **not** alter:
+
+- the 400-attempt budget,
+- AdamW hyperparameters,
+- `checked_refiner_step`,
+- Armijo acceptance,
+- current-gradient rescue,
+- group guard,
+- loss/objective,
+- model architecture,
+- ranks,
+- TRAIN cohort,
+- final64 evaluation.
+
+Instead, the outer RPA loop records one fully rolled-back
+`bounded_search_no_descent` candidate and executes the next attempt normally.
+It terminates before exhausting the remaining budget only if the immediately
+following attempt repeats **exactly**:
+
+- adapter pre/post state hash,
+- optimizer pre/post state hash,
+- clipped gradient hash,
+- objective value,
+- complete trial-list hash,
+- rejection counts and reason.
+
+This is not patience-based early stopping. There is no patience hyperparameter.
+The confirmation attempt is actually executed. When confirmed, the report uses:
+
+```text
+termination_reason = DETERMINISTIC_NO_DESCENT_FIXED_POINT
+attempt_budget = 400
+attempted_steps = <actual>
+remaining_budget_not_executed = 400 - <actual>
+last_accepted_step = <step>
+```
+
+The final model state is the state after the last accepted update; the two
+confirmatory no-descent attempts are fully rolled back.
+
+A v1 interrupted run must remain immutable and must not be reused as the v2
+formal result. The corrected run must start from step 0 in a fresh create-only
+run directory.

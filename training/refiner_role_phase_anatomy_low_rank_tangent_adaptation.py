@@ -26,14 +26,15 @@ then passed once through the unchanged production decoder.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import dataclasses
 import hashlib
 import json
 import math
-from pathlib import Path
 import time
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -60,13 +61,13 @@ from training.refiner_optimizer import (
     validate_update_summary,
 )
 
-
-SCHEMA = "refiner_role_phase_anatomy_low_rank_tangent_adaptation_experiment_v1"
+SCHEMA = "refiner_role_phase_anatomy_low_rank_tangent_adaptation_experiment_v2"
 
 # The patch supplied with this file is adapted to this exact latest-main base.
-IMPLEMENTATION_PARENT_COMMIT = "7a360736db0a184f137446f7da20f23b04fb97ad"
+IMPLEMENTATION_PARENT_COMMIT = "b59fbdbf29e8b44fb9758ca7894da92cc3eb3db1"
 
 STEPS = 400
+TERMINATION_PROTOCOL = "deterministic_no_descent_fixed_point_v1"
 GEOMETRY_DIM = 75
 ROOT_DIM = 3
 JOINT_DIM = 72
@@ -856,6 +857,218 @@ def _update_norm(
     return math.sqrt(sum(float(value) for value in squares))
 
 
+
+def _canonical_tree_sha256(value: Any) -> str:
+    """Stable hash for optimizer/gradient/rejection trees.
+
+    This is provenance/termination bookkeeping only.  It never changes the
+    optimizer proposal, loss, acceptance gate, or model output.
+    """
+    digest = hashlib.sha256()
+
+    def visit(node: Any) -> None:
+        if torch.is_tensor(node):
+            tensor = node.detach().cpu().contiguous()
+            digest.update(b"T")
+            digest.update(str(tensor.dtype).encode())
+            digest.update(json.dumps(list(tensor.shape)).encode())
+            digest.update(tensor.numpy().tobytes())
+            return
+        if isinstance(node, Mapping):
+            digest.update(b"M")
+            for key in sorted(node, key=lambda item: repr(item)):
+                visit(key)
+                visit(node[key])
+            digest.update(b"m")
+            return
+        if isinstance(node, (list, tuple)):
+            digest.update(b"L" if isinstance(node, list) else b"Q")
+            for item in node:
+                visit(item)
+            digest.update(b"l")
+            return
+        if node is None:
+            digest.update(b"N")
+            return
+        if isinstance(node, bool):
+            digest.update(b"B1" if node else b"B0")
+            return
+        if isinstance(node, int):
+            digest.update(b"I")
+            digest.update(str(node).encode())
+            return
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise FloatingPointError("nonfinite value in deterministic hash")
+            digest.update(b"F")
+            digest.update(node.hex().encode())
+            return
+        if isinstance(node, str):
+            digest.update(b"S")
+            digest.update(node.encode("utf-8"))
+            return
+        raise TypeError(
+            f"unsupported deterministic-hash node type: {type(node).__name__}"
+        )
+
+    visit(value)
+    return digest.hexdigest()
+
+
+def _named_gradient_sha256(module: nn.Module) -> str:
+    gradients: dict[str, torch.Tensor | None] = {}
+    for name, parameter in module.named_parameters():
+        gradients[name] = (
+            None
+            if parameter.grad is None
+            else parameter.grad.detach().cpu().contiguous()
+        )
+    return _canonical_tree_sha256(gradients)
+
+
+class DeterministicNoDescentFixedPointDetector:
+    """Confirm one repeated, fully rolled-back no-descent optimizer state.
+
+    No patience hyperparameter is used.  The first eligible rejection is only
+    recorded.  The immediately following attempt is executed normally.  A
+    fixed point is declared only if the complete pre-step state and complete
+    rejection signature repeat exactly after the optimizer rollback.
+    """
+
+    def __init__(self):
+        self.pending: dict[str, Any] | None = None
+
+    @staticmethod
+    def _eligible(
+        update: Mapping[str, Any],
+        *,
+        adapter_rollback_exact: bool,
+        optimizer_rollback_exact: bool,
+    ) -> bool:
+        return bool(
+            not update["optimizer_update_accepted"]
+            and update.get("reason") == "bounded_search_no_descent"
+            and adapter_rollback_exact
+            and optimizer_rollback_exact
+        )
+
+    @staticmethod
+    def _payload(
+        *,
+        loss_before: float,
+        adapter_state_sha256: str,
+        optimizer_state_sha256: str,
+        gradient_sha256: str,
+        update: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "loss_before": float(loss_before),
+            "adapter_state_sha256": adapter_state_sha256,
+            "optimizer_state_sha256": optimizer_state_sha256,
+            "gradient_sha256": gradient_sha256,
+            "reason": update.get("reason"),
+            "direction": update.get("direction"),
+            "step_scale": float(update.get("step_scale", 0.0)),
+            "trial_evaluations": int(update.get("trial_evaluations", 0)),
+            "loss_rejected_trials": int(update.get("loss_rejected_trials", 0)),
+            "nonfinite_trials": int(update.get("nonfinite_trials", 0)),
+            "insufficient_decrease_trials": int(
+                update.get("insufficient_decrease_trials", 0)
+            ),
+            "group_guard_rejected_trials": int(
+                update.get("group_guard_rejected_trials", 0)
+            ),
+            "used_gradient_rescue": bool(
+                update.get("used_gradient_rescue", False)
+            ),
+            "adam_directional_derivative": update.get(
+                "adam_directional_derivative"
+            ),
+            "minimum_loss_decrease": float(
+                update.get("minimum_loss_decrease", 0.0)
+            ),
+            "group_guard_before": update.get("group_guard_before"),
+            "group_guard_last_violations": update.get(
+                "group_guard_last_violations"
+            ),
+            # Hash the full trial list so "same rejection" cannot mean merely
+            # the same summary counts.
+            "trials_sha256": _canonical_tree_sha256(
+                update.get("trials", [])
+            ),
+        }
+
+    def observe(
+        self,
+        *,
+        step: int,
+        loss_before: float,
+        adapter_state_before_sha256: str,
+        adapter_state_after_sha256: str,
+        optimizer_state_before_sha256: str,
+        optimizer_state_after_sha256: str,
+        gradient_sha256: str,
+        update: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        adapter_rollback_exact = (
+            adapter_state_after_sha256 == adapter_state_before_sha256
+        )
+        optimizer_rollback_exact = (
+            optimizer_state_after_sha256 == optimizer_state_before_sha256
+        )
+        if not self._eligible(
+            update,
+            adapter_rollback_exact=adapter_rollback_exact,
+            optimizer_rollback_exact=optimizer_rollback_exact,
+        ):
+            self.pending = None
+            return None
+
+        payload = self._payload(
+            loss_before=loss_before,
+            adapter_state_sha256=adapter_state_before_sha256,
+            optimizer_state_sha256=optimizer_state_before_sha256,
+            gradient_sha256=gradient_sha256,
+            update=update,
+        )
+        signature = _canonical_tree_sha256(payload)
+        current = {
+            "step": int(step),
+            "signature_sha256": signature,
+            "payload": payload,
+            "adapter_rollback_exact": adapter_rollback_exact,
+            "optimizer_rollback_exact": optimizer_rollback_exact,
+        }
+
+        if (
+            self.pending is not None
+            and self.pending["step"] == int(step) - 1
+            and self.pending["signature_sha256"] == signature
+        ):
+            result = {
+                "protocol": TERMINATION_PROTOCOL,
+                "confirmed": True,
+                "first_rejected_step": int(self.pending["step"]),
+                "confirmation_step": int(step),
+                "signature_sha256": signature,
+                "state_repeated_exactly": True,
+                "optimizer_state_repeated_exactly": True,
+                "gradient_repeated_exactly": True,
+                "loss_repeated_exactly": True,
+                "trial_rejection_repeated_exactly": True,
+                "confirmation_attempt_executed": True,
+                "patience_threshold_used": False,
+                "heuristic_early_stopping": False,
+                "scientific_acceptance_changed": False,
+                "optimizer_acceptance_rule_changed": False,
+            }
+            self.pending = current
+            return result
+
+        self.pending = current
+        return None
+
+
 def _compact_update(update: Mapping[str, Any]) -> dict[str, Any]:
     keys = (
         "protocol",
@@ -889,7 +1102,13 @@ def train_rpa(
     cfg: Any,
     destination: Path,
 ) -> dict[str, Any]:
-    """Exactly 400 checked attempts on frozen TRAIN transaction 0."""
+    """Up to 400 checked attempts, with exact deterministic fixed-point exit.
+
+    The scientific budget remains 400.  The optimizer, Armijo rule, gradient
+    rescue, subgroup guard, LR, loss, and batch are unchanged.  We stop before
+    exhausting the budget only after one full confirmatory retry reproduces the
+    exact same fully rolled-back ``bounded_search_no_descent`` state.
+    """
     updates_path = destination / "updates.jsonl"
     updates_path.touch(exist_ok=False)
     initial = {
@@ -902,6 +1121,9 @@ def train_rpa(
         model.adapter.parameters(), lr=cfg.lr, weight_decay=1.0e-4
     )
     summary: dict[str, Any] = {}
+    detector = DeterministicNoDescentFixedPointDetector()
+    fixed_point: dict[str, Any] | None = None
+    last_accepted_step = 0
     started = time.perf_counter()
     model.train()
 
@@ -929,6 +1151,14 @@ def train_rpa(
                 model.adapter.parameters(), 1.0, error_if_nonfinite=True
             )
         )
+
+        adapter_state_before_sha256 = _state_hash(model.adapter)
+        optimizer_state_before_sha256 = _canonical_tree_sha256(
+            optimizer.state_dict()
+        )
+        gradient_sha256 = _named_gradient_sha256(model.adapter)
+        loss_before = _finite(loss, "RPA training objective")
+
         update = checked_refiner_step(
             optimizer,
             loss,
@@ -954,25 +1184,53 @@ def train_rpa(
             and displacement != 0.0
         ):
             raise RuntimeError("rolled-back RPA step changed parameters")
+        if bool(update["optimizer_update_accepted"]):
+            last_accepted_step = step
+
+        adapter_state_after_sha256 = _state_hash(model.adapter)
+        optimizer_state_after_sha256 = _canonical_tree_sha256(
+            optimizer.state_dict()
+        )
+        fixed_point = detector.observe(
+            step=step,
+            loss_before=loss_before,
+            adapter_state_before_sha256=adapter_state_before_sha256,
+            adapter_state_after_sha256=adapter_state_after_sha256,
+            optimizer_state_before_sha256=optimizer_state_before_sha256,
+            optimizer_state_after_sha256=optimizer_state_after_sha256,
+            gradient_sha256=gradient_sha256,
+            update=update,
+        )
 
         row = {
             "step": step,
             "state_position": "after_checked_step",
             "transaction_index": 0,
             "cases": int(train_batch["clean"].shape[0]),
-            "training_objective_before": _finite(
-                loss, "RPA training objective"
-            ),
+            "training_objective_before": loss_before,
             "optimizer": _compact_update(update),
             "accepted": bool(update["optimizer_update_accepted"]),
             "rolled_back": not bool(update["optimizer_update_accepted"]),
             "rpa_parameter_norm": _parameter_norm(model.adapter),
             "rpa_update_norm": displacement,
+            "adapter_state_before_sha256": adapter_state_before_sha256,
+            "adapter_state_after_sha256": adapter_state_after_sha256,
+            "optimizer_state_before_sha256": optimizer_state_before_sha256,
+            "optimizer_state_after_sha256": optimizer_state_after_sha256,
+            "gradient_sha256": gradient_sha256,
+            "deterministic_fixed_point_confirmed": bool(
+                fixed_point is not None
+            ),
         }
         with updates_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, allow_nan=False) + "\n")
 
-        if step in (1, 2, 5, 10, 25, 50, 100, 200, 300, 400):
+        should_print = (
+            step in (1, 2, 5, 10, 25, 50, 100, 200, 300, 400)
+            or not row["accepted"]
+            or fixed_point is not None
+        )
+        if should_print:
             print(
                 json.dumps(
                     {
@@ -982,6 +1240,13 @@ def train_rpa(
                         "objective": row["training_objective_before"],
                         "parameter_norm": row["rpa_parameter_norm"],
                         "update_norm": row["rpa_update_norm"],
+                        "trial_evaluations": int(
+                            update.get("trial_evaluations", 0)
+                        ),
+                        "reason": update.get("reason"),
+                        "fixed_point_confirmed": bool(
+                            fixed_point is not None
+                        ),
                         "elapsed_seconds": time.perf_counter() - started,
                     },
                     allow_nan=False,
@@ -989,23 +1254,61 @@ def train_rpa(
                 flush=True,
             )
 
-    validate_update_summary(summary, STEPS)
+        if fixed_point is not None:
+            break
+
+    actual_attempts = int(summary.get("attempted_steps", 0))
+    if actual_attempts <= 0 or actual_attempts > STEPS:
+        raise RuntimeError("invalid RPA attempted-step accounting")
+    validate_update_summary(summary, actual_attempts)
+
+    if actual_attempts < STEPS and fixed_point is None:
+        raise RuntimeError(
+            "RPA stopped before its fixed budget without a confirmed fixed point"
+        )
+    if fixed_point is not None:
+        if actual_attempts != int(fixed_point["confirmation_step"]):
+            raise RuntimeError(
+                "fixed-point confirmation does not match attempted-step count"
+            )
+        termination_reason = "DETERMINISTIC_NO_DESCENT_FIXED_POINT"
+    else:
+        termination_reason = "ATTEMPT_BUDGET_EXHAUSTED"
+
     displacement = _update_norm(model.adapter, initial)
     final_hash = _state_hash(model.adapter)
     retained = bool(displacement > GRADIENT_NUMERICAL_TOL)
     return {
         "optimizer": "AdamW + checked_refiner_step + Armijo + rollback",
         "optimizer_constructed": True,
-        "optimizer_steps": STEPS,
-        "attempted_steps": STEPS,
+        "attempt_budget": STEPS,
+        "optimizer_steps": actual_attempts,
+        "attempted_steps": actual_attempts,
         "accepted_steps": int(summary["accepted_steps"]),
         # refiner_optimizer legacy key "retained_steps" counts rejected/rollback.
         "rollback_steps": int(summary["retained_steps"]),
-        "accepted_plus_rollback_equals_steps": (
+        "accepted_plus_rollback_equals_attempts": (
             int(summary["accepted_steps"])
             + int(summary["retained_steps"])
-            == STEPS
+            == actual_attempts
         ),
+        "remaining_budget_not_executed": STEPS - actual_attempts,
+        "termination_protocol": TERMINATION_PROTOCOL,
+        "termination_reason": termination_reason,
+        "deterministic_fixed_point": fixed_point,
+        "fixed_point_confirmed": bool(fixed_point is not None),
+        "last_accepted_step": int(last_accepted_step),
+        "final_state_definition": (
+            "state_after_last_accepted_step; subsequent confirmed no-descent "
+            "attempts were fully rolled back"
+            if fixed_point is not None
+            else "state_after_attempt_budget_exhausted"
+        ),
+        "termination_is_heuristic_early_stopping": False,
+        "patience_threshold_used": False,
+        "optimizer_acceptance_rule_changed": False,
+        "optimizer_search_rule_changed": False,
+        "training_objective_changed": False,
         "parameter_update_attempted": True,
         "retained_parameter_update_performed": retained,
         "parameter_update_performed": retained,
@@ -1017,7 +1320,7 @@ def train_rpa(
         "updates_artifact": {
             "path": str(updates_path),
             "sha256": _file_sha256(updates_path),
-            "rows": STEPS,
+            "rows": actual_attempts,
         },
         "elapsed_seconds": time.perf_counter() - started,
     }
@@ -1817,10 +2120,10 @@ def run(args: argparse.Namespace) -> int:
     bctr_path = Path(args.bctr_report).resolve()
     output = Path(args.output_dir).resolve()
 
-    phase21_report, phase21_hash, lineage_paths, upstream = (
+    _phase21_report, phase21_hash, lineage_paths, upstream = (
         bctr._validate_phase21_lineage(phase21_path)
     )
-    bctr_report, bctr_hash = secdr._validate_bctr_report(
+    _bctr_report, bctr_hash = secdr._validate_bctr_report(
         bctr_path, phase21_path, phase21_hash
     )
 
@@ -2068,8 +2371,8 @@ def run(args: argparse.Namespace) -> int:
             summaries = make_summaries(all_rows)
             decision = adjudicate(all_rows, summaries)
 
-            # Fixed final step-400 adapter artifact; this is not checkpoint selection.
-            adapter_path = result_dir / "rpa_adapter_step400.pt"
+            # Fixed final adapter state from the frozen budget/fixed-point contract; this is not checkpoint selection.
+            adapter_path = result_dir / "rpa_adapter_final.pt"
             if adapter_path.exists():
                 raise FileExistsError(
                     "RPA adapter artifact already exists"
@@ -2077,7 +2380,9 @@ def run(args: argparse.Namespace) -> int:
             torch.save(
                 {
                     "schema": SCHEMA,
-                    "step": STEPS,
+                    "step": int(training["attempted_steps"]),
+                    "attempt_budget": STEPS,
+                    "termination_reason": training["termination_reason"],
                     "runtime_commit": runtime_commit,
                     "parent_commit": IMPLEMENTATION_PARENT_COMMIT,
                     "adapter_state_dict": {
@@ -2195,6 +2500,18 @@ def run(args: argparse.Namespace) -> int:
                     "prior_experiment_decisions_modified": False,
                     "prior_scientific_classification_reinterpreted": False,
                     "generator_redesigned": False,
+                    "implementation_correction": {
+                        "type": "DETERMINISTIC_NO_DESCENT_FIXED_POINT",
+                        "parent_runtime_commit": IMPLEMENTATION_PARENT_COMMIT,
+                        "scientific_method_changed": False,
+                        "architecture_changed": False,
+                        "objective_changed": False,
+                        "optimizer_acceptance_changed": False,
+                        "optimizer_search_changed": False,
+                        "learning_rate_changed": False,
+                        "rank_changed": False,
+                        "case_cohort_changed": False,
+                    },
                 },
                 "architecture": architecture,
                 "role_definition": {
@@ -2270,7 +2587,7 @@ def run(args: argparse.Namespace) -> int:
                 "mechanism_summary": mechanism_summary,
                 "decision": decision,
                 "artifacts": {
-                    "rpa_adapter_step400": {
+                    "rpa_adapter_final": {
                         "path": str(adapter_path),
                         "sha256": _file_sha256(adapter_path),
                         "selected_checkpoint": False,

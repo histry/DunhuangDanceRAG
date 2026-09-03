@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -12,10 +10,10 @@ from training import refiner_role_phase_anatomy_low_rank_tangent_adaptation as r
 
 def test_schema_and_parent_contract():
     assert rpa.SCHEMA == (
-        "refiner_role_phase_anatomy_low_rank_tangent_adaptation_experiment_v1"
+        "refiner_role_phase_anatomy_low_rank_tangent_adaptation_experiment_v2"
     )
     assert rpa.IMPLEMENTATION_PARENT_COMMIT == (
-        "7a360736db0a184f137446f7da20f23b04fb97ad"
+        "b59fbdbf29e8b44fb9758ca7894da92cc3eb3db1"
     )
 
 
@@ -267,3 +265,163 @@ def test_safety_regression_blocks_advance():
     decision = rpa.adjudicate(rows, summaries)
     assert decision["conditions"]["G_no_safety_regression"] is False
     assert decision["result"] != "RPA_LRTA_CANDIDATE_ADVANCE_REVIEW"
+
+
+def _mock_bounded_rejection():
+    return {
+        "optimizer_update_accepted": False,
+        "reason": "bounded_search_no_descent",
+        "direction": "none",
+        "step_scale": 0.0,
+        "trial_evaluations": 21,
+        "loss_rejected_trials": 21,
+        "nonfinite_trials": 0,
+        "insufficient_decrease_trials": 2,
+        "group_guard_rejected_trials": 0,
+        "used_gradient_rescue": True,
+        "adam_directional_derivative": -9.32270759135982e-05,
+        "minimum_loss_decrease": 6.3e-11,
+        "group_guard_before": {"single_short": 0.004},
+        "group_guard_last_violations": {},
+        "trials": [
+            {
+                "direction": "adam",
+                "scale": 1.0,
+                "loss": 0.0064,
+                "required_decrease": 1e-10,
+            }
+        ],
+    }
+
+
+def test_canonical_tree_hash_is_stable_and_sensitive():
+    tree = {
+        "x": torch.tensor([1.0, 2.0]),
+        "nested": {"a": 3, "b": [True, None, 0.5]},
+    }
+    same = {
+        "nested": {"b": [True, None, 0.5], "a": 3},
+        "x": torch.tensor([1.0, 2.0]),
+    }
+    changed = {
+        "x": torch.tensor([1.0, 2.1]),
+        "nested": {"a": 3, "b": [True, None, 0.5]},
+    }
+    assert rpa._canonical_tree_sha256(tree) == rpa._canonical_tree_sha256(same)
+    assert rpa._canonical_tree_sha256(tree) != rpa._canonical_tree_sha256(changed)
+
+
+def test_fixed_point_requires_one_full_confirmatory_rejection():
+    detector = rpa.DeterministicNoDescentFixedPointDetector()
+    update = _mock_bounded_rejection()
+
+    first = detector.observe(
+        step=101,
+        loss_before=0.006368398001598344,
+        adapter_state_before_sha256="adapter",
+        adapter_state_after_sha256="adapter",
+        optimizer_state_before_sha256="optimizer",
+        optimizer_state_after_sha256="optimizer",
+        gradient_sha256="gradient",
+        update=update,
+    )
+    assert first is None
+
+    second = detector.observe(
+        step=102,
+        loss_before=0.006368398001598344,
+        adapter_state_before_sha256="adapter",
+        adapter_state_after_sha256="adapter",
+        optimizer_state_before_sha256="optimizer",
+        optimizer_state_after_sha256="optimizer",
+        gradient_sha256="gradient",
+        update=update,
+    )
+    assert second is not None
+    assert second["confirmed"] is True
+    assert second["first_rejected_step"] == 101
+    assert second["confirmation_step"] == 102
+    assert second["patience_threshold_used"] is False
+    assert second["heuristic_early_stopping"] is False
+
+
+def test_fixed_point_not_confirmed_if_gradient_changes():
+    detector = rpa.DeterministicNoDescentFixedPointDetector()
+    update = _mock_bounded_rejection()
+    assert detector.observe(
+        step=10,
+        loss_before=0.1,
+        adapter_state_before_sha256="a",
+        adapter_state_after_sha256="a",
+        optimizer_state_before_sha256="o",
+        optimizer_state_after_sha256="o",
+        gradient_sha256="g1",
+        update=update,
+    ) is None
+    assert detector.observe(
+        step=11,
+        loss_before=0.1,
+        adapter_state_before_sha256="a",
+        adapter_state_after_sha256="a",
+        optimizer_state_before_sha256="o",
+        optimizer_state_after_sha256="o",
+        gradient_sha256="g2",
+        update=update,
+    ) is None
+
+
+def test_fixed_point_not_confirmed_if_optimizer_rollback_is_not_exact():
+    detector = rpa.DeterministicNoDescentFixedPointDetector()
+    update = _mock_bounded_rejection()
+    assert detector.observe(
+        step=10,
+        loss_before=0.1,
+        adapter_state_before_sha256="a",
+        adapter_state_after_sha256="a",
+        optimizer_state_before_sha256="o-before",
+        optimizer_state_after_sha256="o-after",
+        gradient_sha256="g",
+        update=update,
+    ) is None
+    assert detector.pending is None
+
+
+def test_accepted_update_resets_fixed_point_candidate():
+    detector = rpa.DeterministicNoDescentFixedPointDetector()
+    rejected = _mock_bounded_rejection()
+    assert detector.observe(
+        step=20,
+        loss_before=0.1,
+        adapter_state_before_sha256="a",
+        adapter_state_after_sha256="a",
+        optimizer_state_before_sha256="o",
+        optimizer_state_after_sha256="o",
+        gradient_sha256="g",
+        update=rejected,
+    ) is None
+    accepted = dict(rejected)
+    accepted.update(
+        optimizer_update_accepted=True,
+        reason="full_cycle_feasibility_guard_loss_decreased",
+    )
+    assert detector.observe(
+        step=21,
+        loss_before=0.09,
+        adapter_state_before_sha256="a",
+        adapter_state_after_sha256="b",
+        optimizer_state_before_sha256="o",
+        optimizer_state_after_sha256="p",
+        gradient_sha256="g2",
+        update=accepted,
+    ) is None
+    assert detector.pending is None
+
+
+def test_termination_protocol_does_not_change_optimizer_contract_constants():
+    assert rpa.STEPS == 400
+    assert rpa.TERMINATION_PROTOCOL == "deterministic_no_descent_fixed_point_v1"
+    # The fixed-point correction lives outside refiner_optimizer and does not
+    # change the scientific Armijo/group-guard implementation.
+    from training import refiner_optimizer as optimizer
+    assert optimizer.REFINER_UPDATE_PROTOCOL == "full_cycle_feasibility_guard_armijo_v7"
+    assert optimizer.MAX_BACKTRACK_TRIALS == 12
