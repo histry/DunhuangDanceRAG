@@ -9423,12 +9423,38 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
                 root_t = torch.from_numpy(root_np).float().to(cfg.device)
                 contact_t = torch.from_numpy(contact_np).float().to(cfg.device)
             output = model(x, c, sm, joint_t)
+
+            # ================= DEBUG 1: Refiner raw model output =================
+            print(
+                {
+                    "stage": "DEBUG_REFINER_MODEL_OUTPUT",
+                    "output_mean": float(output.abs().mean().detach().cpu()),
+                    "output_max": float(output.abs().max().detach().cpu()),
+                    "output_shape": list(output.shape),
+                },
+                flush=True,
+            )
+
             y = _decode_product_refiner_output(
                 x,
                 output,
                 *_refiner_decode_masks(joint_t, root_t, contact_t, sm, cfg),
                 cfg,
             )
+            # ================= DEBUG 2: decoded motion difference =================
+            print(
+                {
+                    "stage": "DEBUG_REFINER_Y_X_DIFF",
+                    "mean_abs_y_minus_x": float(
+                        torch.abs(y - x).mean().detach().cpu()
+                    ),
+                    "max_abs_y_minus_x": float(
+                        torch.abs(y - x).max().detach().cpu()
+                    ),
+                },
+                flush=True,
+            )
+
             if gpu_preprocessing:
                 y = _enforce_internal_batch_contract_torch(
                     y,
@@ -9458,6 +9484,19 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
                         project_rot=True,
                     )
                 w = overlap_add_weight_np(orig_len, st, T, hop, win)
+                # ================= DEBUG 3: final refiner commit =================
+                print(
+                    {
+                        "stage": "DEBUG_REFINER_COMMIT",
+                        "commit_mean_abs_change": float(
+                            np.abs(y_np - item["motion"]).mean()
+                        ) if "motion" in item else "check_before_commit",
+                        "chunk_start": st,
+                        "chunk_end": ed,
+                    },
+                    flush=True,
+                )
+
                 accumulate_motion_window_np(
                     accum,
                     weight_sum,
@@ -9503,15 +9542,90 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
             motion[None], seam_mask[None], cfg
         )
     tangent = product_log_np(motion, out)
-    joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
-    root_support = (full_root[0] * w > 0.0).astype(np.float32)
+    # joint_support = (full_joint[0] * w > 0.0).astype(np.float32)
+    # root_support = (full_root[0] * w > 0.0).astype(np.float32)
+    # ==========================================================
+    # Frozen V1 support safety fallback
+    #
+    # Problem:
+    # risk mask AND transition mask may produce empty support,
+    # causing identity mapping:
+    #
+    # retrieval == refiner
+    #
+    # We keep safety constraints unchanged.
+    # Only recover valid transition support.
+    # ==========================================================
+
+    joint_support = (
+        full_joint[0] * w > 0.0
+    ).astype(np.float32)
+
+    root_support = (
+        full_root[0] * w > 0.0
+    ).astype(np.float32)
+
+
+    # ---------- fallback 1 ----------
+    # If risk projection removes all joints,
+    # use transition mask as bounded support.
+    #
+    # This does NOT enlarge residual amplitude.
+    # It only restores candidate locations.
+
+    if float(joint_support.sum()) == 0.0:
+
+        transition_support = (
+            seam_mask[:, 0] > 0.05
+        ).astype(np.float32)
+
+        joint_support = (
+            transition_support[:, None]
+            *
+            np.ones(
+                (1, full_joint.shape[-1]),
+                dtype=np.float32
+            )
+        )
+
+
+    if float(root_support.sum()) == 0.0:
+
+        root_support = (
+            seam_mask[:, 0] > 0.05
+        ).astype(np.float32)
+
+
+    print(
+        {
+            "support_fallback": True,
+            "joint_support_frames":
+                int(np.sum(joint_support)),
+            "root_support_frames":
+                int(np.sum(root_support)),
+        },
+        flush=True
+    )
+
+    # out_geometry = masked_retract_np(
+    #     motion,
+    #     tangent,
+    #     joint_mask=joint_support,
+    #     root_mask=root_support,
+    #     max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
+    #     max_root_m=float(cfg.product_refiner_root_cap_m),
+    # )
     out_geometry = masked_retract_np(
         motion,
         tangent,
         joint_mask=joint_support,
         root_mask=root_support,
-        max_rotation_rad=float(cfg.product_refiner_rotation_cap_rad),
-        max_root_m=float(cfg.product_refiner_root_cap_m),
+        max_rotation_rad=float(
+            cfg.product_refiner_rotation_cap_rad
+        ),
+        max_root_m=float(
+            cfg.product_refiner_root_cap_m
+        ),
     )
     contact_weight = (full_contact[0] * w > 0.0).astype(np.float32)
     out_geometry[:, :4] = (
@@ -9519,6 +9633,24 @@ def apply_refiner_model(motion: np.ndarray, cond: np.ndarray, seam_mask: np.ndar
         + out[:, :4] * contact_weight
     )
     out = out_geometry
+    residual = np.abs(
+        product_log_np(
+            motion,
+            out
+        )
+    )
+
+
+    print(
+        {
+            "refiner_residual_mean":
+                float(residual.mean()),
+            "refiner_residual_max":
+                float(residual.max()),
+        },
+        flush=True,
+    )
+
     out, _ = enforce_edge151_contract_np(
         out,
         cfg,
@@ -10947,6 +11079,26 @@ _STAGE_TRANSACTION_AUDIT = []
 _STAGE_PRIOR_XZ = None
 _STAGE_PRIOR_METADATA = {}
 
+import time
+def dump_stage_transaction_audit(
+    output_dir,
+):
+    global _STAGE_TRANSACTION_AUDIT
+
+    if not _STAGE_TRANSACTION_AUDIT:
+        return
+
+    path = Path(output_dir) / (
+        "stage_transaction_audit.json"
+    )
+
+    path.write_text(
+        json.dumps(
+            _STAGE_TRANSACTION_AUDIT,
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 def _stage_guard_env_bool(name, default=True):
     try:
