@@ -7,6 +7,7 @@ consulted, so calm or ambiguous music cannot silently relax these gates.
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from typing import Any, Dict, Mapping, Sequence
 
@@ -16,6 +17,10 @@ DEFAULT_MAX_SINGLE_SOURCE_RATIO = 0.40
 DEFAULT_MIN_UNIQUE_EVENTS = 4
 DEFAULT_MIN_CORE_FRAME_RATIO = 0.70
 _EPS = 1.0e-9
+_CORE_FRAME_RATIO_FAILURE = re.compile(
+    r"^core_frame_ratio_below_minimum:-?\d+(?:\.\d+)?<"
+    r"-?\d+(?:\.\d+)?$"
+)
 
 
 class ScheduleHardConstraintError(RuntimeError):
@@ -269,6 +274,9 @@ def audit_schedule_hard_constraints(
     return {
         "schema": "music_independent_schedule_hard_constraints_v2_recording",
         "ok": not reasons,
+        "formal_pass": not reasons,
+        "diagnostic_bypass_used": False,
+        "bypassed_reasons": [],
         "reasons": reasons,
         "music_label_independent": True,
         "occupancy_basis": "allocated_motion_core_frames",
@@ -308,19 +316,37 @@ def assert_schedule_hard_constraints(
     import os
 
     report = audit_schedule_hard_constraints(schedule, **limits)
+    if report["ok"]:
+        return report
 
-    if not report["ok"]:
-        if os.environ.get(
-            "DISABLE_FINAL_CORE_FRAME_ASSERT",
-            "0"
-        ) == "1":
-            print(
-                "[WARNING] "
-                "DISABLE_FINAL_CORE_FRAME_ASSERT=1, "
-                "bypass final schedule hard constraint failure for diagnostic run",
-                flush=True,
-            )
-        else:
-            raise ScheduleHardConstraintError(report)
+    # This environment switch is intentionally a diagnostic escape hatch for
+    # the core-frame ratio only.  It must never turn an invalid schedule into
+    # a formally passing report or hide a second hard-constraint failure.
+    bypass_requested = os.environ.get(
+        "DISABLE_FINAL_CORE_FRAME_ASSERT", "0"
+    ) == "1"
+    bypassed_reasons = [
+        reason
+        for reason in report["reasons"]
+        if _CORE_FRAME_RATIO_FAILURE.fullmatch(str(reason))
+    ]
+    if bypass_requested and bypassed_reasons and len(bypassed_reasons) == len(
+        report["reasons"]
+    ):
+        diagnostic_report = dict(report)
+        diagnostic_report["formal_pass"] = False
+        diagnostic_report["diagnostic_bypass_used"] = True
+        diagnostic_report["bypassed_reasons"] = list(bypassed_reasons)
+        print(
+            "[WARNING] DISABLE_FINAL_CORE_FRAME_ASSERT=1, "
+            "bypassing only core_frame_ratio_below_minimum for diagnostic run; "
+            "formal_pass remains false",
+            flush=True,
+        )
+        return diagnostic_report
 
-    return report
+    failed_report = dict(report)
+    failed_report["formal_pass"] = False
+    failed_report["diagnostic_bypass_used"] = False
+    failed_report["bypassed_reasons"] = []
+    raise ScheduleHardConstraintError(failed_report)

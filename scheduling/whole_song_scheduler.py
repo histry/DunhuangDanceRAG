@@ -1253,6 +1253,8 @@ def generate_one(
         "score": selected_state.score,
         "schedule": schedule_rows,
         "music_independent_hard_constraints": hard_constraint_report,
+        "schedule_formal_pass": bool(hard_constraint_report.get("formal_pass", hard_constraint_report.get("ok", False))),
+        "schedule_diagnostic_bypass_used": bool(hard_constraint_report.get("diagnostic_bypass_used", False)),
         "boundary_metrics": boundary_reports,
         "timing_policy": {
             "hierarchical_retrieval": bool(args.hierarchical_retrieval),

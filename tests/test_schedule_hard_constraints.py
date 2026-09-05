@@ -45,11 +45,14 @@ class ScheduleHardConstraintTests(unittest.TestCase):
         report = audit_schedule_hard_constraints(schedule_rows())
 
         self.assertTrue(report["ok"])
+        self.assertTrue(report["formal_pass"])
+        self.assertFalse(report["diagnostic_bypass_used"])
         self.assertTrue(report["music_label_independent"])
         self.assertEqual(report["metrics"]["pose_hold_ratio"], 0.25)
         self.assertEqual(report["metrics"]["single_source_ratio"], 0.25)
         self.assertEqual(report["metrics"]["unique_event_count"], 4)
         self.assertEqual(report["metrics"]["core_frame_ratio"], 0.80)
+        self.assertEqual(report["limits"]["min_core_frame_ratio"], 0.70)
 
     def test_pose_hold_ratio_is_a_hard_failure(self):
         rows = schedule_rows()
@@ -157,6 +160,74 @@ class ScheduleHardConstraintTests(unittest.TestCase):
             assert_schedule_hard_constraints(rows)
         self.assertIn("metrics", captured.exception.report)
         self.assertIn("single_source_ratio_exceeded", str(captured.exception))
+
+    def test_diagnostic_switch_bypasses_core_ratio_only(self):
+        rows = schedule_rows()
+        for row in rows:
+            row["allocated_content_len"] = 15
+
+        with patch.dict("os.environ", {"DISABLE_FINAL_CORE_FRAME_ASSERT": "1"}):
+            report = assert_schedule_hard_constraints(rows)
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["formal_pass"])
+        self.assertTrue(report["diagnostic_bypass_used"])
+        self.assertEqual(report["bypassed_reasons"], report["reasons"])
+
+    def test_diagnostic_switch_does_not_bypass_non_core_failure(self):
+        rows = schedule_rows()
+        rows[1]["source_uid"] = "source_a"
+
+        with patch.dict("os.environ", {"DISABLE_FINAL_CORE_FRAME_ASSERT": "1"}):
+            with self.assertRaises(ScheduleHardConstraintError) as captured:
+                assert_schedule_hard_constraints(rows)
+
+        self.assertFalse(captured.exception.report["diagnostic_bypass_used"])
+        self.assertEqual(captured.exception.report["bypassed_reasons"], [])
+
+    def test_diagnostic_switch_does_not_bypass_mixed_failures(self):
+        rows = schedule_rows()
+        rows[1]["source_uid"] = "source_a"
+        for row in rows:
+            row["allocated_content_len"] = 15
+
+        with patch.dict("os.environ", {"DISABLE_FINAL_CORE_FRAME_ASSERT": "1"}):
+            with self.assertRaises(ScheduleHardConstraintError):
+                assert_schedule_hard_constraints(rows)
+
+    def test_empty_schedule_is_never_bypassed(self):
+        with patch.dict("os.environ", {"DISABLE_FINAL_CORE_FRAME_ASSERT": "1"}):
+            with self.assertRaises(ScheduleHardConstraintError) as captured:
+                assert_schedule_hard_constraints([])
+
+        self.assertIn("schedule_empty", captured.exception.report["reasons"])
+
+    def test_core_ratio_failure_still_raises_when_switch_is_off(self):
+        rows = schedule_rows()
+        for row in rows:
+            row["allocated_content_len"] = 15
+
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ScheduleHardConstraintError):
+                assert_schedule_hard_constraints(rows)
+
+    def test_unknown_reason_is_not_bypassable(self):
+        raw = {
+            "schema": "music_independent_schedule_hard_constraints_v2_recording",
+            "ok": False,
+            "formal_pass": False,
+            "diagnostic_bypass_used": False,
+            "bypassed_reasons": [],
+            "reasons": ["core_frame_ratio_below_minimum:malformed"],
+        }
+        with patch(
+            "scheduling.schedule_hard_constraints.audit_schedule_hard_constraints",
+            return_value=raw,
+        ), patch.dict(
+            "os.environ", {"DISABLE_FINAL_CORE_FRAME_ASSERT": "1"}
+        ):
+            with self.assertRaises(ScheduleHardConstraintError):
+                assert_schedule_hard_constraints(schedule_rows())
 
     def test_final_schedule_validator_recomputes_hard_constraints(self):
         rows = schedule_rows()

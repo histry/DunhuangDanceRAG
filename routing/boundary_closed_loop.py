@@ -477,6 +477,7 @@ class CandidateProposal:
     length_info: Dict[str, Any]
     align_report: Dict[str, Any]
     decision: str
+    diagnostic_arrays: Optional[Dict[str, np.ndarray]] = None
 
 
 def build_candidate_proposal(
@@ -491,14 +492,26 @@ def build_candidate_proposal(
     cfg: Any,
 ) -> CandidateProposal:
     raw = load_event_motion(motion_runtime, event_path, cfg, source_hint=f"boundary_closed_loop_load_event:{event_id}")
+    trace = None
+    if env_bool("BOUNDARY_STAGE_DIAGNOSTICS", False):
+        from training.generation_stage_diagnostics import selected_diagnostic_slots
+        if slot_idx in selected_diagnostic_slots():
+            trace = {
+                "source_file_motion": _as_motion_array(np.load(event_path, allow_pickle=False)),
+                "loaded_event": raw.copy(),
+            }
     has_prev = prev_motion is not None and len(prev_motion) > 0
     core_len, trans_len, length_info = choose_transition_lengths(motion_runtime, prev_motion, raw.shape[0], target_len, raw, slot, cfg)
     core = resample_motion(motion_runtime, raw, core_len)
     core = enforce_contract(motion_runtime, core, cfg, source_hint=f"boundary_closed_loop_core_resample:{event_id}")
+    if trace is not None:
+        trace["resampled_core"] = core.copy()
     align_report: Dict[str, Any] = {"mode": "none"}
     bridge = np.zeros((0, EDGE_DIM), dtype=np.float32)
     if has_prev:
         core, align_report = align_core_to_prev(motion_runtime, prev_motion, core, cfg, transition_frames=trans_len)
+        if trace is not None:
+            trace["aligned_core"] = core.copy()
         bridge_report: Dict[str, Any] = {}
         bridge = build_bridge(motion_runtime, prev_motion, core, trans_len, cfg, report=bridge_report)
         align_report["bridge"] = bridge_report
@@ -514,6 +527,9 @@ def build_candidate_proposal(
         length_info["slot_exact_repair_applied"] = True
         length_info["slot_exact_frames_after"] = int(piece.shape[0])
     score = risk_score(risk)
+    if trace is not None:
+        trace["bridge"] = bridge.copy()
+        trace["assembled_piece"] = piece.copy()
     safe = risk_safe(risk) if has_prev else True
     return CandidateProposal(
         slot=slot_idx,
@@ -531,6 +547,7 @@ def build_candidate_proposal(
         length_info=length_info,
         align_report=align_report,
         decision="candidate",
+        diagnostic_arrays=trace,
     )
 
 
@@ -571,6 +588,7 @@ def assemble_closed_loop_reference(
     db: Dict[str, Any],
     cfg: Any,
     banned: Optional[Dict[int, set]] = None,
+    diagnostic_dir: Optional[Path] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[List[int]]]:
     paths = np.asarray(db["paths"], dtype=object)
     banned = banned or {}
@@ -657,6 +675,13 @@ def assemble_closed_loop_reference(
             ],
             "version": "boundary_closed_loop_boundary_simulated_closed_loop_reference",
         }
+        if diagnostic_dir is not None and selected_prop.diagnostic_arrays is not None:
+            from training.generation_stage_diagnostics import save_upstream_stages
+            row["stage_diagnostics"] = save_upstream_stages(
+                diagnostic_dir / f"slot_{slot_idx:03d}",
+                selected_prop.diagnostic_arrays, selected_prop.event_path,
+                motion_runtime, cfg,
+            )
         report.append(row)
         cursor += int(piece.shape[0])
     final = np.concatenate(pieces, axis=0).astype(np.float32) if pieces else np.zeros((0, EDGE_DIM), dtype=np.float32)
@@ -864,6 +889,14 @@ def apply_generators(
     motion = np.asarray(motion_ref, dtype=np.float32).copy()
     stage: Dict[str, Any] = {}
 
+    def capture_candidate(name, value):
+        if env_bool("BOUNDARY_STAGE_DIAGNOSTICS", False):
+            from training.generation_stage_diagnostics import save_guarded_candidate
+            stage[name + "_guarded_candidate"] = save_guarded_candidate(
+                Path(args.out).parent, name, value,
+            )
+        return value
+
     def audit_fn(value: np.ndarray) -> Dict[str, Any]:
         return dict(
             motion_runtime.audit_motion_np(
@@ -893,13 +926,13 @@ def apply_generators(
         motion, transaction = run_stage_transaction(
             stage_name="refiner",
             motion=motion,
-            apply_fn=lambda value: motion_runtime.apply_refiner_model(
+            apply_fn=lambda value: capture_candidate("refiner", motion_runtime.apply_refiner_model(
                 value,
                 cond,
                 refiner_mask,
                 getattr(args, "refiner", None),
                 cfg,
-            ),
+            )),
             audit_fn=audit_fn,
             limits=limits,
             policy=policy,
@@ -926,13 +959,13 @@ def apply_generators(
         motion, transaction = run_stage_transaction(
             stage_name="diffusion",
             motion=motion,
-            apply_fn=lambda value: motion_runtime.apply_diffusion_model(
+            apply_fn=lambda value: capture_candidate("diffusion", motion_runtime.apply_diffusion_model(
                 value,
                 cond,
                 diffusion_mask,
                 getattr(args, "diffusion", None),
                 cfg,
-            ),
+            )),
             audit_fn=audit_fn,
             limits=limits,
             policy=policy,
@@ -1573,6 +1606,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     motion_runtime = import_motion_runtime()
     cfg = motion_runtime.MotionGenerationConfig.from_json(args.config).apply_env()
     set_cfg_runtime_knobs(cfg)
+    diagnostic_root = None
+    if env_bool("BOUNDARY_STAGE_DIAGNOSTICS", False):
+        from uuid import uuid4
+        diagnostic_root = Path(args.out).resolve().parent / (
+            Path(args.out).stem + ".diagnostics." + uuid4().hex[:12]
+        )
+        diagnostic_root.mkdir(parents=True, exist_ok=False)
     gar_trace_enabled = bool(getattr(cfg, "gar_evaluation_trace_enable", False))
     gar_sequence_started = time.perf_counter() if gar_trace_enabled else None
     gar_runtime: Dict[str, Optional[float]] = {
@@ -1606,7 +1646,14 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
 
     for round_id in range(max_rounds + 1):
         gar_stage_started = time.perf_counter() if gar_trace_enabled else None
-        motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(motion_runtime, slots, candidate_lists, db, cfg, banned=banned)
+        round_diagnostic_dir = None
+        if diagnostic_root is not None:
+            round_diagnostic_dir = diagnostic_root / f"round_{round_id:03d}"
+            round_diagnostic_dir.mkdir(exist_ok=False)
+        motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(
+            motion_runtime, slots, candidate_lists, db, cfg, banned=banned,
+            diagnostic_dir=round_diagnostic_dir,
+        )
         _gar_add_runtime(
             gar_runtime, "candidate_simulation_runtime_ms", gar_stage_started
         )
@@ -1625,17 +1672,28 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             motion_ref.shape[0],
         )
         gar_stage_started = time.perf_counter() if gar_trace_enabled else None
+        generator_args = args
+        if round_diagnostic_dir is not None:
+            generator_args = argparse.Namespace(**vars(args))
+            generator_args.out = str(round_diagnostic_dir / "motion.npy")
         motion, stage_reports = apply_generators(
             motion_runtime,
             motion_ref,
             cond,
             seam_mask,
-            args,
+            generator_args,
             cfg,
             sliding_support_eligible=slide_eligible,
         )
         _gar_add_runtime(gar_runtime, "generation_runtime_ms", gar_stage_started)
         stage_reports["sliding_support_eligibility"] = slide_report
+        if round_diagnostic_dir is not None:
+            from training.generation_stage_diagnostics import save_round_bundle
+            stage_reports["generation_stage_diagnostics"] = save_round_bundle(
+                round_diagnostic_dir, round_id, motion_ref, motion, cond,
+                seam_mask, slide_eligible, assembly_report, stage_reports,
+                cfg, db, args,
+            )
         conditioning_contract = (
             str(assembly_report[0].get("conditioning_contract", "unknown"))
             if assembly_report
