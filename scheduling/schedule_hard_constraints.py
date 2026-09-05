@@ -305,20 +305,22 @@ def assert_schedule_hard_constraints(
     schedule: Sequence[Mapping[str, Any]],
     **limits: Any,
 ) -> Dict[str, Any]:
-    report = audit_schedule_hard_constraints(schedule, **limits)
-    if not report["ok"]:
-        import os
+    import os
 
-    if os.environ.get(
-        "DISABLE_FINAL_CORE_FRAME_ASSERT",
-        "0"
-    ) == "1":
-        print(
-            "[WARNING] "
-            "DISABLE_FINAL_CORE_FRAME_ASSERT=1, "
-            "bypass final schedule hard constraint failure for diagnostic run",
-            flush=True,
-        )
-    else:
-        raise ScheduleHardConstraintError(report)
+    report = audit_schedule_hard_constraints(schedule, **limits)
+
+    if not report["ok"]:
+        if os.environ.get(
+            "DISABLE_FINAL_CORE_FRAME_ASSERT",
+            "0"
+        ) == "1":
+            print(
+                "[WARNING] "
+                "DISABLE_FINAL_CORE_FRAME_ASSERT=1, "
+                "bypass final schedule hard constraint failure for diagnostic run",
+                flush=True,
+            )
+        else:
+            raise ScheduleHardConstraintError(report)
+
     return report
