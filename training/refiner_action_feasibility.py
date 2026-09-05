@@ -47,7 +47,11 @@ SAFE_STEP_FRACTION = 0.9
 RESTORATION_GAP_FRACTION = 0.05
 STRICT_MARGIN_DERIVATIVE_FLOOR = 1.0e-6
 BOUNDARY_INVARIANT_METRICS = frozenset(
-    {"rot6d_nonfinite_ratio", "rot6d_degenerate_ratio"}
+    {
+        "rot6d_nonfinite_ratio",
+        "rot6d_degenerate_ratio",
+        "rotation_near_pi_step_ratio",
+    }
 )
 JOINT_PROBE_GROUPS = (
     (0, 1, 2, 3, 4, 5, 6, 7),

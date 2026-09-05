@@ -39,9 +39,10 @@ summaries remain available, but are not independent search directions.
 `dominant_failed_constraint` requires a positive/nonfinite residual;
 zero-residual low-margin metrics appear only as `dominant_guard_constraint`.
 The legacy `dominant_hard_constraint` now means failures only.
-Zero-limit, nonnegative Rot6D nonfinite/degenerate ratios are recorded as
-`boundary_invariant`: zero remains valid, positive residual still fails, and
-their unattainable positive margin is excluded from guards and cone fitting.
+Zero-limit, nonnegative Rot6D nonfinite/degenerate and rotation-near-pi ratios
+are recorded as `boundary_invariant`: zero remains valid, positive residual
+still fails, and their unattainable positive margin is excluded from guards
+and cone fitting.
 
 The solver measures true decoded margins at probe radii `h`, `h/2`, and
 `h/4` near a boundary. Its deterministic search basis includes observable

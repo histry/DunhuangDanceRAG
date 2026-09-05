@@ -91,20 +91,41 @@ def test_zero_limit_validity_metric_is_a_boundary_invariant():
         "before_rot6d_collinearity_abs_p99": 0.0,
         "candidate_rot6d_collinearity_abs_p99": 0.001,
         "allowed_rot6d_collinearity_abs_p99": 0.01,
+        "before_rotation_near_pi_step_ratio": 0.0,
+        "candidate_rotation_near_pi_step_ratio": 0.0,
+        "allowed_rotation_near_pi_step_ratio": 0.0,
     }}
     detail = _gate_residual_details(gate)
     assert detail["rot6d_nonfinite_ratio"]["margin_kind"] == "boundary_invariant"
     assert not detail["rot6d_nonfinite_ratio"]["safety_margin_eligible"]
+    assert (
+        detail["rotation_near_pi_step_ratio"]["margin_kind"]
+        == "boundary_invariant"
+    )
+    assert not detail["rotation_near_pi_step_ratio"]["safety_margin_eligible"]
     components = _hard_residual_components({"reference_fidelity": gate})
     validity = components["canonical_metrics"]["fidelity_rot6d_validity"]
     assert validity["minimum_margin"] == pytest.approx(0.9)
     assert validity["boundary_invariant_metrics"] == [
         "fidelity:rot6d_nonfinite_ratio"
     ]
+    rotation_boundary = components["canonical_metrics"][
+        "fidelity_rotation_near_pi"
+    ]
+    assert rotation_boundary["minimum_margin"] is None
+    assert rotation_boundary["boundary_invariant_metrics"] == [
+        "fidelity:rotation_near_pi_step_ratio"
+    ]
     gate["detail"]["candidate_rot6d_nonfinite_ratio"] = 0.001
     violated = _gate_residual_details(gate)["rot6d_nonfinite_ratio"]
     assert violated["margin_kind"] == "boundary_invariant"
     assert violated["residual"] > 0.0
+    gate["detail"]["candidate_rotation_near_pi_step_ratio"] = 0.001
+    violated_rotation = _gate_residual_details(gate)[
+        "rotation_near_pi_step_ratio"
+    ]
+    assert violated_rotation["margin_kind"] == "boundary_invariant"
+    assert violated_rotation["residual"] > 0.0
 
 
 def test_preparation_improves_margin_without_claiming_joint_success():
