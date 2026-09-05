@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 import dataclasses
 import hashlib
 import json
 import subprocess
 import time
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any
 
 import numpy as np
 
+from motion_geometry.product_manifold import product_log_np
 from training.motion_models import MotionGenerationConfig
 from training.refiner_action_feasibility import (
     ACTION_DIM,
@@ -27,7 +29,6 @@ from training.refiner_action_feasibility import (
     normalized_raw_action_norm,
     solve_action_feasibility,
 )
-from motion_geometry.product_manifold import product_log_np
 
 
 SCHEMA = "refiner_action_feasibility_dev_report_v1"
@@ -62,7 +63,7 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=_json_default) + "\n", encoding="utf-8")
 
 
-def _load_array(path: Path, *, key: Optional[str] = None) -> np.ndarray:
+def _load_array(path: Path, *, key: str | None = None) -> np.ndarray:
     if not path.is_file():
         raise FileNotFoundError(path)
     if path.suffix.lower() == ".npy":
@@ -85,7 +86,9 @@ def _resolve_path(base: Path, value: str) -> Path:
     return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
-def _array_from_row(row: Mapping[str, Any], base: Path, name: str, *, required: bool = True) -> Optional[np.ndarray]:
+def _array_from_row(
+    row: Mapping[str, Any], base: Path, name: str, *, required: bool = True
+) -> np.ndarray | None:
     value = row.get(f"{name}_path")
     if value is None:
         if required:
@@ -119,7 +122,7 @@ def load_case_manifest(path: str | Path, cfg: MotionGenerationConfig) -> tuple[l
     recording_splits: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, Mapping):
-            raise ValueError("case manifest contains a non-object case")
+            raise TypeError("case manifest contains a non-object case")
         forbidden_clean_fields = {
             "clean_path", "clean_motion_path", "hidden_clean_path",
             "ground_truth_path", "target_motion_path",
@@ -179,7 +182,9 @@ def load_case_manifest(path: str | Path, cfg: MotionGenerationConfig) -> tuple[l
     }
 
 
-def _proposal_action(case: ActionFeasibilityCase, row: Mapping[str, Any], manifest_path: Path) -> Optional[np.ndarray]:
+def _proposal_action(
+    case: ActionFeasibilityCase, row: Mapping[str, Any], manifest_path: Path
+) -> np.ndarray | None:
     action_path = row.get("proposal_action_path")
     motion_path = row.get("proposal_motion_path")
     if action_path and motion_path:
@@ -262,7 +267,20 @@ def _summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "invalid_input": sum(row.get("status") == STATUS_INVALID_INPUT for row in values),
         "joint_pass_rate": (sum(bool(row.get("joint_pass", False)) for row in values) / len(values)) if values else None,
         "rollback_rate": (sum(bool(row.get("rollback", False)) for row in values) / len(values)) if values else None,
-        "failure_reasons": dict(sorted({reason: sum(reason in row.get("failure_reasons", []) for row in values) for row in {r for row in values for r in row.get("failure_reasons", [])}}.items())),
+        "failure_reasons": dict(
+            sorted(
+                {
+                    reason: sum(
+                        reason in row.get("failure_reasons", []) for row in values
+                    )
+                    for reason in {
+                        item
+                        for row in values
+                        for item in row.get("failure_reasons", [])
+                    }
+                }.items()
+            )
+        ),
     }
 
 
@@ -389,7 +407,7 @@ def run_evaluation(args: argparse.Namespace) -> int:
 def _git_value(*args: str) -> str:
     try:
         return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return "unknown"
 
 
@@ -398,10 +416,10 @@ def _git_dirty_state() -> str:
     return "clean" if not value else "dirty"
 
 
-def _git_diff_hash() -> Optional[str]:
+def _git_diff_hash() -> str | None:
     try:
         payload = subprocess.check_output(["git", "diff", "--binary", "HEAD"], stderr=subprocess.DEVNULL)
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return None
     return hashlib.sha256(payload).hexdigest()
 

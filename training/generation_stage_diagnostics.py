@@ -6,12 +6,12 @@ summarized without loading torch, checkpoints or motion arrays.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import dataclasses
 import hashlib
 import json
 import os
 import subprocess
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -156,7 +156,10 @@ def export_cases(bundle_path, provenance_path, output, slots, context_frames):
     # Explicit provenance prevents a generated/test sequence being silently
     # relabelled as development data. Never infer identity from file names.
     from training import motion_models as runtime
-    from training.refiner_action_feasibility_evaluation import MANIFEST_SCHEMA, load_case_manifest
+    from training.refiner_action_feasibility_evaluation import (
+        MANIFEST_SCHEMA,
+        load_case_manifest,
+    )
 
     bundle_path = Path(bundle_path).resolve()
     bundle = json.loads(bundle_path.read_text(encoding="utf-8-sig"))

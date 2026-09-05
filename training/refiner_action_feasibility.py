@@ -7,19 +7,24 @@ mutates a production model.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import dataclasses
 import math
 import time
-from typing import Any, Mapping, Optional
+from typing import Any
 
 import numpy as np
 
 try:
     import torch
-except Exception:  # pragma: no cover - the server environment supplies torch
+except ImportError:  # pragma: no cover - the server environment supplies torch
     torch = None
 
-from motion_geometry.product_manifold import PRODUCT_STATE_DIM, product_log_np, product_log_torch
+from motion_geometry.product_manifold import (
+    PRODUCT_STATE_DIM,
+    product_log_np,
+    product_log_torch,
+)
 from training import motion_models as m
 
 
@@ -90,8 +95,8 @@ class ActionFeasibilityCase:
     root_mask: np.ndarray
     cfg: Any
     boundary_role: str = ""
-    contact_mask: Optional[np.ndarray] = None
-    condition: Optional[np.ndarray] = None
+    contact_mask: np.ndarray | None = None
+    condition: np.ndarray | None = None
     source_uid: str = ""
     recording_uid: str = ""
     left_source_uid: str = ""
@@ -209,7 +214,7 @@ def decode_geometry_action_torch(
     contact_mask: Any,
     cfg: Any,
     *,
-    trace: Optional[dict[str, Any]] = None,
+    trace: dict[str, Any] | None = None,
 ) -> Any:
     """Decode a 75D action through the authoritative production decoder."""
     t = _require_torch()
@@ -333,7 +338,7 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
         }
     try:
         candidate, action_detail = decode_geometry_action(case, action)
-    except Exception as exc:
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         return {
             "label": label,
             "joint_pass": False,
@@ -353,7 +358,7 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
         )
         fidelity_stage = m.evaluate_stage_reference_fidelity(reference_audit, candidate_audit)
         absolute_physical = m.evaluate_physical_audit(candidate_audit)
-    except Exception as exc:
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         physical_stage = _failed_gate("stage_physical_quality_v1", f"physical_audit_error:{type(exc).__name__}")
         fidelity_stage = _failed_gate("stage_reference_fidelity_v1", f"fidelity_audit_error:{type(exc).__name__}")
         absolute_physical = {"ok": False, "reasons": [f"absolute_physical_audit_error:{type(exc).__name__}"]}
@@ -361,7 +366,7 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
         candidate_audit = {"schema": "invalid"}
     try:
         observable = m._observable_boundary_audit(candidate, case.reference, case.seam, case.cfg)
-    except Exception as exc:
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         observable = _failed_gate(m.BOUNDARY_PROTOCOL, f"observable_audit_error:{type(exc).__name__}")
         observable["hidden_clean_used"] = False
     try:
@@ -372,7 +377,7 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
             before_audit=reference_audit,
             after_audit=candidate_audit,
         )
-    except Exception as exc:
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         fixed_support = _failed_gate("fixed_reference_support_v1", f"fixed_support_audit_error:{type(exc).__name__}")
         fixed_support["independent_support_diagnostic"] = {"accepted": False, "reasons": [str(exc)]}
     support_outside = float(action_detail["support_outside_edit_max"]) <= 1.0e-6
@@ -500,8 +505,8 @@ class SolverResult:
 def solve_action_feasibility(
     case: ActionFeasibilityCase,
     *,
-    initial_action: Optional[np.ndarray] = None,
-    solver_config: Optional[FeasibilitySolverConfig] = None,
+    initial_action: np.ndarray | None = None,
+    solver_config: FeasibilitySolverConfig | None = None,
 ) -> SolverResult:
     """Run bounded restoration, then minimum-edit search, with rollback."""
     controls = solver_config or FeasibilitySolverConfig()

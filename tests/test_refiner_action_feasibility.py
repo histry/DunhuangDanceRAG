@@ -19,7 +19,7 @@ from training.refiner_action_feasibility import (
 def _identity_motion(frames=32):
     motion = np.zeros((frames, 151), dtype=np.float32)
     identity = np.asarray([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
-    motion[:, ROT6D_START:] = identity
+    motion[:, ROT6D_START:] = np.tile(identity, NUM_JOINTS)
     return motion
 
 
