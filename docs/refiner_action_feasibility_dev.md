@@ -29,7 +29,44 @@ decoder and independent audits, then runs a fixed minimum-edit schedule after a
 feasible point is found. A rejected or unsuccessful case rolls back to the
 observed reference. A rollback is never counted as a rescue.
 
-## Case manifest
+## v6 constrained restoration solver
+
+`refiner_action_feasibility_dev_v6` merges physical/fixed-support source
+metrics by canonical root before searching. Each root retains its source
+metrics and uses the worst normalized residual and minimum signed margin;
+the original layer-specific gates still decide acceptance. Diagnostic layer
+summaries remain available, but are not independent search directions.
+`dominant_failed_constraint` requires a positive/nonfinite residual;
+zero-residual low-margin metrics appear only as `dominant_guard_constraint`.
+The legacy `dominant_hard_constraint` now means failures only.
+
+The solver measures true decoded margins at probe radii `h`, `h/2`, and
+`h/4` near a boundary. It fits separate forward/backward derivatives in the
+observable direction span, then projects candidate directions into all active
+hard-margin halfspaces. Temporal search also protects the actual endpoint
+margin. Missing active models, a zero projected direction, or an unconverged
+projection disable that direction. The linear step bound uses the most
+adverse retained derivative and 90% of the remaining signed margin before
+backtracking; every resulting trial still passes through the original audits.
+These are local models, not guarantees of nonlinear or global feasibility.
+
+When no sampled probe passes observable and hard gates together, the solver
+can accept a `hard_margin_restoration` preparation step if ordinary stage
+search found no better candidate. All hard gates must pass, both observable
+excesses must not increase, previously passed observable gates must remain
+passed, and the minimum available margin among joint jerk, foot penetration,
+and fidelity seam jerk must increase by more than `comparison_tolerance`.
+Preparation never sets `joint_pass`; the original final conjunction and
+rollback behavior remain authoritative.
+
+Iteration output records `observable_stage`, `accepted_phase`, canonical
+metric changes, one-sided probe fits, cone constraints, step bounds, and each
+trial's preparation eligibility. Failed finite probes only describe the
+sampled local span. The configured `0.03` observable thresholds are unchanged.
+The development runner still fixes `pilot_allowed=false`; even a fully
+feasible B1 development result does not itself authorize network training.
+
+## Case manifest format
 
 `training/refiner_action_feasibility_evaluation.py` consumes an explicit JSON
 manifest with schema `refiner_action_feasibility_case_manifest_v1`:
@@ -118,4 +155,3 @@ whose sole failure is the exact core-frame-ratio reason. It preserves
 `bypassed_reasons`. Empty schedules, zero core frames, source/recording
 concentration, insufficient events, malformed/unknown reasons, and mixed
 failures still raise `ScheduleHardConstraintError`.
-

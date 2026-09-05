@@ -227,6 +227,8 @@ def _baseline_row(case: ActionFeasibilityCase, baseline: str, evaluation: Mappin
         "joint_pass": bool(evaluation.get("joint_pass", False)),
         "rollback": bool(getattr(solver, "rollback", False)) if solver is not None else False,
         "failure_reasons": list(evaluation.get("failure_reasons", [])),
+        "dominant_failed_constraint": evaluation.get("dominant_failed_constraint"),
+        "dominant_guard_constraint": evaluation.get("dominant_guard_constraint"),
         "raw_action_norm_normalized": evaluation.get("action", {}).get("raw_action_norm_normalized"),
         "gate_flags": {
             key: evaluation.get(key)
@@ -249,6 +251,8 @@ def _baseline_row(case: ActionFeasibilityCase, baseline: str, evaluation: Mappin
             "solver_iterations": len(solver.iterations),
             "final_failure_reasons": list(solver.final_evaluation.get("failure_reasons", [])),
             "final_joint_pass": bool(solver.final_evaluation.get("joint_pass", False)),
+            "final_dominant_failed_constraint": solver.final_evaluation.get("dominant_failed_constraint"),
+            "final_dominant_guard_constraint": solver.final_evaluation.get("dominant_guard_constraint"),
             "final_action_norm_normalized": normalized_raw_action_norm(solver.returned_action, case.cfg),
         })
     return row
