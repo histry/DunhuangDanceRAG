@@ -27,10 +27,18 @@ from motion_geometry.product_manifold import (
 )
 from training import motion_models as m
 
-PROTOCOL_VERSION = "refiner_action_feasibility_dev_v3"
+PROTOCOL_VERSION = "refiner_action_feasibility_dev_v4"
 DECODER_PROTOCOL = "product_refiner_true_decoder_confidence_smoothing_taper_cap_v1"
 METRIC_PROTOCOL = "observable_boundary_stage_physical_fixed_support_fidelity_v1"
 ACTION_DIM = PRODUCT_STATE_DIM - 4
+HARD_RESIDUAL_NAMES = (
+    "physical",
+    "fixed_support",
+    "fidelity",
+    "joint_jerk",
+    "foot_penetration",
+    "fidelity_seam_jerk",
+)
 STATUS_VERIFIED_FEASIBLE = "VERIFIED_FEASIBLE"
 STATUS_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 STATUS_NUMERICAL_FAILURE = "NUMERICAL_FAILURE"
@@ -343,6 +351,189 @@ def _observable_excesses(observable: Mapping[str, Any], cfg: Any) -> dict[str, f
         return {"endpoint": float("inf"), "temporal": float("inf"), "jerk": float("inf")}
 
 
+def _observable_margins(observable: Mapping[str, Any], cfg: Any) -> dict[str, float]:
+    """Return signed margins above the unchanged observable repair gates."""
+    endpoint_gain = observable.get("endpoint_gain")
+    temporal_gain = observable.get("temporal_gain")
+    endpoint_limit = float(cfg.checkpoint_validation_min_endpoint_repair_gain)
+    temporal_limit = float(cfg.checkpoint_validation_min_temporal_repair_gain)
+
+    def margin(value: Any, limit: float) -> float:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return float("-inf")
+        return value - float(limit) if math.isfinite(value) else float("-inf")
+
+    return {
+        "endpoint": margin(endpoint_gain, endpoint_limit),
+        "temporal": margin(temporal_gain, temporal_limit),
+    }
+
+
+def _physical_metric_directions() -> dict[str, str]:
+    """Read the authoritative high/low direction for physical metrics."""
+    try:
+        limits = m.PhysicalQualityLimits.from_environment()
+        policy = m.StageAcceptancePolicy.from_environment()
+        return {
+            str(spec.key): str(spec.direction)
+            for spec in m.physical_metric_specs(limits, policy)
+        }
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
+
+
+def _gate_residual_details(gate: Mapping[str, Any] | None) -> dict[str, dict[str, float]]:
+    """Extract normalized numeric residuals from an authoritative gate."""
+    if not isinstance(gate, Mapping):
+        return {}
+    detail = gate.get("detail", {}) or {}
+    if not isinstance(detail, Mapping):
+        return {}
+    baseline_prefix = (
+        "before_"
+        if any(str(key).startswith("before_") for key in detail)
+        else "reference_"
+    )
+    directions = _physical_metric_directions()
+    result: dict[str, dict[str, float]] = {}
+    for name, candidate_value in detail.items():
+        name = str(name)
+        if not name.startswith("candidate_"):
+            continue
+        metric = name[len("candidate_") :]
+        baseline_value = detail.get(f"{baseline_prefix}{metric}")
+        allowed_value = detail.get(f"allowed_{metric}")
+        try:
+            baseline = float(baseline_value)
+            candidate = float(candidate_value)
+            allowed = float(allowed_value)
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (baseline, candidate, allowed)):
+            residual = float("inf")
+            margin = float("-inf")
+        else:
+            direction = directions.get(
+                metric,
+                "low" if metric == "foot_penetration_min_m" else "high",
+            )
+            scale = max(abs(allowed), abs(baseline), 1.0e-6)
+            if direction == "low":
+                residual = max(0.0, allowed - candidate) / scale
+                margin = (candidate - allowed) / scale
+            else:
+                residual = max(0.0, candidate - allowed) / scale
+                margin = (allowed - candidate) / scale
+        result[metric] = {
+            "baseline": baseline,
+            "candidate": candidate,
+            "allowed": allowed,
+            "residual": float(residual),
+            "margin": float(margin),
+        }
+    return result
+
+
+def _hard_residual_components(evaluation: Mapping[str, Any]) -> dict[str, Any]:
+    """Return numeric hard-gate residuals and their metric-level evidence."""
+    physical_metrics = _gate_residual_details(evaluation.get("physical_stage"))
+    support_metrics = _gate_residual_details(
+        evaluation.get("fixed_reference_support")
+    )
+    fidelity_metrics = _gate_residual_details(
+        evaluation.get("reference_fidelity")
+    )
+
+    def aggregate(metrics: Mapping[str, Mapping[str, float]]) -> float:
+        values = [float(item["residual"]) for item in metrics.values()]
+        return max(values, default=0.0)
+
+    def select_metrics(
+        metrics: Mapping[str, Mapping[str, float]], needle: str
+    ) -> float:
+        values = [
+            float(item["residual"])
+            for name, item in metrics.items()
+            if needle in name
+        ]
+        return max(values, default=0.0)
+
+    joint_jerk = max(
+        select_metrics(physical_metrics, "joint_jerk"),
+        select_metrics(support_metrics, "joint_jerk"),
+    )
+    foot_penetration = max(
+        select_metrics(physical_metrics, "foot_penetration"),
+        select_metrics(support_metrics, "foot_penetration"),
+    )
+    fidelity_seam_jerk = max(
+        select_metrics(fidelity_metrics, "joint_jerk_window_p95_max_mps3"),
+        select_metrics(fidelity_metrics, "joint_jerk_mps3"),
+    )
+    components = {
+        "physical": {
+            "residual": aggregate(physical_metrics),
+            "metrics": physical_metrics,
+        },
+        "fixed_support": {
+            "residual": aggregate(support_metrics),
+            "metrics": support_metrics,
+        },
+        "fidelity": {
+            "residual": aggregate(fidelity_metrics),
+            "metrics": fidelity_metrics,
+        },
+        "joint_jerk": {"residual": float(joint_jerk)},
+        "foot_penetration": {"residual": float(foot_penetration)},
+        "fidelity_seam_jerk": {"residual": float(fidelity_seam_jerk)},
+    }
+    return components
+
+
+def _canonical_root_causes(reasons: Any) -> list[str]:
+    """Collapse physical/fixed-support duplicate reasons to root causes."""
+    roots: list[str] = []
+    for reason in reasons if isinstance(reasons, (list, tuple)) else []:
+        reason = str(reason)
+        layer, _, metric = reason.partition(":")
+        metric = metric or layer
+        if "foot_penetration" in metric:
+            root = "foot_penetration"
+        elif "joint_jerk" in metric or "seam_jerk" in metric:
+            root = "fidelity_seam_jerk" if layer == "fidelity" else "joint_jerk"
+        elif layer == "observable" and "endpoint" in metric:
+            root = "endpoint_margin"
+        elif layer == "observable" and "temporal" in metric:
+            root = "temporal_margin"
+        elif layer in {"physical", "fixed_support", "fidelity"}:
+            root = f"{layer}:{metric}"
+        else:
+            root = reason
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _dominant_hard_constraint(
+    components: Mapping[str, Any], reasons: Any = None
+) -> str | None:
+    values = {
+        name: float((components.get(name) or {}).get("residual", 0.0))
+        for name in HARD_RESIDUAL_NAMES
+    }
+    finite = {
+        name: value
+        for name, value in values.items()
+        if math.isfinite(value) and value > 0.0
+    }
+    if finite:
+        return max(finite, key=finite.get)
+    roots = _canonical_root_causes(reasons)
+    return roots[0] if roots else None
+
+
 def _proxy_residual(observable: Mapping[str, Any], cfg: Any) -> tuple[int, float]:
     """Return a solver residual on the same scale as the observable gate."""
     excesses = _observable_excesses(observable, cfg)
@@ -440,8 +631,16 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
     if hidden_clean_used:
         reasons.append("hidden_clean_used")
     observable_excesses = _observable_excesses(observable, case.cfg)
+    observable_margins = _observable_margins(observable, case.cfg)
     failure_count, residual = _proxy_residual(observable, case.cfg)
     reasons = list(dict.fromkeys(reasons))
+    hard_residual_components = _hard_residual_components(
+        {
+            "physical_stage": physical_stage,
+            "fixed_reference_support": fixed_support,
+            "reference_fidelity": fidelity_stage,
+        }
+    )
     joint_pass = bool(
         endpoint_pass
         and temporal_pass
@@ -475,6 +674,9 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
         "proxy_failure_count": int(failure_count + int(not physical_pass) + int(not fixed_support_pass) + int(not fidelity_pass)),
         "proxy_residual": float(residual),
         "solver_observable_excess": observable_excesses,
+        "solver_observable_margin": observable_margins,
+        "hard_residual_components": hard_residual_components,
+        "canonical_root_causes": _canonical_root_causes(reasons),
         "hidden_clean_used": hidden_clean_used,
         "invalid_input": False,
         "elapsed_seconds": float(time.perf_counter() - started),
@@ -602,7 +804,7 @@ def _solver_stage(evaluation: Mapping[str, Any]) -> str:
 
 def _stage_key(
     evaluation: Mapping[str, Any], action: np.ndarray, stage: str
-) -> tuple[int, float, float, float, float, float]:
+) -> tuple[int, float, float, float, float, float, float]:
     """Compare candidates while preserving hard constraints and stage order."""
     preserve_endpoint = stage == "temporal"
     hard_failures = _hard_constraint_failures(
@@ -613,6 +815,9 @@ def _stage_key(
     temporal = float(excess.get("temporal", float("inf")))
     jerk = float(excess.get("jerk", float("inf")))
     residual = float(evaluation.get("proxy_residual", float("inf")))
+    margins = evaluation.get("solver_observable_margin", {}) or {}
+    endpoint_margin = float(margins.get("endpoint", float("-inf")))
+    endpoint_margin_key = -endpoint_margin if math.isfinite(endpoint_margin) else float("inf")
     if stage == "temporal":
         primary, secondary = temporal, endpoint
     else:
@@ -621,26 +826,28 @@ def _stage_key(
         int(bool(hard_failures)),
         primary,
         secondary,
+        endpoint_margin_key,
         jerk,
         residual,
         normalized_raw_action_norm(action, evaluation["_cfg"]),
     )
 
 
-def _stage_key_payload(key: tuple[int, float, float, float, float, float]) -> dict[str, Any]:
+def _stage_key_payload(key: tuple[int, float, float, float, float, float, float]) -> dict[str, Any]:
     return {
         "hard_constraint_violation": bool(key[0]),
         "primary_excess": float(key[1]) if math.isfinite(key[1]) else None,
         "secondary_excess": float(key[2]) if math.isfinite(key[2]) else None,
-        "jerk_excess": float(key[3]) if math.isfinite(key[3]) else None,
-        "proxy_residual": float(key[4]) if math.isfinite(key[4]) else None,
-        "action_norm_normalized": float(key[5]) if math.isfinite(key[5]) else None,
+        "endpoint_margin_key": float(key[3]) if math.isfinite(key[3]) else None,
+        "jerk_excess": float(key[4]) if math.isfinite(key[4]) else None,
+        "proxy_residual": float(key[5]) if math.isfinite(key[5]) else None,
+        "action_norm_normalized": float(key[6]) if math.isfinite(key[6]) else None,
     }
 
 
 def _stage_key_rejection_reason(
-    current_key: tuple[int, float, float, float, float, float],
-    trial_key: tuple[int, float, float, float, float, float],
+    current_key: tuple[int, float, float, float, float, float, float],
+    trial_key: tuple[int, float, float, float, float, float, float],
     hard_failures: list[str],
 ) -> str:
     if hard_failures:
@@ -649,17 +856,137 @@ def _stage_key_rejection_reason(
         return "stage_primary_excess_not_reduced"
     if trial_key[1] == current_key[1] and trial_key[2] > current_key[2]:
         return "stage_secondary_excess_not_reduced"
+    if (
+        trial_key[1] == current_key[1]
+        and trial_key[2] == current_key[2]
+        and trial_key[3] > current_key[3]
+    ):
+        return "endpoint_margin_not_preserved"
     if trial_key >= current_key:
         return "stage_key_not_strictly_better"
     return "stage_key_improved"
 
 
-def _solver_objective_order(stage: str) -> tuple[str, ...]:
+def _solver_gradient_objective_order(stage: str) -> tuple[str, ...]:
     if stage == "endpoint":
         return ("endpoint", "joint", "temporal")
     if stage == "temporal":
         return ("temporal", "joint", "endpoint")
     return ("joint", "endpoint", "temporal")
+
+
+def _solver_objective_order(stage: str) -> tuple[str, ...]:
+    """Order observable and hard-residual directions for each restoration stage."""
+    hard = (
+        "hard_joint_jerk",
+        "hard_foot_penetration",
+        "hard_fidelity_seam_jerk",
+        "hard_physical",
+        "hard_fixed_support",
+        "hard_fidelity",
+    )
+    return _solver_gradient_objective_order(stage)[:1] + hard + _solver_gradient_objective_order(stage)[1:]
+
+
+def _project_endpoint_preserving_direction(
+    direction: np.ndarray,
+    endpoint_direction: np.ndarray | None,
+    *,
+    enabled: bool,
+    cfg: Any | None = None,
+) -> tuple[np.ndarray, float]:
+    """Project a temporal/hard direction away from endpoint degradation."""
+    value = np.asarray(direction, dtype=np.float64)
+    if not enabled or endpoint_direction is None:
+        return value.astype(np.float32), 0.0
+    endpoint = np.asarray(endpoint_direction, dtype=np.float64)
+    denominator = float(np.dot(endpoint.reshape(-1), endpoint.reshape(-1)))
+    if not math.isfinite(denominator) or denominator <= 1.0e-12:
+        return value.astype(np.float32), 0.0
+    coefficient = float(np.dot(value.reshape(-1), endpoint.reshape(-1)) / denominator)
+    if coefficient >= 0.0:
+        return value.astype(np.float32), 0.0
+    projected = value - coefficient * endpoint
+    norm = (
+        normalized_raw_action_norm(projected, cfg)
+        if cfg is not None
+        else float(np.linalg.norm(projected))
+    )
+    if not math.isfinite(norm) or norm <= 1.0e-12:
+        return value.astype(np.float32), 0.0
+    return (projected / norm).astype(np.float32), float(-coefficient)
+
+
+def _finite_difference_hard_directions(
+    directions: Mapping[str, np.ndarray],
+    probes: list[Mapping[str, Any]],
+    current_components: Mapping[str, Any],
+    probe_radius: float,
+    *,
+    endpoint_direction: np.ndarray | None = None,
+    project_endpoint: bool = False,
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Estimate residual descent directions in the observable direction span."""
+    grouped: dict[str, dict[int, Mapping[str, Any]]] = {}
+    for probe in probes:
+        objective = str(probe.get("objective", ""))
+        sign = int(probe.get("sign", 0))
+        if objective in directions and sign in {-1, 1}:
+            grouped.setdefault(objective, {})[sign] = probe
+
+    residual_directions: dict[str, np.ndarray] = {}
+    diagnostics: list[dict[str, Any]] = []
+    metadata: dict[str, dict[str, Any]] = {}
+    for residual_name in HARD_RESIDUAL_NAMES:
+        current = float(
+            ((current_components.get(residual_name) or {}).get("residual", 0.0))
+        )
+        gradient = np.zeros_like(next(iter(directions.values())), dtype=np.float64)
+        terms = 0
+        for objective, by_sign in grouped.items():
+            if -1 not in by_sign or 1 not in by_sign:
+                continue
+            minus = float(
+                ((by_sign[-1].get("hard_residual_components", {}).get(residual_name) or {}).get("residual", float("inf")))
+            )
+            plus = float(
+                ((by_sign[1].get("hard_residual_components", {}).get(residual_name) or {}).get("residual", float("inf")))
+            )
+            if not all(math.isfinite(value) for value in (minus, plus)):
+                continue
+            derivative = (plus - minus) / max(2.0 * float(probe_radius), 1.0e-12)
+            gradient += derivative * np.asarray(directions[objective], dtype=np.float64)
+            terms += 1
+        gradient_norm = float(np.linalg.norm(gradient))
+        available = bool(terms and math.isfinite(gradient_norm) and gradient_norm > 1.0e-12)
+        if available:
+            direction = (-gradient / gradient_norm).astype(np.float32)
+            direction, projection = _project_endpoint_preserving_direction(
+                direction,
+                endpoint_direction,
+                enabled=project_endpoint and residual_name != "fidelity_seam_jerk",
+            )
+            residual_directions[f"hard_{residual_name}"] = direction
+            metadata[f"hard_{residual_name}"] = {
+                "source": "finite_difference_hard_residual",
+                "residual_name": residual_name,
+                "projection_coefficient": float(projection),
+            }
+        else:
+            projection = 0.0
+        diagnostics.append(
+            {
+                "objective": f"hard_{residual_name}",
+                "direction_source": "finite_difference_hard_residual",
+                "residual_name": residual_name,
+                "current_residual": current,
+                "available": available,
+                "gradient_norm": gradient_norm,
+                "probe_terms": int(terms),
+                "projection_coefficient": float(projection),
+            }
+        )
+    return residual_directions, diagnostics, metadata
 
 
 def _finite_difference_reachability(
@@ -687,6 +1014,7 @@ def _finite_difference_reachability(
             hard_failures = _hard_constraint_failures(
                 evaluation, preserve_endpoint=stage == "temporal"
             )
+            hard_components = evaluation.get("hard_residual_components", {}) or {}
             observable_improved = any(
                 float(observable.get(name)) > 0.0
                 for name in ("endpoint_gain", "temporal_gain")
@@ -716,6 +1044,12 @@ def _finite_difference_reachability(
                     "temporal_gain": (
                         observable.get("temporal_gain")
                     ),
+                    "endpoint_margin": (
+                        evaluation.get("solver_observable_margin", {}).get("endpoint")
+                    ),
+                    "temporal_margin": (
+                        evaluation.get("solver_observable_margin", {}).get("temporal")
+                    ),
                     "endpoint_pass": bool(evaluation.get("endpoint_pass", False)),
                     "temporal_pass": bool(evaluation.get("temporal_pass", False)),
                     "physical_pass": bool(evaluation.get("physical_pass", False)),
@@ -726,6 +1060,10 @@ def _finite_difference_reachability(
                         observable_pass and physical_pass and not hard_failures
                     ),
                     "hard_constraint_failures": hard_failures,
+                    "canonical_root_causes": _canonical_root_causes(
+                        hard_failures
+                    ),
+                    "hard_residual_components": hard_components,
                     "failure_reasons": list(evaluation.get("failure_reasons", [])),
                 }
             )
@@ -749,12 +1087,15 @@ def _solver_trial_payload(
     *,
     stage: str,
     objective: str,
-    current_stage_key: tuple[int, float, float, float, float, float],
-    trial_stage_key: tuple[int, float, float, float, float, float],
+    direction_source: str,
+    current_stage_key: tuple[int, float, float, float, float, float, float],
+    trial_stage_key: tuple[int, float, float, float, float, float, float],
     backtrack: int,
     current_key: tuple[int, float, float],
     trial_key: tuple[int, float, float],
     action_delta_norm: float,
+    observable_physical_feasible_probe: bool,
+    current_hard_residual_components: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Capture compact authoritative evidence for one trial action."""
     observable = evaluation.get("observable_boundary", {}) or {}
@@ -764,9 +1105,29 @@ def _solver_trial_payload(
     hard_failures = _hard_constraint_failures(
         evaluation, preserve_endpoint=stage == "temporal"
     )
+    hard_components = evaluation.get("hard_residual_components", {}) or {}
+    hard_residual_delta = {}
+    for name in HARD_RESIDUAL_NAMES:
+        current_value = float(
+            (current_hard_residual_components.get(name) or {}).get(
+                "residual", 0.0
+            )
+        )
+        trial_value = float(
+            (hard_components.get(name) or {}).get("residual", 0.0)
+        )
+        hard_residual_delta[name] = (
+            float(trial_value - current_value)
+            if math.isfinite(trial_value) and math.isfinite(current_value)
+            else None
+        )
     payload = {
         "stage": stage,
         "objective": objective,
+        "direction_source": direction_source,
+        "observable_physical_feasible_probe": bool(
+            observable_physical_feasible_probe
+        ),
         "backtrack": int(backtrack),
         "solver_key": _solver_key_payload(trial_key),
         "current_solver_key": _solver_key_payload(current_key),
@@ -774,6 +1135,16 @@ def _solver_trial_payload(
         "current_stage_key": _stage_key_payload(current_stage_key),
         "key_improved": bool(trial_stage_key < current_stage_key),
         "hard_constraint_failures": hard_failures,
+        "canonical_root_causes": _canonical_root_causes(hard_failures),
+        "dominant_hard_constraint": _dominant_hard_constraint(
+            evaluation.get("hard_residual_components", {}) or {},
+            hard_failures,
+        ),
+        "hard_residual_components": hard_components,
+        "hard_residual_delta_from_current": hard_residual_delta,
+        "solver_observable_margin": evaluation.get(
+            "solver_observable_margin", {}
+        ),
         "action_delta_norm_normalized": float(action_delta_norm),
         "joint_pass": bool(evaluation.get("joint_pass", False)),
         "failure_reasons": list(evaluation.get("failure_reasons", [])),
@@ -858,6 +1229,12 @@ def solve_action_feasibility(
         "minimum_edit_completed": False,
         "hard_constraint_gradient_coverage": [
             "observable_boundary_proxy_directions",
+            "finite_difference:joint_jerk",
+            "finite_difference:foot_penetration",
+            "finite_difference:fidelity_seam_jerk",
+            "finite_difference:physical",
+            "finite_difference:fixed_support",
+            "finite_difference:fidelity",
         ],
         "hard_constraint_enforcement": [
             "physical_stage_hard_filter",
@@ -882,10 +1259,11 @@ def solve_action_feasibility(
                 .requires_grad_(True)
             )
             losses, proxy_components = _proxy_loss_components(case, action_tensor)
-            objective_order = _solver_objective_order(stage)
+            gradient_objective_order = _solver_gradient_objective_order(stage)
             directions: dict[str, np.ndarray] = {}
             direction_diagnostics: list[dict[str, Any]] = []
-            for objective in objective_order:
+            direction_sources: dict[str, str] = {}
+            for objective in gradient_objective_order:
                 gradient = t.autograd.grad(
                     losses[objective],
                     action_tensor,
@@ -930,6 +1308,7 @@ def solve_action_feasibility(
                     continue
                 direction = direction / direction_norm
                 directions[objective] = direction.detach().cpu().numpy().astype(np.float32)
+                direction_sources[objective] = "autograd_observable"
                 direction_diagnostics.append(
                     {
                         "objective": objective,
@@ -946,6 +1325,69 @@ def solve_action_feasibility(
             probe_radius = min(
                 float(radius), float(controls.finite_difference_probe_radius)
             )
+            observable_reachability = _finite_difference_reachability(
+                case,
+                current_action,
+                directions,
+                stage,
+                probe_radius,
+            )
+            current_stage_key = _stage_key(current_eval, current_action, stage)
+            current_solver_key = _solver_key(current_eval, current_action)
+            current_hard_components = current_eval.get(
+                "hard_residual_components", {}
+            ) or {}
+            hard_directions, hard_direction_diagnostics, hard_metadata = (
+                _finite_difference_hard_directions(
+                    directions,
+                    observable_reachability,
+                    current_hard_components,
+                    probe_radius,
+                )
+            )
+            for objective, direction in hard_directions.items():
+                directions[objective] = direction
+                direction_sources[objective] = str(
+                    hard_metadata.get(objective, {}).get(
+                        "source", "finite_difference_hard_residual"
+                    )
+                )
+            detail["hard_constraint_gradient_coverage"] = [
+                "observable_boundary_proxy_directions",
+                *[
+                    f"finite_difference:{item['residual_name']}"
+                    for item in hard_direction_diagnostics
+                    if item.get("available")
+                ],
+            ]
+                direction_diagnostics.append(
+                    next(
+                        item
+                        for item in hard_direction_diagnostics
+                        if item["objective"] == objective
+                    )
+                )
+
+            endpoint_projection: dict[str, float] = {}
+            endpoint_direction = directions.get("endpoint")
+            if stage == "temporal":
+                for objective, direction in list(directions.items()):
+                    if objective == "endpoint":
+                        continue
+                    projected, coefficient = _project_endpoint_preserving_direction(
+                        direction,
+                        endpoint_direction,
+                        enabled=True,
+                        cfg=case.cfg,
+                    )
+                    directions[objective] = projected
+                    endpoint_projection[objective] = float(coefficient)
+                    if coefficient > 0.0:
+                        direction_sources[objective] = (
+                            f"{direction_sources.get(objective, 'unknown')}"
+                            "+endpoint_preserving_projection"
+                        )
+
             reachability = _finite_difference_reachability(
                 case,
                 current_action,
@@ -955,8 +1397,13 @@ def solve_action_feasibility(
             )
             reachability_diagnosis = _reachability_diagnosis(reachability)
             last_reachability_diagnosis = reachability_diagnosis
-            current_stage_key = _stage_key(current_eval, current_action, stage)
-            current_solver_key = _solver_key(current_eval, current_action)
+            detail["last_hard_residual_components"] = current_hard_components
+            detail["last_dominant_hard_constraint"] = _dominant_hard_constraint(
+                current_hard_components,
+                current_eval.get("failure_reasons", []),
+            )
+            detail["last_endpoint_projection"] = endpoint_projection
+            objective_order = _solver_objective_order(stage)
             trial_diagnostics: list[dict[str, Any]] = []
             best = None
             for objective in objective_order:
@@ -964,9 +1411,12 @@ def solve_action_feasibility(
                 if direction is None:
                     continue
                 direction_meta = next(
-                    item
-                    for item in direction_diagnostics
-                    if item["objective"] == objective
+                    (
+                        item
+                        for item in direction_diagnostics
+                        if item["objective"] == objective
+                    ),
+                    {},
                 )
                 for backtrack in range(controls.backtracking_steps):
                     factor = 0.5 ** backtrack
@@ -985,6 +1435,9 @@ def solve_action_feasibility(
                         trial,
                         stage=stage,
                         objective=objective,
+                        direction_source=direction_sources.get(
+                            objective, "unknown"
+                        ),
                         current_stage_key=current_stage_key,
                         trial_stage_key=trial_stage_key,
                         backtrack=backtrack,
@@ -993,6 +1446,11 @@ def solve_action_feasibility(
                         action_delta_norm=normalized_raw_action_norm(
                             trial_action - current_action, case.cfg
                         ),
+                        observable_physical_feasible_probe=any(
+                            bool(probe.get("observable_physical_feasible", False))
+                            for probe in reachability
+                        ),
+                        current_hard_residual_components=current_hard_components,
                     )
                     trial_payload["gradient_norm"] = direction_meta.get(
                         "gradient_norm"
@@ -1019,11 +1477,20 @@ def solve_action_feasibility(
                 "iteration": int(step_index),
                 "stage": stage,
                 "objective_order": list(objective_order),
+                "gradient_objective_order": list(gradient_objective_order),
                 "radius": float(radius),
                 "proxy_loss": float(losses["joint"].detach().cpu()),
                 "proxy_components": proxy_components,
                 "gradient_directions": direction_diagnostics,
+                "direction_sources": direction_sources,
+                "finite_difference_hard_direction_diagnostics": hard_direction_diagnostics,
+                "endpoint_preserving_projection": endpoint_projection,
+                "current_hard_residual_components": current_hard_components,
                 "finite_difference_reachability": reachability,
+                "observable_physical_feasible_probe_exists": any(
+                    bool(probe.get("observable_physical_feasible", False))
+                    for probe in reachability
+                ),
                 "reachability_diagnosis": reachability_diagnosis,
                 "accepted": bool(accepted),
                 "current_solver_key": _solver_key_payload(current_solver_key),
