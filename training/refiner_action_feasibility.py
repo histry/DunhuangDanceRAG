@@ -1352,6 +1352,13 @@ def solve_action_feasibility(
                         "source", "finite_difference_hard_residual"
                     )
                 )
+                direction_diagnostics.append(
+                    next(
+                        item
+                        for item in hard_direction_diagnostics
+                        if item["objective"] == objective
+                    )
+                )
             detail["hard_constraint_gradient_coverage"] = [
                 "observable_boundary_proxy_directions",
                 *[
@@ -1360,13 +1367,6 @@ def solve_action_feasibility(
                     if item.get("available")
                 ],
             ]
-                direction_diagnostics.append(
-                    next(
-                        item
-                        for item in hard_direction_diagnostics
-                        if item["objective"] == objective
-                    )
-                )
 
             endpoint_projection: dict[str, float] = {}
             endpoint_direction = directions.get("endpoint")
