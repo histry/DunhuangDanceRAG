@@ -97,7 +97,7 @@ def test_zero_limit_validity_metric_is_a_boundary_invariant():
     assert not detail["rot6d_nonfinite_ratio"]["safety_margin_eligible"]
     components = _hard_residual_components({"reference_fidelity": gate})
     validity = components["canonical_metrics"]["fidelity_rot6d_validity"]
-    assert validity["minimum_margin"] == 0.9
+    assert validity["minimum_margin"] == pytest.approx(0.9)
     assert validity["boundary_invariant_metrics"] == [
         "fidelity:rot6d_nonfinite_ratio"
     ]
