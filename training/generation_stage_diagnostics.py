@@ -6,16 +6,15 @@ summarized without loading torch, checkpoints or motion arrays.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import dataclasses
 import hashlib
 import json
 import os
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
-
 
 METRICS = (
     "joint_jerk_mps3_max", "foot_skate_mps_p95", "foot_skate_mps_max",

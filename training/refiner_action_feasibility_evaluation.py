@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from collections.abc import Iterable, Mapping
 import dataclasses
 import hashlib
 import json
 import subprocess
 import time
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,6 @@ from training.refiner_action_feasibility import (
     normalized_raw_action_norm,
     solve_action_feasibility,
 )
-
 
 SCHEMA = "refiner_action_feasibility_dev_report_v1"
 MANIFEST_SCHEMA = "refiner_action_feasibility_case_manifest_v1"

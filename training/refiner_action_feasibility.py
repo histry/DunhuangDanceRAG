@@ -7,10 +7,10 @@ mutates a production model.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
 import dataclasses
 import math
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -26,7 +26,6 @@ from motion_geometry.product_manifold import (
     product_log_torch,
 )
 from training import motion_models as m
-
 
 PROTOCOL_VERSION = "refiner_action_feasibility_dev_v1"
 DECODER_PROTOCOL = "product_refiner_true_decoder_confidence_smoothing_taper_cap_v1"
