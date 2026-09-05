@@ -27,7 +27,7 @@ from motion_geometry.product_manifold import (
 )
 from training import motion_models as m
 
-PROTOCOL_VERSION = "refiner_action_feasibility_dev_v1"
+PROTOCOL_VERSION = "refiner_action_feasibility_dev_v2"
 DECODER_PROTOCOL = "product_refiner_true_decoder_confidence_smoothing_taper_cap_v1"
 METRIC_PROTOCOL = "observable_boundary_stage_physical_fixed_support_fidelity_v1"
 ACTION_DIM = PRODUCT_STATE_DIM - 4
@@ -306,19 +306,39 @@ def _failed_gate(schema: str, reason: str) -> dict[str, Any]:
     return {"schema": schema, "accepted": False, "reasons": [reason]}
 
 
-def _proxy_residual(observable: Mapping[str, Any]) -> tuple[int, float]:
+def _proxy_residual(observable: Mapping[str, Any], cfg: Any) -> tuple[int, float]:
+    """Return a solver residual on the same scale as the observable gate.
+
+    The differentiable proxy and the authoritative observable gate both use
+    the configured minimum repair gains.  Keeping the candidate comparator on
+    that same scale prevents the solver from optimizing a separate, implicit
+    75-percent-repair objective.
+    """
     before = observable.get("before", {})
     after = observable.get("after", {})
     if not before or not after:
         return 2, float("inf")
     try:
-        endpoint_floor = max(float(before["endpoint_velocity_jump_mps"]) * 0.25, 1.0e-6)
-        temporal_floor = max(float(before["temporal_energy"]) * 0.25, 1.0e-6)
-        endpoint = max(0.0, float(after["endpoint_velocity_jump_mps"]) - endpoint_floor) / endpoint_floor
-        temporal = max(0.0, float(after["temporal_energy"]) - temporal_floor) / temporal_floor
-        jerk = max(0.0, float(after["seam_jerk_mps3"]) - float(before["seam_jerk_mps3"]) * 1.02 - 1.0e-6)
+        endpoint_limit = float(before["endpoint_velocity_jump_mps"]) * (
+            1.0 - float(cfg.checkpoint_validation_min_endpoint_repair_gain)
+        )
+        temporal_limit = float(before["temporal_energy"]) * (
+            1.0 - float(cfg.checkpoint_validation_min_temporal_repair_gain)
+        )
+        endpoint_denominator = max(abs(endpoint_limit), 1.0e-6)
+        temporal_denominator = max(abs(temporal_limit), 1.0e-6)
+        endpoint = max(
+            0.0,
+            float(after["endpoint_velocity_jump_mps"]) - endpoint_limit,
+        ) / endpoint_denominator
+        temporal = max(
+            0.0,
+            float(after["temporal_energy"]) - temporal_limit,
+        ) / temporal_denominator
+        jerk_limit = float(before["seam_jerk_mps3"]) * 1.02 + 1.0e-6
+        jerk = max(0.0, float(after["seam_jerk_mps3"]) - jerk_limit)
         failures = int(not bool(observable.get("endpoint_accepted", False))) + int(not bool(observable.get("temporal_accepted", False)))
-        return failures, float(endpoint + temporal + jerk / max(float(before["seam_jerk_mps3"]), 1.0))
+        return failures, float(endpoint + temporal + jerk / max(abs(jerk_limit), 1.0))
     except (KeyError, TypeError, ValueError, OverflowError):
         return 2, float("inf")
 
@@ -409,7 +429,7 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
             reasons.append("fidelity:observable_reference_fidelity_rejected")
     if hidden_clean_used:
         reasons.append("hidden_clean_used")
-    failure_count, residual = _proxy_residual(observable)
+    failure_count, residual = _proxy_residual(observable, case.cfg)
     reasons = list(dict.fromkeys(reasons))
     joint_pass = bool(
         endpoint_pass
@@ -489,6 +509,75 @@ def _solver_key(evaluation: Mapping[str, Any], action: np.ndarray) -> tuple[int,
     )
 
 
+def _solver_key_payload(key: tuple[int, float, float]) -> dict[str, Any]:
+    """Make a JSON-safe, named representation of the candidate comparator."""
+    return {
+        "failure_count": int(key[0]),
+        "proxy_residual": float(key[1]) if math.isfinite(key[1]) else None,
+        "action_norm_normalized": float(key[2]) if math.isfinite(key[2]) else None,
+    }
+
+
+def _solver_key_rejection_reason(
+    current_key: tuple[int, float, float], trial_key: tuple[int, float, float]
+) -> str:
+    """Explain why a trial did not strictly improve the lexicographic key."""
+    if trial_key[0] > current_key[0]:
+        return "failure_count_increased"
+    if trial_key[0] == current_key[0] and trial_key[1] > current_key[1]:
+        return "proxy_residual_not_reduced"
+    if trial_key[:2] == current_key[:2] and trial_key[2] >= current_key[2]:
+        return "action_norm_not_reduced"
+    return "solver_key_not_strictly_better"
+
+
+def _solver_trial_payload(
+    evaluation: Mapping[str, Any],
+    *,
+    backtrack: int,
+    current_key: tuple[int, float, float],
+    trial_key: tuple[int, float, float],
+    action_delta_norm: float,
+) -> dict[str, Any]:
+    """Capture compact authoritative evidence for one trial action."""
+    observable = evaluation.get("observable_boundary", {})
+    action_detail = evaluation.get("action", {})
+    absolute_physical = evaluation.get("absolute_physical_diagnostic", {})
+    fixed_support = evaluation.get("fixed_reference_support", {}) or {}
+    payload = {
+        "backtrack": int(backtrack),
+        "solver_key": _solver_key_payload(trial_key),
+        "current_solver_key": _solver_key_payload(current_key),
+        "key_improved": bool(trial_key < current_key),
+        "action_delta_norm_normalized": float(action_delta_norm),
+        "joint_pass": bool(evaluation.get("joint_pass", False)),
+        "failure_reasons": list(evaluation.get("failure_reasons", [])),
+        "endpoint_pass": bool(evaluation.get("endpoint_pass", False)),
+        "temporal_pass": bool(evaluation.get("temporal_pass", False)),
+        "jerk_pass": bool(evaluation.get("jerk_pass", False)),
+        "physical_pass": bool(evaluation.get("physical_pass", False)),
+        "fixed_support_pass": bool(fixed_support.get("accepted", False)),
+        "fidelity_pass": bool(evaluation.get("fidelity_pass", False)),
+        "absolute_physical_ok": bool(absolute_physical.get("ok", False)),
+        "absolute_physical_reasons": list(absolute_physical.get("reasons", [])),
+        "support_outside_edit_max": action_detail.get("support_outside_edit_max"),
+        "contact_residual_max": action_detail.get("contact_residual_max"),
+        "proxy_failure_count": int(evaluation.get("proxy_failure_count", 10**6)),
+        "proxy_residual": (
+            float(evaluation["proxy_residual"])
+            if math.isfinite(float(evaluation.get("proxy_residual", float("inf"))))
+            else None
+        ),
+        "endpoint_gain": observable.get("endpoint_gain"),
+        "temporal_gain": observable.get("temporal_gain"),
+        "endpoint_accepted": bool(observable.get("endpoint_accepted", False)),
+        "temporal_accepted": bool(observable.get("temporal_accepted", False)),
+    }
+    if trial_key >= current_key:
+        payload["rejected_reason"] = _solver_key_rejection_reason(current_key, trial_key)
+    return payload
+
+
 @dataclasses.dataclass
 class SolverResult:
     status: str
@@ -565,12 +654,24 @@ def solve_action_feasibility(
             accepted = False
             chosen = None
             current_key = _solver_key(current_eval, current_action)
+            trial_diagnostics: list[dict[str, Any]] = []
             for backtrack in range(controls.backtracking_steps):
                 factor = 0.5 ** backtrack
                 trial_action = current_action + (direction.detach().cpu().numpy() * (radius * factor)).astype(np.float32)
                 trial = evaluate_action_candidate(case, trial_action, label=f"iteration_{step_index}_trial_{backtrack}")
                 trial["_cfg"] = case.cfg
                 trial_key = _solver_key(trial, trial_action)
+                trial_diagnostics.append(
+                    _solver_trial_payload(
+                        trial,
+                        backtrack=backtrack,
+                        current_key=current_key,
+                        trial_key=trial_key,
+                        action_delta_norm=normalized_raw_action_norm(
+                            trial_action - current_action, case.cfg
+                        ),
+                    )
+                )
                 if trial_key < current_key:
                     accepted, chosen = True, (trial_action, trial, backtrack)
                     break
@@ -581,11 +682,16 @@ def solve_action_feasibility(
                 "proxy": proxy,
                 "gradient_norm": gradient_norm,
                 "accepted": bool(accepted),
+                "current_solver_key": _solver_key_payload(current_key),
+                "trial_diagnostics": trial_diagnostics,
             }
             if accepted and chosen is not None:
                 current_action, current_eval, backtrack = chosen
                 radius = min(float(controls.initial_trust_radius), radius / max(controls.trust_radius_shrink, 1.0e-6))
                 record["backtrack"] = int(backtrack)
+                record["selected_solver_key"] = _solver_key_payload(
+                    _solver_key(current_eval, current_action)
+                )
                 record["joint_pass"] = bool(current_eval.get("joint_pass", False))
                 if current_eval.get("joint_pass", False):
                     # A feasible candidate is subjected to the same fixed
@@ -604,6 +710,7 @@ def solve_action_feasibility(
             else:
                 radius *= controls.trust_radius_shrink
                 record["radius_after_rejection"] = float(radius)
+                record["rejection_reason"] = "all_trials_not_strictly_better"
             iterations.append(record)
             if radius < controls.minimum_trust_radius:
                 detail["reason"] = "trust_region_exhausted"
