@@ -297,6 +297,7 @@ def run_evaluation(args: argparse.Namespace) -> int:
         max_iterations=int(args.max_iterations),
         initial_trust_radius=float(args.initial_trust_radius),
         minimum_trust_radius=float(args.minimum_trust_radius),
+        structured_probe_seed=int(args.seed),
     )
     solver_cfg.validate()
     cases, case_info = load_case_manifest(args.case_manifest, cfg)

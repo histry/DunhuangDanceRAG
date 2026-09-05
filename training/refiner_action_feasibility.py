@@ -27,7 +27,7 @@ from motion_geometry.product_manifold import (
 )
 from training import motion_models as m
 
-PROTOCOL_VERSION = "refiner_action_feasibility_dev_v6"
+PROTOCOL_VERSION = "refiner_action_feasibility_dev_v7"
 DECODER_PROTOCOL = "product_refiner_true_decoder_confidence_smoothing_taper_cap_v1"
 METRIC_PROTOCOL = "observable_boundary_stage_physical_fixed_support_fidelity_v1"
 ACTION_DIM = PRODUCT_STATE_DIM - 4
@@ -44,6 +44,16 @@ RESTORATION_METRICS = ("joint_jerk", "foot_penetration", "fidelity_seam_jerk")
 MARGIN_PROBE_SCALES = (1.0, 0.5, 0.25)
 CONE_PROJECTION_SWEEPS = 64
 SAFE_STEP_FRACTION = 0.9
+RESTORATION_GAP_FRACTION = 0.05
+STRICT_MARGIN_DERIVATIVE_FLOOR = 1.0e-6
+BOUNDARY_INVARIANT_METRICS = frozenset(
+    {"rot6d_nonfinite_ratio", "rot6d_degenerate_ratio"}
+)
+JOINT_PROBE_GROUPS = (
+    (0, 1, 2, 3, 4, 5, 6, 7),
+    (8, 9, 10, 11, 12, 13, 14, 15),
+    (16, 17, 18, 19, 20, 21, 22, 23),
+)
 STATUS_VERIFIED_FEASIBLE = "VERIFIED_FEASIBLE"
 STATUS_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 STATUS_NUMERICAL_FAILURE = "NUMERICAL_FAILURE"
@@ -71,6 +81,8 @@ class FeasibilitySolverConfig:
     gradient_norm_floor: float = 1.0e-12
     comparison_tolerance: float = 1.0e-7
     finite_difference_probe_radius: float = 0.03125
+    structured_probe_seed: int = 42
+    structured_sparse_directions: int = 6
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -90,6 +102,8 @@ class FeasibilitySolverConfig:
             raise ValueError("minimum_edit_factors must be in [0,1)")
         if not math.isfinite(self.finite_difference_probe_radius) or self.finite_difference_probe_radius <= 0.0:
             raise ValueError("finite_difference_probe_radius must be positive and finite")
+        if self.structured_sparse_directions < 0:
+            raise ValueError("structured_sparse_directions must be non-negative")
 
 
 @dataclasses.dataclass
@@ -391,7 +405,7 @@ def _physical_metric_directions() -> dict[str, str]:
         return {}
 
 
-def _gate_residual_details(gate: Mapping[str, Any] | None) -> dict[str, dict[str, float]]:
+def _gate_residual_details(gate: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
     """Extract normalized numeric residuals from an authoritative gate."""
     if not isinstance(gate, Mapping):
         return {}
@@ -404,7 +418,7 @@ def _gate_residual_details(gate: Mapping[str, Any] | None) -> dict[str, dict[str
         else "reference_"
     )
     directions = _physical_metric_directions()
-    result: dict[str, dict[str, float]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for name, candidate_value in detail.items():
         name = str(name)
         if not name.startswith("candidate_"):
@@ -433,12 +447,22 @@ def _gate_residual_details(gate: Mapping[str, Any] | None) -> dict[str, dict[str
             else:
                 residual = max(0.0, candidate - allowed) / scale
                 margin = (allowed - candidate) / scale
+        boundary_invariant = bool(
+            metric in BOUNDARY_INVARIANT_METRICS
+            and math.isfinite(allowed)
+            and allowed == 0.0
+            and baseline >= 0.0
+        )
         result[metric] = {
             "baseline": baseline,
             "candidate": candidate,
             "allowed": allowed,
             "residual": float(residual),
             "margin": float(margin),
+            "margin_kind": (
+                "boundary_invariant" if boundary_invariant else "signed_inequality"
+            ),
+            "safety_margin_eligible": not boundary_invariant,
         }
     return result
 
@@ -453,9 +477,13 @@ def _hard_residual_components(evaluation: Mapping[str, Any]) -> dict[str, Any]:
         evaluation.get("reference_fidelity")
     )
 
-    def summary(metrics: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
+    def summary(metrics: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         residuals = [float(item["residual"]) for item in metrics.values()]
-        margins = [float(item["margin"]) for item in metrics.values()]
+        margins = [
+            float(item["margin"])
+            for item in metrics.values()
+            if item.get("safety_margin_eligible", True)
+        ]
         residual = max(residuals, default=0.0)
         minimum_margin = min(margins) if margins else None
         if not margins:
@@ -474,10 +502,15 @@ def _hard_residual_components(evaluation: Mapping[str, Any]) -> dict[str, Any]:
             "safety_deficit": float(safety_deficit),
             "search_value": float(residual + safety_deficit),
             "metrics": dict(metrics),
+            "boundary_invariant_metrics": sorted(
+                name
+                for name, item in metrics.items()
+                if not item.get("safety_margin_eligible", True)
+            ),
         }
 
     def select(
-        sources: tuple[tuple[str, Mapping[str, Mapping[str, float]]], ...],
+        sources: tuple[tuple[str, Mapping[str, Mapping[str, Any]]], ...],
         needle: str,
     ) -> dict[str, Any]:
         selected = {
@@ -990,6 +1023,109 @@ def _evaluation_margins(evaluation: Mapping[str, Any]) -> dict[str, float]:
     }
 
 
+def _structured_probe_basis(
+    case: ActionFeasibilityCase,
+    observable_directions: Mapping[str, np.ndarray],
+    controls: FeasibilitySolverConfig,
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
+    """Build a deterministic, block-structured action-space probe basis."""
+    frames = int(case.frames)
+
+    def frame_weight(value: Any) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float64).reshape(frames, -1)
+        return np.max(np.abs(array), axis=1)
+
+    root_weight = frame_weight(case.root_mask)
+    joint_weight = np.asarray(case.joint_mask, dtype=np.float64).reshape(frames, 24)
+    joint_weight = np.max(np.abs(joint_weight).reshape(frames, 24, -1), axis=2)
+    seam_weight = frame_weight(case.seam)
+    envelope = np.maximum.reduce(
+        [root_weight, np.max(joint_weight, axis=1), seam_weight]
+    )
+    active = np.flatnonzero(envelope > 1.0e-8)
+    if active.size:
+        start, stop = int(active[0]), int(active[-1])
+    else:
+        start, stop = 0, max(0, frames - 1)
+        envelope = np.ones(frames, dtype=np.float64)
+    coordinate = np.zeros(frames, dtype=np.float64)
+    if stop > start:
+        coordinate[start : stop + 1] = np.linspace(0.0, 1.0, stop - start + 1)
+    smooth = np.zeros(frames, dtype=np.float64)
+    smooth[start : stop + 1] = np.sin(
+        np.pi * coordinate[start : stop + 1]
+    )
+    if start == stop:
+        smooth[start] = 1.0
+    smooth *= np.clip(envelope, 0.0, 1.0)
+    profiles = {
+        "left": smooth * np.exp(-0.5 * ((coordinate - 0.2) / 0.18) ** 2),
+        "center": smooth * np.exp(-0.5 * ((coordinate - 0.5) / 0.18) ** 2),
+        "right": smooth * np.exp(-0.5 * ((coordinate - 0.8) / 0.18) ** 2),
+        "symmetric": smooth,
+        "antisymmetric": smooth * (2.0 * coordinate - 1.0),
+    }
+    support = np.zeros((frames, ACTION_DIM), dtype=np.float64)
+    support[:, :3] = root_weight[:, None]
+    support[:, 3:] = np.repeat(joint_weight, 3, axis=1)
+    directions: dict[str, np.ndarray] = {}
+    diagnostics: list[dict[str, Any]] = []
+
+    def add(name: str, value: np.ndarray, source: str) -> None:
+        direction = _normalise_direction_np(value * support, case.cfg)
+        diagnostics.append(
+            {"objective": name, "source": source, "available": direction is not None}
+        )
+        if direction is not None:
+            directions[name] = direction
+
+    for objective, direction in observable_directions.items():
+        for profile_name in ("left", "center", "right", "symmetric", "antisymmetric"):
+            add(
+                f"structured_{objective}_{profile_name}",
+                np.asarray(direction, dtype=np.float64)
+                * profiles[profile_name][:, None],
+                "observable_direction_time_block",
+            )
+    profile_names = tuple(profiles)
+    for axis, axis_name in enumerate(("x", "y", "z")):
+        for profile_name in profile_names:
+            value = np.zeros((frames, ACTION_DIM), dtype=np.float64)
+            value[:, axis] = profiles[profile_name]
+            add(
+                f"structured_root_{axis_name}_{profile_name}",
+                value,
+                "root_axis_time_block",
+            )
+    for group_index, joints in enumerate(JOINT_PROBE_GROUPS):
+        for axis in range(3):
+            for profile_name in profile_names:
+                value = np.zeros((frames, ACTION_DIM), dtype=np.float64)
+                for joint in joints:
+                    value[:, 3 + 3 * joint + axis] = profiles[profile_name]
+                add(
+                    (
+                        f"structured_joint_group{group_index}_axis{axis}_"
+                        f"{profile_name}"
+                    ),
+                    value,
+                    "joint_group_axis_time_block",
+                )
+    case_offset = sum(str(case.case_id).encode("utf-8"))
+    rng = np.random.default_rng(int(controls.structured_probe_seed) + case_offset)
+    for index in range(controls.structured_sparse_directions):
+        value = np.zeros((frames, ACTION_DIM), dtype=np.float64)
+        block = rng.choice(ACTION_DIM, size=min(8, ACTION_DIM), replace=False)
+        profile = profiles[profile_names[index % len(profile_names)]]
+        value[:, block] = profile[:, None] * rng.choice((-1.0, 1.0), size=len(block))
+        add(
+            f"structured_sparse_{index}",
+            value,
+            "fixed_seed_block_sparse",
+        )
+    return directions, diagnostics
+
+
 def _margin_models(
     case: ActionFeasibilityCase,
     action: np.ndarray,
@@ -1007,6 +1143,8 @@ def _margin_models(
     base = _evaluation_margins(evaluation)
     names = list(directions)
     matrix = np.stack([directions[name].reshape(-1) for name in names]).astype(np.float64)
+    reconstructor = np.linalg.pinv(matrix, rcond=1.0e-8)
+    span_rank = int(np.linalg.matrix_rank(matrix))
     shape = action.shape
     nearby = any(value < HARD_SAFETY_MARGIN_FLOOR for value in base.values())
     scales = MARGIN_PROBE_SCALES if nearby else (1.0,)
@@ -1047,13 +1185,11 @@ def _margin_models(
                     "directional_derivatives": derivatives,
                 }
                 if complete:
-                    gradient, _, rank, _ = np.linalg.lstsq(
-                        matrix, np.asarray(derivatives), rcond=1.0e-8
-                    )
+                    gradient = reconstructor @ np.asarray(derivatives)
                     if np.isfinite(gradient).all():
                         models[metric].append(gradient.reshape(shape))
                         diagnostic.update({
-                            "span_rank": int(rank),
+                            "span_rank": span_rank,
                             "gradient_norm": float(np.linalg.norm(gradient)),
                             "fit_residual_max": float(np.max(np.abs(matrix @ gradient - derivatives))),
                         })
@@ -1070,44 +1206,78 @@ def _project_margin_cone(
     cfg: Any,
     *,
     preserve_observables: tuple[str, ...] = (),
+    require_positive: tuple[str, ...] = (),
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     """Project into all active linear halfspaces; discard unconverged candidates."""
     active = [
         name for name, margin in margins.items()
         if (not name.startswith("observable_") and margin < HARD_SAFETY_MARGIN_FLOOR)
         or name in preserve_observables
+        or name in require_positive
     ]
-    missing = [name for name in active if not models.get(name)]
+    usable_models = {
+        name: [
+            gradient
+            for gradient in models.get(name, [])
+            if float(np.linalg.norm(gradient)) > 1.0e-12
+        ]
+        for name in active
+    }
+    missing = [name for name in active if not usable_models[name]]
     evidence: dict[str, Any] = {"active_constraints": active, "missing_models": missing}
     if missing:
         return None, {**evidence, "available": False, "reason": "missing_active_margin_model"}
-    normals = []
+    normals: list[tuple[str, np.ndarray, float]] = []
     for name in active:
-        for gradient in models[name]:
+        for gradient in usable_models[name]:
             norm = float(np.linalg.norm(gradient))
-            if norm > 1.0e-12:
-                normals.append(gradient / norm)
+            lower = (
+                STRICT_MARGIN_DERIVATIVE_FLOOR
+                if name in require_positive
+                else 0.0
+            )
+            normals.append((name, gradient / norm, lower))
     value = np.asarray(direction, dtype=np.float64).copy()
     scale = max(float(np.linalg.norm(value)), 1.0e-12)
     sweeps = 0
     for sweeps in range(1, CONE_PROJECTION_SWEEPS + 1):
-        for normal in normals:
+        for _, normal, lower in normals:
             derivative = float(np.sum(normal * value))
-            if derivative < 0.0:
-                value -= derivative * normal
-        violation = max((-float(np.sum(normal * value)) for normal in normals), default=0.0)
+            if derivative < lower:
+                value += (lower - derivative) * normal
+        violation = max(
+            (
+                lower - float(np.sum(normal * value))
+                for _, normal, lower in normals
+            ),
+            default=0.0,
+        )
         if violation <= 1.0e-10 * scale:
             break
     projected = _normalise_direction_np(value, cfg)
     # Normalizing a nearly cancelled vector can magnify projection error.
     violation = max(
-        (-float(np.sum(normal * projected)) for normal in normals), default=0.0
+        (
+            lower - float(np.sum(normal * projected))
+            for _, normal, lower in normals
+        ),
+        default=0.0,
     ) if projected is not None else float("inf")
     available = projected is not None and violation <= 1.0e-8 * max(
         float(np.linalg.norm(projected)), 1.0e-12
     )
+    projected_derivatives = {
+        name: [
+            float(np.sum(normal * projected))
+            for metric_name, normal, _ in normals
+            if metric_name == name
+        ]
+        for name in active
+    } if projected is not None else {}
     evidence.update({
         "available": bool(available), "sweeps": sweeps,
+        "strict_positive_constraints": list(require_positive),
+        "projected_directional_derivatives": projected_derivatives,
         "max_halfspace_violation": violation if math.isfinite(violation) else None,
         "reason": "projected" if available else "zero_or_unconverged_cone_projection",
     })
@@ -1180,16 +1350,42 @@ def _restoration_acceptance(
         for name in ("endpoint", "temporal")
     )
     hard_failures = _hard_constraint_failures(trial)
-    increased = complete and after_min > before_min + tolerance
+    deficit = (
+        max(0.0, HARD_SAFETY_MARGIN_FLOOR - before_min)
+        if before_min is not None
+        else float("inf")
+    )
+    required_gain = max(tolerance, RESTORATION_GAP_FRACTION * deficit)
+    increased = complete and after_min >= before_min + required_gain
     accepted = not hard_failures and preserved_passes and nonworsening and increased
     return bool(accepted), {
         "eligible": bool(accepted), "hard_constraint_failures": hard_failures,
         "observable_excess_nonworsening": nonworsening,
         "observable_passes_preserved": bool(preserved_passes),
         "target_metrics": targets, "minimum_margin_before": before_min,
-        "minimum_margin_after": after_min, "margin_increase_required": tolerance,
+        "minimum_margin_after": after_min,
+        "safety_margin_deficit_before": deficit if math.isfinite(deficit) else None,
+        "margin_increase_required": required_gain,
+        "restoration_gap_fraction": RESTORATION_GAP_FRACTION,
         "minimum_margin_increased": bool(increased),
     }
+
+
+def _ordinary_candidate_admissible(
+    restoration: Mapping[str, Any],
+    *,
+    feasible_probe_exists: bool,
+    joint_pass: bool,
+    tolerance: float,
+) -> tuple[bool, bool]:
+    before = restoration.get("minimum_margin_before")
+    after = restoration.get("minimum_margin_after")
+    nonworsening = bool(
+        before is not None
+        and after is not None
+        and float(after) >= float(before) - tolerance
+    )
+    return bool(feasible_probe_exists or joint_pass or nonworsening), nonworsening
 
 
 def _combination_directions(
@@ -1537,6 +1733,9 @@ def solve_action_feasibility(
         "safe_step_fraction": SAFE_STEP_FRACTION,
         "cone_projection_sweeps": CONE_PROJECTION_SWEEPS,
         "restoration_margin_increase": controls.comparison_tolerance,
+        "restoration_gap_fraction": RESTORATION_GAP_FRACTION,
+        "structured_probe_seed": controls.structured_probe_seed,
+        "structured_sparse_directions": controls.structured_sparse_directions,
         "reachability_scope": "sampled_local_span_only_not_global_infeasibility",
     }
     last_reachability_diagnosis = None
@@ -1624,27 +1823,52 @@ def solve_action_feasibility(
             current_hard_components = current_eval.get(
                 "hard_residual_components", {}
             ) or {}
+            observable_directions = dict(directions)
+            structured_directions, structured_diagnostics = _structured_probe_basis(
+                case, observable_directions, controls
+            )
+            probe_basis = {**observable_directions, **structured_directions}
             margin_models, observable_reachability, margin_diagnostics = _margin_models(
-                case, current_action, current_eval, directions, stage, probe_radius
+                case, current_action, current_eval, probe_basis, stage, probe_radius
             )
             current_margins = _evaluation_margins(current_eval)
             hard_direction_diagnostics = []
+            hard_metric_objectives: dict[str, list[str]] = {}
             for metric, gradients in margin_models.items():
                 if metric.startswith("observable_") or not gradients:
                     continue
                 if current_margins[metric] >= HARD_SAFETY_MARGIN_FLOOR and metric not in RESTORATION_METRICS:
                     continue
-                direction = _normalise_direction_np(np.mean(gradients, axis=0), case.cfg)
-                hard_direction_diagnostics.append({
-                    "objective": f"hard_{metric}", "metric": metric,
-                    "available": direction is not None,
-                    "model_count": len(gradients),
-                    "current_margin": current_margins[metric],
-                    "direction_source": "canonical_margin_multiscale_one_sided",
-                })
-                if direction is not None:
-                    directions[f"hard_{metric}"] = direction
-                    direction_sources[f"hard_{metric}"] = "canonical_margin_multiscale_one_sided"
+                model_metadata = [
+                    item for item in margin_diagnostics
+                    if item.get("metric") == metric
+                    and item.get("available")
+                    and item.get("gradient_norm") is not None
+                ]
+                for model_index, gradient in enumerate(gradients):
+                    direction = _normalise_direction_np(gradient, case.cfg)
+                    objective = f"hard_{metric}_model{model_index}"
+                    metadata = (
+                        model_metadata[model_index]
+                        if model_index < len(model_metadata)
+                        else {}
+                    )
+                    hard_direction_diagnostics.append({
+                        "objective": objective, "metric": metric,
+                        "available": direction is not None,
+                        "model_index": model_index,
+                        "scale": metadata.get("scale"),
+                        "side": metadata.get("side"),
+                        "current_margin": current_margins[metric],
+                        "direction_source": "canonical_margin_independent_one_sided",
+                    })
+                    if direction is not None:
+                        directions[objective] = direction
+                        hard_metric_objectives.setdefault(metric, []).append(objective)
+                        direction_sources[objective] = (
+                            "canonical_margin_independent_one_sided"
+                            f":scale={metadata.get('scale')}:side={metadata.get('side')}"
+                        )
             direction_diagnostics.extend(hard_direction_diagnostics)
             target_margins = {
                 metric: current_margins[metric] for metric in RESTORATION_METRICS
@@ -1655,11 +1879,16 @@ def solve_action_feasibility(
                 binding = [
                     metric for metric, margin in target_margins.items()
                     if margin <= minimum_target + controls.comparison_tolerance
-                    and f"hard_{metric}" in directions
+                    and hard_metric_objectives.get(metric)
                 ]
                 if binding:
+                    binding_directions = [
+                        directions[objective]
+                        for metric in binding
+                        for objective in hard_metric_objectives[metric]
+                    ]
                     combined_guard = _normalise_direction_np(
-                        np.sum([directions[f"hard_{metric}"] for metric in binding], axis=0),
+                        np.sum(binding_directions, axis=0),
                         case.cfg,
                     )
                     if combined_guard is not None:
@@ -1679,6 +1908,12 @@ def solve_action_feasibility(
             ]
             preserved = ("observable_endpoint",) if stage == "temporal" else ()
             restoration_preserved = ("observable_endpoint", "observable_temporal")
+            strict_restoration_margins = tuple(
+                metric
+                for metric in RESTORATION_METRICS
+                if current_margins.get(metric, float("inf"))
+                <= controls.comparison_tolerance
+            )
             cone_diagnostics: dict[str, Any] = {}
             raw_directions = dict(directions)
             directions = {}
@@ -1697,6 +1932,7 @@ def solve_action_feasibility(
                     prepared, preparation_evidence = _project_margin_cone(
                         direction, margin_models, current_margins, case.cfg,
                         preserve_observables=restoration_preserved,
+                        require_positive=strict_restoration_margins,
                     )
                     cone_diagnostics[name] = preparation_evidence
                     if prepared is not None:
@@ -1803,7 +2039,22 @@ def solve_action_feasibility(
                         current_eval, trial, controls.comparison_tolerance
                     )
                     restoration_evidence["enabled_no_feasible_probe"] = restoration_enabled
+                    (
+                        ordinary_candidate_admissible,
+                        binding_margin_nonworsening,
+                    ) = _ordinary_candidate_admissible(
+                        restoration_evidence,
+                        feasible_probe_exists=feasible_probe_exists,
+                        joint_pass=bool(trial.get("joint_pass", False)),
+                        tolerance=controls.comparison_tolerance,
+                    )
+                    restoration_evidence["binding_margin_nonworsening"] = (
+                        binding_margin_nonworsening
+                    )
                     trial_payload["hard_margin_restoration"] = restoration_evidence
+                    trial_payload["ordinary_candidate_admissible"] = (
+                        ordinary_candidate_admissible
+                    )
                     trial_payload["search_phase"] = (
                         "hard_margin_restoration" if preparation_direction else stage
                     )
@@ -1813,6 +2064,7 @@ def solve_action_feasibility(
                     )
                     if (
                         not hard_failures
+                        and ordinary_candidate_admissible
                         and trial_stage_key < current_stage_key
                         and (best is None or trial_stage_key < best[0])
                     ):
@@ -1822,6 +2074,13 @@ def solve_action_feasibility(
                             trial,
                             objective,
                             backtrack,
+                        )
+                    elif (
+                        not ordinary_candidate_admissible
+                        and trial_stage_key < current_stage_key
+                    ):
+                        trial_payload["rejected_reason"] = (
+                            "binding_hard_margin_reduced_without_joint_pass"
                         )
                     if restoration_enabled and restoration_ok:
                         restoration_key = (
@@ -1836,13 +2095,13 @@ def solve_action_feasibility(
             # A certified finite probe is itself a candidate, even if a local
             # linear model projected its source direction away. Recheck with
             # the same evaluator rather than discarding observed feasibility.
-            probe_directions = {**raw_directions, **directions}
+            probe_directions = {**probe_basis, **raw_directions, **directions}
             for probe in reachability:
                 if not probe.get("joint_pass", False):
                     continue
                 objective = str(probe["objective"])
                 probe_direction = (
-                    raw_directions.get(objective)
+                    probe_basis.get(objective)
                     if probe.get("probe_source") == "canonical_margin_one_sided"
                     else probe_directions.get(objective)
                 )
@@ -1901,11 +2160,13 @@ def solve_action_feasibility(
                 "proxy_loss": float(losses["joint"].detach().cpu()),
                 "proxy_components": proxy_components,
                 "gradient_directions": direction_diagnostics,
+                "structured_probe_directions": structured_diagnostics,
                 "direction_sources": direction_sources,
                 "finite_difference_hard_direction_diagnostics": hard_direction_diagnostics,
                 "finite_difference_margin_diagnostics": margin_diagnostics,
                 "combination_direction_diagnostics": combination_diagnostics,
                 "active_margin_cone_projection": cone_diagnostics,
+                "strict_restoration_margins": list(strict_restoration_margins),
                 "safe_step_diagnostics": step_diagnostics,
                 "current_hard_residual_components": current_hard_components,
                 **_dominant_constraints(current_hard_components),

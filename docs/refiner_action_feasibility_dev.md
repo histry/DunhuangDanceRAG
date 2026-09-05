@@ -29,9 +29,9 @@ decoder and independent audits, then runs a fixed minimum-edit schedule after a
 feasible point is found. A rejected or unsuccessful case rolls back to the
 observed reference. A rollback is never counted as a rescue.
 
-## v6 constrained restoration solver
+## v7 constrained restoration solver
 
-`refiner_action_feasibility_dev_v6` merges physical/fixed-support source
+`refiner_action_feasibility_dev_v7` merges physical/fixed-support source
 metrics by canonical root before searching. Each root retains its source
 metrics and uses the worst normalized residual and minimum signed margin;
 the original layer-specific gates still decide acceptance. Diagnostic layer
@@ -39,23 +39,34 @@ summaries remain available, but are not independent search directions.
 `dominant_failed_constraint` requires a positive/nonfinite residual;
 zero-residual low-margin metrics appear only as `dominant_guard_constraint`.
 The legacy `dominant_hard_constraint` now means failures only.
+Zero-limit, nonnegative Rot6D nonfinite/degenerate ratios are recorded as
+`boundary_invariant`: zero remains valid, positive residual still fails, and
+their unattainable positive margin is excluded from guards and cone fitting.
 
 The solver measures true decoded margins at probe radii `h`, `h/2`, and
-`h/4` near a boundary. It fits separate forward/backward derivatives in the
-observable direction span, then projects candidate directions into all active
-hard-margin halfspaces. Temporal search also protects the actual endpoint
-margin. Missing active models, a zero projected direction, or an unconverged
-projection disable that direction. The linear step bound uses the most
-adverse retained derivative and 90% of the remaining signed margin before
-backtracking; every resulting trial still passes through the original audits.
-These are local models, not guarantees of nonlinear or global feasibility.
+`h/4` near a boundary. Its deterministic search basis includes observable
+gradients; left/center/right and symmetric/antisymmetric seam profiles; root
+x/y/z blocks; three joint groups by tangent axis; and fixed-seed block-sparse
+directions. It fits and retains separate forward/backward margin gradients at
+each scale instead of averaging them. Candidate directions are projected into
+all active hard-margin halfspaces. A zero-margin joint-jerk or penetration
+restoration requires a strictly positive derivative for every such metric.
+Temporal search also protects the actual endpoint margin. Missing active
+models, a zero projected direction, or an unconverged projection disable that
+direction. The linear step bound uses the most adverse retained derivative
+and 90% of the remaining signed margin before backtracking; every resulting
+trial still passes through the original audits. These are local models, not
+guarantees of nonlinear or global feasibility.
 
 When no sampled probe passes observable and hard gates together, the solver
 can accept a `hard_margin_restoration` preparation step if ordinary stage
 search found no better candidate. All hard gates must pass, both observable
 excesses must not increase, previously passed observable gates must remain
 passed, and the minimum available margin among joint jerk, foot penetration,
-and fidelity seam jerk must increase by more than `comparison_tolerance`.
+and fidelity seam jerk must increase by at least 5% of its current gap to the
+safety floor (and more than `comparison_tolerance`). An ordinary observable
+step that spends the binding physical margin is inadmissible when no joint
+feasible probe exists, unless that step itself reaches `joint_pass`.
 Preparation never sets `joint_pass`; the original final conjunction and
 rollback behavior remain authoritative.
 
