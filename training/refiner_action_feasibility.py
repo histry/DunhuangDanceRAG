@@ -27,7 +27,7 @@ from motion_geometry.product_manifold import (
 )
 from training import motion_models as m
 
-PROTOCOL_VERSION = "refiner_action_feasibility_dev_v2"
+PROTOCOL_VERSION = "refiner_action_feasibility_dev_v3"
 DECODER_PROTOCOL = "product_refiner_true_decoder_confidence_smoothing_taper_cap_v1"
 METRIC_PROTOCOL = "observable_boundary_stage_physical_fixed_support_fidelity_v1"
 ACTION_DIM = PRODUCT_STATE_DIM - 4
@@ -57,6 +57,7 @@ class FeasibilitySolverConfig:
     minimum_edit_factors: tuple[float, ...] = (0.5, 0.25, 0.0)
     gradient_norm_floor: float = 1.0e-12
     comparison_tolerance: float = 1.0e-7
+    finite_difference_probe_radius: float = 0.03125
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -72,6 +73,8 @@ class FeasibilitySolverConfig:
             raise ValueError("backtracking_steps must be positive")
         if any(not 0.0 <= factor < 1.0 for factor in self.minimum_edit_factors):
             raise ValueError("minimum_edit_factors must be in [0,1)")
+        if not math.isfinite(self.finite_difference_probe_radius) or self.finite_difference_probe_radius <= 0.0:
+            raise ValueError("finite_difference_probe_radius must be positive and finite")
 
 
 @dataclasses.dataclass
@@ -306,18 +309,12 @@ def _failed_gate(schema: str, reason: str) -> dict[str, Any]:
     return {"schema": schema, "accepted": False, "reasons": [reason]}
 
 
-def _proxy_residual(observable: Mapping[str, Any], cfg: Any) -> tuple[int, float]:
-    """Return a solver residual on the same scale as the observable gate.
-
-    The differentiable proxy and the authoritative observable gate both use
-    the configured minimum repair gains.  Keeping the candidate comparator on
-    that same scale prevents the solver from optimizing a separate, implicit
-    75-percent-repair objective.
-    """
+def _observable_excesses(observable: Mapping[str, Any], cfg: Any) -> dict[str, float]:
+    """Compute authoritative-scale endpoint, temporal, and jerk excesses."""
     before = observable.get("before", {})
     after = observable.get("after", {})
     if not before or not after:
-        return 2, float("inf")
+        return {"endpoint": float("inf"), "temporal": float("inf"), "jerk": float("inf")}
     try:
         endpoint_limit = float(before["endpoint_velocity_jump_mps"]) * (
             1.0 - float(cfg.checkpoint_validation_min_endpoint_repair_gain)
@@ -337,10 +334,23 @@ def _proxy_residual(observable: Mapping[str, Any], cfg: Any) -> tuple[int, float
         ) / temporal_denominator
         jerk_limit = float(before["seam_jerk_mps3"]) * 1.02 + 1.0e-6
         jerk = max(0.0, float(after["seam_jerk_mps3"]) - jerk_limit)
-        failures = int(not bool(observable.get("endpoint_accepted", False))) + int(not bool(observable.get("temporal_accepted", False)))
-        return failures, float(endpoint + temporal + jerk / max(abs(jerk_limit), 1.0))
+        return {
+            "endpoint": float(endpoint),
+            "temporal": float(temporal),
+            "jerk": float(jerk / max(abs(jerk_limit), 1.0)),
+        }
     except (KeyError, TypeError, ValueError, OverflowError):
-        return 2, float("inf")
+        return {"endpoint": float("inf"), "temporal": float("inf"), "jerk": float("inf")}
+
+
+def _proxy_residual(observable: Mapping[str, Any], cfg: Any) -> tuple[int, float]:
+    """Return a solver residual on the same scale as the observable gate."""
+    excesses = _observable_excesses(observable, cfg)
+    failures = int(not bool(observable.get("endpoint_accepted", False))) + int(
+        not bool(observable.get("temporal_accepted", False))
+    )
+    residual = sum(excesses.values())
+    return failures, float(residual)
 
 
 def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarray, *, label: str = "candidate") -> dict[str, Any]:
@@ -429,6 +439,7 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
             reasons.append("fidelity:observable_reference_fidelity_rejected")
     if hidden_clean_used:
         reasons.append("hidden_clean_used")
+    observable_excesses = _observable_excesses(observable, case.cfg)
     failure_count, residual = _proxy_residual(observable, case.cfg)
     reasons = list(dict.fromkeys(reasons))
     joint_pass = bool(
@@ -463,14 +474,17 @@ def evaluate_action_candidate(case: ActionFeasibilityCase, raw_action: np.ndarra
         "action": action_detail,
         "proxy_failure_count": int(failure_count + int(not physical_pass) + int(not fixed_support_pass) + int(not fidelity_pass)),
         "proxy_residual": float(residual),
+        "solver_observable_excess": observable_excesses,
         "hidden_clean_used": hidden_clean_used,
         "invalid_input": False,
         "elapsed_seconds": float(time.perf_counter() - started),
     }
 
 
-def _proxy_loss(case: ActionFeasibilityCase, raw_action: Any) -> tuple[Any, dict[str, float]]:
-    """Differentiable boundary proxy; final acceptance never uses this proxy."""
+def _proxy_loss_components(
+    case: ActionFeasibilityCase, raw_action: Any
+) -> tuple[dict[str, Any], dict[str, float]]:
+    """Return differentiable objective components and their scalar diagnostics."""
     t = _require_torch()
     device, dtype = raw_action.device, raw_action.dtype
     reference = t.as_tensor(case.reference, device=device, dtype=dtype)[None]
@@ -492,13 +506,31 @@ def _proxy_loss(case: ActionFeasibilityCase, raw_action: Any) -> tuple[Any, dict
     temporal_excess = t.relu(after["temporal_energy"] - temporal_limit) / temporal_limit.abs().clamp_min(1.0e-6)
     jerk_excess = t.relu(after["seam_jerk_mps3"] - jerk_limit) / jerk_limit.abs().clamp_min(1.0)
     fidelity = t.mean(t.abs(product_log_torch(reference, candidate))) / max(float(case.cfg.checkpoint_validation_max_refiner_product_log_l1), 1.0e-6)
-    loss = endpoint_excess + temporal_excess + jerk_excess + 0.05 * fidelity
-    return loss, {
+    losses = {
+        "endpoint": endpoint_excess,
+        "temporal": temporal_excess,
+        "joint": endpoint_excess + temporal_excess + jerk_excess + 0.05 * fidelity,
+    }
+    values = {
         "endpoint_excess": float(endpoint_excess.detach().cpu()),
         "temporal_excess": float(temporal_excess.detach().cpu()),
         "jerk_excess": float(jerk_excess.detach().cpu()),
         "fidelity_proxy": float(fidelity.detach().cpu()),
     }
+    return losses, values
+
+
+def _proxy_loss(
+    case: ActionFeasibilityCase,
+    raw_action: Any,
+    *,
+    objective: str = "joint",
+) -> tuple[Any, dict[str, Any]]:
+    """Return one differentiable proxy objective and component diagnostics."""
+    losses, values = _proxy_loss_components(case, raw_action)
+    if objective not in losses:
+        raise ValueError(f"unknown feasibility proxy objective: {objective}")
+    return losses[objective], {**values, "objective": objective}
 
 
 def _solver_key(evaluation: Mapping[str, Any], action: np.ndarray) -> tuple[int, float, float]:
@@ -518,37 +550,230 @@ def _solver_key_payload(key: tuple[int, float, float]) -> dict[str, Any]:
     }
 
 
-def _solver_key_rejection_reason(
-    current_key: tuple[int, float, float], trial_key: tuple[int, float, float]
+def _hard_constraint_failures(
+    evaluation: Mapping[str, Any], *, preserve_endpoint: bool = False
+) -> list[str]:
+    """Return constraints that must remain satisfied during restoration."""
+    failures: list[str] = []
+    if not bool(evaluation.get("physical_pass", False)):
+        failures.extend(
+            f"physical:{reason}"
+            for reason in (evaluation.get("physical_stage", {}) or {}).get("reasons", [])
+        )
+        if not any(reason.startswith("physical:") for reason in failures):
+            failures.append("physical:stage_not_accepted")
+    fixed_support = evaluation.get("fixed_reference_support", {}) or {}
+    if not bool(fixed_support.get("accepted", False)):
+        failures.extend(
+            f"fixed_support:{reason}"
+            for reason in fixed_support.get("reasons", [])
+        )
+        if not any(reason.startswith("fixed_support:") for reason in failures):
+            failures.append("fixed_support:stage_not_accepted")
+    if not bool(evaluation.get("fidelity_pass", False)):
+        failures.extend(
+            f"fidelity:{reason}"
+            for reason in (evaluation.get("reference_fidelity", {}) or {}).get("reasons", [])
+        )
+        if not any(reason.startswith("fidelity:") for reason in failures):
+            failures.append("fidelity:stage_not_accepted")
+    if not bool(evaluation.get("finite_pass", False)):
+        failures.append("candidate_nonfinite")
+    action = evaluation.get("action", {}) or {}
+    if float(action.get("contact_residual_max", float("inf"))) > 1.0e-6:
+        failures.append("contact_residual_not_fixed_zero")
+    if float(action.get("support_outside_edit_max", float("inf"))) > 1.0e-6:
+        failures.append("support_outside_edit")
+    if bool(evaluation.get("hidden_clean_used", False)):
+        failures.append("hidden_clean_used")
+    if preserve_endpoint and not bool(evaluation.get("endpoint_pass", False)):
+        failures.append("observable:endpoint_not_preserved")
+    return list(dict.fromkeys(failures))
+
+
+def _solver_stage(evaluation: Mapping[str, Any]) -> str:
+    """Select the active restoration stage from the authoritative gate."""
+    if not bool(evaluation.get("endpoint_pass", False)):
+        return "endpoint"
+    if not bool(evaluation.get("temporal_pass", False)):
+        return "temporal"
+    return "joint"
+
+
+def _stage_key(
+    evaluation: Mapping[str, Any], action: np.ndarray, stage: str
+) -> tuple[int, float, float, float, float, float]:
+    """Compare candidates while preserving hard constraints and stage order."""
+    preserve_endpoint = stage == "temporal"
+    hard_failures = _hard_constraint_failures(
+        evaluation, preserve_endpoint=preserve_endpoint
+    )
+    excess = evaluation.get("solver_observable_excess", {}) or {}
+    endpoint = float(excess.get("endpoint", float("inf")))
+    temporal = float(excess.get("temporal", float("inf")))
+    jerk = float(excess.get("jerk", float("inf")))
+    residual = float(evaluation.get("proxy_residual", float("inf")))
+    if stage == "temporal":
+        primary, secondary = temporal, endpoint
+    else:
+        primary, secondary = endpoint, temporal
+    return (
+        int(bool(hard_failures)),
+        primary,
+        secondary,
+        jerk,
+        residual,
+        normalized_raw_action_norm(action, evaluation["_cfg"]),
+    )
+
+
+def _stage_key_payload(key: tuple[int, float, float, float, float, float]) -> dict[str, Any]:
+    return {
+        "hard_constraint_violation": bool(key[0]),
+        "primary_excess": float(key[1]) if math.isfinite(key[1]) else None,
+        "secondary_excess": float(key[2]) if math.isfinite(key[2]) else None,
+        "jerk_excess": float(key[3]) if math.isfinite(key[3]) else None,
+        "proxy_residual": float(key[4]) if math.isfinite(key[4]) else None,
+        "action_norm_normalized": float(key[5]) if math.isfinite(key[5]) else None,
+    }
+
+
+def _stage_key_rejection_reason(
+    current_key: tuple[int, float, float, float, float, float],
+    trial_key: tuple[int, float, float, float, float, float],
+    hard_failures: list[str],
 ) -> str:
-    """Explain why a trial did not strictly improve the lexicographic key."""
-    if trial_key[0] > current_key[0]:
-        return "failure_count_increased"
-    if trial_key[0] == current_key[0] and trial_key[1] > current_key[1]:
-        return "proxy_residual_not_reduced"
-    if trial_key[:2] == current_key[:2] and trial_key[2] >= current_key[2]:
-        return "action_norm_not_reduced"
-    return "solver_key_not_strictly_better"
+    if hard_failures:
+        return "hard_constraint_violation"
+    if trial_key[1] > current_key[1]:
+        return "stage_primary_excess_not_reduced"
+    if trial_key[1] == current_key[1] and trial_key[2] > current_key[2]:
+        return "stage_secondary_excess_not_reduced"
+    if trial_key >= current_key:
+        return "stage_key_not_strictly_better"
+    return "stage_key_improved"
+
+
+def _solver_objective_order(stage: str) -> tuple[str, ...]:
+    if stage == "endpoint":
+        return ("endpoint", "joint", "temporal")
+    if stage == "temporal":
+        return ("temporal", "joint", "endpoint")
+    return ("joint", "endpoint", "temporal")
+
+
+def _finite_difference_reachability(
+    case: ActionFeasibilityCase,
+    current_action: np.ndarray,
+    directions: Mapping[str, np.ndarray],
+    stage: str,
+    probe_radius: float,
+) -> list[dict[str, Any]]:
+    """Probe both signs of each objective direction without changing state."""
+    probes: list[dict[str, Any]] = []
+    for objective, direction in directions.items():
+        for sign in (-1, 1):
+            probe_action = current_action + (
+                float(sign) * float(probe_radius) * direction
+            ).astype(np.float32)
+            evaluation = evaluate_action_candidate(
+                case,
+                probe_action,
+                label=f"finite_difference_{objective}_{sign:+d}",
+            )
+            evaluation["_cfg"] = case.cfg
+            observable = evaluation.get("observable_boundary", {}) or {}
+            fixed_support = evaluation.get("fixed_reference_support", {}) or {}
+            hard_failures = _hard_constraint_failures(
+                evaluation, preserve_endpoint=stage == "temporal"
+            )
+            observable_improved = any(
+                float(observable.get(name)) > 0.0
+                for name in ("endpoint_gain", "temporal_gain")
+                if observable.get(name) is not None
+            )
+            observable_pass = bool(
+                evaluation.get("endpoint_pass", False)
+                and evaluation.get("temporal_pass", False)
+            )
+            physical_pass = bool(
+                evaluation.get("physical_pass", False)
+                and fixed_support.get("accepted", False)
+                and evaluation.get("fidelity_pass", False)
+            )
+            probes.append(
+                {
+                    "stage": stage,
+                    "objective": objective,
+                    "sign": int(sign),
+                    "probe_radius": float(probe_radius),
+                    "action_delta_norm_normalized": normalized_raw_action_norm(
+                        probe_action - current_action, case.cfg
+                    ),
+                    "endpoint_gain": (
+                        observable.get("endpoint_gain")
+                    ),
+                    "temporal_gain": (
+                        observable.get("temporal_gain")
+                    ),
+                    "endpoint_pass": bool(evaluation.get("endpoint_pass", False)),
+                    "temporal_pass": bool(evaluation.get("temporal_pass", False)),
+                    "physical_pass": bool(evaluation.get("physical_pass", False)),
+                    "fixed_support_pass": bool(fixed_support.get("accepted", False)),
+                    "fidelity_pass": bool(evaluation.get("fidelity_pass", False)),
+                    "observable_improved": bool(observable_improved),
+                    "observable_physical_feasible": bool(
+                        observable_pass and physical_pass and not hard_failures
+                    ),
+                    "hard_constraint_failures": hard_failures,
+                    "failure_reasons": list(evaluation.get("failure_reasons", [])),
+                }
+            )
+    return probes
+
+
+def _reachability_diagnosis(probes: list[Mapping[str, Any]]) -> str:
+    if any(bool(probe.get("observable_physical_feasible", False)) for probe in probes):
+        return "search_direction_or_acceptance_mismatch"
+    if any(
+        bool(probe.get("observable_improved", False))
+        and bool(probe.get("hard_constraint_failures"))
+        for probe in probes
+    ):
+        return "physical_constraint_blocks_observable_repair"
+    return "local_unreachable_under_finite_difference_probe"
 
 
 def _solver_trial_payload(
     evaluation: Mapping[str, Any],
     *,
+    stage: str,
+    objective: str,
+    current_stage_key: tuple[int, float, float, float, float, float],
+    trial_stage_key: tuple[int, float, float, float, float, float],
     backtrack: int,
     current_key: tuple[int, float, float],
     trial_key: tuple[int, float, float],
     action_delta_norm: float,
 ) -> dict[str, Any]:
     """Capture compact authoritative evidence for one trial action."""
-    observable = evaluation.get("observable_boundary", {})
-    action_detail = evaluation.get("action", {})
-    absolute_physical = evaluation.get("absolute_physical_diagnostic", {})
+    observable = evaluation.get("observable_boundary", {}) or {}
+    action_detail = evaluation.get("action", {}) or {}
+    absolute_physical = evaluation.get("absolute_physical_diagnostic", {}) or {}
     fixed_support = evaluation.get("fixed_reference_support", {}) or {}
+    hard_failures = _hard_constraint_failures(
+        evaluation, preserve_endpoint=stage == "temporal"
+    )
     payload = {
+        "stage": stage,
+        "objective": objective,
         "backtrack": int(backtrack),
         "solver_key": _solver_key_payload(trial_key),
         "current_solver_key": _solver_key_payload(current_key),
-        "key_improved": bool(trial_key < current_key),
+        "stage_key": _stage_key_payload(trial_stage_key),
+        "current_stage_key": _stage_key_payload(current_stage_key),
+        "key_improved": bool(trial_stage_key < current_stage_key),
+        "hard_constraint_failures": hard_failures,
         "action_delta_norm_normalized": float(action_delta_norm),
         "joint_pass": bool(evaluation.get("joint_pass", False)),
         "failure_reasons": list(evaluation.get("failure_reasons", [])),
@@ -573,8 +798,10 @@ def _solver_trial_payload(
         "endpoint_accepted": bool(observable.get("endpoint_accepted", False)),
         "temporal_accepted": bool(observable.get("temporal_accepted", False)),
     }
-    if trial_key >= current_key:
-        payload["rejected_reason"] = _solver_key_rejection_reason(current_key, trial_key)
+    if trial_stage_key >= current_stage_key:
+        payload["rejected_reason"] = _stage_key_rejection_reason(
+            current_stage_key, trial_stage_key, hard_failures
+        )
     return payload
 
 
@@ -629,66 +856,195 @@ def solve_action_feasibility(
     detail: dict[str, Any] = {
         "feasibility_restoration": True,
         "minimum_edit_completed": False,
-        "hard_constraint_gradient_coverage": ["observable_boundary_proxy_only"],
+        "hard_constraint_gradient_coverage": [
+            "observable_boundary_proxy_directions",
+        ],
+        "hard_constraint_enforcement": [
+            "physical_stage_hard_filter",
+            "fixed_support_stage_hard_filter",
+            "fidelity_stage_hard_filter",
+        ],
+        "finite_difference_probe_radius": float(
+            controls.finite_difference_probe_radius
+        ),
     }
+    last_reachability_diagnosis = None
     for step_index in range(controls.max_iterations):
         try:
             device = getattr(case.cfg, "device", "cpu")
             if str(device).startswith("cuda") and not t.cuda.is_available():
                 device = "cpu"
-            action_tensor = t.as_tensor(current_action, dtype=t.float64, device=device).clone().detach().requires_grad_(True)
-            loss, proxy = _proxy_loss(case, action_tensor)
-            gradient = t.autograd.grad(loss, action_tensor, allow_unused=False)[0]
-            gradient_norm = float(t.linalg.vector_norm(gradient).detach().cpu())
-            if not math.isfinite(gradient_norm) or gradient_norm <= controls.gradient_norm_floor:
+            stage = _solver_stage(current_eval)
+            action_tensor = (
+                t.as_tensor(current_action, dtype=t.float64, device=device)
+                .clone()
+                .detach()
+                .requires_grad_(True)
+            )
+            losses, proxy_components = _proxy_loss_components(case, action_tensor)
+            objective_order = _solver_objective_order(stage)
+            directions: dict[str, np.ndarray] = {}
+            direction_diagnostics: list[dict[str, Any]] = []
+            for objective in objective_order:
+                gradient = t.autograd.grad(
+                    losses[objective],
+                    action_tensor,
+                    allow_unused=True,
+                    retain_graph=True,
+                )[0]
+                if gradient is None:
+                    direction_diagnostics.append(
+                        {
+                            "objective": objective,
+                            "available": False,
+                            "reason": "gradient_unavailable",
+                        }
+                    )
+                    continue
+                gradient_norm = float(t.linalg.vector_norm(gradient).detach().cpu())
+                if not math.isfinite(gradient_norm) or gradient_norm <= controls.gradient_norm_floor:
+                    direction_diagnostics.append(
+                        {
+                            "objective": objective,
+                            "available": False,
+                            "gradient_norm": gradient_norm,
+                            "reason": "zero_constraint_gradient",
+                        }
+                    )
+                    continue
+                direction = -gradient / max(gradient_norm, controls.gradient_norm_floor)
+                direction_norm = float(
+                    _normalised_action_norm_torch(direction, case.cfg)
+                    .detach()
+                    .cpu()
+                )
+                if not math.isfinite(direction_norm) or direction_norm <= controls.gradient_norm_floor:
+                    direction_diagnostics.append(
+                        {
+                            "objective": objective,
+                            "available": False,
+                            "gradient_norm": gradient_norm,
+                            "reason": "zero_normalized_gradient_direction",
+                        }
+                    )
+                    continue
+                direction = direction / direction_norm
+                directions[objective] = direction.detach().cpu().numpy().astype(np.float32)
+                direction_diagnostics.append(
+                    {
+                        "objective": objective,
+                        "available": True,
+                        "gradient_norm": gradient_norm,
+                        "direction_norm": direction_norm,
+                    }
+                )
+            if not directions:
                 status = STATUS_NUMERICAL_FAILURE
-                detail["reason"] = "zero_constraint_gradient"
+                detail["reason"] = "no_available_proxy_direction"
                 break
-            direction = -gradient / max(gradient_norm, controls.gradient_norm_floor)
-            direction_norm = float(_normalised_action_norm_torch(direction, case.cfg).detach().cpu())
-            if not math.isfinite(direction_norm) or direction_norm <= controls.gradient_norm_floor:
-                status = STATUS_NUMERICAL_FAILURE
-                detail["reason"] = "zero_normalized_gradient_direction"
-                break
-            direction = direction / direction_norm
-            accepted = False
-            chosen = None
-            current_key = _solver_key(current_eval, current_action)
+
+            probe_radius = min(
+                float(radius), float(controls.finite_difference_probe_radius)
+            )
+            reachability = _finite_difference_reachability(
+                case,
+                current_action,
+                directions,
+                stage,
+                probe_radius,
+            )
+            reachability_diagnosis = _reachability_diagnosis(reachability)
+            last_reachability_diagnosis = reachability_diagnosis
+            current_stage_key = _stage_key(current_eval, current_action, stage)
+            current_solver_key = _solver_key(current_eval, current_action)
             trial_diagnostics: list[dict[str, Any]] = []
-            for backtrack in range(controls.backtracking_steps):
-                factor = 0.5 ** backtrack
-                trial_action = current_action + (direction.detach().cpu().numpy() * (radius * factor)).astype(np.float32)
-                trial = evaluate_action_candidate(case, trial_action, label=f"iteration_{step_index}_trial_{backtrack}")
-                trial["_cfg"] = case.cfg
-                trial_key = _solver_key(trial, trial_action)
-                trial_diagnostics.append(
-                    _solver_trial_payload(
+            best = None
+            for objective in objective_order:
+                direction = directions.get(objective)
+                if direction is None:
+                    continue
+                direction_meta = next(
+                    item
+                    for item in direction_diagnostics
+                    if item["objective"] == objective
+                )
+                for backtrack in range(controls.backtracking_steps):
+                    factor = 0.5 ** backtrack
+                    trial_action = current_action + (
+                        direction * (radius * factor)
+                    ).astype(np.float32)
+                    trial = evaluate_action_candidate(
+                        case,
+                        trial_action,
+                        label=f"iteration_{step_index}_{objective}_trial_{backtrack}",
+                    )
+                    trial["_cfg"] = case.cfg
+                    trial_key = _solver_key(trial, trial_action)
+                    trial_stage_key = _stage_key(trial, trial_action, stage)
+                    trial_payload = _solver_trial_payload(
                         trial,
+                        stage=stage,
+                        objective=objective,
+                        current_stage_key=current_stage_key,
+                        trial_stage_key=trial_stage_key,
                         backtrack=backtrack,
-                        current_key=current_key,
+                        current_key=current_solver_key,
                         trial_key=trial_key,
                         action_delta_norm=normalized_raw_action_norm(
                             trial_action - current_action, case.cfg
                         ),
                     )
-                )
-                if trial_key < current_key:
-                    accepted, chosen = True, (trial_action, trial, backtrack)
-                    break
+                    trial_payload["gradient_norm"] = direction_meta.get(
+                        "gradient_norm"
+                    )
+                    trial_diagnostics.append(trial_payload)
+                    hard_failures = _hard_constraint_failures(
+                        trial, preserve_endpoint=stage == "temporal"
+                    )
+                    if (
+                        not hard_failures
+                        and trial_stage_key < current_stage_key
+                        and (best is None or trial_stage_key < best[0])
+                    ):
+                        best = (
+                            trial_stage_key,
+                            trial_action,
+                            trial,
+                            objective,
+                            backtrack,
+                        )
+
+            accepted = best is not None
             record = {
                 "iteration": int(step_index),
+                "stage": stage,
+                "objective_order": list(objective_order),
                 "radius": float(radius),
-                "proxy_loss": float(loss.detach().cpu()),
-                "proxy": proxy,
-                "gradient_norm": gradient_norm,
+                "proxy_loss": float(losses["joint"].detach().cpu()),
+                "proxy_components": proxy_components,
+                "gradient_directions": direction_diagnostics,
+                "finite_difference_reachability": reachability,
+                "reachability_diagnosis": reachability_diagnosis,
                 "accepted": bool(accepted),
-                "current_solver_key": _solver_key_payload(current_key),
+                "current_solver_key": _solver_key_payload(current_solver_key),
+                "current_stage_key": _stage_key_payload(current_stage_key),
                 "trial_diagnostics": trial_diagnostics,
             }
-            if accepted and chosen is not None:
-                current_action, current_eval, backtrack = chosen
-                radius = min(float(controls.initial_trust_radius), radius / max(controls.trust_radius_shrink, 1.0e-6))
-                record["backtrack"] = int(backtrack)
+            if accepted and best is not None:
+                (
+                    selected_stage_key,
+                    current_action,
+                    current_eval,
+                    selected_objective,
+                    backtrack,
+                ) = best
+                radius = min(
+                    float(controls.initial_trust_radius),
+                    radius / max(controls.trust_radius_shrink, 1.0e-6),
+                )
+                record["selected_objective"] = selected_objective
+                record["selected_backtrack"] = int(backtrack)
+                record["selected_stage_key"] = _stage_key_payload(selected_stage_key)
                 record["selected_solver_key"] = _solver_key_payload(
                     _solver_key(current_eval, current_action)
                 )
@@ -698,10 +1054,25 @@ def solve_action_feasibility(
                     # minimum-edit schedule as an initially feasible point.
                     for index, factor in enumerate(controls.minimum_edit_factors):
                         trial_action = current_action * float(factor)
-                        trial = evaluate_action_candidate(case, trial_action, label=f"minimum_edit_{step_index}_{index}")
+                        trial = evaluate_action_candidate(
+                            case,
+                            trial_action,
+                            label=f"minimum_edit_{step_index}_{index}",
+                        )
                         trial["_cfg"] = case.cfg
-                        iterations.append({"phase": "minimum_edit", "index": index, "factor": float(factor), "joint_pass": bool(trial.get("joint_pass", False))})
-                        if trial.get("joint_pass", False) and normalized_raw_action_norm(trial_action, case.cfg) < normalized_raw_action_norm(current_action, case.cfg):
+                        iterations.append(
+                            {
+                                "phase": "minimum_edit",
+                                "index": index,
+                                "factor": float(factor),
+                                "joint_pass": bool(trial.get("joint_pass", False)),
+                            }
+                        )
+                        if (
+                            trial.get("joint_pass", False)
+                            and normalized_raw_action_norm(trial_action, case.cfg)
+                            < normalized_raw_action_norm(current_action, case.cfg)
+                        ):
                             current_action, current_eval = trial_action, trial
                     detail["minimum_edit_completed"] = True
                     status = STATUS_VERIFIED_FEASIBLE
@@ -710,7 +1081,8 @@ def solve_action_feasibility(
             else:
                 radius *= controls.trust_radius_shrink
                 record["radius_after_rejection"] = float(radius)
-                record["rejection_reason"] = "all_trials_not_strictly_better"
+                record["rejection_reason"] = reachability_diagnosis
+                detail["last_reachability_diagnosis"] = reachability_diagnosis
             iterations.append(record)
             if radius < controls.minimum_trust_radius:
                 detail["reason"] = "trust_region_exhausted"
@@ -722,6 +1094,10 @@ def solve_action_feasibility(
 
     if status != STATUS_VERIFIED_FEASIBLE:
         detail.setdefault("reason", "budget_exhausted")
+        detail.setdefault(
+            "reachability_diagnosis",
+            last_reachability_diagnosis or "not_evaluated",
+        )
         returned_action = zero
         returned_motion = case.reference.copy()
         rollback = True
