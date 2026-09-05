@@ -528,11 +528,9 @@ def _canonical_metric_root(metric: str, layer: str) -> str:
     """Map equivalent stage reason spellings to one metric root."""
     value = str(metric).lower()
     for prefix in ("reference_fidelity_", "absolute_"):
-        if value.startswith(prefix):
-            value = value[len(prefix) :]
+        value = value.removeprefix(prefix)
     for suffix in ("_regressed", "_too_high", "_too_low"):
-        if value.endswith(suffix):
-            value = value[: -len(suffix)]
+        value = value.removesuffix(suffix)
     patterns = (
         ("foot_penetration", "foot_penetration"),
         ("foot_support_drift", "foot_support_drift"),
@@ -593,9 +591,12 @@ def _dominant_constraints(components: Mapping[str, Any]) -> dict[str, Any]:
         margin = item.get("minimum_margin")
         if residual > 0.0 or not math.isfinite(residual):
             failed[root] = residual if math.isfinite(residual) else float("inf")
-        elif margin is not None and math.isfinite(float(margin)):
-            if float(margin) < HARD_SAFETY_MARGIN_FLOOR:
-                guards[root] = float(margin)
+        elif (
+            margin is not None
+            and math.isfinite(float(margin))
+            and float(margin) < HARD_SAFETY_MARGIN_FLOOR
+        ):
+            guards[root] = float(margin)
     return {
         "dominant_failed_constraint": max(failed, key=failed.get) if failed else None,
         "dominant_guard_constraint": min(guards, key=guards.get) if guards else None,
@@ -1691,7 +1692,7 @@ def solve_action_feasibility(
                 if projected is not None:
                     directions[objective] = projected
                     direction_sources[objective] += "+active_margin_cone"
-                if objective.startswith("hard_") or objective.startswith("blend_"):
+                if objective.startswith(("hard_", "blend_")):
                     name = f"restoration_{objective}"
                     prepared, preparation_evidence = _project_margin_cone(
                         direction, margin_models, current_margins, case.cfg,
