@@ -9,29 +9,7 @@ CAPTURE_ROOT="${1:-outputs/generation_stage_capture_20260905_205755}"
 OLD_CASES="${2:-$CAPTURE_ROOT/refiner_failure_cases_selected_round2/cases.json}"
 EXPECTED_COMMIT="${3:-$(git rev-parse HEAD)}"
 MAX_ITERATIONS="${4:-32}"
-SOURCE_REPORT="$CAPTURE_ROOT/fresh_audio_final.report.json"
-
-[[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || {
-  echo "[FATAL] MAX_ITERATIONS must be a positive integer" >&2
-  exit 2
-}
-[[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]] || {
-  echo "[FATAL] commit mismatch" >&2
-  exit 2
-}
-[[ -z "$(git status --porcelain)" ]] || {
-  echo "[FATAL] Git worktree is dirty" >&2
-  git status --short >&2
-  exit 2
-}
-[[ -s "$SOURCE_REPORT" ]] || {
-  echo "[FATAL] source report missing: $SOURCE_REPORT" >&2
-  exit 2
-}
-[[ -s "$OLD_CASES" ]] || {
-  echo "[FATAL] old case manifest missing: $OLD_CASES" >&2
-  exit 2
-}
+SOURCE_REPORT="${5:-${SOURCE_REPORT:-outputs/diagnostic_refiner_only/fresh_audio_final.report.json}}"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 CASE_DIR="outputs/refiner_failure_cases_frozen_v1_${STAMP}"
@@ -61,6 +39,28 @@ echo "===== FROZEN B3 DEVELOPMENT PIPELINE START ====="
 echo "started_at=$(date --iso-8601=seconds)"
 echo "commit=$EXPECTED_COMMIT"
 echo "source_report=$SOURCE_REPORT"
+
+[[ "$MAX_ITERATIONS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "[FATAL] MAX_ITERATIONS must be a positive integer" >&2
+  exit 2
+}
+[[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]] || {
+  echo "[FATAL] commit mismatch" >&2
+  exit 2
+}
+[[ -z "$(git status --porcelain)" ]] || {
+  echo "[FATAL] Git worktree is dirty" >&2
+  git status --short >&2
+  exit 2
+}
+[[ -s "$SOURCE_REPORT" ]] || {
+  echo "[FATAL] source report missing: $SOURCE_REPORT" >&2
+  exit 2
+}
+[[ -s "$OLD_CASES" ]] || {
+  echo "[FATAL] old case manifest missing: $OLD_CASES" >&2
+  exit 2
+}
 
 BUNDLE=$("$PYTHON_BIN" - "$SOURCE_REPORT" <<'PY'
 import hashlib
