@@ -322,7 +322,12 @@ def test_solver_accepts_preparation_then_rolls_back_if_final_gate_still_fails():
         device="cpu", product_refiner_root_cap_m=1.0,
         product_refiner_rotation_cap_rad=1.0,
     )
-    case = SimpleNamespace(frames=1, cfg=cfg, reference=np.zeros((1, 151)))
+    case = SimpleNamespace(
+        case_id="restoration-test",
+        frames=1,
+        cfg=cfg,
+        reference=np.zeros((1, 151)),
+    )
 
     def evaluate(case, action, **kwargs):
         result = _evaluation()
