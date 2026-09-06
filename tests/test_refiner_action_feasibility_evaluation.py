@@ -8,6 +8,9 @@ import numpy as np
 from training.motion_models import MotionGenerationConfig
 from training.refiner_action_feasibility_evaluation import (
     MANIFEST_SCHEMA,
+    _iteration_summary,
+    _sha256,
+    _verified_proposal_source,
     load_case_manifest,
 )
 
@@ -26,6 +29,46 @@ def _write_case(root: Path, case_id: str, recording: str, split: str = "dev") ->
 
 
 class RefinerActionFeasibilityEvaluationTests(unittest.TestCase):
+    def test_proposal_requires_the_exact_checkpoint_and_array_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "refiner.pt"
+            checkpoint.write_bytes(b"verified-checkpoint")
+            proposal = root / "proposal.npy"
+            np.save(proposal, np.zeros((8, 151), dtype=np.float32))
+            row = {
+                "proposal_motion_path": str(proposal),
+                "metadata": {
+                    "proposal_checkpoint_sha256": _sha256(checkpoint),
+                    "proposal_motion_sha256": _sha256(proposal),
+                },
+            }
+            source = _verified_proposal_source(
+                row,
+                root / "manifest.json",
+                {"path": str(checkpoint), "sha256": _sha256(checkpoint)},
+            )
+            self.assertEqual(source["kind"], "motion")
+            row["metadata"]["proposal_checkpoint_sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "checkpoint SHA256 mismatch"):
+                _verified_proposal_source(
+                    row,
+                    root / "manifest.json",
+                    {"path": str(checkpoint), "sha256": _sha256(checkpoint)},
+                )
+
+    def test_iteration_summary_removes_large_probe_payloads(self):
+        result = _iteration_summary({
+            "iteration": 2,
+            "accepted_phase": "temporal",
+            "trial_diagnostics": [{"large": [1, 2, 3]}],
+            "finite_difference_reachability": [{"probe": 1}, {"probe": 2}],
+            "direction_diagnostics": [{"direction": 1}],
+        })
+        self.assertEqual(result["trial_diagnostics_count"], 1)
+        self.assertEqual(result["finite_difference_reachability_count"], 2)
+        self.assertNotIn("trial_diagnostics", result)
+
     def test_manifest_loads_explicit_development_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

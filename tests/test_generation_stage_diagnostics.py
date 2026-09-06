@@ -1,5 +1,14 @@
-"""Behavior checks for the report-only adapter. Not executed locally."""
-from training.generation_stage_diagnostics import summarize_report
+"""Behavior checks for the development diagnostic adapter. Not executed locally."""
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from training.generation_stage_diagnostics import (
+    _apply_verified_solution_windows,
+    _array,
+    summarize_report,
+)
 
 
 def test_absent_diffusion_transaction_is_unknown_not_success():
@@ -35,3 +44,51 @@ def test_round_counts_are_not_conflated_with_assembly_decisions():
     })
     assert len(result["rounds"]) == 2
     assert result["assembly_decisions"]["accepted_best_unsafe_fallback"] == 1
+
+
+def _solution_row(root: Path, case_id: str, span, reference, changed_local):
+    directory = root / case_id
+    directory.mkdir()
+    returned = reference.copy()
+    returned[changed_local, 0] = 1.0
+    artifacts = {
+        "reference": _array(directory, "reference", reference),
+        "returned_motion": _array(directory, "returned_motion", returned),
+        "returned_action": _array(
+            directory,
+            "returned_action",
+            np.ones((len(reference), 75), dtype=np.float32),
+        ),
+        "proposal_action": _array(
+            directory,
+            "proposal_action",
+            np.zeros((len(reference), 75), dtype=np.float32),
+        ),
+    }
+    return {
+        "case_id": case_id,
+        "solution_artifacts": {
+            "bundle_sha256": "bundle-sha",
+            "frame_span": list(span),
+            "artifacts": artifacts,
+        },
+    }
+
+
+def test_replay_rejects_overlapping_actual_edit_frames(tmp_path):
+    full = np.zeros((6, 3), dtype=np.float32)
+    first = _solution_row(tmp_path, "a", [0, 4], full[0:4], 2)
+    second = _solution_row(tmp_path, "b", [2, 6], full[2:6], 0)
+    with pytest.raises(ValueError, match="edit regions overlap"):
+        _apply_verified_solution_windows(
+            full, [first, second], "bundle-sha", 1.0e-7
+        )
+
+
+def test_replay_rejects_reference_from_a_different_capture(tmp_path):
+    full = np.zeros((5, 3), dtype=np.float32)
+    stale = full[1:4].copy()
+    stale[0, 1] = 2.0
+    row = _solution_row(tmp_path, "stale", [1, 4], stale, 1)
+    with pytest.raises(ValueError, match="solution reference mismatch"):
+        _apply_verified_solution_windows(full, [row], "bundle-sha", 1.0e-7)

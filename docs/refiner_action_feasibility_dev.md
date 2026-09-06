@@ -137,9 +137,20 @@ and may not occur in multiple splits.
 
 B2/B3 are marked unavailable unless both explicit proposal actions and a
 verified V1 checkpoint are supplied. Random initialization is never used as a
-V1 proposal. Every run writes a fresh directory containing
-`manifest.json`, `report.json`, `case_level.jsonl`, `solver_iterations.jsonl`,
-and `evidence_summary.md`.
+V1 proposal. Every run writes a fresh directory containing `manifest.json`,
+`report.json`, `case_level.jsonl`, a compact `solver_iterations.jsonl`, and
+`evidence_summary.md`. The default `--iteration-detail full` also writes the
+complete trial and finite-difference records to
+`solver_iterations.full.jsonl.gz`; use `--iteration-detail summary` when only
+the compact per-iteration evidence is needed.
+
+For every B1 or B3 `VERIFIED_FEASIBLE` result, the evaluator writes
+`reference.npy`, `returned_action.npy`, `returned_motion.npy`, and
+`solution.json` below `solutions/<baseline>/<case>/`. B3 also stores the exact
+proposal action used by the solver. `case_level.jsonl` links these artifacts by
+SHA256 and retains the captured full-sequence `frame_span`. A proposal is valid
+only when its array SHA256 and recorded Refiner checkpoint SHA256 match the
+files supplied to the evaluator.
 
 ## Server execution template
 

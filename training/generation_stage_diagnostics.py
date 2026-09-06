@@ -6,6 +6,7 @@ summarized without loading torch, checkpoints or motion arrays.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -53,6 +54,22 @@ def _array(directory, name, value):
     path = Path(directory) / (name + ".npy")
     np.save(path, np.asarray(value), allow_pickle=False)
     return {"path": str(path.resolve()), "sha256": _hash(path), "shape": list(value.shape)}
+
+
+def _load_hashed_array(entry, label):
+    if not isinstance(entry, dict):
+        raise ValueError(f"missing array entry: {label}")
+    path = Path(entry.get("path", "")).resolve()
+    expected = str(entry.get("sha256", "")).strip().lower()
+    if not path.is_file() or not expected:
+        raise ValueError(f"incomplete array entry: {label}")
+    actual = _hash(path)
+    if actual != expected:
+        raise ValueError(f"array hash mismatch: {label}")
+    value = np.load(path, allow_pickle=False)
+    if not np.isfinite(value).all():
+        raise ValueError(f"non-finite array: {label}")
+    return value, {"path": str(path), "sha256": actual, "shape": list(value.shape)}
 
 
 def _git(*args):
@@ -151,7 +168,14 @@ def save_round_bundle(directory, round_id, reference, final, condition, seam,
     return {"path": str(path.resolve()), "sha256": _hash(path), "round": int(round_id)}
 
 
-def export_cases(bundle_path, provenance_path, output, slots, context_frames):
+def export_cases(
+    bundle_path,
+    provenance_path,
+    output,
+    slots,
+    context_frames,
+    proposal_stage=None,
+):
     # Explicit provenance prevents a generated/test sequence being silently
     # relabelled as development data. Never infer identity from file names.
     from training import motion_models as runtime
@@ -174,10 +198,32 @@ def export_cases(bundle_path, provenance_path, output, slots, context_frames):
     cfg = runtime.MotionGenerationConfig.from_json(bundle["config_path"])
     arrays = {}
     for name in ("reference", "condition", "seam"):
-        entry = bundle["arrays"][name]
-        if _hash(entry["path"]) != entry["sha256"]:
-            raise ValueError(f"array hash mismatch: {name}")
-        arrays[name] = np.load(entry["path"], allow_pickle=False)
+        arrays[name], _ = _load_hashed_array(bundle["arrays"][name], name)
+    proposal = None
+    proposal_info = None
+    proposal_checkpoint = None
+    if proposal_stage is not None:
+        if proposal_stage != "refiner":
+            raise ValueError("only the captured refiner proposal is supported")
+        proposal_key = "refiner_guarded_candidate"
+        proposal, proposal_info = _load_hashed_array(
+            bundle.get("stage_reports", {}).get(proposal_key), proposal_key
+        )
+        if proposal.shape != arrays["reference"].shape:
+            raise ValueError("captured refiner proposal shape mismatch")
+        proposal_checkpoint = bundle.get("checkpoints", {}).get("refiner", {})
+        if (
+            not isinstance(proposal_checkpoint, dict)
+            or proposal_checkpoint.get("active") is not True
+            or not proposal_checkpoint.get("sha256")
+        ):
+            raise ValueError("captured refiner proposal has no active checkpoint SHA256")
+        checkpoint_path = Path(proposal_checkpoint.get("path", "")).resolve()
+        if (
+            not checkpoint_path.is_file()
+            or _hash(checkpoint_path) != proposal_checkpoint["sha256"]
+        ):
+            raise ValueError("captured refiner checkpoint SHA256 mismatch")
     rows = bundle["assembly"]
     by_slot = {int(row["slot"]): index for index, row in enumerate(rows)}
     output = Path(output).resolve()
@@ -229,6 +275,21 @@ def export_cases(bundle_path, provenance_path, output, slots, context_frames):
                             ("joint_mask", joint[0].numpy()), ("root_mask", root[0].numpy()),
                             ("contact_mask", np.zeros((len(ref), 4), dtype=np.float32))):
             paths[name + "_path"] = _array(directory, name, value)["path"]
+        proposal_metadata = {}
+        if proposal is not None:
+            proposal_artifact = _array(
+                directory, "proposal_motion", proposal[lo:hi].copy()
+            )
+            paths["proposal_motion_path"] = proposal_artifact["path"]
+            proposal_metadata = {
+                "proposal_checkpoint_sha256": proposal_checkpoint["sha256"],
+                "proposal_motion_sha256": proposal_artifact["sha256"],
+                "proposal_full_motion_sha256": proposal_info["sha256"],
+                "proposal_capture_scope": (
+                    "guarded_refiner_candidate_after_internal_guards_"
+                    "before_outer_stage_transaction"
+                ),
+            }
         case_rows.append({
             "case_id": f"round{bundle['round']}_slot{slot}", "role": "cross_event",
             "width": end - start, "position_stratum": right["position_stratum"],
@@ -238,7 +299,8 @@ def export_cases(bundle_path, provenance_path, output, slots, context_frames):
             "left_recording_uid": left["recording_uid"], "right_recording_uid": right["recording_uid"],
             "metadata": {"bundle_sha256": _hash(bundle_path), "frame_span": [lo, hi],
                          "mask_policy": "recomputed_local_development_masks; not original production masks",
-                         "geometry_only": True, "production_replay_equivalent": False}, **paths,
+                         "geometry_only": True, "production_replay_equivalent": False,
+                         **proposal_metadata}, **paths,
         })
     manifest = output / "cases.json"
     _write(manifest, {"schema": MANIFEST_SCHEMA, "cases": case_rows,
@@ -246,6 +308,291 @@ def export_cases(bundle_path, provenance_path, output, slots, context_frames):
     load_case_manifest(manifest, cfg)
     _write(output / "config.json", dataclasses.asdict(cfg))
     return manifest
+
+
+@contextlib.contextmanager
+def _captured_environment(values):
+    previous = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            os.environ[str(key)] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _linked_source_report(source_report_path, bundle_path, bundle_sha256):
+    source_report_path = Path(source_report_path).resolve()
+    source_report = json.loads(source_report_path.read_text(encoding="utf-8-sig"))
+    link = source_report.get("stage_reports", {}).get(
+        "generation_stage_diagnostics", {}
+    )
+    if Path(link.get("path", "")).resolve() != bundle_path:
+        raise ValueError("source report does not select this bundle")
+    if str(link.get("sha256", "")).lower() != bundle_sha256:
+        raise ValueError("source report bundle SHA256 mismatch")
+    if not isinstance(source_report.get("slots"), list):
+        raise ValueError("source report has no slot activity contract")
+    return source_report, source_report_path
+
+
+def _solution_rows(feasibility_run, baseline):
+    run = Path(feasibility_run).resolve()
+    report_path = run / "report.json"
+    case_path = run / "case_level.jsonl"
+    report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    artifact = report.get("artifacts", {}).get("case_level", {})
+    if artifact:
+        if Path(artifact.get("path", "")).resolve() != case_path:
+            raise ValueError("feasibility case-level path mismatch")
+        if _hash(case_path) != artifact.get("sha256"):
+            raise ValueError("feasibility case-level SHA256 mismatch")
+    rows = [
+        json.loads(line)
+        for line in case_path.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip()
+    ]
+    selected = [row for row in rows if row.get("baseline") == baseline]
+    expected = int(report.get("cases", {}).get("primary_cases", 0))
+    if len(selected) != expected or expected < 1:
+        raise ValueError("replay requires one selected baseline row per primary case")
+    if any(
+        row.get("status") != "VERIFIED_FEASIBLE"
+        or row.get("final_joint_pass") is not True
+        or not row.get("solution_artifacts")
+        for row in selected
+    ):
+        raise ValueError("replay requires VERIFIED_FEASIBLE solution artifacts")
+    return report, report_path, selected
+
+
+def _quality_gate(closed_loop, physical, boundary, activity):
+    failures = []
+    if closed_loop.env_bool("ROUTING_SAFETY_REQUIRE_FINAL_PHYSICAL_GATE", True) and not physical["ok"]:
+        failures.append("physical:" + ",".join(map(str, physical["reasons"])))
+    if closed_loop.env_bool("BOUNDARY_REQUIRE_FINAL_BOUNDARY_GATE", True) and not boundary["ok"]:
+        failures.append("boundary:" + ",".join(map(str, boundary["reasons"])))
+    if closed_loop.env_bool("MOTION_ACTIVITY_FINAL_GATE", True) and not activity["ok"]:
+        failures.append("activity:" + ",".join(map(str, activity["reasons"])))
+    return {
+        "schema": "final_motion_quality_layers_v1",
+        "ok": not failures,
+        "reasons": failures,
+        "layers": {
+            "anti_freeze_anti_collapse": {
+                "ok": bool(activity["ok"]),
+                "reasons": list(activity["reasons"]),
+            },
+            **dict(physical.get("layers", {})),
+            "boundary_continuity": {
+                "ok": bool(boundary["ok"]),
+                "reasons": list(boundary["reasons"]),
+            },
+        },
+        "rejected_output_is_renderable": False,
+    }
+
+
+def _apply_verified_solution_windows(reference, rows, bundle_sha256, edit_tolerance):
+    if not np.isfinite(edit_tolerance) or float(edit_tolerance) < 0.0:
+        raise ValueError("edit_tolerance must be finite and non-negative")
+    repaired = np.asarray(reference).copy()
+    occupied = np.zeros((len(repaired),), dtype=bool)
+    applied = []
+    for row in rows:
+        solution = row["solution_artifacts"]
+        if solution.get("bundle_sha256") != bundle_sha256:
+            raise ValueError(f"solution bundle mismatch: {row.get('case_id')}")
+        span = solution.get("frame_span")
+        if not isinstance(span, list) or len(span) != 2:
+            raise ValueError("solution is missing the original frame_span")
+        lo, hi = map(int, span)
+        if not 0 <= lo < hi <= len(reference):
+            raise ValueError("solution frame_span is outside the captured reference")
+        artifacts = solution.get("artifacts", {})
+        saved_reference, saved_reference_info = _load_hashed_array(
+            artifacts.get("reference"), f"{row['case_id']}:reference"
+        )
+        returned_motion, returned_motion_info = _load_hashed_array(
+            artifacts.get("returned_motion"), f"{row['case_id']}:returned_motion"
+        )
+        returned_action, returned_action_info = _load_hashed_array(
+            artifacts.get("returned_action"), f"{row['case_id']}:returned_action"
+        )
+        proposal_action, proposal_action_info = _load_hashed_array(
+            artifacts.get("proposal_action"), f"{row['case_id']}:proposal_action"
+        )
+        if (
+            saved_reference.shape != reference[lo:hi].shape
+            or returned_motion.shape != saved_reference.shape
+            or returned_action.shape != (saved_reference.shape[0], 75)
+            or proposal_action.shape != returned_action.shape
+            or not np.array_equal(saved_reference, reference[lo:hi])
+        ):
+            raise ValueError(f"solution reference mismatch: {row.get('case_id')}")
+        changed = np.max(
+            np.abs(
+                returned_motion.astype(np.float64)
+                - saved_reference.astype(np.float64)
+            ),
+            axis=1,
+        ) > float(edit_tolerance)
+        global_changed = np.zeros_like(occupied)
+        global_changed[lo:hi] = changed
+        if np.any(occupied & global_changed):
+            raise ValueError("successful solution edit regions overlap")
+        repaired_window = repaired[lo:hi]
+        repaired_window[changed] = returned_motion[changed]
+        occupied |= global_changed
+        applied.append({
+            "case_id": row["case_id"],
+            "frame_span": [lo, hi],
+            "changed_frames": int(changed.sum()),
+            "reference": saved_reference_info,
+            "proposal_action": proposal_action_info,
+            "returned_action": returned_action_info,
+            "returned_motion": returned_motion_info,
+        })
+    return repaired, occupied, applied
+
+
+def replay_solutions(
+    bundle_path,
+    source_report_path,
+    feasibility_run,
+    output,
+    baseline="B3_frozen_v1_proposal_plus_action_solver",
+    edit_tolerance=1.0e-7,
+):
+    from routing import boundary_closed_loop as closed_loop
+    from training import motion_models as runtime
+
+    bundle_path = Path(bundle_path).resolve()
+    bundle_sha256 = _hash(bundle_path)
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8-sig"))
+    if bundle.get("schema") != "generation_round_bundle_v1":
+        raise ValueError("replay requires generation_round_bundle_v1")
+    source_report, source_report_path = _linked_source_report(
+        source_report_path, bundle_path, bundle_sha256
+    )
+    feasibility, feasibility_report_path, rows = _solution_rows(
+        feasibility_run, baseline
+    )
+    refiner_checkpoint = bundle.get("checkpoints", {}).get("refiner", {})
+    evaluated_checkpoint = feasibility.get("provenance", {}).get("checkpoint", {})
+    if (
+        not evaluated_checkpoint
+        or evaluated_checkpoint.get("sha256") != refiner_checkpoint.get("sha256")
+    ):
+        raise ValueError("feasibility/refiner checkpoint SHA256 mismatch")
+
+    reference, reference_info = _load_hashed_array(
+        bundle.get("arrays", {}).get("reference"), "reference"
+    )
+    condition, condition_info = _load_hashed_array(
+        bundle.get("arrays", {}).get("condition"), "condition"
+    )
+    seam, seam_info = _load_hashed_array(
+        bundle.get("arrays", {}).get("seam"), "seam"
+    )
+    slide, slide_info = _load_hashed_array(
+        bundle.get("arrays", {}).get("sliding_support_eligible"),
+        "sliding_support_eligible",
+    )
+    repaired, occupied, applied = _apply_verified_solution_windows(
+        reference, rows, bundle_sha256, edit_tolerance
+    )
+
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    repaired_refiner = _array(output, "repaired_refiner", repaired)
+    config_path = Path(bundle["config_path"]).resolve()
+    if _hash(config_path) != bundle.get("config_sha256"):
+        raise ValueError("captured config SHA256 mismatch")
+    captured_environment = bundle.get("runtime_environment", {})
+    with _captured_environment(captured_environment):
+        cfg = runtime.MotionGenerationConfig.from_json(config_path).apply_env()
+        cfg.refiner_enable = False
+        diffusion = bundle.get("checkpoints", {}).get("diffusion", {})
+        diffusion_path = diffusion.get("path") if diffusion.get("active") else None
+        if diffusion_path and _hash(diffusion_path) != diffusion.get("sha256"):
+            raise ValueError("captured diffusion checkpoint SHA256 mismatch")
+        replay_args = argparse.Namespace(
+            out=str(output / "replayed.npy"),
+            refiner=None,
+            diffusion=diffusion_path,
+        )
+        final_motion, stage_reports = closed_loop.apply_generators(
+            runtime,
+            repaired,
+            condition,
+            seam,
+            replay_args,
+            cfg,
+            sliding_support_eligible=slide,
+        )
+        boundary_rows = closed_loop.audit_boundaries(
+            runtime, final_motion, bundle["assembly"], cfg
+        )
+        physical = closed_loop.physical_quality_gate(stage_reports["final_audit"])
+        boundary = closed_loop.evaluate_boundary_continuity(
+            boundary_rows,
+            expected_boundaries=max(0, len(bundle["assembly"]) - 1),
+        )
+        activity = closed_loop.evaluate_final_motion_activity(
+            final_motion,
+            slots=source_report["slots"],
+            assembly_report=bundle["assembly"],
+            fps=float(cfg.fps),
+        )
+        final_gate = _quality_gate(closed_loop, physical, boundary, activity)
+
+    final_motion_info = _array(output, "replayed_final", final_motion)
+    report = {
+        "schema": "refiner_solution_development_replay_v1",
+        "completed": True,
+        "development_only": True,
+        "formal_preregistration": False,
+        "training_started": False,
+        "production_model_modified": False,
+        "scientific_acceptance": False,
+        "pilot_allowed": False,
+        "baseline": baseline,
+        "source": {
+            "bundle": {"path": str(bundle_path), "sha256": bundle_sha256},
+            "source_report": {
+                "path": str(source_report_path),
+                "sha256": _hash(source_report_path),
+            },
+            "feasibility_report": {
+                "path": str(feasibility_report_path),
+                "sha256": _hash(feasibility_report_path),
+            },
+            "reference": reference_info,
+            "condition": condition_info,
+            "seam": seam_info,
+            "sliding_support_eligible": slide_info,
+            "refiner_checkpoint_sha256": refiner_checkpoint.get("sha256"),
+            "diffusion_checkpoint_sha256": bundle.get("checkpoints", {}).get("diffusion", {}).get("sha256"),
+        },
+        "solutions": applied,
+        "edit_union_frames": int(occupied.sum()),
+        "repaired_refiner": repaired_refiner,
+        "replayed_final": final_motion_info,
+        "stage_reports": stage_reports,
+        "boundary_rows": boundary_rows,
+        "final_physical_gate": physical,
+        "final_boundary_continuity_gate": boundary,
+        "final_motion_activity": activity,
+        "final_quality_gate": final_gate,
+    }
+    report_path = output / "replay.report.json"
+    _write(report_path, report)
+    return report_path, bool(final_gate["ok"])
 
 
 def main():
@@ -260,9 +607,50 @@ def main():
     export.add_argument("--output-dir", required=True)
     export.add_argument("--slots", type=int, nargs="+", default=[25, 26])
     export.add_argument("--context-frames", type=int, default=16)
+    export.add_argument(
+        "--proposal-stage",
+        choices=("refiner",),
+        default=None,
+        help="Export a hash-bound captured frozen proposal for B2/B3.",
+    )
+    replay = commands.add_parser("replay")
+    replay.add_argument("--bundle", required=True)
+    replay.add_argument("--source-report", required=True)
+    replay.add_argument("--feasibility-run", required=True)
+    replay.add_argument("--output-dir", required=True)
+    replay.add_argument(
+        "--baseline",
+        default="B3_frozen_v1_proposal_plus_action_solver",
+        choices=("B3_frozen_v1_proposal_plus_action_solver",),
+    )
+    replay.add_argument("--edit-tolerance", type=float, default=1.0e-7)
     args = parser.parse_args()
     if args.command == "export":
-        print(export_cases(args.bundle, args.provenance, args.output_dir, args.slots, args.context_frames))
+        print(export_cases(
+            args.bundle,
+            args.provenance,
+            args.output_dir,
+            args.slots,
+            args.context_frames,
+            args.proposal_stage,
+        ))
+    elif args.command == "replay":
+        report_path, ok = replay_solutions(
+            args.bundle,
+            args.source_report,
+            args.feasibility_run,
+            args.output_dir,
+            args.baseline,
+            args.edit_tolerance,
+        )
+        print(json.dumps({
+            "stage": "refiner_solution_development_replay_complete",
+            "report": str(report_path),
+            "ok": ok,
+            "training_started": False,
+            "production_model_modified": False,
+        }, ensure_ascii=False))
+        return 0 if ok else 2
     else:
         path = Path(args.output)
         if path.exists():

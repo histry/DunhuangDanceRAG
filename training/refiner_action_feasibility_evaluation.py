@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gzip
 import hashlib
 import json
+import re
 import subprocess
 import time
 from collections import defaultdict
@@ -60,6 +62,87 @@ def _json_default(value: Any) -> Any:
 
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=_json_default) + "\n", encoding="utf-8")
+
+
+def _save_array_artifact(directory: Path, name: str, value: np.ndarray) -> dict[str, Any]:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.npy"
+    np.save(path, np.asarray(value), allow_pickle=False)
+    array = np.asarray(value)
+    return {
+        "path": str(path.resolve()),
+        "sha256": _sha256(path),
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+    }
+
+
+def _safe_component(value: str) -> str:
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    if not component:
+        raise ValueError("empty artifact path component")
+    return component
+
+
+def _save_solver_solution(
+    output: Path,
+    case: ActionFeasibilityCase,
+    baseline: str,
+    solver: Any,
+    *,
+    proposal_action: np.ndarray | None = None,
+    proposal_source: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if solver.status != STATUS_VERIFIED_FEASIBLE:
+        return None
+    directory = output / "solutions" / _safe_component(baseline) / _safe_component(case.case_id)
+    directory.mkdir(parents=True, exist_ok=False)
+    artifacts = {
+        "reference": _save_array_artifact(directory, "reference", case.reference),
+        "returned_action": _save_array_artifact(directory, "returned_action", solver.returned_action),
+        "returned_motion": _save_array_artifact(directory, "returned_motion", solver.returned_motion),
+    }
+    if proposal_action is not None:
+        artifacts["proposal_action"] = _save_array_artifact(directory, "proposal_action", proposal_action)
+    metadata = {
+        "schema": "refiner_action_feasibility_solution_v1",
+        "development_only": True,
+        "case_id": case.case_id,
+        "baseline": baseline,
+        "status": solver.status,
+        "frame_span": list(case.metadata.get("frame_span", [])),
+        "bundle_sha256": case.metadata.get("bundle_sha256"),
+        "proposal_source": dict(proposal_source or {}),
+        "artifacts": artifacts,
+        "joint_pass": bool(solver.final_evaluation.get("joint_pass", False)),
+        "training_started": False,
+        "production_model_modified": False,
+    }
+    metadata_path = directory / "solution.json"
+    _write_json(metadata_path, metadata)
+    return {
+        "metadata_path": str(metadata_path.resolve()),
+        "metadata_sha256": _sha256(metadata_path),
+        "frame_span": metadata["frame_span"],
+        "bundle_sha256": metadata["bundle_sha256"],
+        "reference_sha256": artifacts["reference"]["sha256"],
+        "proposal_sha256": (
+            artifacts.get("proposal_action", {}).get("sha256")
+            or (proposal_source or {}).get("proposal_motion_sha256")
+        ),
+        "returned_action_sha256": artifacts["returned_action"]["sha256"],
+        "returned_motion_sha256": artifacts["returned_motion"]["sha256"],
+        "artifacts": artifacts,
+    }
+
+
+def _iteration_summary(row: Mapping[str, Any]) -> dict[str, Any]:
+    heavy = {"trial_diagnostics", "finite_difference_reachability", "direction_diagnostics"}
+    result = {key: value for key, value in row.items() if key not in heavy}
+    for key in heavy:
+        value = row.get(key)
+        result[f"{key}_count"] = len(value) if isinstance(value, list) else 0
+    return result
 
 
 def _load_array(path: Path, *, key: str | None = None) -> np.ndarray:
@@ -206,11 +289,56 @@ def _proposal_action(
     return action
 
 
+def _verified_proposal_source(
+    row: Mapping[str, Any],
+    manifest_path: Path,
+    checkpoint_info: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    action_value = row.get("proposal_action_path")
+    motion_value = row.get("proposal_motion_path")
+    if not action_value and not motion_value:
+        return None
+    if checkpoint_info is None:
+        raise ValueError("proposal requires an explicit verified V1 checkpoint")
+    metadata = row.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise ValueError("proposal metadata must be an object")
+    expected_checkpoint = str(metadata.get("proposal_checkpoint_sha256", "")).strip().lower()
+    if not expected_checkpoint:
+        raise ValueError("proposal_checkpoint_sha256 is required")
+    if expected_checkpoint != str(checkpoint_info["sha256"]).lower():
+        raise ValueError("proposal checkpoint SHA256 mismatch")
+    path_value = action_value or motion_value
+    kind = "action" if action_value else "motion"
+    path = _resolve_path(manifest_path.parent, str(path_value))
+    expected_array = str(metadata.get(f"proposal_{kind}_sha256", "")).strip().lower()
+    if not expected_array:
+        raise ValueError(f"proposal_{kind}_sha256 is required")
+    actual_array = _sha256(path)
+    if expected_array != actual_array:
+        raise ValueError(f"proposal {kind} SHA256 mismatch")
+    return {
+        "kind": kind,
+        "path": str(path),
+        "sha256": actual_array,
+        "proposal_checkpoint_sha256": expected_checkpoint,
+        "capture_scope": metadata.get("proposal_capture_scope"),
+        "full_motion_sha256": metadata.get("proposal_full_motion_sha256"),
+    }
+
+
 def _status_from_result(result: Any) -> str:
     return str(getattr(result, "status", STATUS_INVALID_INPUT))
 
 
-def _baseline_row(case: ActionFeasibilityCase, baseline: str, evaluation: Mapping[str, Any], *, solver: Any = None) -> dict[str, Any]:
+def _baseline_row(
+    case: ActionFeasibilityCase,
+    baseline: str,
+    evaluation: Mapping[str, Any],
+    *,
+    solver: Any = None,
+    solution_artifacts: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     baseline_status = (
         STATUS_VERIFIED_FEASIBLE
         if evaluation.get("joint_pass")
@@ -254,6 +382,7 @@ def _baseline_row(case: ActionFeasibilityCase, baseline: str, evaluation: Mappin
             "final_dominant_failed_constraint": solver.final_evaluation.get("dominant_failed_constraint"),
             "final_dominant_guard_constraint": solver.final_evaluation.get("dominant_guard_constraint"),
             "final_action_norm_normalized": normalized_raw_action_norm(solver.returned_action, case.cfg),
+            "solution_artifacts": dict(solution_artifacts) if solution_artifacts else None,
         })
     return row
 
@@ -313,18 +442,32 @@ def run_evaluation(args: argparse.Namespace) -> int:
     proposal_rows = json.loads(case_manifest_path.read_text(encoding="utf-8")).get("cases", [])
     proposal_by_id = {str(row["case_id"]): row for row in proposal_rows}
     for case in cases:
+        proposal_row = proposal_by_id[case.case_id]
         zero = np.zeros((case.frames, ACTION_DIM), dtype=np.float32)
         b0_eval = evaluate_action_candidate(case, zero, label="B0_bridge_only_zero_action")
         rows.append(_baseline_row(case, "B0_bridge_only_zero_action", b0_eval))
         b1 = solve_action_feasibility(case, initial_action=zero, solver_config=solver_cfg)
-        rows.append(_baseline_row(case, "B1_zero_plus_action_solver", b1.final_evaluation, solver=b1))
+        b1_solution = _save_solver_solution(
+            output, case, "B1_zero_plus_action_solver", b1
+        )
+        rows.append(_baseline_row(
+            case,
+            "B1_zero_plus_action_solver",
+            b1.final_evaluation,
+            solver=b1,
+            solution_artifacts=b1_solution,
+        ))
         solver_rows.extend({**case.manifest_identity(), "baseline": "B1_zero_plus_action_solver", **iteration} for iteration in b1.iterations)
         try:
-            proposal = _proposal_action(case, proposal_by_id[case.case_id], case_manifest_path)
+            proposal_source = _verified_proposal_source(
+                proposal_row, case_manifest_path, checkpoint_info
+            )
+            proposal = _proposal_action(case, proposal_row, case_manifest_path)
             proposal_error = None
         except (KeyError, OSError, ValueError, TypeError) as exc:
             proposal = None
-            proposal_error = f"invalid_v1_proposal:{type(exc).__name__}"
+            proposal_source = None
+            proposal_error = f"invalid_v1_proposal:{type(exc).__name__}:{exc}"
         if proposal is None or checkpoint_info is None:
             missing = proposal_error or "missing_v1_proposal_or_verified_checkpoint"
             b2_eval = {"joint_pass": False, "failure_reasons": [missing], "invalid_input": True, "_cfg": case.cfg}
@@ -334,7 +477,21 @@ def run_evaluation(args: argparse.Namespace) -> int:
             b2_eval = evaluate_action_candidate(case, proposal, label="B2_frozen_v1_proposal")
             rows.append(_baseline_row(case, "B2_frozen_v1_proposal", b2_eval))
             b3 = solve_action_feasibility(case, initial_action=proposal, solver_config=solver_cfg)
-            rows.append(_baseline_row(case, "B3_frozen_v1_proposal_plus_action_solver", b3.final_evaluation, solver=b3))
+            b3_solution = _save_solver_solution(
+                output,
+                case,
+                "B3_frozen_v1_proposal_plus_action_solver",
+                b3,
+                proposal_action=proposal,
+                proposal_source=proposal_source,
+            )
+            rows.append(_baseline_row(
+                case,
+                "B3_frozen_v1_proposal_plus_action_solver",
+                b3.final_evaluation,
+                solver=b3,
+                solution_artifacts=b3_solution,
+            ))
             solver_rows.extend({**case.manifest_identity(), "baseline": "B3_frozen_v1_proposal_plus_action_solver", **iteration} for iteration in b3.iterations)
     case_path = output / "case_level.jsonl"
     with case_path.open("w", encoding="utf-8") as handle:
@@ -343,7 +500,13 @@ def run_evaluation(args: argparse.Namespace) -> int:
     iterations_path = output / "solver_iterations.jsonl"
     with iterations_path.open("w", encoding="utf-8") as handle:
         for row in solver_rows:
-            handle.write(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
+            handle.write(json.dumps(_iteration_summary(row), ensure_ascii=False, default=_json_default) + "\n")
+    full_iterations_path = None
+    if args.iteration_detail == "full":
+        full_iterations_path = output / "solver_iterations.full.jsonl.gz"
+        with gzip.open(full_iterations_path, "wt", encoding="utf-8") as handle:
+            for row in solver_rows:
+                handle.write(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
     by_baseline = defaultdict(list)
     by_group = defaultdict(list)
     for row in rows:
@@ -354,6 +517,17 @@ def run_evaluation(args: argparse.Namespace) -> int:
     diff_hash = _git_diff_hash() if dirty_state != "clean" else None
     resolved_config = dataclasses.asdict(cfg)
     config_sha256 = _sha256_json(resolved_config)
+    baseline_summaries = {
+        name: _summary(values) for name, values in sorted(by_baseline.items())
+    }
+    b3_summary = baseline_summaries.get(
+        "B3_frozen_v1_proposal_plus_action_solver", {}
+    )
+    complete_b3 = bool(
+        b3_summary.get("cases") == len(cases)
+        and b3_summary.get("verified_feasible") == len(cases)
+        and b3_summary.get("joint_pass_rate") == 1.0
+    )
     report = {
         "schema": SCHEMA,
         "completed": True,
@@ -377,12 +551,32 @@ def run_evaluation(args: argparse.Namespace) -> int:
             "metric_protocol": "observable_boundary_stage_physical_fixed_support_fidelity_v1",
         },
         "solver": solver_cfg.as_dict(),
-        "baselines": {name: _summary(values) for name, values in sorted(by_baseline.items())},
+        "iteration_detail": args.iteration_detail,
+        "artifacts": {
+            "case_level": {"path": str(case_path), "sha256": _sha256(case_path)},
+            "solver_iterations_summary": {
+                "path": str(iterations_path),
+                "sha256": _sha256(iterations_path),
+            },
+            "solver_iterations_full_gzip": (
+                {
+                    "path": str(full_iterations_path),
+                    "sha256": _sha256(full_iterations_path),
+                }
+                if full_iterations_path is not None
+                else None
+            ),
+        },
+        "baselines": baseline_summaries,
         "groups": {f"{role}/{width}/{position}": _summary(values) for (role, width, position), values in sorted(by_group.items())},
         "cases": {"primary_cases": len(cases), "baseline_rows": len(rows), "recordings": case_info["recordings"], "sources": case_info["sources"]},
         "decision": {
             "result": "ACTION_FEASIBILITY_DEVELOPMENT_COMPLETE_NO_NETWORK_TRAINING",
-            "next_action": "inspect_development_failure_modes_before_any_network_training",
+            "next_action": (
+                "run_hash_bound_development_replay_before_any_network_training"
+                if complete_b3
+                else "inspect_development_failure_modes_before_any_network_training"
+            ),
         },
     }
     _write_json(output / "manifest.json", {
@@ -394,6 +588,7 @@ def run_evaluation(args: argparse.Namespace) -> int:
         "resolved_config": resolved_config,
         "config_sha256": config_sha256,
         "solver_budget": solver_cfg.as_dict(),
+        "iteration_detail": args.iteration_detail,
         "case_manifest_sha256": case_info["sha256"],
         "checkpoint_sha256": checkpoint_info["sha256"] if checkpoint_info else None,
         "random_seed": int(args.seed),
@@ -465,6 +660,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int, default=24)
     parser.add_argument("--initial-trust-radius", type=float, default=0.25)
     parser.add_argument("--minimum-trust-radius", type=float, default=0.015625)
+    parser.add_argument(
+        "--iteration-detail",
+        choices=("summary", "full"),
+        default="full",
+        help="Always write compact JSONL; full also writes gzip-compressed trial diagnostics.",
+    )
     parser.set_defaults(started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     return parser
 

@@ -81,12 +81,16 @@ python -m training.generation_stage_diagnostics export \
   --bundle /absolute/path/to/selected/round_002/bundle.json \
   --provenance /absolute/path/to/verified_development_provenance.json \
   --slots 25 26 --context-frames 16 \
+  --proposal-stage refiner \
   --output-dir outputs/refiner_failure_cases_run01
 
 bash scripts/run_refiner_action_feasibility_dev.sh \
   outputs/refiner_failure_cases_run01/cases.json \
   outputs/refiner_feasibility_dev/failure_run01 \
-  --config outputs/refiner_failure_cases_run01/config.json
+  --config outputs/refiner_failure_cases_run01/config.json \
+  --v1-checkpoint /absolute/path/to/the/captured/refiner.pt \
+  --max-iterations 32 \
+  --iteration-detail full
 ```
 
 Export alone does not run the solver. The second command is a separate server
@@ -97,6 +101,38 @@ are fixed to zero, and the crop is NOT an exact replay of whole-song inference.
 The original whole-song seam and condition remain in the bundle for comparison.
 No frozen V1 baseline is claimed unless independently verified proposal and
 checkpoint provenance are supplied to the existing evaluator.
+
+With `--proposal-stage refiner`, export verifies the captured full-motion
+candidate and checkpoint hashes, crops the guarded Refiner candidate to each
+case window, and records `proposal_motion_path`, `proposal_motion_sha256`, and
+`proposal_checkpoint_sha256`. The candidate is after the runtime's internal
+guards and before the outer stage transaction; it is not relabelled as a raw
+network tensor. B2/B3 remain invalid unless the evaluator receives the exact
+checkpoint whose SHA256 is recorded by every proposal.
+
+## Replay verified B3 solutions
+
+Successful B1/B3 solves write immutable reference, returned action, and
+returned motion arrays under the feasibility run's `solutions/` directory.
+The following development-only replay accepts only a complete B3 set:
+
+```bash
+python -m training.generation_stage_diagnostics replay \
+  --bundle /absolute/path/to/selected/round_002/bundle.json \
+  --source-report /absolute/path/to/fresh_audio_final.report.json \
+  --feasibility-run outputs/refiner_feasibility_dev/frozen_v1_run01 \
+  --output-dir outputs/refiner_solution_replay/run01
+```
+
+Replay verifies the source-report-to-bundle link, the frozen Refiner
+checkpoint, every solution and reference hash, the original full-sequence
+frame spans, and the absence of overlapping actual edit frames. It starts from
+the captured reference, commits only changed frames, restores the captured
+runtime environment, and then runs the configured diffusion stage, IK,
+boundary audit, physical gate, and motion-activity gate. A failed final gate
+returns status 2 after preserving `replay.report.json` and all motion artifacts.
+The command never trains or modifies a checkpoint and always reports
+`pilot_allowed=false` and `production_model_modified=false`.
 
 Legacy reports without condition arrays and a round bundle can be summarized,
 but cannot be silently exported with fabricated zero conditions. Regenerate a
