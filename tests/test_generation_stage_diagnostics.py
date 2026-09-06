@@ -96,7 +96,7 @@ def test_replay_rejects_reference_from_a_different_capture(tmp_path):
         _apply_verified_solution_windows(full, [row], "bundle-sha", 1.0e-7)
 
 
-def test_v9_merges_physical_and_boundary_windows():
+def test_v10_merges_physical_and_boundary_windows():
     assert _merge_frame_windows(
         [[10, 20], [22, 30], [70, 90]],
         frames=100,
@@ -104,7 +104,7 @@ def test_v9_merges_physical_and_boundary_windows():
     ) == [[10, 30], [70, 90]]
 
 
-def test_v9_boundary_guard_is_strictly_nonregressing():
+def test_v10_boundary_guard_is_strictly_nonregressing():
     before = [{
         "slot": 1,
         "actual_boundary_jerk_mps3": 500.0,

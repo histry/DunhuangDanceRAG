@@ -1,7 +1,7 @@
 """Opt-in generation traces and development-only solution replay.
 
 The summarize/export paths are read-only.  Replay can execute the explicitly
-requested frozen generators and V9 constrained contact repair, but never
+requested frozen generators and V10 exact-audit contact repair, but never
 starts training or modifies a checkpoint.
 """
 from __future__ import annotations
@@ -562,9 +562,9 @@ def _load_stage_snapshot(entry):
     return value if np.isfinite(value).all() else None
 
 
-def _v9_stage_diagnostics(runtime, cfg, eligible, stages, arrays):
+def _v10_stage_diagnostics(runtime, cfg, eligible, stages, arrays):
     result = {
-        "schema": "generation_stage_physical_diagnostics_v9",
+        "schema": "generation_stage_physical_diagnostics_v10",
         "support_contract": "final_fail_closed_with_sliding_eligibility",
         "sliding_support_eligible_sha256": _array_content_hash(eligible),
         "sliding_support_eligible_frames": int(np.asarray(eligible).sum()),
@@ -702,6 +702,20 @@ def replay_solutions(
             len(repaired),
             gap=merge_gap,
         )
+        boundary_cache = {
+            _array_content_hash(repaired): repair_input_boundaries,
+        }
+
+        def cached_reference_boundaries(value):
+            key = _array_content_hash(value)
+            if key not in boundary_cache:
+                boundary_cache[key] = closed_loop.audit_boundaries(
+                    runtime,
+                    value,
+                    bundle["assembly"],
+                    cfg,
+                )
+            return boundary_cache[key]
 
         def contact_candidate_guard(current, candidate, ownership, audit_span):
             start, end = map(int, audit_span)
@@ -729,11 +743,12 @@ def replay_solutions(
                 )
             )
             boundary = _boundary_nonregression(
+                cached_reference_boundaries(current),
                 closed_loop.audit_boundaries(
-                    runtime, current, bundle["assembly"], cfg
-                ),
-                closed_loop.audit_boundaries(
-                    runtime, candidate, bundle["assembly"], cfg
+                    runtime,
+                    candidate,
+                    bundle["assembly"],
+                    cfg,
                 ),
             )
             observable_geometry_preserved = bool(
@@ -832,11 +847,11 @@ def replay_solutions(
         )
         repaired_contact_info = _array(
             output,
-            "repaired_contact_v9",
+            "repaired_contact_v10",
             repaired_contact,
         )
         contact_repair_transaction = {
-            "schema": "full_sequence_constrained_contact_repair_v9",
+            "schema": "full_sequence_exact_audit_contact_transactions_v10",
             "development_only": True,
             "training_started": False,
             "production_model_modified": False,
@@ -884,7 +899,7 @@ def replay_solutions(
             ik_protected_frame_mask=occupied,
             ik_candidate_guard=contact_candidate_guard,
         )
-        stage_reports["full_sequence_constrained_contact_repair"] = (
+        stage_reports["full_sequence_exact_audit_contact_transactions"] = (
             contact_repair_transaction
         )
         boundary_rows = closed_loop.audit_boundaries(
@@ -916,8 +931,8 @@ def replay_solutions(
         diffusion_selected = _load_stage_snapshot(
             stage_reports.get("motion_activity_diffusion")
         )
-        stage_reports["v9_stage_physical_diagnostics"] = (
-            _v9_stage_diagnostics(
+        stage_reports["v10_stage_physical_diagnostics"] = (
+            _v10_stage_diagnostics(
                 runtime,
                 cfg,
                 slide,
@@ -937,7 +952,7 @@ def replay_solutions(
     final_motion_info = _array(output, "replayed_final", final_motion)
     report = {
         "schema": "refiner_solution_development_replay_v1",
-        "protocol": "full_sequence_constrained_contact_repair_replay_v9",
+        "protocol": "full_sequence_exact_audit_contact_replay_v10",
         "completed": True,
         "development_only": True,
         "formal_preregistration": False,
@@ -966,7 +981,7 @@ def replay_solutions(
         "solutions": applied,
         "edit_union_frames": int(occupied.sum()),
         "repaired_refiner": repaired_refiner,
-        "repaired_contact_v9": repaired_contact_info,
+        "repaired_contact_v10": repaired_contact_info,
         "replayed_final": final_motion_info,
         "stage_reports": stage_reports,
         "boundary_rows": boundary_rows,

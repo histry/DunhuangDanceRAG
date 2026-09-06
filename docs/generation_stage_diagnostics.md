@@ -134,15 +134,15 @@ returns status 2 after preserving `replay.report.json` and all motion artifacts.
 The command never trains or modifies a checkpoint and always reports
 `pilot_allowed=false` and `production_model_modified=false`.
 
-### V9 full-sequence constrained contact repair
+### V10 exact-audit constrained contact transactions
 
-The development replay enables V9 after applying the hash-bound B3 windows.
-Normal generation keeps it disabled by default. V9 uses the captured
+The development replay enables V10 after applying the hash-bound B3 windows.
+Normal generation keeps it disabled by default. V10 uses the captured
 `sliding_support_eligible` array in localization, IK transactions, the
 kinematic barrier oracle, and final auditing so that each stage uses the same
 support-state contract.
 
-V9 ranks penetration, skate, support-drift, and joint-jerk violations over the
+V10 ranks penetration, skate, support-drift, and joint-jerk violations over the
 whole sequence and merges their derivative-halo windows with unsafe boundary
 windows. These per-frame thresholds locate work; they do not replace the
 existing sequence-level physical gate. The solver edits root translation and
@@ -150,26 +150,43 @@ the lower-body hip, knee, ankle, and foot rotations against contact anchors.
 Contact observations are recomputed from the selected geometry instead of
 treating contact logits as unconstrained optimization variables.
 
+Large repair windows are split into left-support, right-support, double-support,
+and no-support phases. Each optimizer iteration is retained as an internal
+candidate and ranked by the exact audit: zero hard regressions, meaningful
+dominant-contact improvement, jerk and boundary margin, then optimizer loss.
+No-support transactions use penetration and joint-jerk residuals as their
+repair objective because skate and support drift are undefined without a
+static support foot. Phases too short to preserve three frozen edge frames are
+reported but not optimized.
+Raw and locally stabilized proposals are evaluated with fixed backtracking
+factors `1, 1/2, 1/4, 1/8, 1/16` under a quintic C2 edit envelope that freezes
+at least three frames at each internal edge.
+
 Each local transaction must meaningfully lower the current dominant contact
 residual while keeping every other contact and physical metric from regressing.
 It must also preserve the accepted B3 root and rotation geometry exactly and
 pass the existing boundary and reference-fidelity guards. The four contact
 observation channels are recomputed from that geometry. Rejected candidates
 roll back to the pre-IK snapshot. The report records input, candidate, and
-selected hashes, hard-residual deltas, repair windows, and the top violations.
-After the V9 transaction, replay executes the captured diffusion, IK, boundary
+selected hashes, every raw/stabilized backtracking attempt, hard-residual
+deltas, support-phase windows, and the top violations. An absolute violation
+already present in the input may remain during a strictly monotone preparation
+step; newly introduced or worsened hard violations still fail. The unchanged
+absolute final quality gate remains authoritative.
+
+After the V10 transaction, replay executes the captured diffusion, IK, boundary
 audit, and final quality gate again. The replay also restores the accepted B3
 geometry after neural stages and protects it during the second IK pass, so the
 fixed `0.03` observable result cannot be invalidated by downstream repair.
 
-`stage_reports.v9_stage_physical_diagnostics` records the common physical
+`stage_reports.v10_stage_physical_diagnostics` records the common physical
 audit, top-K violations, and motion hash for repaired Refiner, contact-repair
 candidate/selection, diffusion candidate/selection, pre-IK, IK candidate/
 selection, and final output when the corresponding captured array is
 available. Missing stage arrays remain absent rather than being inferred from
 metrics.
 
-V9 keeps the observable threshold at `0.03` and leaves physical,
+V10 keeps the observable threshold at `0.03` and leaves physical,
 fixed-support, and fidelity checks as hard filters. It does not train, publish,
 or modify a production model. Beat-aware timing and interpolation remain
 outside this stage because they change time derivatives before contact and
