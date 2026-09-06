@@ -42,6 +42,7 @@ except Exception:  # pragma: no cover
     F = None
 
 from motion_geometry.smpl24 import (
+    CONTACT,
     FOOT_JOINTS as DEFAULT_FOOT_JOINTS,
     MOTION_DIM as EDGE_DIM,
     NUM_JOINTS,
@@ -90,7 +91,14 @@ from support.event_identity import (
     normalize_event_db_contract,
 )
 from motion_geometry.resampling import blend_edge151_geodesic_np
-from motion_geometry.physical import EXTREMITY_JOINTS, ContactStateThresholds
+from motion_geometry.physical import (
+    ContactStateThresholds,
+    EXTREMITY_JOINTS,
+    SLIDING_SUPPORT,
+    STATIC_SUPPORT,
+    classify_support_states_np,
+    median_filter_bool_np,
+)
 from motion_geometry.boundary_observables import (
     BOUNDARY_PROTOCOL, BOUNDARY_FEATURE_DIM, boundary_features_torch,
     boundary_metrics_torch, observable_gate,
@@ -420,6 +428,14 @@ class MotionGenerationConfig:
     rollback_root_delta_max_m: float = 0.12
     ik_post_stabilize_enable: bool = True
     ik_post_stabilize_passes: int = 2
+    # Development-only V9 repair.  The normal generation path never enables
+    # this automatically; hash-bound solution replay opts in explicitly.
+    full_sequence_contact_repair_enable: bool = False
+    full_sequence_contact_repair_top_k: int = 12
+    full_sequence_contact_repair_halo_seconds: float = 12.0 / 30.0
+    full_sequence_contact_repair_merge_gap_seconds: float = 6.0 / 30.0
+    full_sequence_contact_repair_min_gain: float = 0.01
+    full_sequence_contact_repair_jerk_weight: float = 0.75
 
     lower_body_only: bool = True
     refiner_enable: bool = True
@@ -766,6 +782,24 @@ class MotionGenerationConfig:
             "MOTION_IK_CONTACT_RAMP_SECONDS": ("ik_contact_ramp_seconds", float),
             "MOTION_IK_POST_STABILIZE_ENABLE": ("ik_post_stabilize_enable", lambda x: bool(int(x))),
             "MOTION_IK_POST_STABILIZE_PASSES": ("ik_post_stabilize_passes", int),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_ENABLE": (
+                "full_sequence_contact_repair_enable", lambda x: bool(int(x)),
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_TOP_K": (
+                "full_sequence_contact_repair_top_k", int,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_HALO_SECONDS": (
+                "full_sequence_contact_repair_halo_seconds", float,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_MERGE_GAP_SECONDS": (
+                "full_sequence_contact_repair_merge_gap_seconds", float,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_MIN_GAIN": (
+                "full_sequence_contact_repair_min_gain", float,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_JERK_WEIGHT": (
+                "full_sequence_contact_repair_jerk_weight", float,
+            ),
             "MOTION_ROLLBACK_ROOT_DELTA_MAX_M": ("rollback_root_delta_max_m", float),
             "MOTION_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
             "MOTION_ENABLE_ROOT_Y_PHYSICS": ("root_y_physics_enable", lambda x: bool(int(x))),
@@ -10449,29 +10483,487 @@ def generate_ik_targets_np(native_foot: np.ndarray, contacts: np.ndarray, cfg: M
     return targets.astype(np.float32), meta
 
 
-def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple[np.ndarray, dict]:
+def _array_content_sha256(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _physical_residuals(
+    audit: Mapping[str, Any],
+    limits: Optional[PhysicalQualityLimits] = None,
+) -> Dict[str, float]:
+    resolved = limits or PhysicalQualityLimits.from_environment()
+    residuals: Dict[str, float] = {}
+    for spec in physical_metric_specs(
+        resolved,
+        StageAcceptancePolicy.from_environment(),
+    ):
+        try:
+            value = float(audit[spec.key])
+        except (KeyError, TypeError, ValueError):
+            residuals[spec.key] = float("inf")
+            continue
+        scale = max(abs(float(spec.absolute_limit)), 1.0e-3)
+        if spec.direction == "high":
+            residual = max(0.0, value - float(spec.absolute_limit)) / scale
+        else:
+            residual = max(0.0, float(spec.absolute_limit) - value) / scale
+        residuals[spec.key] = float(residual)
+    return residuals
+
+
+def _support_drift_by_frame(
+    feet_xz: np.ndarray,
+    static_support: np.ndarray,
+) -> np.ndarray:
+    drift = np.zeros(static_support.shape, dtype=np.float32)
+    for foot_index in range(static_support.shape[1]):
+        for start, end in contiguous_regions(static_support[:, foot_index]):
+            anchor = feet_xz[start, foot_index]
+            drift[start:end, foot_index] = np.linalg.norm(
+                feet_xz[start:end, foot_index] - anchor,
+                axis=-1,
+            )
+    return drift
+
+
+def _rank_violation_frames(
+    name: str,
+    values: np.ndarray,
+    limit: float,
+    *,
+    direction: str,
+    top_k: int,
+    halo: int,
+) -> List[Dict[str, Any]]:
+    frame_values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if direction == "high":
+        excess = frame_values - float(limit)
+    else:
+        excess = float(limit) - frame_values
+    order = np.argsort(-excess)
+    selected: List[Dict[str, Any]] = []
+    occupied = np.zeros(len(frame_values), dtype=bool)
+    for raw_index in order:
+        index = int(raw_index)
+        if excess[index] <= 0.0 or occupied[index]:
+            continue
+        start = max(0, index - halo)
+        end = min(len(frame_values), index + halo + 1)
+        selected.append({
+            "metric": str(name),
+            "frame": index,
+            "frame_span": [int(start), int(end)],
+            "value": float(frame_values[index]),
+            "limit": float(limit),
+            "excess": float(excess[index]),
+        })
+        occupied[start:end] = True
+        if len(selected) >= int(top_k):
+            break
+    return selected
+
+
+def full_sequence_physical_diagnostics_np(
+    motion: np.ndarray,
+    cfg: MotionGenerationConfig,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
+    top_k: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Locate physical failures with the same support contract as final audit."""
+
+    value = np.asarray(motion, dtype=np.float32)
+    if value.ndim != 2 or value.shape[1] != EDGE_DIM:
+        raise ValueError(f"Expected [T,{EDGE_DIM}], got {value.shape}")
+    eligible = None
+    if sliding_support_eligible is not None:
+        eligible = np.asarray(sliding_support_eligible, dtype=bool).reshape(-1)
+        if len(eligible) != len(value):
+            raise ValueError("sliding_support_eligible length mismatch")
+    fps = float(cfg.fps)
+    limits = PhysicalQualityLimits.from_environment()
+    joints = fk_24_np(value)
+    feet = joints[:, list(DEFAULT_FOOT_JOINTS)]
+    foot_speed = np.zeros(feet.shape[:2], dtype=np.float32)
+    if len(feet) > 1:
+        foot_speed[1:] = np.linalg.norm(
+            feet[1:][..., (0, 2)] - feet[:-1][..., (0, 2)], axis=-1
+        ) * fps
+    floor_y = float(np.percentile(feet[..., 1], 5))
+    height_window = max(1, int(round(fps / 12.0)))
+    if height_window % 2 == 0:
+        height_window += 1
+    height_support = median_filter_bool_np(
+        feet[..., 1] <= floor_y + 0.055,
+        height_window,
+    )
+    declared_contacts = value[:, CONTACT] > 0.5
+    support_states = classify_support_states_np(
+        joints,
+        declared_contacts,
+        fps=fps,
+        sliding_support_eligible=eligible,
+        height_support=height_support,
+        support_policy="final_fail_closed",
+    )
+    static_support = support_states == STATIC_SUPPORT
+    support_drift = _support_drift_by_frame(
+        feet[..., (0, 2)], static_support
+    )
+    penetration = np.min(feet[..., 1] - floor_y, axis=1)
+    skate = np.max(
+        np.where(static_support, foot_speed, 0.0),
+        axis=1,
+    )
+    drift = np.max(support_drift, axis=1)
+    jerk = np.zeros(len(value), dtype=np.float32)
+    if len(value) >= 4:
+        jerk_values = np.max(
+            np.linalg.norm(
+                np.diff(joints, n=3, axis=0) * fps**3,
+                axis=-1,
+            ),
+            axis=1,
+        )
+        jerk[2:2 + len(jerk_values)] = jerk_values
+
+    count = max(1, int(
+        top_k
+        if top_k is not None
+        else cfg.full_sequence_contact_repair_top_k
+    ))
+    halo = max(2, int(round(
+        float(cfg.full_sequence_contact_repair_halo_seconds) * fps
+    )))
+    ranked = {
+        "foot_penetration": _rank_violation_frames(
+            "foot_penetration_min_m", penetration,
+            limits.foot_penetration_min_m,
+            direction="low", top_k=count, halo=halo,
+        ),
+        "foot_skate": _rank_violation_frames(
+            "foot_skate_mps", skate, limits.foot_skate_mps_p95,
+            direction="high", top_k=count, halo=halo,
+        ),
+        "foot_support_drift": _rank_violation_frames(
+            "foot_support_drift_m", drift,
+            limits.foot_support_drift_m_p95,
+            direction="high", top_k=count, halo=halo,
+        ),
+        "joint_jerk": _rank_violation_frames(
+            "joint_jerk_mps3", jerk, limits.joint_jerk_mps3_max,
+            direction="high", top_k=count, halo=halo,
+        ),
+    }
+    active = (
+        (penetration < float(limits.foot_penetration_min_m))
+        | (skate > float(limits.foot_skate_mps_p95))
+        | (drift > float(limits.foot_support_drift_m_p95))
+        | (jerk > float(limits.joint_jerk_mps3_max))
+    )
+    expanded = np.zeros(len(active), dtype=bool)
+    for start, end in contiguous_regions(active):
+        expanded[max(0, start - halo):min(len(active), end + halo)] = True
+    merge_gap = max(0, int(round(
+        float(cfg.full_sequence_contact_repair_merge_gap_seconds) * fps
+    )))
+    regions = contiguous_regions(expanded)
+    merged: List[List[int]] = []
+    for start, end in regions:
+        if merged and start - merged[-1][1] <= merge_gap:
+            merged[-1][1] = int(end)
+        else:
+            merged.append([int(start), int(end)])
+    audit = audit_motion_np(
+        value,
+        cfg,
+        sliding_support_eligible=eligible,
+        precomputed_joints=joints,
+    )
+    return {
+        "schema": "full_sequence_physical_localization_v9",
+        "support_contract": "final_fail_closed_with_sliding_eligibility",
+        "frames": int(len(value)),
+        "top_k": int(count),
+        "violating_frames": int(active.sum()),
+        "expanded_repair_frames": int(expanded.sum()),
+        "repair_windows": merged,
+        "ranked_violations": ranked,
+        "audit": audit,
+        "residuals": _physical_residuals(audit, limits),
+    }
+
+
+def _slice_eligibility(
+    eligible: Optional[np.ndarray],
+    start: int,
+    end: int,
+) -> Optional[np.ndarray]:
+    return None if eligible is None else eligible[start:end]
+
+
+def _contact_restoration_decision(
+    before: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    cfg: MotionGenerationConfig,
+) -> Dict[str, Any]:
+    limits = PhysicalQualityLimits.from_environment()
+    before_residuals = _physical_residuals(before, limits)
+    after_residuals = _physical_residuals(candidate, limits)
+    contact_keys = (
+        "foot_penetration_min_m",
+        "foot_skate_mps_p95",
+        "foot_skate_mps_max",
+        "foot_support_drift_m_p95",
+        "foot_support_drift_m_max",
+    )
+    dominant = max(contact_keys, key=lambda key: before_residuals[key])
+    before_dominant = float(before_residuals[dominant])
+    after_dominant = float(after_residuals[dominant])
+    required = max(
+        1.0e-7,
+        before_dominant * float(cfg.full_sequence_contact_repair_min_gain),
+    )
+    reasons: List[str] = []
+    if before_dominant <= 0.0 or before_dominant - after_dominant < required:
+        reasons.append("dominant_contact_residual_not_meaningfully_improved")
+    for key in contact_keys:
+        tolerance = max(1.0e-7, before_residuals[key] * 1.0e-6)
+        if after_residuals[key] > before_residuals[key] + tolerance:
+            reasons.append(f"contact_residual_regressed:{key}")
+    specs = physical_metric_specs(
+        limits,
+        StageAcceptancePolicy.from_environment(),
+    )
+    for spec in specs:
+        if spec.key in contact_keys:
+            continue
+        before_value = float(before.get(spec.key, float("nan")))
+        after_value = float(candidate.get(spec.key, float("nan")))
+        if not np.isfinite(before_value) or not np.isfinite(after_value):
+            reasons.append(f"hard_metric_missing_or_nonfinite:{spec.key}")
+            continue
+        tolerance = max(1.0e-7, abs(before_value) * 1.0e-6)
+        regressed = (
+            after_value > before_value + tolerance
+            if spec.direction == "high"
+            else after_value < before_value - tolerance
+        )
+        if regressed:
+            reasons.append(f"hard_metric_regressed:{spec.key}")
+    return {
+        "accepted": not reasons,
+        "reasons": list(dict.fromkeys(reasons)),
+        "dominant_contact_metric": dominant,
+        "required_dominant_gain": float(required),
+        "before_residuals": before_residuals,
+        "candidate_residuals": after_residuals,
+        "residual_delta": {
+            key: float(after_residuals[key] - before_residuals[key])
+            for key in before_residuals
+        },
+    }
+
+
+def evaluate_fixed_support_contact_candidate_np(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    cfg: MotionGenerationConfig,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Audit both motions on the reference's immutable static-support set."""
+
+    before = np.asarray(reference, dtype=np.float32)
+    after = np.asarray(candidate, dtype=np.float32)
+    if before.shape != after.shape:
+        return {
+            "accepted": False,
+            "reasons": ["fixed_support_shape_changed"],
+        }
+    eligible = None
+    if sliding_support_eligible is not None:
+        eligible = np.asarray(sliding_support_eligible, dtype=bool)
+    before_joints = fk_24_np(before)
+    after_joints = fk_24_np(after)
+    before_feet = before_joints[:, list(DEFAULT_FOOT_JOINTS)]
+    after_feet = after_joints[:, list(DEFAULT_FOOT_JOINTS)]
+    floor_y = float(np.percentile(before_feet[..., 1], 5))
+    support_states = classify_support_states_np(
+        before_joints,
+        before[:, CONTACT] > 0.5,
+        fps=float(cfg.fps),
+        sliding_support_eligible=eligible,
+        support_policy="final_fail_closed",
+    )
+    fixed_support = support_states == STATIC_SUPPORT
+
+    def metrics(feet: np.ndarray) -> Dict[str, float]:
+        speed = np.zeros(feet.shape[:2], dtype=np.float32)
+        if len(feet) > 1:
+            speed[1:] = np.linalg.norm(
+                feet[1:][..., (0, 2)] - feet[:-1][..., (0, 2)],
+                axis=-1,
+            ) * float(cfg.fps)
+        drift = _support_drift_by_frame(feet[..., (0, 2)], fixed_support)
+        supported_speed = speed[fixed_support]
+        supported_drift = drift[fixed_support]
+        supported_height = (feet[..., 1] - floor_y)[fixed_support]
+        return {
+            "foot_skate_mps_p95": float(
+                np.percentile(supported_speed, 95)
+                if supported_speed.size
+                else 0.0
+            ),
+            "foot_skate_mps_max": float(
+                supported_speed.max() if supported_speed.size else 0.0
+            ),
+            "foot_support_drift_m_p95": float(
+                np.percentile(supported_drift, 95)
+                if supported_drift.size
+                else 0.0
+            ),
+            "foot_support_drift_m_max": float(
+                supported_drift.max() if supported_drift.size else 0.0
+            ),
+            "foot_penetration_min_m": float(
+                supported_height.min() if supported_height.size else 0.0
+            ),
+        }
+
+    before_metrics = metrics(before_feet)
+    candidate_metrics = metrics(after_feet)
+    limits = PhysicalQualityLimits.from_environment()
+    before_residuals = _physical_residuals(before_metrics, limits)
+    candidate_residuals = _physical_residuals(candidate_metrics, limits)
+    keys = tuple(before_metrics)
+    reasons = []
+    for key in keys:
+        tolerance = max(1.0e-7, before_residuals[key] * 1.0e-6)
+        if candidate_residuals[key] > before_residuals[key] + tolerance:
+            reasons.append(f"fixed_support_regressed:{key}")
+    return {
+        "schema": "fixed_reference_support_contact_gate_v9",
+        "accepted": not reasons,
+        "reasons": reasons,
+        "support_contract": "final_fail_closed_with_sliding_eligibility",
+        "fixed_support_samples": int(fixed_support.sum()),
+        "fixed_support_frames": int(np.any(fixed_support, axis=1).sum()),
+        "reference_metrics": before_metrics,
+        "candidate_metrics": candidate_metrics,
+        "reference_residuals": {
+            key: before_residuals[key] for key in keys
+        },
+        "candidate_residuals": {
+            key: candidate_residuals[key] for key in keys
+        },
+        "residual_delta": {
+            key: float(candidate_residuals[key] - before_residuals[key])
+            for key in keys
+        },
+    }
+
+
+def true_lower_body_ik(
+    motion: np.ndarray,
+    cfg: MotionGenerationConfig,
+    *,
+    sliding_support_eligible: Optional[np.ndarray] = None,
+    repair_windows: Optional[Sequence[Sequence[int]]] = None,
+    protected_frame_mask: Optional[np.ndarray] = None,
+    candidate_guard: Optional[Any] = None,
+) -> Tuple[np.ndarray, dict]:
     if torch is None:
         return motion, {"enabled": False, "reason": "torch_unavailable"}
+    motion = np.asarray(motion, dtype=np.float32)
+    T = int(motion.shape[0])
+    eligible = None
+    if sliding_support_eligible is not None:
+        eligible = np.asarray(sliding_support_eligible, dtype=bool).reshape(-1)
+        if len(eligible) != T:
+            raise ValueError("sliding_support_eligible length mismatch")
+    protected = np.zeros(T, dtype=bool)
+    if protected_frame_mask is not None:
+        protected = np.asarray(protected_frame_mask, dtype=bool).reshape(-1)
+        if len(protected) != T:
+            raise ValueError("protected_frame_mask length mismatch")
+    localization = None
+    if bool(cfg.full_sequence_contact_repair_enable):
+        localization = full_sequence_physical_diagnostics_np(
+            motion,
+            cfg,
+            sliding_support_eligible=eligible,
+        )
+        if repair_windows is None:
+            repair_windows = localization["repair_windows"]
     contacts0, _, _, _ = derive_contacts_np(motion, cfg)
     motion_base, root_y_report = apply_root_y_c1_physics_np(motion, contacts0, cfg)
-    contacts, conf, floor_y, native_foot = derive_contacts_np(motion_base, cfg)
+    if np.any(protected):
+        motion_base[protected, 4:] = motion[protected, 4:]
+    motion_base_joints = fk_24_np(motion_base)
+    contacts, conf, floor_y, native_foot = derive_contacts_np(
+        motion_base,
+        cfg,
+        precomputed_joints=motion_base_joints,
+    )
+    solver_contacts = contacts
+    support_states = None
+    if bool(cfg.full_sequence_contact_repair_enable):
+        support_states = classify_support_states_np(
+            motion_base_joints,
+            contacts,
+            fps=float(cfg.fps),
+            sliding_support_eligible=eligible,
+            support_policy="final_fail_closed",
+        )
+        solver_contacts = support_states == STATIC_SUPPORT
     contact_ramps = contact_ramp_weights_np(
-        contacts,
+        solver_contacts,
         fps=float(cfg.fps),
         ramp_seconds=float(cfg.ik_contact_ramp_seconds),
     )
-    targets, target_meta = generate_ik_targets_np(native_foot, contacts, cfg, root_xz=motion_base[:, [ROOT_X_IDX, ROOT_Z_IDX]])
+    targets, target_meta = generate_ik_targets_np(
+        native_foot,
+        solver_contacts,
+        cfg,
+        root_xz=motion_base[:, [ROOT_X_IDX, ROOT_Z_IDX]],
+    )
     device = torch.device(cfg.device)
     out_all = motion_base.copy().astype(np.float32)
     reports = []
-    T = motion.shape[0]
     chunk = int(cfg.ik_chunk)
     overlap = max(0, int(cfg.ik_chunk_overlap))
     stride = max(1, chunk - overlap)
     # Root-Aware Motion Safety: independent chunk solves are merged by weighted accumulation,
     # rather than half-overlap overwrite.  This avoids long-sequence IK seams at
     # chunk boundaries and preserves every overlapping frame as a blend.
-    starts = list(range(0, T, stride))
+    solve_ranges: List[Tuple[int, int]] = []
+    if repair_windows is None:
+        solve_ranges = [
+            (int(start), int(min(T, start + chunk)))
+            for start in range(0, T, stride)
+        ]
+    else:
+        for raw in repair_windows:
+            if len(raw) != 2:
+                raise ValueError("repair window must contain [start, end]")
+            window_start = max(0, int(raw[0]))
+            window_end = min(T, int(raw[1]))
+            if window_end - window_start < 4:
+                continue
+            start = window_start
+            while start < window_end:
+                end = min(window_end, start + chunk)
+                if end - start >= 4:
+                    solve_ranges.append((int(start), int(end)))
+                if end >= window_end:
+                    break
+                start += stride
     accum = np.zeros_like(out_all, dtype=np.float32)
     weight_sum = np.zeros((T, 1), dtype=np.float32)
     lower_idx = torch.as_tensor(
@@ -10480,8 +10972,7 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         dtype=torch.long,
     )
     floor = torch.tensor(floor_y, device=device, dtype=torch.float32)
-    for st in starts:
-        ed = min(T, st + chunk)
+    for st, ed in solve_ranges:
         if ed - st < 4:
             continue
         base_np = motion_base[st:ed].copy()
@@ -10492,11 +10983,17 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         lower_rot = rot_full[:, lower_idx].detach().clone().requires_grad_(True)
         opt = torch.optim.Adam([lower_rot, root], lr=cfg.ik_lr)
         target = torch.from_numpy(targets[st:ed]).float().to(device)
-        contact = torch.from_numpy(contacts[st:ed].astype(np.float32)).float().to(device)
+        contact = torch.from_numpy(
+            solver_contacts[st:ed].astype(np.float32)
+        ).float().to(device)
         contact_ramp = torch.from_numpy(contact_ramps[st:ed]).float().to(device)
         confidence = torch.from_numpy(conf[st:ed]).float().to(device)
         base_rot = rot_full[:, lower_idx].detach().clone()
         base_root = root.detach().clone()
+        base_joints = fk_24_torch(base).detach()
+        free_frame = torch.from_numpy((~protected[st:ed]).astype(np.bool_)).to(
+            device=device
+        )
         best_loss_device = torch.full(
             (),
             float("inf"),
@@ -10507,10 +11004,14 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         for it in range(int(cfg.ik_iters)):
             rr = project_rot6d_torch(lower_rot)
             rr = base_rot + torch.clamp(rr - base_rot, -cfg.ik_max_delta_rot, cfg.ik_max_delta_rot)
+            rr = torch.where(free_frame[:, None, None], rr, base_rot)
+            effective_root = torch.where(
+                free_frame[:, None], root, base_root
+            )
             rot = rot_full.clone()
             rot[:, lower_idx] = rr
             mm = base.clone()
-            mm[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = root
+            mm[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = effective_root
             mm[:, ROT6D_START:ROT6D_END] = rot.reshape(L, -1)
             joints = fk_24_torch(mm)
             foot = joints[:, list(DEFAULT_FOOT_JOINTS)]
@@ -10533,7 +11034,36 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
                 root_vel = torch.tensor(0.0, device=device)
             pen = F.relu(floor + 0.003 - foot[..., 1]).pow(2).mean()
             root_loss = F.smooth_l1_loss(root, base_root) + root_vel
-            loss = cfg.ik_contact_w * foot_loss + cfg.ik_pose_w * pose_loss + cfg.ik_temporal_w * vel_loss + cfg.ik_root_w * root_loss + cfg.ik_penetration_w * pen
+            jerk_loss = foot_loss * 0.0
+            if L >= 4:
+                jerk_limit = float(
+                    PhysicalQualityLimits.from_environment().joint_jerk_mps3_max
+                )
+                candidate_jerk = torch.linalg.vector_norm(
+                    torch.diff(joints.to(torch.float64), n=3, dim=0)
+                    * float(cfg.fps) ** 3,
+                    dim=-1,
+                )
+                baseline_jerk = torch.linalg.vector_norm(
+                    torch.diff(base_joints.to(torch.float64), n=3, dim=0)
+                    * float(cfg.fps) ** 3,
+                    dim=-1,
+                )
+                allowed_jerk = torch.minimum(
+                    baseline_jerk,
+                    torch.full_like(baseline_jerk, jerk_limit),
+                )
+                jerk_loss = torch.relu(
+                    candidate_jerk - allowed_jerk
+                ).square().mean().to(base.dtype) / max(jerk_limit**2, 1.0)
+            loss = (
+                cfg.ik_contact_w * foot_loss
+                + cfg.ik_pose_w * pose_loss
+                + cfg.ik_temporal_w * vel_loss
+                + cfg.ik_root_w * root_loss
+                + cfg.ik_penetration_w * pen
+                + float(cfg.full_sequence_contact_repair_jerk_weight) * jerk_loss
+            )
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_([lower_rot, root], 1.0)
@@ -10581,7 +11111,12 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
             weight = np.maximum(weight, 1e-4)
             accum[st:ed] += best_motion.astype(np.float32) * weight
             weight_sum[st:ed] += weight
-        reports.append({"start": int(st), "end": int(ed), "best_loss": float(best_loss), "contact_ratio": float(contacts[st:ed].mean())})
+        reports.append({
+            "start": int(st),
+            "end": int(ed),
+            "best_loss": float(best_loss),
+            "contact_ratio": float(solver_contacts[st:ed].mean()),
+        })
     valid = weight_sum[:, 0] > 1e-8
     out_all = motion_base.copy().astype(np.float32)
     out_all[valid] = accum[valid] / weight_sum[valid]
@@ -10607,7 +11142,11 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
     }
     if bool(cfg.ik_post_stabilize_enable) and T >= 5:
         candidate_before_stabilize = out_all.copy()
-        audit_before_stabilize = audit_motion_np(candidate_before_stabilize, cfg)
+        audit_before_stabilize = audit_motion_np(
+            candidate_before_stabilize,
+            cfg,
+            sliding_support_eligible=eligible,
+        )
         kernel = np.asarray([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
 
         def binomial_filter_time(values: np.ndarray) -> np.ndarray:
@@ -10635,7 +11174,11 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
                 rot6d_to_matrix_np(rotations[:, lower])
             )
         stabilized[:, ROT6D_START:ROT6D_END] = rotations.reshape(T, -1)
-        audit_stabilized = audit_motion_np(stabilized, cfg)
+        audit_stabilized = audit_motion_np(
+            stabilized,
+            cfg,
+            sliding_support_eligible=eligible,
+        )
         stabilization_decision = evaluate_stage_candidate(
             audit_before_stabilize,
             audit_stabilized,
@@ -10659,8 +11202,18 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
             "audit_before": audit_before_stabilize,
             "audit_candidate": audit_stabilized,
         })
-    audit_before = audit_motion_np(motion, cfg)
-    audit_after = audit_motion_np(out_all, cfg)
+    if np.any(protected):
+        out_all[protected, 4:] = motion[protected, 4:]
+    audit_before = audit_motion_np(
+        motion,
+        cfg,
+        sliding_support_eligible=eligible,
+    )
+    audit_after = audit_motion_np(
+        out_all,
+        cfg,
+        sliding_support_eligible=eligible,
+    )
     root_delta = np.linalg.norm(out_all[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] - motion[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]], axis=1)
     ik_limits = PhysicalQualityLimits.from_environment()
     ik_policy = StageAcceptancePolicy.from_environment()
@@ -10724,13 +11277,14 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
             )
         if own_end - own_start < 4:
             continue
-        has_contact = bool(np.any(contacts[own_start:own_end]))
+        has_contact = bool(np.any(solver_contacts[own_start:own_end]))
         if not has_contact:
             transaction_reports.append(
                 {
                     "start": int(own_start),
                     "end": int(own_end),
                     "committed": False,
+                    "rollback_to_pre_ik_snapshot": True,
                     "reason": "no_contact_in_ownership_window",
                 }
             )
@@ -10762,8 +11316,18 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         halo = max(4, int(round(6.0 * float(cfg.fps) / 30.0)))
         audit_start = max(0, own_start - halo)
         audit_end = min(T, own_end + halo)
-        before_local = audit_motion_np(final[audit_start:audit_end], cfg)
-        after_local = audit_motion_np(trial[audit_start:audit_end], cfg)
+        transaction_input = final[audit_start:audit_end].copy()
+        local_eligible = _slice_eligibility(eligible, audit_start, audit_end)
+        before_local = audit_motion_np(
+            final[audit_start:audit_end],
+            cfg,
+            sliding_support_eligible=local_eligible,
+        )
+        after_local = audit_motion_np(
+            trial[audit_start:audit_end],
+            cfg,
+            sliding_support_eligible=local_eligible,
+        )
         local_root_delta = np.linalg.norm(
             trial[own_start:own_end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
             - final[own_start:own_end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]],
@@ -10774,6 +11338,42 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
             after_local,
             float(local_root_delta.max()) if local_root_delta.size else 0.0,
         )
+        restoration = None
+        fixed_support = None
+        if repair_windows is not None:
+            restoration = _contact_restoration_decision(
+                before_local,
+                after_local,
+                cfg,
+            )
+            relative_reasons.extend(restoration["reasons"])
+            fixed_support = evaluate_fixed_support_contact_candidate_np(
+                transaction_input,
+                trial[audit_start:audit_end],
+                cfg,
+                sliding_support_eligible=local_eligible,
+            )
+            relative_reasons.extend(fixed_support["reasons"])
+        guard_report: Dict[str, Any] = {
+            "accepted": True,
+            "reasons": [],
+        }
+        if candidate_guard is not None:
+            result = candidate_guard(
+                final,
+                trial,
+                [int(own_start), int(own_end)],
+                [int(audit_start), int(audit_end)],
+            )
+            if not isinstance(result, Mapping):
+                raise TypeError("candidate_guard must return a mapping")
+            guard_report = dict(result)
+            if not bool(guard_report.get("accepted", False)):
+                relative_reasons.extend(
+                    f"candidate_guard:{reason}"
+                    for reason in guard_report.get("reasons", ["rejected"])
+                )
+        relative_reasons = list(dict.fromkeys(relative_reasons))
         kbo_reasons: List[str] = []
         kbo_detail: Dict[str, Any] = {}
         if (
@@ -10787,6 +11387,7 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
                 cfg,
                 stage="ik_local_transaction",
                 global_start=int(audit_start),
+                sliding_support_eligible=local_eligible,
             )
             if not kbo_ok and not kbo_reasons:
                 kbo_reasons = ["local_kbo_rejected"]
@@ -10798,6 +11399,13 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         if committed:
             final = trial
             accepted_transactions += 1
+        transaction_selected = (
+            trial[audit_start:audit_end]
+            if committed
+            else transaction_input
+        )
+        before_residuals = _physical_residuals(before_local, ik_limits)
+        candidate_residuals = _physical_residuals(after_local, ik_limits)
         transaction_reports.append(
             {
                 "start": int(own_start),
@@ -10805,10 +11413,14 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
                 "audit_start": int(audit_start),
                 "audit_end": int(audit_end),
                 "committed": bool(committed),
+                "rollback_to_pre_ik_snapshot": bool(not committed),
                 "relative_reasons": relative_reasons,
                 "absolute_reasons": absolute_reasons,
                 "kbo_reasons": kbo_reasons,
                 "kbo_detail": kbo_detail,
+                "contact_restoration": restoration,
+                "fixed_support_gate": fixed_support,
+                "candidate_guard": guard_report,
                 "root_delta_max_m": float(
                     local_root_delta.max()
                     if local_root_delta.size
@@ -10816,6 +11428,17 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
                 ),
                 "audit_before": before_local,
                 "audit_after": after_local,
+                "hashes": {
+                    "input": _array_content_sha256(transaction_input),
+                    "candidate": _array_content_sha256(
+                        trial[audit_start:audit_end]
+                    ),
+                    "selected": _array_content_sha256(transaction_selected),
+                },
+                "hard_constraint_residual_delta": {
+                    key: float(candidate_residuals[key] - value)
+                    for key, value in before_residuals.items()
+                },
             }
         )
     rollback = bool(solved_ranges and accepted_transactions == 0)
@@ -10824,8 +11447,31 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
     final_contacts, final_confidence, final_floor_y, _ = derive_contacts_np(final, cfg)
     final = final.copy().astype(np.float32)
     final[:, :4] = final_contacts.astype(np.float32)
+    final_audit = audit_motion_np(
+        final,
+        cfg,
+        sliding_support_eligible=eligible,
+    )
+    candidate_localization = None
+    selected_localization = None
+    if bool(cfg.full_sequence_contact_repair_enable):
+        candidate_localization = full_sequence_physical_diagnostics_np(
+            out_all,
+            cfg,
+            sliding_support_eligible=eligible,
+        )
+        selected_localization = full_sequence_physical_diagnostics_np(
+            final,
+            cfg,
+            sliding_support_eligible=eligible,
+        )
     report = {
         "version": "lower_body_ik_contact_transactions",
+        "protocol": (
+            "full_sequence_constrained_contact_repair_v9"
+            if repair_windows is not None
+            else "legacy_lower_body_ik"
+        ),
         "enabled": True,
         "writes_lower_body_rot6d": True,
         "root_y_physics": root_y_report,
@@ -10834,7 +11480,20 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         "lower_body_joints": list(map(int, LOWER_BODY_JOINTS)),
         "foot_joint_ids": list(map(int, DEFAULT_FOOT_JOINTS)),
         "floor_y": float(floor_y),
-        "contact_ratio": float(contacts.mean()),
+        "contact_ratio": float(solver_contacts.mean()),
+        "derived_contact_ratio_before_support_classification": float(
+            contacts.mean()
+        ),
+        "support_state_contract": (
+            "final_fail_closed_with_sliding_eligibility"
+            if support_states is not None
+            else "legacy_derived_contacts"
+        ),
+        "sliding_support_frames": int(
+            np.sum(support_states == SLIDING_SUPPORT)
+            if support_states is not None
+            else 0
+        ),
         "contact_ramp": {
             "seconds": float(cfg.ik_contact_ramp_seconds),
             "frames": int(
@@ -10857,7 +11516,11 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
             "coverage_p95": float(np.percentile(weight_sum[:, 0], 95)) if weight_sum.size else 0.0,
         },
         "rollback_policy": {
-            "mode": "local_ownership_window_transactions",
+            "mode": (
+                "full_sequence_violation_window_transactions_v9"
+                if repair_windows is not None
+                else "local_ownership_window_transactions"
+            ),
             "physical_metric_registry": "contracts.physical_quality.physical_metric_specs",
             "root_delta_max_m": float(cfg.rollback_root_delta_max_m),
         },
@@ -10881,12 +11544,32 @@ def true_lower_body_ik(motion: np.ndarray, cfg: MotionGenerationConfig) -> Tuple
         "absolute_commit_gate_passed": not absolute_commit_reasons,
         "audit_before": audit_before,
         "audit_after_candidate": audit_after,
-        "rollback_triggered": rollback,
+        "rollback_to_pre_ik_snapshot": bool(rollback),
         "final_contact_recomputed": True,
         "final_contact_ratio": float(final_contacts.mean()),
         "final_contact_confidence_mean": float(final_confidence.mean()),
         "final_contact_floor_y": float(final_floor_y),
-        "audit_final": audit_motion_np(final, cfg),
+        "audit_final": final_audit,
+        "candidate_localization": candidate_localization,
+        "selected_localization": selected_localization,
+        "full_sequence_localization": localization,
+        "repair_windows": (
+            [list(map(int, window)) for window in repair_windows]
+            if repair_windows is not None
+            else None
+        ),
+        "protected_frames": int(protected.sum()),
+        "hashes": {
+            "input": _array_content_sha256(motion),
+            "candidate": _array_content_sha256(out_all),
+            "selected": _array_content_sha256(final),
+        },
+        "hard_constraint_residual_delta": {
+            key: float(value - _physical_residuals(audit_before).get(key, 0.0))
+            for key, value in _physical_residuals(
+                final_audit
+            ).items()
+        },
     }
     return final.astype(np.float32), report
 
@@ -11209,7 +11892,12 @@ def concat_events(event_paths, target_durations, cfg):
     return motion, rep
 
 
-def _kinematic_stability_metrics(motion, cfg):
+def _kinematic_stability_metrics(
+    motion,
+    cfg,
+    *,
+    sliding_support_eligible=None,
+):
     """Return KBO statistics using the same true frame-joint SI metrics as final audit."""
     m = np.asarray(motion, dtype=np.float32)
     stats = {"finite": bool(np.isfinite(m).all()), "shape": list(m.shape)}
@@ -11247,7 +11935,12 @@ def _kinematic_stability_metrics(motion, cfg):
         stats["fk_finite"] = False
         stats["fk_error"] = str(exc)
     try:
-        stats.update(audit_motion_np(m, cfg, precomputed_joints=joints))
+        stats.update(audit_motion_np(
+            m,
+            cfg,
+            sliding_support_eligible=sliding_support_eligible,
+            precomputed_joints=joints,
+        ))
     except Exception as exc:
         stats["audit_error"] = str(exc)
     stats["root_y_range_m"] = float(
@@ -11268,7 +11961,14 @@ def _kinematic_stability_metrics(motion, cfg):
 
 
 
-def _kinematic_barrier_oracle(candidate, reference, cfg, stage="stage", global_start=0):
+def _kinematic_barrier_oracle(
+    candidate,
+    reference,
+    cfg,
+    stage="stage",
+    global_start=0,
+    sliding_support_eligible=None,
+):
     """Kinematic barrier oracle aligned with the final SI physical gate."""
     cand = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
@@ -11278,8 +11978,16 @@ def _kinematic_barrier_oracle(candidate, reference, cfg, stage="stage", global_s
             "reference_shape": list(ref.shape),
         }
 
-    candidate_stats = _kinematic_stability_metrics(cand, cfg)
-    reference_stats = _kinematic_stability_metrics(ref, cfg)
+    candidate_stats = _kinematic_stability_metrics(
+        cand,
+        cfg,
+        sliding_support_eligible=sliding_support_eligible,
+    )
+    reference_stats = _kinematic_stability_metrics(
+        ref,
+        cfg,
+        sliding_support_eligible=sliding_support_eligible,
+    )
     reasons = []
 
     if not candidate_stats.get("finite", False) or not candidate_stats.get(
@@ -11404,7 +12112,17 @@ def _repair_regions(seam_mask, T):
 
 
 
-def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, cfg):
+def _apply_guarded_stage(
+    stage,
+    orig_func,
+    motion,
+    cond,
+    seam_mask,
+    ckpt_path,
+    cfg,
+    *,
+    sliding_support_eligible=None,
+):
     preserve_neural_contacts = False
     if torch is not None and ckpt_path and Path(ckpt_path).exists():
         try:
@@ -11441,6 +12159,7 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
             stage=stage,
             global_start=0,
             preserve_contacts=preserve_neural_contacts,
+            sliding_support_eligible=sliding_support_eligible,
         )
     ref_all = np.asarray(motion, dtype=np.float32)
     out = ref_all.copy().astype(np.float32)
@@ -11452,6 +12171,7 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
         snapshot = out[a:b].copy().astype(np.float32)
         sm_win = np.asarray(seam_mask[a:b], dtype=np.float32).copy()
         cond_win = _condition_chunk_np(cond, a, b)
+        eligible_win = _slice_eligibility(sliding_support_eligible, a, b)
         token = {"mechanism": "TGT+KBO", "stage": stage, "temporal_transaction_id": int(tx_id), "atomic_window": [int(a), int(b)], "frames": int(b-a), "commit_state": "pending"}
         rejected_candidate = None
         try:
@@ -11469,8 +12189,16 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
                 global_start=a,
                 preserve_contacts=preserve_neural_contacts,
                 validate_barrier=False,
+                sliding_support_eligible=eligible_win,
             )
-            ok, reasons, detail = _kinematic_barrier_oracle(cand, snapshot, cfg, stage=f"{stage}_neural_commit", global_start=a)
+            ok, reasons, detail = _kinematic_barrier_oracle(
+                cand,
+                snapshot,
+                cfg,
+                stage=f"{stage}_neural_commit",
+                global_start=a,
+                sliding_support_eligible=eligible_win,
+            )
             if ok:
                 out[a:b] = cand.astype(np.float32)
                 token.update({"commit_state": "committed", "fallback_level": "neural_bounded_commit", "kbo_status": "pass", "hard_negative": False})
@@ -11479,7 +12207,14 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
                 raise RuntimeError("kbo_reject:" + ",".join(reasons))
         except Exception as exc:
             token["neural_exception"] = str(exc)[:500]
-            fb, fb_report = _deterministic_repair_bridge(snapshot, sm_win, cfg, stage=stage, global_start=a)
+            fb, fb_report = _deterministic_repair_bridge(
+                snapshot,
+                sm_win,
+                cfg,
+                stage=stage,
+                global_start=a,
+                sliding_support_eligible=eligible_win,
+            )
             if fb_report.get("committed"):
                 out[a:b] = fb.astype(np.float32)
                 token.update({"commit_state": "committed", "fallback_level": "deterministic_root_rotation_prior", "kbo_status": "fallback_pass", "fallback_report": fb_report, "hard_negative": True})
@@ -11506,31 +12241,92 @@ def _apply_guarded_stage(stage, orig_func, motion, cond, seam_mask, ckpt_path, c
         ),
         preserve_contacts=preserve_neural_contacts,
     )
-    ok, reasons, detail = _kinematic_barrier_oracle(out, ref_all, cfg, stage=f"{stage}_whole_stage_guard", global_start=0)
+    ok, reasons, detail = _kinematic_barrier_oracle(
+        out,
+        ref_all,
+        cfg,
+        stage=f"{stage}_whole_stage_guard",
+        global_start=0,
+        sliding_support_eligible=sliding_support_eligible,
+    )
     if not ok:
         _append_stage_transaction_audit({"mechanism": "KBO", "stage": stage, "event": "whole_stage_rollback", "commit_state": "rolled_back", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
         return ref_all.astype(np.float32)
     return out.astype(np.float32)
 
 
-def apply_refiner_model(motion, cond, seam_mask, ckpt_path, cfg):
-    return _apply_guarded_stage("refiner", _stage_guard_orig_apply_refiner_model, motion, cond, seam_mask, ckpt_path, cfg)
+def apply_refiner_model(
+    motion,
+    cond,
+    seam_mask,
+    ckpt_path,
+    cfg,
+    *,
+    sliding_support_eligible=None,
+):
+    return _apply_guarded_stage(
+        "refiner",
+        _stage_guard_orig_apply_refiner_model,
+        motion,
+        cond,
+        seam_mask,
+        ckpt_path,
+        cfg,
+        sliding_support_eligible=sliding_support_eligible,
+    )
 
 
-def apply_diffusion_model(motion, cond, seam_mask, ckpt_path, cfg):
-    return _apply_guarded_stage("diffusion", _stage_guard_orig_apply_diffusion_model, motion, cond, seam_mask, ckpt_path, cfg)
+def apply_diffusion_model(
+    motion,
+    cond,
+    seam_mask,
+    ckpt_path,
+    cfg,
+    *,
+    sliding_support_eligible=None,
+):
+    return _apply_guarded_stage(
+        "diffusion",
+        _stage_guard_orig_apply_diffusion_model,
+        motion,
+        cond,
+        seam_mask,
+        ckpt_path,
+        cfg,
+        sliding_support_eligible=sliding_support_eligible,
+    )
 
 
-def true_lower_body_ik(motion, cfg):
+def true_lower_body_ik(
+    motion,
+    cfg,
+    *,
+    sliding_support_eligible=None,
+    repair_windows=None,
+    protected_frame_mask=None,
+    candidate_guard=None,
+):
+    forwarded = {
+        "sliding_support_eligible": sliding_support_eligible,
+        "repair_windows": repair_windows,
+        "protected_frame_mask": protected_frame_mask,
+        "candidate_guard": candidate_guard,
+    }
     if not _stage_guard_env_bool("STAGE_GUARD_IK_TGT_ENABLE", True):
-        return _stage_guard_orig_true_lower_body_ik(motion, cfg)
+        return _stage_guard_orig_true_lower_body_ik(motion, cfg, **forwarded)
     snapshot = np.asarray(motion, dtype=np.float32).copy()
     try:
-        out, report = _stage_guard_orig_true_lower_body_ik(snapshot.copy(), cfg)
+        out, report = _stage_guard_orig_true_lower_body_ik(
+            snapshot.copy(),
+            cfg,
+            **forwarded,
+        )
         local_transactions = dict(report.get("local_transactions", {}))
         local_mode = str(
             report.get("rollback_policy", {}).get("mode", "")
-        ) == "local_ownership_window_transactions"
+        ).endswith("window_transactions") or str(
+            report.get("rollback_policy", {}).get("mode", "")
+        ).endswith("window_transactions_v9")
         # Local transactions have already passed physical and KBO checks with
         # derivative halos.  A second whole-song stage prior would modify
         # frames outside those audited ownership windows.
@@ -11542,7 +12338,14 @@ def true_lower_body_ik(motion, cfg):
                     "STAGE_GUARD_MSA_IK_STRENGTH", 0.04
                 ),
             )
-        ok, reasons, detail = _kinematic_barrier_oracle(out, snapshot, cfg, stage="ik_final", global_start=0)
+        ok, reasons, detail = _kinematic_barrier_oracle(
+            out,
+            snapshot,
+            cfg,
+            stage="ik_final",
+            global_start=0,
+            sliding_support_eligible=sliding_support_eligible,
+        )
         if ok:
             _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "committed", "fallback_level": "ik_commit", "kbo_status": "pass", "frames": int(snapshot.shape[0])})
             return out.astype(np.float32), report
@@ -11570,17 +12373,42 @@ def true_lower_body_ik(motion, cfg):
                 ),
             }
             return out.astype(np.float32), report
-        _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "fk_snapshot_rollback", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
+        _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "pre_ik_snapshot_rollback", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
         try:
             report = dict(report)
-            report["stage_guard_ik_rollback_to_fk"] = True
+            report["stage_guard_ik_rollback_to_pre_ik_snapshot"] = True
             report["stage_guard_rollback_reasons"] = reasons
+            report["stage_guard_hashes"] = {
+                "input": _array_content_sha256(snapshot),
+                "candidate": _array_content_sha256(out),
+                "selected": _array_content_sha256(snapshot),
+            }
+            report["hashes"] = {
+                **dict(report.get("hashes", {})),
+                "selected": _array_content_sha256(snapshot),
+            }
+            if bool(getattr(cfg, "full_sequence_contact_repair_enable", False)):
+                report["selected_localization"] = (
+                    full_sequence_physical_diagnostics_np(
+                        snapshot,
+                        cfg,
+                        sliding_support_eligible=sliding_support_eligible,
+                    )
+                )
         except Exception:
             pass
         return snapshot.astype(np.float32), report
     except Exception as exc:
-        _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "ik_exception_to_fk", "exception": str(exc)[:500], "hard_negative": True})
-        return snapshot.astype(np.float32), {"enabled": True, "stage_guard_ik_exception_to_fk": True, "exception": str(exc)[:500]}
+        _append_stage_transaction_audit({"mechanism": "IK_TGT", "stage": "ik", "commit_state": "rolled_back", "fallback_level": "ik_exception_to_pre_ik_snapshot", "exception": str(exc)[:500], "hard_negative": True})
+        return snapshot.astype(np.float32), {
+            "enabled": True,
+            "stage_guard_ik_exception_to_pre_ik_snapshot": True,
+            "exception": str(exc)[:500],
+            "stage_guard_hashes": {
+                "input": _array_content_sha256(snapshot),
+                "selected": _array_content_sha256(snapshot),
+            },
+        }
 
 
 def _summarize_stage_transactions(records):
@@ -11796,6 +12624,7 @@ def _bounded_residual_update(
     global_start=0,
     preserve_contacts=False,
     validate_barrier=True,
+    sliding_support_eligible=None,
 ):
     cand = np.asarray(candidate, dtype=np.float32)
     ref = np.asarray(reference, dtype=np.float32)
@@ -11848,14 +12677,28 @@ def _bounded_residual_update(
         preserve_contacts=preserve_contacts,
     )
     if validate_barrier:
-        ok, reasons, detail = _kinematic_barrier_oracle(out, ref, cfg, stage=f"{stage}_bounded_residual", global_start=global_start)
+        ok, reasons, detail = _kinematic_barrier_oracle(
+            out,
+            ref,
+            cfg,
+            stage=f"{stage}_bounded_residual",
+            global_start=global_start,
+            sliding_support_eligible=sliding_support_eligible,
+        )
         if not ok:
             _append_stage_transaction_audit({"mechanism": "KBO", "version": "motion_42", "stage": stage, "event": "bounded_residual_rejected", "barrier_violations": reasons, "detail": detail, "hard_negative": True})
             return ref.astype(np.float32)
     return out.astype(np.float32)
 
 
-def _deterministic_repair_bridge(reference, seam_mask, cfg, stage="fallback", global_start=0):
+def _deterministic_repair_bridge(
+    reference,
+    seam_mask,
+    cfg,
+    stage="fallback",
+    global_start=0,
+    sliding_support_eligible=None,
+):
     ref = np.asarray(reference, dtype=np.float32).copy()
     if ref.shape[0] < 4:
         return ref.astype(np.float32), {"mode": "snapshot_too_short", "committed": False}
@@ -11893,7 +12736,14 @@ def _deterministic_repair_bridge(reference, seam_mask, cfg, stage="fallback", gl
         reports.append({"span": [int(a), int(b)], "frames": int(n)})
     out, _ = enforce_edge151_contract_np(out, cfg, source_hint=f"energy_stability_deterministic_bridge:{stage}", derive_contact=True, project_rot=True)
     out, _ = _apply_guarded_stage_prior(out, cfg, strength=_stage_guard_env_float("STAGE_GUARD_MSA_FALLBACK_STRENGTH", 0.10), global_start=global_start)
-    ok, reasons, detail = _kinematic_barrier_oracle(out, ref, cfg, stage=f"{stage}_deterministic_bridge", global_start=global_start)
+    ok, reasons, detail = _kinematic_barrier_oracle(
+        out,
+        ref,
+        cfg,
+        stage=f"{stage}_deterministic_bridge",
+        global_start=global_start,
+        sliding_support_eligible=sliding_support_eligible,
+    )
     if not ok:
         return ref.astype(np.float32), {"mode": "deterministic_bridge_rejected", "committed": False, "reasons": reasons, "detail": detail}
     return out.astype(np.float32), {"mode": "deterministic_root_rotation_bridge", "committed": True, "regions": reports, "energy_stability_dynamic_msa": True}

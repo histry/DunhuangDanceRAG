@@ -7,6 +7,8 @@ import pytest
 from training.generation_stage_diagnostics import (
     _apply_verified_solution_windows,
     _array,
+    _boundary_nonregression,
+    _merge_frame_windows,
     summarize_report,
 )
 
@@ -92,3 +94,35 @@ def test_replay_rejects_reference_from_a_different_capture(tmp_path):
     row = _solution_row(tmp_path, "stale", [1, 4], stale, 1)
     with pytest.raises(ValueError, match="solution reference mismatch"):
         _apply_verified_solution_windows(full, [row], "bundle-sha", 1.0e-7)
+
+
+def test_v9_merges_physical_and_boundary_windows():
+    assert _merge_frame_windows(
+        [[10, 20], [22, 30], [70, 90]],
+        frames=100,
+        gap=2,
+    ) == [[10, 30], [70, 90]]
+
+
+def test_v9_boundary_guard_is_strictly_nonregressing():
+    before = [{
+        "slot": 1,
+        "actual_boundary_jerk_mps3": 500.0,
+        "actual_foot_slip_p95_mps": 0.30,
+    }]
+    improved = [{
+        "slot": 1,
+        "actual_boundary_jerk_mps3": 490.0,
+        "actual_foot_slip_p95_mps": 0.25,
+    }]
+    regressed = [{
+        "slot": 1,
+        "actual_boundary_jerk_mps3": 490.0,
+        "actual_foot_slip_p95_mps": 0.31,
+    }]
+    assert _boundary_nonregression(before, improved)["accepted"] is True
+    decision = _boundary_nonregression(before, regressed)
+    assert decision["accepted"] is False
+    assert decision["reasons"] == [
+        "slot_1:actual_foot_slip_p95_mps_regressed"
+    ]

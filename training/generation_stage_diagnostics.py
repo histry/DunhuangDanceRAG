@@ -1,7 +1,8 @@
-"""Opt-in generation traces and an adapter to the development feasibility runner.
+"""Opt-in generation traces and development-only solution replay.
 
-No training or solver is executed by this module. Existing reports can be
-summarized without loading torch, checkpoints or motion arrays.
+The summarize/export paths are read-only.  Replay can execute the explicitly
+requested frozen generators and V9 constrained contact repair, but never
+starts training or modifies a checkpoint.
 """
 from __future__ import annotations
 
@@ -47,6 +48,15 @@ def _hash(path):
     with Path(path).open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def _array_content_hash(value):
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+    digest.update(array.tobytes())
     return digest.hexdigest()
 
 
@@ -132,7 +142,15 @@ def summarize_report(report):
         "ik_local_transactions": {key: local.get(key) for key in ("attempted", "accepted", "rejected")},
         "ik_rejections": {field: dict(Counter(reason for row in local.get("transactions", []) for reason in row.get(field, [])))
                           for field in ("relative_reasons", "absolute_reasons", "kbo_reasons")},
-        "ik_rollback": {key: ik.get(key) for key in ("rollback_triggered", "stage_guard_ik_rollback_to_fk", "stage_guard_rollback_reasons")},
+        "ik_rollback": {
+            key: ik.get(key)
+            for key in (
+                "rollback_triggered",
+                "rollback_to_pre_ik_snapshot",
+                "stage_guard_ik_rollback_to_pre_ik_snapshot",
+                "stage_guard_rollback_reasons",
+            )
+        },
         "assembly_decisions": dict(Counter(row.get("decision", "missing") for row in stages.get("closed_loop_concat", []))),
         "rounds": [{"round": row.get("round"), "unsafe_boundaries": row.get("unsafe_boundaries")} for row in report.get("closed_loop", {}).get("rounds", [])],
         "final_quality_gate": report.get("final_quality_gate"),
@@ -460,6 +478,133 @@ def _apply_verified_solution_windows(reference, rows, bundle_sha256, edit_tolera
     return repaired, occupied, applied
 
 
+def _merge_frame_windows(windows, frames, gap=0):
+    normalized = sorted(
+        (
+            max(0, int(window[0])),
+            min(int(frames), int(window[1])),
+        )
+        for window in windows
+        if isinstance(window, (list, tuple)) and len(window) == 2
+    )
+    merged = []
+    for start, end in normalized:
+        if end - start < 4:
+            continue
+        if merged and start - merged[-1][1] <= int(gap):
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _unsafe_boundary_windows(rows, frames, halo):
+    windows = []
+    for row in rows:
+        if bool(row.get("safe", False)):
+            continue
+        start = int(row.get("transition_start", row.get("content_start", 0)))
+        end = int(row.get("transition_end", start))
+        if end <= start:
+            end = int(row.get("content_start", start)) + 1
+        windows.append([
+            max(0, start - int(halo)),
+            min(int(frames), end + int(halo)),
+        ])
+    return windows
+
+
+def _boundary_nonregression(before_rows, candidate_rows):
+    before = {int(row["slot"]): row for row in before_rows}
+    candidate = {int(row["slot"]): row for row in candidate_rows}
+    metrics = (
+        "actual_boundary_jerk_mps3",
+        "actual_entry_fk_jump_m",
+        "actual_exit_fk_jump_m",
+        "actual_entry_fk_jump_max_m",
+        "actual_exit_fk_jump_max_m",
+        "actual_entry_rotation_step_rad",
+        "actual_exit_rotation_step_rad",
+        "actual_foot_slip",
+        "actual_foot_slip_p95_mps",
+        "actual_foot_slip_peak_mps",
+        "actual_foot_penetration_depth_max_m",
+    )
+    regressions = []
+    deltas = {}
+    for slot, reference in before.items():
+        trial = candidate.get(slot)
+        if trial is None:
+            regressions.append(f"slot_{slot}:missing_candidate_boundary")
+            continue
+        for metric in metrics:
+            old = float(reference.get(metric, 0.0))
+            new = float(trial.get(metric, 0.0))
+            delta = new - old
+            deltas[f"slot_{slot}:{metric}"] = float(delta)
+            tolerance = max(1.0e-7, abs(old) * 1.0e-6)
+            if delta > tolerance:
+                regressions.append(f"slot_{slot}:{metric}_regressed")
+    return {
+        "accepted": not regressions,
+        "reasons": regressions,
+        "metric_deltas": deltas,
+    }
+
+
+def _load_stage_snapshot(entry):
+    if not isinstance(entry, dict) or not entry.get("snapshot_saved"):
+        return None
+    path = Path(entry.get("snapshot_path", "")).resolve()
+    if not path.is_file():
+        return None
+    value = np.load(path, allow_pickle=False)
+    return value if np.isfinite(value).all() else None
+
+
+def _v9_stage_diagnostics(runtime, cfg, eligible, stages, arrays):
+    result = {
+        "schema": "generation_stage_physical_diagnostics_v9",
+        "support_contract": "final_fail_closed_with_sliding_eligibility",
+        "sliding_support_eligible_sha256": _array_content_hash(eligible),
+        "sliding_support_eligible_frames": int(np.asarray(eligible).sum()),
+        "top_k": int(cfg.full_sequence_contact_repair_top_k),
+        "stages": {},
+    }
+    for name, value in arrays.items():
+        if value is None:
+            continue
+        diagnostic = runtime.full_sequence_physical_diagnostics_np(
+            value,
+            cfg,
+            sliding_support_eligible=eligible,
+        )
+        diagnostic["motion_sha256"] = _array_content_hash(value)
+        result["stages"][name] = diagnostic
+    ik = stages.get("lower_body_ik_true_ik", {})
+    if isinstance(ik, dict):
+        for name, key in (
+            ("ik_candidate", "candidate_localization"),
+            ("ik_selected", "selected_localization"),
+        ):
+            value = ik.get(key)
+            if isinstance(value, dict):
+                diagnostic = dict(value)
+                hash_key = "candidate" if name == "ik_candidate" else "selected"
+                if name == "ik_selected" and ik.get(
+                    "stage_guard_ik_rollback_to_pre_ik_snapshot"
+                ):
+                    motion_sha256 = ik.get("stage_guard_hashes", {}).get(
+                        "selected"
+                    )
+                else:
+                    motion_sha256 = ik.get("hashes", {}).get(hash_key)
+                if motion_sha256:
+                    diagnostic["motion_sha256"] = str(motion_sha256)
+                result["stages"][name] = diagnostic
+    return result
+
+
 def replay_solutions(
     bundle_path,
     source_report_path,
@@ -468,6 +613,7 @@ def replay_solutions(
     baseline="B3_frozen_v1_proposal_plus_action_solver",
     edit_tolerance=1.0e-7,
 ):
+    from contracts.physical_quality import evaluate_stage_reference_fidelity
     from routing import boundary_closed_loop as closed_loop
     from training import motion_models as runtime
 
@@ -514,9 +660,209 @@ def replay_solutions(
     if _hash(config_path) != bundle.get("config_sha256"):
         raise ValueError("captured config SHA256 mismatch")
     captured_environment = bundle.get("runtime_environment", {})
-    with _captured_environment(captured_environment):
+    diagnostic_environment = {
+        "BOUNDARY_STAGE_DIAGNOSTICS": "1",
+        "MOTION_ACTIVITY_SAVE_STAGE_OUTPUTS": "1",
+    }
+    with _captured_environment(captured_environment), _captured_environment(
+        diagnostic_environment
+    ):
         cfg = runtime.MotionGenerationConfig.from_json(config_path).apply_env()
         cfg.refiner_enable = False
+        cfg.full_sequence_contact_repair_enable = True
+
+        repair_input_localization = (
+            runtime.full_sequence_physical_diagnostics_np(
+                repaired,
+                cfg,
+                sliding_support_eligible=slide,
+            )
+        )
+        repair_input_boundaries = closed_loop.audit_boundaries(
+            runtime,
+            repaired,
+            bundle["assembly"],
+            cfg,
+        )
+        halo = max(2, int(round(
+            float(cfg.full_sequence_contact_repair_halo_seconds)
+            * float(cfg.fps)
+        )))
+        merge_gap = max(0, int(round(
+            float(cfg.full_sequence_contact_repair_merge_gap_seconds)
+            * float(cfg.fps)
+        )))
+        repair_windows = _merge_frame_windows(
+            list(repair_input_localization["repair_windows"])
+            + _unsafe_boundary_windows(
+                repair_input_boundaries,
+                len(repaired),
+                halo,
+            ),
+            len(repaired),
+            gap=merge_gap,
+        )
+
+        def contact_candidate_guard(current, candidate, ownership, audit_span):
+            start, end = map(int, audit_span)
+            local_eligible = slide[start:end]
+            reference_audit = runtime.audit_motion_np(
+                repaired[start:end],
+                cfg,
+                sliding_support_eligible=local_eligible,
+            )
+            candidate_audit = runtime.audit_motion_np(
+                candidate[start:end],
+                cfg,
+                sliding_support_eligible=local_eligible,
+            )
+            fidelity = evaluate_stage_reference_fidelity(
+                reference_audit,
+                candidate_audit,
+            )
+            fixed_support = (
+                runtime.evaluate_fixed_support_contact_candidate_np(
+                    current[start:end],
+                    candidate[start:end],
+                    cfg,
+                    sliding_support_eligible=local_eligible,
+                )
+            )
+            boundary = _boundary_nonregression(
+                closed_loop.audit_boundaries(
+                    runtime, current, bundle["assembly"], cfg
+                ),
+                closed_loop.audit_boundaries(
+                    runtime, candidate, bundle["assembly"], cfg
+                ),
+            )
+            observable_geometry_preserved = bool(
+                np.array_equal(candidate[occupied, 4:], current[occupied, 4:])
+            )
+            reasons = []
+            if not fidelity["accepted"]:
+                reasons.extend(
+                    f"fidelity:{reason}" for reason in fidelity["reasons"]
+                )
+            if not fixed_support["accepted"]:
+                reasons.extend(
+                    f"fixed_support:{reason}"
+                    for reason in fixed_support["reasons"]
+                )
+            if not boundary["accepted"]:
+                reasons.extend(
+                    f"boundary:{reason}" for reason in boundary["reasons"]
+                )
+            if not observable_geometry_preserved:
+                reasons.append("observable_solution_geometry_modified")
+            return {
+                "accepted": not reasons,
+                "reasons": reasons,
+                "ownership_span": list(map(int, ownership)),
+                "audit_span": [start, end],
+                "fidelity": fidelity,
+                "fixed_support": fixed_support,
+                "boundary": boundary,
+                "observable_gate": 0.03,
+                "observable_solution_geometry_preserved": (
+                    observable_geometry_preserved
+                ),
+            }
+
+        repair_candidate, contact_repair_report = runtime.true_lower_body_ik(
+            repaired,
+            cfg,
+            sliding_support_eligible=slide,
+            repair_windows=repair_windows,
+            protected_frame_mask=occupied,
+            candidate_guard=contact_candidate_guard,
+        )
+        repair_input_audit = runtime.audit_motion_np(
+            repaired,
+            cfg,
+            sliding_support_eligible=slide,
+        )
+        repair_candidate_audit = runtime.audit_motion_np(
+            repair_candidate,
+            cfg,
+            sliding_support_eligible=slide,
+        )
+        contact_decision = runtime._contact_restoration_decision(
+            repair_input_audit,
+            repair_candidate_audit,
+            cfg,
+        )
+        repair_candidate_boundaries = closed_loop.audit_boundaries(
+            runtime,
+            repair_candidate,
+            bundle["assembly"],
+            cfg,
+        )
+        boundary_decision = _boundary_nonregression(
+            repair_input_boundaries,
+            repair_candidate_boundaries,
+        )
+        fidelity_decision = evaluate_stage_reference_fidelity(
+            repair_input_audit,
+            repair_candidate_audit,
+        )
+        fixed_support_decision = (
+            runtime.evaluate_fixed_support_contact_candidate_np(
+                repaired,
+                repair_candidate,
+                cfg,
+                sliding_support_eligible=slide,
+            )
+        )
+        observable_geometry_preserved = bool(
+            np.array_equal(
+                repair_candidate[occupied, 4:],
+                repaired[occupied, 4:],
+            )
+        )
+        contact_stage_accepted = bool(
+            contact_decision["accepted"]
+            and boundary_decision["accepted"]
+            and fidelity_decision["accepted"]
+            and fixed_support_decision["accepted"]
+            and observable_geometry_preserved
+        )
+        repaired_contact = (
+            repair_candidate if contact_stage_accepted else repaired.copy()
+        )
+        repaired_contact_info = _array(
+            output,
+            "repaired_contact_v9",
+            repaired_contact,
+        )
+        contact_repair_transaction = {
+            "schema": "full_sequence_constrained_contact_repair_v9",
+            "development_only": True,
+            "training_started": False,
+            "production_model_modified": False,
+            "observable_gate": 0.03,
+            "repair_windows": repair_windows,
+            "input_localization": repair_input_localization,
+            "input_boundary_rows": repair_input_boundaries,
+            "solver_report": contact_repair_report,
+            "contact_decision": contact_decision,
+            "boundary_decision": boundary_decision,
+            "fidelity_decision": fidelity_decision,
+            "fixed_support_decision": fixed_support_decision,
+            "observable_solution_geometry_preserved": (
+                observable_geometry_preserved
+            ),
+            "accepted": contact_stage_accepted,
+            "rollback_to_pre_contact_repair_snapshot": (
+                not contact_stage_accepted
+            ),
+            "hashes": {
+                "input": _array_content_hash(repaired),
+                "candidate": _array_content_hash(repair_candidate),
+                "selected": _array_content_hash(repaired_contact),
+            },
+            "selected_artifact": repaired_contact_info,
+        }
         diffusion = bundle.get("checkpoints", {}).get("diffusion", {})
         diffusion_path = diffusion.get("path") if diffusion.get("active") else None
         if diffusion_path and _hash(diffusion_path) != diffusion.get("sha256"):
@@ -528,12 +874,18 @@ def replay_solutions(
         )
         final_motion, stage_reports = closed_loop.apply_generators(
             runtime,
-            repaired,
+            repaired_contact,
             condition,
             seam,
             replay_args,
             cfg,
             sliding_support_eligible=slide,
+            protected_geometry_mask=occupied,
+            ik_protected_frame_mask=occupied,
+            ik_candidate_guard=contact_candidate_guard,
+        )
+        stage_reports["full_sequence_constrained_contact_repair"] = (
+            contact_repair_transaction
         )
         boundary_rows = closed_loop.audit_boundaries(
             runtime, final_motion, bundle["assembly"], cfg
@@ -551,9 +903,41 @@ def replay_solutions(
         )
         final_gate = _quality_gate(closed_loop, physical, boundary, activity)
 
+        diffusion_candidate = None
+        diffusion_entry = stage_reports.get("diffusion_guarded_candidate")
+        if isinstance(diffusion_entry, dict):
+            try:
+                diffusion_candidate, _ = _load_hashed_array(
+                    diffusion_entry,
+                    "diffusion_guarded_candidate",
+                )
+            except (OSError, TypeError, ValueError):
+                diffusion_candidate = None
+        diffusion_selected = _load_stage_snapshot(
+            stage_reports.get("motion_activity_diffusion")
+        )
+        stage_reports["v9_stage_physical_diagnostics"] = (
+            _v9_stage_diagnostics(
+                runtime,
+                cfg,
+                slide,
+                stage_reports,
+                {
+                    "repaired_refiner": repaired,
+                    "contact_repair_candidate": repair_candidate,
+                    "contact_repair_selected": repaired_contact,
+                    "diffusion_candidate": diffusion_candidate,
+                    "diffusion_selected": diffusion_selected,
+                    "pre_ik": diffusion_selected,
+                    "final": final_motion,
+                },
+            )
+        )
+
     final_motion_info = _array(output, "replayed_final", final_motion)
     report = {
         "schema": "refiner_solution_development_replay_v1",
+        "protocol": "full_sequence_constrained_contact_repair_replay_v9",
         "completed": True,
         "development_only": True,
         "formal_preregistration": False,
@@ -582,6 +966,7 @@ def replay_solutions(
         "solutions": applied,
         "edit_union_frames": int(occupied.sum()),
         "repaired_refiner": repaired_refiner,
+        "repaired_contact_v9": repaired_contact_info,
         "replayed_final": final_motion_info,
         "stage_reports": stage_reports,
         "boundary_rows": boundary_rows,

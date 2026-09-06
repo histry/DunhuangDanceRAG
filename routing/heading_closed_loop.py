@@ -1422,10 +1422,32 @@ def apply_generators_with_heading_guard(
     cfg: Any,
     *,
     sliding_support_eligible: Optional[np.ndarray] = None,
+    protected_geometry_mask: Optional[np.ndarray] = None,
+    ik_protected_frame_mask: Optional[np.ndarray] = None,
+    ik_candidate_guard: Optional[Any] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Refiner/diffusion edit seams; planner root heading remains authoritative."""
     stage: Dict[str, Any] = {}
     motion = np.asarray(motion_ref, dtype=np.float32).copy()
+    protected = None
+    if protected_geometry_mask is not None:
+        protected = np.asarray(protected_geometry_mask, dtype=bool).reshape(-1)
+        if len(protected) != len(motion):
+            raise ValueError("protected_geometry_mask length mismatch")
+
+    def restore_protected_geometry(value):
+        if protected is None or not np.any(protected):
+            return value
+        restored = np.asarray(value, dtype=np.float32).copy()
+        restored[protected, 4:] = motion_ref[protected, 4:]
+        return restored
+
+    if protected is not None:
+        stage["protected_geometry_contract"] = {
+            "frames": int(protected.sum()),
+            "channels": [4, int(motion.shape[1])],
+            "contact_channels_recomputed": True,
+        }
 
     def physical_audit(value: np.ndarray) -> Dict[str, Any]:
         if not hasattr(motion_runtime, "audit_motion_np"):
@@ -1455,7 +1477,9 @@ def apply_generators_with_heading_guard(
             seam_mask,
             getattr(args, "refiner", None),
             cfg,
+            sliding_support_eligible=sliding_support_eligible,
         )
+        motion = restore_protected_geometry(motion)
         stage["boundary_refiner_audit"] = physical_audit(motion)
     stage["motion_activity_refiner"] = save_stage_snapshot(
         getattr(args, "out", None),
@@ -1473,7 +1497,9 @@ def apply_generators_with_heading_guard(
             seam_mask,
             getattr(args, "diffusion", None),
             cfg,
+            sliding_support_eligible=sliding_support_eligible,
         )
+        motion = restore_protected_geometry(motion)
         stage["motion_diffusion_audit"] = physical_audit(motion)
     stage["motion_activity_diffusion"] = save_stage_snapshot(
         getattr(args, "out", None),
@@ -1501,7 +1527,13 @@ def apply_generators_with_heading_guard(
     if bool(getattr(cfg, "ik_enable", False)) and base.env_bool(
         "BOUNDARY_USE_IK", True
     ):
-        motion, ik_report = motion_runtime.true_lower_body_ik(motion, cfg)
+        motion, ik_report = motion_runtime.true_lower_body_ik(
+            motion,
+            cfg,
+            sliding_support_eligible=sliding_support_eligible,
+            protected_frame_mask=ik_protected_frame_mask,
+            candidate_guard=ik_candidate_guard,
+        )
     stage["lower_body_ik_true_ik"] = ik_report
 
     if env_bool("EVENT_HEADING_PROTECT_PLANNED_ROOT_HEADING", True):

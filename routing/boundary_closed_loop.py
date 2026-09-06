@@ -877,6 +877,9 @@ def apply_generators(
     cfg: Any,
     *,
     sliding_support_eligible: Optional[np.ndarray] = None,
+    protected_geometry_mask: Optional[np.ndarray] = None,
+    ik_protected_frame_mask: Optional[np.ndarray] = None,
+    ik_candidate_guard: Optional[Any] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Apply repair stages with Peak-Jerk support and transactional rollback."""
     if not hasattr(motion_runtime, "audit_motion_np"):
@@ -887,7 +890,25 @@ def apply_generators(
     limits = PhysicalQualityLimits.from_environment()
     policy = StageAcceptancePolicy.from_environment()
     motion = np.asarray(motion_ref, dtype=np.float32).copy()
+    protected = None
+    if protected_geometry_mask is not None:
+        protected = np.asarray(protected_geometry_mask, dtype=bool).reshape(-1)
+        if len(protected) != len(motion):
+            raise ValueError("protected_geometry_mask length mismatch")
     stage: Dict[str, Any] = {}
+    if protected is not None:
+        stage["protected_geometry_contract"] = {
+            "frames": int(protected.sum()),
+            "channels": [4, int(motion.shape[1])],
+            "contact_channels_recomputed": True,
+        }
+
+    def restore_protected_geometry(value):
+        if protected is None or not np.any(protected):
+            return value
+        restored = np.asarray(value, dtype=np.float32).copy()
+        restored[protected, 4:] = motion_ref[protected, 4:]
+        return restored
 
     def capture_candidate(name, value):
         if env_bool("BOUNDARY_STAGE_DIAGNOSTICS", False):
@@ -932,12 +953,14 @@ def apply_generators(
                 refiner_mask,
                 getattr(args, "refiner", None),
                 cfg,
+                sliding_support_eligible=sliding_support_eligible,
             )),
             audit_fn=audit_fn,
             limits=limits,
             policy=policy,
             require_repair_gain=True,
         )
+        motion = restore_protected_geometry(motion)
         stage["boundary_refiner_transaction"] = transaction
         stage["boundary_refiner_audit"] = audit_fn(motion)
     stage["motion_activity_refiner"] = save_stage_snapshot(
@@ -965,12 +988,14 @@ def apply_generators(
                 diffusion_mask,
                 getattr(args, "diffusion", None),
                 cfg,
+                sliding_support_eligible=sliding_support_eligible,
             )),
             audit_fn=audit_fn,
             limits=limits,
             policy=policy,
             require_repair_gain=True,
         )
+        motion = restore_protected_geometry(motion)
         stage["motion_diffusion_transaction"] = transaction
         stage["motion_diffusion_audit"] = audit_fn(motion)
     stage["motion_activity_diffusion"] = save_stage_snapshot(
@@ -984,7 +1009,13 @@ def apply_generators(
     if bool(getattr(cfg, "ik_enable", False)) and env_bool(
         "BOUNDARY_USE_IK", True
     ):
-        motion, ik_report = motion_runtime.true_lower_body_ik(motion, cfg)
+        motion, ik_report = motion_runtime.true_lower_body_ik(
+            motion,
+            cfg,
+            sliding_support_eligible=sliding_support_eligible,
+            protected_frame_mask=ik_protected_frame_mask,
+            candidate_guard=ik_candidate_guard,
+        )
     stage["lower_body_ik_true_ik"] = ik_report
     stage["final_audit"] = audit_fn(motion)
     stage["final_physical_gate"] = physical_quality_gate(
