@@ -10,6 +10,7 @@ OLD_CASES="${2:-$CAPTURE_ROOT/refiner_failure_cases_selected_round2/cases.json}"
 EXPECTED_COMMIT="${3:-$(git rev-parse HEAD)}"
 MAX_ITERATIONS="${4:-32}"
 SOURCE_REPORT="${5:-${SOURCE_REPORT:-outputs/diagnostic_refiner_only/fresh_audio_final.report.json}}"
+PROVENANCE_OVERRIDE="${6:-${PROVENANCE_PATH:-}}"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 CASE_DIR="outputs/refiner_failure_cases_frozen_v1_${STAMP}"
@@ -116,7 +117,26 @@ print(path)
 PY
 )
 
-PROVENANCE=$("$PYTHON_BIN" - "$OLD_CASES" <<'PY'
+if [[ -n "$PROVENANCE_OVERRIDE" ]]; then
+  [[ -s "$PROVENANCE_OVERRIDE" ]] || {
+    echo "[FATAL] provenance override missing: $PROVENANCE_OVERRIDE" >&2
+    exit 2
+  }
+  PROVENANCE=$("$PYTHON_BIN" - "$PROVENANCE_OVERRIDE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+path = Path(sys.argv[1]).resolve()
+value = json.loads(path.read_text(encoding="utf-8-sig"))
+if value.get("development_only") is not True or not isinstance(value.get("events"), dict):
+    raise SystemExit("[FATAL] invalid development provenance override")
+print(path)
+PY
+  )
+else
+  PROVENANCE=$("$PYTHON_BIN" - "$OLD_CASES" <<'PY'
 import hashlib
 import json
 import sys
@@ -149,7 +169,8 @@ for path in Path("outputs").rglob("*.json"):
         continue
 raise SystemExit("[FATAL] matching development provenance was not found")
 PY
-)
+  )
+fi
 
 printf '%s\n' "$SOURCE_REPORT" > outputs/LATEST_REFINER_SOURCE_REPORT
 printf '%s\n' "$BUNDLE" > outputs/LATEST_REFINER_CAPTURE_BUNDLE
