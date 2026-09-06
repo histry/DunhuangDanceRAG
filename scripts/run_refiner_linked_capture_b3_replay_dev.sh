@@ -12,7 +12,8 @@ LEGACY_REPORT="${LEGACY_REPORT:-outputs/diagnostic_refiner_only/fresh_audio_fina
 SCHEDULE="${SCHEDULE:-$PRIOR_CAPTURE/schedule.from_failure_run.mssd.json}"
 OLD_CASES="${OLD_CASES:-$PRIOR_CAPTURE/refiner_failure_cases_selected_round2/cases.json}"
 PRIOR_BUNDLE="${PRIOR_BUNDLE:-$(cat "$PRIOR_CAPTURE/selected_bundle.path" 2>/dev/null || true)}"
-FROZEN_DIFFUSION="${FROZEN_DIFFUSION:-outputs/run_smpl14_formal_20260822_163915/motion_train_only_diffusion.pt}"
+FROZEN_DIFFUSION="${FROZEN_DIFFUSION:-outputs/motion_v12_v4_direct_20260903_184738/checkpoints/local_diffusion.rejected_validation.pt}"
+DIFFUSION_CHECKPOINT_STATUS="${DIFFUSION_CHECKPOINT_STATUS:-rejected_validation_diagnostic_only}"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 CAPTURE_DIR="outputs/generation_stage_capture_linked_${STAMP}"
@@ -62,7 +63,7 @@ for file in "$LEGACY_REPORT" "$SCHEDULE" "$OLD_CASES" "$PRIOR_BUNDLE" "$FROZEN_D
 done
 
 INPUTS_JSON="$CAPTURE_DIR/inputs.json"
-"$PYTHON_BIN" - "$LEGACY_REPORT" "$OLD_CASES" "$PRIOR_BUNDLE" "$FROZEN_DIFFUSION" "$INPUTS_JSON" "$ENV_FILE" <<'PY'
+"$PYTHON_BIN" - "$LEGACY_REPORT" "$OLD_CASES" "$PRIOR_BUNDLE" "$FROZEN_DIFFUSION" "$INPUTS_JSON" "$ENV_FILE" "$DIFFUSION_CHECKPOINT_STATUS" <<'PY'
 import hashlib
 import json
 import re
@@ -80,8 +81,9 @@ def sha256(path):
 
 
 legacy_path, cases_path, bundle_path, diffusion_path, output_path, env_path = map(
-    lambda value: Path(value).resolve(), sys.argv[1:]
+    lambda value: Path(value).resolve(), sys.argv[1:7]
 )
+diffusion_status = sys.argv[7]
 legacy = json.loads(legacy_path.read_text(encoding="utf-8-sig"))
 cases = json.loads(cases_path.read_text(encoding="utf-8-sig"))
 bundle = json.loads(bundle_path.read_text(encoding="utf-8-sig"))
@@ -125,6 +127,7 @@ environment.update({
     "BOUNDARY_USE_DIFFUSION": "1",
     "MOTION_ENABLE_TRUE_IK": "1",
     "BOUNDARY_USE_IK": "1",
+    "MOTION_DIFFUSION_CHECKPOINT_STATUS": diffusion_status,
 })
 for key in environment:
     if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", str(key)):
@@ -141,7 +144,12 @@ result = {
     "audio": {"path": str(audio_path), "sha256": sha256(audio_path)},
     "db": {"path": str(db_path), "sha256": sha256(db_path)},
     "refiner": {"path": str(refiner_path), "sha256": sha256(refiner_path)},
-    "diffusion": {"path": str(diffusion_path), "sha256": sha256(diffusion_path)},
+    "diffusion": {
+        "path": str(diffusion_path),
+        "sha256": sha256(diffusion_path),
+        "selection_status": diffusion_status,
+        "production_eligible": False,
+    },
 }
 output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 print(json.dumps(result, ensure_ascii=False, indent=2))
