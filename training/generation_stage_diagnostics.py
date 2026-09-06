@@ -58,7 +58,7 @@ def _array(directory, name, value):
 
 def _load_hashed_array(entry, label):
     if not isinstance(entry, dict):
-        raise ValueError(f"missing array entry: {label}")
+        raise TypeError(f"array entry must be an object: {label}")
     path = Path(entry.get("path", "")).resolve()
     expected = str(entry.get("sha256", "")).strip().lower()
     if not path.is_file() or not expected:
@@ -336,7 +336,7 @@ def _linked_source_report(source_report_path, bundle_path, bundle_sha256):
     if str(link.get("sha256", "")).lower() != bundle_sha256:
         raise ValueError("source report bundle SHA256 mismatch")
     if not isinstance(source_report.get("slots"), list):
-        raise ValueError("source report has no slot activity contract")
+        raise TypeError("source report slot activity contract must be a list")
     return source_report, source_report_path
 
 

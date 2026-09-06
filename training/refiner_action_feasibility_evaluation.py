@@ -302,7 +302,7 @@ def _verified_proposal_source(
         raise ValueError("proposal requires an explicit verified V1 checkpoint")
     metadata = row.get("metadata", {})
     if not isinstance(metadata, Mapping):
-        raise ValueError("proposal metadata must be an object")
+        raise TypeError("proposal metadata must be an object")
     expected_checkpoint = str(metadata.get("proposal_checkpoint_sha256", "")).strip().lower()
     if not expected_checkpoint:
         raise ValueError("proposal_checkpoint_sha256 is required")
