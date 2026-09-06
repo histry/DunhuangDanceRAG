@@ -173,7 +173,7 @@ source "$ENV_FILE"
 
 echo "===== CONTROLLED LINKED CAPTURE ====="
 set +e
-time "$PYTHON_BIN" routing/boundary_closed_loop.py generate \
+time "$PYTHON_BIN" -m routing.boundary_closed_loop generate \
   --config "$CONFIG" \
   --audio "$AUDIO" \
   --slots_json "$SCHEDULE" \
