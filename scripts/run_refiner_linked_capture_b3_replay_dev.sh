@@ -16,7 +16,7 @@ FROZEN_DIFFUSION="${FROZEN_DIFFUSION:-outputs/motion_v12_v4_direct_20260903_1847
 DIFFUSION_CHECKPOINT_STATUS="${DIFFUSION_CHECKPOINT_STATUS:-rejected_validation_diagnostic_only}"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
-CAPTURE_DIR="outputs/generation_stage_capture_linked_${STAMP}"
+CAPTURE_DIR="${RESUME_CAPTURE_DIR:-outputs/generation_stage_capture_linked_${STAMP}}"
 CAPTURE_OUT="$CAPTURE_DIR/fresh_audio_final.npy"
 CAPTURE_REPORT="$CAPTURE_DIR/fresh_audio_final.report.json"
 PROVENANCE="$CAPTURE_DIR/verified_development_provenance.json"
@@ -172,23 +172,28 @@ DIFFUSION_SHA=$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv
 source "$ENV_FILE"
 
 echo "===== CONTROLLED LINKED CAPTURE ====="
-set +e
-time "$PYTHON_BIN" -m routing.boundary_closed_loop generate \
-  --config "$CONFIG" \
-  --audio "$AUDIO" \
-  --slots_json "$SCHEDULE" \
-  --db "$DB" \
-  --refiner "$REFINER" \
-  --diffusion "$DIFFUSION" \
-  --out "$CAPTURE_OUT" \
-  --json "$CAPTURE_REPORT"
-CAPTURE_STATUS=$?
-set -e
-echo "capture_status=$CAPTURE_STATUS"
-if [[ "$CAPTURE_STATUS" -ne 0 && "$CAPTURE_STATUS" -ne 2 ]]; then
-  echo "[FATAL] controlled capture crashed" >&2
-  exit "$CAPTURE_STATUS"
+if [[ -n "${RESUME_CAPTURE_DIR:-}" ]]; then
+  echo "resume_capture_dir=$CAPTURE_DIR"
+  [[ -s "$CAPTURE_REPORT" ]] || {
+    echo "[FATAL] resumed capture report missing: $CAPTURE_REPORT" >&2
+    exit 2
+  }
+  CAPTURE_STATUS="resumed_preserved_report"
+else
+  set +e
+  time "$PYTHON_BIN" -m routing.boundary_closed_loop generate \
+    --config "$CONFIG" \
+    --audio "$AUDIO" \
+    --slots_json "$SCHEDULE" \
+    --db "$DB" \
+    --refiner "$REFINER" \
+    --diffusion "$DIFFUSION" \
+    --out "$CAPTURE_OUT" \
+    --json "$CAPTURE_REPORT"
+  CAPTURE_STATUS=$?
+  set -e
 fi
+echo "capture_status=$CAPTURE_STATUS"
 [[ "$(sha256sum "$REFINER" | awk '{print $1}')" == "$REFINER_SHA" ]] || {
   echo "[FATAL] frozen Refiner changed during capture" >&2
   exit 2
@@ -198,9 +203,15 @@ fi
   exit 2
 }
 [[ -s "$CAPTURE_REPORT" ]] || {
-  echo "[FATAL] controlled capture did not write its report" >&2
+  echo "[FATAL] controlled capture failed before writing its report; status=$CAPTURE_STATUS" >&2
+  if [[ "$CAPTURE_STATUS" =~ ^[1-9][0-9]*$ ]]; then
+    exit "$CAPTURE_STATUS"
+  fi
   exit 2
 }
+if [[ "$CAPTURE_STATUS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[INFO] generator returned nonzero after preserving a report; validating fail-closed artifacts"
+fi
 
 NEW_BUNDLE=$("$PYTHON_BIN" - "$CAPTURE_REPORT" "$REFINER_SHA" "$DIFFUSION_SHA" <<'PY'
 import hashlib
@@ -218,6 +229,8 @@ def sha256(path):
 
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
+if not isinstance(report.get("slots"), list) or not isinstance(report.get("final_quality_gate"), dict):
+    raise SystemExit("[FATAL] linked capture report is incomplete")
 entry = report.get("stage_reports", {}).get("generation_stage_diagnostics")
 if not isinstance(entry, dict):
     raise SystemExit("[FATAL] linked capture report has no selected bundle")
