@@ -29,9 +29,9 @@ decoder and independent audits, then runs a fixed minimum-edit schedule after a
 feasible point is found. A rejected or unsuccessful case rolls back to the
 observed reference. A rollback is never counted as a rescue.
 
-## v7 constrained restoration solver
+## v8 constrained restoration solver
 
-`refiner_action_feasibility_dev_v7` merges physical/fixed-support source
+`refiner_action_feasibility_dev_v8` merges physical/fixed-support source
 metrics by canonical root before searching. Each root retains its source
 metrics and uses the worst normalized residual and minimum signed margin;
 the original layer-specific gates still decide acceptance. Diagnostic layer
@@ -43,6 +43,14 @@ Zero-limit, nonnegative Rot6D nonfinite/degenerate and rotation-near-pi ratios
 are recorded as `boundary_invariant`: zero remains valid, positive residual
 still fails, and their unattainable positive margin is excluded from guards
 and cone fitting.
+
+Measured finite-difference probes that improve the active observable stage,
+preserve endpoint acceptance during temporal repair, pass every hard filter,
+and do not spend the binding restoration margin are ranked for direct replay.
+The solver authoritatively re-evaluates at most 16 of these probes per
+iteration and may accept one as an ordinary multi-step update before shrinking
+the trust region. Probe promotion does not bypass restoration materiality,
+binding-margin protection, minimum-edit verification, or final joint gates.
 
 The solver measures true decoded margins at probe radii `h`, `h/2`, and
 `h/4` near a boundary. Its deterministic search basis includes observable

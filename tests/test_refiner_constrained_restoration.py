@@ -16,6 +16,7 @@ from training.refiner_action_feasibility import (
     _margin_models,
     _ordinary_candidate_admissible,
     _project_margin_cone,
+    _promotable_probe_candidates,
     _restoration_acceptance,
     _safe_margin_step,
     _structured_probe_basis,
@@ -200,6 +201,40 @@ def test_ordinary_candidate_cannot_spend_binding_margin_without_joint_pass():
     assert _ordinary_candidate_admissible(
         evidence, feasible_probe_exists=False, joint_pass=True, tolerance=1.0e-7
     )[0]
+
+
+def test_direct_probe_promotion_requires_stage_gain_and_binding_margin_safety():
+    current = _evaluation()
+    hard = copy.deepcopy(current["hard_residual_components"])
+    good = {
+        "objective": "structured_temporal_symmetric",
+        "probe_source": "canonical_margin_one_sided",
+        "sign": 1,
+        "probe_radius": 0.03125,
+        "endpoint_pass": True,
+        "temporal_margin": -0.1,
+        "endpoint_margin": 0.1,
+        "joint_pass": False,
+        "hard_constraint_failures": [],
+        "hard_residual_components": hard,
+    }
+    binding_regression = copy.deepcopy(good)
+    binding_regression["objective"] = "unsafe_binding"
+    binding_regression["hard_residual_components"]["canonical_metrics"][
+        "joint_jerk"
+    ]["minimum_margin"] = 0.0
+    no_stage_gain = copy.deepcopy(good)
+    no_stage_gain["objective"] = "no_stage_gain"
+    no_stage_gain["temporal_margin"] = -0.25
+    ranked = _promotable_probe_candidates(
+        [binding_regression, no_stage_gain, good],
+        current,
+        "temporal",
+        1.0e-7,
+    )
+    assert [probe["objective"] for probe in ranked] == [
+        "structured_temporal_symmetric"
+    ]
 
 
 def test_structured_probe_basis_is_seeded_and_spans_required_blocks():

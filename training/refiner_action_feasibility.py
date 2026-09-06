@@ -27,7 +27,7 @@ from motion_geometry.product_manifold import (
 )
 from training import motion_models as m
 
-PROTOCOL_VERSION = "refiner_action_feasibility_dev_v7"
+PROTOCOL_VERSION = "refiner_action_feasibility_dev_v8"
 DECODER_PROTOCOL = "product_refiner_true_decoder_confidence_smoothing_taper_cap_v1"
 METRIC_PROTOCOL = "observable_boundary_stage_physical_fixed_support_fidelity_v1"
 ACTION_DIM = PRODUCT_STATE_DIM - 4
@@ -46,6 +46,7 @@ CONE_PROJECTION_SWEEPS = 64
 SAFE_STEP_FRACTION = 0.9
 RESTORATION_GAP_FRACTION = 0.05
 STRICT_MARGIN_DERIVATIVE_FLOOR = 1.0e-6
+DIRECT_PROBE_PROMOTION_LIMIT = 16
 BOUNDARY_INVARIANT_METRICS = frozenset(
     {
         "rot6d_nonfinite_ratio",
@@ -1533,6 +1534,88 @@ def _finite_difference_reachability(
     return probes
 
 
+def _promotable_probe_candidates(
+    probes: list[Mapping[str, Any]],
+    current_evaluation: Mapping[str, Any],
+    stage: str,
+    tolerance: float,
+) -> list[Mapping[str, Any]]:
+    """Rank measured, hard-safe stage improvements for direct replay."""
+    current_margin = float(
+        (current_evaluation.get("solver_observable_margin", {}) or {}).get(
+            stage, float("-inf")
+        )
+    )
+    current_hard_margins = _evaluation_margins(current_evaluation)
+    current_target_minimum = min(
+        (
+            current_hard_margins[name]
+            for name in RESTORATION_METRICS
+            if name in current_hard_margins
+        ),
+        default=None,
+    )
+    candidates: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    margin_key = f"{stage}_margin"
+    for probe in probes:
+        if probe.get("hard_constraint_failures"):
+            continue
+        if stage == "temporal" and not probe.get("endpoint_pass", False):
+            continue
+        margin = probe.get(margin_key)
+        if margin is None or not math.isfinite(float(margin)):
+            continue
+        if float(margin) <= current_margin + tolerance:
+            continue
+        probe_components = probe.get("hard_residual_components", {}) or {}
+        probe_margins = {
+            name: float(item["minimum_margin"])
+            for name, item in (
+                probe_components.get("canonical_metrics", {}) or {}
+            ).items()
+            if item.get("minimum_margin") is not None
+            and math.isfinite(float(item["minimum_margin"]))
+        }
+        probe_target_minimum = min(
+            (
+                probe_margins[name]
+                for name in RESTORATION_METRICS
+                if name in probe_margins
+            ),
+            default=None,
+        )
+        binding_nonworsening = bool(
+            current_target_minimum is not None
+            and probe_target_minimum is not None
+            and probe_target_minimum >= current_target_minimum - tolerance
+        )
+        if not probe.get("joint_pass", False) and not binding_nonworsening:
+            continue
+        key = (
+            probe.get("probe_source"),
+            probe.get("objective"),
+            int(probe.get("sign", 0)),
+            float(probe.get("probe_radius", 0.0)),
+        )
+        candidates[key] = probe
+    secondary_margin_key = (
+        "endpoint_margin" if stage == "temporal" else "temporal_margin"
+    )
+
+    def ranking(probe: Mapping[str, Any]) -> tuple[float, float]:
+        primary = float(probe[margin_key])
+        secondary_value = probe.get(secondary_margin_key)
+        secondary = (
+            float(secondary_value)
+            if secondary_value is not None
+            and math.isfinite(float(secondary_value))
+            else float("-inf")
+        )
+        return primary, secondary
+
+    return sorted(candidates.values(), key=ranking, reverse=True)
+
+
 def _reachability_diagnosis(probes: list[Mapping[str, Any]]) -> str:
     if any(bool(probe.get("observable_physical_feasible", False)) for probe in probes):
         return "search_direction_or_acceptance_mismatch"
@@ -2036,6 +2119,7 @@ def solve_action_feasibility(
                     trial_payload["gradient_norm"] = direction_meta.get(
                         "gradient_norm"
                     )
+                    trial_payload["case_id"] = case.case_id
                     trial_payload["safe_step_upper_bound"] = safe_radius
                     trial_payload["step_size"] = float(safe_radius * factor)
                     trial_payload["step_bound_constraints"] = step_evidence
@@ -2096,10 +2180,141 @@ def solve_action_feasibility(
                                 restoration_key, trial_action, trial, objective, backtrack
                             )
 
+            promotable_probes = _promotable_probe_candidates(
+                reachability,
+                current_eval,
+                stage,
+                controls.comparison_tolerance,
+            )
+            probe_directions = {**probe_basis, **raw_directions, **directions}
+            promotion_diagnostics = {
+                "eligible_probe_count": len(promotable_probes),
+                "replay_limit": DIRECT_PROBE_PROMOTION_LIMIT,
+                "replayed_probe_count": 0,
+                "accepted_candidate_count": 0,
+            }
+            for promotion_index, probe in enumerate(
+                promotable_probes[:DIRECT_PROBE_PROMOTION_LIMIT]
+            ):
+                source_objective = str(probe["objective"])
+                probe_direction = (
+                    probe_basis.get(source_objective)
+                    if probe.get("probe_source") == "canonical_margin_one_sided"
+                    else probe_directions.get(source_objective)
+                )
+                if probe_direction is None:
+                    continue
+                sign = int(probe["sign"])
+                probe_radius_value = float(probe["probe_radius"])
+                promoted_objective = (
+                    f"promoted_probe_{promotion_index}_{source_objective}_"
+                    f"{sign:+d}"
+                )
+                trial_action = current_action + (
+                    sign * probe_radius_value * probe_direction
+                ).astype(np.float32)
+                trial = evaluate_action_candidate(
+                    case,
+                    trial_action,
+                    label=(
+                        f"iteration_{step_index}_{promoted_objective}_replay"
+                    ),
+                )
+                trial["_cfg"] = case.cfg
+                trial_key = _solver_key(trial, trial_action)
+                trial_stage_key = _stage_key(trial, trial_action, stage)
+                trial_payload = _solver_trial_payload(
+                    trial,
+                    stage=stage,
+                    objective=promoted_objective,
+                    direction_source="authoritative_finite_difference_probe_promotion",
+                    current_stage_key=current_stage_key,
+                    trial_stage_key=trial_stage_key,
+                    backtrack=-1,
+                    current_key=current_solver_key,
+                    trial_key=trial_key,
+                    action_delta_norm=normalized_raw_action_norm(
+                        trial_action - current_action, case.cfg
+                    ),
+                    observable_physical_feasible_probe=bool(
+                        probe.get("observable_physical_feasible", False)
+                    ),
+                    current_hard_residual_components=current_hard_components,
+                )
+                trial_payload["case_id"] = case.case_id
+                trial_payload["probe_objective"] = source_objective
+                trial_payload["probe_sign"] = sign
+                trial_payload["probe_scale"] = probe.get("probe_scale")
+                trial_payload["step_size"] = probe_radius_value
+                trial_payload["search_phase"] = "direct_probe_promotion"
+                restoration_ok, restoration_evidence = _restoration_acceptance(
+                    current_eval, trial, controls.comparison_tolerance
+                )
+                restoration_evidence["enabled_no_feasible_probe"] = (
+                    restoration_enabled
+                )
+                (
+                    ordinary_candidate_admissible,
+                    binding_margin_nonworsening,
+                ) = _ordinary_candidate_admissible(
+                    restoration_evidence,
+                    feasible_probe_exists=feasible_probe_exists,
+                    joint_pass=bool(trial.get("joint_pass", False)),
+                    tolerance=controls.comparison_tolerance,
+                )
+                restoration_evidence["binding_margin_nonworsening"] = (
+                    binding_margin_nonworsening
+                )
+                trial_payload["hard_margin_restoration"] = restoration_evidence
+                trial_payload["ordinary_candidate_admissible"] = (
+                    ordinary_candidate_admissible
+                )
+                trial_diagnostics.append(trial_payload)
+                promotion_diagnostics["replayed_probe_count"] += 1
+                hard_failures = _hard_constraint_failures(
+                    trial, preserve_endpoint=stage == "temporal"
+                )
+                if (
+                    not hard_failures
+                    and ordinary_candidate_admissible
+                    and trial_stage_key < current_stage_key
+                ):
+                    promotion_diagnostics["accepted_candidate_count"] += 1
+                    if best is None or trial_stage_key < best[0]:
+                        best = (
+                            trial_stage_key,
+                            trial_action,
+                            trial,
+                            promoted_objective,
+                            -1,
+                        )
+                elif (
+                    not ordinary_candidate_admissible
+                    and trial_stage_key < current_stage_key
+                ):
+                    trial_payload["rejected_reason"] = (
+                        "binding_hard_margin_reduced_without_joint_pass"
+                    )
+                if restoration_enabled and restoration_ok:
+                    restoration_key = (
+                        -float(restoration_evidence["minimum_margin_after"]),
+                        trial_stage_key,
+                    )
+                    if (
+                        best_restoration is None
+                        or restoration_key < best_restoration[0]
+                    ):
+                        best_restoration = (
+                            restoration_key,
+                            trial_action,
+                            trial,
+                            promoted_objective,
+                            -1,
+                        )
+
             # A certified finite probe is itself a candidate, even if a local
             # linear model projected its source direction away. Recheck with
             # the same evaluator rather than discarding observed feasibility.
-            probe_directions = {**probe_basis, **raw_directions, **directions}
             for probe in reachability:
                 if not probe.get("joint_pass", False):
                     continue
@@ -2129,6 +2344,7 @@ def solve_action_feasibility(
                 )
                 trial_payload["probe_sign"] = probe["sign"]
                 trial_payload["step_size"] = probe["probe_radius"]
+                trial_payload["case_id"] = case.case_id
                 trial_diagnostics.append(trial_payload)
                 if trial.get("joint_pass", False) and not _hard_constraint_failures(trial):
                     best = (trial_stage_key, trial_action, trial, f"probe:{objective}", -1)
@@ -2171,6 +2387,7 @@ def solve_action_feasibility(
                 "combination_direction_diagnostics": combination_diagnostics,
                 "active_margin_cone_projection": cone_diagnostics,
                 "strict_restoration_margins": list(strict_restoration_margins),
+                "direct_probe_promotion": promotion_diagnostics,
                 "safe_step_diagnostics": step_diagnostics,
                 "current_hard_residual_components": current_hard_components,
                 **_dominant_constraints(current_hard_components),
