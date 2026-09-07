@@ -1,7 +1,7 @@
 """Opt-in generation traces and development-only solution replay.
 
 The summarize/export paths are read-only.  Replay can execute the explicitly
-requested frozen generators and V10 exact-audit contact repair, but never
+requested frozen generators and V11 observable-tolerant contact repair, but never
 starts training or modifies a checkpoint.
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import gzip
 import hashlib
 import json
 import os
@@ -41,6 +42,16 @@ def _write(path, value):
             return str(item)
         raise TypeError(type(item).__name__)
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, default=encode) + "\n", encoding="utf-8")
+
+
+def _json_default(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(type(value).__name__)
 
 
 def _hash(path):
@@ -478,6 +489,250 @@ def _apply_verified_solution_windows(reference, rows, bundle_sha256, edit_tolera
     return repaired, occupied, applied
 
 
+def _load_observable_solution_contracts(feasibility, rows):
+    manifest_entry = feasibility.get("provenance", {}).get("case_manifest", {})
+    if not isinstance(manifest_entry, dict):
+        raise TypeError("feasibility case manifest provenance must be an object")
+    manifest_path = Path(manifest_entry.get("path", "")).resolve()
+    expected_sha256 = str(manifest_entry.get("sha256", "")).strip().lower()
+    if not manifest_path.is_file() or not expected_sha256:
+        raise ValueError("feasibility case manifest provenance is incomplete")
+    if _hash(manifest_path) != expected_sha256:
+        raise ValueError("feasibility case manifest SHA256 mismatch")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    case_rows = manifest.get("cases")
+    if not isinstance(case_rows, list):
+        raise TypeError("feasibility case manifest cases must be a list")
+    cases_by_id = {str(case["case_id"]): case for case in case_rows}
+    contracts = []
+    for row in rows:
+        case_id = str(row["case_id"])
+        case = cases_by_id.get(case_id)
+        if case is None:
+            raise ValueError(f"observable case missing from manifest: {case_id}")
+        solution = row["solution_artifacts"]
+        lo, hi = map(int, solution["frame_span"])
+        reference, reference_info = _load_hashed_array(
+            solution["artifacts"]["reference"],
+            f"{case_id}:observable_reference",
+        )
+        baseline, baseline_info = _load_hashed_array(
+            solution["artifacts"]["returned_motion"],
+            f"{case_id}:observable_baseline",
+        )
+        seam_path = Path(case.get("seam_path", "")).resolve()
+        if not seam_path.is_file():
+            raise ValueError(f"observable seam missing: {case_id}")
+        seam = np.load(seam_path, allow_pickle=False)
+        if (
+            seam.shape != (hi - lo, 1)
+            or reference.shape != baseline.shape
+            or len(reference) != hi - lo
+            or not np.isfinite(seam).all()
+        ):
+            raise ValueError(f"observable contract shape mismatch: {case_id}")
+        contracts.append({
+            "case_id": case_id,
+            "frame_span": [lo, hi],
+            "reference": reference,
+            "baseline": baseline,
+            "seam": seam.astype(np.float32, copy=False),
+            "reference_artifact": reference_info,
+            "baseline_artifact": baseline_info,
+            "seam_path": str(seam_path),
+            "seam_sha256": _hash(seam_path),
+        })
+    return contracts
+
+
+def _observable_solution_gate(runtime, candidate, contracts, cfg, active_span=None):
+    active = None if active_span is None else tuple(map(int, active_span))
+    cases = []
+    for contract in contracts:
+        lo, hi = contract["frame_span"]
+        if active is not None and (active[1] <= lo or hi <= active[0]):
+            continue
+        audit = runtime._observable_boundary_audit(
+            np.asarray(candidate[lo:hi], dtype=np.float32),
+            contract["reference"],
+            contract["seam"],
+            cfg,
+        )
+        accepted = bool(
+            audit.get("endpoint_accepted", False)
+            and audit.get("temporal_accepted", False)
+        )
+        cases.append({
+            "case_id": contract["case_id"],
+            "frame_span": [int(lo), int(hi)],
+            "accepted": accepted,
+            "endpoint_accepted": bool(audit.get("endpoint_accepted", False)),
+            "temporal_accepted": bool(audit.get("temporal_accepted", False)),
+            "endpoint_gain": audit.get("endpoint_gain"),
+            "temporal_gain": audit.get("temporal_gain"),
+            "reasons": list(audit.get("reasons", [])),
+        })
+    failures = [row["case_id"] for row in cases if not row["accepted"]]
+    return {
+        "schema": "observable_solution_transaction_gate_v11",
+        "accepted": not failures,
+        "thresholds": {
+            "endpoint_minimum_gain": float(
+                cfg.checkpoint_validation_min_endpoint_repair_gain
+            ),
+            "temporal_minimum_gain": float(
+                cfg.checkpoint_validation_min_temporal_repair_gain
+            ),
+        },
+        "audited_cases": len(cases),
+        "failed_cases": failures,
+        "cases": cases,
+    }
+
+
+def _reason_counts(rows):
+    return dict(Counter(str(value) for row in rows for value in row))
+
+
+def _compact_candidate_attempt(attempt):
+    exact = attempt.get("exact_audit", {})
+    return {
+        "source": attempt.get("source"),
+        "backtracking_factor": attempt.get("backtracking_factor"),
+        "motion_sha256": attempt.get("motion_sha256"),
+        "accepted": bool(attempt.get("accepted", False)),
+        "rank": attempt.get("rank"),
+        "relative_reasons": list(attempt.get("relative_reasons", [])),
+        "blocking_absolute_reasons": list(
+            attempt.get("blocking_absolute_reasons", [])
+        ),
+        "kbo_reasons": list(attempt.get("kbo_reasons", [])),
+        "dominant_contact_metric": exact.get("dominant_contact_metric"),
+        "dominant_contact_residual_before": exact.get(
+            "dominant_contact_residual_before"
+        ),
+        "dominant_contact_residual_candidate": exact.get(
+            "dominant_contact_residual_candidate"
+        ),
+        "hard_regression_count": exact.get("hard_regression_count"),
+        "hard_constraint_residual_delta": exact.get(
+            "hard_constraint_residual_delta", {}
+        ),
+        "global_nonregression": attempt.get("global_nonregression"),
+    }
+
+
+def _externalize_v11_solver_diagnostics(stage_reports, output):
+    output = Path(output)
+    full_path = output / "contact_transactions.full.jsonl.gz"
+    records = 0
+
+    def solver_nodes():
+        contact = stage_reports.get(
+            "full_sequence_exact_audit_contact_transactions", {}
+        )
+        if isinstance(contact, dict):
+            solver = contact.get("solver_report")
+            if isinstance(solver, dict):
+                yield "pre_diffusion_contact_repair", solver
+        ik = stage_reports.get("lower_body_ik_true_ik")
+        if isinstance(ik, dict):
+            yield "post_diffusion_ik", ik
+
+    with gzip.open(full_path, "wt", encoding="utf-8") as handle:
+        for solver_name, solver in solver_nodes():
+            for chunk_index, chunk in enumerate(solver.get("chunks", [])):
+                candidates = chunk.get("iteration_candidates", [])
+                for candidate in candidates:
+                    handle.write(json.dumps({
+                        "kind": "iteration_candidate",
+                        "solver": solver_name,
+                        "chunk_index": int(chunk_index),
+                        "chunk_span": [chunk.get("start"), chunk.get("end")],
+                        "candidate": candidate,
+                    }, ensure_ascii=False, default=_json_default) + "\n")
+                    records += 1
+                chunk["iteration_candidates"] = {
+                    "diagnostic_level": "summary",
+                    "count": len(candidates),
+                    "selected_iteration": chunk.get("selected_iteration"),
+                }
+            local = solver.get("local_transactions", {})
+            transactions = local.get("transactions", [])
+            compact_transactions = []
+            for transaction_index, transaction in enumerate(transactions):
+                handle.write(json.dumps({
+                    "kind": "local_transaction",
+                    "solver": solver_name,
+                    "transaction_index": int(transaction_index),
+                    "transaction": transaction,
+                }, ensure_ascii=False, default=_json_default) + "\n")
+                records += 1
+                selection = transaction.get("candidate_selection", {})
+                attempts = selection.get("attempts", [])
+                selected = next((
+                    attempt for attempt in attempts
+                    if attempt.get("source") == selection.get("selected_source")
+                    and attempt.get("backtracking_factor")
+                    == selection.get("selected_factor")
+                ), None)
+                compact_transactions.append({
+                    "start": transaction.get("start"),
+                    "end": transaction.get("end"),
+                    "audit_start": transaction.get("audit_start"),
+                    "audit_end": transaction.get("audit_end"),
+                    "support_phase": transaction.get("support_phase"),
+                    "committed": bool(transaction.get("committed", False)),
+                    "rollback_to_pre_ik_snapshot": bool(
+                        transaction.get("rollback_to_pre_ik_snapshot", False)
+                    ),
+                    "hashes": transaction.get("hashes", {}),
+                    "ownership_residual_delta": transaction.get(
+                        "ownership_residual_delta", {}
+                    ),
+                    "ownership_metrics": transaction.get(
+                        "ownership_metrics", {}
+                    ),
+                    "audit_halo_residual_delta": transaction.get(
+                        "hard_constraint_residual_delta", {}
+                    ),
+                    "audit_halo_metrics": transaction.get(
+                        "audit_halo_metrics", {}
+                    ),
+                    "global_nonregression": transaction.get(
+                        "global_nonregression"
+                    ),
+                    "candidate_selection": {
+                        "protocol": selection.get("protocol"),
+                        "attempt_count": len(attempts),
+                        "selected_source": selection.get("selected_source"),
+                        "selected_factor": selection.get("selected_factor"),
+                        "selected_rank": selection.get("selected_rank"),
+                        "selected_attempt": (
+                            _compact_candidate_attempt(selected)
+                            if selected is not None else None
+                        ),
+                        "reason_counts": _reason_counts(
+                            list(attempt.get("relative_reasons", []))
+                            + list(attempt.get("blocking_absolute_reasons", []))
+                            + list(attempt.get("kbo_reasons", []))
+                            for attempt in attempts
+                        ),
+                    },
+                })
+            local["transactions"] = compact_transactions
+            local["diagnostic_level"] = "summary"
+    return {
+        "schema": "compressed_candidate_diagnostics_v1",
+        "diagnostic_level": "full",
+        "compression": "gzip",
+        "format": "jsonl",
+        "path": str(full_path.resolve()),
+        "sha256": _hash(full_path),
+        "records": int(records),
+    }
+
+
 def _merge_frame_windows(windows, frames, gap=0):
     normalized = sorted(
         (
@@ -552,6 +807,10 @@ def _boundary_nonregression(before_rows, candidate_rows):
     }
 
 
+def _physical_nonregression(runtime, before, candidate):
+    return runtime._physical_nonregression_decision(before, candidate)
+
+
 def _load_stage_snapshot(entry):
     if not isinstance(entry, dict) or not entry.get("snapshot_saved"):
         return None
@@ -562,9 +821,9 @@ def _load_stage_snapshot(entry):
     return value if np.isfinite(value).all() else None
 
 
-def _v10_stage_diagnostics(runtime, cfg, eligible, stages, arrays):
+def _v11_stage_diagnostics(runtime, cfg, eligible, stages, arrays):
     result = {
-        "schema": "generation_stage_physical_diagnostics_v10",
+        "schema": "generation_stage_physical_diagnostics_v11",
         "support_contract": "final_fail_closed_with_sliding_eligibility",
         "sliding_support_eligible_sha256": _array_content_hash(eligible),
         "sliding_support_eligible_frames": int(np.asarray(eligible).sum()),
@@ -670,6 +929,25 @@ def replay_solutions(
         cfg = runtime.MotionGenerationConfig.from_json(config_path).apply_env()
         cfg.refiner_enable = False
         cfg.full_sequence_contact_repair_enable = True
+        if (
+            float(cfg.checkpoint_validation_min_endpoint_repair_gain) != 0.03
+            or float(cfg.checkpoint_validation_min_temporal_repair_gain) != 0.03
+        ):
+            raise ValueError("V11 replay requires the unchanged observable 0.03 gates")
+        observable_contracts = _load_observable_solution_contracts(
+            feasibility,
+            rows,
+        )
+        observable_baseline_gate = _observable_solution_gate(
+            runtime,
+            repaired,
+            observable_contracts,
+            cfg,
+        )
+        if not observable_baseline_gate["accepted"]:
+            raise ValueError(
+                "verified B3 baseline does not pass the captured observable gate"
+            )
 
         repair_input_localization = (
             runtime.full_sequence_physical_diagnostics_np(
@@ -751,8 +1029,12 @@ def replay_solutions(
                     cfg,
                 ),
             )
-            observable_geometry_preserved = bool(
-                np.array_equal(candidate[occupied, 4:], current[occupied, 4:])
+            observable = _observable_solution_gate(
+                runtime,
+                candidate,
+                observable_contracts,
+                cfg,
+                active_span=ownership,
             )
             reasons = []
             if not fidelity["accepted"]:
@@ -768,8 +1050,11 @@ def replay_solutions(
                 reasons.extend(
                     f"boundary:{reason}" for reason in boundary["reasons"]
                 )
-            if not observable_geometry_preserved:
-                reasons.append("observable_solution_geometry_modified")
+            if not observable["accepted"]:
+                reasons.extend(
+                    f"observable:{case_id}:endpoint_or_temporal_gate_failed"
+                    for case_id in observable["failed_cases"]
+                )
             return {
                 "accepted": not reasons,
                 "reasons": reasons,
@@ -779,9 +1064,7 @@ def replay_solutions(
                 "fixed_support": fixed_support,
                 "boundary": boundary,
                 "observable_gate": 0.03,
-                "observable_solution_geometry_preserved": (
-                    observable_geometry_preserved
-                ),
+                "observable_solution_gate": observable,
             }
 
         repair_candidate, contact_repair_report = runtime.true_lower_body_ik(
@@ -789,7 +1072,7 @@ def replay_solutions(
             cfg,
             sliding_support_eligible=slide,
             repair_windows=repair_windows,
-            protected_frame_mask=occupied,
+            protected_frame_mask=None,
             candidate_guard=contact_candidate_guard,
         )
         repair_input_audit = runtime.audit_motion_np(
@@ -802,10 +1085,10 @@ def replay_solutions(
             cfg,
             sliding_support_eligible=slide,
         )
-        contact_decision = runtime._contact_restoration_decision(
+        contact_decision = _physical_nonregression(
+            runtime,
             repair_input_audit,
             repair_candidate_audit,
-            cfg,
         )
         repair_candidate_boundaries = closed_loop.audit_boundaries(
             runtime,
@@ -829,34 +1112,41 @@ def replay_solutions(
                 sliding_support_eligible=slide,
             )
         )
-        observable_geometry_preserved = bool(
-            np.array_equal(
-                repair_candidate[occupied, 4:],
-                repaired[occupied, 4:],
+        observable_decision = _observable_solution_gate(
+            runtime,
+            repair_candidate,
+            observable_contracts,
+            cfg,
+        )
+        accepted_local_transactions = int(
+            contact_repair_report.get("local_transactions", {}).get(
+                "accepted", 0
             )
         )
         contact_stage_accepted = bool(
-            contact_decision["accepted"]
+            accepted_local_transactions > 0
+            and contact_decision["accepted"]
             and boundary_decision["accepted"]
             and fidelity_decision["accepted"]
             and fixed_support_decision["accepted"]
-            and observable_geometry_preserved
+            and observable_decision["accepted"]
         )
         repaired_contact = (
             repair_candidate if contact_stage_accepted else repaired.copy()
         )
         repaired_contact_info = _array(
             output,
-            "repaired_contact_v10",
+            "repaired_contact_v11",
             repaired_contact,
         )
         contact_repair_transaction = {
-            "schema": "full_sequence_exact_audit_contact_transactions_v10",
+            "schema": "observable_tolerant_contact_transactions_v11",
             "development_only": True,
             "training_started": False,
             "production_model_modified": False,
             "observable_gate": 0.03,
             "repair_windows": repair_windows,
+            "accepted_local_transactions": accepted_local_transactions,
             "input_localization": repair_input_localization,
             "input_boundary_rows": repair_input_boundaries,
             "solver_report": contact_repair_report,
@@ -864,9 +1154,8 @@ def replay_solutions(
             "boundary_decision": boundary_decision,
             "fidelity_decision": fidelity_decision,
             "fixed_support_decision": fixed_support_decision,
-            "observable_solution_geometry_preserved": (
-                observable_geometry_preserved
-            ),
+            "observable_baseline_gate": observable_baseline_gate,
+            "observable_solution_gate": observable_decision,
             "accepted": contact_stage_accepted,
             "rollback_to_pre_contact_repair_snapshot": (
                 not contact_stage_accepted
@@ -896,7 +1185,7 @@ def replay_solutions(
             cfg,
             sliding_support_eligible=slide,
             protected_geometry_mask=occupied,
-            ik_protected_frame_mask=occupied,
+            ik_protected_frame_mask=None,
             ik_candidate_guard=contact_candidate_guard,
         )
         stage_reports["full_sequence_exact_audit_contact_transactions"] = (
@@ -931,8 +1220,8 @@ def replay_solutions(
         diffusion_selected = _load_stage_snapshot(
             stage_reports.get("motion_activity_diffusion")
         )
-        stage_reports["v10_stage_physical_diagnostics"] = (
-            _v10_stage_diagnostics(
+        stage_reports["v11_stage_physical_diagnostics"] = (
+            _v11_stage_diagnostics(
                 runtime,
                 cfg,
                 slide,
@@ -948,11 +1237,15 @@ def replay_solutions(
                 },
             )
         )
+        full_candidate_diagnostics = _externalize_v11_solver_diagnostics(
+            stage_reports,
+            output,
+        )
 
     final_motion_info = _array(output, "replayed_final", final_motion)
     report = {
         "schema": "refiner_solution_development_replay_v1",
-        "protocol": "full_sequence_exact_audit_contact_replay_v10",
+        "protocol": "observable_tolerant_transaction_replay_v11",
         "completed": True,
         "development_only": True,
         "formal_preregistration": False,
@@ -981,8 +1274,10 @@ def replay_solutions(
         "solutions": applied,
         "edit_union_frames": int(occupied.sum()),
         "repaired_refiner": repaired_refiner,
-        "repaired_contact_v10": repaired_contact_info,
+        "repaired_contact_v11": repaired_contact_info,
         "replayed_final": final_motion_info,
+        "diagnostic_level": "summary",
+        "full_candidate_diagnostics": full_candidate_diagnostics,
         "stage_reports": stage_reports,
         "boundary_rows": boundary_rows,
         "final_physical_gate": physical,

@@ -1,4 +1,4 @@
-"""Development contract checks for V10 exact-audit contact repair."""
+"""Development contract checks for V11 observable-tolerant contact repair."""
 
 import numpy as np
 
@@ -9,6 +9,7 @@ from training.motion_models import (
     _c2_transaction_weight,
     _contact_restoration_decision,
     _partition_repair_windows_by_support_phase,
+    _physical_nonregression_decision,
     evaluate_fixed_support_contact_candidate_np,
     full_sequence_physical_diagnostics_np,
 )
@@ -24,23 +25,9 @@ def _identity_motion(frames):
     return motion
 
 
-def test_v10_is_development_opt_in_and_keeps_gate_values():
+def test_v11_is_development_opt_in_and_keeps_gate_values():
     cfg = MotionGenerationConfig()
     assert cfg.full_sequence_contact_repair_enable is False
-    diagnostics = full_sequence_physical_diagnostics_np(
-        _identity_motion(30),
-        cfg,
-        sliding_support_eligible=np.zeros(30, dtype=bool),
-    )
-    assert diagnostics["schema"] == "full_sequence_physical_localization_v10"
-    assert diagnostics["support_contract"] == (
-        "final_fail_closed_with_sliding_eligibility"
-    )
-    assert diagnostics["audit"]["foot_skate_mps_p95"] == 0.0
-
-
-def test_v10_restoration_requires_a_real_dominant_contact_gain():
-    cfg = MotionGenerationConfig()
     diagnostics = full_sequence_physical_diagnostics_np(
         _identity_motion(30),
         cfg,
@@ -52,9 +39,41 @@ def test_v10_restoration_requires_a_real_dominant_contact_gain():
     assert "dominant_contact_residual_not_meaningfully_improved" in (
         decision["reasons"]
     )
+    assert diagnostics["schema"] == "full_sequence_physical_localization_v11"
+    assert diagnostics["support_contract"] == (
+        "final_fail_closed_with_sliding_eligibility"
+    )
+    assert diagnostics["audit"]["foot_skate_mps_p95"] == 0.0
 
 
-def test_v10_fixed_support_gate_uses_the_captured_eligibility_contract():
+def test_v11_restoration_requires_a_real_dominant_contact_gain():
+    cfg = MotionGenerationConfig()
+    diagnostics = full_sequence_physical_diagnostics_np(
+        _identity_motion(30),
+        cfg,
+        sliding_support_eligible=np.zeros(30, dtype=bool),
+    )
+
+
+def test_v11_global_guard_only_checks_nonregression():
+    cfg = MotionGenerationConfig()
+    audit = full_sequence_physical_diagnostics_np(
+        _identity_motion(30),
+        cfg,
+        sliding_support_eligible=np.zeros(30, dtype=bool),
+    )["audit"]
+    unchanged = _physical_nonregression_decision(audit, dict(audit))
+    assert unchanged["accepted"] is True
+    regressed = dict(audit)
+    regressed["foot_skate_mps_max"] = audit["foot_skate_mps_max"] + 0.01
+    decision = _physical_nonregression_decision(audit, regressed)
+    assert decision["accepted"] is False
+    assert decision["reasons"] == [
+        "global_metric_regressed:foot_skate_mps_max"
+    ]
+
+
+def test_v11_fixed_support_gate_uses_the_captured_eligibility_contract():
     cfg = MotionGenerationConfig()
     motion = _identity_motion(30)
     decision = evaluate_fixed_support_contact_candidate_np(
@@ -70,7 +89,7 @@ def test_v10_fixed_support_gate_uses_the_captured_eligibility_contract():
     assert all(value == 0.0 for value in decision["residual_delta"].values())
 
 
-def test_v10_uses_the_required_exact_backtracking_ladder():
+def test_v11_uses_the_required_exact_backtracking_ladder():
     cfg = MotionGenerationConfig()
     assert cfg.full_sequence_contact_repair_backtracking_factors == (
         1.0,
@@ -81,7 +100,7 @@ def test_v10_uses_the_required_exact_backtracking_ladder():
     )
 
 
-def test_v10_c2_envelope_freezes_three_frames_at_each_edge():
+def test_v11_c2_envelope_freezes_three_frames_at_each_edge():
     weight = _c2_transaction_weight(
         20,
         fade=7,
@@ -96,7 +115,7 @@ def test_v10_c2_envelope_freezes_three_frames_at_each_edge():
     assert np.all((weight >= 0.0) & (weight <= 1.0))
 
 
-def test_v10_partitions_large_windows_by_left_right_and_double_support():
+def test_v11_partitions_large_windows_by_left_right_and_double_support():
     static = np.zeros((32, 4), dtype=bool)
     static[4:12, (0, 2)] = True
     static[12:20, (1, 3)] = True
@@ -122,7 +141,7 @@ def test_v10_partitions_large_windows_by_left_right_and_double_support():
     ]
 
 
-def test_v10_marks_too_short_c2_support_phases_ineligible():
+def test_v11_marks_too_short_c2_support_phases_ineligible():
     static = np.zeros((12, 4), dtype=bool)
     static[4:8, (0, 2)] = True
     partitions = _partition_repair_windows_by_support_phase(

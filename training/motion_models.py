@@ -428,7 +428,7 @@ class MotionGenerationConfig:
     rollback_root_delta_max_m: float = 0.12
     ik_post_stabilize_enable: bool = True
     ik_post_stabilize_passes: int = 2
-    # Development-only V10 repair.  The normal generation path never enables
+    # Development-only V11 repair.  The normal generation path never enables
     # this automatically; hash-bound solution replay opts in explicitly.
     full_sequence_contact_repair_enable: bool = False
     full_sequence_contact_repair_top_k: int = 12
@@ -10817,7 +10817,7 @@ def full_sequence_physical_diagnostics_np(
         precomputed_joints=joints,
     )
     return {
-        "schema": "full_sequence_physical_localization_v10",
+        "schema": "full_sequence_physical_localization_v11",
         "support_contract": "final_fail_closed_with_sliding_eligibility",
         "frames": int(len(value)),
         "top_k": int(count),
@@ -10913,6 +10913,47 @@ def _contact_restoration_decision(
     }
 
 
+def _physical_nonregression_decision(
+    before: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> Dict[str, Any]:
+    limits = PhysicalQualityLimits.from_environment()
+    policy = StageAcceptancePolicy.from_environment()
+    before_residuals = _physical_residuals(before, limits)
+    candidate_residuals = _physical_residuals(candidate, limits)
+    reasons: List[str] = []
+    metric_deltas: Dict[str, float] = {}
+    before_metrics: Dict[str, float] = {}
+    candidate_metrics: Dict[str, float] = {}
+    for spec in physical_metric_specs(limits, policy):
+        old = float(before.get(spec.key, float("nan")))
+        new = float(candidate.get(spec.key, float("nan")))
+        before_metrics[spec.key] = old
+        candidate_metrics[spec.key] = new
+        if not np.isfinite(old) or not np.isfinite(new):
+            reasons.append(f"missing_or_nonfinite:{spec.key}")
+            continue
+        signed_delta = new - old if spec.direction == "high" else old - new
+        metric_deltas[spec.key] = float(signed_delta)
+        tolerance = max(1.0e-7, abs(old) * 1.0e-6)
+        if signed_delta > tolerance:
+            reasons.append(f"global_metric_regressed:{spec.key}")
+    return {
+        "schema": "full_sequence_physical_nonregression_v11",
+        "accepted": not reasons,
+        "reasons": reasons,
+        "metric_deltas": metric_deltas,
+        "before_metrics": before_metrics,
+        "candidate_metrics": candidate_metrics,
+        "before_residuals": before_residuals,
+        "candidate_residuals": candidate_residuals,
+        "residual_delta": {
+            key: float(candidate_residuals[key] - value)
+            for key, value in before_residuals.items()
+        },
+    }
+
+
 def _exact_audit_candidate_rank(
     before: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -10923,7 +10964,7 @@ def _exact_audit_candidate_rank(
     dominant_metric_keys: Optional[Sequence[str]] = None,
     additional_hard_regression_reasons: Optional[Sequence[str]] = None,
 ) -> Tuple[Tuple[float, ...], Dict[str, Any]]:
-    """Rank an IK snapshot by the exact V10 transaction contract."""
+    """Rank an IK snapshot by the exact V11 transaction contract."""
 
     decision = _contact_restoration_decision(
         before,
@@ -11073,7 +11114,7 @@ def evaluate_fixed_support_contact_candidate_np(
         if candidate_residuals[key] > before_residuals[key] + tolerance:
             reasons.append(f"fixed_support_regressed:{key}")
     return {
-        "schema": "fixed_reference_support_contact_gate_v10",
+        "schema": "fixed_reference_support_contact_gate_v11",
         "accepted": not reasons,
         "reasons": reasons,
         "support_contract": "final_fail_closed_with_sliding_eligibility",
@@ -11118,9 +11159,9 @@ def true_lower_body_ik(
         if len(protected) != T:
             raise ValueError("protected_frame_mask length mismatch")
     # This switch is development-only and disabled in the normal generation
-    # configuration.  Keep every V10 loss, transaction and reporting change
+    # configuration.  Keep every V11 loss, transaction and reporting change
     # behind the explicit switch, including auto-localized repair windows.
-    v10_mode = bool(cfg.full_sequence_contact_repair_enable)
+    v11_mode = bool(cfg.full_sequence_contact_repair_enable)
     localization = None
     if bool(cfg.full_sequence_contact_repair_enable):
         localization = full_sequence_physical_diagnostics_np(
@@ -11152,7 +11193,7 @@ def true_lower_body_ik(
             support_policy="final_fail_closed",
         )
         solver_contacts = support_states == STATIC_SUPPORT
-        if v10_mode:
+        if v11_mode:
             support_phase_partitions = _partition_repair_windows_by_support_phase(
                 repair_windows,
                 solver_contacts,
@@ -11223,13 +11264,20 @@ def true_lower_body_ik(
     }
     support_phase_codes = (
         _support_phase_labels(solver_contacts)
-        if v10_mode
+        if v11_mode
         else np.zeros(T, dtype=np.int8)
     )
     no_support_objective_keys = (
         "foot_penetration_min_m",
         "joint_jerk_mps3_max",
         "joint_jerk_window_p95_max_mps3",
+    )
+    contact_objective_keys = (
+        "foot_penetration_min_m",
+        "foot_skate_mps_p95",
+        "foot_skate_mps_max",
+        "foot_support_drift_m_p95",
+        "foot_support_drift_m_max",
     )
     for st, ed in solve_ranges:
         if ed - st < 4:
@@ -11250,6 +11298,51 @@ def true_lower_body_ik(
         base_rot = rot_full[:, lower_idx].detach().clone()
         base_root = root.detach().clone()
         base_joints = fk_24_torch(base).detach()
+        if v11_mode:
+            chunk_objective_keys = (
+                no_support_objective_keys
+                if int(support_phase_codes[st]) == 0
+                else contact_objective_keys
+            )
+            chunk_before_audit = audit_motion_np(
+                base_np,
+                cfg,
+                sliding_support_eligible=_slice_eligibility(eligible, st, ed),
+            )
+            chunk_before_residuals = _physical_residuals(
+                chunk_before_audit,
+                physical_limits,
+            )
+            optimizer_dominant_metric = max(
+                chunk_objective_keys,
+                key=lambda key: chunk_before_residuals[key],
+            )
+            skate_weight = float(cfg.ik_contact_w) * (
+                1.0
+                if optimizer_dominant_metric.startswith("foot_skate")
+                else 0.25
+            )
+            drift_weight = float(cfg.ik_contact_w) * (
+                1.0
+                if optimizer_dominant_metric.startswith("foot_support_drift")
+                else 0.25
+            )
+            penetration_weight = float(cfg.ik_penetration_w) * (
+                4.0
+                if optimizer_dominant_metric == "foot_penetration_min_m"
+                else 1.0
+            )
+            jerk_weight = float(
+                cfg.full_sequence_contact_repair_jerk_weight
+            ) * (4.0 if "jerk" in optimizer_dominant_metric else 1.0)
+        else:
+            chunk_objective_keys = ()
+            chunk_before_residuals = {}
+            optimizer_dominant_metric = "legacy"
+            skate_weight = 0.25 * float(cfg.ik_contact_w)
+            drift_weight = 0.25 * float(cfg.ik_contact_w)
+            penetration_weight = float(cfg.ik_penetration_w)
+            jerk_weight = float(cfg.full_sequence_contact_repair_jerk_weight)
         free_frame = torch.from_numpy((~protected[st:ed]).astype(np.bool_)).to(
             device=device
         )
@@ -11288,7 +11381,7 @@ def true_lower_body_ik(
             foot_error_sq = ((foot - target) ** 2).sum(dim=-1)
             weighted_foot_error = foot_error_sq * sample_weight
             foot_mean = weighted_foot_error.sum() / sample_weight.sum().clamp_min(1.0)
-            if v10_mode:
+            if v11_mode:
                 foot_cvar = _torch_cvar_topk(weighted_foot_error, cvar_fraction)
                 foot_loss = 0.5 * foot_mean + 0.5 * foot_cvar
             else:
@@ -11301,7 +11394,7 @@ def true_lower_body_ik(
                 vel_loss = torch.tensor(0.0, device=device)
                 root_vel = torch.tensor(0.0, device=device)
             penetration_values = F.relu(floor + 0.003 - foot[..., 1]).pow(2)
-            if v10_mode:
+            if v11_mode:
                 penetration_scale = max(
                     abs(float(physical_limits.foot_penetration_min_m)),
                     1.0e-3,
@@ -11325,7 +11418,7 @@ def true_lower_body_ik(
             jerk_loss = foot_loss * 0.0
             skate_loss = foot_loss * 0.0
             drift_loss = foot_loss * 0.0
-            if v10_mode and L > 1:
+            if v11_mode and L > 1:
                 static_pair = sample_weight[1:] * sample_weight[:-1]
                 foot_speed = torch.linalg.vector_norm(
                     foot[1:, :, (0, 2)] - foot[:-1, :, (0, 2)],
@@ -11352,7 +11445,7 @@ def true_lower_body_ik(
                     )
                     + 0.5 * skate_max_excess.max()
                 )
-            if v10_mode:
+            if v11_mode:
                 foot_drift = torch.linalg.vector_norm(
                     foot[..., (0, 2)] - target[..., (0, 2)],
                     dim=-1,
@@ -11399,7 +11492,7 @@ def true_lower_body_ik(
                 jerk_excess = torch.relu(
                     candidate_jerk - allowed_jerk
                 ).square().to(base.dtype) / max(jerk_limit**2, 1.0)
-                if v10_mode:
+                if v11_mode:
                     jerk_window_limit = max(
                         float(
                             physical_limits.joint_jerk_window_p95_max_mps3
@@ -11423,13 +11516,13 @@ def true_lower_body_ik(
                     jerk_loss = jerk_excess.mean()
             loss = (
                 cfg.ik_contact_w * foot_loss
-                + 0.25 * cfg.ik_contact_w * skate_loss
-                + 0.25 * cfg.ik_contact_w * drift_loss
+                + skate_weight * skate_loss
+                + drift_weight * drift_loss
                 + cfg.ik_pose_w * pose_loss
                 + cfg.ik_temporal_w * vel_loss
                 + cfg.ik_root_w * root_loss
-                + cfg.ik_penetration_w * pen
-                + float(cfg.full_sequence_contact_repair_jerk_weight) * jerk_loss
+                + penetration_weight * pen
+                + jerk_weight * jerk_loss
             )
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -11461,7 +11554,7 @@ def true_lower_body_ik(
                 detached_loss,
                 best_loss_device,
             )
-            if v10_mode:
+            if v11_mode:
                 exact_snapshots.append(
                     (int(it), detached_loss.clone(), mm.detach().clone())
                 )
@@ -11473,12 +11566,7 @@ def true_lower_body_ik(
         )
         exact_audit_summaries: List[Dict[str, Any]] = []
         selected_iteration: Optional[int] = None
-        if v10_mode and exact_snapshots:
-            chunk_objective_keys = (
-                no_support_objective_keys
-                if int(support_phase_codes[st]) == 0
-                else None
-            )
+        if v11_mode and exact_snapshots:
             snapshot_halo = max(
                 4,
                 int(round(6.0 * float(cfg.fps) / 30.0)),
@@ -11494,6 +11582,15 @@ def true_lower_body_ik(
                     snapshot_audit_end,
                 ),
             )
+            before_objective = audit_motion_np(
+                motion_base[st:ed],
+                cfg,
+                sliding_support_eligible=_slice_eligibility(
+                    eligible,
+                    st,
+                    ed,
+                ),
+            )
             ranked_snapshots = []
             for iteration, snapshot_loss_device, snapshot_device in exact_snapshots:
                 snapshot_loss = float(snapshot_loss_device.cpu())
@@ -11507,6 +11604,15 @@ def true_lower_body_ik(
                         eligible,
                         snapshot_audit_start,
                         snapshot_audit_end,
+                    ),
+                )
+                snapshot_objective = audit_motion_np(
+                    snapshot_full[st:ed],
+                    cfg,
+                    sliding_support_eligible=_slice_eligibility(
+                        eligible,
+                        st,
+                        ed,
                     ),
                 )
                 snapshot_guard: Dict[str, Any] = {
@@ -11538,15 +11644,20 @@ def true_lower_body_ik(
                     ),
                     default=0.0,
                 )
-                rank, summary = _exact_audit_candidate_rank(
+                snapshot_halo_guard = _physical_nonregression_decision(
                     before_chunk,
                     snapshot_audit,
+                )
+                rank, summary = _exact_audit_candidate_rank(
+                    before_objective,
+                    snapshot_objective,
                     cfg,
                     optimization_loss=snapshot_loss,
                     boundary_margin_score=snapshot_boundary_score,
                     dominant_metric_keys=chunk_objective_keys,
                     additional_hard_regression_reasons=(
-                        snapshot_guard.get("reasons", [])
+                        list(snapshot_guard.get("reasons", []))
+                        + list(snapshot_halo_guard["reasons"])
                     ),
                 )
                 summary.update({
@@ -11559,6 +11670,28 @@ def true_lower_body_ik(
                         int(snapshot_audit_start),
                         int(snapshot_audit_end),
                     ],
+                    "ownership_span": [int(st), int(ed)],
+                    "ownership_residual_delta": {
+                        key: float(value - _physical_residuals(
+                            before_objective,
+                            physical_limits,
+                        )[key])
+                        for key, value in _physical_residuals(
+                            snapshot_objective,
+                            physical_limits,
+                        ).items()
+                    },
+                    "audit_halo_residual_delta": {
+                        key: float(value - _physical_residuals(
+                            before_chunk,
+                            physical_limits,
+                        )[key])
+                        for key, value in _physical_residuals(
+                            snapshot_audit,
+                            physical_limits,
+                        ).items()
+                    },
+                    "audit_halo_nonregression": snapshot_halo_guard,
                     "candidate_guard": snapshot_guard,
                 })
                 exact_audit_summaries.append(summary)
@@ -11573,12 +11706,12 @@ def true_lower_body_ik(
             if ov > 1 and st > 0:
                 ramp = np.linspace(0.0, 1.0, ov, dtype=np.float32)
                 weight[:ov, 0] *= (
-                    smootherstep01(ramp) if v10_mode else ramp
+                    smootherstep01(ramp) if v11_mode else ramp
                 )
             if ov > 1 and ed < T:
                 ramp = np.linspace(1.0, 0.0, ov, dtype=np.float32)
                 weight[-ov:, 0] *= (
-                    smootherstep01(ramp) if v10_mode else ramp
+                    smootherstep01(ramp) if v11_mode else ramp
                 )
             # Avoid exact zero-only coverage on pathological tiny chunks.
             weight = np.maximum(weight, 1e-4)
@@ -11591,12 +11724,12 @@ def true_lower_body_ik(
             "contact_ratio": float(solver_contacts[st:ed].mean()),
             "support_phase": (
                 support_phase_names[int(support_phase_codes[st])]
-                if v10_mode
+                if v11_mode
                 else "legacy_mixed"
             ),
             "candidate_selection": (
-                "exact_audit_lexicographic_v10"
-                if v10_mode
+                "ownership_exact_audit_v11"
+                if v11_mode
                 else "minimum_optimizer_loss"
             ),
             "selected_iteration": selected_iteration,
@@ -11605,6 +11738,16 @@ def true_lower_body_ik(
                 if best_motion is not None
                 else None
             ),
+            "optimizer_dominant_metric": optimizer_dominant_metric,
+            "optimizer_dominant_residual": float(
+                chunk_before_residuals.get(optimizer_dominant_metric, 0.0)
+            ),
+            "optimizer_weights": {
+                "skate": float(skate_weight),
+                "support_drift": float(drift_weight),
+                "penetration": float(penetration_weight),
+                "jerk": float(jerk_weight),
+            },
             "iteration_candidates": exact_audit_summaries,
         })
     valid = weight_sum[:, 0] > 1e-8
@@ -11668,7 +11811,7 @@ def true_lower_body_ik(
             )
         filtered[:, ROT6D_START:ROT6D_END] = rotations.reshape(T, -1)
         stabilized = candidate_before_stabilize.copy()
-        if not v10_mode:
+        if not v11_mode:
             stabilized = filtered
         else:
             for raw_window in repair_windows:
@@ -11710,7 +11853,7 @@ def true_lower_body_ik(
         )
         stabilization_safe = bool(stabilization_decision["accepted"])
         if passes > 0:
-            if v10_mode:
+            if v11_mode:
                 stabilized_out_all = stabilized
                 # An unsafe smoothing result remains available for exact local
                 # backtracking diagnostics, but can never replace the raw
@@ -11726,11 +11869,11 @@ def true_lower_body_ik(
             "globally_safe": bool(stabilization_safe),
             "commit_scope": (
                 "support_phase_window_c2_candidate"
-                if v10_mode
+                if v11_mode
                 else "local_transaction_candidate"
             ),
             "unsafe_candidate_selected": bool(
-                passes > 0 and not v10_mode and not stabilization_safe
+                passes > 0 and not v11_mode and not stabilization_safe
             ),
             "passes": int(passes),
             "safe": bool(stabilization_safe),
@@ -11807,14 +11950,14 @@ def true_lower_body_ik(
         if transaction_index > 0:
             left_overlap = (
                 max(0, solved_ranges[transaction_index - 1][1] - start)
-                if v10_mode
+                if v11_mode
                 else overlap
             )
             own_start = min(own_end, own_start + left_overlap // 2)
         if transaction_index + 1 < len(solved_ranges) and own_end < T:
             right_overlap = (
                 max(0, end - solved_ranges[transaction_index + 1][0])
-                if v10_mode
+                if v11_mode
                 else overlap
             )
             own_end = max(
@@ -11824,7 +11967,7 @@ def true_lower_body_ik(
         if own_end - own_start < 4:
             continue
         has_contact = bool(np.any(solver_contacts[own_start:own_end]))
-        if not has_contact and not v10_mode:
+        if not has_contact and not v11_mode:
             transaction_reports.append(
                 {
                     "start": int(own_start),
@@ -11836,7 +11979,7 @@ def true_lower_body_ik(
             )
             continue
 
-        if v10_mode:
+        if v11_mode:
             frozen_edges = int(
                 cfg.full_sequence_contact_repair_frozen_edge_frames
             )
@@ -11879,10 +12022,16 @@ def true_lower_body_ik(
         audit_end = min(T, own_end + halo)
         transaction_input = final[audit_start:audit_end].copy()
         local_eligible = _slice_eligibility(eligible, audit_start, audit_end)
+        ownership_eligible = _slice_eligibility(eligible, own_start, own_end)
         before_local = audit_motion_np(
             final[audit_start:audit_end],
             cfg,
             sliding_support_eligible=local_eligible,
+        )
+        before_ownership = audit_motion_np(
+            final[own_start:own_end],
+            cfg,
+            sliding_support_eligible=ownership_eligible,
         )
         before_absolute_reasons = set(
             evaluate_physical_audit(before_local, limits=ik_limits)["reasons"]
@@ -11892,14 +12041,18 @@ def true_lower_body_ik(
         )
         source_candidates = (
             [("raw", raw_out_all)]
-            if v10_mode
+            if v11_mode
             else [("legacy", out_all)]
         )
-        if v10_mode and stabilized_out_all is not None:
+        if (
+            v11_mode
+            and stabilized_out_all is not None
+            and stabilization_safe is True
+        ):
             source_candidates.append(("stabilized", stabilized_out_all))
         factors = (
             tuple(cfg.full_sequence_contact_repair_backtracking_factors)
-            if v10_mode
+            if v11_mode
             else (1.0,)
         )
         candidate_attempts: List[Dict[str, Any]] = []
@@ -11917,6 +12070,11 @@ def true_lower_body_ik(
                     trial[audit_start:audit_end],
                     cfg,
                     sliding_support_eligible=local_eligible,
+                )
+                after_ownership = audit_motion_np(
+                    trial[own_start:own_end],
+                    cfg,
+                    sliding_support_eligible=ownership_eligible,
                 )
                 local_root_delta = np.linalg.norm(
                     trial[
@@ -11936,10 +12094,10 @@ def true_lower_body_ik(
                 )
                 restoration = None
                 fixed_support = None
-                if v10_mode:
+                if v11_mode:
                     restoration = _contact_restoration_decision(
-                        before_local,
-                        after_local,
+                        before_ownership,
+                        after_ownership,
                         cfg,
                         dominant_metric_keys=transaction_objective_keys,
                     )
@@ -11989,7 +12147,7 @@ def true_lower_body_ik(
                         or reason == "absolute_root_delta"
                         or reason.startswith("candidate_missing_or_")
                     ]
-                    if v10_mode
+                    if v11_mode
                     else list(absolute_reasons)
                 )
                 kbo_reasons: List[str] = []
@@ -12006,8 +12164,8 @@ def true_lower_body_ik(
                         final[audit_start:audit_end],
                         cfg,
                         stage=(
-                            "ik_local_transaction_v10_restoration"
-                            if v10_mode
+                            "ik_local_transaction_v11_restoration"
+                            if v11_mode
                             else "ik_local_transaction"
                         ),
                         global_start=int(audit_start),
@@ -12026,8 +12184,8 @@ def true_lower_body_ik(
                 )
                 optimization_loss = float(reports[transaction_index]["best_loss"])
                 exact_rank, exact_summary = _exact_audit_candidate_rank(
-                    before_local,
-                    after_local,
+                    before_ownership,
+                    after_ownership,
                     cfg,
                     optimization_loss=optimization_loss,
                     boundary_margin_score=boundary_margin_score,
@@ -12061,12 +12219,15 @@ def true_lower_body_ik(
                     "blocking_absolute_reasons": blocking_absolute_reasons,
                     "kbo_reasons": list(kbo_reasons),
                     "exact_audit": exact_summary,
+                    "ownership_span": [int(own_start), int(own_end)],
+                    "audit_span": [int(audit_start), int(audit_end)],
                 }
                 candidate_attempts.append(attempt)
                 candidate_states.append({
                     "rank": rank,
                     "trial": trial,
                     "after_local": after_local,
+                    "after_ownership": after_ownership,
                     "local_root_delta": local_root_delta,
                     "relative_reasons": relative_reasons,
                     "absolute_reasons": absolute_reasons,
@@ -12081,12 +12242,49 @@ def true_lower_body_ik(
         accepted_states = [
             state for state in candidate_states if state["attempt"]["accepted"]
         ]
+        global_before = None
+        globally_safe_states = []
+        for state in sorted(accepted_states, key=lambda item: item["rank"]):
+            if global_before is None:
+                global_before = audit_motion_np(
+                    final,
+                    cfg,
+                    sliding_support_eligible=eligible,
+                )
+            global_after = audit_motion_np(
+                state["trial"],
+                cfg,
+                sliding_support_eligible=eligible,
+            )
+            global_nonregression = _physical_nonregression_decision(
+                global_before,
+                global_after,
+            )
+            global_reasons = list(global_nonregression["reasons"])
+            state["global_nonregression"] = global_nonregression
+            state["attempt"]["global_nonregression"] = global_nonregression
+            if global_reasons:
+                prefixed = [
+                    f"global_nonregression:{reason}"
+                    for reason in global_reasons
+                ]
+                state["relative_reasons"] = list(dict.fromkeys(
+                    list(state["relative_reasons"]) + prefixed
+                ))
+                state["attempt"]["relative_reasons"] = list(dict.fromkeys(
+                    list(state["attempt"]["relative_reasons"]) + prefixed
+                ))
+                state["attempt"]["accepted"] = False
+            else:
+                globally_safe_states.append(state)
+        accepted_states = globally_safe_states
         selected_state = min(
             accepted_states or candidate_states,
             key=lambda state: state["rank"],
         )
         trial = selected_state["trial"]
         after_local = selected_state["after_local"]
+        after_ownership = selected_state["after_ownership"]
         local_root_delta = selected_state["local_root_delta"]
         relative_reasons = selected_state["relative_reasons"]
         absolute_reasons = selected_state["absolute_reasons"]
@@ -12096,12 +12294,13 @@ def true_lower_body_ik(
         guard_report = selected_state["guard_report"]
         kbo_reasons = selected_state["kbo_reasons"]
         kbo_detail = selected_state["kbo_detail"]
+        global_nonregression = selected_state.get("global_nonregression")
         committed = bool(accepted_states)
         post_commit_localization = None
         if committed:
             final = trial
             accepted_transactions += 1
-            if v10_mode:
+            if v11_mode:
                 refreshed = full_sequence_physical_diagnostics_np(
                     final,
                     cfg,
@@ -12124,6 +12323,23 @@ def true_lower_body_ik(
         )
         before_residuals = _physical_residuals(before_local, ik_limits)
         candidate_residuals = _physical_residuals(after_local, ik_limits)
+        ownership_before_residuals = _physical_residuals(
+            before_ownership,
+            ik_limits,
+        )
+        ownership_candidate_residuals = _physical_residuals(
+            after_ownership,
+            ik_limits,
+        )
+        transaction_metric_keys = (
+            "joint_jerk_mps3_max",
+            "joint_jerk_window_p95_max_mps3",
+            "foot_skate_mps_p95",
+            "foot_skate_mps_max",
+            "foot_support_drift_m_p95",
+            "foot_support_drift_m_max",
+            "foot_penetration_min_m",
+        )
         transaction_reports.append(
             {
                 "start": int(own_start),
@@ -12143,10 +12359,11 @@ def true_lower_body_ik(
                 "contact_restoration": restoration,
                 "fixed_support_gate": fixed_support,
                 "candidate_guard": guard_report,
+                "global_nonregression": global_nonregression,
                 "candidate_selection": {
                     "protocol": (
-                        "exact_audit_lexicographic_backtracking_v10"
-                        if v10_mode
+                        "ownership_exact_audit_backtracking_v11"
+                        if v11_mode
                         else "legacy_single_candidate"
                     ),
                     "sources": [name for name, _ in source_candidates],
@@ -12166,6 +12383,28 @@ def true_lower_body_ik(
                 ),
                 "audit_before": before_local,
                 "audit_after": after_local,
+                "ownership_audit_before": before_ownership,
+                "ownership_audit_after": after_ownership,
+                "ownership_metrics": {
+                    "before": {
+                        key: before_ownership.get(key)
+                        for key in transaction_metric_keys
+                    },
+                    "candidate": {
+                        key: after_ownership.get(key)
+                        for key in transaction_metric_keys
+                    },
+                },
+                "audit_halo_metrics": {
+                    "before": {
+                        key: before_local.get(key)
+                        for key in transaction_metric_keys
+                    },
+                    "candidate": {
+                        key: after_local.get(key)
+                        for key in transaction_metric_keys
+                    },
+                },
                 "hashes": {
                     "input": _array_content_sha256(transaction_input),
                     "candidate": _array_content_sha256(
@@ -12176,6 +12415,10 @@ def true_lower_body_ik(
                 "hard_constraint_residual_delta": {
                     key: float(candidate_residuals[key] - value)
                     for key, value in before_residuals.items()
+                },
+                "ownership_residual_delta": {
+                    key: float(ownership_candidate_residuals[key] - value)
+                    for key, value in ownership_before_residuals.items()
                 },
             }
         )
@@ -12206,8 +12449,8 @@ def true_lower_body_ik(
     report = {
         "version": "lower_body_ik_contact_transactions",
         "protocol": (
-            "full_sequence_exact_audit_contact_transactions_v10"
-            if v10_mode
+            "observable_tolerant_contact_transactions_v11"
+            if v11_mode
             else "legacy_lower_body_ik"
         ),
         "enabled": True,
@@ -12255,8 +12498,8 @@ def true_lower_body_ik(
         },
         "rollback_policy": {
             "mode": (
-                "support_phase_exact_audit_window_transactions_v10"
-                if v10_mode
+                "observable_tolerant_ownership_window_transactions_v11"
+                if v11_mode
                 else "local_ownership_window_transactions"
             ),
             "physical_metric_registry": "contracts.physical_quality.physical_metric_specs",
@@ -12293,7 +12536,7 @@ def true_lower_body_ik(
         "full_sequence_localization": localization,
         "repair_windows": (
             [list(map(int, window)) for window in repair_windows]
-            if v10_mode
+            if v11_mode
             else None
         ),
         "support_phase_partitions": support_phase_partitions,
@@ -12302,12 +12545,12 @@ def true_lower_body_ik(
                 float,
                 cfg.full_sequence_contact_repair_backtracking_factors,
             ))
-            if v10_mode
+            if v11_mode
             else None
         ),
         "c2_frozen_edge_frames": (
             int(cfg.full_sequence_contact_repair_frozen_edge_frames)
-            if v10_mode
+            if v11_mode
             else None
         ),
         "protected_frames": int(protected.sum()),
@@ -12772,8 +13015,8 @@ def _kinematic_barrier_oracle(
     limits = PhysicalQualityLimits.from_environment()
     stage_key = str(stage).strip().lower()
 
-    if "v10_restoration" in stage_key:
-        # Local V10 preparation transactions are allowed to move an already
+    if "v11_restoration" in stage_key:
+        # Local V11 preparation transactions are allowed to move an already
         # invalid baseline monotonically toward the unchanged absolute gate.
         # Final replay still uses the authoritative absolute physical gate.
         decision = evaluate_stage_candidate(
@@ -12793,7 +13036,7 @@ def _kinematic_barrier_oracle(
             if reason not in baseline_absolute
         ]
         decision["accepted"] = not decision["reasons"]
-        decision["v10_baseline_absolute_reasons_allowed"] = sorted(
+        decision["v11_baseline_absolute_reasons_allowed"] = sorted(
             baseline_absolute
         )
     elif stage_key.startswith("ik_"):
@@ -13104,13 +13347,15 @@ def true_lower_body_ik(
             **forwarded,
         )
         local_transactions = dict(report.get("local_transactions", {}))
-        local_mode = str(
+        rollback_mode = str(
             report.get("rollback_policy", {}).get("mode", "")
-        ).endswith("window_transactions") or str(
-            report.get("rollback_policy", {}).get("mode", "")
-        ).endswith("window_transactions_v9") or str(
-            report.get("rollback_policy", {}).get("mode", "")
-        ).endswith("window_transactions_v10")
+        )
+        local_mode = rollback_mode.endswith((
+            "window_transactions",
+            "window_transactions_v9",
+            "window_transactions_v10",
+            "window_transactions_v11",
+        ))
         # Local transactions have already passed physical and KBO checks with
         # derivative halos.  A second whole-song stage prior would modify
         # frames outside those audited ownership windows.

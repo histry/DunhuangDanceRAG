@@ -134,15 +134,15 @@ returns status 2 after preserving `replay.report.json` and all motion artifacts.
 The command never trains or modifies a checkpoint and always reports
 `pilot_allowed=false` and `production_model_modified=false`.
 
-### V10 exact-audit constrained contact transactions
+### V11 observable-tolerant contact transactions
 
-The development replay enables V10 after applying the hash-bound B3 windows.
-Normal generation keeps it disabled by default. V10 uses the captured
+The development replay enables V11 after applying the hash-bound B3 windows.
+Normal generation keeps it disabled by default. V11 uses the captured
 `sliding_support_eligible` array in localization, IK transactions, the
 kinematic barrier oracle, and final auditing so that each stage uses the same
 support-state contract.
 
-V10 ranks penetration, skate, support-drift, and joint-jerk violations over the
+V11 ranks penetration, skate, support-drift, and joint-jerk violations over the
 whole sequence and merges their derivative-halo windows with unsafe boundary
 windows. These per-frame thresholds locate work; they do not replace the
 existing sequence-level physical gate. The solver edits root translation and
@@ -162,35 +162,38 @@ Raw and locally stabilized proposals are evaluated with fixed backtracking
 factors `1, 1/2, 1/4, 1/8, 1/16` under a quintic C2 edit envelope that freezes
 at least three frames at each internal edge.
 
-Each local transaction must meaningfully lower the current dominant contact
-residual while keeping every other contact and physical metric from regressing.
-It must also preserve the accepted B3 root and rotation geometry exactly and
-pass the existing boundary and reference-fidelity guards. The four contact
-observation channels are recomputed from that geometry. Rejected candidates
-roll back to the pre-IK snapshot. The report records input, candidate, and
-selected hashes, every raw/stabilized backtracking attempt, hard-residual
-deltas, support-phase windows, and the top violations. An absolute violation
-already present in the input may remain during a strictly monotone preparation
-step; newly introduced or worsened hard violations still fail. The unchanged
-absolute final quality gate remains authoritative.
+Each local transaction chooses its dominant repair objective from the exact
+physical residuals inside its ownership window. Derivative halos retain the
+physical, fixed-support, fidelity, and boundary non-regression checks. A
+candidate that passes those local checks is then subject to a whole-sequence
+physical non-regression guard before commit. Whole-sequence max and p95 values
+therefore protect the sequence but do not hide a real local improvement.
 
-After the V10 transaction, replay executes the captured diffusion, IK, boundary
-audit, and final quality gate again. The replay also restores the accepted B3
-geometry after neural stages and protects it during the second IK pass, so the
-fixed `0.03` observable result cannot be invalidated by downstream repair.
+V11 replaces the old bitwise geometry lock over B3 edits with the same captured
+observable boundary audit that accepted each B3 solution. Root and lower-body
+geometry may change only while both endpoint and temporal gains continue to
+pass their unchanged `0.03` thresholds. Diffusion still preserves the B3 edit
+union; both contact-repair IK passes use the observable gate instead of freezing
+those frames. Rejected candidates roll back to the pre-IK snapshot.
 
-`stage_reports.v10_stage_physical_diagnostics` records the common physical
-audit, top-K violations, and motion hash for repaired Refiner, contact-repair
-candidate/selection, diffusion candidate/selection, pre-IK, IK candidate/
-selection, and final output when the corresponding captured array is
-available. Missing stage arrays remain absent rather than being inferred from
-metrics.
+After the V11 transaction, replay executes the captured diffusion, IK, boundary
+audit, and final quality gate again. `stage_reports.v11_stage_physical_diagnostics`
+records the whole-sequence audit, top-K violations, and motion hash for repaired
+Refiner, contact-repair candidate/selection, diffusion candidate/selection,
+pre-IK, IK candidate/selection, and final output when available. Each
+transaction separately records ownership-window and derivative-halo residual
+deltas plus the whole-sequence non-regression result.
 
-V10 keeps the observable threshold at `0.03` and leaves physical,
-fixed-support, and fidelity checks as hard filters. It does not train, publish,
-or modify a production model. Beat-aware timing and interpolation remain
-outside this stage because they change time derivatives before contact and
-jerk closure has been demonstrated.
+The main `replay.report.json` uses summary diagnostics. Full optimizer-iteration
+and raw/backtracked transaction records are stored in
+`contact_transactions.full.jsonl.gz` with its path, SHA256, record count, and
+compression format recorded in the main report. This preserves the review trail
+without repeating hundreds of megabytes of candidate guards in the main JSON.
+
+V11 keeps the observable threshold at `0.03` and leaves physical,
+fixed-support, fidelity, boundary, and final quality checks unchanged. It does
+not increase `ik_iters`, train, publish, or modify a production model. Beat-aware
+timing remains outside this stage.
 
 Legacy reports without condition arrays and a round bundle can be summarized,
 but cannot be silently exported with fabricated zero conditions. Regenerate a

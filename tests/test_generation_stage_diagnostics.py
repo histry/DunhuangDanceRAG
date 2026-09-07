@@ -1,5 +1,8 @@
 """Behavior checks for the development diagnostic adapter. Not executed locally."""
+import gzip
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,7 +11,9 @@ from training.generation_stage_diagnostics import (
     _apply_verified_solution_windows,
     _array,
     _boundary_nonregression,
+    _externalize_v11_solver_diagnostics,
     _merge_frame_windows,
+    _observable_solution_gate,
     summarize_report,
 )
 
@@ -96,7 +101,7 @@ def test_replay_rejects_reference_from_a_different_capture(tmp_path):
         _apply_verified_solution_windows(full, [row], "bundle-sha", 1.0e-7)
 
 
-def test_v10_merges_physical_and_boundary_windows():
+def test_v11_merges_physical_and_boundary_windows():
     assert _merge_frame_windows(
         [[10, 20], [22, 30], [70, 90]],
         frames=100,
@@ -104,7 +109,7 @@ def test_v10_merges_physical_and_boundary_windows():
     ) == [[10, 30], [70, 90]]
 
 
-def test_v10_boundary_guard_is_strictly_nonregressing():
+def test_v11_boundary_guard_is_strictly_nonregressing():
     before = [{
         "slot": 1,
         "actual_boundary_jerk_mps3": 500.0,
@@ -125,4 +130,107 @@ def test_v10_boundary_guard_is_strictly_nonregressing():
     assert decision["accepted"] is False
     assert decision["reasons"] == [
         "slot_1:actual_foot_slip_p95_mps_regressed"
+    ]
+
+
+def test_v11_observable_guard_reaudits_only_overlapping_solution_windows():
+    class Runtime:
+        @staticmethod
+        def _observable_boundary_audit(prediction, reference, seam, cfg):
+            accepted = bool(prediction[0, 0] >= 0.0)
+            return {
+                "endpoint_accepted": accepted,
+                "temporal_accepted": accepted,
+                "endpoint_gain": 0.04 if accepted else 0.0,
+                "temporal_gain": 0.04 if accepted else 0.0,
+                "reasons": [] if accepted else ["observable_failed"],
+            }
+
+    contracts = [
+        {
+            "case_id": "slot25",
+            "frame_span": [2, 6],
+            "reference": np.zeros((4, 3), dtype=np.float32),
+            "seam": np.ones((4, 1), dtype=np.float32),
+        },
+        {
+            "case_id": "slot26",
+            "frame_span": [7, 11],
+            "reference": np.zeros((4, 3), dtype=np.float32),
+            "seam": np.ones((4, 1), dtype=np.float32),
+        },
+    ]
+    candidate = np.zeros((12, 3), dtype=np.float32)
+    candidate[7, 0] = -1.0
+    cfg = SimpleNamespace(
+        checkpoint_validation_min_endpoint_repair_gain=0.03,
+        checkpoint_validation_min_temporal_repair_gain=0.03,
+    )
+    local = _observable_solution_gate(
+        Runtime,
+        candidate,
+        contracts,
+        cfg,
+        active_span=[2, 6],
+    )
+    assert local["accepted"] is True
+    assert local["audited_cases"] == 1
+    assert local["thresholds"] == {
+        "endpoint_minimum_gain": 0.03,
+        "temporal_minimum_gain": 0.03,
+    }
+    full = _observable_solution_gate(Runtime, candidate, contracts, cfg)
+    assert full["accepted"] is False
+    assert full["failed_cases"] == ["slot26"]
+
+
+def test_v11_externalizes_full_candidate_records_and_keeps_summary(tmp_path):
+    attempt = {
+        "source": "raw",
+        "backtracking_factor": 0.5,
+        "accepted": False,
+        "relative_reasons": ["dominant_not_improved"],
+        "blocking_absolute_reasons": [],
+        "kbo_reasons": [],
+        "exact_audit": {"dominant_contact_metric": "foot_skate_mps_p95"},
+    }
+    solver = {
+        "chunks": [{
+            "start": 2,
+            "end": 8,
+            "selected_iteration": 1,
+            "iteration_candidates": [{"iteration": 1, "large": [1, 2, 3]}],
+        }],
+        "local_transactions": {
+            "attempted": 1,
+            "accepted": 0,
+            "rejected": 1,
+            "transactions": [{
+                "start": 2,
+                "end": 8,
+                "committed": False,
+                "candidate_selection": {
+                    "selected_source": "raw",
+                    "selected_factor": 0.5,
+                    "attempts": [attempt],
+                },
+            }],
+        },
+    }
+    stages = {
+        "full_sequence_exact_audit_contact_transactions": {
+            "solver_report": solver,
+        },
+    }
+    artifact = _externalize_v11_solver_diagnostics(stages, tmp_path)
+    assert artifact["records"] == 2
+    assert solver["chunks"][0]["iteration_candidates"]["count"] == 1
+    compact = solver["local_transactions"]["transactions"][0]
+    assert compact["candidate_selection"]["attempt_count"] == 1
+    assert "attempts" not in compact["candidate_selection"]
+    with gzip.open(artifact["path"], "rt", encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    assert [record["kind"] for record in records] == [
+        "iteration_candidate",
+        "local_transaction",
     ]
