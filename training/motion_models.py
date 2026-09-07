@@ -11060,8 +11060,52 @@ def _finite_difference_cone_sources(
     finite_difference_sources: Sequence[
         Tuple[str, np.ndarray, Dict[str, Any]]
     ],
+    cfg: MotionGenerationConfig,
+    ownership_eligible: np.ndarray,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
-    """Build a small deterministic cone basis from signed FD directions."""
+    """Build an adaptive cone using measured hard/contact derivatives."""
+
+    if not finite_difference_sources:
+        return []
+    first_span = finite_difference_sources[0][2].get("ownership_span", [])
+    if len(first_span) != 2:
+        return []
+    start, end = map(int, first_span)
+    if end <= start:
+        return []
+    limits = PhysicalQualityLimits.from_environment()
+    policy = StageAcceptancePolicy.from_environment()
+    specs = physical_metric_specs(limits, policy)
+    contact_keys = {
+        "foot_penetration_min_m",
+        "foot_skate_mps_p95",
+        "foot_skate_mps_max",
+        "foot_support_drift_m_p95",
+        "foot_support_drift_m_max",
+    }
+    before_audit = audit_motion_np(
+        base[start:end],
+        cfg,
+        sliding_support_eligible=np.asarray(ownership_eligible, dtype=bool),
+    )
+    before_residuals = _physical_residuals(before_audit, limits)
+
+    def hard_derivatives(audit: Mapping[str, Any]) -> Dict[str, float]:
+        values: Dict[str, float] = {}
+        for spec in specs:
+            if spec.key in contact_keys:
+                continue
+            old = float(before_audit.get(spec.key, float("nan")))
+            new = float(audit.get(spec.key, float("nan")))
+            if not np.isfinite(old) or not np.isfinite(new):
+                values[spec.key] = float("inf")
+                continue
+            scale = max(abs(float(spec.absolute_limit)), 1.0e-3)
+            signed = new - old if spec.direction == "high" else old - new
+            values[spec.key] = float(signed / scale)
+        return values
+
+    profiles: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     indexed: Dict[Tuple[str, int], Tuple[str, np.ndarray, Dict[str, Any]]] = {}
     for source in finite_difference_sources:
@@ -11070,6 +11114,22 @@ def _finite_difference_cone_sources(
         sign = int(metadata.get("direction_sign", 0))
         if block and sign in (-1, 1):
             indexed.setdefault((block, sign), source)
+            source_audit = audit_motion_np(
+                source[1][start:end],
+                cfg,
+                sliding_support_eligible=np.asarray(
+                    ownership_eligible,
+                    dtype=bool,
+                ),
+            )
+            source_residuals = _physical_residuals(source_audit, limits)
+            profiles[(block, sign)] = {
+                "contact_derivative": {
+                    key: float(source_residuals[key] - before_residuals[key])
+                    for key in contact_keys
+                },
+                "hard_derivative": hard_derivatives(source_audit),
+            }
     pair_blocks = (
         ("root", "hips"),
         ("root", "knees"),
@@ -11078,9 +11138,13 @@ def _finite_difference_cone_sources(
         ("root", "right_foot"),
         ("knees", "ankles"),
     )
-    combinations = (
-        (-1, 1),
-        (1, -1),
+    combinations = ((-1, 1), (1, -1))
+    coefficient_grid = (
+        (0.125, 0.875),
+        (0.25, 0.75),
+        (0.5, 0.5),
+        (0.75, 0.25),
+        (0.875, 0.125),
     )
     output: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
     for left_block, right_block in pair_blocks:
@@ -11089,15 +11153,100 @@ def _finite_difference_cone_sources(
             right = indexed.get((right_block, right_sign))
             if left is None or right is None:
                 continue
+            left_profile = profiles[(left_block, left_sign)]
+            right_profile = profiles[(right_block, right_sign)]
+            best = None
+            for left_coefficient, right_coefficient in coefficient_grid:
+                contact_derivative = {
+                    key: float(
+                        left_coefficient
+                        * left_profile["contact_derivative"][key]
+                        + right_coefficient
+                        * right_profile["contact_derivative"][key]
+                    )
+                    for key in contact_keys
+                }
+                hard_derivative = {
+                    key: float(
+                        left_coefficient * left_profile["hard_derivative"].get(
+                            key,
+                            float("inf"),
+                        )
+                        + right_coefficient * right_profile[
+                            "hard_derivative"
+                        ].get(key, float("inf"))
+                    )
+                    for key in set(left_profile["hard_derivative"])
+                    | set(right_profile["hard_derivative"])
+                }
+                contact_regression = sum(
+                    max(0.0, value - 1.0e-8)
+                    for value in contact_derivative.values()
+                )
+                hard_regression = sum(
+                    1.0e6
+                    if not np.isfinite(value)
+                    else max(0.0, value - 1.0e-8)
+                    for value in hard_derivative.values()
+                )
+                meaningful = any(
+                    value
+                    <= -max(
+                        1.0e-7,
+                        before_residuals[key]
+                        * float(cfg.full_sequence_contact_repair_min_gain),
+                    )
+                    for key, value in contact_derivative.items()
+                )
+                derivative_feasible = bool(
+                    meaningful
+                    and contact_regression <= 1.0e-8
+                    and hard_regression <= 1.0e-8
+                )
+                contact_gain = sum(
+                    max(0.0, -value)
+                    / max(before_residuals[key], 1.0e-7)
+                    for key, value in contact_derivative.items()
+                )
+                score = (
+                    0 if derivative_feasible else 1,
+                    float(hard_regression),
+                    float(contact_regression),
+                    -float(contact_gain),
+                )
+                item = {
+                    "score": score,
+                    "left_coefficient": left_coefficient,
+                    "right_coefficient": right_coefficient,
+                    "contact_derivative": contact_derivative,
+                    "hard_derivative": hard_derivative,
+                    "derivative_feasible": derivative_feasible,
+                }
+                if best is None or score < best["score"]:
+                    best = item
+            if best is None:
+                continue
             left_delta = np.asarray(left[1], dtype=np.float32) - base
             right_delta = np.asarray(right[1], dtype=np.float32) - base
-            candidate = base + 0.5 * (left_delta + right_delta)
+            candidate = base + (
+                float(best["left_coefficient"]) * left_delta
+                + float(best["right_coefficient"]) * right_delta
+            )
             metadata = {
                 "direction_source": "finite_difference_cone",
                 "direction_blocks": [left_block, right_block],
                 "direction_signs": [left_sign, right_sign],
-                "direction_coefficients": [0.5, 0.5],
-                "probe_basis": "pairwise_signed_fd_cone",
+                "direction_coefficients": [
+                    float(best["left_coefficient"]),
+                    float(best["right_coefficient"]),
+                ],
+                "probe_basis": "adaptive_signed_fd_cone",
+                "cone_derivative_feasible": bool(
+                    best["derivative_feasible"]
+                ),
+                "contact_residual_derivative": best["contact_derivative"],
+                "hard_metric_derivative": best["hard_derivative"],
+                "cone_derivative_score": list(map(float, best["score"])),
                 "ownership_span": list(left[2].get("ownership_span", [])),
             }
             span = metadata["ownership_span"]
@@ -12481,7 +12630,12 @@ def true_lower_body_ik(
             )
             source_candidates.extend(finite_difference_sources)
             source_candidates.extend(
-                _finite_difference_cone_sources(final, finite_difference_sources)
+                _finite_difference_cone_sources(
+                    final,
+                    finite_difference_sources,
+                    cfg,
+                    ownership_eligible,
+                )
             )
         factors = (
             tuple(cfg.full_sequence_contact_repair_backtracking_factors)
@@ -12629,7 +12783,10 @@ def true_lower_body_ik(
                         + list(blocking_absolute_reasons)
                     ),
                 )
-                if source_metadata.get("direction_source") == "finite_difference":
+                if source_metadata.get("direction_source") in (
+                    "finite_difference",
+                    "finite_difference_cone",
+                ):
                     probe_step = float(source_metadata.get("probe_step", 0.0))
                     exact_summary["finite_difference"] = {
                         **source_metadata,
