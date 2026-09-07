@@ -9,6 +9,8 @@ from training.motion_models import (
     _c2_transaction_weight,
     _contact_restoration_decision,
     _exact_audit_candidate_rank,
+    _finite_difference_contact_direction_sources,
+    _local_infeasibility_diagnosis,
     _partition_repair_windows_by_support_phase,
     _physical_nonregression_decision,
     evaluate_fixed_support_contact_candidate_np,
@@ -76,6 +78,59 @@ def test_v11_global_guard_only_checks_nonregression():
     assert decision["reasons"] == [
         "global_metric_regressed:foot_skate_mps_max"
     ]
+    assert decision["regressed_metrics"] == ["foot_skate_mps_max"]
+    assert decision["reason_by_metric"] == {
+        "foot_skate_mps_max": "global_metric_regressed:foot_skate_mps_max"
+    }
+
+
+def test_v11_signed_finite_difference_sources_cover_contact_action_blocks():
+    cfg = MotionGenerationConfig()
+    base = _identity_motion(24)
+    proposal = base.copy()
+    sources = _finite_difference_contact_direction_sources(
+        base,
+        proposal,
+        4,
+        20,
+        cfg,
+    )
+    assert len(sources) == 12
+    assert {
+        metadata["direction_block"]
+        for _, _, metadata in sources
+    } == {"root", "hips", "knees", "ankles", "left_foot", "right_foot"}
+    assert {
+        metadata["direction_sign"]
+        for _, _, metadata in sources
+    } == {-1, 1}
+    for _, candidate, metadata in sources:
+        assert np.isfinite(candidate).all()
+        assert np.array_equal(candidate[:4], base[:4])
+        assert np.array_equal(candidate[20:], base[20:])
+        assert metadata["direction_source"] == "finite_difference"
+
+
+def test_v11_reports_local_infeasibility_without_relaxing_hard_filters():
+    diagnosis = _local_infeasibility_diagnosis([
+        {
+            "accepted": False,
+            "blocking_reasons": [
+                "contact_residual_regressed:foot_skate_mps_p95",
+                "audit_halo_metric_regressed:joint_jerk_mps3_p95",
+            ],
+        }
+    ])
+    assert diagnosis["status"] == (
+        "local_infeasible_under_current_action_basis"
+    )
+    assert diagnosis["accepted_count"] == 0
+    assert diagnosis["contact_regressions"] == {
+        "contact_residual_regressed:foot_skate_mps_p95": 1
+    }
+    assert diagnosis["hard_regressions"] == {
+        "audit_halo_metric_regressed:joint_jerk_mps3_p95": 1
+    }
 
 
 def test_v11_fixed_support_gate_uses_the_captured_eligibility_contract():

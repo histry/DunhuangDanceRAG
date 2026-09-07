@@ -438,6 +438,12 @@ class MotionGenerationConfig:
     full_sequence_contact_repair_jerk_weight: float = 0.75
     full_sequence_contact_repair_cvar_fraction: float = 0.10
     full_sequence_contact_repair_frozen_edge_frames: int = 3
+    # Development-only finite-difference action probes.  These values are
+    # deliberately small: the exact backtracking ladder below is still the
+    # authority for transaction acceptance.
+    full_sequence_contact_repair_fd_root_step_m: float = 0.005
+    full_sequence_contact_repair_fd_rotation_step: float = 0.01
+    full_sequence_contact_repair_fd_min_delta: float = 1.0e-8
     full_sequence_contact_repair_backtracking_factors: Tuple[float, ...] = (
         1.0,
         0.5,
@@ -10838,6 +10844,166 @@ def _slice_eligibility(
     return None if eligible is None else eligible[start:end]
 
 
+def _finite_difference_contact_direction_sources(
+    base_motion: np.ndarray,
+    proposal_motion: np.ndarray,
+    own_start: int,
+    own_end: int,
+    cfg: MotionGenerationConfig,
+) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
+    """Build signed local finite-difference directions for contact repair.
+
+    The optimizer proposal is useful as a warm direction, but it can hide a
+    cancellation between root and lower-body coordinates.  This development
+    path therefore probes the signed blocks independently.  A block uses the
+    corresponding optimizer displacement when it exists and falls back to a
+    small synthetic perturbation otherwise.  Every returned motion is scoped
+    to the ownership window and rotation channels are projected back to the
+    canonical SO(3) representation before auditing.
+    """
+
+    base = np.asarray(base_motion, dtype=np.float32)
+    proposal = np.asarray(proposal_motion, dtype=np.float32)
+    if base.shape != proposal.shape or base.ndim != 2:
+        raise ValueError("finite-difference motions must have equal [T,D] shapes")
+    start = max(0, int(own_start))
+    end = min(int(base.shape[0]), int(own_end))
+    if end <= start:
+        return []
+    span = end - start
+    envelope = _c2_transaction_weight(
+        span,
+        fade=min(
+            max(
+                int(cfg.full_sequence_contact_repair_frozen_edge_frames) + 3,
+                2,
+            ),
+            max(1, span // 2),
+        ),
+        freeze_edges=int(cfg.full_sequence_contact_repair_frozen_edge_frames),
+        has_left_context=start > 0,
+        has_right_context=end < base.shape[0],
+    )[:, 0]
+    delta = proposal[start:end] - base[start:end]
+    root_indices = [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]
+    joint_groups = {
+        "hips": (1, 2),
+        "knees": (4, 5),
+        "ankles": (7, 8),
+        "left_foot": (7, 10),
+        "right_foot": (8, 11),
+    }
+    blocks: List[Tuple[str, List[int], float]] = [
+        (
+            "root",
+            root_indices,
+            float(cfg.full_sequence_contact_repair_fd_root_step_m),
+        )
+    ]
+    for name, joints in joint_groups.items():
+        indices: List[int] = []
+        for joint in joints:
+            first = ROT6D_START + 6 * int(joint)
+            indices.extend(range(first, first + 6))
+        blocks.append(
+            (
+                name,
+                indices,
+                float(cfg.full_sequence_contact_repair_fd_rotation_step),
+            )
+        )
+    sources: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
+    min_delta = max(
+        float(cfg.full_sequence_contact_repair_fd_min_delta),
+        1.0e-12,
+    )
+    for name, indices, step in blocks:
+        if not np.isfinite(step) or step <= 0.0:
+            continue
+        block_delta = np.zeros_like(delta, dtype=np.float32)
+        block_delta[:, indices] = delta[:, indices]
+        block_delta *= envelope[:, None]
+        source_kind = "optimizer_delta"
+        amplitude = float(np.max(np.abs(block_delta))) if block_delta.size else 0.0
+        if not np.isfinite(amplitude) or amplitude < min_delta:
+            block_delta.fill(0.0)
+            if name == "root":
+                block_delta[:, indices] = (
+                    float(step) * envelope[:, None]
+                )
+            else:
+                # Perturb the first tangent coordinate of each joint.  The
+                # subsequent SO(3) projection makes this a valid rotation
+                # direction while keeping the probe deterministic.
+                for joint in joint_groups.get(name, ()):
+                    block_delta[:, ROT6D_START + 6 * int(joint)] = (
+                        float(step) * envelope
+                    )
+            source_kind = "synthetic_basis"
+            amplitude = float(np.max(np.abs(block_delta)))
+        else:
+            block_delta *= float(step) / max(amplitude, min_delta)
+            amplitude = float(np.max(np.abs(block_delta)))
+        for sign, label in ((1.0, "positive"), (-1.0, "negative")):
+            candidate = base.copy()
+            candidate[start:end] = base[start:end] + sign * block_delta
+            rotations = candidate[
+                start:end,
+                ROT6D_START:ROT6D_END,
+            ].reshape(
+                span,
+                NUM_JOINTS,
+                6,
+            )
+            candidate[start:end, ROT6D_START:ROT6D_END] = (
+                matrix_to_rot6d_np(rot6d_to_matrix_np(rotations)).reshape(
+                    span,
+                    -1,
+                )
+            )
+            sources.append(
+                (
+                    f"finite_difference:{name}:{label}",
+                    candidate.astype(np.float32),
+                    {
+                        "direction_source": "finite_difference",
+                        "direction_block": name,
+                        "direction_sign": int(sign),
+                        "probe_step": float(sign * amplitude),
+                        "probe_basis": source_kind,
+                        "ownership_span": [start, end],
+                    },
+                )
+            )
+    return sources
+
+
+def _local_infeasibility_diagnosis(
+    attempts: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize a failed local action basis without relaxing any gate."""
+
+    reasons: Dict[str, int] = {}
+    contact_reasons: Dict[str, int] = {}
+    hard_reasons: Dict[str, int] = {}
+    for attempt in attempts:
+        for reason in attempt.get("blocking_reasons", ()):
+            key = str(reason)
+            reasons[key] = reasons.get(key, 0) + 1
+            if key.startswith("contact_residual_regressed:"):
+                contact_reasons[key] = contact_reasons.get(key, 0) + 1
+            if key.startswith(("hard_metric_regressed:", "audit_halo_metric_regressed:")):
+                hard_reasons[key] = hard_reasons.get(key, 0) + 1
+    return {
+        "status": "local_infeasible_under_current_action_basis",
+        "attempt_count": int(len(attempts)),
+        "accepted_count": int(sum(bool(item.get("accepted")) for item in attempts)),
+        "blocking_reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
+        "contact_regressions": dict(sorted(contact_reasons.items(), key=lambda item: (-item[1], item[0]))),
+        "hard_regressions": dict(sorted(hard_reasons.items(), key=lambda item: (-item[1], item[0]))),
+    }
+
+
 def _contact_restoration_decision(
     before: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -10928,6 +11094,7 @@ def _physical_nonregression_decision(
     metric_deltas: Dict[str, float] = {}
     before_metrics: Dict[str, float] = {}
     candidate_metrics: Dict[str, float] = {}
+    regressed_metrics: List[str] = []
     for spec in physical_metric_specs(limits, policy):
         old = float(before.get(spec.key, float("nan")))
         new = float(candidate.get(spec.key, float("nan")))
@@ -10941,6 +11108,11 @@ def _physical_nonregression_decision(
         tolerance = max(1.0e-7, abs(old) * 1.0e-6)
         if signed_delta > tolerance:
             reasons.append(f"{reason_prefix}:{spec.key}")
+            regressed_metrics.append(str(spec.key))
+    reason_by_metric = {
+        str(key): f"{reason_prefix}:{key}"
+        for key in regressed_metrics
+    }
     return {
         "schema": "physical_nonregression_audit_v12",
         "scope": str(scope),
@@ -10950,6 +11122,8 @@ def _physical_nonregression_decision(
         "metric_deltas": metric_deltas,
         "before_metrics": before_metrics,
         "candidate_metrics": candidate_metrics,
+        "regressed_metrics": regressed_metrics,
+        "reason_by_metric": reason_by_metric,
         "before_residuals": before_residuals,
         "candidate_residuals": candidate_residuals,
         "residual_delta": {
@@ -11022,10 +11196,22 @@ def _exact_audit_candidate_rank(
         float(boundary_margin_score),
         float(optimization_loss),
     )
+    regression_metrics_by_scope: Dict[str, List[str]] = {}
+    for reason in all_regression_reasons:
+        text = str(reason)
+        if ":" in text:
+            prefix, metric = text.split(":", 1)
+            regression_metrics_by_scope.setdefault(prefix, []).append(metric)
+        else:
+            regression_metrics_by_scope.setdefault("other", []).append(text)
     return rank, {
         "rank": list(map(float, rank)),
         "accepted_by_physical_contract": bool(decision["accepted"]),
         "regression_reasons": all_regression_reasons,
+        "regression_metrics_by_scope": {
+            key: sorted(set(values))
+            for key, values in regression_metrics_by_scope.items()
+        },
         "hard_regression_count": int(len(all_regression_reasons)),
         "dominant_contact_metric": dominant,
         "objective_metrics": list(decision["objective_metrics"]),
@@ -12066,17 +12252,33 @@ def true_lower_body_ik(
         transaction_objective_keys = (
             None if has_contact else no_support_objective_keys
         )
-        source_candidates = (
-            [("raw", raw_out_all)]
+        source_candidates: List[Tuple[str, np.ndarray, Dict[str, Any]]] = (
+            [("raw", raw_out_all, {"direction_source": "optimizer"})]
             if v11_mode
-            else [("legacy", out_all)]
+            else [("legacy", out_all, {"direction_source": "legacy"})]
         )
         if (
             v11_mode
             and stabilized_out_all is not None
             and stabilization_safe is True
         ):
-            source_candidates.append(("stabilized", stabilized_out_all))
+            source_candidates.append(
+                (
+                    "stabilized",
+                    stabilized_out_all,
+                    {"direction_source": "post_stabilization"},
+                )
+            )
+        if v11_mode:
+            source_candidates.extend(
+                _finite_difference_contact_direction_sources(
+                    final,
+                    raw_out_all,
+                    own_start,
+                    own_end,
+                    cfg,
+                )
+            )
         factors = (
             tuple(cfg.full_sequence_contact_repair_backtracking_factors)
             if v11_mode
@@ -12084,7 +12286,7 @@ def true_lower_body_ik(
         )
         candidate_attempts: List[Dict[str, Any]] = []
         candidate_states: List[Dict[str, Any]] = []
-        for source_name, source_motion in source_candidates:
+        for source_name, source_motion, source_metadata in source_candidates:
             for factor in factors:
                 scaled_weight = weight * float(factor)
                 trial = final.copy()
@@ -12223,6 +12425,21 @@ def true_lower_body_ik(
                         + list(blocking_absolute_reasons)
                     ),
                 )
+                if source_metadata.get("direction_source") == "finite_difference":
+                    probe_step = float(source_metadata.get("probe_step", 0.0))
+                    exact_summary["finite_difference"] = {
+                        **source_metadata,
+                        "residual_derivative": {
+                            key: (
+                                float(value) / probe_step
+                                if abs(probe_step) > 1.0e-12
+                                else None
+                            )
+                            for key, value in exact_summary[
+                                "residual_delta"
+                            ].items()
+                        },
+                    }
                 scope_delta = np.max(np.abs(trial - final), axis=1)
                 scope_outside = np.ones(T, dtype=bool)
                 scope_outside[own_start:own_end] = False
@@ -12259,6 +12476,12 @@ def true_lower_body_ik(
                 committed = not blocking_reasons
                 attempt = {
                     "source": source_name,
+                    "direction_source": source_metadata.get(
+                        "direction_source",
+                        source_name,
+                    ),
+                    "direction_block": source_metadata.get("direction_block"),
+                    "direction_sign": source_metadata.get("direction_sign"),
                     "backtracking_factor": float(factor),
                     "source_motion_sha256": _array_content_sha256(
                         source_motion[audit_start:audit_end]
@@ -12277,6 +12500,7 @@ def true_lower_body_ik(
                     "ownership_span": [int(own_start), int(own_end)],
                     "audit_span": [int(audit_start), int(audit_end)],
                 }
+                attempt["blocking_reasons"] = list(blocking_reasons)
                 candidate_attempts.append(attempt)
                 candidate_states.append({
                     "rank": rank,
@@ -12329,10 +12553,19 @@ def true_lower_body_ik(
                 state["attempt"]["relative_reasons"] = list(dict.fromkeys(
                     list(state["attempt"]["relative_reasons"]) + prefixed
                 ))
+                state["attempt"]["blocking_reasons"] = list(dict.fromkeys(
+                    list(state["attempt"].get("blocking_reasons", []))
+                    + prefixed
+                ))
                 state["attempt"]["accepted"] = False
             else:
                 globally_safe_states.append(state)
         accepted_states = globally_safe_states
+        local_infeasibility = (
+            _local_infeasibility_diagnosis(candidate_attempts)
+            if v11_mode and not accepted_states
+            else None
+        )
         selected_state = min(
             accepted_states or candidate_states,
             key=lambda state: state["rank"],
@@ -12415,13 +12648,14 @@ def true_lower_body_ik(
                 "fixed_support_gate": fixed_support,
                 "candidate_guard": guard_report,
                 "global_nonregression": global_nonregression,
+                "local_infeasibility": local_infeasibility,
                 "candidate_selection": {
                     "protocol": (
                         "ownership_exact_audit_backtracking_v11"
                         if v11_mode
                         else "legacy_single_candidate"
                     ),
-                    "sources": [name for name, _ in source_candidates],
+                    "sources": [name for name, _, _ in source_candidates],
                     "backtracking_factors": list(map(float, factors)),
                     "selected_source": selected_state["attempt"]["source"],
                     "selected_factor": float(
@@ -12572,6 +12806,24 @@ def true_lower_body_ik(
             ),
             "ownership_overlap_frames": int(overlap),
             "transactions": transaction_reports,
+        },
+        "local_infeasibility": {
+            "status": (
+                "local_infeasible_under_current_action_basis"
+                if v11_mode
+                and transaction_reports
+                and accepted_transactions == 0
+                else None
+            ),
+            "transactions": [
+                {
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "diagnosis": item.get("local_infeasibility"),
+                }
+                for item in transaction_reports
+                if item.get("local_infeasibility") is not None
+            ],
         },
         "root_delta_max_m": float(root_delta.max()) if root_delta.size else 0.0,
         "root_delta_p95_m": float(np.percentile(root_delta, 95)) if root_delta.size else 0.0,

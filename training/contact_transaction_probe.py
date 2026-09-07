@@ -65,6 +65,7 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
     numeric = []
     accepted = []
     scope_violations = []
+    finite_difference = []
     for attempt in attempts:
         exact = attempt.get("exact_audit", {}) or {}
         has_numeric = bool(
@@ -76,9 +77,12 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
             numeric.append(attempt)
         if bool(attempt.get("accepted", False)):
             accepted.append(attempt)
+        if attempt.get("direction_source") == "finite_difference":
+            finite_difference.append(attempt)
         scope = attempt.get("scope_audit", {}) or {}
         if scope.get("changed_frames_outside"):
             scope_violations.append(scope)
+    infeasibility = report.get("local_infeasibility", {}) or {}
     return {
         "schema": "local_contact_transaction_probe_v1",
         "development_only": True,
@@ -91,6 +95,13 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
         "scope_violation_count": len(scope_violations),
         "numeric_audit_complete": len(numeric) == len(attempts),
         "local_solver_direction_exists": bool(accepted),
+        "finite_difference_direction_count": len(finite_difference),
+        "local_feasibility_status": (
+            "feasible_direction_found"
+            if accepted
+            else "local_infeasible_under_current_action_basis"
+        ),
+        "local_infeasibility": infeasibility,
         "scope_safe": not scope_violations,
         "transactions": report.get("local_transactions", {}).get(
             "transactions", []
