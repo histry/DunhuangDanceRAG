@@ -12436,7 +12436,7 @@ def true_lower_body_ik(
                                 else None
                             )
                             for key, value in exact_summary[
-                                "residual_delta"
+                                "hard_constraint_residual_delta"
                             ].items()
                         },
                     }
