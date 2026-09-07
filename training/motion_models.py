@@ -10190,6 +10190,25 @@ def _c3_transaction_weight(
     return weight
 
 
+def _smooth_transaction_delta(values: np.ndarray) -> np.ndarray:
+    """Low-pass a transaction direction before jerk-sensitive auditing."""
+
+    array = np.asarray(values, dtype=np.float32)
+    if array.ndim < 1 or array.shape[0] < 3:
+        return array.copy()
+    kernel = np.asarray([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
+    pad = len(kernel) // 2
+    padded = np.pad(
+        array,
+        [(pad, pad)] + [(0, 0)] * (array.ndim - 1),
+        mode="edge",
+    )
+    smoothed = np.zeros_like(array, dtype=np.float32)
+    for offset, coefficient in enumerate(kernel):
+        smoothed += float(coefficient) * padded[offset:offset + len(array)]
+    return smoothed
+
+
 def _torch_cvar_topk(values: "torch.Tensor", fraction: float) -> "torch.Tensor":
     """Mean of the largest finite residuals without detaching gradients."""
 
@@ -10972,7 +10991,11 @@ def _finite_difference_contact_direction_sources(
         if not np.isfinite(step) or step <= 0.0:
             continue
         block_delta = np.zeros_like(delta, dtype=np.float32)
-        block_delta[:, indices] = delta[:, indices]
+        # The raw optimizer delta can contain frame-to-frame oscillations that
+        # are harmless for its training loss but create a hard jerk regression
+        # when used as a finite-difference contact direction.  Smooth only the
+        # direction estimate; the original optimizer candidate remains intact.
+        block_delta[:, indices] = _smooth_transaction_delta(delta[:, indices])
         block_delta *= envelope[:, None]
         source_kind = "optimizer_delta"
         amplitude = float(np.max(np.abs(block_delta))) if block_delta.size else 0.0
@@ -11022,6 +11045,9 @@ def _finite_difference_contact_direction_sources(
                         "direction_sign": int(sign),
                         "probe_step": float(sign * amplitude),
                         "probe_basis": source_kind,
+                        "temporal_filter": "binomial5"
+                        if source_kind == "optimizer_delta"
+                        else "none",
                         "ownership_span": [start, end],
                     },
                 )
