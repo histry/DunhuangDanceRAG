@@ -614,6 +614,12 @@ def _compact_candidate_attempt(attempt):
         "dominant_contact_residual_candidate": exact.get(
             "dominant_contact_residual_candidate"
         ),
+        "before_metrics": exact.get("before_metrics", {}),
+        "candidate_metrics": exact.get("candidate_metrics", {}),
+        "metric_delta": exact.get("metric_delta", {}),
+        "before_residuals": exact.get("before_residuals", {}),
+        "candidate_residuals": exact.get("candidate_residuals", {}),
+        "scope_audit": attempt.get("scope_audit", {}),
         "hard_regression_count": exact.get("hard_regression_count"),
         "hard_constraint_residual_delta": exact.get(
             "hard_constraint_residual_delta", {}
@@ -769,7 +775,80 @@ def _unsafe_boundary_windows(rows, frames, halo):
     return windows
 
 
-def _boundary_nonregression(before_rows, candidate_rows):
+def _boundary_row_span(row):
+    """Return the frame span whose boundary audit can be affected by a local edit."""
+
+    if not isinstance(row, dict):
+        return (0, 0)
+    explicit = row.get("boundary_span")
+    if isinstance(explicit, (list, tuple)) and len(explicit) == 2:
+        start, end = map(int, explicit)
+        return (min(start, end), max(start + 1, end))
+    values = []
+    for key in ("transition_start", "content_start"):
+        if row.get(key) is not None:
+            values.append(int(row[key]))
+    ends = []
+    for key in ("transition_end", "content_end"):
+        if row.get(key) is not None:
+            ends.append(int(row[key]))
+    if not values:
+        return (0, 0)
+    start = min(values)
+    end = max(ends or values)
+    return (start, max(start + 1, end))
+
+
+def _span_overlaps(left, right):
+    if left is None:
+        return True
+    start, end = map(int, left)
+    other_start, other_end = map(int, right)
+    return max(start, other_start) < min(end, other_end)
+
+
+def _motion_scope_audit(before, candidate, active_span):
+    """Verify that a local transaction does not modify frames outside its owner."""
+
+    before_value = np.asarray(before)
+    candidate_value = np.asarray(candidate)
+    if before_value.shape != candidate_value.shape:
+        return {
+            "accepted": False,
+            "reason": "candidate_shape_changed",
+            "active_span": list(map(int, active_span)),
+            "max_delta_inside": None,
+            "max_delta_outside": float("inf"),
+            "changed_frames_outside": [],
+        }
+    start, end = map(int, active_span)
+    if start < 0 or end <= start or end > len(before_value):
+        return {
+            "accepted": False,
+            "reason": "invalid_active_span",
+            "active_span": [start, end],
+            "max_delta_inside": None,
+            "max_delta_outside": float("inf"),
+            "changed_frames_outside": [],
+        }
+    delta = np.max(np.abs(candidate_value - before_value), axis=1)
+    outside = np.ones(len(delta), dtype=bool)
+    outside[start:end] = False
+    tolerance = 1.0e-6
+    changed_outside = np.flatnonzero(outside & (delta > tolerance))
+    changed_inside = np.flatnonzero((~outside) & (delta > tolerance))
+    return {
+        "accepted": bool(changed_outside.size == 0),
+        "reason": None if changed_outside.size == 0 else "candidate_changed_outside_owner",
+        "active_span": [start, end],
+        "max_delta_inside": float(delta[~outside].max()) if changed_inside.size else 0.0,
+        "max_delta_outside": float(delta[outside].max()) if outside.any() else 0.0,
+        "changed_frames_inside": changed_inside.astype(int).tolist(),
+        "changed_frames_outside": changed_outside.astype(int).tolist(),
+    }
+
+
+def _boundary_nonregression(before_rows, candidate_rows, active_span=None):
     before = {int(row["slot"]): row for row in before_rows}
     candidate = {int(row["slot"]): row for row in candidate_rows}
     metrics = (
@@ -785,9 +864,17 @@ def _boundary_nonregression(before_rows, candidate_rows):
         "actual_foot_slip_peak_mps",
         "actual_foot_penetration_depth_max_m",
     )
+    selected_slots = []
+    ignored_slots = []
+    for slot, reference in before.items():
+        if _span_overlaps(active_span, _boundary_row_span(reference)):
+            selected_slots.append(int(slot))
+        else:
+            ignored_slots.append(int(slot))
     regressions = []
     deltas = {}
-    for slot, reference in before.items():
+    for slot in selected_slots:
+        reference = before[slot]
         trial = candidate.get(slot)
         if trial is None:
             regressions.append(f"slot_{slot}:missing_candidate_boundary")
@@ -804,6 +891,11 @@ def _boundary_nonregression(before_rows, candidate_rows):
         "accepted": not regressions,
         "reasons": regressions,
         "metric_deltas": deltas,
+        "active_span": (
+            list(map(int, active_span)) if active_span is not None else None
+        ),
+        "evaluated_slots": selected_slots,
+        "ignored_slots": ignored_slots,
     }
 
 
@@ -997,9 +1089,10 @@ def replay_solutions(
 
         def contact_candidate_guard(current, candidate, ownership, audit_span):
             start, end = map(int, audit_span)
+            owner_start, owner_end = map(int, ownership)
             local_eligible = slide[start:end]
             reference_audit = runtime.audit_motion_np(
-                repaired[start:end],
+                current[start:end],
                 cfg,
                 sliding_support_eligible=local_eligible,
             )
@@ -1028,6 +1121,12 @@ def replay_solutions(
                     bundle["assembly"],
                     cfg,
                 ),
+                active_span=[start, end],
+            )
+            scope = _motion_scope_audit(
+                current,
+                candidate,
+                [owner_start, owner_end],
             )
             observable = _observable_solution_gate(
                 runtime,
@@ -1050,6 +1149,8 @@ def replay_solutions(
                 reasons.extend(
                     f"boundary:{reason}" for reason in boundary["reasons"]
                 )
+            if not scope["accepted"]:
+                reasons.append(f"scope:{scope['reason']}")
             if not observable["accepted"]:
                 reasons.extend(
                     f"observable:{case_id}:endpoint_or_temporal_gate_failed"
@@ -1060,6 +1161,7 @@ def replay_solutions(
                 "reasons": reasons,
                 "ownership_span": list(map(int, ownership)),
                 "audit_span": [start, end],
+                "scope": scope,
                 "fidelity": fidelity,
                 "fixed_support": fixed_support,
                 "boundary": boundary,

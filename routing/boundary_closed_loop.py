@@ -1069,6 +1069,11 @@ def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequen
             "transition_start": int(t0),
             "transition_end": int(t1),
             "content_start": int(c0),
+            "content_end": int(c1),
+            "boundary_span": [
+                int(min(t0, c0)),
+                int(max(t1, c1, c0 + 1)),
+            ],
             "predicted_risk_score": float(assembly_report[i].get("risk_score_predicted", 0.0)),
             "predicted_boundary_jerk": float(pred.get("boundary_joint_jerk_max", 0.0)) if isinstance(pred, dict) else 0.0,
             "predicted_entry_fk_jump": float(pred.get("entry_fk_jump", 0.0)) if isinstance(pred, dict) else 0.0,

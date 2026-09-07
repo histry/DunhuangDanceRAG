@@ -10916,6 +10916,9 @@ def _contact_restoration_decision(
 def _physical_nonregression_decision(
     before: Mapping[str, Any],
     candidate: Mapping[str, Any],
+    *,
+    reason_prefix: str = "global_metric_regressed",
+    scope: str = "full_sequence",
 ) -> Dict[str, Any]:
     limits = PhysicalQualityLimits.from_environment()
     policy = StageAcceptancePolicy.from_environment()
@@ -10937,9 +10940,11 @@ def _physical_nonregression_decision(
         metric_deltas[spec.key] = float(signed_delta)
         tolerance = max(1.0e-7, abs(old) * 1.0e-6)
         if signed_delta > tolerance:
-            reasons.append(f"global_metric_regressed:{spec.key}")
+            reasons.append(f"{reason_prefix}:{spec.key}")
     return {
-        "schema": "full_sequence_physical_nonregression_v11",
+        "schema": "physical_nonregression_audit_v12",
+        "scope": str(scope),
+        "reason_prefix": str(reason_prefix),
         "accepted": not reasons,
         "reasons": reasons,
         "metric_deltas": metric_deltas,
@@ -11029,6 +11034,26 @@ def _exact_audit_candidate_rank(
         ),
         "dominant_contact_residual_candidate": dominant_after,
         "required_dominant_gain": float(decision["required_dominant_gain"]),
+        # Keep raw metrics and normalized residuals together.  Reason strings
+        # alone cannot distinguish a real numeric regression from a scope or
+        # reporting error, especially for local ownership-window candidates.
+        "before_metrics": {
+            key: float(before.get(key, float("nan")))
+            for key in decision["before_residuals"]
+        },
+        "candidate_metrics": {
+            key: float(candidate.get(key, float("nan")))
+            for key in decision["candidate_residuals"]
+        },
+        "metric_delta": {
+            key: float(
+                float(candidate.get(key, float("nan")))
+                - float(before.get(key, float("nan")))
+            )
+            for key in decision["before_residuals"]
+        },
+        "before_residuals": dict(decision["before_residuals"]),
+        "candidate_residuals": dict(decision["candidate_residuals"]),
         "jerk_margins": jerk_margins,
         "boundary_margin_score": float(boundary_margin_score),
         "optimization_loss": float(optimization_loss),
@@ -11647,6 +11672,8 @@ def true_lower_body_ik(
                 snapshot_halo_guard = _physical_nonregression_decision(
                     before_chunk,
                     snapshot_audit,
+                    reason_prefix="audit_halo_metric_regressed",
+                    scope="transaction_audit_halo",
                 )
                 rank, summary = _exact_audit_candidate_rank(
                     before_objective,
@@ -12196,11 +12223,38 @@ def true_lower_body_ik(
                         + list(blocking_absolute_reasons)
                     ),
                 )
+                scope_delta = np.max(np.abs(trial - final), axis=1)
+                scope_outside = np.ones(T, dtype=bool)
+                scope_outside[own_start:own_end] = False
+                scope_changed_outside = np.flatnonzero(
+                    scope_outside & (scope_delta > 1.0e-6)
+                )
+                scope_audit = {
+                    "active_span": [int(own_start), int(own_end)],
+                    "max_delta_inside": float(
+                        scope_delta[own_start:own_end].max()
+                        if own_end > own_start else 0.0
+                    ),
+                    "max_delta_outside": float(
+                        scope_delta[scope_outside].max()
+                        if scope_outside.any() else 0.0
+                    ),
+                    "changed_frames_outside": (
+                        scope_changed_outside.astype(int).tolist()
+                    ),
+                    "accepted": bool(scope_changed_outside.size == 0),
+                }
+                if not scope_audit["accepted"]:
+                    relative_reasons.append(
+                        "scope:candidate_changed_outside_owner"
+                    )
                 blocking_reasons = list(dict.fromkeys(
                     relative_reasons
                     + blocking_absolute_reasons
                     + list(kbo_reasons)
                 ))
+                if not scope_audit["accepted"]:
+                    blocking_reasons.append("scope:candidate_changed_outside_owner")
                 rank = exact_rank
                 committed = not blocking_reasons
                 attempt = {
@@ -12218,6 +12272,7 @@ def true_lower_body_ik(
                     "absolute_reasons": absolute_reasons,
                     "blocking_absolute_reasons": blocking_absolute_reasons,
                     "kbo_reasons": list(kbo_reasons),
+                    "scope_audit": scope_audit,
                     "exact_audit": exact_summary,
                     "ownership_span": [int(own_start), int(own_end)],
                     "audit_span": [int(audit_start), int(audit_end)],

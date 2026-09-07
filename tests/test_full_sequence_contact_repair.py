@@ -8,10 +8,15 @@ from training.motion_models import (
     MotionGenerationConfig,
     _c2_transaction_weight,
     _contact_restoration_decision,
+    _exact_audit_candidate_rank,
     _partition_repair_windows_by_support_phase,
     _physical_nonregression_decision,
     evaluate_fixed_support_contact_candidate_np,
     full_sequence_physical_diagnostics_np,
+)
+from training.generation_stage_diagnostics import (
+    _boundary_nonregression,
+    _motion_scope_audit,
 )
 
 
@@ -152,3 +157,70 @@ def test_v11_marks_too_short_c2_support_phases_ineligible():
     assert partitions[1]["support_phase"] == "left_support"
     assert partitions[1]["minimum_solver_frames"] == 7
     assert partitions[1]["solver_eligible"] is False
+
+
+def test_local_boundary_audit_ignores_unrelated_slots():
+    before = [
+        {
+            "slot": 1,
+            "transition_start": 0,
+            "transition_end": 4,
+            "content_start": 4,
+            "content_end": 10,
+            "actual_boundary_jerk_mps3": 1.0,
+        },
+        {
+            "slot": 23,
+            "transition_start": 220,
+            "transition_end": 224,
+            "content_start": 224,
+            "content_end": 240,
+            "actual_boundary_jerk_mps3": 1.0,
+        },
+    ]
+    candidate = [dict(row) for row in before]
+    candidate[0]["actual_boundary_jerk_mps3"] = 2.0
+    decision = _boundary_nonregression(
+        before,
+        candidate,
+        active_span=[220, 230],
+    )
+    assert decision["accepted"] is True
+    assert decision["evaluated_slots"] == [23]
+    assert decision["ignored_slots"] == [1]
+
+
+def test_local_motion_scope_rejects_out_of_owner_changes():
+    before = np.zeros((12, 3), dtype=np.float32)
+    candidate = before.copy()
+    candidate[5, 1] = 0.25
+    candidate[2, 0] = 0.5
+    decision = _motion_scope_audit(before, candidate, [4, 8])
+    assert decision["accepted"] is False
+    assert decision["changed_frames_inside"] == [5]
+    assert decision["changed_frames_outside"] == [2]
+
+
+def test_exact_audit_records_numeric_metrics_and_residuals():
+    cfg = MotionGenerationConfig()
+    before = {
+        "foot_penetration_min_m": -0.10,
+        "foot_skate_mps_p95": 0.40,
+        "foot_skate_mps_max": 0.80,
+        "foot_support_drift_m_p95": 0.10,
+        "foot_support_drift_m_max": 0.20,
+        "joint_jerk_mps3_max": 100.0,
+    }
+    candidate = dict(before)
+    candidate["foot_penetration_min_m"] = -0.08
+    rank, summary = _exact_audit_candidate_rank(
+        before,
+        candidate,
+        cfg,
+        optimization_loss=1.0,
+    )
+    assert len(rank) == 6
+    assert summary["before_metrics"]["foot_penetration_min_m"] == -0.10
+    assert summary["candidate_metrics"]["foot_penetration_min_m"] == -0.08
+    assert "foot_penetration_min_m" in summary["metric_delta"]
+    assert "foot_penetration_min_m" in summary["before_residuals"]
