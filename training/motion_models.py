@@ -14,6 +14,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import hashlib
+from itertools import combinations
 import json
 import math
 import os
@@ -11063,7 +11064,16 @@ def _finite_difference_cone_sources(
     cfg: MotionGenerationConfig,
     ownership_eligible: np.ndarray,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
-    """Build an adaptive cone using measured hard/contact derivatives."""
+    """Build a global sparse cone from measured local derivatives.
+
+    The old implementation selected one pair of blocks at a time.  That can
+    miss a feasible direction when contact improvement needs three coupled
+    blocks while jerk must be cancelled by a different block.  This helper
+    keeps the same signed finite-difference basis, but evaluates every
+    one-, two-, and three-direction non-negative combination using the actual
+    local audit derivatives.  Only the best candidates are materialized; the
+    complete combination counts and rejected constraints remain in metadata.
+    """
 
     if not finite_difference_sources:
         return []
@@ -11076,21 +11086,47 @@ def _finite_difference_cone_sources(
     limits = PhysicalQualityLimits.from_environment()
     policy = StageAcceptancePolicy.from_environment()
     specs = physical_metric_specs(limits, policy)
-    contact_keys = {
-        "foot_penetration_min_m",
+    contact_keys = (
         "foot_skate_mps_p95",
         "foot_skate_mps_max",
         "foot_support_drift_m_p95",
         "foot_support_drift_m_max",
-    }
+        "foot_penetration_min_m",
+    )
+    before_eligible = np.asarray(ownership_eligible, dtype=bool)
     before_audit = audit_motion_np(
         base[start:end],
         cfg,
-        sliding_support_eligible=np.asarray(ownership_eligible, dtype=bool),
+        sliding_support_eligible=before_eligible,
     )
     before_residuals = _physical_residuals(before_audit, limits)
 
-    def hard_derivatives(audit: Mapping[str, Any]) -> Dict[str, float]:
+    # These two seam metrics are derived from the actual FK trajectory in the
+    # ownership window.  They are intentionally kept separate from the
+    # physical registry so a cone candidate cannot hide a local boundary or
+    # fidelity-seam jerk increase behind a duplicated registry key.
+    def seam_metrics(value: np.ndarray) -> Dict[str, float]:
+        local = np.asarray(value, dtype=np.float32)
+        joints = fk_24_np(local)
+        if len(joints) < 4:
+            return {"boundary_jerk": 0.0, "fidelity_seam_jerk": 0.0}
+        jerk = np.linalg.norm(
+            np.diff(joints, n=3, axis=0) * float(cfg.fps) ** 3,
+            axis=-1,
+        ).max(axis=-1)
+        edge = max(2, min(8, len(jerk) // 2))
+        edge_values = np.concatenate((jerk[:edge], jerk[-edge:]))
+        return {
+            "boundary_jerk": float(np.max(edge_values)),
+            "fidelity_seam_jerk": float(np.percentile(edge_values, 95)),
+        }
+
+    before_seam = seam_metrics(base[start:end])
+
+    def hard_derivatives(
+        audit: Mapping[str, Any],
+        seam: Mapping[str, float],
+    ) -> Dict[str, float]:
         values: Dict[str, float] = {}
         for spec in specs:
             if spec.key in contact_keys:
@@ -11103,173 +11139,239 @@ def _finite_difference_cone_sources(
             scale = max(abs(float(spec.absolute_limit)), 1.0e-3)
             signed = new - old if spec.direction == "high" else old - new
             values[spec.key] = float(signed / scale)
+        for key, value in seam.items():
+            old = float(before_seam[key])
+            scale = max(abs(old), 1.0)
+            values[key] = float((float(value) - old) / scale)
         return values
 
-    profiles: Dict[Tuple[str, int], Dict[str, Any]] = {}
-
     indexed: Dict[Tuple[str, int], Tuple[str, np.ndarray, Dict[str, Any]]] = {}
+    profiles: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for source in finite_difference_sources:
         metadata = source[2]
         block = str(metadata.get("direction_block", ""))
         sign = int(metadata.get("direction_sign", 0))
-        if block and sign in (-1, 1):
-            indexed.setdefault((block, sign), source)
-            source_audit = audit_motion_np(
-                source[1][start:end],
-                cfg,
-                sliding_support_eligible=np.asarray(
-                    ownership_eligible,
-                    dtype=bool,
-                ),
+        if not block or sign not in (-1, 1):
+            continue
+        key = (block, sign)
+        if key in indexed:
+            continue
+        indexed[key] = source
+        source_audit = audit_motion_np(
+            source[1][start:end],
+            cfg,
+            sliding_support_eligible=before_eligible,
+        )
+        source_residuals = _physical_residuals(source_audit, limits)
+        source_seam = seam_metrics(source[1][start:end])
+        profiles[key] = {
+            "contact_derivative": {
+                metric: float(source_residuals[metric] - before_residuals[metric])
+                for metric in contact_keys
+            },
+            "hard_derivative": hard_derivatives(source_audit, source_seam),
+            "raw_seam_metrics": source_seam,
+        }
+
+    directions = sorted(indexed, key=lambda item: (item[0], item[1]))
+    if not directions:
+        return []
+
+    def coefficient_candidates(size: int) -> List[Tuple[float, ...]]:
+        if size == 1:
+            return [(1.0,)]
+        # Sixteenth fractions are deliberately aligned with the transaction
+        # backtracking ladder.  Every coefficient is non-negative and sums to
+        # one; backtracking later supplies the overall safe amplitude.
+        output: List[Tuple[float, ...]] = []
+        units = 16
+        if size == 2:
+            for left in range(1, units):
+                output.append((left / units, (units - left) / units))
+        elif size == 3:
+            for first in range(1, units - 1):
+                for second in range(1, units - first):
+                    third = units - first - second
+                    if third >= 1:
+                        output.append((
+                            first / units,
+                            second / units,
+                            third / units,
+                        ))
+        return output
+
+    def derivative_sum(
+        combo: Sequence[Tuple[str, int]],
+        coefficients: Sequence[float],
+        field: str,
+    ) -> Dict[str, float]:
+        keys = set()
+        for direction in combo:
+            keys.update(profiles[direction][field])
+        return {
+            key: float(sum(
+                float(coefficient)
+                * float(profiles[direction][field].get(key, float("inf")))
+                for coefficient, direction in zip(coefficients, combo)
+            ))
+            for key in sorted(keys)
+        }
+
+    def evaluate_combination(
+        combo: Sequence[Tuple[str, int]],
+        coefficients: Sequence[float],
+    ) -> Dict[str, Any]:
+        contact_derivative = derivative_sum(
+            combo, coefficients, "contact_derivative"
+        )
+        hard_derivative = derivative_sum(
+            combo, coefficients, "hard_derivative"
+        )
+        contact_regression = sum(
+            max(0.0, value - 1.0e-8)
+            for value in contact_derivative.values()
+        )
+        hard_regression = sum(
+            1.0e6
+            if not np.isfinite(value)
+            else max(0.0, value - 1.0e-8)
+            for value in hard_derivative.values()
+        )
+        meaningful_metrics = {
+            key: float(value)
+            for key, value in contact_derivative.items()
+            if value <= -max(
+                1.0e-7,
+                before_residuals[key]
+                * float(cfg.full_sequence_contact_repair_min_gain),
             )
-            source_residuals = _physical_residuals(source_audit, limits)
-            profiles[(block, sign)] = {
-                "contact_derivative": {
-                    key: float(source_residuals[key] - before_residuals[key])
-                    for key in contact_keys
-                },
-                "hard_derivative": hard_derivatives(source_audit),
-            }
-    pair_blocks = (
-        ("root", "hips"),
-        ("root", "knees"),
-        ("root", "ankles"),
-        ("root", "left_foot"),
-        ("root", "right_foot"),
-        ("knees", "ankles"),
+        }
+        derivative_feasible = bool(
+            meaningful_metrics
+            and contact_regression <= 1.0e-8
+            and hard_regression <= 1.0e-8
+        )
+        contact_gain = sum(
+            max(0.0, -value)
+            / max(before_residuals[key], 1.0e-7)
+            for key, value in contact_derivative.items()
+        )
+        score = (
+            0 if derivative_feasible else 1,
+            float(hard_regression),
+            float(contact_regression),
+            -float(contact_gain),
+            -float(len(meaningful_metrics)),
+        )
+        return {
+            "score": score,
+            "contact_derivative": contact_derivative,
+            "hard_derivative": hard_derivative,
+            "meaningful_contact_metrics": meaningful_metrics,
+            "derivative_feasible": derivative_feasible,
+        }
+
+    records: List[Dict[str, Any]] = []
+    combination_count = 0
+    feasible_records: List[Dict[str, Any]] = []
+    rejected_constraint_counts: Dict[str, int] = {}
+    for size in (1, 2, 3):
+        for combo in combinations(directions, size):
+            for coefficients in coefficient_candidates(size):
+                combination_count += 1
+                evaluated = evaluate_combination(combo, coefficients)
+                record = {
+                    "combo": combo,
+                    "coefficients": coefficients,
+                    **evaluated,
+                }
+                records.append(record)
+                if evaluated["derivative_feasible"]:
+                    feasible_records.append(record)
+                else:
+                    for key, value in evaluated[
+                        "hard_derivative"
+                    ].items():
+                        if not np.isfinite(value) or value > 1.0e-8:
+                            rejected_constraint_counts[key] = (
+                                rejected_constraint_counts.get(key, 0) + 1
+                            )
+                    if not evaluated["meaningful_contact_metrics"]:
+                        rejected_constraint_counts[
+                            "contact_improvement"
+                        ] = rejected_constraint_counts.get(
+                            "contact_improvement", 0
+                        ) + 1
+
+    global_cone_feasible = bool(feasible_records)
+    feasible_records.sort(key=lambda item: item["score"])
+    records.sort(key=lambda item: item["score"])
+    # Materialize only a bounded diagnostic frontier.  The derivative search
+    # still enumerates every combination, while candidate auditing remains
+    # tractable and retains the best feasible directions first.
+    selected_records = (
+        feasible_records[:32]
+        if global_cone_feasible
+        else records[:32]
     )
-    combinations = ((-1, 1), (1, -1))
-    coefficient_grid = (
-        (0.125, 0.875),
-        (0.25, 0.75),
-        (0.5, 0.5),
-        (0.75, 0.25),
-        (0.875, 0.125),
-    )
+    feasible_direction_sources = [
+        [f"{block}:{sign}" for block, sign in record["combo"]]
+        for record in feasible_records[:32]
+    ]
     output: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
-    for left_block, right_block in pair_blocks:
-        for left_sign, right_sign in combinations:
-            left = indexed.get((left_block, left_sign))
-            right = indexed.get((right_block, right_sign))
-            if left is None or right is None:
-                continue
-            left_profile = profiles[(left_block, left_sign)]
-            right_profile = profiles[(right_block, right_sign)]
-            best = None
-            for left_coefficient, right_coefficient in coefficient_grid:
-                contact_derivative = {
-                    key: float(
-                        left_coefficient
-                        * left_profile["contact_derivative"][key]
-                        + right_coefficient
-                        * right_profile["contact_derivative"][key]
-                    )
-                    for key in contact_keys
-                }
-                hard_derivative = {
-                    key: float(
-                        left_coefficient * left_profile["hard_derivative"].get(
-                            key,
-                            float("inf"),
-                        )
-                        + right_coefficient * right_profile[
-                            "hard_derivative"
-                        ].get(key, float("inf"))
-                    )
-                    for key in set(left_profile["hard_derivative"])
-                    | set(right_profile["hard_derivative"])
-                }
-                contact_regression = sum(
-                    max(0.0, value - 1.0e-8)
-                    for value in contact_derivative.values()
-                )
-                hard_regression = sum(
-                    1.0e6
-                    if not np.isfinite(value)
-                    else max(0.0, value - 1.0e-8)
-                    for value in hard_derivative.values()
-                )
-                meaningful = any(
-                    value
-                    <= -max(
-                        1.0e-7,
-                        before_residuals[key]
-                        * float(cfg.full_sequence_contact_repair_min_gain),
-                    )
-                    for key, value in contact_derivative.items()
-                )
-                derivative_feasible = bool(
-                    meaningful
-                    and contact_regression <= 1.0e-8
-                    and hard_regression <= 1.0e-8
-                )
-                contact_gain = sum(
-                    max(0.0, -value)
-                    / max(before_residuals[key], 1.0e-7)
-                    for key, value in contact_derivative.items()
-                )
-                score = (
-                    0 if derivative_feasible else 1,
-                    float(hard_regression),
-                    float(contact_regression),
-                    -float(contact_gain),
-                )
-                item = {
-                    "score": score,
-                    "left_coefficient": left_coefficient,
-                    "right_coefficient": right_coefficient,
-                    "contact_derivative": contact_derivative,
-                    "hard_derivative": hard_derivative,
-                    "derivative_feasible": derivative_feasible,
-                }
-                if best is None or score < best["score"]:
-                    best = item
-            if best is None:
-                continue
-            left_delta = np.asarray(left[1], dtype=np.float32) - base
-            right_delta = np.asarray(right[1], dtype=np.float32) - base
-            candidate = base + (
-                float(best["left_coefficient"]) * left_delta
-                + float(best["right_coefficient"]) * right_delta
+    for record in selected_records:
+        combo = record["combo"]
+        coefficients = record["coefficients"]
+        candidate = base.copy()
+        for coefficient, direction in zip(coefficients, combo):
+            candidate += float(coefficient) * (
+                np.asarray(indexed[direction][1], dtype=np.float32) - base
             )
-            metadata = {
-                "direction_source": "finite_difference_cone",
-                "direction_blocks": [left_block, right_block],
-                "direction_signs": [left_sign, right_sign],
-                "direction_coefficients": [
-                    float(best["left_coefficient"]),
-                    float(best["right_coefficient"]),
-                ],
-                "probe_basis": "adaptive_signed_fd_cone",
-                "cone_derivative_feasible": bool(
-                    best["derivative_feasible"]
-                ),
-                "contact_residual_derivative": best["contact_derivative"],
-                "hard_metric_derivative": best["hard_derivative"],
-                "cone_derivative_score": list(map(float, best["score"])),
-                "ownership_span": list(left[2].get("ownership_span", [])),
-            }
-            span = metadata["ownership_span"]
-            if len(span) == 2:
-                start, end = map(int, span)
-                rotations = candidate[
-                    start:end,
-                    ROT6D_START:ROT6D_END,
-                ].reshape(end - start, NUM_JOINTS, 6)
-                candidate[start:end, ROT6D_START:ROT6D_END] = (
-                    matrix_to_rot6d_np(rot6d_to_matrix_np(rotations)).reshape(
-                        end - start,
-                        -1,
-                    )
-                )
-            output.append(
-                (
-                    "finite_difference_cone:"
-                    f"{left_block}{left_sign}:{right_block}{right_sign}",
-                    candidate.astype(np.float32),
-                    metadata,
-                )
+        rotations = candidate[start:end, ROT6D_START:ROT6D_END].reshape(
+            end - start, NUM_JOINTS, 6
+        )
+        candidate[start:end, ROT6D_START:ROT6D_END] = (
+            matrix_to_rot6d_np(rot6d_to_matrix_np(rotations)).reshape(
+                end - start,
+                -1,
             )
+        )
+        blocks = [block for block, _ in combo]
+        signs = [int(sign) for _, sign in combo]
+        metadata = {
+            "direction_source": "finite_difference_cone",
+            "direction_blocks": blocks,
+            "direction_signs": signs,
+            "direction_coefficients": [float(value) for value in coefficients],
+            "probe_basis": "global_sparse_adaptive_signed_fd_cone",
+            "cone_derivative_feasible": bool(record["derivative_feasible"]),
+            "global_cone_feasible": global_cone_feasible,
+            "feasible_direction_count": int(len(feasible_records)),
+            "selected_direction_sources": feasible_direction_sources,
+            "contact_residual_derivative": record["contact_derivative"],
+            "hard_metric_derivative": record["hard_derivative"],
+            "meaningful_contact_metrics": record[
+                "meaningful_contact_metrics"
+            ],
+            "rejected_constraint_counts": dict(
+                sorted(
+                    rejected_constraint_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ),
+            "enumerated_combination_count": int(combination_count),
+            "enumerated_direction_count": int(len(directions)),
+            "cone_derivative_score": list(map(float, record["score"])),
+            "ownership_span": list(indexed[combo[0]][2].get("ownership_span", [])),
+            "probe_step": 1.0,
+        }
+        output.append((
+            "finite_difference_cone:" + ":".join(
+                f"{block}{sign}" for block, sign in combo
+            ),
+            candidate.astype(np.float32),
+            metadata,
+        ))
     return output
 
 
@@ -12629,14 +12731,15 @@ def true_lower_body_ik(
                 cfg,
             )
             source_candidates.extend(finite_difference_sources)
-            source_candidates.extend(
-                _finite_difference_cone_sources(
-                    final,
-                    finite_difference_sources,
-                    cfg,
-                    ownership_eligible,
-                )
+            cone_sources = _finite_difference_cone_sources(
+                final,
+                finite_difference_sources,
+                cfg,
+                ownership_eligible,
             )
+            source_candidates.extend(cone_sources)
+        else:
+            cone_sources = []
         factors = (
             tuple(cfg.full_sequence_contact_repair_backtracking_factors)
             if v11_mode
@@ -12989,6 +13092,23 @@ def true_lower_body_ik(
             "foot_support_drift_m_max",
             "foot_penetration_min_m",
         )
+        cone_rejected_counts_local: Dict[str, int] = {}
+        cone_selected_sources_local: List[Any] = []
+        for _, _, metadata in cone_sources:
+            for key, count in (
+                metadata.get("rejected_constraint_counts", {}) or {}
+            ).items():
+                cone_rejected_counts_local[str(key)] = (
+                    cone_rejected_counts_local.get(str(key), 0) + int(count)
+                )
+            if bool(metadata.get("cone_derivative_feasible", False)):
+                cone_selected_sources_local.append({
+                    "blocks": list(metadata.get("direction_blocks", [])),
+                    "signs": list(metadata.get("direction_signs", [])),
+                    "coefficients": list(
+                        metadata.get("direction_coefficients", [])
+                    ),
+                })
         transaction_reports.append(
             {
                 "start": int(own_start),
@@ -13023,6 +13143,22 @@ def true_lower_body_ik(
                         selected_state["attempt"]["backtracking_factor"]
                     ),
                     "selected_rank": list(map(float, selected_state["rank"])),
+                    "global_cone_feasible": bool(any(
+                        bool(metadata.get("global_cone_feasible", False))
+                        for _, _, metadata in cone_sources
+                    )),
+                    "feasible_direction_count": int(max(
+                        (
+                            int(metadata.get("feasible_direction_count", 0))
+                            for _, _, metadata in cone_sources
+                        ),
+                        default=0,
+                    )),
+                    "selected_direction_sources": cone_selected_sources_local,
+                    "rejected_constraint_counts": dict(sorted(
+                        cone_rejected_counts_local.items(),
+                        key=lambda item: (-int(item[1]), str(item[0])),
+                    )),
                     "attempts": candidate_attempts,
                 },
                 "post_commit_relocalization": post_commit_localization,
@@ -13096,6 +13232,46 @@ def true_lower_body_ik(
             cfg,
             sliding_support_eligible=eligible,
         )
+    cone_selection_reports = [
+        transaction.get("candidate_selection", {})
+        for transaction in transaction_reports
+        if isinstance(transaction.get("candidate_selection", {}), Mapping)
+    ]
+    cone_rejected_counts: Dict[str, int] = {}
+    cone_selected_sources: List[Any] = []
+    for selection in cone_selection_reports:
+        for key, value in (
+            selection.get("rejected_constraint_counts", {}) or {}
+        ).items():
+            cone_rejected_counts[str(key)] = (
+                cone_rejected_counts.get(str(key), 0) + int(value)
+            )
+        cone_selected_sources.extend(
+            selection.get("selected_direction_sources", []) or []
+        )
+    global_sparse_cone = {
+        "global_cone_feasible": bool(any(
+            bool(selection.get("global_cone_feasible", False))
+            for selection in cone_selection_reports
+        )),
+        "feasible_direction_count": int(sum(
+            int(selection.get("feasible_direction_count", 0))
+            for selection in cone_selection_reports
+        )),
+        "selected_direction_sources": cone_selected_sources,
+        "rejected_constraint_counts": dict(sorted(
+            cone_rejected_counts.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )),
+        "status": (
+            "feasible_direction_found"
+            if any(
+                bool(selection.get("global_cone_feasible", False))
+                for selection in cone_selection_reports
+            )
+            else "local_infeasible_under_current_action_basis"
+        ),
+    }
     report = {
         "version": "lower_body_ik_contact_transactions",
         "protocol": (
@@ -13168,6 +13344,7 @@ def true_lower_body_ik(
             "ownership_overlap_frames": int(overlap),
             "transactions": transaction_reports,
         },
+        "global_sparse_cone": global_sparse_cone,
         "local_infeasibility": {
             "status": (
                 "local_infeasible_under_current_action_basis"

@@ -67,6 +67,9 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
     scope_violations = []
     finite_difference = []
     finite_difference_cone = []
+    cone_feasible = []
+    selected_direction_sources = []
+    rejected_constraint_counts: Dict[str, int] = {}
     for attempt in attempts:
         exact = attempt.get("exact_audit", {}) or {}
         has_numeric = bool(
@@ -82,6 +85,18 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
             finite_difference.append(attempt)
         if attempt.get("direction_source") == "finite_difference_cone":
             finite_difference_cone.append(attempt)
+            exact_fd = exact.get("finite_difference", {}) or {}
+            if bool(exact_fd.get("global_cone_feasible", False)):
+                cone_feasible.append(attempt)
+            for key, count in (
+                exact_fd.get("rejected_constraint_counts", {}) or {}
+            ).items():
+                rejected_constraint_counts[str(key)] = (
+                    rejected_constraint_counts.get(str(key), 0) + int(count)
+                )
+            selected_direction_sources.extend(
+                exact_fd.get("selected_direction_sources", []) or []
+            )
         scope = attempt.get("scope_audit", {}) or {}
         if scope.get("changed_frames_outside"):
             scope_violations.append(scope)
@@ -102,6 +117,13 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
         "finite_difference_cone_direction_count": len(
             finite_difference_cone
         ),
+        "global_cone_feasible": bool(cone_feasible),
+        "feasible_direction_count": int(len(cone_feasible)),
+        "selected_direction_sources": selected_direction_sources,
+        "rejected_constraint_counts": dict(sorted(
+            rejected_constraint_counts.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )),
         "local_feasibility_status": (
             "feasible_direction_found"
             if accepted
