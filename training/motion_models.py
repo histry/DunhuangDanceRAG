@@ -10106,6 +10106,16 @@ def smootherstep01(x: np.ndarray | float) -> np.ndarray | float:
     return out.astype(np.float32)
 
 
+def septicstep01(x: np.ndarray | float) -> np.ndarray | float:
+    """Septic C3 taper with zero value through third derivative at both ends."""
+
+    y = np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
+    out = y**4 * (35.0 - 84.0 * y + 70.0 * y**2 - 20.0 * y**3)
+    if np.isscalar(x):
+        return float(out)
+    return out.astype(np.float32)
+
+
 def _c2_transaction_weight(
     length: int,
     *,
@@ -10137,6 +10147,43 @@ def _c2_transaction_weight(
             weight[-taper:-frozen if frozen else None, 0] = np.minimum(
                 weight[-taper:-frozen if frozen else None, 0],
                 smootherstep01(
+                    np.linspace(1.0, 0.0, active, dtype=np.float32)
+                ),
+            )
+    return weight
+
+
+def _c3_transaction_weight(
+    length: int,
+    *,
+    fade: int,
+    freeze_edges: int,
+    has_left_context: bool,
+    has_right_context: bool,
+) -> np.ndarray:
+    """Return a jerk-safer C3 edit envelope with frozen edge frames."""
+
+    size = max(0, int(length))
+    weight = np.ones((size, 1), dtype=np.float32)
+    if size == 0:
+        return weight
+    frozen = min(max(0, int(freeze_edges)), max(0, size // 2))
+    taper = min(max(frozen + 1, int(fade)), max(1, size // 2))
+    if has_left_context:
+        weight[:frozen, 0] = 0.0
+        active = taper - frozen
+        if active > 0:
+            weight[frozen:taper, 0] = septicstep01(
+                np.linspace(0.0, 1.0, active, dtype=np.float32)
+            )
+    if has_right_context:
+        if frozen:
+            weight[-frozen:, 0] = 0.0
+        active = taper - frozen
+        if active > 0:
+            weight[-taper:-frozen if frozen else None, 0] = np.minimum(
+                weight[-taper:-frozen if frozen else None, 0],
+                septicstep01(
                     np.linspace(1.0, 0.0, active, dtype=np.float32)
                 ),
             )
@@ -10871,7 +10918,11 @@ def _finite_difference_contact_direction_sources(
     if end <= start:
         return []
     span = end - start
-    envelope = _c2_transaction_weight(
+    # Finite-difference probes are used to estimate contact derivatives.  A
+    # C3 envelope keeps position, velocity, acceleration, and the first jerk
+    # transition continuous, preventing the probe itself from manufacturing
+    # a boundary jerk peak.
+    envelope = _c3_transaction_weight(
         span,
         fade=min(
             max(
@@ -10986,7 +11037,11 @@ def _local_infeasibility_diagnosis(
     reasons: Dict[str, int] = {}
     contact_reasons: Dict[str, int] = {}
     hard_reasons: Dict[str, int] = {}
+    contact_improving_attempts = 0
     for attempt in attempts:
+        exact_audit = attempt.get("exact_audit", {})
+        if exact_audit.get("meaningful_contact_metrics"):
+            contact_improving_attempts += 1
         for reason in attempt.get("blocking_reasons", ()):
             key = str(reason)
             reasons[key] = reasons.get(key, 0) + 1
@@ -10994,10 +11049,16 @@ def _local_infeasibility_diagnosis(
                 contact_reasons[key] = contact_reasons.get(key, 0) + 1
             if key.startswith(("hard_metric_regressed:", "audit_halo_metric_regressed:")):
                 hard_reasons[key] = hard_reasons.get(key, 0) + 1
+    if contact_improving_attempts:
+        blocking_class = "contact_direction_found_but_hard_constraints_blocked"
+    else:
+        blocking_class = "no_contact_improving_probe"
     return {
         "status": "local_infeasible_under_current_action_basis",
+        "blocking_class": blocking_class,
         "attempt_count": int(len(attempts)),
         "accepted_count": int(sum(bool(item.get("accepted")) for item in attempts)),
+        "contact_improving_attempt_count": int(contact_improving_attempts),
         "blocking_reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
         "contact_regressions": dict(sorted(contact_reasons.items(), key=lambda item: (-item[1], item[0]))),
         "hard_regressions": dict(sorted(hard_reasons.items(), key=lambda item: (-item[1], item[0]))),
@@ -11030,15 +11091,46 @@ def _contact_restoration_decision(
             "unknown exact-audit objective metrics: "
             + ", ".join(missing_objectives)
         )
-    dominant = max(objective_keys, key=lambda key: before_residuals[key])
+    contact_gains = {
+        key: float(before_residuals[key] - after_residuals[key])
+        for key in objective_keys
+    }
+    required_by_metric = {
+        key: max(
+            1.0e-7,
+            float(before_residuals[key])
+            * float(cfg.full_sequence_contact_repair_min_gain),
+        )
+        for key in objective_keys
+    }
+    normalized_gains = {
+        key: float(contact_gains[key])
+        / max(float(before_residuals[key]), 1.0e-7)
+        for key in objective_keys
+    }
+    meaningful_metrics = [
+        key
+        for key in objective_keys
+        if float(before_residuals[key]) > 0.0
+        and contact_gains[key] >= required_by_metric[key]
+    ]
+    # Select the metric that the candidate actually repairs.  The previous
+    # rule selected the largest residual before the edit, which rejected a
+    # valid skate/penetration improvement whenever another contact metric was
+    # numerically larger but not reachable by this action basis.
+    dominant = max(
+        objective_keys,
+        key=lambda key: (
+            normalized_gains[key],
+            contact_gains[key],
+            -float(before_residuals[key]),
+        ),
+    )
     before_dominant = float(before_residuals[dominant])
     after_dominant = float(after_residuals[dominant])
-    required = max(
-        1.0e-7,
-        before_dominant * float(cfg.full_sequence_contact_repair_min_gain),
-    )
+    required = float(required_by_metric[dominant])
     reasons: List[str] = []
-    if before_dominant <= 0.0 or before_dominant - after_dominant < required:
+    if not meaningful_metrics:
         reasons.append("dominant_contact_residual_not_meaningfully_improved")
     for key in contact_keys:
         tolerance = max(1.0e-7, before_residuals[key] * 1.0e-6)
@@ -11069,6 +11161,10 @@ def _contact_restoration_decision(
         "reasons": list(dict.fromkeys(reasons)),
         "dominant_contact_metric": dominant,
         "objective_metrics": list(objective_keys),
+        "meaningful_contact_metrics": list(meaningful_metrics),
+        "contact_gains": contact_gains,
+        "normalized_contact_gains": normalized_gains,
+        "required_gain_by_metric": required_by_metric,
         "required_dominant_gain": float(required),
         "before_residuals": before_residuals,
         "candidate_residuals": after_residuals,
@@ -11220,6 +11316,17 @@ def _exact_audit_candidate_rank(
         ),
         "dominant_contact_residual_candidate": dominant_after,
         "required_dominant_gain": float(decision["required_dominant_gain"]),
+        "meaningful_contact_metrics": list(
+            decision.get("meaningful_contact_metrics", [])
+        ),
+        "contact_gains": {
+            key: float(value)
+            for key, value in decision.get("contact_gains", {}).items()
+        },
+        "normalized_contact_gains": {
+            key: float(value)
+            for key, value in decision.get("normalized_contact_gains", {}).items()
+        },
         # Keep raw metrics and normalized residuals together.  Reason strings
         # alone cannot distinguish a real numeric regression from a scope or
         # reporting error, especially for local ownership-window candidates.
