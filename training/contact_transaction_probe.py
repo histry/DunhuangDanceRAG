@@ -66,6 +66,7 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
     accepted = []
     scope_violations = []
     finite_difference = []
+    finite_difference_cone = []
     for attempt in attempts:
         exact = attempt.get("exact_audit", {}) or {}
         has_numeric = bool(
@@ -79,6 +80,8 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
             accepted.append(attempt)
         if attempt.get("direction_source") == "finite_difference":
             finite_difference.append(attempt)
+        if attempt.get("direction_source") == "finite_difference_cone":
+            finite_difference_cone.append(attempt)
         scope = attempt.get("scope_audit", {}) or {}
         if scope.get("changed_frames_outside"):
             scope_violations.append(scope)
@@ -96,6 +99,9 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
         "numeric_audit_complete": len(numeric) == len(attempts),
         "local_solver_direction_exists": bool(accepted),
         "finite_difference_direction_count": len(finite_difference),
+        "finite_difference_cone_direction_count": len(
+            finite_difference_cone
+        ),
         "local_feasibility_status": (
             "feasible_direction_found"
             if accepted

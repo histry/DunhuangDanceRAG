@@ -11055,6 +11055,75 @@ def _finite_difference_contact_direction_sources(
     return sources
 
 
+def _finite_difference_cone_sources(
+    base: np.ndarray,
+    finite_difference_sources: Sequence[
+        Tuple[str, np.ndarray, Dict[str, Any]]
+    ],
+) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
+    """Build a small deterministic cone basis from signed FD directions."""
+
+    indexed: Dict[Tuple[str, int], Tuple[str, np.ndarray, Dict[str, Any]]] = {}
+    for source in finite_difference_sources:
+        metadata = source[2]
+        block = str(metadata.get("direction_block", ""))
+        sign = int(metadata.get("direction_sign", 0))
+        if block and sign in (-1, 1):
+            indexed.setdefault((block, sign), source)
+    pair_blocks = (
+        ("root", "hips"),
+        ("root", "knees"),
+        ("root", "ankles"),
+        ("root", "left_foot"),
+        ("root", "right_foot"),
+        ("knees", "ankles"),
+    )
+    combinations = (
+        (-1, 1),
+        (1, -1),
+    )
+    output: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
+    for left_block, right_block in pair_blocks:
+        for left_sign, right_sign in combinations:
+            left = indexed.get((left_block, left_sign))
+            right = indexed.get((right_block, right_sign))
+            if left is None or right is None:
+                continue
+            left_delta = np.asarray(left[1], dtype=np.float32) - base
+            right_delta = np.asarray(right[1], dtype=np.float32) - base
+            candidate = base + 0.5 * (left_delta + right_delta)
+            metadata = {
+                "direction_source": "finite_difference_cone",
+                "direction_blocks": [left_block, right_block],
+                "direction_signs": [left_sign, right_sign],
+                "direction_coefficients": [0.5, 0.5],
+                "probe_basis": "pairwise_signed_fd_cone",
+                "ownership_span": list(left[2].get("ownership_span", [])),
+            }
+            span = metadata["ownership_span"]
+            if len(span) == 2:
+                start, end = map(int, span)
+                rotations = candidate[
+                    start:end,
+                    ROT6D_START:ROT6D_END,
+                ].reshape(end - start, NUM_JOINTS, 6)
+                candidate[start:end, ROT6D_START:ROT6D_END] = (
+                    matrix_to_rot6d_np(rot6d_to_matrix_np(rotations)).reshape(
+                        end - start,
+                        -1,
+                    )
+                )
+            output.append(
+                (
+                    "finite_difference_cone:"
+                    f"{left_block}{left_sign}:{right_block}{right_sign}",
+                    candidate.astype(np.float32),
+                    metadata,
+                )
+            )
+    return output
+
+
 def _local_infeasibility_diagnosis(
     attempts: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
@@ -12403,14 +12472,16 @@ def true_lower_body_ik(
                 )
             )
         if v11_mode:
+            finite_difference_sources = _finite_difference_contact_direction_sources(
+                final,
+                raw_out_all,
+                own_start,
+                own_end,
+                cfg,
+            )
+            source_candidates.extend(finite_difference_sources)
             source_candidates.extend(
-                _finite_difference_contact_direction_sources(
-                    final,
-                    raw_out_all,
-                    own_start,
-                    own_end,
-                    cfg,
-                )
+                _finite_difference_cone_sources(final, finite_difference_sources)
             )
         factors = (
             tuple(cfg.full_sequence_contact_repair_backtracking_factors)
