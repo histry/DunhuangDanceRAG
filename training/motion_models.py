@@ -12145,7 +12145,7 @@ def true_lower_body_ik(
                     ),
                     max(1, (end - start) // 2),
                 )
-                envelope = _c2_transaction_weight(
+                envelope = _c3_transaction_weight(
                     end - start,
                     fade=fade,
                     freeze_edges=int(
@@ -12188,7 +12188,7 @@ def true_lower_body_ik(
             "applied": bool(passes > 0),
             "globally_safe": bool(stabilization_safe),
             "commit_scope": (
-                "support_phase_window_c2_candidate"
+                "support_phase_window_c3_candidate"
                 if v11_mode
                 else "local_transaction_candidate"
             ),
@@ -12310,7 +12310,7 @@ def true_lower_body_ik(
                 ),
                 max(1, (own_end - own_start) // 2),
             )
-            weight = _c2_transaction_weight(
+            weight = _c3_transaction_weight(
                 own_end - own_start,
                 fade=fade,
                 freeze_edges=frozen_edges,
