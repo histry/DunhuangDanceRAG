@@ -11313,6 +11313,8 @@ def _finite_difference_cone_sources(
         )
         static_support = states == STATIC_SUPPORT
         feet_xz = feet[..., (0, 2)]
+        root_xz = local[:, [ROOT_X_IDX, ROOT_Z_IDX]]
+        relative_feet_xz = feet_xz - root_xz[:, None, :]
         direction_by_side: Dict[str, np.ndarray] = {}
         side_columns = {
             "left": (0, 2),
@@ -11325,16 +11327,16 @@ def _finite_difference_cone_sources(
                 if segment_end - segment_start < 3:
                     continue
                 anchor_end = min(segment_end, segment_start + 3)
-                anchor_xz = np.mean(
-                    feet_xz[segment_start:anchor_end, columns],
+                anchor_relative_xz = np.mean(
+                    relative_feet_xz[segment_start:anchor_end, columns],
                     axis=(0, 1),
                 )
-                current_xz = np.mean(
-                    feet_xz[segment_start:segment_end, columns],
+                current_relative_xz = np.mean(
+                    relative_feet_xz[segment_start:segment_end, columns],
                     axis=1,
                 )
                 correction[segment_start:segment_end, (0, 2)] += (
-                    anchor_xz[None, :] - current_xz
+                    anchor_relative_xz[None, :] - current_relative_xz
                 )
                 current_y = np.mean(
                     feet[segment_start:segment_end, columns, 1],
