@@ -13094,21 +13094,31 @@ def true_lower_body_ik(
         )
         cone_rejected_counts_local: Dict[str, int] = {}
         cone_selected_sources_local: List[Any] = []
-        for _, _, metadata in cone_sources:
+        # Every materialized cone candidate carries the same aggregate search
+        # diagnostics.  Read that aggregate once instead of multiplying it by
+        # the number of backtracking candidates.
+        cone_metadata = [metadata for _, _, metadata in cone_sources]
+        if cone_metadata:
             for key, count in (
-                metadata.get("rejected_constraint_counts", {}) or {}
+                cone_metadata[0].get("rejected_constraint_counts", {}) or {}
             ).items():
-                cone_rejected_counts_local[str(key)] = (
-                    cone_rejected_counts_local.get(str(key), 0) + int(count)
-                )
-            if bool(metadata.get("cone_derivative_feasible", False)):
-                cone_selected_sources_local.append({
-                    "blocks": list(metadata.get("direction_blocks", [])),
-                    "signs": list(metadata.get("direction_signs", [])),
-                    "coefficients": list(
-                        metadata.get("direction_coefficients", [])
-                    ),
-                })
+                cone_rejected_counts_local[str(key)] = int(count)
+        seen_cone_sources = set()
+        for metadata in cone_metadata:
+            if not bool(metadata.get("cone_derivative_feasible", False)):
+                continue
+            source = {
+                "blocks": list(metadata.get("direction_blocks", [])),
+                "signs": list(metadata.get("direction_signs", [])),
+                "coefficients": list(
+                    metadata.get("direction_coefficients", [])
+                ),
+            }
+            source_key = json.dumps(source, sort_keys=True)
+            if source_key in seen_cone_sources:
+                continue
+            seen_cone_sources.add(source_key)
+            cone_selected_sources_local.append(source)
         transaction_reports.append(
             {
                 "start": int(own_start),

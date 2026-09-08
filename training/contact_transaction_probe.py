@@ -67,9 +67,7 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
     scope_violations = []
     finite_difference = []
     finite_difference_cone = []
-    cone_feasible = []
-    selected_direction_sources = []
-    rejected_constraint_counts: Dict[str, int] = {}
+    cone_derivative_feasible = []
     for attempt in attempts:
         exact = attempt.get("exact_audit", {}) or {}
         has_numeric = bool(
@@ -86,21 +84,27 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
         if attempt.get("direction_source") == "finite_difference_cone":
             finite_difference_cone.append(attempt)
             exact_fd = exact.get("finite_difference", {}) or {}
-            if bool(exact_fd.get("global_cone_feasible", False)):
-                cone_feasible.append(attempt)
-            for key, count in (
-                exact_fd.get("rejected_constraint_counts", {}) or {}
-            ).items():
-                rejected_constraint_counts[str(key)] = (
-                    rejected_constraint_counts.get(str(key), 0) + int(count)
-                )
-            selected_direction_sources.extend(
-                exact_fd.get("selected_direction_sources", []) or []
-            )
+            if bool(exact_fd.get("cone_derivative_feasible", False)):
+                cone_derivative_feasible.append(attempt)
         scope = attempt.get("scope_audit", {}) or {}
         if scope.get("changed_frames_outside"):
             scope_violations.append(scope)
     infeasibility = report.get("local_infeasibility", {}) or {}
+    cone_summary = report.get("global_sparse_cone", {}) or {}
+    selected_direction_sources = []
+    seen_sources = set()
+    for source in cone_summary.get("selected_direction_sources", []) or []:
+        key = json.dumps(source, ensure_ascii=False, sort_keys=True)
+        if key in seen_sources:
+            continue
+        seen_sources.add(key)
+        selected_direction_sources.append(source)
+    rejected_constraint_counts = {
+        str(key): int(value)
+        for key, value in (
+            cone_summary.get("rejected_constraint_counts", {}) or {}
+        ).items()
+    }
     return {
         "schema": "local_contact_transaction_probe_v1",
         "development_only": True,
@@ -117,8 +121,15 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
         "finite_difference_cone_direction_count": len(
             finite_difference_cone
         ),
-        "global_cone_feasible": bool(cone_feasible),
-        "feasible_direction_count": int(len(cone_feasible)),
+        "global_cone_feasible": bool(
+            cone_summary.get("global_cone_feasible", False)
+        ),
+        "feasible_direction_count": int(
+            cone_summary.get("feasible_direction_count", 0)
+        ),
+        "exact_derivative_feasible_attempt_count": int(
+            len(cone_derivative_feasible)
+        ),
         "selected_direction_sources": selected_direction_sources,
         "rejected_constraint_counts": dict(sorted(
             rejected_constraint_counts.items(),
