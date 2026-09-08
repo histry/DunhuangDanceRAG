@@ -11053,6 +11053,165 @@ def _finite_difference_contact_direction_sources(
                     },
                 )
             )
+
+    # Add temporal structure directions independently of the body-block
+    # directions above.  The global cone measures their real full-sequence
+    # jerk derivatives, so these are not proxy-loss corrections: they provide
+    # explicit seam and temporal degrees of freedom that can cancel a global
+    # p95 jerk increase while a body direction repairs contact.
+    temporal_indices = sorted({
+        index
+        for indices, _step in (
+            (root_indices, float(cfg.full_sequence_contact_repair_fd_root_step_m)),
+            *[
+                (
+                    [
+                        ROT6D_START + 6 * int(joint) + offset
+                        for joint in joints
+                        for offset in range(6)
+                    ],
+                    float(cfg.full_sequence_contact_repair_fd_rotation_step),
+                )
+                for _name, joints in joint_groups.items()
+            ],
+        )
+        for index in indices
+    })
+    aggregate = np.zeros_like(delta, dtype=np.float32)
+    if temporal_indices:
+        aggregate[:, temporal_indices] = _smooth_transaction_delta(
+            delta[:, temporal_indices]
+        )
+    aggregate_amplitude = float(np.max(np.abs(aggregate))) if aggregate.size else 0.0
+    if not np.isfinite(aggregate_amplitude) or aggregate_amplitude < min_delta:
+        aggregate.fill(0.0)
+        for index in temporal_indices:
+            if index in root_indices:
+                aggregate[:, index] = float(
+                    cfg.full_sequence_contact_repair_fd_root_step_m
+                )
+            else:
+                aggregate[:, index] = float(
+                    cfg.full_sequence_contact_repair_fd_rotation_step
+                )
+        aggregate_amplitude = float(np.max(np.abs(aggregate))) if aggregate.size else 0.0
+        aggregate_kind = "synthetic_temporal_basis"
+    else:
+        aggregate *= float(cfg.full_sequence_contact_repair_fd_rotation_step) / max(
+            aggregate_amplitude,
+            min_delta,
+        )
+        aggregate_amplitude = float(np.max(np.abs(aggregate)))
+        aggregate_kind = "optimizer_delta_temporal_basis"
+
+    def temporal_filter(values: np.ndarray, kernel: Sequence[float]) -> np.ndarray:
+        coefficients = np.asarray(kernel, dtype=np.float32)
+        coefficients = coefficients / max(
+            float(np.sum(np.abs(coefficients))),
+            min_delta,
+        )
+        pad = len(coefficients) // 2
+        padded = np.pad(
+            values,
+            [(pad, pad)] + [(0, 0)] * (values.ndim - 1),
+            mode="edge",
+        )
+        filtered = np.zeros_like(values, dtype=np.float32)
+        for offset, coefficient in enumerate(coefficients):
+            filtered += float(coefficient) * padded[
+                offset:offset + len(values)
+            ]
+        return filtered
+
+    def third_difference_adjoint(values: np.ndarray) -> np.ndarray:
+        if len(values) < 4:
+            return np.zeros_like(values, dtype=np.float32)
+        difference = np.diff(values, n=3, axis=0)
+        gradient = np.zeros_like(values, dtype=np.float32)
+        stencil = np.asarray((-1.0, 3.0, -3.0, 1.0), dtype=np.float32)
+        for offset, coefficient in enumerate(stencil):
+            gradient[offset:offset + len(difference)] += (
+                float(coefficient) * difference
+            )
+        return -gradient
+
+    seam_width = min(max(3, span // 5), max(1, span))
+    seam_left = np.zeros(span, dtype=np.float32)
+    seam_left[:seam_width] = np.linspace(
+        1.0, 0.0, seam_width, dtype=np.float32
+    )
+    seam_right = seam_left[::-1].copy()
+    center = np.arange(span, dtype=np.float32) - (span - 1.0) / 2.0
+    sigma = max(1.0, float(span) / 6.0)
+    seam_center = np.exp(-0.5 * (center / sigma) ** 2).astype(np.float32)
+    temporal_masks = {
+        "seam_left": seam_left,
+        "seam_center": seam_center,
+        "seam_right": seam_right,
+    }
+    temporal_directions = {
+        name: aggregate * mask[:, None] * envelope[:, None]
+        for name, mask in temporal_masks.items()
+    }
+    temporal_directions["symmetric5"] = (
+        temporal_filter(
+            aggregate,
+            (1.0, 4.0, 6.0, 4.0, 1.0),
+        ) * envelope[:, None]
+    )
+    temporal_directions["antisymmetric5"] = (
+        temporal_filter(
+            aggregate,
+            (-1.0, -2.0, 0.0, 2.0, 1.0),
+        ) * envelope[:, None]
+    )
+    temporal_directions["global_jerk_cancel"] = (
+        third_difference_adjoint(aggregate) * envelope[:, None]
+    )
+
+    for name, direction in temporal_directions.items():
+        amplitude = float(np.max(np.abs(direction))) if direction.size else 0.0
+        if not np.isfinite(amplitude) or amplitude < min_delta:
+            continue
+        direction = direction * (
+            float(cfg.full_sequence_contact_repair_fd_rotation_step)
+            / max(amplitude, min_delta)
+        )
+        amplitude = float(np.max(np.abs(direction)))
+        for sign, label in ((1.0, "positive"), (-1.0, "negative")):
+            candidate = base.copy()
+            candidate[start:end] = base[start:end] + sign * direction
+            rotations = candidate[
+                start:end,
+                ROT6D_START:ROT6D_END,
+            ].reshape(span, NUM_JOINTS, 6)
+            candidate[start:end, ROT6D_START:ROT6D_END] = (
+                matrix_to_rot6d_np(rot6d_to_matrix_np(rotations)).reshape(
+                    span,
+                    -1,
+                )
+            )
+            sources.append(
+                (
+                    f"finite_difference:temporal_{name}:{label}",
+                    candidate.astype(np.float32),
+                    {
+                        "direction_source": "finite_difference",
+                        "direction_block": f"temporal_{name}",
+                        "direction_sign": int(sign),
+                        "probe_step": float(sign * amplitude),
+                        "probe_basis": aggregate_kind,
+                        "direction_family": "temporal_structure",
+                        "temporal_filter": name,
+                        "jerk_objective": (
+                            "global_hard_metric_finite_difference"
+                            if name == "global_jerk_cancel"
+                            else "contact_temporal_structure"
+                        ),
+                        "ownership_span": [start, end],
+                    },
+                )
+            )
     return sources
 
 
