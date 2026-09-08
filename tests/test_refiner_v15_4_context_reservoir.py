@@ -12,7 +12,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_6"
+        == "refiner_observable_bridge_diagnostic_v15_7"
     )
 
     assert (
@@ -32,12 +32,12 @@ def test_v15_4_contract_preserves_scientific_objective():
     # reservoir, exact gate, optimizer, and tail-fraction contracts.
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_component_tail_observable_v9"
+        == "gate_aligned_component_tail_observable_v10"
     )
 
     assert (
         m.REFINER_BATCH_AGGREGATION_PROTOCOL
-        == "group_balanced_endpoint_temporal_smooth_cvar_v3"
+        == "confidence_preconditioned_endpoint_temporal_smooth_cvar_v4"
     )
 
     assert (

@@ -117,8 +117,12 @@ REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_component_tail_observable_v9"
+    "gate_aligned_component_tail_observable_v10"
 )
+REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
+    "detached_inverse_applied_confidence_normalized_v1"
+)
+REFINER_CONFIDENCE_PRECONDITION_MAX = 5.0
 
 
 def now_tag() -> str:
@@ -6445,6 +6449,12 @@ def _training_config_sha256(
     if stage == "refiner":
         payload["optimizer_update_protocol"] = REFINER_UPDATE_PROTOCOL
         payload["observable_objective_protocol"] = REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
+        payload["confidence_precondition_protocol"] = (
+            REFINER_CONFIDENCE_PRECONDITION_PROTOCOL
+        )
+        payload["confidence_precondition_max"] = float(
+            REFINER_CONFIDENCE_PRECONDITION_MAX
+        )
         payload["repair_safety_protocol"] = REFINER_REPAIR_SAFETY_PROTOCOL
         payload["input_protocol"] = REFINER_INPUT_PROTOCOL
         payload["tangent_gradient_protocol"] = REFINER_TANGENT_GRADIENT_PROTOCOL
@@ -7281,6 +7291,68 @@ def _refiner_group_balanced_scientific_tail(
     return balanced, stats
 
 
+def _refiner_observable_confidence_preconditioner(batch):
+    """Balance learning speed without changing the true decoder derivative.
+
+    The decoder intentionally multiplies raw geometry by soft root/joint risk
+    confidence.  That makes low-confidence single-recording cases learn four
+    to five times more slowly than high-confidence cross-event cases even when
+    their scientific losses receive equal group weight.  Multiplying the
+    scalar loss by a detached inverse-confidence weight is an ordinary forward
+    objective: Armijo evaluates the same value, and autograd still follows the
+    exact soft-mask chain rule.
+    """
+    required = ("seam", "root", "joint")
+    missing = [key for key in required if key not in batch]
+    if missing:
+        raise ValueError(
+            "observable confidence preconditioner is missing: "
+            + ", ".join(missing)
+        )
+    seam = batch["seam"]
+    root = batch["root"]
+    joint = batch["joint"]
+    if seam.ndim != 3 or seam.shape[-1] != 1:
+        raise ValueError("Refiner seam mask must have shape [B,T,1]")
+    if root.shape != seam.shape:
+        raise ValueError("Refiner root confidence must match seam shape")
+    if (
+        joint.ndim != 3
+        or joint.shape[:2] != seam.shape[:2]
+        or joint.shape[-1] != NUM_JOINTS
+    ):
+        raise ValueError(
+            "Refiner joint confidence must have shape [B,T,24]"
+        )
+    active = (seam >= 0.5).to(root.dtype)
+    active_frames = active.sum(dim=(1, 2))
+    if bool((active_frames <= 0.0).any()):
+        raise ValueError(
+            "observable confidence preconditioner requires an active seam"
+        )
+    root_confidence = (
+        (root.clamp(0.0, 1.0) * active).sum(dim=(1, 2))
+        / active_frames
+    )
+    joint_active = active.expand_as(joint)
+    joint_confidence = (
+        (joint.clamp(0.0, 1.0) * joint_active).sum(dim=(1, 2))
+        / joint_active.sum(dim=(1, 2)).clamp_min(1.0)
+    )
+    applied_confidence = 0.5 * (
+        root_confidence + joint_confidence
+    )
+    maximum = float(REFINER_CONFIDENCE_PRECONDITION_MAX)
+    if not math.isfinite(maximum) or maximum < 1.0:
+        raise ValueError(
+            "Refiner confidence precondition maximum must be finite and >= 1"
+        )
+    weight = applied_confidence.clamp_min(1.0 / maximum).reciprocal()
+    weight = weight.clamp_max(maximum)
+    weight = weight / weight.mean().clamp_min(1.0e-12)
+    return weight.detach()
+
+
 def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace=None):
     # Optional detached decoder measurements; no extra forward or changed loss.
     pred, identity = _refiner_batch_outputs(model, batch, cfg, trace=trace)
@@ -7347,19 +7419,41 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         - scientific_weight * scientific
     )
 
+    confidence_weight = (
+        _refiner_observable_confidence_preconditioner(batch)
+        if "group" in batch
+        else torch.ones_like(scientific)
+    )
+    endpoint_scientific_weighted = (
+        endpoint_scientific * confidence_weight
+    )
+    temporal_scientific_weighted = (
+        temporal_scientific * confidence_weight
+    )
+    scientific_weighted = (
+        endpoint_scientific_weighted
+        + temporal_scientific_weighted
+    )
+    terms["scientific_confidence_weight"] = confidence_weight.mean()
+    terms["scientific_confidence_weight_min"] = confidence_weight.min()
+    terms["scientific_confidence_weight_max"] = confidence_weight.max()
+    terms["scientific_preconditioned_batch_mean"] = (
+        scientific_weighted.mean()
+    )
+
     if "group" in batch:
         (
             endpoint_tail,
             endpoint_tail_stats,
         ) = _refiner_group_balanced_scientific_tail(
-            endpoint_scientific,
+            endpoint_scientific_weighted,
             batch["group"],
         )
         (
             temporal_tail,
             temporal_tail_stats,
         ) = _refiner_group_balanced_scientific_tail(
-            temporal_scientific,
+            temporal_scientific_weighted,
             batch["group"],
         )
         scientific_tail = endpoint_tail + temporal_tail
@@ -7398,7 +7492,7 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
             "scientific_tail_uplift"
         ] = (
             scientific_tail
-            - scientific.mean()
+            - scientific_weighted.mean()
         )
 
         for label, stat in tail_stats.items():
@@ -7725,13 +7819,14 @@ def _feasible_minimum_edit_penalty(
 SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 
 # ------------------------------------------------------------------
-# Tail-aware NETWORK batch aggregation.  V15.6 applies the same risk operator
-# independently to endpoint and temporal deficits before summing them, so one
+# Tail-aware NETWORK batch aggregation. V15.7 first balances the true scalar
+# scientific objective across soft-confidence levels, then applies the same
+# risk operator independently to endpoint and temporal deficits. One
 # component's hard cases cannot disappear behind the other component.
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "group_balanced_endpoint_temporal_smooth_cvar_v3"
+    "confidence_preconditioned_endpoint_temporal_smooth_cvar_v4"
 )
 
 # One-variable V15.3 experimental contract.
@@ -8464,6 +8559,13 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
             "observable_objective_protocol":
                 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL,
+            "confidence_precondition_protocol":
+                REFINER_CONFIDENCE_PRECONDITION_PROTOCOL,
+            "confidence_precondition_max": float(
+                REFINER_CONFIDENCE_PRECONDITION_MAX
+            ),
+            "refiner_batch_aggregation_protocol":
+                REFINER_BATCH_AGGREGATION_PROTOCOL,
             "clean_identity_weight": float(
                 cfg.product_refiner_clean_identity_weight
             ),

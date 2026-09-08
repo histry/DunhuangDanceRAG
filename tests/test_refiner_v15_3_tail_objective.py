@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from training import motion_models as m
@@ -9,13 +10,20 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_3_1_contract():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_component_tail_observable_v9"
+        == "gate_aligned_component_tail_observable_v10"
     )
 
     assert (
         m.REFINER_BATCH_AGGREGATION_PROTOCOL
-        == "group_balanced_endpoint_temporal_smooth_cvar_v3"
+        == "confidence_preconditioned_endpoint_temporal_smooth_cvar_v4"
     )
+
+    assert (
+        m.REFINER_CONFIDENCE_PRECONDITION_PROTOCOL
+        == "detached_inverse_applied_confidence_normalized_v1"
+    )
+
+    assert m.REFINER_CONFIDENCE_PRECONDITION_MAX == 5.0
 
     assert (
         m.REFINER_SCIENTIFIC_TAIL_FRACTION
@@ -44,10 +52,63 @@ def test_v15_3_1_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_6"
+        == "refiner_observable_bridge_diagnostic_v15_7"
     )
 
     assert d.FIT_CONTEXT_COUNT == 5
+
+
+def test_v15_7_inverse_confidence_preconditioner_is_normalized_and_detached():
+    seam = torch.ones((2, 4, 1), dtype=torch.float64)
+    root = torch.tensor([0.2, 0.8], dtype=torch.float64).view(2, 1, 1)
+    root = root.expand_as(seam).clone().requires_grad_(True)
+    joint = torch.tensor([0.2, 0.8], dtype=torch.float64).view(2, 1, 1)
+    joint = joint.expand(2, 4, m.NUM_JOINTS).clone().requires_grad_(True)
+
+    weight = m._refiner_observable_confidence_preconditioner({
+        "seam": seam,
+        "root": root,
+        "joint": joint,
+    })
+
+    torch.testing.assert_close(
+        weight,
+        torch.tensor([1.6, 0.4], dtype=torch.float64),
+        rtol=0,
+        atol=1.0e-12,
+    )
+    torch.testing.assert_close(
+        weight.mean(),
+        torch.tensor(1.0, dtype=torch.float64),
+        rtol=0,
+        atol=1.0e-12,
+    )
+    assert not weight.requires_grad
+
+    raw_tangent = torch.ones(2, dtype=torch.float64, requires_grad=True)
+    applied_confidence = torch.tensor([0.2, 0.8], dtype=torch.float64)
+    preconditioned = (raw_tangent * applied_confidence * weight).sum()
+    preconditioned.backward()
+    torch.testing.assert_close(
+        raw_tangent.grad,
+        torch.tensor([0.32, 0.32], dtype=torch.float64),
+        rtol=0,
+        atol=1.0e-12,
+    )
+
+
+def test_v15_7_confidence_preconditioner_fails_closed_without_active_seam():
+    with torch.no_grad():
+        seam = torch.zeros((1, 4, 1))
+        root = torch.ones_like(seam)
+        joint = torch.ones((1, 4, m.NUM_JOINTS))
+
+    with pytest.raises(ValueError, match="requires an active seam"):
+        m._refiner_observable_confidence_preconditioner({
+            "seam": seam,
+            "root": root,
+            "joint": joint,
+        })
 
 
 def test_equal_deficits_are_value_preserving():
