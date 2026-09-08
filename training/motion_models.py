@@ -11765,8 +11765,17 @@ def _finite_difference_cone_sources(
     combination_count = 0
     feasible_records: List[Dict[str, Any]] = []
     rejected_constraint_counts: Dict[str, int] = {}
+    contact_direction_keys = {
+        direction
+        for direction in directions
+        if direction[0].startswith("contact_anchor_")
+    }
     for size in (1, 2, 3):
         for combo in combinations(directions, size):
+            if contact_direction_keys and not any(
+                direction in contact_direction_keys for direction in combo
+            ):
+                continue
             for coefficients in coefficient_candidates(size):
                 combination_count += 1
                 evaluated = evaluate_combination(combo, coefficients)
