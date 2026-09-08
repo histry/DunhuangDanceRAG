@@ -11263,6 +11263,131 @@ def _finite_difference_cone_sources(
     if end <= start:
         return []
 
+    before_eligible = np.asarray(ownership_eligible, dtype=bool).reshape(-1)
+    if before_eligible.shape != (end - start,):
+        raise ValueError(
+            "ownership finite-difference eligibility must match window length"
+        )
+
+    contact_envelope = _c3_transaction_weight(
+        end - start,
+        fade=min(
+            max(
+                int(cfg.full_sequence_contact_repair_frozen_edge_frames) + 3,
+                2,
+            ),
+            max(1, (end - start) // 2),
+        ),
+        freeze_edges=int(cfg.full_sequence_contact_repair_frozen_edge_frames),
+        has_left_context=start > 0,
+        has_right_context=end < base.shape[0],
+    )[:, 0]
+
+    def contact_anchor_sources() -> List[
+        Tuple[str, np.ndarray, Dict[str, Any]]
+    ]:
+        """Construct signed root translations that lock supported feet to anchors."""
+
+        span = end - start
+        local = base[start:end]
+        joints = fk_24_np(local)
+        feet = joints[:, list(DEFAULT_FOOT_JOINTS)]
+        if span < 4 or feet.size == 0:
+            return []
+        fps = float(cfg.fps)
+        floor_y = float(np.percentile(feet[..., 1], 5))
+        height_window = max(1, int(round(fps / 12.0)))
+        if height_window % 2 == 0:
+            height_window += 1
+        height_support = median_filter_bool_np(
+            feet[..., 1] <= floor_y + 0.055,
+            height_window,
+        )
+        states = classify_support_states_np(
+            joints,
+            local[:, CONTACT] > 0.5,
+            fps=fps,
+            sliding_support_eligible=before_eligible,
+            height_support=height_support,
+            support_policy="final_fail_closed",
+        )
+        static_support = states == STATIC_SUPPORT
+        feet_xz = feet[..., (0, 2)]
+        direction_by_side: Dict[str, np.ndarray] = {}
+        side_columns = {
+            "left": (0, 2),
+            "right": (1, 3),
+        }
+        for side, columns in side_columns.items():
+            active = np.any(static_support[:, columns], axis=1)
+            correction = np.zeros((span, 3), dtype=np.float32)
+            for segment_start, segment_end in contiguous_regions(active):
+                if segment_end - segment_start < 3:
+                    continue
+                anchor_end = min(segment_end, segment_start + 3)
+                anchor_xz = np.mean(
+                    feet_xz[segment_start:anchor_end, columns],
+                    axis=(0, 1),
+                )
+                current_xz = np.mean(
+                    feet_xz[segment_start:segment_end, columns],
+                    axis=1,
+                )
+                correction[segment_start:segment_end, (0, 2)] += (
+                    anchor_xz[None, :] - current_xz
+                )
+                current_y = np.mean(
+                    feet[segment_start:segment_end, columns, 1],
+                    axis=1,
+                )
+                correction[segment_start:segment_end, 1] += np.maximum(
+                    0.0,
+                    floor_y - current_y,
+                )
+            correction = _smooth_transaction_delta(correction)
+            correction *= contact_envelope[:, None]
+            amplitude = float(np.max(np.abs(correction)))
+            if not np.isfinite(amplitude) or amplitude < 1.0e-8:
+                continue
+            correction *= float(cfg.full_sequence_contact_repair_fd_root_step_m) / max(
+                amplitude,
+                1.0e-8,
+            )
+            direction_by_side[side] = correction.astype(np.float32)
+
+        output: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
+        for side, correction in direction_by_side.items():
+            amplitude = float(np.max(np.abs(correction)))
+            for sign, label in ((1.0, "positive"), (-1.0, "negative")):
+                candidate = base.copy()
+                candidate[start:end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = (
+                    base[start:end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
+                    + sign * correction
+                )
+                output.append(
+                    (
+                        f"finite_difference:contact_anchor_{side}:{label}",
+                        candidate.astype(np.float32),
+                        {
+                            "direction_source": "finite_difference",
+                            "direction_block": f"contact_anchor_{side}",
+                            "direction_sign": int(sign),
+                            "probe_step": float(sign * amplitude),
+                            "probe_basis": "contact_anchor_root_relative",
+                            "direction_family": "contact_anchor",
+                            "support_side": side,
+                            "support_policy": "final_fail_closed",
+                            "contact_objectives": [
+                                "foot_skate_mps_p95",
+                                "foot_support_drift_m_p95",
+                                "foot_penetration_min_m",
+                            ],
+                            "ownership_span": [start, end],
+                        },
+                    )
+                )
+        return output
+
     # Keep the public signed block probe at its historical 12 directions.
     # Temporal bases belong to the global cone, where they can be combined
     # with those blocks and evaluated by the same full-sequence derivatives.
@@ -11288,6 +11413,12 @@ def _finite_difference_cone_sources(
         finite_difference_sources = tuple(
             list(finite_difference_sources) + temporal_sources
         )
+    anchor_sources = contact_anchor_sources()
+    if anchor_sources:
+        finite_difference_sources = tuple(
+            list(finite_difference_sources) + anchor_sources
+        )
+
     limits = PhysicalQualityLimits.from_environment()
     policy = StageAcceptancePolicy.from_environment()
     specs = physical_metric_specs(limits, policy)
@@ -11298,7 +11429,6 @@ def _finite_difference_cone_sources(
         "foot_support_drift_m_max",
         "foot_penetration_min_m",
     )
-    before_eligible = np.asarray(ownership_eligible, dtype=bool)
     before_audit = audit_motion_np(
         base[start:end],
         cfg,
