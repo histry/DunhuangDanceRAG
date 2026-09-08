@@ -11368,6 +11368,19 @@ def _finite_difference_cone_sources(
             values[key] = float((float(value) - old) / scale)
         return values
 
+    def hard_derivative_tolerances() -> Dict[str, float]:
+        tolerances: Dict[str, float] = {}
+        for spec in specs:
+            old = float(before_audit.get(spec.key, float("nan")))
+            scale = max(abs(float(spec.absolute_limit)), 1.0e-3)
+            tolerances[spec.key] = float(
+                max(1.0e-7, abs(old) * 1.0e-6) / scale
+            )
+        tolerances.update({"boundary_jerk": 1.0e-8, "fidelity_seam_jerk": 1.0e-8})
+        return tolerances
+
+    hard_tolerances = hard_derivative_tolerances()
+
     def global_nonregression_derivatives(
         audit: Mapping[str, Any],
     ) -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -11428,6 +11441,7 @@ def _finite_difference_cone_sources(
                 for metric in contact_keys
             },
             "hard_derivative": hard_derivatives(source_audit, source_seam),
+            "hard_derivative_tolerance": hard_tolerances,
             "global_nonregression_derivative": global_nonregression_derivative,
             "global_nonregression_tolerance": global_nonregression_tolerance,
             "raw_seam_metrics": source_seam,
@@ -11519,6 +11533,44 @@ def _finite_difference_cone_sources(
             )
             for key, value in global_nonregression_derivative.items()
         )
+        minimum_backtracking_factor = min(
+            float(value)
+            for value in cfg.full_sequence_contact_repair_backtracking_factors
+        )
+        hard_safe_backtracking_factor = float("inf")
+        for key, value in hard_derivative.items():
+            tolerance = max(
+                float(
+                    profiles[directions[0]].get(
+                        "hard_derivative_tolerance", {}
+                    ).get(key, 1.0e-8)
+                ),
+                1.0e-8,
+            )
+            if np.isfinite(value) and value > tolerance:
+                hard_safe_backtracking_factor = min(
+                    hard_safe_backtracking_factor,
+                    tolerance / max(float(value), 1.0e-12),
+                )
+            elif not np.isfinite(value):
+                hard_safe_backtracking_factor = 0.0
+        global_safe_backtracking_factor = float("inf")
+        for key, value in global_nonregression_derivative.items():
+            tolerance = max(
+                float(
+                    profiles[directions[0]].get(
+                        "global_nonregression_tolerance", {}
+                    ).get(key, 1.0e-8)
+                ),
+                1.0e-8,
+            )
+            if np.isfinite(value) and value > tolerance:
+                global_safe_backtracking_factor = min(
+                    global_safe_backtracking_factor,
+                    tolerance / max(float(value), 1.0e-12),
+                )
+            elif not np.isfinite(value):
+                global_safe_backtracking_factor = 0.0
         meaningful_metrics = {
             key: float(value)
             for key, value in contact_derivative.items()
@@ -11531,18 +11583,29 @@ def _finite_difference_cone_sources(
         derivative_feasible = bool(
             meaningful_metrics
             and contact_regression <= 1.0e-8
-            and hard_regression <= 1.0e-8
-            and global_nonregression_regression <= 1.0e-8
+            and hard_safe_backtracking_factor + 1.0e-12
+            >= minimum_backtracking_factor
+            and global_safe_backtracking_factor + 1.0e-12
+            >= minimum_backtracking_factor
         )
         contact_gain = sum(
             max(0.0, -value)
             / max(before_residuals[key], 1.0e-7)
             for key, value in contact_derivative.items()
         )
+        # Keep diagnostic scores finite when a direction has no positive hard
+        # derivative.  The unbounded safe factor is still reported verbatim;
+        # only the sortable score is capped so JSON remains strict and stable.
+        hard_safe_score = min(float(hard_safe_backtracking_factor), 1.0e6)
+        global_safe_score = min(
+            float(global_safe_backtracking_factor), 1.0e6
+        )
         score = (
             0 if derivative_feasible else 1,
             float(hard_regression),
             float(global_nonregression_regression),
+            float(-hard_safe_score),
+            float(-global_safe_score),
             float(contact_regression),
             -float(contact_gain),
             -float(len(meaningful_metrics)),
@@ -11554,6 +11617,15 @@ def _finite_difference_cone_sources(
             "global_nonregression_derivative": global_nonregression_derivative,
             "global_nonregression_regression": float(
                 global_nonregression_regression
+            ),
+            "hard_safe_backtracking_factor": float(
+                hard_safe_backtracking_factor
+            ),
+            "global_safe_backtracking_factor": float(
+                global_safe_backtracking_factor
+            ),
+            "minimum_backtracking_factor": float(
+                minimum_backtracking_factor
             ),
             "meaningful_contact_metrics": meaningful_metrics,
             "derivative_feasible": derivative_feasible,
@@ -11660,6 +11732,15 @@ def _finite_difference_cone_sources(
             ],
             "global_nonregression_regression": record[
                 "global_nonregression_regression"
+            ],
+            "hard_safe_backtracking_factor": record[
+                "hard_safe_backtracking_factor"
+            ],
+            "global_safe_backtracking_factor": record[
+                "global_safe_backtracking_factor"
+            ],
+            "minimum_backtracking_factor": record[
+                "minimum_backtracking_factor"
             ],
             "meaningful_contact_metrics": record[
                 "meaningful_contact_metrics"
