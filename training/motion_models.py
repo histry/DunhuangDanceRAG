@@ -10917,6 +10917,9 @@ def _finite_difference_contact_direction_sources(
     own_start: int,
     own_end: int,
     cfg: MotionGenerationConfig,
+    *,
+    include_body_blocks: bool = True,
+    include_temporal: bool = False,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
     """Build signed local finite-difference directions for contact repair.
 
@@ -10989,6 +10992,8 @@ def _finite_difference_contact_direction_sources(
         1.0e-12,
     )
     for name, indices, step in blocks:
+        if not include_body_blocks:
+            break
         if not np.isfinite(step) or step <= 0.0:
             continue
         block_delta = np.zeros_like(delta, dtype=np.float32)
@@ -11053,6 +11058,9 @@ def _finite_difference_contact_direction_sources(
                     },
                 )
             )
+
+    if not include_temporal:
+        return sources
 
     # Add temporal structure directions independently of the body-block
     # directions above.  The global cone measures their real full-sequence
@@ -11243,6 +11251,32 @@ def _finite_difference_cone_sources(
     start, end = map(int, first_span)
     if end <= start:
         return []
+
+    # Keep the public signed block probe at its historical 12 directions.
+    # Temporal bases belong to the global cone, where they can be combined
+    # with those blocks and evaluated by the same full-sequence derivatives.
+    temporal_delta = np.zeros_like(base, dtype=np.float32)
+    seen_blocks = set()
+    for _source_name, source_motion, metadata in finite_difference_sources:
+        block = str(metadata.get("direction_block", ""))
+        sign = int(metadata.get("direction_sign", 0))
+        if sign != 1 or not block or block in seen_blocks:
+            continue
+        seen_blocks.add(block)
+        temporal_delta += np.asarray(source_motion, dtype=np.float32) - base
+    if np.any(np.abs(temporal_delta) > 0.0):
+        temporal_sources = _finite_difference_contact_direction_sources(
+            base,
+            base + temporal_delta,
+            start,
+            end,
+            cfg,
+            include_body_blocks=False,
+            include_temporal=True,
+        )
+        finite_difference_sources = tuple(
+            list(finite_difference_sources) + temporal_sources
+        )
     limits = PhysicalQualityLimits.from_environment()
     policy = StageAcceptancePolicy.from_environment()
     specs = physical_metric_specs(limits, policy)
