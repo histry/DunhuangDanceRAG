@@ -11063,6 +11063,7 @@ def _finite_difference_cone_sources(
     ],
     cfg: MotionGenerationConfig,
     ownership_eligible: np.ndarray,
+    global_eligible: Optional[np.ndarray] = None,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
     """Build a global sparse cone from measured local derivatives.
 
@@ -11100,6 +11101,24 @@ def _finite_difference_cone_sources(
         sliding_support_eligible=before_eligible,
     )
     before_residuals = _physical_residuals(before_audit, limits)
+
+    # The exact transaction selector applies a full-sequence non-regression
+    # audit after local blending.  Estimate the same signed metric changes at
+    # the finite-difference stage so directions that are locally attractive
+    # but globally unsafe are removed before candidate materialization.
+    full_eligible = None
+    before_global_audit: Optional[Mapping[str, Any]] = None
+    if global_eligible is not None:
+        full_eligible = np.asarray(global_eligible, dtype=bool)
+        if full_eligible.shape != (base.shape[0],):
+            raise ValueError(
+                "global finite-difference eligibility must match motion length"
+            )
+        before_global_audit = audit_motion_np(
+            base,
+            cfg,
+            sliding_support_eligible=full_eligible,
+        )
 
     # These two seam metrics are derived from the actual FK trajectory in the
     # ownership window.  They are intentionally kept separate from the
@@ -11145,6 +11164,28 @@ def _finite_difference_cone_sources(
             values[key] = float((float(value) - old) / scale)
         return values
 
+    def global_nonregression_derivatives(
+        audit: Mapping[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        values: Dict[str, float] = {}
+        tolerances: Dict[str, float] = {}
+        if before_global_audit is None:
+            return values, tolerances
+        for spec in specs:
+            old = float(before_global_audit.get(spec.key, float("nan")))
+            new = float(audit.get(spec.key, float("nan")))
+            if not np.isfinite(old) or not np.isfinite(new):
+                values[spec.key] = float("inf")
+                tolerances[spec.key] = 0.0
+                continue
+            signed = new - old if spec.direction == "high" else old - new
+            scale = max(abs(old), 1.0e-3)
+            values[spec.key] = float(signed / scale)
+            tolerances[spec.key] = float(
+                max(1.0e-7, abs(old) * 1.0e-6) / scale
+            )
+        return values, tolerances
+
     indexed: Dict[Tuple[str, int], Tuple[str, np.ndarray, Dict[str, Any]]] = {}
     profiles: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for source in finite_difference_sources:
@@ -11164,12 +11205,27 @@ def _finite_difference_cone_sources(
         )
         source_residuals = _physical_residuals(source_audit, limits)
         source_seam = seam_metrics(source[1][start:end])
+        source_global_audit = None
+        global_nonregression_derivative: Dict[str, float] = {}
+        global_nonregression_tolerance: Dict[str, float] = {}
+        if before_global_audit is not None:
+            source_global_audit = audit_motion_np(
+                source[1],
+                cfg,
+                sliding_support_eligible=full_eligible,
+            )
+            (
+                global_nonregression_derivative,
+                global_nonregression_tolerance,
+            ) = global_nonregression_derivatives(source_global_audit)
         profiles[key] = {
             "contact_derivative": {
                 metric: float(source_residuals[metric] - before_residuals[metric])
                 for metric in contact_keys
             },
             "hard_derivative": hard_derivatives(source_audit, source_seam),
+            "global_nonregression_derivative": global_nonregression_derivative,
+            "global_nonregression_tolerance": global_nonregression_tolerance,
             "raw_seam_metrics": source_seam,
         }
 
@@ -11227,6 +11283,11 @@ def _finite_difference_cone_sources(
         hard_derivative = derivative_sum(
             combo, coefficients, "hard_derivative"
         )
+        global_nonregression_derivative = derivative_sum(
+            combo,
+            coefficients,
+            "global_nonregression_derivative",
+        )
         contact_regression = sum(
             max(0.0, value - 1.0e-8)
             for value in contact_derivative.values()
@@ -11236,6 +11297,23 @@ def _finite_difference_cone_sources(
             if not np.isfinite(value)
             else max(0.0, value - 1.0e-8)
             for value in hard_derivative.values()
+        )
+        global_nonregression_regression = sum(
+            1.0e6
+            if not np.isfinite(value)
+            else max(
+                0.0,
+                value
+                - max(
+                    float(
+                        profiles[directions[0]].get(
+                            "global_nonregression_tolerance", {}
+                        ).get(key, 1.0e-8)
+                    ),
+                    1.0e-8,
+                ),
+            )
+            for key, value in global_nonregression_derivative.items()
         )
         meaningful_metrics = {
             key: float(value)
@@ -11250,6 +11328,7 @@ def _finite_difference_cone_sources(
             meaningful_metrics
             and contact_regression <= 1.0e-8
             and hard_regression <= 1.0e-8
+            and global_nonregression_regression <= 1.0e-8
         )
         contact_gain = sum(
             max(0.0, -value)
@@ -11259,6 +11338,7 @@ def _finite_difference_cone_sources(
         score = (
             0 if derivative_feasible else 1,
             float(hard_regression),
+            float(global_nonregression_regression),
             float(contact_regression),
             -float(contact_gain),
             -float(len(meaningful_metrics)),
@@ -11267,6 +11347,10 @@ def _finite_difference_cone_sources(
             "score": score,
             "contact_derivative": contact_derivative,
             "hard_derivative": hard_derivative,
+            "global_nonregression_derivative": global_nonregression_derivative,
+            "global_nonregression_regression": float(
+                global_nonregression_regression
+            ),
             "meaningful_contact_metrics": meaningful_metrics,
             "derivative_feasible": derivative_feasible,
         }
@@ -11295,6 +11379,23 @@ def _finite_difference_cone_sources(
                         if not np.isfinite(value) or value > 1.0e-8:
                             rejected_constraint_counts[key] = (
                                 rejected_constraint_counts.get(key, 0) + 1
+                            )
+                    for key, value in evaluated[
+                        "global_nonregression_derivative"
+                    ].items():
+                        tolerance = max(
+                            float(
+                                profiles[directions[0]].get(
+                                    "global_nonregression_tolerance", {}
+                                ).get(key, 1.0e-8)
+                            ),
+                            1.0e-8,
+                        )
+                        if not np.isfinite(value) or value > tolerance:
+                            metric_key = f"global_nonregression:{key}"
+                            rejected_constraint_counts[metric_key] = (
+                                rejected_constraint_counts.get(metric_key, 0)
+                                + 1
                             )
                     if not evaluated["meaningful_contact_metrics"]:
                         rejected_constraint_counts[
@@ -11350,6 +11451,12 @@ def _finite_difference_cone_sources(
             "selected_direction_sources": feasible_direction_sources,
             "contact_residual_derivative": record["contact_derivative"],
             "hard_metric_derivative": record["hard_derivative"],
+            "global_nonregression_derivative": record[
+                "global_nonregression_derivative"
+            ],
+            "global_nonregression_regression": record[
+                "global_nonregression_regression"
+            ],
             "meaningful_contact_metrics": record[
                 "meaningful_contact_metrics"
             ],
@@ -12736,6 +12843,7 @@ def true_lower_body_ik(
                 finite_difference_sources,
                 cfg,
                 ownership_eligible,
+                eligible,
             )
             source_candidates.extend(cone_sources)
         else:
