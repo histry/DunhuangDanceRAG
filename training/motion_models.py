@@ -13141,7 +13141,37 @@ def true_lower_body_ik(
         candidate_attempts: List[Dict[str, Any]] = []
         candidate_states: List[Dict[str, Any]] = []
         for source_name, source_motion, source_metadata in source_candidates:
-            for factor in factors:
+            source_factors = factors
+            adaptive_factor = None
+            if source_metadata.get("direction_source") == (
+                "finite_difference_cone"
+            ):
+                safe_factors = [
+                    float(source_metadata.get(key, float("inf")))
+                    for key in (
+                        "hard_safe_backtracking_factor",
+                        "global_safe_backtracking_factor",
+                    )
+                ]
+                safe_factor = min(safe_factors)
+                minimum_factor = min(float(value) for value in factors)
+                if (
+                    np.isfinite(safe_factor)
+                    and safe_factor > 1.0e-6
+                    and safe_factor < minimum_factor
+                ):
+                    # Leave a margin below the linearized safety limit.  The
+                    # exact audit remains authoritative and may still reject
+                    # this candidate; this only adds a derivative-informed
+                    # probe between the fixed backtracking levels.
+                    adaptive_factor = max(
+                        1.0e-6,
+                        min(minimum_factor, 0.9 * safe_factor),
+                    )
+                    source_factors = tuple(
+                        list(factors) + [float(adaptive_factor)]
+                    )
+            for factor in source_factors:
                 scaled_weight = weight * float(factor)
                 trial = final.copy()
                 trial[own_start:own_end] = blend_edge151_geodesic_np(
@@ -13340,6 +13370,13 @@ def true_lower_body_ik(
                     "direction_block": source_metadata.get("direction_block"),
                     "direction_sign": source_metadata.get("direction_sign"),
                     "backtracking_factor": float(factor),
+                    "backtracking_factor_source": (
+                        "adaptive_safe_derivative"
+                        if adaptive_factor is not None
+                        and abs(float(factor) - float(adaptive_factor))
+                        <= 1.0e-12
+                        else "fixed_ladder"
+                    ),
                     "source_motion_sha256": _array_content_sha256(
                         source_motion[audit_start:audit_end]
                     ),
