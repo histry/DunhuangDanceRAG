@@ -11176,6 +11176,14 @@ def _finite_difference_contact_direction_sources(
     temporal_directions["global_jerk_cancel"] = (
         third_difference_adjoint(aggregate) * envelope[:, None]
     )
+    action_jerk_cancel = np.zeros_like(delta, dtype=np.float32)
+    if temporal_indices and span >= 4:
+        action_jerk_cancel[:, temporal_indices] = third_difference_adjoint(
+            base[start:end, temporal_indices]
+        )
+    temporal_directions["global_action_jerk_cancel"] = (
+        action_jerk_cancel * envelope[:, None]
+    )
 
     for name, direction in temporal_directions.items():
         amplitude = float(np.max(np.abs(direction))) if direction.size else 0.0
@@ -11213,7 +11221,10 @@ def _finite_difference_contact_direction_sources(
                         "temporal_filter": name,
                         "jerk_objective": (
                             "global_hard_metric_finite_difference"
-                            if name == "global_jerk_cancel"
+                            if name in (
+                                "global_jerk_cancel",
+                                "global_action_jerk_cancel",
+                            )
                             else "contact_temporal_structure"
                         ),
                         "ownership_span": [start, end],
