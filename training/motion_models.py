@@ -116,7 +116,9 @@ REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleratio
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
-REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = "scientific_feasibility_smooth_bottleneck_observable_v8"
+REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
+    "gate_aligned_component_tail_observable_v9"
+)
 
 
 def now_tag() -> str:
@@ -755,6 +757,15 @@ class MotionGenerationConfig:
     product_refiner_clean_noop_weight: float = 0.03
     # V12: prefer the minimum repair tangent that satisfies observable repair.
     product_refiner_minimum_edit_weight: float = 0.01
+    # V15.6: train beyond the exact 3% gate so floating-point equality and the
+    # line search do not leave a candidate infinitesimally below acceptance.
+    # This is a training-only safety buffer; the exact validation gate remains
+    # checkpoint_validation_min_{endpoint,temporal}_repair_gain == 0.03.
+    product_refiner_scientific_training_gain_buffer: float = 0.005
+    # Preserve a useful gradient as the buffered gate is approached.  The old
+    # pure Huber objective had a derivative that converged to zero at the gate,
+    # which allowed sub-threshold stationary points.
+    product_refiner_scientific_gradient_floor: float = 0.10
     # V12: numerical/severity scale floor is TRAIN-reference-only; target gain is unchanged.
     product_refiner_observable_floor_quantile: float = 0.25
     product_refiner_observable_floor_ratio: float = 0.50
@@ -896,6 +907,12 @@ class MotionGenerationConfig:
             ),
             "MOTION_PRODUCT_REFINER_MINIMUM_EDIT_WEIGHT": (
                 "product_refiner_minimum_edit_weight", float,
+            ),
+            "MOTION_PRODUCT_REFINER_SCIENTIFIC_TRAINING_GAIN_BUFFER": (
+                "product_refiner_scientific_training_gain_buffer", float,
+            ),
+            "MOTION_PRODUCT_REFINER_SCIENTIFIC_GRADIENT_FLOOR": (
+                "product_refiner_scientific_gradient_floor", float,
             ),
             "MOTION_PRODUCT_REFINER_OBSERVABLE_FLOOR_QUANTILE": (
                 "product_refiner_observable_floor_quantile", float,
@@ -7284,9 +7301,23 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         "scientific_observable"
     ]
 
-    if scientific.shape != per_case.shape:
+    endpoint_scientific = case_terms[
+        "endpoint_scientific_deficit"
+    ]
+    temporal_scientific = case_terms[
+        "temporal_scientific_deficit"
+    ]
+
+    if any(
+        value.shape != per_case.shape
+        for value in (
+            scientific,
+            endpoint_scientific,
+            temporal_scientific,
+        )
+    ):
         raise RuntimeError(
-            "scientific_observable must match per-case loss shape"
+            "scientific observable components must match per-case loss shape"
         )
 
     scientific_weight = float(
@@ -7318,12 +7349,37 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
 
     if "group" in batch:
         (
-            scientific_tail,
-            tail_stats,
+            endpoint_tail,
+            endpoint_tail_stats,
         ) = _refiner_group_balanced_scientific_tail(
-            scientific,
+            endpoint_scientific,
             batch["group"],
         )
+        (
+            temporal_tail,
+            temporal_tail_stats,
+        ) = _refiner_group_balanced_scientific_tail(
+            temporal_scientific,
+            batch["group"],
+        )
+        scientific_tail = endpoint_tail + temporal_tail
+        tail_stats = {}
+
+        if endpoint_tail_stats.keys() != temporal_tail_stats.keys():
+            raise RuntimeError(
+                "endpoint/temporal scientific tail groups must match"
+            )
+
+        for label in endpoint_tail_stats:
+            endpoint_stat = endpoint_tail_stats[label]
+            temporal_stat = temporal_tail_stats[label]
+            tail_stats[label] = {
+                key: endpoint_stat[key] + temporal_stat[key]
+                for key in ("mean", "tail_cvar", "risk")
+            }
+            tail_stats[label]["tail_count"] = endpoint_stat[
+                "tail_count"
+            ]
 
         repair = (
             non_scientific.mean()
@@ -7357,6 +7413,20 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
             terms[
                 f"group_{label}_scientific_tail_risk"
             ] = stat["risk"]
+
+            for component, component_stat in (
+                ("endpoint", endpoint_tail_stats[label]),
+                ("temporal", temporal_tail_stats[label]),
+            ):
+                terms[
+                    f"group_{label}_{component}_scientific_tail_mean"
+                ] = component_stat["mean"]
+                terms[
+                    f"group_{label}_{component}_scientific_tail_cvar"
+                ] = component_stat["tail_cvar"]
+                terms[
+                    f"group_{label}_{component}_scientific_tail_risk"
+                ] = component_stat["risk"]
 
     else:
         # Compatibility for callers without the explicit TRAIN group
@@ -7556,19 +7626,112 @@ def _smooth_observable_margin(proposed, baseline, gain, *, scale_floor=None):
     return shoulder.square() / (2.0 * gain) + (gap - shoulder), gap
 
 
+def _gate_aligned_observable_deficit(
+    proposed,
+    baseline,
+    gain,
+    *,
+    training_buffer=0.0,
+    gradient_floor=0.0,
+    scale_floor=None,
+):
+    """Differentiable deficit aligned with the exact observable gate.
+
+    The acceptance threshold itself is unchanged.  During fitting, an optional
+    positive buffer asks the network to move a little beyond that threshold.
+    A linear component keeps the derivative nonzero until the buffered target
+    is reached; this avoids the sub-threshold stationary point of the previous
+    pure Huber penalty.
+
+    The exact auditor treats a baseline at or below 1e-6 as satisfied when the
+    proposal is also at or below 1e-6.  This helper uses the same target for
+    that branch instead of incorrectly asking a nonnegative metric to reach
+    exactly zero.
+    """
+    gain = float(gain)
+    training_buffer = float(training_buffer)
+    gradient_floor = float(gradient_floor)
+    effective_gain = gain + training_buffer
+
+    if not np.isfinite(gain) or not 0.0 < gain < 1.0:
+        raise ValueError(
+            "observable repair target gain must be finite in (0, 1)"
+        )
+    if (
+        not np.isfinite(training_buffer)
+        or training_buffer < 0.0
+        or effective_gain >= 1.0
+    ):
+        raise ValueError(
+            "observable training gain buffer must be finite, non-negative, "
+            "and keep the effective gain below 1"
+        )
+    if not np.isfinite(gradient_floor) or gradient_floor < 0.0:
+        raise ValueError(
+            "observable scientific gradient floor must be finite and "
+            "non-negative"
+        )
+
+    baseline = baseline.detach()
+    audit_floor = baseline.new_tensor(1.0e-6)
+    denominator_floor = audit_floor
+    if scale_floor is not None:
+        denominator_floor = torch.as_tensor(
+            scale_floor,
+            dtype=baseline.dtype,
+            device=baseline.device,
+        ).clamp_min(audit_floor)
+    denominator = torch.maximum(
+        baseline.abs(),
+        denominator_floor,
+    )
+    informative = baseline > audit_floor
+    target = torch.where(
+        informative,
+        (1.0 - effective_gain) * baseline,
+        audit_floor,
+    )
+    gap = torch.relu(proposed - target) / denominator
+    shoulder = gap.clamp_max(effective_gain)
+    huber = (
+        shoulder.square() / (2.0 * effective_gain)
+        + gap
+        - shoulder
+    )
+    return huber + gradient_floor * gap, gap
+
+
+def _feasible_minimum_edit_penalty(
+    minimum_edit,
+    endpoint_gap,
+    temporal_gap,
+):
+    """Apply minimum-edit pressure only inside the buffered feasible set."""
+    if not (
+        minimum_edit.shape
+        == endpoint_gap.shape
+        == temporal_gap.shape
+    ):
+        raise ValueError(
+            "minimum edit and observable gaps must have identical shapes"
+        )
+    active = (
+        (endpoint_gap == 0.0)
+        & (temporal_gap == 0.0)
+    ).to(minimum_edit.dtype).detach()
+    return minimum_edit * active, active
+
+
 SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 
 # ------------------------------------------------------------------
-# V15.3: tail-aware NETWORK batch aggregation.
-#
-# IMPORTANT:
-# The V15.2 per-case scientific objective remains completely unchanged.
-# V15.3 modifies only how per-case scientific deficits are aggregated
-# for shared-network optimization.
+# Tail-aware NETWORK batch aggregation.  V15.6 applies the same risk operator
+# independently to endpoint and temporal deficits before summing them, so one
+# component's hard cases cannot disappear behind the other component.
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "group_balanced_scientific_mean_smooth_cvar_v2"
+    "group_balanced_endpoint_temporal_smooth_cvar_v3"
 )
 
 # One-variable V15.3 experimental contract.
@@ -7696,6 +7859,12 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     temporal_scientific_gain = float(
         cfg.checkpoint_validation_min_temporal_repair_gain
     )
+    scientific_training_buffer = float(
+        cfg.product_refiner_scientific_training_gain_buffer
+    )
+    scientific_gradient_floor = float(
+        cfg.product_refiner_scientific_gradient_floor
+    )
 
     for name, value in (
         ("training_gain", training_gain),
@@ -7749,27 +7918,31 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     (
         endpoint_scientific,
         endpoint_scientific_gap,
-    ) = _smooth_observable_margin(
+    ) = _gate_aligned_observable_deficit(
         proposed["endpoint_velocity_jump_mps"],
         before["endpoint_velocity_jump_mps"],
         endpoint_scientific_gain,
+        training_buffer=scientific_training_buffer,
+        gradient_floor=scientific_gradient_floor,
         scale_floor=endpoint_floor,
     )
 
     (
         temporal_scientific,
         temporal_scientific_gap,
-    ) = _smooth_observable_margin(
+    ) = _gate_aligned_observable_deficit(
         proposed["temporal_energy"],
         before["temporal_energy"],
         temporal_scientific_gain,
+        training_buffer=scientific_training_buffer,
+        gradient_floor=scientific_gradient_floor,
         scale_floor=temporal_floor,
     )
 
-    joint_scientific = _joint_scientific_deficit(
-        endpoint_scientific,
-        temporal_scientific,
-    )
+    # The exact gate requires both components.  A direct sum preserves useful
+    # gradient for endpoint and temporal repair independently; the previous
+    # smooth maximum could assign almost all gradient to one component.
+    joint_scientific = endpoint_scientific + temporal_scientific
     jerk = (torch.relu(proposed["seam_jerk_mps3"] - 1.02 * before["seam_jerk_mps3"] - 1e-6)
             / before["seam_jerk_mps3"].clamp_min(1.0))
     jerk_safety, jerk_safety_terms = _repair_jerk_safety_loss_torch(
@@ -7780,7 +7953,17 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     per_window = (delta.abs() * active).sum((1, 2)) / (active.sum((1, 2)) * delta.shape[-1]).clamp_min(1)
     trust = torch.relu(per_window / cfg.checkpoint_validation_max_refiner_product_log_l1 - 1)
     edit_cap = max(float(cfg.checkpoint_validation_max_refiner_product_log_l1), 1.0e-6)
-    minimum_edit = per_window / edit_cap
+    minimum_edit_raw = per_window / edit_cap
+    # Minimum-edit is a second-stage preference inside the feasible set.  It
+    # must not pull a still-infeasible candidate back toward the zero action.
+    (
+        minimum_edit,
+        scientific_training_satisfied,
+    ) = _feasible_minimum_edit_penalty(
+        minimum_edit_raw,
+        endpoint_scientific_gap,
+        temporal_scientific_gap,
+    )
     minimum_edit_weight = float(cfg.product_refiner_minimum_edit_weight)
     if not np.isfinite(minimum_edit_weight) or minimum_edit_weight < 0.0:
         raise ValueError("minimum-edit weight must be finite and non-negative")
@@ -7793,9 +7976,8 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
     penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean((1,2))
     reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean((1,2)).detach()
     penetration = torch.relu(penetration - reference_penetration)
-    # V15 observable optimization is ungated.  The worse scientific
-    # deficit is the bottleneck; endpoint/temporal slack may therefore trade
-    # while the joint feasibility deficit decreases.
+    # Both exact observable requirements remain active until their respective
+    # buffered training targets are satisfied.
     scientific_observable = joint_scientific
 
     physics = (
@@ -7844,6 +8026,14 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
             proposed["temporal_energy"]
         ),
         "minimum_edit": minimum_edit,
+        "minimum_edit_raw": minimum_edit_raw,
+        "minimum_edit_active": scientific_training_satisfied,
+        "endpoint_scientific_training_gain": (
+            zero + endpoint_scientific_gain + scientific_training_buffer
+        ),
+        "temporal_scientific_training_gain": (
+            zero + temporal_scientific_gain + scientific_training_buffer
+        ),
         "seam_velocity": proposed["endpoint_velocity_jump_mps"],
         "seam_acceleration": proposed["seam_acceleration_mps2"],
         "seam_jerk": proposed["seam_jerk_mps3"], "relative_temporal": temporal,
@@ -8265,6 +8455,12 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
             "temporal_scientific_repair_gain": float(
                 cfg.checkpoint_validation_min_temporal_repair_gain
+            ),
+            "scientific_training_gain_buffer": float(
+                cfg.product_refiner_scientific_training_gain_buffer
+            ),
+            "scientific_gradient_floor": float(
+                cfg.product_refiner_scientific_gradient_floor
             ),
             "observable_objective_protocol":
                 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL,

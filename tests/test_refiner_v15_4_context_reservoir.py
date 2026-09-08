@@ -12,7 +12,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_5_1"
+        == "refiner_observable_bridge_diagnostic_v15_6"
     )
 
     assert (
@@ -28,15 +28,16 @@ def test_v15_4_contract_preserves_scientific_objective():
     # Still C5 PER UPDATE.
     assert d.FIT_CONTEXT_COUNT == 5
 
-    # V15.2/V15.3.1 scientific objective remains frozen.
+    # V15.6 uses the gate-aligned component objective while preserving the
+    # reservoir, exact gate, optimizer, and tail-fraction contracts.
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "scientific_feasibility_smooth_bottleneck_observable_v8"
+        == "gate_aligned_component_tail_observable_v9"
     )
 
     assert (
         m.REFINER_BATCH_AGGREGATION_PROTOCOL
-        == "group_balanced_scientific_mean_smooth_cvar_v2"
+        == "group_balanced_endpoint_temporal_smooth_cvar_v3"
     )
 
     assert (

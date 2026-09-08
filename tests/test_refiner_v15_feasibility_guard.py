@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from tests.test_bridge_feasibility import bank
 from training import motion_models as m
 from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 
@@ -48,6 +49,117 @@ def test_v15_three_percent_scientific_margin():
 
     assert float(gap[1]) > 0.0
     assert float(loss[1]) > 0.0
+
+
+def test_v15_6_gate_aligned_deficit_keeps_gradient_until_buffered_target():
+    baseline = torch.ones(
+        2,
+        dtype=torch.float64,
+    )
+    proposed = torch.tensor(
+        [
+            0.969,  # exact 3% gate passes, buffered 3.5% target is active
+            0.9650001,  # extremely close to the buffered target
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    loss, gap = m._gate_aligned_observable_deficit(
+        proposed,
+        baseline,
+        0.03,
+        training_buffer=0.005,
+        gradient_floor=0.10,
+    )
+
+    assert torch.all(gap > 0.0)
+    loss.sum().backward()
+    assert torch.all(proposed.grad >= 0.10)
+
+
+def test_v15_6_gate_aligned_deficit_matches_uninformative_audit_floor():
+    baseline = torch.tensor(
+        [0.0, 1.0e-6],
+        dtype=torch.float64,
+    )
+    proposed = torch.tensor(
+        [1.0e-6, 1.0e-6],
+        dtype=torch.float64,
+    )
+
+    loss, gap = m._gate_aligned_observable_deficit(
+        proposed,
+        baseline,
+        0.03,
+        training_buffer=0.005,
+        gradient_floor=0.10,
+    )
+
+    assert torch.equal(gap, torch.zeros_like(gap))
+    assert torch.equal(loss, torch.zeros_like(loss))
+
+
+def test_v15_6_minimum_edit_is_inactive_until_both_targets_pass():
+    edit = torch.tensor(
+        [0.4, 0.4, 0.4],
+        dtype=torch.float64,
+    )
+    endpoint_gap = torch.tensor(
+        [0.0, 0.1, 0.0],
+        dtype=torch.float64,
+    )
+    temporal_gap = torch.tensor(
+        [0.0, 0.0, 0.1],
+        dtype=torch.float64,
+    )
+
+    penalty, active = m._feasible_minimum_edit_penalty(
+        edit,
+        endpoint_gap,
+        temporal_gap,
+    )
+
+    torch.testing.assert_close(
+        active,
+        torch.tensor(
+            [1.0, 0.0, 0.0],
+            dtype=torch.float64,
+        ),
+    )
+    torch.testing.assert_close(
+        penalty,
+        torch.tensor(
+            [0.4, 0.0, 0.0],
+            dtype=torch.float64,
+        ),
+    )
+
+
+def test_v15_6_objective_keeps_endpoint_and_temporal_components_active():
+    batch, cfg = bank()
+
+    _, terms = m._observable_refiner_objective(
+        batch["bad"],
+        batch["bad"],
+        batch["seam"],
+        cfg,
+        reduction="none",
+    )
+
+    torch.testing.assert_close(
+        terms["joint_scientific_deficit"],
+        terms["endpoint_scientific_deficit"]
+        + terms["temporal_scientific_deficit"],
+    )
+    torch.testing.assert_close(
+        terms["scientific_observable"],
+        terms["joint_scientific_deficit"],
+    )
+    assert torch.equal(
+        terms["minimum_edit_active"],
+        torch.zeros_like(terms["minimum_edit_active"]),
+    )
 
 
 def test_v15_2_joint_deficit_is_smooth_worst_requirement():
@@ -188,5 +300,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "scientific_feasibility_smooth_bottleneck_observable_v8"
+        == "gate_aligned_component_tail_observable_v9"
     )

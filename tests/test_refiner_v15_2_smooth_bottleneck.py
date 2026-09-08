@@ -8,12 +8,12 @@ from training import refiner_bridge_diagnostics as d
 def test_v15_2_protocol_contract():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "scientific_feasibility_smooth_bottleneck_observable_v8"
+        == "gate_aligned_component_tail_observable_v9"
     )
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_5_1"
+        == "refiner_observable_bridge_diagnostic_v15_6"
     )
 
     assert (
