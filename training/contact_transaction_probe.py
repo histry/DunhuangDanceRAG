@@ -19,6 +19,7 @@ import numpy as np
 
 from training.motion_models import (
     MotionGenerationConfig,
+    _contact_anchor_rejection_reason_counts,
     full_sequence_physical_diagnostics_np,
     true_lower_body_ik,
 )
@@ -135,6 +136,9 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
             rejected_constraint_counts.items(),
             key=lambda item: (-int(item[1]), item[0]),
         )),
+        "contact_anchor_rejection_reasons": (
+            _contact_anchor_rejection_reason_counts(attempts)
+        ),
         "local_feasibility_status": (
             "feasible_direction_found"
             if accepted

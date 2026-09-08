@@ -11286,7 +11286,15 @@ def _finite_difference_cone_sources(
     def contact_anchor_sources() -> List[
         Tuple[str, np.ndarray, Dict[str, Any]]
     ]:
-        """Construct signed root translations that lock supported feet to anchors."""
+        """Build signed FK-Jacobian directions for each static support foot.
+
+        A root-only correction moves the support reference together with the
+        body and can therefore reduce penetration while increasing support
+        drift.  Solve the foot-endpoint displacement through the complete
+        root/hip/knee/ankle chain instead.  Root coordinates remain available
+        for coupled corrections, but their smaller column scale makes the
+        lower-body joints carry most of the update.
+        """
 
         span = end - start
         local = base[start:end]
@@ -11312,72 +11320,261 @@ def _finite_difference_cone_sources(
             support_policy="final_fail_closed",
         )
         static_support = states == STATIC_SUPPORT
-        feet_xz = feet[..., (0, 2)]
-        root_xz = local[:, [ROOT_X_IDX, ROOT_Z_IDX]]
-        relative_feet_xz = feet_xz - root_xz[:, None, :]
-        direction_by_side: Dict[str, np.ndarray] = {}
+        local_rotations = rot6d_to_matrix_np(
+            local[:, ROT6D_START:ROT6D_END].reshape(
+                span,
+                NUM_JOINTS,
+                6,
+            )
+        )
         side_columns = {
             "left": (0, 2),
             "right": (1, 3),
         }
+        side_chains = {
+            "left": (0, 1, 4, 7),
+            "right": (0, 2, 5, 8),
+        }
+
+        def tangent_rotation(axis: int, angles: np.ndarray) -> np.ndarray:
+            values = np.asarray(angles, dtype=np.float32).reshape(-1)
+            matrices = np.broadcast_to(
+                np.eye(3, dtype=np.float32),
+                (len(values), 3, 3),
+            ).copy()
+            cosine = np.cos(values)
+            sine = np.sin(values)
+            first = (axis + 1) % 3
+            second = (axis + 2) % 3
+            matrices[:, first, first] = cosine
+            matrices[:, second, second] = cosine
+            matrices[:, first, second] = -sine
+            matrices[:, second, first] = sine
+            return matrices
+
+        def motion_with_joint_tangent(
+            joint: int,
+            axis: int,
+            angles: np.ndarray,
+        ) -> np.ndarray:
+            candidate = local.copy()
+            rotations = local_rotations.copy()
+            rotations[:, joint] = np.matmul(
+                rotations[:, joint],
+                tangent_rotation(axis, angles),
+            )
+            candidate[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(
+                rotations
+            ).reshape(span, -1)
+            return candidate.astype(np.float32)
+
+        def apply_chain_parameters(
+            parameters: np.ndarray,
+            chain: Sequence[int],
+        ) -> np.ndarray:
+            candidate = local.copy()
+            candidate[:, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] += (
+                parameters[:, :3]
+            )
+            rotations = local_rotations.copy()
+            parameter_index = 3
+            for joint in chain:
+                for axis in range(3):
+                    rotations[:, joint] = np.matmul(
+                        rotations[:, joint],
+                        tangent_rotation(
+                            axis,
+                            parameters[:, parameter_index],
+                        ),
+                    )
+                    parameter_index += 1
+            candidate[:, ROT6D_START:ROT6D_END] = matrix_to_rot6d_np(
+                rotations
+            ).reshape(span, -1)
+            return candidate.astype(np.float32)
+
+        direction_by_side: Dict[str, Dict[str, Any]] = {}
         for side, columns in side_columns.items():
-            active = np.any(static_support[:, columns], axis=1)
-            correction = np.zeros((span, 3), dtype=np.float32)
-            for segment_start, segment_end in contiguous_regions(active):
-                if segment_end - segment_start < 3:
+            chain = side_chains[side]
+            target_error = np.zeros((span, len(columns), 3), dtype=np.float32)
+            active_by_endpoint = static_support[:, columns]
+            for endpoint_index, foot_column in enumerate(columns):
+                for segment_start, segment_end in contiguous_regions(
+                    active_by_endpoint[:, endpoint_index]
+                ):
+                    if segment_end - segment_start < 3:
+                        continue
+                    anchor = feet[segment_start, foot_column]
+                    target_error[
+                        segment_start:segment_end,
+                        endpoint_index,
+                    ][:, (0, 2)] = (
+                        anchor[None, (0, 2)]
+                        - feet[
+                            segment_start:segment_end,
+                            foot_column,
+                        ][:, (0, 2)]
+                    )
+                    target_error[
+                        segment_start:segment_end,
+                        endpoint_index,
+                        1,
+                    ] = np.maximum(
+                        0.0,
+                        floor_y
+                        - feet[
+                            segment_start:segment_end,
+                            foot_column,
+                            1,
+                        ],
+                    )
+
+            parameter_count = 3 + 3 * len(chain)
+            jacobian = np.zeros(
+                (span, len(columns), 3, parameter_count),
+                dtype=np.float32,
+            )
+            for axis in range(3):
+                jacobian[:, :, axis, axis] = 1.0
+            rotation_probe = min(
+                max(
+                    float(cfg.full_sequence_contact_repair_fd_rotation_step)
+                    * 0.25,
+                    1.0e-4,
+                ),
+                1.0e-2,
+            )
+            parameter_index = 3
+            probe_angles = np.full(span, rotation_probe, dtype=np.float32)
+            for joint in chain:
+                for axis in range(3):
+                    plus = fk_24_np(
+                        motion_with_joint_tangent(joint, axis, probe_angles)
+                    )[:, list(DEFAULT_FOOT_JOINTS)][:, columns]
+                    minus = fk_24_np(
+                        motion_with_joint_tangent(joint, axis, -probe_angles)
+                    )[:, list(DEFAULT_FOOT_JOINTS)][:, columns]
+                    jacobian[:, :, :, parameter_index] = (
+                        plus - minus
+                    ) / float(2.0 * rotation_probe)
+                    parameter_index += 1
+
+            parameters = np.zeros(
+                (span, parameter_count),
+                dtype=np.float32,
+            )
+            # Weighted damped least squares.  Root translation/rotation remain
+            # available for feasibility, while hip/knee/ankle compensation is
+            # preferred so the world-space support anchor does not follow the
+            # root correction.
+            column_scale = np.ones(parameter_count, dtype=np.float32)
+            column_scale[:3] = 0.15
+            column_scale[3:6] = 0.35
+            damping = 1.0e-4
+            for frame in range(span):
+                active_endpoints = np.flatnonzero(active_by_endpoint[frame])
+                if active_endpoints.size == 0:
                     continue
-                anchor_end = min(segment_end, segment_start + 3)
-                anchor_relative_xz = np.mean(
-                    relative_feet_xz[segment_start:anchor_end, columns],
-                    axis=(0, 1),
+                rows = np.concatenate([
+                    np.arange(3 * int(endpoint), 3 * int(endpoint) + 3)
+                    for endpoint in active_endpoints
+                ])
+                frame_jacobian = jacobian[frame].reshape(-1, parameter_count)[
+                    rows
+                ]
+                frame_target = target_error[frame].reshape(-1)[rows]
+                scaled_jacobian = frame_jacobian * column_scale[None, :]
+                system = (
+                    scaled_jacobian @ scaled_jacobian.T
+                    + damping * np.eye(len(rows), dtype=np.float32)
                 )
-                current_relative_xz = np.mean(
-                    relative_feet_xz[segment_start:segment_end, columns],
-                    axis=1,
+                try:
+                    dual = np.linalg.solve(system, frame_target)
+                except np.linalg.LinAlgError:
+                    dual = np.linalg.lstsq(
+                        system,
+                        frame_target,
+                        rcond=None,
+                    )[0]
+                parameters[frame] = column_scale * (
+                    scaled_jacobian.T @ dual
                 )
-                correction[segment_start:segment_end, (0, 2)] += (
-                    anchor_relative_xz[None, :] - current_relative_xz
+
+            parameters = _smooth_transaction_delta(parameters)
+            parameters *= contact_envelope[:, None]
+            root_amplitude = float(np.max(np.abs(parameters[:, :3])))
+            rotation_amplitude = float(np.max(np.abs(parameters[:, 3:])))
+            scale_limits = [1.0]
+            if root_amplitude > 1.0e-8:
+                scale_limits.append(
+                    float(cfg.full_sequence_contact_repair_fd_root_step_m)
+                    / root_amplitude
                 )
-                current_y = np.mean(
-                    feet[segment_start:segment_end, columns, 1],
-                    axis=1,
+            if rotation_amplitude > 1.0e-8:
+                scale_limits.append(
+                    float(cfg.full_sequence_contact_repair_fd_rotation_step)
+                    / rotation_amplitude
                 )
-                correction[segment_start:segment_end, 1] += np.maximum(
-                    0.0,
-                    floor_y - current_y,
-                )
-            correction = _smooth_transaction_delta(correction)
-            correction *= contact_envelope[:, None]
-            amplitude = float(np.max(np.abs(correction)))
+            parameters *= float(min(scale_limits))
+            amplitude = float(np.max(np.abs(parameters)))
             if not np.isfinite(amplitude) or amplitude < 1.0e-8:
                 continue
-            correction *= float(cfg.full_sequence_contact_repair_fd_root_step_m) / max(
-                amplitude,
-                1.0e-8,
-            )
-            direction_by_side[side] = correction.astype(np.float32)
+            direction_by_side[side] = {
+                "parameters": parameters.astype(np.float32),
+                "chain": chain,
+                "active_frames": int(np.any(active_by_endpoint, axis=1).sum()),
+                "root_parameter_scale": float(column_scale[0]),
+                "root_rotation_parameter_scale": float(column_scale[3]),
+                "joint_parameter_scale": 1.0,
+            }
 
         output: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
-        for side, correction in direction_by_side.items():
-            amplitude = float(np.max(np.abs(correction)))
+        for side, direction in direction_by_side.items():
+            parameters = np.asarray(direction["parameters"], dtype=np.float32)
+            chain = tuple(direction["chain"])
+            amplitude = float(np.max(np.abs(parameters)))
             for sign, label in ((1.0, "positive"), (-1.0, "negative")):
                 candidate = base.copy()
-                candidate[start:end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]] = (
-                    base[start:end, [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]]
-                    + sign * correction
+                candidate[start:end] = apply_chain_parameters(
+                    sign * parameters,
+                    chain,
                 )
                 output.append(
                     (
-                        f"finite_difference:contact_anchor_{side}:{label}",
+                        (
+                            "finite_difference:"
+                            f"contact_anchor_jacobian_{side}:{label}"
+                        ),
                         candidate.astype(np.float32),
                         {
                             "direction_source": "finite_difference",
-                            "direction_block": f"contact_anchor_{side}",
+                            "direction_block": (
+                                f"contact_anchor_jacobian_{side}"
+                            ),
                             "direction_sign": int(sign),
                             "probe_step": float(sign * amplitude),
-                            "probe_basis": "contact_anchor_root_relative",
-                            "direction_family": "contact_anchor",
+                            "probe_basis": (
+                                "fk_contact_endpoint_jacobian_damped_ls"
+                            ),
+                            "direction_family": "contact_anchor_jacobian",
                             "support_side": side,
+                            "kinematic_chain": [
+                                JOINT_NAMES[int(joint)] for joint in chain
+                            ],
+                            "active_support_frames": int(
+                                direction["active_frames"]
+                            ),
+                            "parameter_scales": {
+                                "root_translation": float(
+                                    direction["root_parameter_scale"]
+                                ),
+                                "root_rotation": float(
+                                    direction["root_rotation_parameter_scale"]
+                                ),
+                                "hip_knee_ankle": float(
+                                    direction["joint_parameter_scale"]
+                                ),
+                            },
                             "support_policy": "final_fail_closed",
                             "contact_objectives": [
                                 "foot_skate_mps_p95",
@@ -11642,6 +11839,19 @@ def _finite_difference_cone_sources(
             max(0.0, value - 1.0e-8)
             for value in contact_derivative.values()
         )
+        active_contact_metrics = [
+            key for key in contact_keys if before_residuals[key] > 0.0
+        ]
+        dominant_contact_metric = max(
+            active_contact_metrics or list(contact_keys),
+            key=lambda key: before_residuals[key],
+        )
+        dominant_contact_nonregression = bool(
+            contact_derivative[dominant_contact_metric] <= 1.0e-8
+        )
+        support_drift_nonregression = bool(
+            contact_derivative["foot_support_drift_m_p95"] <= 1.0e-8
+        )
         hard_regression = sum(
             1.0e6
             if not np.isfinite(value)
@@ -11715,6 +11925,8 @@ def _finite_difference_cone_sources(
         derivative_feasible = bool(
             meaningful_metrics
             and contact_regression <= 1.0e-8
+            and dominant_contact_nonregression
+            and support_drift_nonregression
             and hard_safe_backtracking_factor + 1.0e-12
             >= minimum_backtracking_factor
             and global_safe_backtracking_factor + 1.0e-12
@@ -11760,6 +11972,9 @@ def _finite_difference_cone_sources(
                 minimum_backtracking_factor
             ),
             "meaningful_contact_metrics": meaningful_metrics,
+            "dominant_contact_metric": dominant_contact_metric,
+            "dominant_contact_nonregression": dominant_contact_nonregression,
+            "support_drift_nonregression": support_drift_nonregression,
             "derivative_feasible": derivative_feasible,
         }
 
@@ -11790,6 +12005,15 @@ def _finite_difference_cone_sources(
                 if evaluated["derivative_feasible"]:
                     feasible_records.append(record)
                 else:
+                    for key, value in evaluated[
+                        "contact_derivative"
+                    ].items():
+                        if not np.isfinite(value) or value > 1.0e-8:
+                            metric_key = f"contact:{key}"
+                            rejected_constraint_counts[metric_key] = (
+                                rejected_constraint_counts.get(metric_key, 0)
+                                + 1
+                            )
                     for key, value in evaluated[
                         "hard_derivative"
                     ].items():
@@ -11886,6 +12110,15 @@ def _finite_difference_cone_sources(
             "meaningful_contact_metrics": record[
                 "meaningful_contact_metrics"
             ],
+            "dominant_contact_metric": record[
+                "dominant_contact_metric"
+            ],
+            "dominant_contact_nonregression": record[
+                "dominant_contact_nonregression"
+            ],
+            "support_drift_nonregression": record[
+                "support_drift_nonregression"
+            ],
             "rejected_constraint_counts": dict(
                 sorted(
                     rejected_constraint_counts.items(),
@@ -11941,7 +12174,54 @@ def _local_infeasibility_diagnosis(
         "blocking_reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
         "contact_regressions": dict(sorted(contact_reasons.items(), key=lambda item: (-item[1], item[0]))),
         "hard_regressions": dict(sorted(hard_reasons.items(), key=lambda item: (-item[1], item[0]))),
+        "contact_anchor_rejection_reasons": (
+            _contact_anchor_rejection_reason_counts(attempts)
+        ),
     }
+
+
+def _contact_anchor_rejection_reason_counts(
+    attempts: Sequence[Mapping[str, Any]],
+) -> Dict[str, int]:
+    """Classify exact-audit failures for FK contact-anchor directions."""
+
+    categories = {
+        "support_drift_regression": 0,
+        "penetration_not_improved": 0,
+        "jerk_regression": 0,
+        "boundary_regression": 0,
+        "fidelity_regression": 0,
+    }
+    for attempt in attempts:
+        source_parts = [
+            str(attempt.get("source", "")),
+            str(attempt.get("direction_block", "")),
+        ]
+        source_parts.extend(
+            str(value) for value in attempt.get("direction_blocks", ()) or ()
+        )
+        if not any("contact_anchor" in value for value in source_parts):
+            continue
+        if bool(attempt.get("accepted", False)):
+            continue
+        reasons = [str(value) for value in attempt.get("blocking_reasons", ())]
+        exact = attempt.get("exact_audit", {}) or {}
+        meaningful = set(exact.get("meaningful_contact_metrics", ()) or ())
+        before_residuals = exact.get("before_residuals", {}) or {}
+        if any("foot_support_drift" in reason for reason in reasons):
+            categories["support_drift_regression"] += 1
+        if (
+            float(before_residuals.get("foot_penetration_min_m", 0.0)) > 0.0
+            and "foot_penetration_min_m" not in meaningful
+        ):
+            categories["penetration_not_improved"] += 1
+        if any("jerk" in reason for reason in reasons):
+            categories["jerk_regression"] += 1
+        if any("boundary" in reason for reason in reasons):
+            categories["boundary_regression"] += 1
+        if any("fidelity" in reason for reason in reasons):
+            categories["fidelity_regression"] += 1
+    return {key: int(value) for key, value in categories.items()}
 
 
 def _contact_restoration_decision(
@@ -13740,6 +14020,11 @@ def true_lower_body_ik(
                         cone_rejected_counts_local.items(),
                         key=lambda item: (-int(item[1]), str(item[0])),
                     )),
+                    "contact_anchor_rejection_reasons": (
+                        _contact_anchor_rejection_reason_counts(
+                            candidate_attempts
+                        )
+                    ),
                     "attempts": candidate_attempts,
                 },
                 "post_commit_relocalization": post_commit_localization,

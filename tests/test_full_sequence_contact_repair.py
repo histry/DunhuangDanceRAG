@@ -7,6 +7,7 @@ from motion_geometry.smpl24 import MOTION_DIM
 from training.motion_models import (
     MotionGenerationConfig,
     _c2_transaction_weight,
+    _contact_anchor_rejection_reason_counts,
     _contact_restoration_decision,
     _exact_audit_candidate_rank,
     _finite_difference_contact_direction_sources,
@@ -130,6 +131,30 @@ def test_v11_reports_local_infeasibility_without_relaxing_hard_filters():
     }
     assert diagnosis["hard_regressions"] == {
         "audit_halo_metric_regressed:joint_jerk_mps3_p95": 1
+    }
+
+
+def test_contact_anchor_rejections_are_reported_by_exact_failure_layer():
+    attempts = [{
+        "source": "finite_difference_cone:contact_anchor_jacobian_left1",
+        "accepted": False,
+        "blocking_reasons": [
+            "contact_residual_regressed:foot_support_drift_m_p95",
+            "hard_metric_regressed:joint_jerk_mps3_p95",
+            "candidate_guard:boundary:slot_4",
+            "candidate_guard:fidelity:seam_jerk",
+        ],
+        "exact_audit": {
+            "before_residuals": {"foot_penetration_min_m": 0.5},
+            "meaningful_contact_metrics": [],
+        },
+    }]
+    assert _contact_anchor_rejection_reason_counts(attempts) == {
+        "support_drift_regression": 1,
+        "penetration_not_improved": 1,
+        "jerk_regression": 1,
+        "boundary_regression": 1,
+        "fidelity_regression": 1,
     }
 
 
