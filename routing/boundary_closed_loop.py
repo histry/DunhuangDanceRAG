@@ -1038,8 +1038,20 @@ def physical_quality_gate(audit: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequence[Dict[str, Any]], cfg: Any) -> List[Dict[str, Any]]:
+def audit_boundaries(
+    motion_runtime,
+    motion: np.ndarray,
+    assembly_report: Sequence[Dict[str, Any]],
+    cfg: Any,
+    *,
+    active_span: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    selected_span = None
+    if active_span is not None:
+        if len(active_span) != 2:
+            raise ValueError("active_span must contain [start, end]")
+        selected_span = tuple(map(int, active_span))
     for i in range(1, len(assembly_report)):
         prev_core = assembly_report[i - 1].get("core_span")
         transition = assembly_report[i].get("transition_span")
@@ -1054,6 +1066,13 @@ def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequen
         else:
             t0, t1 = int(transition[0]), int(transition[1])
         c0, c1 = int(curr_core[0]), int(curr_core[1])
+        dependency_start = min(max(0, prev_end - 4), t0, c0)
+        dependency_end = max(prev_end, t1, min(c1, c0 + 4))
+        if selected_span is not None and (
+            dependency_end <= selected_span[0]
+            or selected_span[1] <= dependency_start
+        ):
+            continue
         previous = motion[max(0, prev_end - 4):prev_end]
         bridge = motion[t0:t1]
         following = motion[c0:min(c1, c0 + 4)]
@@ -1071,8 +1090,8 @@ def audit_boundaries(motion_runtime, motion: np.ndarray, assembly_report: Sequen
             "content_start": int(c0),
             "content_end": int(c1),
             "boundary_span": [
-                int(min(t0, c0)),
-                int(max(t1, c1, c0 + 1)),
+                int(dependency_start),
+                int(dependency_end),
             ],
             "predicted_risk_score": float(assembly_report[i].get("risk_score_predicted", 0.0)),
             "predicted_boundary_jerk": float(pred.get("boundary_joint_jerk_max", 0.0)) if isinstance(pred, dict) else 0.0,

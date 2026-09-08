@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -1113,16 +1114,28 @@ def replay_solutions(
                     sliding_support_eligible=local_eligible,
                 )
             )
-            boundary = _boundary_nonregression(
-                cached_reference_boundaries(current),
-                closed_loop.audit_boundaries(
-                    runtime,
-                    candidate,
-                    bundle["assembly"],
-                    cfg,
-                ),
+            boundary_started = time.perf_counter()
+            reference_boundary_rows = cached_reference_boundaries(current)
+            candidate_boundary_rows = closed_loop.audit_boundaries(
+                runtime,
+                candidate,
+                bundle["assembly"],
+                cfg,
                 active_span=[start, end],
             )
+            boundary = _boundary_nonregression(
+                reference_boundary_rows,
+                candidate_boundary_rows,
+                active_span=[start, end],
+            )
+            updated_by_slot = {
+                int(row["slot"]): row for row in candidate_boundary_rows
+            }
+            boundary_cache[_array_content_hash(candidate)] = [
+                updated_by_slot.get(int(row["slot"]), row)
+                for row in reference_boundary_rows
+            ]
+            boundary_seconds = time.perf_counter() - boundary_started
             scope = _motion_scope_audit(
                 current,
                 candidate,
@@ -1165,6 +1178,12 @@ def replay_solutions(
                 "fidelity": fidelity,
                 "fixed_support": fixed_support,
                 "boundary": boundary,
+                "performance": {
+                    "boundary_audit": {
+                        "seconds": float(boundary_seconds),
+                        "calls": 1,
+                    }
+                },
                 "observable_gate": 0.03,
                 "observable_solution_gate": observable,
             }

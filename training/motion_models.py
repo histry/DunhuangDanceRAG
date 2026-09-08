@@ -65,6 +65,7 @@ from motion_geometry.rotations import (
     matrix_to_rot6d_torch as _contract_matrix_to_rot6d_torch,
     rot6d_to_matrix_np as _contract_rot6d_to_matrix_np,
     rot6d_to_matrix_torch as _contract_rot6d_to_matrix_torch,
+    so3_exp_torch,
     so3_log_torch,
 )
 from motion_geometry.product_manifold import (
@@ -346,6 +347,266 @@ def fk_24_torch(motion, parents=None, offsets=None):
     return torch.stack(joints, dim=1).reshape(*leading, NUM_JOINTS, 3)
 
 
+def _torch_masked_percentile(values, mask, percentile: float):
+    """Return a per-candidate nearest-rank percentile without host transfer."""
+
+    if values.ndim < 2:
+        raise ValueError("batched percentile expects [B,...]")
+    flat = values.reshape(values.shape[0], -1)
+    valid = torch.broadcast_to(mask, values.shape).reshape(values.shape[0], -1)
+    counts = valid.sum(dim=1)
+    safe = torch.where(valid, flat, torch.full_like(flat, float("inf")))
+    ordered = torch.sort(safe, dim=1).values
+    rank = torch.ceil(
+        counts.to(values.dtype) * (float(percentile) / 100.0)
+    ).to(torch.long) - 1
+    rank = torch.clamp(rank, min=0, max=max(0, flat.shape[1] - 1))
+    result = ordered.gather(1, rank[:, None])[:, 0]
+    return torch.where(counts > 0, result, torch.zeros_like(result))
+
+
+def _torch_distribution(values, prefix: str, mask=None):
+    """Small tensor metric registry used by the GPU candidate pre-screen."""
+
+    if values.ndim < 2:
+        raise ValueError("batched distribution expects [B,...]")
+    if mask is None:
+        mask = torch.ones_like(values, dtype=torch.bool)
+    else:
+        mask = torch.broadcast_to(mask, values.shape)
+    flat = values.reshape(values.shape[0], -1)
+    valid = mask.reshape(values.shape[0], -1)
+    counts = valid.sum(dim=1)
+    total = torch.where(valid, flat, torch.zeros_like(flat)).sum(dim=1)
+    maximum = torch.where(
+        valid,
+        flat,
+        torch.full_like(flat, float("-inf")),
+    ).max(dim=1).values
+    maximum = torch.where(counts > 0, maximum, torch.zeros_like(maximum))
+    return {
+        f"{prefix}_mean": total / counts.clamp_min(1).to(values.dtype),
+        f"{prefix}_p95": _torch_masked_percentile(values, mask, 95.0),
+        f"{prefix}_max": maximum,
+    }
+
+
+def _torch_window_percentile_max_batch(
+    values,
+    *,
+    fps: float,
+    seconds: float = 1.0,
+    percentile: float = 95.0,
+):
+    """Maximum local percentile for every candidate in a GPU batch."""
+
+    if values.ndim < 2 or values.shape[1] == 0:
+        return torch.zeros(
+            values.shape[0], device=values.device, dtype=values.dtype
+        )
+    window = min(
+        int(values.shape[1]),
+        max(1, int(round(float(seconds) * float(fps)))),
+    )
+    hop = max(1, window // 2)
+    starts = list(range(0, max(1, values.shape[1] - window + 1), hop))
+    final_start = max(0, int(values.shape[1]) - window)
+    if not starts or starts[-1] != final_start:
+        starts.append(final_start)
+    percentiles = [
+        torch.quantile(
+            values[:, start:start + window].reshape(values.shape[0], -1),
+            float(percentile) / 100.0,
+            dim=1,
+        )
+        for start in starts
+    ]
+    return torch.stack(percentiles, dim=1).max(dim=1).values
+
+
+def batch_physical_audit_torch(
+    motions,
+    cfg: Optional["MotionGenerationConfig"] = None,
+    *,
+    sliding_support_eligible=None,
+    static_support_mask=None,
+):
+    """Batch physical pre-audit for ``[candidate, frame, 151]`` tensors.
+
+    FK and all temporal/contact quantities stay on the input device.  This is
+    deliberately a conservative screening layer: final acceptance still runs
+    :func:`audit_motion_np`, fixed-support, fidelity, boundary, KBO and the
+    observable 0.03 contract on CPU.  A fixed support mask may be supplied so
+    all candidates are compared on exactly the same ownership support frames.
+    """
+
+    if torch is None or not torch.is_tensor(motions):
+        raise TypeError("motions must be a torch tensor")
+    if motions.ndim != 3 or motions.shape[-1] != EDGE_DIM:
+        raise ValueError(
+            f"Expected [B,T,{EDGE_DIM}], got {tuple(motions.shape)}"
+        )
+    cfg = cfg or MotionGenerationConfig()
+    batch, frames, _ = motions.shape
+    if frames < 1:
+        raise ValueError("physical audit requires at least one frame")
+    fps = float(cfg.fps)
+    joints = fk_24_torch(motions)
+    velocity = torch.diff(joints, n=1, dim=1) * fps
+    acceleration = torch.diff(joints, n=2, dim=1) * fps**2
+    jerk = torch.diff(joints.to(torch.float64), n=3, dim=1) * fps**3
+    jerk_norm = torch.linalg.vector_norm(jerk, dim=-1).to(motions.dtype)
+    extremity_ids = torch.as_tensor(
+        (7, 8, 10, 11, 20, 21, 22, 23),
+        device=motions.device,
+        dtype=torch.long,
+    )
+    extremity_jerk = jerk_norm.index_select(2, extremity_ids)
+    foot_ids = torch.as_tensor(
+        DEFAULT_FOOT_JOINTS, device=motions.device, dtype=torch.long
+    )
+    feet = joints.index_select(2, foot_ids)
+    foot_speed = torch.zeros(
+        (batch, frames, len(DEFAULT_FOOT_JOINTS)),
+        device=motions.device,
+        dtype=motions.dtype,
+    )
+    if frames > 1:
+        foot_speed[:, 1:] = torch.linalg.vector_norm(
+            torch.diff(feet[..., (0, 2)], dim=1), dim=-1
+        ) * fps
+    floor_y = torch.quantile(
+        feet[..., 1].reshape(batch, -1), 0.05, dim=1
+    )
+    relative_height = feet[..., 1] - floor_y[:, None, None]
+
+    if static_support_mask is None:
+        declared = motions[..., CONTACT] > 0.5
+        low_height = relative_height <= 0.055
+        static = declared | low_height
+        if sliding_support_eligible is not None:
+            eligible = torch.as_tensor(
+                sliding_support_eligible,
+                device=motions.device,
+                dtype=torch.bool,
+            )
+            if eligible.ndim == 1:
+                eligible = eligible[None, :, None]
+            elif eligible.ndim == 2:
+                eligible = eligible[None]
+            static = static & ~torch.broadcast_to(eligible, static.shape)
+    else:
+        static = torch.as_tensor(
+            static_support_mask,
+            device=motions.device,
+            dtype=torch.bool,
+        )
+        if static.ndim == 2:
+            static = static[None]
+        static = torch.broadcast_to(static, foot_speed.shape)
+
+    feet_xz = feet[..., (0, 2)]
+    drift = torch.zeros_like(foot_speed)
+    anchor = feet_xz[:, 0]
+    previous = torch.zeros_like(static[:, 0])
+    for frame in range(frames):
+        active = static[:, frame]
+        starts = active & ~previous
+        anchor = torch.where(starts[..., None], feet_xz[:, frame], anchor)
+        drift[:, frame] = torch.where(
+            active,
+            torch.linalg.vector_norm(feet_xz[:, frame] - anchor, dim=-1),
+            torch.zeros_like(drift[:, frame]),
+        )
+        previous = active
+
+    result = {
+        "floor_y_m": floor_y,
+        "foot_penetration_min_m": relative_height.reshape(batch, -1).min(
+            dim=1
+        ).values,
+        "foot_penetration_p01_m": torch.quantile(
+            relative_height.reshape(batch, -1), 0.01, dim=1
+        ),
+        "joint_jerk_window_p95_max_mps3": (
+            _torch_window_percentile_max_batch(jerk_norm, fps=fps)
+        ),
+        "extremity_jerk_window_p95_max_mps3": (
+            _torch_window_percentile_max_batch(extremity_jerk, fps=fps)
+        ),
+        "static_support_ratio": static.to(motions.dtype).mean(dim=(1, 2)),
+    }
+    result.update(
+        _torch_distribution(
+            torch.linalg.vector_norm(velocity, dim=-1), "joint_velocity_mps"
+        )
+    )
+    result.update(
+        _torch_distribution(
+            torch.linalg.vector_norm(acceleration, dim=-1),
+            "joint_acceleration_mps2",
+        )
+    )
+    result.update(_torch_distribution(jerk_norm, "joint_jerk_mps3"))
+    result.update(
+        _torch_distribution(extremity_jerk, "extremity_jerk_mps3")
+    )
+    result.update(
+        _torch_distribution(foot_speed, "foot_skate_mps", mask=static)
+    )
+    result.update(
+        _torch_distribution(drift, "foot_support_drift_m", mask=static)
+    )
+    return result
+
+
+def _blend_edge151_geodesic_torch_batch(reference, proposals, weights):
+    """Blend local candidate patches without constructing full host motions."""
+
+    if reference.ndim != 2 or reference.shape[-1] != EDGE_DIM:
+        raise ValueError(f"Expected reference [T,{EDGE_DIM}]")
+    if proposals.ndim != 3 or proposals.shape[1:] != reference.shape:
+        raise ValueError("proposal batch must match the reference patch")
+    batch, frames, _ = proposals.shape
+    value = torch.as_tensor(
+        weights, device=proposals.device, dtype=proposals.dtype
+    )
+    if value.ndim == 1:
+        value = value[None, :, None]
+    elif value.ndim == 2:
+        value = value[:, :, None]
+    value = torch.broadcast_to(value, (batch, frames, 1)).clamp(0.0, 1.0)
+    base = reference[None].expand(batch, -1, -1)
+    output = base.clone()
+    output[..., CONTACT] = base[..., CONTACT]
+    root_ids = [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]
+    output[..., root_ids] = (
+        base[..., root_ids]
+        + value * (proposals[..., root_ids] - base[..., root_ids])
+    )
+    base_rot = rot6d_to_matrix_torch(
+        base[..., ROT6D_START:ROT6D_END].reshape(
+            batch, frames, NUM_JOINTS, 6
+        )
+    )
+    proposal_rot = rot6d_to_matrix_torch(
+        proposals[..., ROT6D_START:ROT6D_END].reshape(
+            batch, frames, NUM_JOINTS, 6
+        )
+    )
+    tangent = so3_log_torch(
+        torch.matmul(base_rot.transpose(-1, -2), proposal_rot)
+    )
+    blended_rot = torch.matmul(
+        base_rot,
+        so3_exp_torch(tangent * value[..., None]),
+    )
+    output[..., ROT6D_START:ROT6D_END] = matrix_to_rot6d_torch(
+        blended_rot
+    ).reshape(batch, frames, -1)
+    return output
+
+
 def root_yaw_np(motion: np.ndarray) -> np.ndarray:
     root_r = rot6d_to_matrix_np(motion[:, ROT6D_START:ROT6D_START + 6].reshape(-1, 1, 6))[:, 0]
     forward = root_r[:, :, 2]
@@ -445,6 +706,12 @@ class MotionGenerationConfig:
     full_sequence_contact_repair_fd_root_step_m: float = 0.005
     full_sequence_contact_repair_fd_rotation_step: float = 0.01
     full_sequence_contact_repair_fd_min_delta: float = 1.0e-8
+    # Development-only accelerator pre-screen.  These controls never change
+    # the authoritative NumPy/CPU acceptance contract; they only limit which
+    # candidates reach that exact audit.
+    full_sequence_contact_repair_gpu_batch_size: int = 256
+    full_sequence_contact_repair_gpu_shortlist: int = 64
+    full_sequence_contact_repair_gpu_boundary_tolerance: float = 1.0e-5
     full_sequence_contact_repair_backtracking_factors: Tuple[float, ...] = (
         1.0,
         0.5,
@@ -821,6 +1088,15 @@ class MotionGenerationConfig:
             ),
             "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_FROZEN_EDGE_FRAMES": (
                 "full_sequence_contact_repair_frozen_edge_frames", int,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_GPU_BATCH_SIZE": (
+                "full_sequence_contact_repair_gpu_batch_size", int,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_GPU_SHORTLIST": (
+                "full_sequence_contact_repair_gpu_shortlist", int,
+            ),
+            "MOTION_FULL_SEQUENCE_CONTACT_REPAIR_GPU_BOUNDARY_TOLERANCE": (
+                "full_sequence_contact_repair_gpu_boundary_tolerance", float,
             ),
             "MOTION_ROLLBACK_ROOT_DELTA_MAX_M": ("rollback_root_delta_max_m", float),
             "MOTION_ROOT_Y_DAMPING_MAX_SECONDS": ("root_y_damping_max_seconds", float),
@@ -10920,6 +11196,7 @@ def _finite_difference_contact_direction_sources(
     *,
     include_body_blocks: bool = True,
     include_temporal: bool = False,
+    return_patches: bool = False,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
     """Build signed local finite-difference directions for contact repair.
 
@@ -11059,8 +11336,22 @@ def _finite_difference_contact_direction_sources(
                 )
             )
 
+    def finalized_sources():
+        if not return_patches:
+            return sources
+        output = []
+        for name, candidate, metadata in sources:
+            patch_metadata = dict(metadata)
+            patch_metadata["motion_scope"] = "ownership_patch"
+            output.append((
+                name,
+                np.asarray(candidate[start:end], dtype=np.float32).copy(),
+                patch_metadata,
+            ))
+        return output
+
     if not include_temporal:
-        return sources
+        return finalized_sources()
 
     # Add temporal structure directions independently of the body-block
     # directions above.  The global cone measures their real full-sequence
@@ -11231,7 +11522,7 @@ def _finite_difference_contact_direction_sources(
                     },
                 )
             )
-    return sources
+    return finalized_sources()
 
 
 def _finite_difference_cone_sources(
@@ -11262,6 +11553,16 @@ def _finite_difference_cone_sources(
     start, end = map(int, first_span)
     if end <= start:
         return []
+
+    def local_patch(source_motion: np.ndarray) -> np.ndarray:
+        value = np.asarray(source_motion, dtype=np.float32)
+        if value.shape == base.shape:
+            return value[start:end]
+        if value.shape == base[start:end].shape:
+            return value
+        raise ValueError(
+            "finite-difference source must be full motion or ownership patch"
+        )
 
     before_eligible = np.asarray(ownership_eligible, dtype=bool).reshape(-1)
     if before_eligible.shape != (end - start,):
@@ -11598,7 +11899,9 @@ def _finite_difference_cone_sources(
         if sign != 1 or not block or block in seen_blocks:
             continue
         seen_blocks.add(block)
-        temporal_delta += np.asarray(source_motion, dtype=np.float32) - base
+        temporal_delta[start:end] += (
+            local_patch(source_motion) - base[start:end]
+        )
     if np.any(np.abs(temporal_delta) > 0.0):
         temporal_sources = _finite_difference_contact_direction_sources(
             base,
@@ -11608,6 +11911,7 @@ def _finite_difference_cone_sources(
             cfg,
             include_body_blocks=False,
             include_temporal=True,
+            return_patches=True,
         )
         finite_difference_sources = tuple(
             list(finite_difference_sources) + temporal_sources
@@ -11744,19 +12048,22 @@ def _finite_difference_cone_sources(
         if key in indexed:
             continue
         indexed[key] = source
+        source_patch = local_patch(source[1])
         source_audit = audit_motion_np(
-            source[1][start:end],
+            source_patch,
             cfg,
             sliding_support_eligible=before_eligible,
         )
         source_residuals = _physical_residuals(source_audit, limits)
-        source_seam = seam_metrics(source[1][start:end])
+        source_seam = seam_metrics(source_patch)
         source_global_audit = None
         global_nonregression_derivative: Dict[str, float] = {}
         global_nonregression_tolerance: Dict[str, float] = {}
         if before_global_audit is not None:
+            source_full = base.copy()
+            source_full[start:end] = source_patch
             source_global_audit = audit_motion_np(
-                source[1],
+                source_full,
                 cfg,
                 sliding_support_eligible=full_eligible,
             )
@@ -11978,15 +12285,21 @@ def _finite_difference_cone_sources(
             "derivative_feasible": derivative_feasible,
         }
 
-    records: List[Dict[str, Any]] = []
+    enumeration_started = time.perf_counter()
     combination_count = 0
-    feasible_records: List[Dict[str, Any]] = []
     rejected_constraint_counts: Dict[str, int] = {}
     contact_direction_keys = {
         direction
         for direction in directions
         if direction[0].startswith("contact_anchor_")
     }
+    direction_index = {
+        direction: index for index, direction in enumerate(directions)
+    }
+    combination_specs: List[
+        Tuple[Tuple[Tuple[str, int], ...], Tuple[float, ...]]
+    ] = []
+    coefficient_rows: List[np.ndarray] = []
     for size in (1, 2, 3):
         for combo in combinations(directions, size):
             if contact_direction_keys and not any(
@@ -11995,84 +12308,389 @@ def _finite_difference_cone_sources(
                 continue
             for coefficients in coefficient_candidates(size):
                 combination_count += 1
-                evaluated = evaluate_combination(combo, coefficients)
-                record = {
-                    "combo": combo,
-                    "coefficients": coefficients,
-                    **evaluated,
-                }
-                records.append(record)
-                if evaluated["derivative_feasible"]:
-                    feasible_records.append(record)
-                else:
-                    for key, value in evaluated[
-                        "contact_derivative"
-                    ].items():
-                        if not np.isfinite(value) or value > 1.0e-8:
-                            metric_key = f"contact:{key}"
-                            rejected_constraint_counts[metric_key] = (
-                                rejected_constraint_counts.get(metric_key, 0)
-                                + 1
-                            )
-                    for key, value in evaluated[
-                        "hard_derivative"
-                    ].items():
-                        if not np.isfinite(value) or value > 1.0e-8:
-                            rejected_constraint_counts[key] = (
-                                rejected_constraint_counts.get(key, 0) + 1
-                            )
-                    for key, value in evaluated[
-                        "global_nonregression_derivative"
-                    ].items():
-                        tolerance = max(
-                            float(
-                                profiles[directions[0]].get(
-                                    "global_nonregression_tolerance", {}
-                                ).get(key, 1.0e-8)
-                            ),
-                            1.0e-8,
-                        )
-                        if not np.isfinite(value) or value > tolerance:
-                            metric_key = f"global_nonregression:{key}"
-                            rejected_constraint_counts[metric_key] = (
-                                rejected_constraint_counts.get(metric_key, 0)
-                                + 1
-                            )
-                    if not evaluated["meaningful_contact_metrics"]:
-                        rejected_constraint_counts[
-                            "contact_improvement"
-                        ] = rejected_constraint_counts.get(
-                            "contact_improvement", 0
-                        ) + 1
+                row = np.zeros(len(directions), dtype=np.float32)
+                for coefficient, direction in zip(coefficients, combo):
+                    row[direction_index[direction]] = float(coefficient)
+                coefficient_rows.append(row)
+                combination_specs.append((tuple(combo), tuple(coefficients)))
 
-    global_cone_feasible = bool(feasible_records)
-    feasible_records.sort(key=lambda item: item["score"])
-    records.sort(key=lambda item: item["score"])
-    # Materialize only a bounded diagnostic frontier.  The derivative search
-    # still enumerates every combination, while candidate auditing remains
-    # tractable and retains the best feasible directions first.
-    selected_records = (
-        feasible_records[:32]
-        if global_cone_feasible
-        else records[:32]
+    if not coefficient_rows:
+        return []
+
+    if torch is None:
+        matrix_device = None
+    else:
+        requested_device = torch.device(str(cfg.device))
+        matrix_device = requested_device
+        if requested_device.type == "cuda" and not torch.cuda.is_available():
+            matrix_device = torch.device("cpu")
+    contact_metric_keys = sorted(contact_keys)
+    hard_metric_keys = sorted({
+        key
+        for direction in directions
+        for key in profiles[direction]["hard_derivative"]
+    })
+    global_metric_keys = sorted({
+        key
+        for direction in directions
+        for key in profiles[direction]["global_nonregression_derivative"]
+    })
+
+    def direction_derivative_matrix(field: str, keys: Sequence[str]):
+        values = np.asarray([
+            [
+                float(profiles[direction][field].get(key, 0.0))
+                for key in keys
+            ]
+            for direction in directions
+        ], dtype=np.float32)
+        return np.nan_to_num(
+            values,
+            nan=1.0e6,
+            posinf=1.0e6,
+            neginf=-1.0e6,
+        )
+
+    coefficient_matrix_np = np.stack(coefficient_rows, axis=0)
+    if torch is None:
+        coefficient_matrix = None
+        contact_values_np = coefficient_matrix_np @ direction_derivative_matrix(
+            "contact_derivative", contact_metric_keys
+        )
+        hard_values_np = coefficient_matrix_np @ direction_derivative_matrix(
+            "hard_derivative", hard_metric_keys
+        )
+        global_values_np = coefficient_matrix_np @ direction_derivative_matrix(
+            "global_nonregression_derivative", global_metric_keys
+        )
+        contact_values = np.asarray(contact_values_np)
+        hard_values = np.asarray(hard_values_np)
+        global_values = np.asarray(global_values_np)
+    else:
+        coefficient_matrix = torch.as_tensor(
+            coefficient_matrix_np,
+            device=matrix_device,
+            dtype=torch.float32,
+        )
+        contact_values = coefficient_matrix @ torch.as_tensor(
+            direction_derivative_matrix(
+                "contact_derivative", contact_metric_keys
+            ),
+            device=matrix_device,
+            dtype=torch.float32,
+        )
+        hard_values = coefficient_matrix @ torch.as_tensor(
+            direction_derivative_matrix("hard_derivative", hard_metric_keys),
+            device=matrix_device,
+            dtype=torch.float32,
+        )
+        global_values = coefficient_matrix @ torch.as_tensor(
+            direction_derivative_matrix(
+                "global_nonregression_derivative", global_metric_keys
+            ),
+            device=matrix_device,
+            dtype=torch.float32,
+        )
+
+    active_contact_metrics = [
+        key for key in contact_keys if before_residuals[key] > 0.0
+    ]
+    dominant_contact_metric = max(
+        active_contact_metrics or list(contact_keys),
+        key=lambda key: before_residuals[key],
     )
+    dominant_index = contact_metric_keys.index(dominant_contact_metric)
+    drift_index = contact_metric_keys.index("foot_support_drift_m_p95")
+    meaningful_threshold = np.asarray([
+        max(
+            1.0e-7,
+            before_residuals[key]
+            * float(cfg.full_sequence_contact_repair_min_gain),
+        )
+        for key in contact_metric_keys
+    ], dtype=np.float32)
+    hard_tolerance_np = np.asarray([
+        max(
+            float(
+                profiles[directions[0]].get(
+                    "hard_derivative_tolerance", {}
+                ).get(key, 1.0e-8)
+            ),
+            1.0e-8,
+        )
+        for key in hard_metric_keys
+    ], dtype=np.float32)
+    global_tolerance_np = np.asarray([
+        max(
+            float(
+                profiles[directions[0]].get(
+                    "global_nonregression_tolerance", {}
+                ).get(key, 1.0e-8)
+            ),
+            1.0e-8,
+        )
+        for key in global_metric_keys
+    ], dtype=np.float32)
+    minimum_backtracking_factor = min(
+        float(value)
+        for value in cfg.full_sequence_contact_repair_backtracking_factors
+    )
+
+    if torch is None:
+        meaningful = contact_values <= -meaningful_threshold[None]
+        contact_regression = np.maximum(
+            contact_values - 1.0e-8, 0.0
+        ).sum(axis=1)
+        hard_regression = np.maximum(hard_values - 1.0e-8, 0.0).sum(axis=1)
+        global_regression = np.maximum(
+            global_values - global_tolerance_np[None], 0.0
+        ).sum(axis=1)
+
+        def safe_factor(values, tolerances):
+            positive = values > tolerances[None]
+            ratios = np.where(
+                positive,
+                tolerances[None] / np.maximum(values, 1.0e-12),
+                np.inf,
+            )
+            return ratios.min(axis=1) if values.shape[1] else np.full(
+                values.shape[0], np.inf, dtype=np.float32
+            )
+
+        hard_safe = safe_factor(hard_values, hard_tolerance_np)
+        global_safe = safe_factor(global_values, global_tolerance_np)
+        feasible_mask = (
+            meaningful.any(axis=1)
+            & (contact_regression <= 1.0e-8)
+            & (contact_values[:, dominant_index] <= 1.0e-8)
+            & (contact_values[:, drift_index] <= 1.0e-8)
+            & (hard_safe + 1.0e-12 >= minimum_backtracking_factor)
+            & (global_safe + 1.0e-12 >= minimum_backtracking_factor)
+        )
+        contact_gain = (
+            np.maximum(-contact_values, 0.0)
+            / np.maximum(
+                np.asarray(
+                    [before_residuals[key] for key in contact_metric_keys]
+                )[None],
+                1.0e-7,
+            )
+        ).sum(axis=1)
+        score_scalar = (
+            (~feasible_mask).astype(np.float64) * 1.0e12
+            + hard_regression.astype(np.float64) * 1.0e8
+            + global_regression.astype(np.float64) * 1.0e6
+            + contact_regression.astype(np.float64) * 1.0e4
+            - contact_gain.astype(np.float64)
+        )
+        feasible_indices = np.flatnonzero(feasible_mask)
+        candidate_indices = (
+            feasible_indices[np.argsort(score_scalar[feasible_indices])[:32]]
+            if feasible_indices.size
+            else np.argsort(score_scalar)[:32]
+        )
+    else:
+        meaningful_threshold_t = torch.as_tensor(
+            meaningful_threshold, device=matrix_device
+        )
+        hard_tolerance_t = torch.as_tensor(
+            hard_tolerance_np, device=matrix_device
+        )
+        global_tolerance_t = torch.as_tensor(
+            global_tolerance_np, device=matrix_device
+        )
+        meaningful = contact_values <= -meaningful_threshold_t[None]
+        contact_regression = torch.relu(contact_values - 1.0e-8).sum(dim=1)
+        hard_regression = torch.relu(hard_values - 1.0e-8).sum(dim=1)
+        global_regression = torch.relu(
+            global_values - global_tolerance_t[None]
+        ).sum(dim=1)
+
+        def safe_factor(values, tolerances):
+            if values.shape[1] == 0:
+                return torch.full(
+                    (values.shape[0],),
+                    float("inf"),
+                    device=values.device,
+                    dtype=values.dtype,
+                )
+            ratios = torch.where(
+                values > tolerances[None],
+                tolerances[None] / values.clamp_min(1.0e-12),
+                torch.full_like(values, float("inf")),
+            )
+            return ratios.min(dim=1).values
+
+        hard_safe = safe_factor(hard_values, hard_tolerance_t)
+        global_safe = safe_factor(global_values, global_tolerance_t)
+        feasible_mask = (
+            meaningful.any(dim=1)
+            & (contact_regression <= 1.0e-8)
+            & (contact_values[:, dominant_index] <= 1.0e-8)
+            & (contact_values[:, drift_index] <= 1.0e-8)
+            & (hard_safe + 1.0e-12 >= minimum_backtracking_factor)
+            & (global_safe + 1.0e-12 >= minimum_backtracking_factor)
+        )
+        residual_scale = torch.as_tensor(
+            [max(before_residuals[key], 1.0e-7) for key in contact_metric_keys],
+            device=matrix_device,
+            dtype=torch.float32,
+        )
+        contact_gain = (
+            torch.relu(-contact_values) / residual_scale[None]
+        ).sum(dim=1)
+        score_scalar = (
+            (~feasible_mask).to(torch.float64) * 1.0e12
+            + hard_regression.to(torch.float64) * 1.0e8
+            + global_regression.to(torch.float64) * 1.0e6
+            + contact_regression.to(torch.float64) * 1.0e4
+            - contact_gain.to(torch.float64)
+        )
+        feasible_indices_t = torch.nonzero(
+            feasible_mask, as_tuple=False
+        ).flatten()
+        ranking_pool = (
+            feasible_indices_t
+            if feasible_indices_t.numel()
+            else torch.arange(
+                score_scalar.shape[0], device=score_scalar.device
+            )
+        )
+        shortlist_count = min(32, int(ranking_pool.numel()))
+        selected_offsets = torch.topk(
+            score_scalar.index_select(0, ranking_pool),
+            k=shortlist_count,
+            largest=False,
+        ).indices
+        candidate_indices = ranking_pool.index_select(
+            0, selected_offsets
+        ).detach().cpu().numpy()
+        feasible_indices = feasible_indices_t.detach().cpu().numpy()
+
+    feasible_count = int(len(feasible_indices))
+    global_cone_feasible = bool(feasible_count)
+    for metric_index, key in enumerate(contact_metric_keys):
+        if torch is None:
+            count = int(np.sum(contact_values[:, metric_index] > 1.0e-8))
+        else:
+            count = int((contact_values[:, metric_index] > 1.0e-8).sum().item())
+        if count:
+            rejected_constraint_counts[f"contact:{key}"] = count
+    for metric_index, key in enumerate(hard_metric_keys):
+        if torch is None:
+            count = int(np.sum(hard_values[:, metric_index] > 1.0e-8))
+        else:
+            count = int((hard_values[:, metric_index] > 1.0e-8).sum().item())
+        if count:
+            rejected_constraint_counts[key] = count
+    for metric_index, key in enumerate(global_metric_keys):
+        if torch is None:
+            count = int(np.sum(
+                global_values[:, metric_index]
+                > global_tolerance_np[metric_index]
+            ))
+        else:
+            count = int((
+                global_values[:, metric_index]
+                > global_tolerance_t[metric_index]
+            ).sum().item())
+        if count:
+            rejected_constraint_counts[f"global_nonregression:{key}"] = count
+    if torch is None:
+        no_improvement_count = int(np.sum(~meaningful.any(axis=1)))
+    else:
+        no_improvement_count = int((~meaningful.any(dim=1)).sum().item())
+    if no_improvement_count:
+        rejected_constraint_counts["contact_improvement"] = no_improvement_count
+
+    def selected_record(index: int) -> Dict[str, Any]:
+        combo, coefficients = combination_specs[int(index)]
+        contact_derivative = {
+            key: float(contact_values[int(index), metric_index])
+            for metric_index, key in enumerate(contact_metric_keys)
+        }
+        hard_derivative = {
+            key: float(hard_values[int(index), metric_index])
+            for metric_index, key in enumerate(hard_metric_keys)
+        }
+        global_derivative = {
+            key: float(global_values[int(index), metric_index])
+            for metric_index, key in enumerate(global_metric_keys)
+        }
+        meaningful_metrics = {
+            key: value
+            for key, value in contact_derivative.items()
+            if value <= -max(
+                1.0e-7,
+                before_residuals[key]
+                * float(cfg.full_sequence_contact_repair_min_gain),
+            )
+        }
+        hard_safe_value = float(hard_safe[int(index)])
+        global_safe_value = float(global_safe[int(index)])
+        derivative_feasible = bool(feasible_mask[int(index)])
+        contact_regression_value = float(contact_regression[int(index)])
+        hard_regression_value = float(hard_regression[int(index)])
+        global_regression_value = float(global_regression[int(index)])
+        contact_gain_value = float(contact_gain[int(index)])
+        score = (
+            0 if derivative_feasible else 1,
+            hard_regression_value,
+            global_regression_value,
+            -min(hard_safe_value, 1.0e6),
+            -min(global_safe_value, 1.0e6),
+            contact_regression_value,
+            -contact_gain_value,
+            -float(len(meaningful_metrics)),
+        )
+        return {
+            "combo": combo,
+            "coefficients": coefficients,
+            "score": score,
+            "contact_derivative": contact_derivative,
+            "hard_derivative": hard_derivative,
+            "global_nonregression_derivative": global_derivative,
+            "global_nonregression_regression": global_regression_value,
+            "hard_safe_backtracking_factor": hard_safe_value,
+            "global_safe_backtracking_factor": global_safe_value,
+            "minimum_backtracking_factor": minimum_backtracking_factor,
+            "meaningful_contact_metrics": meaningful_metrics,
+            "dominant_contact_metric": dominant_contact_metric,
+            "dominant_contact_nonregression": bool(
+                contact_derivative[dominant_contact_metric] <= 1.0e-8
+            ),
+            "support_drift_nonregression": bool(
+                contact_derivative["foot_support_drift_m_p95"] <= 1.0e-8
+            ),
+            "derivative_feasible": derivative_feasible,
+        }
+
+    selected_records = [selected_record(int(index)) for index in candidate_indices]
+    feasible_frontier = [
+        selected_record(int(index))
+        for index in feasible_indices[:32]
+    ]
     feasible_direction_sources = [
         [f"{block}:{sign}" for block, sign in record["combo"]]
-        for record in feasible_records[:32]
+        for record in feasible_frontier
     ]
+    enumeration_seconds = time.perf_counter() - enumeration_started
     output: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
     for record in selected_records:
         combo = record["combo"]
         coefficients = record["coefficients"]
-        candidate = base.copy()
+        candidate = base[start:end].copy()
         for coefficient, direction in zip(coefficients, combo):
             candidate += float(coefficient) * (
-                np.asarray(indexed[direction][1], dtype=np.float32) - base
+                np.asarray(
+                    local_patch(indexed[direction][1]), dtype=np.float32
+                )
+                - base[start:end]
             )
-        rotations = candidate[start:end, ROT6D_START:ROT6D_END].reshape(
+        rotations = candidate[:, ROT6D_START:ROT6D_END].reshape(
             end - start, NUM_JOINTS, 6
         )
-        candidate[start:end, ROT6D_START:ROT6D_END] = (
+        candidate[:, ROT6D_START:ROT6D_END] = (
             matrix_to_rot6d_np(rot6d_to_matrix_np(rotations)).reshape(
                 end - start,
                 -1,
@@ -12088,7 +12706,7 @@ def _finite_difference_cone_sources(
             "probe_basis": "global_sparse_adaptive_signed_fd_cone",
             "cone_derivative_feasible": bool(record["derivative_feasible"]),
             "global_cone_feasible": global_cone_feasible,
-            "feasible_direction_count": int(len(feasible_records)),
+            "feasible_direction_count": int(feasible_count),
             "selected_direction_sources": feasible_direction_sources,
             "contact_residual_derivative": record["contact_derivative"],
             "hard_metric_derivative": record["hard_derivative"],
@@ -12127,9 +12745,20 @@ def _finite_difference_cone_sources(
             ),
             "enumerated_combination_count": int(combination_count),
             "enumerated_direction_count": int(len(directions)),
+            "cone_enumeration_backend": (
+                str(matrix_device) if matrix_device is not None else "numpy"
+            ),
+            "performance": {
+                "cone_enumeration": {
+                    "seconds": float(enumeration_seconds),
+                    "calls": 1,
+                    "combinations": int(combination_count),
+                }
+            },
             "cone_derivative_score": list(map(float, record["score"])),
             "ownership_span": list(indexed[combo[0]][2].get("ownership_span", [])),
             "probe_step": 1.0,
+            "motion_scope": "ownership_patch",
         }
         output.append((
             "finite_difference_cone:" + ":".join(
@@ -12176,6 +12805,183 @@ def _exact_audit_feasible_cone_directions(
         seen.add(key)
         directions.append(direction)
     return directions
+
+
+def _gpu_prescreen_transaction_candidates(
+    reference_motion: np.ndarray,
+    plans: Sequence[Mapping[str, Any]],
+    cfg: MotionGenerationConfig,
+    *,
+    ownership_span: Sequence[int],
+    audit_span: Sequence[int],
+    static_support_mask: np.ndarray,
+) -> Tuple[set, Dict[str, Any]]:
+    """Shortlist local patches on GPU before authoritative CPU exact audit."""
+
+    started = time.perf_counter()
+    report: Dict[str, Any] = {
+        "backend": "cpu_exact_only",
+        "input_candidates": int(len(plans)),
+        "shortlisted_candidates": int(len(plans)),
+        "clear_gpu_rejections": 0,
+        "near_numeric_boundary_candidates": 0,
+        "seconds": 0.0,
+        "calls": 0,
+    }
+    if (
+        torch is None
+        or not torch.cuda.is_available()
+        or not plans
+        or torch.device(str(cfg.device)).type != "cuda"
+    ):
+        report["seconds"] = float(time.perf_counter() - started)
+        return set(range(len(plans))), report
+
+    own_start, own_end = map(int, ownership_span)
+    audit_start, audit_end = map(int, audit_span)
+    ownership_length = own_end - own_start
+    audit_length = audit_end - audit_start
+    offset = own_start - audit_start
+    if ownership_length < 1 or audit_length < ownership_length:
+        raise ValueError("invalid ownership/audit span for GPU pre-screen")
+    device = torch.device(str(cfg.device))
+    base_audit = torch.as_tensor(
+        np.asarray(
+            reference_motion[audit_start:audit_end], dtype=np.float32
+        ),
+        device=device,
+    )
+    base_ownership = base_audit[offset:offset + ownership_length]
+    static_mask = torch.as_tensor(
+        np.asarray(static_support_mask, dtype=bool),
+        device=device,
+    )
+    baseline = batch_physical_audit_torch(
+        base_audit[None],
+        cfg,
+        static_support_mask=static_mask,
+    )
+    contact_keys = (
+        "foot_skate_mps_p95",
+        "foot_skate_mps_max",
+        "foot_support_drift_m_p95",
+        "foot_support_drift_m_max",
+        "foot_penetration_min_m",
+    )
+    hard_keys = (
+        "joint_jerk_mps3_p95",
+        "joint_jerk_mps3_max",
+        "joint_jerk_window_p95_max_mps3",
+        "extremity_jerk_mps3_p95",
+        "extremity_jerk_mps3_max",
+        "extremity_jerk_window_p95_max_mps3",
+    )
+    all_scores: List["torch.Tensor"] = []
+    all_near: List["torch.Tensor"] = []
+    batch_size = max(
+        1, int(cfg.full_sequence_contact_repair_gpu_batch_size)
+    )
+    for batch_start in range(0, len(plans), batch_size):
+        batch_plans = plans[batch_start:batch_start + batch_size]
+        patches = torch.as_tensor(
+            np.stack([
+                np.asarray(plan["source_patch"], dtype=np.float32)
+                for plan in batch_plans
+            ]),
+            device=device,
+        )
+        factors = torch.as_tensor(
+            [float(plan["factor"]) for plan in batch_plans],
+            device=device,
+            dtype=patches.dtype,
+        )
+        envelope = torch.as_tensor(
+            np.asarray(batch_plans[0]["weight"], dtype=np.float32),
+            device=device,
+        )
+        blended = _blend_edge151_geodesic_torch_batch(
+            base_ownership,
+            patches,
+            factors[:, None, None] * envelope[None],
+        )
+        candidates = base_audit[None].expand(
+            len(batch_plans), -1, -1
+        ).clone()
+        candidates[:, offset:offset + ownership_length] = blended
+        measured = batch_physical_audit_torch(
+            candidates,
+            cfg,
+            static_support_mask=static_mask,
+        )
+        contact_deltas = []
+        for key in contact_keys:
+            delta = measured[key] - baseline[key]
+            if key == "foot_penetration_min_m":
+                delta = -delta
+            contact_deltas.append(delta)
+        hard_deltas = torch.stack([
+            measured[key] - baseline[key] for key in hard_keys
+        ], dim=1)
+        contact_delta = torch.stack(contact_deltas, dim=1)
+        normalized_contact = contact_delta / torch.stack([
+            baseline[key].abs().clamp_min(1.0e-4)[0]
+            for key in contact_keys
+        ])[None]
+        normalized_hard = hard_deltas / torch.stack([
+            baseline[key].abs().clamp_min(1.0)[0] for key in hard_keys
+        ])[None]
+        contact_gain = torch.relu(-normalized_contact).sum(dim=1)
+        contact_regression = torch.relu(normalized_contact).sum(dim=1)
+        hard_regression = torch.relu(normalized_hard).sum(dim=1)
+        any_contact_gain = (contact_delta < -1.0e-7).any(dim=1)
+        hard_safe = (hard_deltas <= 1.0e-5).all(dim=1)
+        score = (
+            (~hard_safe).to(torch.float64) * 1.0e12
+            + (~any_contact_gain).to(torch.float64) * 1.0e10
+            + hard_regression.to(torch.float64) * 1.0e7
+            + contact_regression.to(torch.float64) * 1.0e4
+            - contact_gain.to(torch.float64)
+        )
+        nonzero_hard_delta = hard_deltas.abs() > 0.0
+        near = (
+            nonzero_hard_delta
+            & (
+                hard_deltas.abs()
+                <= float(
+                    cfg.full_sequence_contact_repair_gpu_boundary_tolerance
+                )
+            )
+        ).any(dim=1)
+        all_scores.append(score)
+        all_near.append(near)
+        report["calls"] += 1
+
+    scores = torch.cat(all_scores)
+    near = torch.cat(all_near)
+    shortlist_count = min(
+        max(1, int(cfg.full_sequence_contact_repair_gpu_shortlist)),
+        int(scores.numel()),
+    )
+    top_indices = torch.topk(
+        scores, k=shortlist_count, largest=False
+    ).indices
+    selected = set(map(int, top_indices.detach().cpu().tolist()))
+    selected.update(map(int, torch.nonzero(near).flatten().cpu().tolist()))
+    # Optimizer and post-stabilization candidates are always exact-audited.
+    for index, plan in enumerate(plans):
+        if str(plan.get("direction_source")) in (
+            "optimizer",
+            "post_stabilization",
+        ):
+            selected.add(int(index))
+    report.update({
+        "backend": str(device),
+        "shortlisted_candidates": int(len(selected)),
+        "clear_gpu_rejections": int(len(plans) - len(selected)),
+        "near_numeric_boundary_candidates": int(near.sum().item()),
+        "seconds": float(time.perf_counter() - started),
+    })
+    return selected, report
 
 
 def _local_infeasibility_diagnosis(
@@ -13455,6 +14261,20 @@ def true_lower_body_ik(
     final = np.asarray(motion, dtype=np.float32).copy()
     transaction_reports: List[Dict[str, Any]] = []
     accepted_transactions = 0
+    performance_counters: Dict[str, Dict[str, float]] = {
+        name: {"seconds": 0.0, "calls": 0}
+        for name in (
+            "cone_enumeration",
+            "gpu_batch_audit",
+            "cpu_exact_audit",
+            "boundary_audit",
+            "kbo",
+        )
+    }
+
+    def add_performance(name: str, seconds: float, calls: int = 1) -> None:
+        performance_counters[name]["seconds"] += float(seconds)
+        performance_counters[name]["calls"] += int(calls)
     solved_ranges = [
         (int(report["start"]), int(report["end"]))
         for report in reports
@@ -13579,6 +14399,7 @@ def true_lower_body_ik(
                 own_start,
                 own_end,
                 cfg,
+                return_patches=True,
             )
             source_candidates.extend(finite_difference_sources)
             cone_sources = _finite_difference_cone_sources(
@@ -13589,6 +14410,15 @@ def true_lower_body_ik(
                 eligible,
             )
             source_candidates.extend(cone_sources)
+            if cone_sources:
+                cone_performance = cone_sources[0][2].get(
+                    "performance", {}
+                ).get("cone_enumeration", {})
+                add_performance(
+                    "cone_enumeration",
+                    float(cone_performance.get("seconds", 0.0)),
+                    int(cone_performance.get("calls", 0)),
+                )
         else:
             cone_sources = []
         factors = (
@@ -13596,9 +14426,29 @@ def true_lower_body_ik(
             if v11_mode
             else (1.0,)
         )
-        candidate_attempts: List[Dict[str, Any]] = []
-        candidate_states: List[Dict[str, Any]] = []
+        localized_sources: List[Tuple[str, np.ndarray, Dict[str, Any]]] = []
         for source_name, source_motion, source_metadata in source_candidates:
+            source_value = np.asarray(source_motion, dtype=np.float32)
+            if source_value.shape == final.shape:
+                source_patch = source_value[own_start:own_end].copy()
+            elif source_value.shape == final[own_start:own_end].shape:
+                source_patch = source_value.copy()
+            else:
+                raise ValueError(
+                    "candidate source must be a full motion or ownership patch"
+                )
+            localized_sources.append(
+                (source_name, source_patch, dict(source_metadata))
+            )
+        # Full finite-difference arrays are no longer needed after derivative
+        # construction.  The transaction search below retains only GPU-ready
+        # ownership patches.
+        source_candidates = []
+        if v11_mode:
+            del finite_difference_sources
+
+        candidate_plans: List[Dict[str, Any]] = []
+        for source_name, source_patch, source_metadata in localized_sources:
             source_factors = factors
             adaptive_factor = None
             if source_metadata.get("direction_source") == (
@@ -13630,246 +14480,337 @@ def true_lower_body_ik(
                         list(factors) + [float(adaptive_factor)]
                     )
             for factor in source_factors:
-                scaled_weight = weight * float(factor)
-                trial = final.copy()
-                trial[own_start:own_end] = blend_edge151_geodesic_np(
-                    final[own_start:own_end],
-                    source_motion[own_start:own_end],
-                    scaled_weight,
+                candidate_plans.append({
+                    "source_name": source_name,
+                    "source_patch": source_patch,
+                    "source_metadata": source_metadata,
+                    "direction_source": source_metadata.get(
+                        "direction_source", source_name
+                    ),
+                    "factor": float(factor),
+                    "adaptive_factor": adaptive_factor,
+                    "weight": weight,
+                })
+
+        selected_plan_indices, gpu_prescreen = (
+            _gpu_prescreen_transaction_candidates(
+                final,
+                candidate_plans,
+                cfg,
+                ownership_span=[own_start, own_end],
+                audit_span=[audit_start, audit_end],
+                static_support_mask=solver_contacts[
+                    audit_start:audit_end
+                ],
+            )
+            if v11_mode
+            else (
+                set(range(len(candidate_plans))),
+                {
+                    "backend": "disabled",
+                    "input_candidates": len(candidate_plans),
+                    "shortlisted_candidates": len(candidate_plans),
+                    "clear_gpu_rejections": 0,
+                    "near_numeric_boundary_candidates": 0,
+                    "seconds": 0.0,
+                    "calls": 0,
+                },
+            )
+        )
+        add_performance(
+            "gpu_batch_audit",
+            float(gpu_prescreen.get("seconds", 0.0)),
+            int(gpu_prescreen.get("calls", 0)),
+        )
+        candidate_attempts: List[Dict[str, Any]] = []
+        candidate_states: List[Dict[str, Any]] = []
+        for plan_index, plan in enumerate(candidate_plans):
+            source_name = str(plan["source_name"])
+            source_patch = np.asarray(plan["source_patch"], dtype=np.float32)
+            source_metadata = dict(plan["source_metadata"])
+            factor = float(plan["factor"])
+            adaptive_factor = plan.get("adaptive_factor")
+            if plan_index not in selected_plan_indices:
+                candidate_attempts.append({
+                    "source": source_name,
+                    "direction_source": source_metadata.get(
+                        "direction_source", source_name
+                    ),
+                    "direction_block": source_metadata.get(
+                        "direction_block"
+                    ),
+                    "direction_sign": source_metadata.get("direction_sign"),
+                    "backtracking_factor": factor,
+                    "accepted": False,
+                    "cpu_exact_audit_executed": False,
+                    "blocking_reasons": ["gpu_prescreen_clear_rejection"],
+                    "ownership_span": [int(own_start), int(own_end)],
+                    "audit_span": [int(audit_start), int(audit_end)],
+                })
+                continue
+            cpu_exact_started = time.perf_counter()
+            scaled_weight = weight * float(factor)
+            trial = final.copy()
+            trial[own_start:own_end] = blend_edge151_geodesic_np(
+                final[own_start:own_end],
+                source_patch,
+                scaled_weight,
+            )
+            after_local = audit_motion_np(
+                trial[audit_start:audit_end],
+                cfg,
+                sliding_support_eligible=local_eligible,
+            )
+            after_ownership = audit_motion_np(
+                trial[own_start:own_end],
+                cfg,
+                sliding_support_eligible=ownership_eligible,
+            )
+            local_root_delta = np.linalg.norm(
+                trial[
+                    own_start:own_end,
+                    [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX],
+                ]
+                - final[
+                    own_start:own_end,
+                    [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX],
+                ],
+                axis=1,
+            )
+            relative_reasons, absolute_reasons = transaction_reasons(
+                before_local,
+                after_local,
+                float(local_root_delta.max()) if local_root_delta.size else 0.0,
+            )
+            restoration = None
+            fixed_support = None
+            if v11_mode:
+                restoration = _contact_restoration_decision(
+                    before_ownership,
+                    after_ownership,
+                    cfg,
+                    dominant_metric_keys=transaction_objective_keys,
                 )
-                after_local = audit_motion_np(
+                relative_reasons.extend(restoration["reasons"])
+                fixed_support = evaluate_fixed_support_contact_candidate_np(
+                    transaction_input,
                     trial[audit_start:audit_end],
                     cfg,
                     sliding_support_eligible=local_eligible,
                 )
-                after_ownership = audit_motion_np(
-                    trial[own_start:own_end],
-                    cfg,
-                    sliding_support_eligible=ownership_eligible,
-                )
-                local_root_delta = np.linalg.norm(
-                    trial[
-                        own_start:own_end,
-                        [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX],
-                    ]
-                    - final[
-                        own_start:own_end,
-                        [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX],
-                    ],
-                    axis=1,
-                )
-                relative_reasons, absolute_reasons = transaction_reasons(
-                    before_local,
-                    after_local,
-                    float(local_root_delta.max()) if local_root_delta.size else 0.0,
-                )
-                restoration = None
-                fixed_support = None
-                if v11_mode:
-                    restoration = _contact_restoration_decision(
-                        before_ownership,
-                        after_ownership,
-                        cfg,
-                        dominant_metric_keys=transaction_objective_keys,
-                    )
-                    relative_reasons.extend(restoration["reasons"])
-                    fixed_support = evaluate_fixed_support_contact_candidate_np(
-                        transaction_input,
-                        trial[audit_start:audit_end],
-                        cfg,
-                        sliding_support_eligible=local_eligible,
-                    )
-                    relative_reasons.extend(fixed_support["reasons"])
-                    if (
-                        source_name == "stabilized"
-                        and stabilization_safe is False
-                    ):
-                        relative_reasons.append(
-                            "unsafe_stabilization_source"
-                        )
-                guard_report: Dict[str, Any] = {
-                    "accepted": True,
-                    "reasons": [],
-                }
-                if candidate_guard is not None:
-                    result = candidate_guard(
-                        final,
-                        trial,
-                        [int(own_start), int(own_end)],
-                        [int(audit_start), int(audit_end)],
-                    )
-                    if not isinstance(result, Mapping):
-                        raise TypeError("candidate_guard must return a mapping")
-                    guard_report = dict(result)
-                    if not bool(guard_report.get("accepted", False)):
-                        relative_reasons.extend(
-                            f"candidate_guard:{reason}"
-                            for reason in guard_report.get("reasons", ["rejected"])
-                        )
-                relative_reasons = list(dict.fromkeys(relative_reasons))
-                # A baseline-invalid metric may remain above its absolute gate
-                # during a strictly monotone preparation step.  New absolute
-                # failures, missing metrics and root-cap failures still block.
-                blocking_absolute_reasons = (
-                    [
-                        reason
-                        for reason in absolute_reasons
-                        if reason not in before_absolute_reasons
-                        or reason == "absolute_root_delta"
-                        or reason.startswith("candidate_missing_or_")
-                    ]
-                    if v11_mode
-                    else list(absolute_reasons)
-                )
-                kbo_reasons: List[str] = []
-                kbo_detail: Dict[str, Any] = {}
+                relative_reasons.extend(fixed_support["reasons"])
                 if (
-                    not relative_reasons
-                    and not blocking_absolute_reasons
-                    and callable(globals().get("_kinematic_barrier_oracle"))
+                    source_name == "stabilized"
+                    and stabilization_safe is False
                 ):
-                    kbo_ok, kbo_reasons, kbo_detail = globals()[
-                        "_kinematic_barrier_oracle"
-                    ](
-                        trial[audit_start:audit_end],
-                        final[audit_start:audit_end],
-                        cfg,
-                        stage=(
-                            "ik_local_transaction_v11_restoration"
-                            if v11_mode
-                            else "ik_local_transaction"
-                        ),
-                        global_start=int(audit_start),
-                        sliding_support_eligible=local_eligible,
-                    )
-                    if not kbo_ok and not kbo_reasons:
-                        kbo_reasons = ["local_kbo_rejected"]
-                boundary_deltas = (
-                    guard_report.get("boundary", {}).get("metric_deltas", {})
-                    if isinstance(guard_report.get("boundary", {}), Mapping)
-                    else {}
-                )
-                boundary_margin_score = max(
-                    (float(value) for value in boundary_deltas.values()),
-                    default=0.0,
-                )
-                optimization_loss = float(reports[transaction_index]["best_loss"])
-                exact_rank, exact_summary = _exact_audit_candidate_rank(
-                    before_ownership,
-                    after_ownership,
-                    cfg,
-                    optimization_loss=optimization_loss,
-                    boundary_margin_score=boundary_margin_score,
-                    dominant_metric_keys=transaction_objective_keys,
-                    additional_hard_regression_reasons=(
-                        list(guard_report.get("reasons", []))
-                        + list(kbo_reasons)
-                        + list(blocking_absolute_reasons)
-                    ),
-                )
-                if source_metadata.get("direction_source") in (
-                    "finite_difference",
-                    "finite_difference_cone",
-                ):
-                    probe_step = float(source_metadata.get("probe_step", 0.0))
-                    exact_summary["finite_difference"] = {
-                        **source_metadata,
-                        "residual_derivative": {
-                            key: (
-                                float(value) / probe_step
-                                if abs(probe_step) > 1.0e-12
-                                else None
-                            )
-                            for key, value in exact_summary[
-                                "hard_constraint_residual_delta"
-                            ].items()
-                        },
-                    }
-                scope_delta = np.max(np.abs(trial - final), axis=1)
-                scope_outside = np.ones(T, dtype=bool)
-                scope_outside[own_start:own_end] = False
-                scope_changed_outside = np.flatnonzero(
-                    scope_outside & (scope_delta > 1.0e-6)
-                )
-                scope_audit = {
-                    "active_span": [int(own_start), int(own_end)],
-                    "max_delta_inside": float(
-                        scope_delta[own_start:own_end].max()
-                        if own_end > own_start else 0.0
-                    ),
-                    "max_delta_outside": float(
-                        scope_delta[scope_outside].max()
-                        if scope_outside.any() else 0.0
-                    ),
-                    "changed_frames_outside": (
-                        scope_changed_outside.astype(int).tolist()
-                    ),
-                    "accepted": bool(scope_changed_outside.size == 0),
-                }
-                if not scope_audit["accepted"]:
                     relative_reasons.append(
-                        "scope:candidate_changed_outside_owner"
+                        "unsafe_stabilization_source"
                     )
-                blocking_reasons = list(dict.fromkeys(
-                    relative_reasons
-                    + blocking_absolute_reasons
+            guard_report: Dict[str, Any] = {
+                "accepted": True,
+                "reasons": [],
+            }
+            if candidate_guard is not None:
+                guard_started = time.perf_counter()
+                result = candidate_guard(
+                    final,
+                    trial,
+                    [int(own_start), int(own_end)],
+                    [int(audit_start), int(audit_end)],
+                )
+                if not isinstance(result, Mapping):
+                    raise TypeError("candidate_guard must return a mapping")
+                guard_report = dict(result)
+                guard_elapsed = time.perf_counter() - guard_started
+                boundary_performance = guard_report.get(
+                    "performance", {}
+                ).get("boundary_audit", {})
+                add_performance(
+                    "boundary_audit",
+                    float(
+                        boundary_performance.get("seconds", guard_elapsed)
+                    ),
+                    int(boundary_performance.get("calls", 1)),
+                )
+                if not bool(guard_report.get("accepted", False)):
+                    relative_reasons.extend(
+                        f"candidate_guard:{reason}"
+                        for reason in guard_report.get("reasons", ["rejected"])
+                    )
+            relative_reasons = list(dict.fromkeys(relative_reasons))
+            # A baseline-invalid metric may remain above its absolute gate
+            # during a strictly monotone preparation step.  New absolute
+            # failures, missing metrics and root-cap failures still block.
+            blocking_absolute_reasons = (
+                [
+                    reason
+                    for reason in absolute_reasons
+                    if reason not in before_absolute_reasons
+                    or reason == "absolute_root_delta"
+                    or reason.startswith("candidate_missing_or_")
+                ]
+                if v11_mode
+                else list(absolute_reasons)
+            )
+            kbo_reasons: List[str] = []
+            kbo_detail: Dict[str, Any] = {}
+            if (
+                not relative_reasons
+                and not blocking_absolute_reasons
+                and callable(globals().get("_kinematic_barrier_oracle"))
+            ):
+                kbo_started = time.perf_counter()
+                kbo_ok, kbo_reasons, kbo_detail = globals()[
+                    "_kinematic_barrier_oracle"
+                ](
+                    trial[audit_start:audit_end],
+                    final[audit_start:audit_end],
+                    cfg,
+                    stage=(
+                        "ik_local_transaction_v11_restoration"
+                        if v11_mode
+                        else "ik_local_transaction"
+                    ),
+                    global_start=int(audit_start),
+                    sliding_support_eligible=local_eligible,
+                )
+                add_performance(
+                    "kbo", time.perf_counter() - kbo_started, 1
+                )
+                if not kbo_ok and not kbo_reasons:
+                    kbo_reasons = ["local_kbo_rejected"]
+            boundary_deltas = (
+                guard_report.get("boundary", {}).get("metric_deltas", {})
+                if isinstance(guard_report.get("boundary", {}), Mapping)
+                else {}
+            )
+            boundary_margin_score = max(
+                (float(value) for value in boundary_deltas.values()),
+                default=0.0,
+            )
+            optimization_loss = float(reports[transaction_index]["best_loss"])
+            exact_rank, exact_summary = _exact_audit_candidate_rank(
+                before_ownership,
+                after_ownership,
+                cfg,
+                optimization_loss=optimization_loss,
+                boundary_margin_score=boundary_margin_score,
+                dominant_metric_keys=transaction_objective_keys,
+                additional_hard_regression_reasons=(
+                    list(guard_report.get("reasons", []))
                     + list(kbo_reasons)
-                ))
-                if not scope_audit["accepted"]:
-                    blocking_reasons.append("scope:candidate_changed_outside_owner")
-                rank = exact_rank
-                committed = not blocking_reasons
-                attempt = {
-                    "source": source_name,
-                    "direction_source": source_metadata.get(
-                        "direction_source",
-                        source_name,
-                    ),
-                    "direction_block": source_metadata.get("direction_block"),
-                    "direction_sign": source_metadata.get("direction_sign"),
-                    "backtracking_factor": float(factor),
-                    "backtracking_factor_source": (
-                        "adaptive_safe_derivative"
-                        if adaptive_factor is not None
-                        and abs(float(factor) - float(adaptive_factor))
-                        <= 1.0e-12
-                        else "fixed_ladder"
-                    ),
-                    "source_motion_sha256": _array_content_sha256(
-                        source_motion[audit_start:audit_end]
-                    ),
-                    "motion_sha256": _array_content_sha256(
-                        trial[audit_start:audit_end]
-                    ),
-                    "accepted": bool(committed),
-                    "rank": list(map(float, rank)),
-                    "relative_reasons": relative_reasons,
-                    "absolute_reasons": absolute_reasons,
-                    "blocking_absolute_reasons": blocking_absolute_reasons,
-                    "kbo_reasons": list(kbo_reasons),
-                    "scope_audit": scope_audit,
-                    "exact_audit": exact_summary,
-                    "ownership_span": [int(own_start), int(own_end)],
-                    "audit_span": [int(audit_start), int(audit_end)],
+                    + list(blocking_absolute_reasons)
+                ),
+            )
+            if source_metadata.get("direction_source") in (
+                "finite_difference",
+                "finite_difference_cone",
+            ):
+                probe_step = float(source_metadata.get("probe_step", 0.0))
+                exact_summary["finite_difference"] = {
+                    **source_metadata,
+                    "residual_derivative": {
+                        key: (
+                            float(value) / probe_step
+                            if abs(probe_step) > 1.0e-12
+                            else None
+                        )
+                        for key, value in exact_summary[
+                            "hard_constraint_residual_delta"
+                        ].items()
+                    },
                 }
-                attempt["blocking_reasons"] = list(blocking_reasons)
-                candidate_attempts.append(attempt)
-                candidate_states.append({
-                    "rank": rank,
-                    "trial": trial,
-                    "after_local": after_local,
-                    "after_ownership": after_ownership,
-                    "local_root_delta": local_root_delta,
-                    "relative_reasons": relative_reasons,
-                    "absolute_reasons": absolute_reasons,
-                    "blocking_absolute_reasons": blocking_absolute_reasons,
-                    "restoration": restoration,
-                    "fixed_support": fixed_support,
-                    "guard_report": guard_report,
-                    "kbo_reasons": list(kbo_reasons),
-                    "kbo_detail": kbo_detail,
-                    "attempt": attempt,
-                })
+            scope_delta = np.max(np.abs(trial - final), axis=1)
+            scope_outside = np.ones(T, dtype=bool)
+            scope_outside[own_start:own_end] = False
+            scope_changed_outside = np.flatnonzero(
+                scope_outside & (scope_delta > 1.0e-6)
+            )
+            scope_audit = {
+                "active_span": [int(own_start), int(own_end)],
+                "max_delta_inside": float(
+                    scope_delta[own_start:own_end].max()
+                    if own_end > own_start else 0.0
+                ),
+                "max_delta_outside": float(
+                    scope_delta[scope_outside].max()
+                    if scope_outside.any() else 0.0
+                ),
+                "changed_frames_outside": (
+                    scope_changed_outside.astype(int).tolist()
+                ),
+                "accepted": bool(scope_changed_outside.size == 0),
+            }
+            if not scope_audit["accepted"]:
+                relative_reasons.append(
+                    "scope:candidate_changed_outside_owner"
+                )
+            blocking_reasons = list(dict.fromkeys(
+                relative_reasons
+                + blocking_absolute_reasons
+                + list(kbo_reasons)
+            ))
+            if not scope_audit["accepted"]:
+                blocking_reasons.append("scope:candidate_changed_outside_owner")
+            rank = exact_rank
+            committed = not blocking_reasons
+            attempt = {
+                "source": source_name,
+                "direction_source": source_metadata.get(
+                    "direction_source",
+                    source_name,
+                ),
+                "direction_block": source_metadata.get("direction_block"),
+                "direction_sign": source_metadata.get("direction_sign"),
+                "backtracking_factor": float(factor),
+                "backtracking_factor_source": (
+                    "adaptive_safe_derivative"
+                    if adaptive_factor is not None
+                    and abs(float(factor) - float(adaptive_factor))
+                    <= 1.0e-12
+                    else "fixed_ladder"
+                ),
+                "source_motion_sha256": _array_content_sha256(
+                    source_patch
+                ),
+                "motion_sha256": _array_content_sha256(
+                    trial[audit_start:audit_end]
+                ),
+                "accepted": bool(committed),
+                "cpu_exact_audit_executed": True,
+                "rank": list(map(float, rank)),
+                "relative_reasons": relative_reasons,
+                "absolute_reasons": absolute_reasons,
+                "blocking_absolute_reasons": blocking_absolute_reasons,
+                "kbo_reasons": list(kbo_reasons),
+                "scope_audit": scope_audit,
+                "exact_audit": exact_summary,
+                "ownership_span": [int(own_start), int(own_end)],
+                "audit_span": [int(audit_start), int(audit_end)],
+            }
+            attempt["blocking_reasons"] = list(blocking_reasons)
+            candidate_attempts.append(attempt)
+            candidate_states.append({
+                "rank": rank,
+                "trial": trial,
+                "after_local": after_local,
+                "after_ownership": after_ownership,
+                "local_root_delta": local_root_delta,
+                "relative_reasons": relative_reasons,
+                "absolute_reasons": absolute_reasons,
+                "blocking_absolute_reasons": blocking_absolute_reasons,
+                "restoration": restoration,
+                "fixed_support": fixed_support,
+                "guard_report": guard_report,
+                "kbo_reasons": list(kbo_reasons),
+                "kbo_detail": kbo_detail,
+                "attempt": attempt,
+            })
+            add_performance(
+                "cpu_exact_audit",
+                time.perf_counter() - cpu_exact_started,
+                1,
+            )
         accepted_states = [
             state for state in candidate_states if state["attempt"]["accepted"]
         ]
@@ -14048,8 +14989,9 @@ def true_lower_body_ik(
                         if v11_mode
                         else "legacy_single_candidate"
                     ),
-                    "sources": [name for name, _, _ in source_candidates],
+                    "sources": [name for name, _, _ in localized_sources],
                     "backtracking_factors": list(map(float, factors)),
+                    "gpu_prescreen": gpu_prescreen,
                     "selected_source": selected_state["attempt"]["source"],
                     "selected_factor": float(
                         selected_state["attempt"]["backtracking_factor"]
@@ -14296,6 +15238,13 @@ def true_lower_body_ik(
             "transactions": transaction_reports,
         },
         "global_sparse_cone": global_sparse_cone,
+        "performance": {
+            name: {
+                "seconds": float(value["seconds"]),
+                "calls": int(value["calls"]),
+            }
+            for name, value in performance_counters.items()
+        },
         "local_infeasibility": {
             "status": (
                 "local_infeasible_under_current_action_basis"
