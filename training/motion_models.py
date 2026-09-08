@@ -12141,6 +12141,43 @@ def _finite_difference_cone_sources(
     return output
 
 
+def _exact_audit_feasible_cone_directions(
+    attempts: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return unique cone directions that passed every exact audit layer."""
+
+    directions: List[Dict[str, Any]] = []
+    seen = set()
+    for attempt in attempts:
+        if (
+            attempt.get("direction_source") != "finite_difference_cone"
+            or not bool(attempt.get("accepted", False))
+        ):
+            continue
+        finite_difference = (
+            attempt.get("exact_audit", {}).get("finite_difference", {}) or {}
+        )
+        direction = {
+            "blocks": list(finite_difference.get("direction_blocks", [])),
+            "signs": list(finite_difference.get("direction_signs", [])),
+            "coefficients": list(
+                finite_difference.get("direction_coefficients", [])
+            ),
+            "ownership_span": list(
+                finite_difference.get(
+                    "ownership_span",
+                    attempt.get("ownership_span", []),
+                )
+            ),
+        }
+        key = json.dumps(direction, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        directions.append(direction)
+    return directions
+
+
 def _local_infeasibility_diagnosis(
     attempts: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
@@ -13944,7 +13981,7 @@ def true_lower_body_ik(
             "foot_penetration_min_m",
         )
         cone_rejected_counts_local: Dict[str, int] = {}
-        cone_selected_sources_local: List[Any] = []
+        derivative_selected_sources_local: List[Any] = []
         # Every materialized cone candidate carries the same aggregate search
         # diagnostics.  Read that aggregate once instead of multiplying it by
         # the number of backtracking candidates.
@@ -13969,7 +14006,21 @@ def true_lower_body_ik(
             if source_key in seen_cone_sources:
                 continue
             seen_cone_sources.add(source_key)
-            cone_selected_sources_local.append(source)
+            derivative_selected_sources_local.append(source)
+        exact_cone_sources_local = _exact_audit_feasible_cone_directions(
+            candidate_attempts
+        )
+        derivative_cone_feasible_local = bool(any(
+            bool(metadata.get("global_cone_feasible", False))
+            for _, _, metadata in cone_sources
+        ))
+        derivative_feasible_direction_count_local = int(max(
+            (
+                int(metadata.get("feasible_direction_count", 0))
+                for _, _, metadata in cone_sources
+            ),
+            default=0,
+        ))
         transaction_reports.append(
             {
                 "start": int(own_start),
@@ -14004,18 +14055,29 @@ def true_lower_body_ik(
                         selected_state["attempt"]["backtracking_factor"]
                     ),
                     "selected_rank": list(map(float, selected_state["rank"])),
-                    "global_cone_feasible": bool(any(
-                        bool(metadata.get("global_cone_feasible", False))
-                        for _, _, metadata in cone_sources
-                    )),
-                    "feasible_direction_count": int(max(
-                        (
-                            int(metadata.get("feasible_direction_count", 0))
-                            for _, _, metadata in cone_sources
-                        ),
-                        default=0,
-                    )),
-                    "selected_direction_sources": cone_selected_sources_local,
+                    # The exact audit is authoritative.  Keep the linearized
+                    # derivative prediction as a separate diagnostic because
+                    # nonsmooth p95/contact metrics can disagree with it.
+                    "global_cone_feasible": bool(exact_cone_sources_local),
+                    "feasible_direction_count": int(
+                        len(exact_cone_sources_local)
+                    ),
+                    "exact_audit_global_cone_feasible": bool(
+                        exact_cone_sources_local
+                    ),
+                    "exact_audit_feasible_direction_count": int(
+                        len(exact_cone_sources_local)
+                    ),
+                    "selected_direction_sources": exact_cone_sources_local,
+                    "derivative_cone_feasible": (
+                        derivative_cone_feasible_local
+                    ),
+                    "derivative_feasible_direction_count": (
+                        derivative_feasible_direction_count_local
+                    ),
+                    "derivative_selected_direction_sources": (
+                        derivative_selected_sources_local
+                    ),
                     "rejected_constraint_counts": dict(sorted(
                         cone_rejected_counts_local.items(),
                         key=lambda item: (-int(item[1]), str(item[0])),
@@ -14105,6 +14167,7 @@ def true_lower_body_ik(
     ]
     cone_rejected_counts: Dict[str, int] = {}
     cone_selected_sources: List[Any] = []
+    derivative_cone_selected_sources: List[Any] = []
     for selection in cone_selection_reports:
         for key, value in (
             selection.get("rejected_constraint_counts", {}) or {}
@@ -14115,6 +14178,9 @@ def true_lower_body_ik(
         cone_selected_sources.extend(
             selection.get("selected_direction_sources", []) or []
         )
+        derivative_cone_selected_sources.extend(
+            selection.get("derivative_selected_direction_sources", []) or []
+        )
     global_sparse_cone = {
         "global_cone_feasible": bool(any(
             bool(selection.get("global_cone_feasible", False))
@@ -14124,7 +14190,26 @@ def true_lower_body_ik(
             int(selection.get("feasible_direction_count", 0))
             for selection in cone_selection_reports
         )),
+        "exact_audit_global_cone_feasible": bool(any(
+            bool(selection.get("exact_audit_global_cone_feasible", False))
+            for selection in cone_selection_reports
+        )),
+        "exact_audit_feasible_direction_count": int(sum(
+            int(selection.get("exact_audit_feasible_direction_count", 0))
+            for selection in cone_selection_reports
+        )),
         "selected_direction_sources": cone_selected_sources,
+        "derivative_cone_feasible": bool(any(
+            bool(selection.get("derivative_cone_feasible", False))
+            for selection in cone_selection_reports
+        )),
+        "derivative_feasible_direction_count": int(sum(
+            int(selection.get("derivative_feasible_direction_count", 0))
+            for selection in cone_selection_reports
+        )),
+        "derivative_selected_direction_sources": (
+            derivative_cone_selected_sources
+        ),
         "rejected_constraint_counts": dict(sorted(
             cone_rejected_counts.items(),
             key=lambda item: (-int(item[1]), item[0]),

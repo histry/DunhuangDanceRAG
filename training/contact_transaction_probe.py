@@ -128,6 +128,18 @@ def _summarize(report: Dict[str, Any], windows: List[List[int]]) -> Dict[str, An
         "feasible_direction_count": int(
             cone_summary.get("feasible_direction_count", 0)
         ),
+        "exact_audit_global_cone_feasible": bool(
+            cone_summary.get("exact_audit_global_cone_feasible", False)
+        ),
+        "exact_audit_feasible_direction_count": int(
+            cone_summary.get("exact_audit_feasible_direction_count", 0)
+        ),
+        "derivative_cone_feasible": bool(
+            cone_summary.get("derivative_cone_feasible", False)
+        ),
+        "derivative_feasible_direction_count": int(
+            cone_summary.get("derivative_feasible_direction_count", 0)
+        ),
         "exact_derivative_feasible_attempt_count": int(
             len(cone_derivative_feasible)
         ),

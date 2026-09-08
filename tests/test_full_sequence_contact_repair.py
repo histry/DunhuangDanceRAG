@@ -9,6 +9,7 @@ from training.motion_models import (
     _c2_transaction_weight,
     _contact_anchor_rejection_reason_counts,
     _contact_restoration_decision,
+    _exact_audit_feasible_cone_directions,
     _exact_audit_candidate_rank,
     _finite_difference_contact_direction_sources,
     _local_infeasibility_diagnosis,
@@ -156,6 +157,37 @@ def test_contact_anchor_rejections_are_reported_by_exact_failure_layer():
         "boundary_regression": 1,
         "fidelity_regression": 1,
     }
+
+
+def test_exact_audit_cone_feasibility_is_not_hidden_by_derivative_prediction():
+    """Nonsmooth exact audit remains authoritative over a failed linear probe."""
+    finite_difference = {
+        "direction_blocks": [
+            "contact_anchor_jacobian_right",
+            "temporal_antisymmetric5",
+            "temporal_seam_center",
+        ],
+        "direction_signs": [1, 1, 1],
+        "direction_coefficients": [0.0625, 0.4375, 0.5],
+        "cone_derivative_feasible": False,
+    }
+    attempts = [
+        {
+            "direction_source": "finite_difference_cone",
+            "accepted": True,
+            "ownership_span": [2520, 2600],
+            "backtracking_factor": factor,
+            "exact_audit": {"finite_difference": finite_difference},
+        }
+        for factor in (0.5, 0.25, 0.125)
+    ]
+    directions = _exact_audit_feasible_cone_directions(attempts)
+    assert directions == [{
+        "blocks": finite_difference["direction_blocks"],
+        "signs": finite_difference["direction_signs"],
+        "coefficients": finite_difference["direction_coefficients"],
+        "ownership_span": [2520, 2600],
+    }]
 
 
 def test_v11_fixed_support_gate_uses_the_captured_eligibility_contract():
