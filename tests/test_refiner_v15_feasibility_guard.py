@@ -240,6 +240,14 @@ def _group_terms():
             f"group_{label}_joint_scientific_deficit"
         ] = torch.tensor(value + 0.1)
 
+        terms[
+            f"group_{label}_endpoint_scientific_tail_risk"
+        ] = torch.tensor(value + 0.2)
+
+        terms[
+            f"group_{label}_temporal_scientific_tail_risk"
+        ] = torch.tensor(value + 0.3)
+
         # Historical fields deliberately remain present but must not become
         # independent V15 monotonic guards.
         terms[
@@ -253,7 +261,7 @@ def _group_terms():
     return terms
 
 
-def test_v15_guard_has_eight_keys():
+def test_v15_9_guard_has_sixteen_keys():
     guards = m._refiner_group_repair_losses(
         _group_terms(),
         require_all=True,
@@ -266,19 +274,11 @@ def test_v15_guard_has_eight_keys():
         expected.add(
             f"{label}.feasibility"
         )
+        expected.add(f"{label}.endpoint")
+        expected.add(f"{label}.temporal")
 
     assert set(guards) == expected
-    assert len(guards) == 8
-
-    assert not any(
-        key.endswith(".endpoint")
-        for key in guards
-    )
-
-    assert not any(
-        key.endswith(".temporal")
-        for key in guards
-    )
+    assert len(guards) == 16
 
 
 def test_v15_guard_fails_closed_on_partial_group():
@@ -300,5 +300,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_component_tail_observable_v11"
+        == "gate_aligned_temporal_balanced_component_tail_observable_v12"
     )

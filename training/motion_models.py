@@ -109,20 +109,27 @@ from training.refiner_optimizer import checked_refiner_step, record_update, REFI
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v12"
-REFINER_INPUT_PROTOCOL = "local_frame_norm_world_fk_dynamics_support_v4"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v13"
+REFINER_INPUT_PROTOCOL = (
+    "local_frame_norm_world_fk_dynamics_condition_path_support_v5"
+)
 REFINER_TANGENT_GRADIENT_PROTOCOL = "soft_confidence_true_chain_rule_v2"
 REFINER_FK_DYNAMICS_PROTOCOL = "observable_world_fk_float64_derivatives_duration_support_v3"
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
+REFINER_CONDITION_PATH_PROTOCOL = (
+    "observable_continuous_condition_velocity_acceleration_path_gap_v1"
+)
+REFINER_CONDITION_PATH_FEATURE_DIM = 4
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_component_tail_observable_v11"
+    "gate_aligned_temporal_balanced_component_tail_observable_v12"
 )
 REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
     "identity_weights_after_v15_7_rejection_v2"
 )
 REFINER_CONFIDENCE_PRECONDITION_MAX = 5.0
+REFINER_TEMPORAL_SCIENTIFIC_WEIGHT = 3.0
 
 
 def now_tag() -> str:
@@ -2864,6 +2871,61 @@ def _refiner_fk_dynamics_features(x, seam_mask, fps):
     return torch.where(active, features, torch.zeros_like(features)).to(x.dtype)
 
 
+def _refiner_condition_path_features(cond, seam_mask, frames):
+    """Continuous procedural-role evidence with no semantic labels.
+
+    A single-recording bridge has a constant conditioning path, while a
+    cross-event bridge interpolates between two observed descriptors. A finite
+    receptive field sees only a small local condition derivative in a long
+    transition, so expose local derivatives and whole-support path statistics.
+    """
+    expanded = _expand_temporal_condition_torch(cond, frames)
+    if seam_mask.ndim == 2:
+        seam_mask = seam_mask.unsqueeze(-1)
+    if seam_mask.ndim != 3 or seam_mask.shape[:2] != expanded.shape[:2]:
+        raise ValueError(
+            "Refiner condition-path features require an event-aligned seam mask"
+        )
+    scale = math.sqrt(float(expanded.shape[-1]))
+    delta = torch.zeros_like(expanded)
+    acceleration = torch.zeros_like(expanded)
+    if frames > 1:
+        delta[:, 1:] = expanded[:, 1:] - expanded[:, :-1]
+    if frames > 2:
+        acceleration[:, 2:] = torch.diff(expanded, n=2, dim=1)
+    local_velocity = torch.linalg.vector_norm(delta, dim=-1) / scale
+    local_acceleration = torch.linalg.vector_norm(acceleration, dim=-1) / scale
+    active = seam_mask.amax(dim=-1) > 0.0
+    core = seam_mask.amax(dim=-1) >= 0.5
+    edge_support = core.clone()
+    if frames > 1:
+        edge_support[:, 1:] |= core[:, :-1]
+    path_length = (
+        local_velocity * edge_support.to(local_velocity.dtype)
+    ).sum(dim=1, keepdim=True)
+    signed_path = (
+        delta * edge_support.unsqueeze(-1).to(delta.dtype)
+    ).sum(dim=1)
+    endpoint_gap = torch.linalg.vector_norm(
+        signed_path, dim=-1, keepdim=True
+    ) / scale
+    global_features = torch.cat([path_length, endpoint_gap], dim=-1)
+    global_features = global_features[:, None, :].expand(-1, frames, -1)
+    features = torch.cat(
+        [
+            local_velocity.unsqueeze(-1),
+            local_acceleration.unsqueeze(-1),
+            global_features,
+        ],
+        dim=-1,
+    )
+    if features.shape[-1] != REFINER_CONDITION_PATH_FEATURE_DIM:
+        raise RuntimeError("Refiner condition-path feature layout mismatch")
+    return torch.where(
+        active.unsqueeze(-1), features, torch.zeros_like(features)
+    )
+
+
 class ProductManifoldTemporalRefiner(nn.Module):
     """Boundary refiner with a joint-risk-conditioned 79D geometric output.
 
@@ -2903,7 +2965,8 @@ class ProductManifoldTemporalRefiner(nn.Module):
             + 1
             + NUM_JOINTS
             + BOUNDARY_FEATURE_DIM
-            + REFINER_FK_DYNAMICS_FEATURE_DIM,
+            + REFINER_FK_DYNAMICS_FEATURE_DIM
+            + REFINER_CONDITION_PATH_FEATURE_DIM,
             hidden,
             1,
         )
@@ -2935,6 +2998,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
         c = _expand_temporal_condition_torch(cond, frames)
         observed = boundary_features_torch(x, seam_mask)
         fk_dynamics = _refiner_fk_dynamics_features(x, seam_mask, self.fps)
+        condition_path = _refiner_condition_path_features(c, seam_mask, frames)
         y = torch.cat(
             [
                 _refiner_motion_features(x),
@@ -2943,6 +3007,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
                 joint_mask,
                 observed,
                 fk_dynamics,
+                condition_path,
             ],
             dim=-1,
         ).transpose(1, 2)
@@ -7450,7 +7515,8 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
     )
     scientific_weighted = (
         endpoint_scientific_weighted
-        + temporal_scientific_weighted
+        + REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+        * temporal_scientific_weighted
     )
     terms["scientific_confidence_weight"] = confidence_weight.mean()
     terms["scientific_confidence_preconditioning_active"] = scientific.new_zeros(())
@@ -7475,9 +7541,14 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
             temporal_scientific_weighted,
             batch["group"],
         )
-        scientific_tail = endpoint_tail + temporal_tail
+        scientific_tail = (
+            endpoint_tail
+            + REFINER_TEMPORAL_SCIENTIFIC_WEIGHT * temporal_tail
+        )
         terms["endpoint_training_objective"] = endpoint_tail
-        terms["temporal_training_objective"] = temporal_tail
+        terms["temporal_training_objective"] = (
+            REFINER_TEMPORAL_SCIENTIFIC_WEIGHT * temporal_tail
+        )
         tail_stats = {}
 
         if endpoint_tail_stats.keys() != temporal_tail_stats.keys():
@@ -7489,7 +7560,11 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
             endpoint_stat = endpoint_tail_stats[label]
             temporal_stat = temporal_tail_stats[label]
             tail_stats[label] = {
-                key: endpoint_stat[key] + temporal_stat[key]
+                key: (
+                    endpoint_stat[key]
+                    + REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+                    * temporal_stat[key]
+                )
                 for key in ("mean", "tail_cvar", "risk")
             }
             tail_stats[label]["tail_count"] = endpoint_stat[
@@ -7547,9 +7622,20 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         # Compatibility for callers without the explicit TRAIN group
         # contract. Formal Refiner training and bridge diagnostic both
         # provide batch["group"].
-        repair = per_case.mean()
+        repair = (
+            non_scientific.mean()
+            + scientific_weight
+            * (
+                endpoint_scientific.mean()
+                + REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+                * temporal_scientific.mean()
+            )
+        )
         terms["endpoint_training_objective"] = endpoint_scientific.mean()
-        terms["temporal_training_objective"] = temporal_scientific.mean()
+        terms["temporal_training_objective"] = (
+            REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+            * temporal_scientific.mean()
+        )
 
         terms[
             "scientific_batch_mean"
@@ -7557,7 +7643,11 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
 
         terms[
             "scientific_tail_objective"
-        ] = scientific.mean()
+        ] = (
+            endpoint_scientific.mean()
+            + REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+            * temporal_scientific.mean()
+        )
 
         terms[
             "scientific_tail_uplift"
@@ -7567,7 +7657,10 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         for index, label in enumerate(REFINER_GROUP_LABELS):
             selected = batch["group"] == index
             if bool(selected.any()):
-                terms[f"group_{label}_repair_total"] = per_case[selected].mean()
+                terms[f"group_{label}_repair_total"] = (
+                    non_scientific[selected].mean()
+                    + scientific_weight * tail_stats[label]["risk"]
+                )
                 for key in (
                     # Historical comparison fields.
                     "endpoint_continuity",
@@ -7620,16 +7713,18 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
 
 
 def _refiner_group_repair_losses(terms, *, require_all=False):
-    """V15 subgroup repair-total + joint-feasibility transactional guards.
+    """Guard subgroup total, joint, endpoint and temporal objectives.
 
-    Every present role/width subgroup contributes two protected quantities:
+    Every present role/width subgroup contributes four protected quantities:
 
       1. the complete subgroup repair objective;
-      2. the joint endpoint/temporal scientific deficit.
+      2. the joint endpoint/temporal scientific deficit;
+      3. the endpoint tail risk;
+      4. the temporal tail risk.
 
-    Endpoint and temporal are deliberately not guarded independently in V15:
-    useful slack trading is allowed as long as joint scientific feasibility
-    improves without buying it through subgroup-level total deterioration.
+    V15.8 showed that a joint sum could improve while one exact gate lost pass
+    rate. Component guards preserve the two unchanged 0.03 requirements
+    independently during each checked transaction.
     """
     values = {}
     missing = []
@@ -7639,11 +7734,20 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
         feasibility_key = (
             f"group_{label}_joint_scientific_deficit"
         )
+        endpoint_key = f"group_{label}_endpoint_scientific_tail_risk"
+        temporal_key = f"group_{label}_temporal_scientific_tail_risk"
 
         total_present = total_key in terms
         feasibility_present = feasibility_key in terms
+        endpoint_present = endpoint_key in terms
+        temporal_present = temporal_key in terms
 
-        if total_present != feasibility_present:
+        if len({
+            total_present,
+            feasibility_present,
+            endpoint_present,
+            temporal_present,
+        }) != 1:
             absent = []
 
             if not total_present:
@@ -7651,6 +7755,12 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
 
             if not feasibility_present:
                 absent.append("feasibility")
+
+            if not endpoint_present:
+                absent.append("endpoint")
+
+            if not temporal_present:
+                absent.append("temporal")
 
             raise RuntimeError(
                 f"incomplete Refiner subgroup objectives for {label}: "
@@ -7663,6 +7773,9 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
             values[
                 f"{label}.feasibility"
             ] = terms[feasibility_key]
+
+            values[f"{label}.endpoint"] = terms[endpoint_key]
+            values[f"{label}.temporal"] = terms[temporal_key]
         else:
             missing.append(label)
 
@@ -7842,13 +7955,13 @@ def _feasible_minimum_edit_penalty(
 SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 
 # ------------------------------------------------------------------
-# Tail-aware NETWORK batch aggregation. V15.8 restores equal case weighting
-# and applies the risk operator independently to endpoint and temporal. One
-# component's hard cases cannot disappear behind the other component.
+# Tail-aware NETWORK batch aggregation. V15.9 retains independent endpoint and
+# temporal risks, then applies the fixed temporal scale measured from V15.8's
+# final-step component gradients. Exact acceptance thresholds are unchanged.
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "equal_weight_endpoint_temporal_smooth_cvar_v5"
+    "temporal_balanced_component_guarded_smooth_cvar_v6"
 )
 
 # One-variable V15.3 experimental contract.
@@ -8545,6 +8658,8 @@ def train_refiner(args: argparse.Namespace) -> int:
             "boundary_conditioning_dim": BOUNDARY_FEATURE_DIM,
             "fk_dynamics_conditioning_dim": REFINER_FK_DYNAMICS_FEATURE_DIM,
             "fk_dynamics_conditioning_protocol": REFINER_FK_DYNAMICS_PROTOCOL,
+            "condition_path_conditioning_dim": REFINER_CONDITION_PATH_FEATURE_DIM,
+            "condition_path_conditioning_protocol": REFINER_CONDITION_PATH_PROTOCOL,
             "temporal_priority": "endpoint_acceptance_active_set",
             "repair_target": "observable_endpoint_jump_and_actual_fk_dynamics",
             "hidden_clean_interior_in_repair_loss": False,
@@ -8588,6 +8703,9 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
             "refiner_batch_aggregation_protocol":
                 REFINER_BATCH_AGGREGATION_PROTOCOL,
+            "temporal_scientific_weight": float(
+                REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+            ),
             "clean_identity_weight": float(
                 cfg.product_refiner_clean_identity_weight
             ),

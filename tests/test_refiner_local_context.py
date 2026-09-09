@@ -167,11 +167,14 @@ def test_input_protocol_is_checked_not_just_stored():
     cfg = m.MotionGenerationConfig()
     contract = m.motion_checkpoint_contract(cfg, 'boundary_refiner')
     assert contract['refiner_input_protocol'] == m.REFINER_INPUT_PROTOCOL
-    assert m.REFINER_INPUT_PROTOCOL.endswith('world_fk_dynamics_support_v4')
+    assert m.REFINER_INPUT_PROTOCOL.endswith(
+        'world_fk_dynamics_condition_path_support_v5'
+    )
     model = m.ProductManifoldTemporalRefiner(hidden=16)
     assert model.in_proj.in_channels == (
         m.EDGE_DIM + 32 + 1 + m.NUM_JOINTS
         + m.BOUNDARY_FEATURE_DIM + m.REFINER_FK_DYNAMICS_FEATURE_DIM
+        + m.REFINER_CONDITION_PATH_FEATURE_DIM
     )
     contract.pop('refiner_input_protocol')
     with pytest.raises(RuntimeError, match='refiner_input_protocol'):
