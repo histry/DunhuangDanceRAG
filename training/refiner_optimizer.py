@@ -50,12 +50,23 @@ def checked_refiner_step(
         raise ValueError(f"max_trials must be in [1,{MAX_BACKTRACK_TRIALS}]")
     if not math.isfinite(gradient_unscale) or gradient_unscale < 1.0:
         raise ValueError("gradient_unscale must be finite and >= 1")
-    for value, name in (
-        (group_guard_relative_tolerance, "group_guard_relative_tolerance"),
-        (group_guard_absolute_tolerance, "group_guard_absolute_tolerance"),
-    ):
-        if not math.isfinite(float(value)) or float(value) < 0.0:
+    raw_relative_tolerance = group_guard_relative_tolerance
+    raw_absolute_tolerance = group_guard_absolute_tolerance
+
+    def tolerance_map(value, keys, name):
+        """Resolve one scalar or an exact per-guard absolute allowance map."""
+        if hasattr(value, "items"):
+            resolved = {str(k): float(v) for k, v in value.items()}
+            if set(resolved) != set(keys):
+                raise ValueError(f"{name} keys differ from group guard metrics")
+        else:
+            scalar_value = float(value)
+            if not math.isfinite(scalar_value) or scalar_value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            resolved = {key: scalar_value for key in keys}
+        if not all(math.isfinite(v) and v >= 0.0 for v in resolved.values()):
             raise ValueError(f"{name} must be finite and non-negative")
+        return resolved
 
     def scalar(value):
         if torch.is_tensor(value):
@@ -65,6 +76,8 @@ def checked_refiner_step(
     guard_enabled = group_guard_before is not None
     guard_before = {}
     guard_reference = {}
+    guard_relative_tolerance = {}
+    guard_absolute_tolerance = {}
     if guard_enabled:
         if not hasattr(group_guard_before, "items") or not group_guard_before:
             raise ValueError("group_guard_before must be a non-empty mapping")
@@ -85,6 +98,33 @@ def checked_refiner_step(
             raise ValueError("group guard reference keys differ from current metrics")
         if not all(math.isfinite(v) for v in guard_reference.values()):
             raise FloatingPointError("nonfinite subgroup guard reference")
+        guard_relative_tolerance = tolerance_map(
+            group_guard_relative_tolerance,
+            guard_before,
+            "group_guard_relative_tolerance",
+        )
+        guard_absolute_tolerance = tolerance_map(
+            group_guard_absolute_tolerance,
+            guard_before,
+            "group_guard_absolute_tolerance",
+        )
+    else:
+        # Validate disabled scalar callers too. A mapping has no meaning without
+        # named guard metrics and is rejected rather than silently ignored.
+        if hasattr(group_guard_relative_tolerance, "items") or hasattr(
+            group_guard_absolute_tolerance, "items"
+        ):
+            raise ValueError("per-guard tolerances require group_guard_before")
+        tolerance_map(
+            group_guard_relative_tolerance,
+            (),
+            "group_guard_relative_tolerance",
+        )
+        tolerance_map(
+            group_guard_absolute_tolerance,
+            (),
+            "group_guard_absolute_tolerance",
+        )
 
     before = float(loss.detach())
     if not math.isfinite(before):
@@ -125,8 +165,16 @@ def checked_refiner_step(
         "gradient_unscale": float(gradient_unscale),
         "insufficient_decrease_trials": 0,
         "group_guard_enabled": guard_enabled,
-        "group_guard_relative_tolerance": float(group_guard_relative_tolerance),
-        "group_guard_absolute_tolerance": float(group_guard_absolute_tolerance),
+        "group_guard_relative_tolerance": (
+            guard_relative_tolerance
+            if hasattr(raw_relative_tolerance, "items")
+            else float(raw_relative_tolerance)
+        ),
+        "group_guard_absolute_tolerance": (
+            guard_absolute_tolerance
+            if hasattr(raw_absolute_tolerance, "items")
+            else float(raw_absolute_tolerance)
+        ),
         "group_guard_before": guard_before,
         "group_guard_reference": guard_reference,
         "group_guard_reference_is_persistent": bool(
@@ -185,8 +233,8 @@ def checked_refiner_step(
         for key, baseline in guard_reference.items():
             candidate = candidate_groups[key]
             allowance = max(
-                abs(baseline) * float(group_guard_relative_tolerance),
-                float(group_guard_absolute_tolerance),
+                abs(baseline) * guard_relative_tolerance[key],
+                guard_absolute_tolerance[key],
             )
             allowed = baseline + allowance
             if not math.isfinite(candidate) or candidate > allowed:

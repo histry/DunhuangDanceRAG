@@ -246,7 +246,7 @@ def test_diagnostic_and_formal_training_share_checked_update():
     assert '_refiner_guarded_total_batch_loss(' in formal_source
     assert 'checked_refiner_step(' in diagnostic_source
     assert '_fixed_anchor_guarded_loss(' in diagnostic_source
-    assert '_refiner_guarded_total_batch_loss(' in fixed_guard_source
+    assert '_diagnostic_guarded_loss(' in fixed_guard_source
     assert REFINER_UPDATE_PROTOCOL == m.REFINER_UPDATE_PROTOCOL
 
 
@@ -378,3 +378,33 @@ def test_persistent_group_guard_rejects_cumulative_rolling_regression():
     assert violation['reference']==pytest.approx(1.0)
     assert violation['candidate']>violation['allowed']
     torch.testing.assert_close(p,before,atol=0,rtol=0)
+
+
+def test_group_guard_accepts_exact_per_metric_tolerance_maps():
+    p=torch.nn.Parameter(torch.zeros(1,dtype=torch.float64))
+    opt=torch.optim.SGD([p],lr=.1)
+    def objective():
+        value=(p-1).square().sum()
+        return value, {
+            'single_short.endpoint': .5 + .001*p.sum(),
+            'cross_short.support': .5 + .01*p.sum(),
+        }
+    loss,groups=objective(); loss.backward()
+    report=checked_refiner_step(
+        opt,loss,objective,
+        group_guard_before=groups,
+        group_guard_reference={
+            'single_short.endpoint': .5,
+            'cross_short.support': .5,
+        },
+        group_guard_relative_tolerance={
+            'single_short.endpoint': 0.0,
+            'cross_short.support': 0.0,
+        },
+        group_guard_absolute_tolerance={
+            'single_short.endpoint': 1.0e-3,
+            'cross_short.support': 2.0e-2,
+        },
+    )
+    assert report['optimizer_update_accepted']
+    assert isinstance(report['group_guard_absolute_tolerance'],dict)

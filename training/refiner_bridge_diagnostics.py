@@ -26,8 +26,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_12b"
-FIT_PROTOCOL = "fixed_anchor_best_so_far_context_reservoir_transaction_v3"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_12c"
+FIT_PROTOCOL = "pcgrad_fixed_envelope_context_reservoir_transaction_v4"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
     "all_probe_safe_farthest_order_rotating_c5_v1"
@@ -37,6 +37,20 @@ PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
 # V15.4 does not increase this value.
 FIT_CONTEXT_COUNT = 5
 PROBE_START_GUARD_FRAMES = 6
+
+# Development-diagnostic trust region only. These are absolute allowances in
+# the normalized TRAIN objective domain; they are not production thresholds
+# and do not change physical, fixed-support, fidelity, boundary, or 0.03 gates.
+SINGLE_SUPPORT_ABSOLUTE_EPSILON = 1.0e-3
+CROSS_SUPPORT_ABSOLUTE_EPSILON = 2.0e-2
+SINGLE_PENETRATION_ABSOLUTE_EPSILON = 1.0e-3
+CROSS_PENETRATION_ABSOLUTE_EPSILON = 2.0e-2
+SINGLE_JERK_ABSOLUTE_EPSILON = 5.0e-3
+CROSS_JERK_ABSOLUTE_EPSILON = 5.0e-2
+SINGLE_ROOT_VERTICAL_ABSOLUTE_EPSILON = 1.0e-3
+CROSS_ROOT_VERTICAL_ABSOLUTE_EPSILON = 1.0e-2
+OUTPUT_WARMUP_STEPS = 50
+OUTPUT_WARMUP_LR_MULTIPLIER = 10.0
 
 
 def fingerprint(args, cfg):
@@ -83,6 +97,20 @@ def fingerprint(args, cfg):
     value["fit_protocol"] = FIT_PROTOCOL
     value["context_reservoir_protocol"] = CONTEXT_RESERVOIR_PROTOCOL
     value["probe_scope"] = PROBE_SCOPE
+    value["pareto_gradient_protocol"] = "symmetric_pcgrad_rms_scaled_v1"
+    value["guard_envelope_protocol"] = "fixed_component_anchor_best_joint_v1"
+    value["output_warmup_steps"] = OUTPUT_WARMUP_STEPS
+    value["output_warmup_lr_multiplier"] = OUTPUT_WARMUP_LR_MULTIPLIER
+    value["training_guard_absolute_epsilons"] = {
+        "single_support": SINGLE_SUPPORT_ABSOLUTE_EPSILON,
+        "cross_support": CROSS_SUPPORT_ABSOLUTE_EPSILON,
+        "single_penetration": SINGLE_PENETRATION_ABSOLUTE_EPSILON,
+        "cross_penetration": CROSS_PENETRATION_ABSOLUTE_EPSILON,
+        "single_jerk": SINGLE_JERK_ABSOLUTE_EPSILON,
+        "cross_jerk": CROSS_JERK_ABSOLUTE_EPSILON,
+        "single_root_vertical": SINGLE_ROOT_VERTICAL_ABSOLUTE_EPSILON,
+        "cross_root_vertical": CROSS_ROOT_VERTICAL_ABSOLUTE_EPSILON,
+    }
     return value
 
 
@@ -452,10 +480,21 @@ def fit_bank_contract(
             "fixed_complete_seen_train_anchor",
 
         "group_guard_reference":
-            "componentwise_best_so_far_on_fixed_anchor",
+            "fixed_component_anchor_with_best_joint_envelope",
 
         "group_guard_rolling_tolerance_accumulation":
             False,
+
+        "historical_component_minimum_intersection":
+            False,
+
+        "endpoint_temporal_gradient_protocol":
+            "symmetric_pcgrad_rms_scaled",
+
+        "output_warmup_steps": OUTPUT_WARMUP_STEPS,
+
+        "output_warmup_lr_multiplier":
+            OUTPUT_WARMUP_LR_MULTIPLIER,
 
         "seen_anchor_cases_per_update":
             4 * windows,
@@ -1121,15 +1160,54 @@ def failure_breakdown(metrics):
     return groups
 
 
+def _diagnostic_group_guard_values(terms, group_objectives):
+    """Build the V15.12c two-axis guard on one immutable TRAIN bank.
+
+    Trajectory components and normalized physical excesses remain independent.
+    This avoids hiding a physical regression inside a lower endpoint loss while
+    leaving every production acceptance threshold unchanged.
+    """
+    values = dict(
+        m._refiner_group_repair_losses(
+            terms,
+            require_all=True,
+        )
+    )
+    for label in m.REFINER_GROUP_LABELS:
+        objective = group_objectives[label]
+        values[label] = objective["training_total"]
+        values[f"{label}.support"] = terms[
+            f"group_{label}_support_excess"
+        ]
+        values[f"{label}.penetration"] = terms[
+            f"group_{label}_penetration_excess"
+        ]
+        values[f"{label}.jerk"] = terms[
+            f"group_{label}_jerk_safety_excess"
+        ]
+        values[f"{label}.root_vertical"] = terms[
+            f"group_{label}_root_vertical_safety_excess"
+        ]
+        values[f"{label}.fidelity"] = objective["clean_identity"]
+    return values
+
+
+def _diagnostic_guarded_loss(model, batch, cfg):
+    groups = {}
+    repair, protection, terms, _ = m._refiner_batch_objectives(
+        model,
+        batch,
+        cfg,
+        group_objectives=groups,
+    )
+    total = repair + cfg.product_refiner_clean_identity_weight * protection
+    return total, _diagnostic_group_guard_values(terms, groups)
+
+
 def _fixed_group_guard_metrics(model, batch, cfg):
     """Measure guard components on one immutable TRAIN anchor bank."""
     with m.torch.no_grad():
-        _, values = m._refiner_guarded_total_batch_loss(
-            model,
-            batch,
-            cfg,
-            require_all_groups=True,
-        )
+        _, values = _diagnostic_guarded_loss(model, batch, cfg)
     return {
         key: float(value.detach())
         for key, value in values.items()
@@ -1139,13 +1217,281 @@ def _fixed_group_guard_metrics(model, batch, cfg):
 def _fixed_anchor_guarded_loss(model, train_batch, guard_batch, cfg):
     """Use the rotating C5 batch for Armijo and the fixed bank for guards."""
     train_loss = m._refiner_total_batch_loss(model, train_batch, cfg)
-    _, fixed_groups = m._refiner_guarded_total_batch_loss(
-        model,
-        guard_batch,
-        cfg,
-        require_all_groups=True,
-    )
+    _, fixed_groups = _diagnostic_guarded_loss(model, guard_batch, cfg)
     return train_loss, fixed_groups
+
+
+def _mixed_group_guard_reference(anchor, best):
+    """Keep component envelopes fixed while joint progress is best-so-far.
+
+    Using each component's historical minimum creates an intersection that may
+    never have existed in one model state. V15.12c uses the immutable initial
+    anchor for endpoint, temporal, physical and fidelity axes, and best-so-far
+    only for the joint feasibility and total objectives.
+    """
+    if set(anchor) != set(best):
+        raise ValueError("guard anchor/best keys differ")
+    return {
+        key: (
+            best[key]
+            if "." not in key or key.endswith(".feasibility")
+            else anchor[key]
+        )
+        for key in anchor
+    }
+
+
+def _group_guard_tolerances(anchor, cfg):
+    """Return nonaccumulating, per-axis TRAIN-objective allowances."""
+    relative = {}
+    absolute = {}
+    base_relative = float(
+        cfg.product_refiner_group_guard_relative_tolerance
+    )
+    base_absolute = float(
+        cfg.product_refiner_group_guard_absolute_tolerance
+    )
+    for key in anchor:
+        role = key.split("_", 1)[0]
+        suffix = key.rsplit(".", 1)[-1] if "." in key else "total"
+        if suffix in {"total", "feasibility"}:
+            relative[key] = base_relative
+            absolute[key] = base_absolute
+        elif suffix == "support":
+            relative[key] = 0.0
+            absolute[key] = (
+                CROSS_SUPPORT_ABSOLUTE_EPSILON
+                if role == "cross"
+                else SINGLE_SUPPORT_ABSOLUTE_EPSILON
+            )
+        elif suffix == "penetration":
+            relative[key] = 0.0
+            absolute[key] = (
+                CROSS_PENETRATION_ABSOLUTE_EPSILON
+                if role == "cross"
+                else SINGLE_PENETRATION_ABSOLUTE_EPSILON
+            )
+        elif suffix == "jerk":
+            relative[key] = 0.0
+            absolute[key] = (
+                CROSS_JERK_ABSOLUTE_EPSILON
+                if role == "cross"
+                else SINGLE_JERK_ABSOLUTE_EPSILON
+            )
+        elif suffix == "root_vertical":
+            relative[key] = 0.0
+            absolute[key] = (
+                CROSS_ROOT_VERTICAL_ABSOLUTE_EPSILON
+                if role == "cross"
+                else SINGLE_ROOT_VERTICAL_ABSOLUTE_EPSILON
+            )
+        else:
+            # Endpoint, temporal, and clean fidelity may only move within the
+            # existing numerical absolute tolerance around the fixed anchor.
+            relative[key] = 0.0
+            absolute[key] = base_absolute
+    return relative, absolute
+
+
+def _tuple_dot(left, right):
+    values = [
+        (a.double() * b.double()).sum()
+        for a, b in zip(left, right)
+    ]
+    return m.torch.stack(values).sum()
+
+
+def _pareto_common_descent_backward(model, total_loss, terms, cfg):
+    """Backpropagate an RMS-scaled symmetric PCGrad scientific direction.
+
+    The endpoint and temporal gradients are projected symmetrically when they
+    conflict. Their common direction is rescaled to the RMS task norm so a
+    negative cosine cannot collapse output amplitude. The remaining physical,
+    trust and fidelity gradient is admitted only as far as both scientific
+    directional derivatives stay nonnegative. Actual candidate acceptance is
+    still decided by the deterministic loss closure and fixed guard envelope.
+    """
+    endpoint = terms.get("endpoint_training_objective")
+    temporal = terms.get("temporal_training_objective")
+    if endpoint is None or temporal is None:
+        total_loss.backward()
+        return {
+            "protocol": "symmetric_pcgrad_rms_scaled_v1",
+            "active": False,
+            "reason": "scientific_components_unavailable",
+        }
+    weight = float(cfg.product_refiner_repair_margin_weight)
+    endpoint = weight * endpoint
+    temporal = weight * temporal
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    endpoint_raw = m.torch.autograd.grad(
+        endpoint,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    temporal_raw = m.torch.autograd.grad(
+        temporal,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    endpoint_grad = [
+        m.torch.zeros_like(p) if g is None else g
+        for p, g in zip(parameters, endpoint_raw)
+    ]
+    temporal_grad = [
+        m.torch.zeros_like(p) if g is None else g
+        for p, g in zip(parameters, temporal_raw)
+    ]
+    total_loss.backward()
+    total_grad = [
+        m.torch.zeros_like(p) if p.grad is None else p.grad.detach().clone()
+        for p in parameters
+    ]
+    endpoint_norm_sq = _tuple_dot(endpoint_grad, endpoint_grad)
+    temporal_norm_sq = _tuple_dot(temporal_grad, temporal_grad)
+    dot = _tuple_dot(endpoint_grad, temporal_grad)
+    epsilon = total_loss.new_tensor(1.0e-24, dtype=m.torch.float64)
+    endpoint_norm = endpoint_norm_sq.clamp_min(epsilon).sqrt()
+    temporal_norm = temporal_norm_sq.clamp_min(epsilon).sqrt()
+    cosine = dot / (endpoint_norm * temporal_norm)
+    conflict = bool(float(dot.detach()) < 0.0)
+    if conflict:
+        endpoint_projected = [
+            ge - dot.to(ge.dtype) / temporal_norm_sq.clamp_min(epsilon).to(ge.dtype) * gt
+            for ge, gt in zip(endpoint_grad, temporal_grad)
+        ]
+        temporal_projected = [
+            gt - dot.to(gt.dtype) / endpoint_norm_sq.clamp_min(epsilon).to(gt.dtype) * ge
+            for ge, gt in zip(endpoint_grad, temporal_grad)
+        ]
+    else:
+        endpoint_projected = endpoint_grad
+        temporal_projected = temporal_grad
+    common = [
+        0.5 * (ge + gt)
+        for ge, gt in zip(endpoint_projected, temporal_projected)
+    ]
+    common_norm = _tuple_dot(common, common).clamp_min(epsilon).sqrt()
+    target_norm = (0.5 * (endpoint_norm_sq + temporal_norm_sq)).sqrt()
+    common_exists = bool(float(common_norm.detach()) > 1.0e-12)
+    if common_exists:
+        amplitude_scale = target_norm / common_norm
+        common = [
+            value * amplitude_scale.to(value.dtype)
+            for value in common
+        ]
+    else:
+        amplitude_scale = common_norm.new_zeros(())
+        common = [m.torch.zeros_like(value) for value in common]
+    remainder = [
+        total - ge - gt
+        for total, ge, gt in zip(total_grad, endpoint_grad, temporal_grad)
+    ]
+    common_endpoint_dot = _tuple_dot(common, endpoint_grad)
+    common_temporal_dot = _tuple_dot(common, temporal_grad)
+    remainder_endpoint_dot = _tuple_dot(remainder, endpoint_grad)
+    remainder_temporal_dot = _tuple_dot(remainder, temporal_grad)
+    remainder_scale = 1.0
+    for common_dot, remainder_dot in (
+        (common_endpoint_dot, remainder_endpoint_dot),
+        (common_temporal_dot, remainder_temporal_dot),
+    ):
+        common_value = float(common_dot.detach())
+        remainder_value = float(remainder_dot.detach())
+        if remainder_value < 0.0:
+            remainder_scale = min(
+                remainder_scale,
+                max(0.0, 0.95 * common_value / (-remainder_value)),
+            )
+    final_grad = [
+        science + remainder_scale * other
+        for science, other in zip(common, remainder)
+    ]
+    for parameter, gradient in zip(parameters, final_grad):
+        parameter.grad = gradient
+    return {
+        "protocol": "symmetric_pcgrad_rms_scaled_v1",
+        "active": True,
+        "conflict": conflict,
+        "common_direction_exists": common_exists,
+        "endpoint_gradient_norm": float(endpoint_norm.detach()),
+        "temporal_gradient_norm": float(temporal_norm.detach()),
+        "endpoint_temporal_cosine": float(cosine.detach()),
+        "amplitude_preserving_scale": float(amplitude_scale.detach()),
+        "non_scientific_remainder_scale": float(remainder_scale),
+        "final_endpoint_directional_product": float(
+            _tuple_dot(final_grad, endpoint_grad).detach()
+        ),
+        "final_temporal_directional_product": float(
+            _tuple_dot(final_grad, temporal_grad).detach()
+        ),
+    }
+
+
+def _diagnostic_optimizer(model, cfg):
+    """Use a bounded output-head warmup without changing model architecture."""
+    output_parameters = list(getattr(model, "out", model).parameters())
+    output_ids = {id(parameter) for parameter in output_parameters}
+    backbone = [
+        parameter
+        for parameter in model.parameters()
+        if id(parameter) not in output_ids
+    ]
+    groups = []
+    if backbone:
+        groups.append({
+            "params": backbone,
+            "lr": cfg.lr,
+            "diagnostic_role": "backbone",
+        })
+    groups.append({
+        "params": output_parameters,
+        "lr": cfg.lr * OUTPUT_WARMUP_LR_MULTIPLIER,
+        "diagnostic_role": "output",
+    })
+    return m.torch.optim.AdamW(groups, weight_decay=1.0e-4)
+
+
+def _set_diagnostic_learning_rates(optimizer, cfg, step):
+    warmup = int(step) <= OUTPUT_WARMUP_STEPS
+    for group in optimizer.param_groups:
+        role = group.get("diagnostic_role", "backbone")
+        group["lr"] = float(cfg.lr) * (
+            OUTPUT_WARMUP_LR_MULTIPLIER
+            if warmup and role == "output"
+            else 1.0
+        )
+    return {
+        "active": warmup,
+        "steps": OUTPUT_WARMUP_STEPS,
+        "output_lr_multiplier": (
+            OUTPUT_WARMUP_LR_MULTIPLIER if warmup else 1.0
+        ),
+        "parameter_group_lrs": [
+            float(group["lr"])
+            for group in optimizer.param_groups
+        ],
+    }
+
+
+def _decoder_amplitude_summary(trace, seam):
+    repair = trace.get("repair", {})
+    active = seam[..., 0] >= 0.5
+    result = {}
+    for name in ("raw", "after_mask", "after_taper", "applied"):
+        value = repair.get(name)
+        if value is None:
+            continue
+        selected = value[active]
+        result[f"{name}_tangent_rms"] = float(
+            selected.double().square().mean().sqrt().detach()
+        ) if selected.numel() else 0.0
+        result[f"{name}_tangent_abs_max"] = float(
+            selected.abs().max().detach()
+        ) if selected.numel() else 0.0
+    return result
 
 
 def evaluate_fit_contexts(model, banks, cfg):
@@ -1257,13 +1603,13 @@ def run(args):
         guard = report.get("group_guard_contract", {})
         if (
             guard.get("schema")
-            != "refiner_fixed_anchor_best_so_far_guard_v1"
+            != "refiner_fixed_component_anchor_dual_track_guard_v2"
             or guard.get("bank") != "complete_seen_train_anchor"
             or guard.get("fixed_across_all_steps") is not True
             or guard.get("rolling_pre_step_reference_forbidden") is not True
         ):
             raise RuntimeError(
-                "diagnostic did not use the fixed-anchor best-so-far guard"
+                "diagnostic did not use the fixed component-anchor guard"
             )
         fit_contexts = report.get("fit_context_evaluation", {})
         if (
@@ -1343,7 +1689,7 @@ def run(args):
             "complete safe-start reservoir cycle"
         )
     model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
-    optimizer = m.torch.optim.AdamW(model.parameters(),lr=cfg.lr,weight_decay=1e-4)
+    optimizer = _diagnostic_optimizer(model, cfg)
     fixed_guard_batch = fixed_fit_bank(banks, "seen")
     fixed_guard_anchor = _fixed_group_guard_metrics(
         model,
@@ -1352,6 +1698,10 @@ def run(args):
     )
     fixed_guard_current = dict(fixed_guard_anchor)
     fixed_guard_best = dict(fixed_guard_anchor)
+    (
+        guard_relative_tolerance,
+        guard_absolute_tolerance,
+    ) = _group_guard_tolerances(fixed_guard_anchor, cfg)
     destination.mkdir(parents=True)
     report = {"schema":SCHEMA,"protocol":m.BOUNDARY_PROTOCOL,"fingerprint":fingerprint(args,cfg),
               "completed":False,"published":False,"independent_validation":False,
@@ -1363,19 +1713,34 @@ def run(args):
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[],
               "group_guard_contract": {
-                  "schema": "refiner_fixed_anchor_best_so_far_guard_v1",
+                  "schema": "refiner_fixed_component_anchor_dual_track_guard_v2",
                   "bank": "complete_seen_train_anchor",
                   "fixed_across_all_steps": True,
                   "rolling_pre_step_reference_forbidden": True,
-                  "relative_tolerance": float(
-                      cfg.product_refiner_group_guard_relative_tolerance
-                  ),
-                  "absolute_tolerance": float(
-                      cfg.product_refiner_group_guard_absolute_tolerance
-                  ),
+                  "historical_component_minimum_intersection": False,
+                  "joint_reference": "best_so_far",
+                  "component_reference": "immutable_initial_anchor",
+                  "relative_tolerance": dict(guard_relative_tolerance),
+                  "absolute_tolerance": dict(guard_absolute_tolerance),
+                  "absolute_tolerance_domain":
+                      "normalized_training_objective_only",
+                  "production_gate_thresholds_changed": False,
                   "initial_anchor": dict(fixed_guard_anchor),
                   "best_so_far": dict(fixed_guard_best),
                   "current": dict(fixed_guard_current),
+              },
+              "output_amplitude_contract": {
+                  "schema": "refiner_output_head_trust_warmup_v1",
+                  "steps": OUTPUT_WARMUP_STEPS,
+                  "lr_multiplier": OUTPUT_WARMUP_LR_MULTIPLIER,
+                  "bounded_by_checked_step": True,
+                  "decoder_caps_changed": False,
+              },
+              "multiobjective_contract": {
+                  "schema": "refiner_endpoint_temporal_pcgrad_v1",
+                  "protocol": "symmetric_pcgrad_rms_scaled",
+                  "actual_loss_closure_required": True,
+                  "physical_remainder_requires_scientific_nonregression": True,
               }}
     report["fit_bank_artifact"] = save_fit_bank(
         destination,
@@ -1410,16 +1775,32 @@ def run(args):
             banks,
             selected_context_indices,
         )
-        repair,protection,terms,identity = m._refiner_batch_objectives(model,batch,cfg)
-        loss = repair + cfg.product_refiner_clean_identity_weight * protection
         logging = step == 1 or step % 25 == 0 or step == args.steps
+        amplitude_trace = {} if logging else None
+        warmup = _set_diagnostic_learning_rates(optimizer, cfg, step)
+        repair,protection,terms,identity = m._refiner_batch_objectives(
+            model,
+            batch,
+            cfg,
+            trace=amplitude_trace,
+        )
+        loss = repair + cfg.product_refiner_clean_identity_weight * protection
         gradient = m._refiner_gradient_diagnostics(model,repair,protection,cfg.product_refiner_clean_identity_weight) if logging else None
         components = m._refiner_component_gradients(model,terms,cfg) if logging else None
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        pareto_gradient = _pareto_common_descent_backward(
+            model,
+            loss,
+            terms,
+            cfg,
+        )
         norm = float(m.torch.nn.utils.clip_grad_norm_(model.parameters(),1,error_if_nonfinite=True))
         group_guard_before = dict(fixed_guard_current)
         group_guard_best_before = dict(fixed_guard_best)
+        group_guard_reference = _mixed_group_guard_reference(
+            fixed_guard_anchor,
+            group_guard_best_before,
+        )
         update = m.checked_refiner_step(
             optimizer,
             loss,
@@ -1431,13 +1812,9 @@ def run(args):
             ),
             gradient_unscale=max(1.0, norm + 1.0e-6),
             group_guard_before=group_guard_before,
-            group_guard_reference=group_guard_best_before,
-            group_guard_relative_tolerance=float(
-                cfg.product_refiner_group_guard_relative_tolerance
-            ),
-            group_guard_absolute_tolerance=float(
-                cfg.product_refiner_group_guard_absolute_tolerance
-            ),
+            group_guard_reference=group_guard_reference,
+            group_guard_relative_tolerance=guard_relative_tolerance,
+            group_guard_absolute_tolerance=guard_absolute_tolerance,
         )
         if update["optimizer_update_accepted"]:
             fixed_guard_current = dict(update["group_guard_after"])
@@ -1449,6 +1826,9 @@ def run(args):
                 for key in fixed_guard_best
             }
         update["group_guard_anchor"] = dict(fixed_guard_anchor)
+        update["group_guard_reference_policy"] = (
+            "fixed_component_anchor_with_best_joint_envelope"
+        )
         update["group_guard_best_before"] = group_guard_best_before
         update["group_guard_best_after"] = dict(fixed_guard_best)
         report["group_guard_contract"]["best_so_far"] = dict(
@@ -1474,7 +1854,10 @@ def run(args):
         if stopped_early and not logging:
             # backward() released the old graph. The rejected transaction has
             # restored the exact pre-update state; recompute on the SAME bank.
-            r,p,t,_ = m._refiner_batch_objectives(model,batch,cfg)
+            amplitude_trace = {}
+            r,p,t,_ = m._refiner_batch_objectives(
+                model, batch, cfg, trace=amplitude_trace
+            )
             gradient = m._refiner_gradient_diagnostics(model,r,p,cfg.product_refiner_clean_identity_weight)
             components = m._refiner_component_gradients(model,t,cfg)
         if logging or stopped_early:
@@ -1483,6 +1866,11 @@ def run(args):
                    "repair":float(repair.detach()),"clean":float(protection.detach()),
                    "terms":{k:float(v.detach()) for k,v in terms.items()},"gradient":gradient,
                    "component_gradients":components,"clip_norm_before":norm,
+                   "pareto_gradient":pareto_gradient,
+                   "decoder_output_amplitude":_decoder_amplitude_summary(
+                       amplitude_trace or {}, batch["seam"]
+                   ),
+                   "output_warmup":warmup,
                    "optimizer_update":update,
                    "fit_context_index":fit_context_index,
                    "fit_reservoir_transaction_index":fit_context_index,

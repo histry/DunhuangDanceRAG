@@ -7685,6 +7685,7 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
 
                     # Safety diagnostics.
                     "support_excess",
+                    "penetration_excess",
                     "jerk_safety_excess",
                     "root_vertical_safety_excess",
                 ):
@@ -8306,6 +8307,7 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         "jerk_safety_excess": jerk_safety, **jerk_safety_terms,
         "root_vertical_safety_excess":root_safety, **root_safety_terms,
         "observable_trust_excess": trust, "support_excess": support,
+        "penetration_excess": penetration,
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }
     return (loss,terms) if reduction=="none" else (loss.mean(),{k:v.mean() for k,v in terms.items()})

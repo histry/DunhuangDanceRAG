@@ -97,7 +97,7 @@ def test_fit_contract_counts_examples_not_just_iterations():
     assert contract["group_guard_scope"] == "fixed_complete_seen_train_anchor"
     assert (
         contract["group_guard_reference"]
-        == "componentwise_best_so_far_on_fixed_anchor"
+        == "fixed_component_anchor_with_best_joint_envelope"
     )
     assert contract["group_guard_rolling_tolerance_accumulation"] is False
 
@@ -140,8 +140,7 @@ def test_fit_contract_counts_examples_not_just_iterations():
         in closure_source
     )
     assert (
-        "m._refiner_guarded_total_batch_loss("
-        "model,guard_batch,cfg,require_all_groups=True"
+        "_diagnostic_guarded_loss(model,guard_batch,cfg)"
         in closure_source
     )
 
@@ -688,6 +687,9 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
         model,
         batch,
         cfg,
+        *,
+        group_objectives=None,
+        trace=None,
     ):
         r = sum(
             p.square().sum()
@@ -722,6 +724,23 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
             terms[
                 f"group_{label}_temporal_scientific_tail_risk"
             ] = r
+
+            for component in (
+                "support_excess",
+                "penetration_excess",
+                "jerk_safety_excess",
+                "root_vertical_safety_excess",
+            ):
+                terms[f"group_{label}_{component}"] = r * 0
+
+            if group_objectives is not None:
+                group_objectives[label] = {
+                    "training_total": r,
+                    "clean_identity": r * 0,
+                }
+
+        if trace is not None:
+            trace["repair"] = {}
 
         return (
             r,
@@ -917,3 +936,99 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
             / "optimizer_updates.jsonl"
         ).read_text().splitlines()
     ) == expected_steps
+
+
+def test_v15_12c_guard_uses_fixed_components_and_best_joint_envelope():
+    anchor = {
+        "single_short": 1.0,
+        "single_short.feasibility": 2.0,
+        "single_short.endpoint": 3.0,
+        "single_short.temporal": 4.0,
+        "single_short.support": 5.0,
+        "single_short.penetration": 6.0,
+        "single_short.jerk": 7.0,
+        "single_short.root_vertical": 8.0,
+        "single_short.fidelity": 9.0,
+    }
+    best = {key: value / 2.0 for key, value in anchor.items()}
+
+    reference = d._mixed_group_guard_reference(anchor, best)
+
+    assert reference["single_short"] == best["single_short"]
+    assert (
+        reference["single_short.feasibility"]
+        == best["single_short.feasibility"]
+    )
+    for suffix in (
+        "endpoint",
+        "temporal",
+        "support",
+        "penetration",
+        "jerk",
+        "root_vertical",
+        "fidelity",
+    ):
+        key = f"single_short.{suffix}"
+        assert reference[key] == anchor[key]
+
+
+def test_v15_12c_dual_track_absolute_tolerances_are_nonaccumulating():
+    cfg = m.MotionGenerationConfig()
+    anchor = {
+        f"{label}.{suffix}": 0.0
+        for label in m.REFINER_GROUP_LABELS
+        for suffix in (
+            "support",
+            "penetration",
+            "jerk",
+            "root_vertical",
+            "fidelity",
+        )
+    }
+    relative, absolute = d._group_guard_tolerances(anchor, cfg)
+
+    assert all(value == 0.0 for value in relative.values())
+    assert (
+        absolute["single_short.support"]
+        == d.SINGLE_SUPPORT_ABSOLUTE_EPSILON
+    )
+    assert (
+        absolute["cross_short.support"]
+        == d.CROSS_SUPPORT_ABSOLUTE_EPSILON
+    )
+    assert (
+        absolute["single_long.jerk"]
+        == d.SINGLE_JERK_ABSOLUTE_EPSILON
+    )
+    assert (
+        absolute["cross_long.jerk"]
+        == d.CROSS_JERK_ABSOLUTE_EPSILON
+    )
+
+
+def test_v15_12c_pcgrad_keeps_endpoint_and_temporal_descent_products():
+    model = torch.nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    prediction = model.weight.reshape(-1)
+    endpoint = (prediction[0] - 1.0).square()
+    temporal = (prediction[0] + 0.5).square() + (
+        prediction[1] - 1.0
+    ).square()
+    total = endpoint + temporal
+    report = d._pareto_common_descent_backward(
+        model,
+        total,
+        {
+            "endpoint_training_objective": endpoint,
+            "temporal_training_objective": temporal,
+        },
+        m.MotionGenerationConfig(),
+    )
+
+    assert report["active"]
+    assert report["conflict"]
+    assert report["common_direction_exists"]
+    assert report["amplitude_preserving_scale"] > 0.0
+    assert report["final_endpoint_directional_product"] >= 0.0
+    assert report["final_temporal_directional_product"] >= 0.0

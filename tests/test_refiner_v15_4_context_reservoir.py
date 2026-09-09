@@ -12,12 +12,12 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12b"
+        == "refiner_observable_bridge_diagnostic_v15_12c"
     )
 
     assert (
         d.FIT_PROTOCOL
-        == "fixed_anchor_best_so_far_context_reservoir_transaction_v3"
+        == "pcgrad_fixed_envelope_context_reservoir_transaction_v4"
     )
 
     assert (
