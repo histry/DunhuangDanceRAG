@@ -26,8 +26,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_12c"
-FIT_PROTOCOL = "pcgrad_fixed_envelope_context_reservoir_transaction_v4"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_12d"
+FIT_PROTOCOL = "pcgrad_gate_metric_context_reservoir_transaction_v5"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
     "all_probe_safe_farthest_order_rotating_c5_v1"
@@ -38,17 +38,6 @@ PROBE_SCOPE = "unfitted_local_motion_context_within_train_windows"
 FIT_CONTEXT_COUNT = 5
 PROBE_START_GUARD_FRAMES = 6
 
-# Development-diagnostic trust region only. These are absolute allowances in
-# the normalized TRAIN objective domain; they are not production thresholds
-# and do not change physical, fixed-support, fidelity, boundary, or 0.03 gates.
-SINGLE_SUPPORT_ABSOLUTE_EPSILON = 1.0e-3
-CROSS_SUPPORT_ABSOLUTE_EPSILON = 2.0e-2
-SINGLE_PENETRATION_ABSOLUTE_EPSILON = 1.0e-3
-CROSS_PENETRATION_ABSOLUTE_EPSILON = 2.0e-2
-SINGLE_JERK_ABSOLUTE_EPSILON = 5.0e-3
-CROSS_JERK_ABSOLUTE_EPSILON = 5.0e-2
-SINGLE_ROOT_VERTICAL_ABSOLUTE_EPSILON = 1.0e-3
-CROSS_ROOT_VERTICAL_ABSOLUTE_EPSILON = 1.0e-2
 OUTPUT_WARMUP_STEPS = 50
 OUTPUT_WARMUP_LR_MULTIPLIER = 10.0
 
@@ -101,15 +90,13 @@ def fingerprint(args, cfg):
     value["guard_envelope_protocol"] = "fixed_component_anchor_best_joint_v1"
     value["output_warmup_steps"] = OUTPUT_WARMUP_STEPS
     value["output_warmup_lr_multiplier"] = OUTPUT_WARMUP_LR_MULTIPLIER
-    value["training_guard_absolute_epsilons"] = {
-        "single_support": SINGLE_SUPPORT_ABSOLUTE_EPSILON,
-        "cross_support": CROSS_SUPPORT_ABSOLUTE_EPSILON,
-        "single_penetration": SINGLE_PENETRATION_ABSOLUTE_EPSILON,
-        "cross_penetration": CROSS_PENETRATION_ABSOLUTE_EPSILON,
-        "single_jerk": SINGLE_JERK_ABSOLUTE_EPSILON,
-        "cross_jerk": CROSS_JERK_ABSOLUTE_EPSILON,
-        "single_root_vertical": SINGLE_ROOT_VERTICAL_ABSOLUTE_EPSILON,
-        "cross_root_vertical": CROSS_ROOT_VERTICAL_ABSOLUTE_EPSILON,
+    value["training_guard_threshold_sources"] = {
+        "clean_geometry_max":
+            "checkpoint_validation_max_clean_identity_product_log_l1",
+        "clean_contact_max":
+            "checkpoint_validation_max_clean_identity_contact_l1",
+        "physical_excess":
+            "zero_excess_plus_configured_numerical_tolerance",
     }
     return value
 
@@ -1161,7 +1148,7 @@ def failure_breakdown(metrics):
 
 
 def _diagnostic_group_guard_values(terms, group_objectives):
-    """Build the V15.12c two-axis guard on one immutable TRAIN bank.
+    """Build the V15.12d gate-metric guard on one immutable TRAIN bank.
 
     Trajectory components and normalized physical excesses remain independent.
     This avoids hiding a physical regression inside a lower endpoint loss while
@@ -1188,7 +1175,18 @@ def _diagnostic_group_guard_values(terms, group_objectives):
         values[f"{label}.root_vertical"] = terms[
             f"group_{label}_root_vertical_safety_excess"
         ]
-        values[f"{label}.fidelity"] = objective["clean_identity"]
+        values[f"{label}.clean_geometry_max"] = objective[
+            "clean_geometry_max"
+        ]
+        values[f"{label}.clean_contact_max"] = objective[
+            "clean_contact_max"
+        ]
+        values[f"{label}.clean_temporal_excess"] = objective[
+            "clean_temporal_excess"
+        ]
+        values[f"{label}.clean_support_excess"] = objective[
+            "clean_support_excess"
+        ]
     return values
 
 
@@ -1225,9 +1223,9 @@ def _mixed_group_guard_reference(anchor, best):
     """Keep component envelopes fixed while joint progress is best-so-far.
 
     Using each component's historical minimum creates an intersection that may
-    never have existed in one model state. V15.12c uses the immutable initial
-    anchor for endpoint, temporal, physical and fidelity axes, and best-so-far
-    only for the joint feasibility and total objectives.
+    never have existed in one model state. V15.12d uses the immutable initial
+    anchor for endpoint, temporal, physical and clean gate metrics, and
+    best-so-far only for the joint feasibility and total objectives.
     """
     if set(anchor) != set(best):
         raise ValueError("guard anchor/best keys differ")
@@ -1242,7 +1240,7 @@ def _mixed_group_guard_reference(anchor, best):
 
 
 def _group_guard_tolerances(anchor, cfg):
-    """Return nonaccumulating, per-axis TRAIN-objective allowances."""
+    """Return fixed, nonaccumulating allowances in audited metric units."""
     relative = {}
     absolute = {}
     base_relative = float(
@@ -1252,42 +1250,30 @@ def _group_guard_tolerances(anchor, cfg):
         cfg.product_refiner_group_guard_absolute_tolerance
     )
     for key in anchor:
-        role = key.split("_", 1)[0]
         suffix = key.rsplit(".", 1)[-1] if "." in key else "total"
         if suffix in {"total", "feasibility"}:
             relative[key] = base_relative
             absolute[key] = base_absolute
-        elif suffix == "support":
+        elif suffix == "clean_geometry_max":
             relative[key] = 0.0
-            absolute[key] = (
-                CROSS_SUPPORT_ABSOLUTE_EPSILON
-                if role == "cross"
-                else SINGLE_SUPPORT_ABSOLUTE_EPSILON
+            absolute[key] = max(
+                0.0,
+                float(
+                    cfg.checkpoint_validation_max_clean_identity_product_log_l1
+                ) - float(anchor[key]),
             )
-        elif suffix == "penetration":
+        elif suffix == "clean_contact_max":
             relative[key] = 0.0
-            absolute[key] = (
-                CROSS_PENETRATION_ABSOLUTE_EPSILON
-                if role == "cross"
-                else SINGLE_PENETRATION_ABSOLUTE_EPSILON
-            )
-        elif suffix == "jerk":
-            relative[key] = 0.0
-            absolute[key] = (
-                CROSS_JERK_ABSOLUTE_EPSILON
-                if role == "cross"
-                else SINGLE_JERK_ABSOLUTE_EPSILON
-            )
-        elif suffix == "root_vertical":
-            relative[key] = 0.0
-            absolute[key] = (
-                CROSS_ROOT_VERTICAL_ABSOLUTE_EPSILON
-                if role == "cross"
-                else SINGLE_ROOT_VERTICAL_ABSOLUTE_EPSILON
+            absolute[key] = max(
+                0.0,
+                float(
+                    cfg.checkpoint_validation_max_clean_identity_contact_l1
+                ) - float(anchor[key]),
             )
         else:
-            # Endpoint, temporal, and clean fidelity may only move within the
-            # existing numerical absolute tolerance around the fixed anchor.
+            # Endpoint/temporal and physical excesses retain a fixed numerical
+            # allowance around the immutable anchor. The clean no-op loss is a
+            # soft objective and is deliberately absent from this hard guard.
             relative[key] = 0.0
             absolute[key] = base_absolute
     return relative, absolute
@@ -1605,7 +1591,7 @@ def run(args):
         guard = report.get("group_guard_contract", {})
         if (
             guard.get("schema")
-            != "refiner_fixed_component_anchor_dual_track_guard_v2"
+            != "refiner_fixed_gate_metric_anchor_guard_v3"
             or guard.get("bank") != "complete_seen_train_anchor"
             or guard.get("fixed_across_all_steps") is not True
             or guard.get("rolling_pre_step_reference_forbidden") is not True
@@ -1715,7 +1701,7 @@ def run(args):
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[],
               "group_guard_contract": {
-                  "schema": "refiner_fixed_component_anchor_dual_track_guard_v2",
+                  "schema": "refiner_fixed_gate_metric_anchor_guard_v3",
                   "bank": "complete_seen_train_anchor",
                   "fixed_across_all_steps": True,
                   "rolling_pre_step_reference_forbidden": True,
@@ -1725,7 +1711,14 @@ def run(args):
                   "relative_tolerance": dict(guard_relative_tolerance),
                   "absolute_tolerance": dict(guard_absolute_tolerance),
                   "absolute_tolerance_domain":
-                      "normalized_training_objective_only",
+                      "configured_gate_metrics_and_zero_excess",
+                  "soft_clean_noop_used_as_hard_guard": False,
+                  "clean_geometry_threshold": float(
+                      cfg.checkpoint_validation_max_clean_identity_product_log_l1
+                  ),
+                  "clean_contact_threshold": float(
+                      cfg.checkpoint_validation_max_clean_identity_contact_l1
+                  ),
                   "production_gate_thresholds_changed": False,
                   "initial_anchor": dict(fixed_guard_anchor),
                   "best_so_far": dict(fixed_guard_best),

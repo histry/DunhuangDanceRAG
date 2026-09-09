@@ -4276,9 +4276,11 @@ def _product_refiner_clean_identity_loss(
     )
     return total, {
         "reconstruction": geometry_per_window.mean(),
+        "geometry_product_log_l1_max": geometry_per_window.max(),
         "temporal": fk_temporal,
         "fk_temporal": fk_temporal,
         "contact": contact_per_window.mean(),
+        "contact_l1_max": contact_per_window.max(),
         "geometry_excess": geometry_excess,
         "contact_excess": contact_excess,
         "support_excess": support_excess,
@@ -7710,7 +7712,7 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
                 continue
             group_repair = (non_scientific[selected].mean()
                             + scientific_weight * tail_stats[label]["risk"])
-            group_clean, _ = _product_refiner_clean_identity_loss(
+            group_clean, group_clean_terms = _product_refiner_clean_identity_loss(
                 identity[selected], batch["clean"][selected],
                 batch["clean_joint"][selected], batch["clean_root"][selected],
                 batch["clean_contact"][selected], cfg)
@@ -7719,6 +7721,12 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
                 "endpoint_deficit_mean": case_terms["endpoint_scientific_deficit"][selected].mean(),
                 "temporal_deficit_mean": case_terms["temporal_scientific_deficit"][selected].mean(),
                 "clean_identity": group_clean,
+                "clean_geometry_max": group_clean_terms[
+                    "geometry_product_log_l1_max"
+                ],
+                "clean_contact_max": group_clean_terms["contact_l1_max"],
+                "clean_temporal_excess": group_clean_terms["temporal"],
+                "clean_support_excess": group_clean_terms["support_excess"],
                 "training_total": group_repair + cfg.product_refiner_clean_identity_weight * group_clean,
             }
     return repair, protection, terms, identity_terms

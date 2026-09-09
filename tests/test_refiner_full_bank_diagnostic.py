@@ -738,6 +738,10 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
                 group_objectives[label] = {
                     "training_total": r,
                     "clean_identity": r * 0,
+                    "clean_geometry_max": r * 0,
+                    "clean_contact_max": r * 0,
+                    "clean_temporal_excess": r * 0,
+                    "clean_support_excess": r * 0,
                 }
 
         if trace is not None:
@@ -939,7 +943,7 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
     ) == expected_steps
 
 
-def test_v15_12c_guard_uses_fixed_components_and_best_joint_envelope():
+def test_v15_12d_guard_uses_fixed_components_and_best_joint_envelope():
     anchor = {
         "single_short": 1.0,
         "single_short.feasibility": 2.0,
@@ -949,7 +953,10 @@ def test_v15_12c_guard_uses_fixed_components_and_best_joint_envelope():
         "single_short.penetration": 6.0,
         "single_short.jerk": 7.0,
         "single_short.root_vertical": 8.0,
-        "single_short.fidelity": 9.0,
+        "single_short.clean_geometry_max": 9.0,
+        "single_short.clean_contact_max": 10.0,
+        "single_short.clean_temporal_excess": 11.0,
+        "single_short.clean_support_excess": 12.0,
     }
     best = {key: value / 2.0 for key, value in anchor.items()}
 
@@ -967,13 +974,16 @@ def test_v15_12c_guard_uses_fixed_components_and_best_joint_envelope():
         "penetration",
         "jerk",
         "root_vertical",
-        "fidelity",
+        "clean_geometry_max",
+        "clean_contact_max",
+        "clean_temporal_excess",
+        "clean_support_excess",
     ):
         key = f"single_short.{suffix}"
         assert reference[key] == anchor[key]
 
 
-def test_v15_12c_dual_track_absolute_tolerances_are_nonaccumulating():
+def test_v15_12d_gate_metric_tolerances_are_nonaccumulating():
     cfg = m.MotionGenerationConfig()
     anchor = {
         f"{label}.{suffix}": 0.0
@@ -983,31 +993,30 @@ def test_v15_12c_dual_track_absolute_tolerances_are_nonaccumulating():
             "penetration",
             "jerk",
             "root_vertical",
-            "fidelity",
+            "clean_geometry_max",
+            "clean_contact_max",
+            "clean_temporal_excess",
+            "clean_support_excess",
         )
     }
     relative, absolute = d._group_guard_tolerances(anchor, cfg)
 
     assert all(value == 0.0 for value in relative.values())
-    assert (
-        absolute["single_short.support"]
-        == d.SINGLE_SUPPORT_ABSOLUTE_EPSILON
+    assert absolute["single_short.support"] == pytest.approx(
+        cfg.product_refiner_group_guard_absolute_tolerance
     )
-    assert (
-        absolute["cross_short.support"]
-        == d.CROSS_SUPPORT_ABSOLUTE_EPSILON
+    assert absolute["cross_short.support"] == pytest.approx(
+        cfg.product_refiner_group_guard_absolute_tolerance
     )
-    assert (
-        absolute["single_long.jerk"]
-        == d.SINGLE_JERK_ABSOLUTE_EPSILON
+    assert absolute["single_long.clean_geometry_max"] == pytest.approx(
+        cfg.checkpoint_validation_max_clean_identity_product_log_l1
     )
-    assert (
-        absolute["cross_long.jerk"]
-        == d.CROSS_JERK_ABSOLUTE_EPSILON
+    assert absolute["cross_long.clean_contact_max"] == pytest.approx(
+        cfg.checkpoint_validation_max_clean_identity_contact_l1
     )
 
 
-def test_v15_12c_pcgrad_keeps_endpoint_and_temporal_descent_products():
+def test_v15_12d_pcgrad_keeps_endpoint_and_temporal_descent_products():
     model = torch.nn.Linear(2, 1, bias=False)
     with torch.no_grad():
         model.weight.zero_()
