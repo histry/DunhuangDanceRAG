@@ -94,6 +94,12 @@ def test_fit_contract_counts_examples_not_just_iterations():
 
     assert contract["probe_start_guard_frames"] == 6
     assert contract["probe_used_for_updates"] is False
+    assert contract["group_guard_scope"] == "fixed_complete_seen_train_anchor"
+    assert (
+        contract["group_guard_reference"]
+        == "componentwise_best_so_far_on_fixed_anchor"
+    )
+    assert contract["group_guard_rolling_tolerance_accumulation"] is False
 
     source = inspect.getsource(d.run)
     compact = "".join(source.split())
@@ -119,10 +125,24 @@ def test_fit_contract_counts_examples_not_just_iterations():
         in compact
     )
 
-    # Armijo closure still uses the SAME local batch object.
+    # Armijo uses the SAME rotating C5 batch for scalar descent while the
+    # subgroup guard is evaluated on one immutable seen TRAIN anchor.
+    closure_source = "".join(
+        inspect.getsource(d._fixed_anchor_guarded_loss).split()
+    )
     assert (
-        "model,batch,cfg,require_all_groups=True"
+        "lambda:_fixed_anchor_guarded_loss("
+        "model,batch,fixed_guard_batch,cfg"
         in compact
+    )
+    assert (
+        "m._refiner_total_batch_loss(model,train_batch,cfg)"
+        in closure_source
+    )
+    assert (
+        "m._refiner_guarded_total_batch_loss("
+        "model,guard_batch,cfg,require_all_groups=True"
+        in closure_source
     )
 
     assert (

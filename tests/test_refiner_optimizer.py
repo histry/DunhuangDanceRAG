@@ -239,10 +239,14 @@ def test_zero_gradient_does_not_apply_weight_decay(device):
 def test_diagnostic_and_formal_training_share_checked_update():
     from training import motion_models as m
     from training import refiner_bridge_diagnostics as d
-    for fn in (m.train_refiner,d.run):
-        source=inspect.getsource(fn)
-        assert 'checked_refiner_step(' in source
-        assert '_refiner_guarded_total_batch_loss(' in source
+    formal_source=inspect.getsource(m.train_refiner)
+    diagnostic_source=inspect.getsource(d.run)
+    fixed_guard_source=inspect.getsource(d._fixed_anchor_guarded_loss)
+    assert 'checked_refiner_step(' in formal_source
+    assert '_refiner_guarded_total_batch_loss(' in formal_source
+    assert 'checked_refiner_step(' in diagnostic_source
+    assert '_fixed_anchor_guarded_loss(' in diagnostic_source
+    assert '_refiner_guarded_total_batch_loss(' in fixed_guard_source
     assert REFINER_UPDATE_PROTOCOL == m.REFINER_UPDATE_PROTOCOL
 
 
@@ -354,7 +358,9 @@ def test_persistent_group_guard_rejects_cumulative_rolling_regression():
     opt=torch.optim.SGD([p],lr=.1)
     def objective():
         value=(p-1).square().sum()
-        return value, {'single_short': 1.005 + .045*p.sum()}
+        # The current point is inside the fixed 1% allowance, while the next
+        # full step crosses it. A rolling reference at 1.005 would accept it.
+        return value, {'single_short': 1.005 + .06*p.sum()}
     loss,groups=objective(); loss.backward()
     before=p.detach().clone()
     report=checked_refiner_step(
