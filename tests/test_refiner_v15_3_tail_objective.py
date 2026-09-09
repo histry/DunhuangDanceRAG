@@ -10,12 +10,12 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_3_1_contract():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_balanced_feasibility_slack_guard_observable_v14"
+        == "gate_aligned_temporal_group_rms_feasibility_slack_guard_observable_v15"
     )
 
     assert (
         m.REFINER_BATCH_AGGREGATION_PROTOCOL
-        == "temporal_balanced_feasibility_slack_guarded_smooth_cvar_v8"
+        == "temporal_group_rms_feasibility_slack_guarded_smooth_cvar_v9"
     )
 
     assert (
@@ -52,7 +52,7 @@ def test_v15_3_1_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_11"
+        == "refiner_observable_bridge_diagnostic_v15_12"
     )
 
     assert d.FIT_CONTEXT_COUNT == 5
@@ -324,6 +324,35 @@ def test_four_group_aggregation_is_symmetric():
         rtol=0,
         atol=1.0e-12,
     )
+
+
+def test_four_group_aggregation_emphasizes_larger_unresolved_risks():
+    values = torch.tensor(
+        [
+            0.001, 0.001, 0.001, 0.001,
+            0.004, 0.004, 0.004, 0.004,
+            0.010, 0.010, 0.010, 0.010,
+            0.020, 0.020, 0.020, 0.020,
+        ],
+        dtype=torch.float64,
+    )
+    groups = torch.arange(4).repeat_interleave(4)
+
+    risk, stats = m._refiner_group_balanced_scientific_tail(
+        values,
+        groups,
+    )
+    rows = torch.stack(
+        [
+            stats[label]["risk"]
+            for label in m.REFINER_SCIENTIFIC_GROUP_LABELS
+        ]
+    )
+    expected = torch.linalg.vector_norm(rows) / 2.0
+
+    torch.testing.assert_close(risk, expected, rtol=0, atol=1.0e-12)
+    assert risk > rows.mean()
+    assert risk < rows.max()
 
 
 def test_smooth_cvar_fails_closed():

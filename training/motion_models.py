@@ -123,7 +123,7 @@ REFINER_CONDITION_PATH_FEATURE_DIM = 4
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_temporal_balanced_feasibility_slack_guard_observable_v14"
+    "gate_aligned_temporal_group_rms_feasibility_slack_guard_observable_v15"
 )
 REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
     "identity_weights_after_v15_7_rejection_v2"
@@ -7308,7 +7308,7 @@ def _refiner_group_balanced_scientific_tail(
     scientific,
     group,
 ):
-    """Equal-group V15.3 mean/CVaR scientific aggregation.
+    """Symmetric group-tail aggregation with unresolved-group emphasis.
 
     No case is created or resampled here.  This function only reweights TRAIN
     cases that are already part of the fixed full-cycle diagnostic or formal
@@ -7368,11 +7368,20 @@ def _refiner_group_balanced_scientific_tail(
             "V15.3 aggregation found no valid refiner groups"
         )
 
-    # Every present role/width group receives equal weight.
-    balanced = torch.stack(
+    # V15.11 showed that a plain arithmetic mean keeps assigning one quarter
+    # of the objective to an already near-resolved group while the long and
+    # single-recording groups remain far from the unchanged exact gates.
+    # Root-mean-square is permutation invariant and equals the common value
+    # when all groups are equal, but gives a larger derivative to a larger
+    # unresolved risk.  It introduces no role label, threshold or tunable
+    # temperature.  A zero vector maps exactly to zero.
+    stacked_risks = torch.stack(
         group_risks,
         dim=0,
-    ).mean()
+    )
+    balanced = torch.linalg.vector_norm(
+        stacked_risks,
+    ) / math.sqrt(float(len(group_risks)))
 
     return balanced, stats
 
@@ -7985,8 +7994,9 @@ SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "temporal_balanced_feasibility_slack_guarded_smooth_cvar_v8"
+    "temporal_group_rms_feasibility_slack_guarded_smooth_cvar_v9"
 )
+REFINER_SCIENTIFIC_GROUP_AGGREGATION = "root_mean_square_v1"
 
 # One-variable V15.3 experimental contract.
 #
@@ -8729,6 +8739,9 @@ def train_refiner(args: argparse.Namespace) -> int:
                 REFINER_BATCH_AGGREGATION_PROTOCOL,
             "temporal_scientific_weight": float(
                 REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+            ),
+            "scientific_group_aggregation": (
+                REFINER_SCIENTIFIC_GROUP_AGGREGATION
             ),
             "component_guard_deadband": float(
                 REFINER_COMPONENT_GUARD_DEADBAND

@@ -325,5 +325,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_balanced_feasibility_slack_guard_observable_v14"
+        == "gate_aligned_temporal_group_rms_feasibility_slack_guard_observable_v15"
     )
