@@ -3,6 +3,7 @@ import inspect
 import pytest
 import torch
 
+from training import motion_models as m
 from training import refiner_bridge_diagnostics as d
 
 
