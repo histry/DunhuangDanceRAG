@@ -123,7 +123,7 @@ REFINER_CONDITION_PATH_FEATURE_DIM = 4
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_temporal_balanced_slack_guard_observable_v13"
+    "gate_aligned_temporal_balanced_feasibility_slack_guard_observable_v14"
 )
 REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
     "identity_weights_after_v15_7_rejection_v2"
@@ -131,6 +131,7 @@ REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
 REFINER_CONFIDENCE_PRECONDITION_MAX = 5.0
 REFINER_TEMPORAL_SCIENTIFIC_WEIGHT = 3.0
 REFINER_COMPONENT_GUARD_DEADBAND = 1.0e-3
+REFINER_FEASIBILITY_GUARD_DEADBAND = 2.0e-3
 
 
 def now_tag() -> str:
@@ -7730,9 +7731,12 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
     V15.9 then showed that an already near-zero component could force fourfold
     backtracking for changes below the smooth-CVaR resolution, freezing larger
     deficits in other groups. Guard endpoint and temporal excess above the
-    fixed training-resolution deadband. Crossing that deadband or regressing
-    any unresolved component still fails closed. The exact per-case 0.03
-    acceptance gate is evaluated separately and remains unchanged.
+    fixed training-resolution deadband. V15.10 exposed the same duplicate
+    obstruction in their joint feasibility sum, so that sum uses the exact
+    sum of the two component deadbands. Crossing either component deadband,
+    crossing their joint deadband, or regressing any unresolved component
+    still fails closed. The exact per-case 0.03 acceptance gate is evaluated
+    separately and remains unchanged.
     """
     values = {}
     missing = []
@@ -7778,9 +7782,13 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
         if total_present:
             values[label] = terms[total_key]
 
-            values[
-                f"{label}.feasibility"
-            ] = terms[feasibility_key]
+            feasibility_deadband = terms[feasibility_key].new_tensor(
+                REFINER_FEASIBILITY_GUARD_DEADBAND
+            )
+
+            values[f"{label}.feasibility"] = torch.relu(
+                terms[feasibility_key] - feasibility_deadband
+            )
 
             deadband = terms[endpoint_key].new_tensor(
                 REFINER_COMPONENT_GUARD_DEADBAND
@@ -7977,7 +7985,7 @@ SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "temporal_balanced_slack_guarded_smooth_cvar_v7"
+    "temporal_balanced_feasibility_slack_guarded_smooth_cvar_v8"
 )
 
 # One-variable V15.3 experimental contract.
@@ -8724,6 +8732,9 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
             "component_guard_deadband": float(
                 REFINER_COMPONENT_GUARD_DEADBAND
+            ),
+            "feasibility_guard_deadband": float(
+                REFINER_FEASIBILITY_GUARD_DEADBAND
             ),
             "clean_identity_weight": float(
                 cfg.product_refiner_clean_identity_weight

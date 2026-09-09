@@ -10,12 +10,12 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_3_1_contract():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_balanced_slack_guard_observable_v13"
+        == "gate_aligned_temporal_balanced_feasibility_slack_guard_observable_v14"
     )
 
     assert (
         m.REFINER_BATCH_AGGREGATION_PROTOCOL
-        == "temporal_balanced_slack_guarded_smooth_cvar_v7"
+        == "temporal_balanced_feasibility_slack_guarded_smooth_cvar_v8"
     )
 
     assert (
@@ -52,7 +52,7 @@ def test_v15_3_1_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_10"
+        == "refiner_observable_bridge_diagnostic_v15_11"
     )
 
     assert d.FIT_CONTEXT_COUNT == 5

@@ -26,7 +26,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_10"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_11"
 FIT_PROTOCOL = "safe_start_context_reservoir_transaction_v2"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
@@ -71,6 +71,9 @@ def fingerprint(args, cfg):
     )
     value["component_guard_deadband"] = float(
         m.REFINER_COMPONENT_GUARD_DEADBAND
+    )
+    value["feasibility_guard_deadband"] = float(
+        m.REFINER_FEASIBILITY_GUARD_DEADBAND
     )
     value["refiner_tangent_gradient_protocol"] = m.REFINER_TANGENT_GRADIENT_PROTOCOL
     value["refiner_update_protocol"] = m.REFINER_UPDATE_PROTOCOL
