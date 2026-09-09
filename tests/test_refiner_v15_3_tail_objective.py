@@ -10,17 +10,17 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_3_1_contract():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_component_tail_observable_v10"
+        == "gate_aligned_component_tail_observable_v11"
     )
 
     assert (
         m.REFINER_BATCH_AGGREGATION_PROTOCOL
-        == "confidence_preconditioned_endpoint_temporal_smooth_cvar_v4"
+        == "equal_weight_endpoint_temporal_smooth_cvar_v5"
     )
 
     assert (
         m.REFINER_CONFIDENCE_PRECONDITION_PROTOCOL
-        == "detached_inverse_applied_confidence_normalized_v1"
+        == "identity_weights_after_v15_7_rejection_v2"
     )
 
     assert m.REFINER_CONFIDENCE_PRECONDITION_MAX == 5.0
@@ -52,7 +52,7 @@ def test_v15_3_1_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_7"
+        == "refiner_observable_bridge_diagnostic_v15_8"
     )
 
     assert d.FIT_CONTEXT_COUNT == 5
@@ -109,6 +109,26 @@ def test_v15_7_confidence_preconditioner_fails_closed_without_active_seam():
             "root": root,
             "joint": joint,
         })
+
+
+def test_v15_8_component_diagnostics_follow_actual_training_objective():
+    model = torch.nn.Linear(1, 1, bias=False)
+    value = model.weight.sum()
+    cfg = m.MotionGenerationConfig()
+    cfg.product_refiner_repair_margin_weight = 1.0
+    terms = {
+        "endpoint_training_objective": 3 * value,
+        "temporal_training_objective": 5 * value,
+        "endpoint_scientific_deficit": value,
+        "temporal_scientific_deficit": 2 * value,
+        "support_excess": 0 * value,
+        "jerk": 0 * value,
+    }
+    result = m._refiner_component_gradients(model, terms, cfg)
+    assert result["norms"]["endpoint"] == pytest.approx(3.0)
+    assert result["norms"]["temporal"] == pytest.approx(5.0)
+    assert result["endpoint_objective_source"] == "batch_tail_objective"
+    assert result["temporal_objective_source"] == "batch_tail_objective"
 
 
 def test_equal_deficits_are_value_preserving():

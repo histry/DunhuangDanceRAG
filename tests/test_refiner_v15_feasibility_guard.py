@@ -300,5 +300,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_component_tail_observable_v10"
+        == "gate_aligned_component_tail_observable_v11"
     )

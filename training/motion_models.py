@@ -110,17 +110,17 @@ from training.refiner_optimizer import checked_refiner_step, record_update, REFI
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
 REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v12"
-REFINER_INPUT_PROTOCOL = "local_frame_norm_horizontal_velocity_fk_dynamics_support_v3"
+REFINER_INPUT_PROTOCOL = "local_frame_norm_world_fk_dynamics_support_v4"
 REFINER_TANGENT_GRADIENT_PROTOCOL = "soft_confidence_true_chain_rule_v2"
-REFINER_FK_DYNAMICS_PROTOCOL = "observable_root_relative_fk_velocity_acceleration_jerk_duration_support_v2"
+REFINER_FK_DYNAMICS_PROTOCOL = "observable_world_fk_float64_derivatives_duration_support_v3"
 REFINER_FK_DYNAMICS_FEATURE_DIM = NUM_JOINTS * 3 * 3 + 1
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_component_tail_observable_v10"
+    "gate_aligned_component_tail_observable_v11"
 )
 REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
-    "detached_inverse_applied_confidence_normalized_v1"
+    "identity_weights_after_v15_7_rejection_v2"
 )
 REFINER_CONFIDENCE_PRECONDITION_MAX = 5.0
 
@@ -2813,24 +2813,31 @@ def _refiner_fk_dynamics_features(x, seam_mask, fps):
         seam_mask = seam_mask.unsqueeze(-1)
     if seam_mask.ndim != 3 or seam_mask.shape[:2] != x.shape[:2]:
         raise ValueError("Refiner FK features require an event-aligned seam mask")
-    # Horizontal root velocity is already an explicit, translation-invariant
-    # motion feature. Remove absolute X/Z before FK so high-order differences
-    # cannot amplify float32 cancellation after a routed clip is translated far
-    # from the origin. The resulting body-relative FK dynamics plus the existing
-    # root displacement channels still cover the complete observable motion.
-    kinematic = x.clone()
-    kinematic[..., ROOT_X_IDX] = 0.0
-    kinematic[..., ROOT_Z_IDX] = 0.0
+    # FK and differencing use float64, just like the observable audit. Remove
+    # translation only for body FK, then add ALL root derivatives back. V15.7
+    # omitted horizontal root dynamics entirely from these channels.
+    kinematic = x.to(torch.float64).clone()
+    root = kinematic[..., 4:7].clone()
+    kinematic[..., 4:7] = 0.0
     joints = fk_24_torch(kinematic)
     velocity = torch.zeros_like(joints)
     acceleration = torch.zeros_like(joints)
     jerk = torch.zeros_like(joints)
     if joints.shape[1] > 1:
-        velocity[:, 1:] = torch.diff(joints, dim=1) * float(fps)
+        velocity[:, 1:] = (
+            torch.diff(joints, dim=1)
+            + torch.diff(root, dim=1).unsqueeze(-2)
+        ) * float(fps)
     if joints.shape[1] > 2:
-        acceleration[:, 2:] = torch.diff(joints, n=2, dim=1) * float(fps) ** 2
+        acceleration[:, 2:] = (
+            torch.diff(joints, n=2, dim=1)
+            + torch.diff(root, n=2, dim=1).unsqueeze(-2)
+        ) * float(fps) ** 2
     if joints.shape[1] > 3:
-        jerk[:, 3:] = torch.diff(joints, n=3, dim=1) * float(fps) ** 3
+        jerk[:, 3:] = (
+            torch.diff(joints, n=3, dim=1)
+            + torch.diff(root, n=3, dim=1).unsqueeze(-2)
+        ) * float(fps) ** 3
     core = seam_mask.amax(dim=-1) >= 0.5
     declared_support = seam_mask.amax(dim=-1) > 0.0
     third_difference_support = F.max_pool1d(
@@ -2854,7 +2861,7 @@ def _refiner_fk_dynamics_features(x, seam_mask, fps):
     )
     if features.shape[-1] != REFINER_FK_DYNAMICS_FEATURE_DIM:
         raise RuntimeError("Refiner FK dynamics feature layout mismatch")
-    return torch.where(active, features, torch.zeros_like(features))
+    return torch.where(active, features, torch.zeros_like(features)).to(x.dtype)
 
 
 class ProductManifoldTemporalRefiner(nn.Module):
@@ -4532,7 +4539,9 @@ def _refiner_component_gradients(model, terms, cfg):
     # ``terms.get(key, terms[legacy_key])`` evaluates the legacy lookup
     # eagerly and breaks diagnostic/test callers that provide only one
     # representation of the component.
-    if "endpoint_scientific_deficit" in terms:
+    if "endpoint_training_objective" in terms:
+        endpoint = terms["endpoint_training_objective"]
+    elif "endpoint_scientific_deficit" in terms:
         endpoint = terms["endpoint_scientific_deficit"]
     elif "endpoint_continuity" in terms:
         endpoint = terms["endpoint_continuity"]
@@ -4541,7 +4550,9 @@ def _refiner_component_gradients(model, terms, cfg):
             "missing endpoint scientific/legacy diagnostic objective"
         )
 
-    if "temporal_scientific_deficit" in terms:
+    if "temporal_training_objective" in terms:
+        temporal = terms["temporal_training_objective"]
+    elif "temporal_scientific_deficit" in terms:
         temporal = terms["temporal_scientific_deficit"]
     elif "temporal_supervision_raw" in terms:
         temporal = terms["temporal_supervision_raw"]
@@ -4659,6 +4670,14 @@ def _refiner_component_gradients(model, terms, cfg):
     return {
         "schema":
             "refiner_scientific_objective_gradient_v4",
+        "endpoint_objective_source": (
+            "batch_tail_objective" if "endpoint_training_objective" in terms
+            else "legacy_raw_component"
+        ),
+        "temporal_objective_source": (
+            "batch_tail_objective" if "temporal_training_objective" in terms
+            else "legacy_raw_component"
+        ),
         "norms": norms,
         "pairs": pairs,
         "before_clipping": True,
@@ -7292,7 +7311,7 @@ def _refiner_group_balanced_scientific_tail(
 
 
 def _refiner_observable_confidence_preconditioner(batch):
-    """Balance learning speed without changing the true decoder derivative.
+    """Legacy V15.7 helper, retained for reproducing its rejected experiment.
 
     The decoder intentionally multiplies raw geometry by soft root/joint risk
     confidence.  That makes low-confidence single-recording cases learn four
@@ -7419,11 +7438,10 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         - scientific_weight * scientific
     )
 
-    confidence_weight = (
-        _refiner_observable_confidence_preconditioner(batch)
-        if "group" in batch
-        else torch.ones_like(scientific)
-    )
+    # V15.7 reweighting reduced cross-event temporal repair without resolving
+    # single-recording failures. Restore equal case weights, keeping raw
+    # endpoint/temporal components separate through tail aggregation.
+    confidence_weight = torch.ones_like(scientific)
     endpoint_scientific_weighted = (
         endpoint_scientific * confidence_weight
     )
@@ -7435,6 +7453,7 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         + temporal_scientific_weighted
     )
     terms["scientific_confidence_weight"] = confidence_weight.mean()
+    terms["scientific_confidence_preconditioning_active"] = scientific.new_zeros(())
     terms["scientific_confidence_weight_min"] = confidence_weight.min()
     terms["scientific_confidence_weight_max"] = confidence_weight.max()
     terms["scientific_preconditioned_batch_mean"] = (
@@ -7457,6 +7476,8 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
             batch["group"],
         )
         scientific_tail = endpoint_tail + temporal_tail
+        terms["endpoint_training_objective"] = endpoint_tail
+        terms["temporal_training_objective"] = temporal_tail
         tail_stats = {}
 
         if endpoint_tail_stats.keys() != temporal_tail_stats.keys():
@@ -7527,6 +7548,8 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
         # contract. Formal Refiner training and bridge diagnostic both
         # provide batch["group"].
         repair = per_case.mean()
+        terms["endpoint_training_objective"] = endpoint_scientific.mean()
+        terms["temporal_training_objective"] = temporal_scientific.mean()
 
         terms[
             "scientific_batch_mean"
@@ -7819,14 +7842,13 @@ def _feasible_minimum_edit_penalty(
 SCIENTIFIC_BOTTLENECK_SMOOTH_EPS = 1.0e-3
 
 # ------------------------------------------------------------------
-# Tail-aware NETWORK batch aggregation. V15.7 first balances the true scalar
-# scientific objective across soft-confidence levels, then applies the same
-# risk operator independently to endpoint and temporal deficits. One
+# Tail-aware NETWORK batch aggregation. V15.8 restores equal case weighting
+# and applies the risk operator independently to endpoint and temporal. One
 # component's hard cases cannot disappear behind the other component.
 # ------------------------------------------------------------------
 
 REFINER_BATCH_AGGREGATION_PROTOCOL = (
-    "confidence_preconditioned_endpoint_temporal_smooth_cvar_v4"
+    "equal_weight_endpoint_temporal_smooth_cvar_v5"
 )
 
 # One-variable V15.3 experimental contract.

@@ -11,7 +11,9 @@ def sample(device):
     x = torch.zeros((2, frames, 151), device=device)
     x[..., 7:] = torch.as_tensor(np.tile(m.identity6d_np(), 24), device=device)
     x[..., 5] = .95
-    x[..., 4] = torch.linspace(0, .3, frames, device=device)
+    # Exact binary coordinates isolate translation invariance from float32
+    # input quantization, which no downstream float64 derivative can undo.
+    x[..., 4] = torch.arange(frames, device=device) / 256.0
     seam = torch.zeros((2, frames, 1), device=device)
     seam[:, 40:76] = .3
     seam[:, 44:72] = 1
@@ -87,6 +89,33 @@ def test_fk_dynamics_explicitly_cover_third_difference_support_without_config_ha
     assert torch.count_nonzero(features[:, 75:]) == 0
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_world_fk_features_include_root_motion_and_match_audit_derivatives(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    x, _, seam, _ = sample(device)
+    x[:, 50:56, 4] += 0.125
+    x[:, 53:59, 6] -= 0.0625
+    features = m._refiner_fk_dynamics_features(x, seam, 30.0)
+    audited = m._observable_boundary_joints_torch(x)
+    block = m.NUM_JOINTS * 3
+    for order, scale in ((1, 1.0), (2, 10.0), (3, 1000.0)):
+        expected = torch.diff(audited, n=order, dim=1) * 30.0**order / scale
+        actual = features[:, 44:72, (order - 1)*block:order*block]
+        torch.testing.assert_close(
+            actual,
+            expected[:, 44-order:72-order].flatten(2).to(x.dtype),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+    stationary = x.clone()
+    stationary[..., 4] = 0
+    stationary[..., 6] = 0
+    stationary_features = m._refiner_fk_dynamics_features(stationary, seam, 30.0)
+    assert not torch.equal(features[..., 2*block:3*block],
+                           stationary_features[..., 2*block:3*block])
+
+
 def test_temporal_objective_waits_for_observable_endpoint_feasibility():
     before = torch.tensor([1.0, 1.0, 0.0])
     proposed = torch.tensor([1.0, 0.985, 0.0], requires_grad=True)
@@ -138,7 +167,7 @@ def test_input_protocol_is_checked_not_just_stored():
     cfg = m.MotionGenerationConfig()
     contract = m.motion_checkpoint_contract(cfg, 'boundary_refiner')
     assert contract['refiner_input_protocol'] == m.REFINER_INPUT_PROTOCOL
-    assert m.REFINER_INPUT_PROTOCOL.endswith('fk_dynamics_support_v3')
+    assert m.REFINER_INPUT_PROTOCOL.endswith('world_fk_dynamics_support_v4')
     model = m.ProductManifoldTemporalRefiner(hidden=16)
     assert model.in_proj.in_channels == (
         m.EDGE_DIM + 32 + 1 + m.NUM_JOINTS
