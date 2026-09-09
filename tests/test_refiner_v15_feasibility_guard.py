@@ -261,7 +261,7 @@ def _group_terms():
     return terms
 
 
-def test_v15_9_guard_has_sixteen_keys():
+def test_v15_10_guard_has_sixteen_keys_and_component_deadband():
     guards = m._refiner_group_repair_losses(
         _group_terms(),
         require_all=True,
@@ -279,6 +279,25 @@ def test_v15_9_guard_has_sixteen_keys():
 
     assert set(guards) == expected
     assert len(guards) == 16
+
+    assert m.REFINER_COMPONENT_GUARD_DEADBAND == 1.0e-3
+    assert float(guards["single_short.endpoint"]) == pytest.approx(1.199)
+    assert float(guards["single_short.temporal"]) == pytest.approx(1.299)
+
+
+def test_v15_10_component_guard_ignores_only_subresolution_slack():
+    terms = _group_terms()
+    terms["group_single_short_endpoint_scientific_tail_risk"] = torch.tensor(
+        3.65e-4
+    )
+    terms["group_single_short_temporal_scientific_tail_risk"] = torch.tensor(
+        1.2e-3
+    )
+
+    guards = m._refiner_group_repair_losses(terms, require_all=True)
+
+    assert float(guards["single_short.endpoint"]) == 0.0
+    assert float(guards["single_short.temporal"]) == pytest.approx(2.0e-4)
 
 
 def test_v15_guard_fails_closed_on_partial_group():
@@ -300,5 +319,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_balanced_component_tail_observable_v12"
+        == "gate_aligned_temporal_balanced_slack_guard_observable_v13"
     )
