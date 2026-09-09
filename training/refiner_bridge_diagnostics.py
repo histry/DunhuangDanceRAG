@@ -26,8 +26,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_12"
-FIT_PROTOCOL = "safe_start_context_reservoir_transaction_v2"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_12b"
+FIT_PROTOCOL = "fixed_anchor_best_so_far_context_reservoir_transaction_v3"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
     "all_probe_safe_farthest_order_rotating_c5_v1"
@@ -447,6 +447,15 @@ def fit_bank_contract(
 
         "line_search_scope":
             "same_complete_seen_plus_rotating_c5_transaction",
+
+        "group_guard_scope":
+            "fixed_complete_seen_train_anchor",
+
+        "group_guard_reference":
+            "componentwise_best_so_far_on_fixed_anchor",
+
+        "group_guard_rolling_tolerance_accumulation":
+            False,
 
         "seen_anchor_cases_per_update":
             4 * windows,
@@ -1036,7 +1045,7 @@ def build_banks(
     return banks, recipes
 
 
-def evaluate(model, banks, split, cfg, *, predictions=None):
+def evaluate(model, banks, split, cfg, *, predictions=None, progress=True):
     physical = m._new_validation_physical_accumulator()
     errors, details, cross = [], [], []
     for role in ("single_recording", "cross_event"):
@@ -1070,8 +1079,9 @@ def evaluate(model, banks, split, cfg, *, predictions=None):
                         safety = {**safety,"accepted":False,"reasons":[*safety.get("reasons",[]),"cross_reference_geometry_budget_exceeded"]}
                     cross.append({"case_index":start+case,"decoder":decoder_rows[case],
                                   "width":int(np.sum(seam >= .5)),"observable": gate, "safety": safety, "hidden_clean_used": False})
-            print(json.dumps({"stage": "bridge_probe", "split": split, "role": role,
-                              "completed": min(start + 8, len(bank["clean"])), "total": len(bank["clean"])}), flush=True)
+            if progress:
+                print(json.dumps({"stage": "bridge_probe", "split": split, "role": role,
+                                  "completed": min(start + 8, len(bank["clean"])), "total": len(bank["clean"])}), flush=True)
     gates = [row["observable"] for row in cross]
     return {"physical_quality": m._summarize_validation_physical_metrics(physical),
             "reconstruction_product_log_l1": float(np.mean(errors)), "windows": details,
@@ -1111,6 +1121,123 @@ def failure_breakdown(metrics):
     return groups
 
 
+def _fixed_group_guard_metrics(model, batch, cfg):
+    """Measure guard components on one immutable TRAIN anchor bank."""
+    with m.torch.no_grad():
+        _, values = m._refiner_guarded_total_batch_loss(
+            model,
+            batch,
+            cfg,
+            require_all_groups=True,
+        )
+    return {
+        key: float(value.detach())
+        for key, value in values.items()
+    }
+
+
+def _fixed_anchor_guarded_loss(model, train_batch, guard_batch, cfg):
+    """Use the rotating C5 batch for Armijo and the fixed bank for guards."""
+    train_loss = m._refiner_total_batch_loss(model, train_batch, cfg)
+    _, fixed_groups = m._refiner_guarded_total_batch_loss(
+        model,
+        guard_batch,
+        cfg,
+        require_all_groups=True,
+    )
+    return train_loss, fixed_groups
+
+
+def evaluate_fit_contexts(model, banks, cfg):
+    """Evaluate every fitted temporal cut independently from held-out probes."""
+    from training.bridge_feasibility import group_decisions
+
+    contexts = {}
+    passed = 0
+    group_pass_counts = Counter()
+    indices = _fit_context_indices(banks)
+
+    for index in indices:
+        split = f"fit_context_{index}"
+        metrics = evaluate(
+            model,
+            banks,
+            split,
+            cfg,
+            progress=False,
+        )
+        decision = m._checkpoint_validation_decision(
+            metrics,
+            cfg,
+            stage="refiner",
+        )
+        groups = group_decisions(metrics, cfg)
+        context_passed = bool(
+            decision["scientific_acceptance"]
+            and all(row["passed"] for row in groups.values())
+        )
+        passed += int(context_passed)
+        for label, row in groups.items():
+            group_pass_counts[label] += int(row["passed"])
+        contexts[split] = {
+            "passed": context_passed,
+            "reasons": list(decision["reasons"]),
+            "observed": dict(decision["observed"]),
+            "group_decisions": groups,
+            "failure_breakdown": failure_breakdown(metrics),
+            "used_for_optimizer_updates": True,
+            "held_out_probe": False,
+        }
+        completed = len(contexts)
+        if completed % 8 == 0 or completed == len(indices):
+            print(json.dumps({
+                "stage": "bridge_fit_context_probe",
+                "completed": completed,
+                "total": len(indices),
+                "contexts_passed": passed,
+            }), flush=True)
+
+    total = len(indices)
+    return {
+        "schema": "refiner_fit_context_independent_evaluation_v1",
+        "contexts_evaluated": total,
+        "context_indices": list(indices),
+        "contexts_passed": passed,
+        "contexts_failed": total - passed,
+        "pass_rate": float(passed / total) if total else 0.0,
+        "all_contexts_passed": bool(total and passed == total),
+        "group_pass_counts": dict(sorted(group_pass_counts.items())),
+        "probe_cases_used": False,
+        "contexts": contexts,
+    }
+
+
+def learning_scope_diagnosis(fit_contexts, probe_decisions, probe_groups):
+    """Separate inability to fit TRAIN cuts from held-out-cut failure."""
+    fit_passed = bool(fit_contexts["all_contexts_passed"])
+    probe_passed = bool(
+        all(row["scientific_acceptance"] for row in probe_decisions.values())
+        and all(
+            group["passed"]
+            for groups in probe_groups.values()
+            for group in groups.values()
+        )
+    )
+    if fit_passed and probe_passed:
+        classification = "fit_context_and_probe_passed"
+    elif fit_passed:
+        classification = "fit_context_passed_probe_generalization_failed"
+    else:
+        classification = "fit_context_learning_failed"
+    return {
+        "schema": "refiner_learning_scope_diagnosis_v1",
+        "classification": classification,
+        "fit_context_passed": fit_passed,
+        "held_out_probe_passed": probe_passed,
+        "new_position_used_for_optimizer_updates": False,
+    }
+
+
 def run(args):
     cfg = m.MotionGenerationConfig.from_json(args.config).apply_env()
     if args.check_report:
@@ -1127,6 +1254,27 @@ def run(args):
         validate_update_summary(report.get("optimizer_updates", {}), 400)
         if report.get("fit_bank") != fit_bank_contract(args.windows, cfg):
             raise RuntimeError("diagnostic did not use the complete predefined TRAIN context cycle")
+        guard = report.get("group_guard_contract", {})
+        if (
+            guard.get("schema")
+            != "refiner_fixed_anchor_best_so_far_guard_v1"
+            or guard.get("bank") != "complete_seen_train_anchor"
+            or guard.get("fixed_across_all_steps") is not True
+            or guard.get("rolling_pre_step_reference_forbidden") is not True
+        ):
+            raise RuntimeError(
+                "diagnostic did not use the fixed-anchor best-so-far guard"
+            )
+        fit_contexts = report.get("fit_context_evaluation", {})
+        if (
+            fit_contexts.get("schema")
+            != "refiner_fit_context_independent_evaluation_v1"
+            or fit_contexts.get("probe_cases_used") is not False
+            or fit_contexts.get("all_contexts_passed") is not True
+        ):
+            raise RuntimeError(
+                "independent fit-context evaluation failed; do not train"
+            )
         from training.bridge_feasibility import check_foundation_report, group_decisions
         check_foundation_report(report["foundation_report"],fingerprint(args,cfg),cfg)
         for role in ("seen", "new_position"):
@@ -1196,6 +1344,14 @@ def run(args):
         )
     model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
     optimizer = m.torch.optim.AdamW(model.parameters(),lr=cfg.lr,weight_decay=1e-4)
+    fixed_guard_batch = fixed_fit_bank(banks, "seen")
+    fixed_guard_anchor = _fixed_group_guard_metrics(
+        model,
+        fixed_guard_batch,
+        cfg,
+    )
+    fixed_guard_current = dict(fixed_guard_anchor)
+    fixed_guard_best = dict(fixed_guard_anchor)
     destination.mkdir(parents=True)
     report = {"schema":SCHEMA,"protocol":m.BOUNDARY_PROTOCOL,"fingerprint":fingerprint(args,cfg),
               "completed":False,"published":False,"independent_validation":False,
@@ -1205,7 +1361,22 @@ def run(args):
               "fit_bank":fit_bank_contract(args.windows, cfg),
               "source_separation":separation,"recipes":recipes,"target_steps":args.steps,
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
-              "baseline":{},"history":[]}
+              "baseline":{},"history":[],
+              "group_guard_contract": {
+                  "schema": "refiner_fixed_anchor_best_so_far_guard_v1",
+                  "bank": "complete_seen_train_anchor",
+                  "fixed_across_all_steps": True,
+                  "rolling_pre_step_reference_forbidden": True,
+                  "relative_tolerance": float(
+                      cfg.product_refiner_group_guard_relative_tolerance
+                  ),
+                  "absolute_tolerance": float(
+                      cfg.product_refiner_group_guard_absolute_tolerance
+                  ),
+                  "initial_anchor": dict(fixed_guard_anchor),
+                  "best_so_far": dict(fixed_guard_best),
+                  "current": dict(fixed_guard_current),
+              }}
     report["fit_bank_artifact"] = save_fit_bank(
         destination,
         report,
@@ -1247,23 +1418,44 @@ def run(args):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         norm = float(m.torch.nn.utils.clip_grad_norm_(model.parameters(),1,error_if_nonfinite=True))
-        group_guard_before = m._refiner_group_repair_losses(
-            terms, require_all=True
-        )
+        group_guard_before = dict(fixed_guard_current)
+        group_guard_best_before = dict(fixed_guard_best)
         update = m.checked_refiner_step(
             optimizer,
             loss,
-            lambda: m._refiner_guarded_total_batch_loss(
-                model, batch, cfg, require_all_groups=True
+            lambda: _fixed_anchor_guarded_loss(
+                model,
+                batch,
+                fixed_guard_batch,
+                cfg,
             ),
             gradient_unscale=max(1.0, norm + 1.0e-6),
             group_guard_before=group_guard_before,
+            group_guard_reference=group_guard_best_before,
             group_guard_relative_tolerance=float(
                 cfg.product_refiner_group_guard_relative_tolerance
             ),
             group_guard_absolute_tolerance=float(
                 cfg.product_refiner_group_guard_absolute_tolerance
             ),
+        )
+        if update["optimizer_update_accepted"]:
+            fixed_guard_current = dict(update["group_guard_after"])
+            fixed_guard_best = {
+                key: min(
+                    fixed_guard_best[key],
+                    fixed_guard_current[key],
+                )
+                for key in fixed_guard_best
+            }
+        update["group_guard_anchor"] = dict(fixed_guard_anchor)
+        update["group_guard_best_before"] = group_guard_best_before
+        update["group_guard_best_after"] = dict(fixed_guard_best)
+        report["group_guard_contract"]["best_so_far"] = dict(
+            fixed_guard_best
+        )
+        report["group_guard_contract"]["current"] = dict(
+            fixed_guard_current
         )
         record_update(report["optimizer_updates"], update)
         with (destination / "optimizer_updates.jsonl").open("a",encoding="utf8") as handle:
@@ -1311,19 +1503,39 @@ def run(args):
             final = {split:evaluate(model,banks,split,cfg) for split in ("seen","new_position")}
             decisions = {split:m._checkpoint_validation_decision(metrics,cfg,stage="refiner") for split,metrics in final.items()}
             groups = {split:group_decisions(metrics,cfg) for split,metrics in final.items()}
+            fit_contexts = evaluate_fit_contexts(model, banks, cfg)
+            scope_diagnosis = learning_scope_diagnosis(
+                fit_contexts,
+                decisions,
+                groups,
+            )
             report.update(completed_steps=step,final=final,diagnostic_ready=(
                 step == 400 and args.steps == 400 and args.windows == 8
                 and all(d["scientific_acceptance"] for d in decisions.values())
-                and all(g["passed"] for split in groups.values() for g in split.values())))
+                and all(g["passed"] for split in groups.values() for g in split.values())
+                and fit_contexts["all_contexts_passed"]))
             report["group_decisions"] = groups
+            report["fit_context_evaluation"] = fit_contexts
+            report["learning_scope_diagnosis"] = scope_diagnosis
             breakdown = {split:failure_breakdown(metrics) for split,metrics in final.items()}
             report["failure_breakdown"] = breakdown
             # These decisions only judge train-window readiness, never publication.
-            report["history"].append({"step":step,"readiness":{s:{"passed":d["scientific_acceptance"],"reasons":d["reasons"],"observed":d["observed"]} for s,d in decisions.items()}})
+            fit_context_summary = {
+                key: value
+                for key, value in fit_contexts.items()
+                if key != "contexts"
+            }
+            report["history"].append({"step":step,
+                "readiness":{s:{"passed":d["scientific_acceptance"],"reasons":d["reasons"],"observed":d["observed"]} for s,d in decisions.items()},
+                "fit_context_readiness":fit_context_summary,
+                "learning_scope_diagnosis":scope_diagnosis})
             m.save_json(report,destination / "diagnostic_report.json")
             m.save_json({"schema":SCHEMA,"fingerprint":report["fingerprint"],
                          "completed_steps":step,"diagnostic_ready":report["diagnostic_ready"],
                          "group_decisions":groups,"failure_breakdown":breakdown,
+                         "fit_context_evaluation":fit_context_summary,
+                         "learning_scope_diagnosis":scope_diagnosis,
+                         "group_guard_contract":report["group_guard_contract"],
                          "optimizer_updates":report["optimizer_updates"],
                          "fit_bank":report["fit_bank"],
                          "fit_bank_artifact":report["fit_bank_artifact"],

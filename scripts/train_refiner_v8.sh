@@ -57,10 +57,10 @@ if [[ "$MODE" == foundation ]]; then
 fi
 if [[ "$MODE" == diagnose ]]; then
   echo "[DIAGNOSTIC] Up to 400 neural fitting steps, not an Internet/download check."
-  echo "[OPTIMIZER] One equal-weight 192-case TRAIN transaction with subgroup-total + joint-scientific-feasibility guard: 32 seen + 5x32 context; no probe fitting."
+  echo "[OPTIMIZER] RMS 192-case rotating C5 TRAIN objective with a persistent best-so-far guard on the fixed 32-case seen TRAIN anchor; no rolling tolerance accumulation."
   echo "[PROBE] New cuts also change local motion context; they are not a pure position-shift test."
   echo "[STOP] A full-cycle transaction stall saves reports and blocks all later stages."
-  echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json (also saved on gate rejection)."
+  echo "[REPORT] $FIT_DIR/summary.json and diagnostic_report.json include independent fit_context evaluation and fit-vs-probe diagnosis."
   echo "[REPLAY] Exact equal-weight full-cycle TRAIN input in fit_bank.pt; held-out probe remains updates_forbidden."
   "$PY" -u -m training.refiner_bridge_diagnostics "${FIT_ARGS[@]}" \
     --out_dir "$FIT_DIR" --windows 8 --steps 400 --eval_every 200 --foundation_report "$FOUNDATION" \

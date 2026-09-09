@@ -9,7 +9,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_optimizer_protocol():
     assert (
         REFINER_UPDATE_PROTOCOL
-        == "full_cycle_feasibility_guard_armijo_v7"
+        == "fixed_anchor_best_so_far_guard_armijo_v8"
     )
 
 
@@ -325,5 +325,5 @@ def test_v15_guard_fails_closed_on_partial_group():
 def test_v15_objective_protocol():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_group_rms_feasibility_slack_guard_observable_v15"
+        == "gate_aligned_temporal_group_rms_fixed_anchor_guard_observable_v15_12b"
     )

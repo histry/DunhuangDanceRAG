@@ -123,7 +123,7 @@ REFINER_CONDITION_PATH_FEATURE_DIM = 4
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_temporal_group_rms_feasibility_slack_guard_observable_v15"
+    "gate_aligned_temporal_group_rms_fixed_anchor_guard_observable_v15_12b"
 )
 REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
     "identity_weights_after_v15_7_rejection_v2"

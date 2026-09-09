@@ -347,3 +347,28 @@ def test_group_guard_accepts_non_regressing_subgroup():
     )
     assert report['optimizer_update_accepted']
     assert report['group_guard_after']['single_short']<=0.0
+
+
+def test_persistent_group_guard_rejects_cumulative_rolling_regression():
+    p=torch.nn.Parameter(torch.zeros(1,dtype=torch.float64))
+    opt=torch.optim.SGD([p],lr=.1)
+    def objective():
+        value=(p-1).square().sum()
+        return value, {'single_short': 1.005 + .045*p.sum()}
+    loss,groups=objective(); loss.backward()
+    before=p.detach().clone()
+    report=checked_refiner_step(
+        opt,loss,objective,
+        group_guard_before=groups,
+        group_guard_reference={'single_short':1.0},
+        group_guard_relative_tolerance=.01,
+        group_guard_absolute_tolerance=0.0,
+        max_trials=1,
+    )
+    assert not report['optimizer_update_accepted']
+    assert report['group_guard_reference_is_persistent']
+    violation=report['group_guard_last_violations']['single_short']
+    assert violation['before']==pytest.approx(1.005)
+    assert violation['reference']==pytest.approx(1.0)
+    assert violation['candidate']>violation['allowed']
+    torch.testing.assert_close(p,before,atol=0,rtol=0)

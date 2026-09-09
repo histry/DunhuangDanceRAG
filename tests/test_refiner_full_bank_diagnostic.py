@@ -155,6 +155,34 @@ def test_fixed_bank_stall_is_not_counted_as_400_steps_or_pilot_acceptance():
     assert 'fixed_bank_stalled' not in inspect.getsource(m.train_refiner)
 
 
+def test_learning_scope_diagnosis_separates_fit_failure_from_probe_failure():
+    failed_probe = {
+        "seen": {"scientific_acceptance": False},
+        "new_position": {"scientific_acceptance": False},
+    }
+    failed_groups = {
+        split: {"group": {"passed": False}}
+        for split in failed_probe
+    }
+    fit_failed = d.learning_scope_diagnosis(
+        {"all_contexts_passed": False},
+        failed_probe,
+        failed_groups,
+    )
+    assert fit_failed["classification"] == "fit_context_learning_failed"
+
+    probe_only = d.learning_scope_diagnosis(
+        {"all_contexts_passed": True},
+        failed_probe,
+        failed_groups,
+    )
+    assert (
+        probe_only["classification"]
+        == "fit_context_passed_probe_generalization_failed"
+    )
+    assert not probe_only["new_position_used_for_optimizer_updates"]
+
+
 def test_stalled_report_cannot_authorize_pilot(tmp_path,monkeypatch):
     import json
     from argparse import Namespace
@@ -667,6 +695,14 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
                 f"group_{label}_joint_scientific_deficit"
             ] = r
 
+            terms[
+                f"group_{label}_endpoint_scientific_tail_risk"
+            ] = r
+
+            terms[
+                f"group_{label}_temporal_scientific_tail_risk"
+            ] = r
+
         return (
             r,
             r * 0,
@@ -744,6 +780,13 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
                     if accepted
                     else 1.0
                 ),
+
+            "group_guard_after":
+                (
+                    dict(k["group_guard_before"])
+                    if accepted
+                    else None
+                ),
         }
 
     monkeypatch.setattr(
@@ -755,7 +798,7 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
     monkeypatch.setattr(
         d,
         "evaluate",
-        lambda *a: {},
+        lambda *a, **k: {},
     )
 
     monkeypatch.setattr(

@@ -15,7 +15,7 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "full_cycle_feasibility_guard_armijo_v7"
+REFINER_UPDATE_PROTOCOL = "fixed_anchor_best_so_far_guard_armijo_v8"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
 ARMIJO_FACTOR = 1.0e-4
 MIN_RELATIVE_DECREASE = 1.0e-8  # optimization progress, NOT a motion-quality gate
@@ -30,6 +30,7 @@ def checked_refiner_step(
     max_trials=MAX_BACKTRACK_TRIALS,
     gradient_unscale=1.0,
     group_guard_before=None,
+    group_guard_reference=None,
     group_guard_relative_tolerance=0.0,
     group_guard_absolute_tolerance=0.0,
 ):
@@ -38,8 +39,11 @@ def checked_refiner_step(
     With ``group_guard_before`` disabled this is the V11 same-batch optimizer.
     With the guard enabled, ``closure`` MUST return ``(loss, group_losses)``.
     A trial is accepted only when the scalar Armijo condition passes AND every
-    named subgroup/component guard stays within its pre-update
-    relative/absolute allowance.
+    named subgroup/component guard stays within its fixed reference
+    relative/absolute allowance. ``group_guard_before`` records the actual
+    fixed-bank metrics before this transaction. ``group_guard_reference`` may
+    hold a persistent anchor/best-so-far envelope; when omitted, the former
+    pre-update behavior is retained for callers without a fixed bank.
     Parameters and the complete optimizer state are restored on rejection.
     """
     if not 1 <= int(max_trials) <= MAX_BACKTRACK_TRIALS:
@@ -60,12 +64,27 @@ def checked_refiner_step(
 
     guard_enabled = group_guard_before is not None
     guard_before = {}
+    guard_reference = {}
     if guard_enabled:
         if not hasattr(group_guard_before, "items") or not group_guard_before:
             raise ValueError("group_guard_before must be a non-empty mapping")
         guard_before = {str(k): scalar(v) for k, v in group_guard_before.items()}
         if not all(math.isfinite(v) for v in guard_before.values()):
             raise FloatingPointError("nonfinite subgroup loss before optimizer update")
+        raw_reference = (
+            group_guard_before
+            if group_guard_reference is None
+            else group_guard_reference
+        )
+        if not hasattr(raw_reference, "items") or not raw_reference:
+            raise ValueError("group_guard_reference must be a non-empty mapping")
+        guard_reference = {
+            str(k): scalar(v) for k, v in raw_reference.items()
+        }
+        if set(guard_reference) != set(guard_before):
+            raise ValueError("group guard reference keys differ from current metrics")
+        if not all(math.isfinite(v) for v in guard_reference.values()):
+            raise FloatingPointError("nonfinite subgroup guard reference")
 
     before = float(loss.detach())
     if not math.isfinite(before):
@@ -109,6 +128,10 @@ def checked_refiner_step(
         "group_guard_relative_tolerance": float(group_guard_relative_tolerance),
         "group_guard_absolute_tolerance": float(group_guard_absolute_tolerance),
         "group_guard_before": guard_before,
+        "group_guard_reference": guard_reference,
+        "group_guard_reference_is_persistent": bool(
+            guard_enabled and group_guard_reference is not None
+        ),
         "group_guard_after": None,
         "group_guard_rejected_trials": 0,
         "group_guard_last_violations": {},
@@ -159,7 +182,7 @@ def checked_refiner_step(
         if not guard_enabled:
             return {}
         violations = {}
-        for key, baseline in guard_before.items():
+        for key, baseline in guard_reference.items():
             candidate = candidate_groups[key]
             allowance = max(
                 abs(baseline) * float(group_guard_relative_tolerance),
@@ -168,7 +191,8 @@ def checked_refiner_step(
             allowed = baseline + allowance
             if not math.isfinite(candidate) or candidate > allowed:
                 violations[key] = {
-                    "before": baseline,
+                    "before": guard_before[key],
+                    "reference": baseline,
                     "candidate": candidate if math.isfinite(candidate) else None,
                     "allowed": allowed,
                 }
