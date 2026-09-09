@@ -1476,8 +1476,10 @@ def _set_diagnostic_learning_rates(optimizer, cfg, step):
     }
 
 
-def _decoder_amplitude_summary(trace, seam):
+def _decoder_amplitude_summary(trace, seam=None):
     repair = trace.get("repair", {})
+    if not repair or seam is None:
+        return {}
     active = seam[..., 0] >= 0.5
     result = {}
     for name in ("raw", "after_mask", "after_taper", "applied"):
@@ -1868,7 +1870,7 @@ def run(args):
                    "component_gradients":components,"clip_norm_before":norm,
                    "pareto_gradient":pareto_gradient,
                    "decoder_output_amplitude":_decoder_amplitude_summary(
-                       amplitude_trace or {}, batch["seam"]
+                       amplitude_trace or {}, batch.get("seam")
                    ),
                    "output_warmup":warmup,
                    "optimizer_update":update,
