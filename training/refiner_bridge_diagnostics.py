@@ -26,7 +26,7 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_12f"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_13_film"
 FIT_PROTOCOL = "exact_guard_constrained_subgroup_mgda_transaction_v7"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
@@ -1868,8 +1868,11 @@ def _pareto_common_descent_backward(
 
 
 def _diagnostic_optimizer(model, cfg):
-    """Use a bounded output-head warmup without changing model architecture."""
+    """Warm the residual projection and optional FiLM modulation together."""
     output_parameters = list(getattr(model, "out", model).parameters())
+    film_generator = getattr(model, "film_generator", None)
+    if film_generator is not None:
+        output_parameters.extend(film_generator.parameters())
     output_ids = {id(parameter) for parameter in output_parameters}
     backbone = [
         parameter
@@ -1886,7 +1889,7 @@ def _diagnostic_optimizer(model, cfg):
     groups.append({
         "params": output_parameters,
         "lr": cfg.lr * OUTPUT_WARMUP_LR_MULTIPLIER,
-        "diagnostic_role": "output",
+        "diagnostic_role": "output_and_film",
     })
     return m.torch.optim.AdamW(groups, weight_decay=1.0e-4)
 
@@ -1897,7 +1900,7 @@ def _set_diagnostic_learning_rates(optimizer, cfg, step):
         role = group.get("diagnostic_role", "backbone")
         group["lr"] = float(cfg.lr) * (
             OUTPUT_WARMUP_LR_MULTIPLIER
-            if warmup and role == "output"
+            if warmup and role in {"output", "output_and_film"}
             else 1.0
         )
     return {
@@ -1952,6 +1955,41 @@ def _decoder_amplitude_by_group(trace, seam=None, group=None):
             {"repair": sliced},
             seam[selected],
         )
+    return result
+
+
+def _film_modulation_summary(trace, seam=None, group=None):
+    """Summarize continuous FiLM conditions without exposing case tensors."""
+    film = trace.get("film", {})
+    condition = film.get("condition")
+    gamma = film.get("gamma")
+    beta = film.get("beta")
+    if condition is None or gamma is None or beta is None or seam is None:
+        return {}
+    active = seam[..., 0] >= 0.5
+
+    def summarize(selected):
+        if not bool(selected.any()):
+            return {}
+        return {
+            "anchor_fk_gap_log1p_mean": float(
+                condition[..., 0][selected].double().mean()
+            ),
+            "root_yaw_gap_over_pi_mean": float(
+                condition[..., 1][selected].double().mean()
+            ),
+            "gamma_mean": float(gamma[selected].double().mean()),
+            "gamma_rms": float(gamma[selected].double().square().mean().sqrt()),
+            "beta_rms": float(beta[selected].double().square().mean().sqrt()),
+        }
+
+    result = {"aggregate": summarize(active)}
+    if group is not None:
+        result["by_group"] = {}
+        for index, label in enumerate(m.REFINER_GROUP_LABELS):
+            selected = active & (group[:, None] == index)
+            if bool(selected.any()):
+                result["by_group"][label] = summarize(selected)
     return result
 
 
@@ -2149,7 +2187,10 @@ def run(args):
             "400-step scientific diagnostic cannot cover one "
             "complete safe-start reservoir cycle"
         )
-    model = m.ProductManifoldTemporalRefiner(fps=cfg.fps).to(device)
+    model = m.ProductManifoldTemporalRefiner(
+        fps=cfg.fps,
+        film_conditioning=bool(cfg.product_refiner_film_conditioning),
+    ).to(device)
     optimizer = _diagnostic_optimizer(model, cfg)
     fixed_guard_batch = fixed_fit_bank(banks, "seen")
     fixed_guard_anchor = _fixed_group_guard_metrics(
@@ -2175,6 +2216,25 @@ def run(args):
               "probe_scope":PROBE_SCOPE,
               "formal_training_must_start_fresh":True,"selection":"fixed_final_step",
               "foundation_report":str(Path(args.foundation_report).resolve()),
+              "conditional_modulation": {
+                  "enabled": bool(cfg.product_refiner_film_conditioning),
+                  "protocol": (
+                      m.REFINER_FILM_PROTOCOL
+                      if cfg.product_refiner_film_conditioning
+                      else "disabled"
+                  ),
+                  "condition_dim": (
+                      m.REFINER_FILM_CONDITION_DIM
+                      if cfg.product_refiner_film_conditioning
+                      else 0
+                  ),
+                  "conditions": [
+                      "observable_anchor_fk_gap",
+                      "observable_wrapped_root_yaw_gap",
+                  ],
+                  "role_label_consumed": False,
+                  "hidden_clean_consumed": False,
+              },
               "fit_bank":fit_bank_contract(args.windows, cfg),
               "source_separation":separation,"recipes":recipes,"target_steps":args.steps,
               "candidate_audit_artifact": str(
@@ -2433,10 +2493,14 @@ def run(args):
             amplitude_by_group = _decoder_amplitude_by_group(
                 amplitude_trace or {}, batch.get("seam"), batch.get("group")
             )
+            film_modulation = _film_modulation_summary(
+                amplitude_trace or {}, batch.get("seam"), batch.get("group")
+            )
             report["output_amplitude_diagnostics"] = {
                 "step": step,
                 "aggregate": amplitude_summary,
                 "by_group": amplitude_by_group,
+                "film_modulation": film_modulation,
             }
             save_diagnostic_state(destination,model,optimizer,report,step)
             row = {"stage":"observable_bridge_fit","step":step,"target_steps":args.steps,
@@ -2446,6 +2510,7 @@ def run(args):
                    "pareto_gradient":pareto_gradient,
                    "decoder_output_amplitude":amplitude_summary,
                    "decoder_output_amplitude_by_group":amplitude_by_group,
+                   "film_modulation":film_modulation,
                    "output_warmup":warmup,
                    "optimizer_update":update,
                    "fit_context_index":fit_context_index,

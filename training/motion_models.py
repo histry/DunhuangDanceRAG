@@ -120,6 +120,10 @@ REFINER_CONDITION_PATH_PROTOCOL = (
     "observable_continuous_condition_velocity_acceleration_path_gap_v1"
 )
 REFINER_CONDITION_PATH_FEATURE_DIM = 4
+REFINER_FILM_CONDITION_DIM = 2
+REFINER_FILM_PROTOCOL = (
+    "observable_anchor_fk_gap_and_root_yaw_film_v1"
+)
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = (
     "stage_registry_exact_signed_guard_tail_support_root_v5"
@@ -790,6 +794,9 @@ class MotionGenerationConfig:
     product_refiner_relative_temporal_weight: float = 0.25
     product_refiner_residual_smoothing_passes: int = 2
     product_refiner_residual_taper_frames: int = 3
+    # Optional V15.13 development architecture.  Its conditions are computed
+    # only from the two observable anchors surrounding each edit region.
+    product_refiner_film_conditioning: bool = False
     product_refiner_endpoint_continuity_weight: float = 0.50
     product_refiner_seam_velocity_weight: float = 0.20
     product_refiner_seam_acceleration_weight: float = 0.25
@@ -949,6 +956,9 @@ class MotionGenerationConfig:
             ),
             "MOTION_PRODUCT_REFINER_RESIDUAL_TAPER_FRAMES": (
                 "product_refiner_residual_taper_frames", int,
+            ),
+            "MOTION_PRODUCT_REFINER_FILM_CONDITIONING": (
+                "product_refiner_film_conditioning", lambda x: bool(int(x)),
             ),
             "MOTION_PRODUCT_REFINER_ENDPOINT_CONTINUITY_WEIGHT": (
                 "product_refiner_endpoint_continuity_weight",
@@ -1203,6 +1213,12 @@ def motion_checkpoint_contract(cfg: MotionGenerationConfig, role: str) -> Dict[s
             "soft_scale_then_cap_applied_tangent_v1"
         )
         contract["refiner_input_protocol"] = REFINER_INPUT_PROTOCOL
+        if bool(getattr(cfg, "product_refiner_film_conditioning", False)):
+            contract["refiner_film_conditioning"] = {
+                "enabled": True,
+                "protocol": REFINER_FILM_PROTOCOL,
+                "condition_dim": REFINER_FILM_CONDITION_DIM,
+            }
     return contract
 
 
@@ -1245,6 +1261,14 @@ def assert_motion_checkpoint_contract(
                 mismatches.append(
                     f"{key}: checkpoint={actual.get(key)!r}, "
                     f"runtime={expected[key]!r}"
+                )
+        expected_film = expected.get("refiner_film_conditioning")
+        actual_film = actual.get("refiner_film_conditioning")
+        if expected_film is not None or actual_film is not None:
+            if actual_film != expected_film:
+                mismatches.append(
+                    "refiner_film_conditioning: "
+                    f"checkpoint={actual_film!r}, runtime={expected_film!r}"
                 )
     if mismatches:
         raise RuntimeError(
@@ -2930,6 +2954,89 @@ def _refiner_condition_path_features(cond, seam_mask, frames):
     )
 
 
+def _refiner_film_condition_features(x, seam_mask):
+    """Return per-frame observable repair difficulty for FiLM.
+
+    The two channels are the mean FK distance and wrapped root-yaw distance
+    between the clean frames immediately outside the current seam.  They are
+    derived from inference inputs only; no role label, hidden clean interior,
+    target residual, source identity or validation metadata is consumed.
+    """
+    if seam_mask.ndim == 3:
+        seam = seam_mask[..., 0]
+    elif seam_mask.ndim == 2:
+        seam = seam_mask
+    else:
+        raise ValueError("Refiner FiLM requires [B,T] or [B,T,1] seam masks")
+    if seam.shape != x.shape[:2]:
+        raise ValueError("Refiner FiLM seam mask must align with the motion")
+    batch, frames = seam.shape
+    core = seam >= 0.5
+    active = seam > 0.0
+    index = torch.arange(frames, device=x.device)[None].expand(batch, -1)
+    starts = core & ~F.pad(core[:, :-1], (1, 0), value=False)
+    ends = core & ~F.pad(core[:, 1:], (0, 1), value=False)
+    left = torch.where(
+        starts, index - 1, -torch.ones_like(index)
+    ).cummax(1).values
+    right = torch.where(
+        ends, index + 1, torch.full_like(index, frames)
+    )
+    right = right.flip(1).cummin(1).values.flip(1)
+    previous = torch.where(
+        core, index, -torch.full_like(index, frames)
+    ).cummax(1).values
+    following = torch.where(
+        core, index, torch.full_like(index, 2 * frames)
+    )
+    following = following.flip(1).cummin(1).values.flip(1)
+    nearest = torch.where(
+        index - previous <= following - index, previous, following
+    ).clamp(0, frames - 1)
+    left = left.gather(1, nearest)
+    right = right.gather(1, nearest)
+    valid = (left >= 0) & (right < frames) & core.any(1)[:, None]
+
+    joints = fk_24_torch(x.to(torch.float64))
+
+    def gather_frames(value, at):
+        trailing = value.shape[2:]
+        gather_index = at.clamp(0, frames - 1).reshape(
+            batch, frames, *([1] * len(trailing))
+        ).expand(batch, frames, *trailing)
+        return value.gather(1, gather_index)
+
+    left_joints = gather_frames(joints, left)
+    right_joints = gather_frames(joints, right)
+    fk_gap = torch.linalg.vector_norm(
+        right_joints - left_joints, dim=-1
+    ).mean(dim=-1)
+
+    root_rotation = rot6d_to_matrix_torch(
+        x[..., ROT6D_START:ROT6D_START + 6]
+    )
+    forward = root_rotation[..., :, 2]
+    yaw = torch.atan2(forward[..., 0], forward[..., 2])
+    left_yaw = gather_frames(yaw.unsqueeze(-1), left).squeeze(-1)
+    right_yaw = gather_frames(yaw.unsqueeze(-1), right).squeeze(-1)
+    yaw_gap = torch.atan2(
+        torch.sin(right_yaw - left_yaw),
+        torch.cos(right_yaw - left_yaw),
+    ).abs() / math.pi
+
+    # log1p keeps the metric monotone while preventing a rare large FK gap
+    # from setting the modulation scale for an entire minibatch.
+    features = torch.stack([torch.log1p(fk_gap), yaw_gap], dim=-1)
+    features = torch.where(
+        (valid & active).unsqueeze(-1),
+        features,
+        torch.zeros_like(features),
+    )
+    if features.shape[-1] != REFINER_FILM_CONDITION_DIM:
+        raise RuntimeError("Refiner FiLM condition layout mismatch")
+    return features.to(dtype=x.dtype)
+
+
 class ProductManifoldTemporalRefiner(nn.Module):
     """Boundary refiner with a joint-risk-conditioned 79D geometric output.
 
@@ -2946,6 +3053,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
         hidden: int = 256,
         fps: float = 30.0,
         output_init_std: float = 0.0,
+        film_conditioning: bool = False,
     ):
         super().__init__()
         if not np.isfinite(float(fps)) or float(fps) <= 0:
@@ -2953,6 +3061,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
         if not np.isfinite(float(output_init_std)) or float(output_init_std) < 0:
             raise ValueError("Refiner output initialization std must be finite and nonnegative")
         self.fps = float(fps)
+        self.film_conditioning = bool(film_conditioning)
         # Kernel-5 dilations [1,2,5] give a 33-frame convolutional field. The
         # local horizontal difference needs one additional preceding frame;
         # explicit boundary features also read the two supplied anchors. A
@@ -2985,6 +3094,16 @@ class ProductManifoldTemporalRefiner(nn.Module):
             FramewiseChannelNorm(hidden),
             nn.SiLU(),
         )
+        if self.film_conditioning:
+            self.film_generator = nn.Sequential(
+                nn.Linear(REFINER_FILM_CONDITION_DIM, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, 2 * hidden),
+            )
+            # Identity modulation at initialization preserves the established
+            # zero-output safe start exactly.
+            nn.init.zeros_(self.film_generator[-1].weight)
+            nn.init.zeros_(self.film_generator[-1].bias)
         self.out = nn.Conv1d(hidden, PRODUCT_STATE_DIM, 1)
         # Production remains exact-zero safe-start. A separate, nonpublishing
         # paired diagnostic may opt into small Gaussian weights. Its initial
@@ -2996,7 +3115,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
             nn.init.normal_(self.out.weight, mean=0.0, std=float(output_init_std))
         nn.init.zeros_(self.out.bias)
 
-    def forward(self, x, cond, seam_mask, joint_mask):
+    def forward(self, x, cond, seam_mask, joint_mask, *, film_trace=None):
         # x: B,T,151; cond: B,32 or B,T,32; seam: B,T,1.
         batch, frames, _ = x.shape
         c = _expand_temporal_condition_torch(cond, frames)
@@ -3017,6 +3136,20 @@ class ProductManifoldTemporalRefiner(nn.Module):
         ).transpose(1, 2)
         h = self.in_proj(y)
         h = h + self.net(h)
+        if self.film_conditioning:
+            difficulty = _refiner_film_condition_features(x, seam_mask)
+            raw_gamma, raw_beta = self.film_generator(difficulty).chunk(2, -1)
+            active = (seam_mask[..., :1] > 0.0).to(h.dtype)
+            log_gamma = 2.0 * torch.tanh(raw_gamma) * active
+            gamma = torch.exp(log_gamma).transpose(1, 2)
+            beta = (0.10 * torch.tanh(raw_beta) * active).transpose(1, 2)
+            h = gamma * h + beta
+            if film_trace is not None:
+                film_trace.update({
+                    "condition": difficulty.detach(),
+                    "gamma": gamma.transpose(1, 2).detach(),
+                    "beta": beta.transpose(1, 2).detach(),
+                })
         return self.out(h).transpose(1, 2)
 
 
@@ -7095,12 +7228,21 @@ def _prepare_refiner_batch(clean_np, bad_np, seam_np, cond_np, cfg, device, *, e
 
 def _refiner_batch_outputs(model, batch, cfg, *, trace=None):
     count = batch["clean"].shape[0]
-    outputs = model(
+    model_inputs = (
         torch.cat([batch["bad"], batch["clean"]]),
         torch.cat([batch["cond"], batch.get("clean_cond", batch["cond"])]),
         torch.cat([batch["seam"], batch["seam"]]),
         torch.cat([batch["joint"], batch["clean_joint"]]),
     )
+    if trace is not None and bool(getattr(model, "film_conditioning", False)):
+        film_trace = {}
+        outputs = model(*model_inputs, film_trace=film_trace)
+        trace["film"] = {
+            key: value[:count]
+            for key, value in film_trace.items()
+        }
+    else:
+        outputs = model(*model_inputs)
     pred = _decode_product_refiner_output(
         batch["bad"], outputs[:count], *_refiner_decode_masks(
             batch["joint"], batch["root"], batch["contact"], batch["seam"], cfg), cfg,
@@ -8512,7 +8654,12 @@ def train_refiner(args: argparse.Namespace) -> int:
         "source_disjoint": _validate_source_disjoint(db, validation_db),
     }
     device = torch.device(cfg.device)
-    model = ProductManifoldTemporalRefiner(EDGE_DIM, 32, fps=cfg.fps).to(device)
+    model = ProductManifoldTemporalRefiner(
+        EDGE_DIM,
+        32,
+        fps=cfg.fps,
+        film_conditioning=bool(cfg.product_refiner_film_conditioning),
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
     if steps < 1:
@@ -8874,6 +9021,23 @@ def train_refiner(args: argparse.Namespace) -> int:
             "fk_dynamics_conditioning_protocol": REFINER_FK_DYNAMICS_PROTOCOL,
             "condition_path_conditioning_dim": REFINER_CONDITION_PATH_FEATURE_DIM,
             "condition_path_conditioning_protocol": REFINER_CONDITION_PATH_PROTOCOL,
+            "film_conditioning": {
+                "enabled": bool(cfg.product_refiner_film_conditioning),
+                "protocol": (
+                    REFINER_FILM_PROTOCOL
+                    if cfg.product_refiner_film_conditioning
+                    else "disabled"
+                ),
+                "condition_dim": (
+                    REFINER_FILM_CONDITION_DIM
+                    if cfg.product_refiner_film_conditioning
+                    else 0
+                ),
+                "routing_signal": (
+                    "observable_anchor_fk_gap_and_wrapped_root_yaw_gap"
+                ),
+                "diagnostic_role_labels_used": False,
+            },
             "temporal_priority": "endpoint_acceptance_active_set",
             "repair_target": "observable_endpoint_jump_and_actual_fk_dynamics",
             "hidden_clean_interior_in_repair_loss": False,
@@ -10178,7 +10342,9 @@ def analytic_residual_refine(motion: np.ndarray, seam_positions: Sequence[int], 
     return out.astype(np.float32)
 
 
-_INFERENCE_MODEL_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
+_INFERENCE_MODEL_CACHE: Dict[
+    Tuple[str, str, int, int, str, bool], Dict[str, Any]
+] = {}
 
 
 def _cached_inference_model(
@@ -10195,6 +10361,7 @@ def _cached_inference_model(
         int(stat.st_mtime_ns),
         int(stat.st_size),
         str(cfg.device),
+        bool(getattr(cfg, "product_refiner_film_conditioning", False)),
     )
     cached = _INFERENCE_MODEL_CACHE.get(key)
     if cached is None:
@@ -10206,7 +10373,12 @@ def _cached_inference_model(
                     "Formal generation rejects a non-product refiner checkpoint"
                 )
             model = ProductManifoldTemporalRefiner(
-                EDGE_DIM, 32, fps=cfg.fps
+                EDGE_DIM,
+                32,
+                fps=cfg.fps,
+                film_conditioning=bool(
+                    cfg.product_refiner_film_conditioning
+                ),
             ).to(cfg.device)
             schedule = None
         elif role == "motion_diffusion":

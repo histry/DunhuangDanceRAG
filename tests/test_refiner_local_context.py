@@ -163,6 +163,68 @@ def test_fresh_model_is_identity_with_trainable_output_head(setup):
     assert torch.isfinite(model.out.weight.grad).all()
 
 
+def test_film_uses_observable_anchor_difficulty_without_world_position_leakage():
+    x, _, seam, _ = sample("cpu")
+    base = m._refiner_film_condition_features(x, seam)
+    shifted = x.clone()
+    shifted[..., 4] += 12.0
+    shifted[..., 6] -= 7.0
+    torch.testing.assert_close(
+        base,
+        m._refiner_film_condition_features(shifted, seam),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+    changed = x.clone()
+    changed[:, 72, 4] += 0.5
+    modified = m._refiner_film_condition_features(changed, seam)
+    assert modified[:, 44:72, 0].mean() > base[:, 44:72, 0].mean()
+    assert torch.count_nonzero(base[:, :40]) == 0
+
+
+def test_film_safe_start_is_identity_modulation_and_zero_refiner_output():
+    x, cond, seam, joint = sample("cpu")
+    model = m.ProductManifoldTemporalRefiner(
+        hidden=16,
+        film_conditioning=True,
+    )
+    trace = {}
+    output = model(x, cond, seam, joint, film_trace=trace)
+    assert torch.count_nonzero(output) == 0
+    torch.testing.assert_close(trace["gamma"], torch.ones_like(trace["gamma"]))
+    assert torch.count_nonzero(trace["beta"]) == 0
+    assert trace["condition"].shape == (
+        x.shape[0], x.shape[1], m.REFINER_FILM_CONDITION_DIM
+    )
+
+
+def test_film_checkpoint_contract_is_opt_in_and_fail_closed():
+    legacy = m.MotionGenerationConfig()
+    assert "refiner_film_conditioning" not in m.motion_checkpoint_contract(
+        legacy, "boundary_refiner"
+    )
+    cfg = m.MotionGenerationConfig(product_refiner_film_conditioning=True)
+    contract = m.motion_checkpoint_contract(cfg, "boundary_refiner")
+    assert contract["refiner_film_conditioning"] == {
+        "enabled": True,
+        "protocol": m.REFINER_FILM_PROTOCOL,
+        "condition_dim": m.REFINER_FILM_CONDITION_DIM,
+    }
+    broken = dict(contract)
+    broken.pop("refiner_film_conditioning")
+    with pytest.raises(RuntimeError, match="refiner_film_conditioning"):
+        m.assert_motion_checkpoint_contract(
+            {"motion_contract": broken}, cfg, "film.pt", "boundary_refiner"
+        )
+    with pytest.raises(RuntimeError, match="refiner_film_conditioning"):
+        m.assert_motion_checkpoint_contract(
+            {"motion_contract": contract},
+            legacy,
+            "film.pt",
+            "boundary_refiner",
+        )
+
+
 def test_input_protocol_is_checked_not_just_stored():
     cfg = m.MotionGenerationConfig()
     contract = m.motion_checkpoint_contract(cfg, 'boundary_refiner')
