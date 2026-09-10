@@ -25,8 +25,9 @@ from training import refiner_group_local_nullspace_cone_probe as group_probe
 from training import refiner_projected_candidate_probe as projected_probe
 
 
-SCHEMA = "refiner_v15_14g_case_local_finite_radius_sequential_cone_v1"
-PROTOCOL = "fixed_bank_case_local_witness_cut_sequential_inequality_v1"
+SCHEMA = "refiner_v15_14g_case_local_finite_radius_sequential_cone_v2"
+PROTOCOL = "fixed_bank_case_local_witness_cut_sequential_inequality_v2"
+TAPER_PROTOCOL = "decoder_consistent_inward_quintic_c2_v1"
 DEFAULT_FD_EPSILON = 1.0e-6
 DEFAULT_TARGET_RMS = 1.0e-4
 DEFAULT_MAX_ITERATIONS = 6
@@ -74,9 +75,27 @@ def _case_activity(batch, case_index, cfg):
         1,
         int(getattr(cfg, "product_refiner_residual_taper_frames", 3)),
     )
-    owned, c2 = projected_probe._ownership_c2_activity(
-        batch["seam"], taper_frames
-    )
+    owned = batch["seam"][..., 0] >= 0.5
+    # Match motion_models._smooth_supported_residual_torch exactly.  Its
+    # inward distance starts at one on the first owned frame, so the seam-edge
+    # weight is small but nonzero.  The projector helper starts at zero and
+    # would annihilate the endpoint derivative that V15.14g is meant to test.
+    eroded = owned.to(batch["bad"].dtype).unsqueeze(1)
+    distance = eroded.clone()
+    for _ in range(taper_frames):
+        eroded = -m.torch.nn.functional.max_pool1d(
+            -m.torch.nn.functional.pad(
+                eroded, (1, 1), mode="replicate"
+            ),
+            3,
+            stride=1,
+        )
+        distance = distance + eroded
+    phase = distance / float(taper_frames + 1)
+    c2 = (
+        phase.pow(3)
+        * (10.0 - 15.0 * phase + 6.0 * phase.square())
+    ).squeeze(1)
     selected = m.torch.zeros_like(owned)
     selected[int(case_index)] = True
     active = selected & owned
@@ -1399,6 +1418,7 @@ def run(args):
         "diagnostic_fd_epsilon_output_tangent_rms": float(args.fd_epsilon),
         "diagnostic_fd_scales_eligible_as_learning_steps": False,
         "max_sequential_iterations": int(args.max_iterations),
+        "c2_taper_protocol": TAPER_PROTOCOL,
         "epsilon_active_fraction": ACTIVE_FRACTION,
         "topk_witnesses": int(args.topk_witnesses),
         "case_trial_count_expected": expected_trials,

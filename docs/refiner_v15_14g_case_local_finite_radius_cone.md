@@ -6,8 +6,11 @@ replays, generates motion, or produces video.
 The probe moves the action basis from four group-wide edits to independent
 `[case, frame, 79]` edits. Every action is exactly zero for all other cases,
 groups and frames outside the ownership window. The existing C2 seam taper is
-applied before any direction is normalized. Contact action channels remain
-zero and only the 75-dimensional product-manifold tangent is retracted.
+applied before any direction is normalized. Its inward quintic distance uses
+the same one-based edge level as the decoder, leaving a small nonzero weight on
+the first and last owned frames so endpoint derivatives remain observable.
+Contact action channels remain zero and only the 75-dimensional
+product-manifold tangent is retracted.
 
 For every case the probe constructs independent endpoint and temporal descent
 directions. Hard correction atoms come from concrete Top-K and epsilon-active
