@@ -7666,9 +7666,31 @@ def _refiner_observable_confidence_preconditioner(batch):
     return weight.detach()
 
 
-def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace=None):
+def _refiner_batch_objectives(
+    model,
+    batch,
+    cfg,
+    *,
+    group_objectives=None,
+    trace=None,
+    prediction_override=None,
+    identity_override=None,
+):
     # Optional detached decoder measurements; no extra forward or changed loss.
-    pred, identity = _refiner_batch_outputs(model, batch, cfg, trace=trace)
+    if prediction_override is None:
+        pred, identity = _refiner_batch_outputs(model, batch, cfg, trace=trace)
+    else:
+        pred = prediction_override
+        identity = (
+            batch["clean"]
+            if identity_override is None
+            else identity_override
+        )
+        expected = batch["bad"].shape
+        if pred.shape != expected or identity.shape != expected:
+            raise ValueError(
+                "Refiner objective overrides must match the batch motion shape"
+            )
     per_case, case_terms = _observable_refiner_objective(
         pred, batch["bad"], batch["seam"], cfg, reduction="none"
     )
