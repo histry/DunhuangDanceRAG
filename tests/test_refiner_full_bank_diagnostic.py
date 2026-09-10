@@ -98,7 +98,7 @@ def test_fit_contract_counts_examples_not_just_iterations():
     assert contract["group_guard_scope"] == "fixed_complete_seen_train_anchor"
     assert (
         contract["group_guard_reference"]
-        == "fixed_component_anchor_with_best_joint_envelope"
+        == "immutable_fixed_metric_anchor"
     )
     assert contract["group_guard_rolling_tolerance_accumulation"] is False
 
@@ -736,6 +736,21 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
             ):
                 terms[f"group_{label}_{component}"] = r * 0
 
+            for component in (
+                "repair_joint_jerk_mps3_p95_signed_margin_max",
+                "repair_joint_jerk_mps3_max_signed_margin_max",
+                "repair_joint_jerk_window_p95_max_mps3_signed_margin_max",
+                "repair_extremity_jerk_mps3_p95_signed_margin_max",
+                "repair_extremity_jerk_window_p95_max_mps3_signed_margin_max",
+                "repair_foot_skate_mps_p95_signed_margin_max",
+                "repair_foot_skate_mps_max_signed_margin_max",
+                "repair_foot_support_drift_m_p95_signed_margin_max",
+                "repair_foot_support_drift_m_max_signed_margin_max",
+                "repair_foot_penetration_min_m_signed_margin_max",
+                "boundary_jerk_signed_margin_max",
+            ):
+                terms[f"group_{label}_{component}"] = r * 0
+
             if group_objectives is not None:
                 group_objectives[label] = {
                     "training_total": r,
@@ -945,75 +960,61 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
     ) == expected_steps
 
 
-def test_v15_12d_guard_uses_fixed_components_and_best_joint_envelope():
+def test_v15_12f_guard_uses_only_the_immutable_metric_anchor():
     anchor = {
-        "single_short": 1.0,
-        "single_short.feasibility": 2.0,
-        "single_short.endpoint": 3.0,
-        "single_short.temporal": 4.0,
-        "single_short.support": 5.0,
-        "single_short.penetration": 6.0,
-        "single_short.jerk": 7.0,
-        "single_short.root_vertical": 8.0,
-        "single_short.clean_geometry_max": 9.0,
-        "single_short.clean_contact_max": 10.0,
-        "single_short.clean_temporal_excess": 11.0,
-        "single_short.clean_support_excess": 12.0,
+        "single_short.observable_endpoint_0p03": 1.0,
+        "single_short.observable_temporal_0p03": 2.0,
+        "single_short.joint_jerk_p95": 3.0,
+        "single_short.extremity_jerk_p95": 4.0,
+        "single_short.support_drift_p95": 5.0,
+        "single_short.foot_skate_p95": 6.0,
+        "single_short.penetration": 7.0,
+        "single_short.fixed_support": 8.0,
+        "single_short.boundary": 9.0,
+        "single_short.fidelity_geometry": 10.0,
     }
     best = {key: value / 2.0 for key, value in anchor.items()}
 
     reference = d._mixed_group_guard_reference(anchor, best)
 
-    assert reference["single_short"] == best["single_short"]
-    assert (
-        reference["single_short.feasibility"]
-        == best["single_short.feasibility"]
-    )
-    for suffix in (
-        "endpoint",
-        "temporal",
-        "support",
-        "penetration",
-        "jerk",
-        "root_vertical",
-        "clean_geometry_max",
-        "clean_contact_max",
-        "clean_temporal_excess",
-        "clean_support_excess",
-    ):
-        key = f"single_short.{suffix}"
-        assert reference[key] == anchor[key]
+    assert reference == anchor
+    assert reference != best
 
 
-def test_v15_12d_gate_metric_tolerances_are_nonaccumulating():
+def test_v15_12f_exact_metric_tolerances_are_nonaccumulating():
     cfg = m.MotionGenerationConfig()
     anchor = {
         f"{label}.{suffix}": 0.0
         for label in m.REFINER_GROUP_LABELS
         for suffix in (
-            "support",
+            "observable_endpoint_0p03",
+            "observable_temporal_0p03",
+            "joint_jerk_p95",
+            "extremity_jerk_p95",
+            "foot_skate_p95",
+            "support_drift_p95",
             "penetration",
-            "jerk",
-            "root_vertical",
-            "clean_geometry_max",
-            "clean_contact_max",
-            "clean_temporal_excess",
-            "clean_support_excess",
+            "fixed_support",
+            "boundary",
+            "fidelity_geometry",
+            "fidelity_contact",
+            "fidelity_temporal",
+            "fidelity_support",
         )
     }
     relative, absolute = d._group_guard_tolerances(anchor, cfg)
 
     assert all(value == 0.0 for value in relative.values())
-    assert absolute["single_short.support"] == pytest.approx(
+    assert absolute["single_short.support_drift_p95"] == pytest.approx(
         cfg.product_refiner_group_guard_absolute_tolerance
     )
-    assert absolute["cross_short.support"] == pytest.approx(
+    assert absolute["cross_short.observable_temporal_0p03"] == pytest.approx(
         cfg.product_refiner_group_guard_absolute_tolerance
     )
-    assert absolute["single_long.clean_geometry_max"] == pytest.approx(
+    assert absolute["single_long.fidelity_geometry"] == pytest.approx(
         cfg.checkpoint_validation_max_clean_identity_product_log_l1
     )
-    assert absolute["cross_long.clean_contact_max"] == pytest.approx(
+    assert absolute["cross_long.fidelity_contact"] == pytest.approx(
         cfg.checkpoint_validation_max_clean_identity_contact_l1
     )
 
@@ -1033,7 +1034,7 @@ def _eight_subgroup_objectives(endpoint, temporal):
     return terms
 
 
-def test_v15_12e_mgda_keeps_all_subgroup_derivatives_nonpositive():
+def test_v15_12f_mgda_keeps_all_subgroup_derivatives_nonpositive():
     model = torch.nn.Linear(2, 1, bias=False)
     with torch.no_grad():
         model.weight.zero_()
@@ -1067,7 +1068,7 @@ def test_v15_12e_mgda_keeps_all_subgroup_derivatives_nonpositive():
     )
 
 
-def test_v15_12e_mgda_reports_pareto_stationary_opposition():
+def test_v15_12f_mgda_reports_pareto_stationary_opposition():
     model = torch.nn.Linear(1, 1, bias=False)
     with torch.no_grad():
         model.weight.zero_()
@@ -1087,3 +1088,39 @@ def test_v15_12e_mgda_reports_pareto_stationary_opposition():
     assert report["reason"] == "pareto_stationary_or_no_common_descent"
     assert report["mgda_min_norm"] <= d.MGDA_COMMON_DESCENT_RMS_EPSILON
     assert all(value == 0.0 for value in report["directional_derivatives"].values())
+
+
+def test_v15_12f_exact_guard_constraint_can_close_the_common_descent_cone():
+    model = torch.nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    prediction = model.weight.reshape(-1)
+    endpoint = (prediction[0] - 1.0).square()
+    temporal = endpoint + prediction[1].square()
+    total = endpoint + temporal
+    key = "cross_long.support_drift_p95"
+
+    report = d._pareto_common_descent_backward(
+        model,
+        total,
+        _eight_subgroup_objectives(endpoint, temporal),
+        m.MotionGenerationConfig(),
+        fixed_guard_values={key: prediction[0]},
+        guard_reference={key: 0.0},
+        guard_relative_tolerance={key: 0.0},
+        guard_absolute_tolerance={key: 0.0},
+        guard_metadata={
+            key: {
+                "category": "support_drift",
+                "fixed_anchor": 0.0,
+                "guard_absolute_limit": 0.0,
+            }
+        },
+    )
+
+    report.pop("_guard_directional_derivative_callback")
+    assert report["unconstrained_common_descent_exists"]
+    assert not report["constrained_common_descent_exists"]
+    assert report["reason"] == "no_exact_guard_constrained_common_descent"
+    assert report["active_constraint_gradients"] == [key]
+    assert key in report["constraint_metrics"]

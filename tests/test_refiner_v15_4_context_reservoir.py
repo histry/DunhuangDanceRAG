@@ -12,12 +12,12 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12e"
+        == "refiner_observable_bridge_diagnostic_v15_12f"
     )
 
     assert (
         d.FIT_PROTOCOL
-        == "pcgrad_fixed_envelope_context_reservoir_transaction_v4"
+        == "exact_guard_constrained_subgroup_mgda_transaction_v7"
     )
 
     assert (
@@ -32,7 +32,7 @@ def test_v15_4_contract_preserves_scientific_objective():
     # reservoir, exact gate, optimizer, and tail-fraction contracts.
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_group_rms_fixed_anchor_guard_observable_v15_12b"
+        == "gate_aligned_temporal_exact_guard_observable_v15_12f"
     )
 
     assert (
@@ -62,7 +62,7 @@ def test_v15_4_contract_preserves_scientific_objective():
 
     assert (
         REFINER_UPDATE_PROTOCOL
-        == "fixed_anchor_best_so_far_guard_armijo_v8"
+        == "exact_guard_constrained_fixed_anchor_armijo_v9"
     )
 
 

@@ -26,8 +26,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_12e"
-FIT_PROTOCOL = "subgroup_mgda_context_reservoir_transaction_v6"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_12f"
+FIT_PROTOCOL = "exact_guard_constrained_subgroup_mgda_transaction_v7"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
     "all_probe_safe_farthest_order_rotating_c5_v1"
@@ -43,6 +43,10 @@ OUTPUT_WARMUP_LR_MULTIPLIER = 10.0
 MGDA_MAX_ITERATIONS = 512
 MGDA_DUALITY_GAP_TOLERANCE = 1.0e-10
 MGDA_COMMON_DESCENT_RMS_EPSILON = 1.0e-8
+EXACT_GUARD_ACTIVE_MARGIN_FRACTION = 1.0
+EXACT_GUARD_PROJECTION_MAX_PASSES = 64
+EXACT_GUARD_DERIVATIVE_EPSILON = 1.0e-10
+EXACT_GUARD_MIN_EFFECTIVE_SCALE = 1.0e-7
 
 
 def fingerprint(args, cfg):
@@ -90,9 +94,9 @@ def fingerprint(args, cfg):
     value["context_reservoir_protocol"] = CONTEXT_RESERVOIR_PROTOCOL
     value["probe_scope"] = PROBE_SCOPE
     value["pareto_gradient_protocol"] = (
-        "deterministic_subgroup_mgda_rms_normalized_v1"
+        "deterministic_exact_guard_constrained_subgroup_mgda_v1"
     )
-    value["guard_envelope_protocol"] = "fixed_component_anchor_best_joint_v1"
+    value["guard_envelope_protocol"] = "immutable_fixed_metric_anchor_v1"
     value["output_warmup_steps"] = OUTPUT_WARMUP_STEPS
     value["output_warmup_lr_multiplier"] = OUTPUT_WARMUP_LR_MULTIPLIER
     value["training_guard_threshold_sources"] = {
@@ -472,7 +476,7 @@ def fit_bank_contract(
             "fixed_complete_seen_train_anchor",
 
         "group_guard_reference":
-            "fixed_component_anchor_with_best_joint_envelope",
+            "immutable_fixed_metric_anchor",
 
         "group_guard_rolling_tolerance_accumulation":
             False,
@@ -481,7 +485,10 @@ def fit_bank_contract(
             False,
 
         "endpoint_temporal_gradient_protocol":
-            "deterministic_subgroup_mgda_rms_normalized",
+            "deterministic_exact_guard_constrained_subgroup_mgda",
+
+        "guard_gradient_scope":
+            "same_fixed_complete_seen_train_anchor",
 
         "output_warmup_steps": OUTPUT_WARMUP_STEPS,
 
@@ -526,6 +533,8 @@ def fixed_bank_stalled(update):
             "bounded_search_no_descent",
             "zero_gradient",
             "pareto_stationary_or_no_common_descent",
+            "no_exact_guard_constrained_common_descent",
+            "resolution_limited_under_exact_guard",
         }
     )
 
@@ -1157,43 +1166,84 @@ def failure_breakdown(metrics):
 
 
 def _diagnostic_group_guard_values(terms, group_objectives):
-    """Build the V15.12d gate-metric guard on one immutable TRAIN bank.
+    """Expose exact fixed-bank components instead of one feasibility sum.
 
-    Trajectory components and normalized physical excesses remain independent.
-    This avoids hiding a physical regression inside a lower endpoint loss while
-    leaving every production acceptance threshold unchanged.
+    All values come from the same differentiable metric implementations used by
+    the stage guard. Physical entries are signed residuals against the exact
+    reference-relative allowed value and comparison epsilon, including the
+    reversed sign for low-is-bad penetration. Endpoint and temporal remain
+    separate representations of the unchanged observable 0.03 requirements.
+    No component can be hidden by a lower aggregate loss.
     """
-    values = dict(
-        m._refiner_group_repair_losses(
-            terms,
-            require_all=True,
-        )
-    )
+    values = {}
     for label in m.REFINER_GROUP_LABELS:
         objective = group_objectives[label]
-        values[label] = objective["training_total"]
-        values[f"{label}.support"] = terms[
-            f"group_{label}_support_excess"
+        values[f"{label}.observable_endpoint_0p03"] = terms[
+            f"group_{label}_endpoint_scientific_tail_risk"
         ]
-        values[f"{label}.penetration"] = terms[
-            f"group_{label}_penetration_excess"
+        values[f"{label}.observable_temporal_0p03"] = terms[
+            f"group_{label}_temporal_scientific_tail_risk"
         ]
-        values[f"{label}.jerk"] = terms[
-            f"group_{label}_jerk_safety_excess"
+        physical_terms = {
+            "joint_jerk_p95": (
+                "repair_joint_jerk_mps3_p95_signed_margin_max"
+            ),
+            "joint_jerk_max": (
+                "repair_joint_jerk_mps3_max_signed_margin_max"
+            ),
+            "joint_jerk_window_p95": (
+                "repair_joint_jerk_window_p95_max_mps3_signed_margin_max"
+            ),
+            "extremity_jerk_p95": (
+                "repair_extremity_jerk_mps3_p95_signed_margin_max"
+            ),
+            "extremity_jerk_window_p95": (
+                "repair_extremity_jerk_window_p95_max_mps3_signed_margin_max"
+            ),
+            "foot_skate_p95": (
+                "repair_foot_skate_mps_p95_signed_margin_max"
+            ),
+            "foot_skate_max": (
+                "repair_foot_skate_mps_max_signed_margin_max"
+            ),
+            "support_drift_p95": (
+                "repair_foot_support_drift_m_p95_signed_margin_max"
+            ),
+            "support_drift_max": (
+                "repair_foot_support_drift_m_max_signed_margin_max"
+            ),
+            "penetration": (
+                "repair_foot_penetration_min_m_signed_margin_max"
+            ),
+            "boundary": "boundary_jerk_signed_margin_max",
+        }
+        for suffix, term_suffix in physical_terms.items():
+            values[f"{label}.{suffix}"] = terms[
+                f"group_{label}_{term_suffix}"
+            ]
+        support_parts = [
+            values[f"{label}.{suffix}"]
+            for suffix in (
+                "foot_skate_p95",
+                "foot_skate_max",
+                "support_drift_p95",
+                "support_drift_max",
+                "penetration",
+            )
         ]
-        values[f"{label}.root_vertical"] = terms[
-            f"group_{label}_root_vertical_safety_excess"
-        ]
-        values[f"{label}.clean_geometry_max"] = objective[
+        values[f"{label}.fixed_support"] = m.torch.stack(
+            support_parts
+        ).max()
+        values[f"{label}.fidelity_geometry"] = objective[
             "clean_geometry_max"
         ]
-        values[f"{label}.clean_contact_max"] = objective[
+        values[f"{label}.fidelity_contact"] = objective[
             "clean_contact_max"
         ]
-        values[f"{label}.clean_temporal_excess"] = objective[
+        values[f"{label}.fidelity_temporal"] = objective[
             "clean_temporal_excess"
         ]
-        values[f"{label}.clean_support_excess"] = objective[
+        values[f"{label}.fidelity_support"] = objective[
             "clean_support_excess"
         ]
     return values
@@ -1229,23 +1279,10 @@ def _fixed_anchor_guarded_loss(model, train_batch, guard_batch, cfg):
 
 
 def _mixed_group_guard_reference(anchor, best):
-    """Keep component envelopes fixed while joint progress is best-so-far.
-
-    Using each component's historical minimum creates an intersection that may
-    never have existed in one model state. V15.12d uses the immutable initial
-    anchor for endpoint, temporal, physical and clean gate metrics, and
-    best-so-far only for the joint feasibility and total objectives.
-    """
+    """Return one immutable component anchor; ``best`` is diagnostic only."""
     if set(anchor) != set(best):
         raise ValueError("guard anchor/best keys differ")
-    return {
-        key: (
-            best[key]
-            if "." not in key or key.endswith(".feasibility")
-            else anchor[key]
-        )
-        for key in anchor
-    }
+    return dict(anchor)
 
 
 def _group_guard_tolerances(anchor, cfg):
@@ -1260,10 +1297,7 @@ def _group_guard_tolerances(anchor, cfg):
     )
     for key in anchor:
         suffix = key.rsplit(".", 1)[-1] if "." in key else "total"
-        if suffix in {"total", "feasibility"}:
-            relative[key] = base_relative
-            absolute[key] = base_absolute
-        elif suffix == "clean_geometry_max":
+        if suffix == "fidelity_geometry":
             relative[key] = 0.0
             absolute[key] = max(
                 0.0,
@@ -1271,7 +1305,7 @@ def _group_guard_tolerances(anchor, cfg):
                     cfg.checkpoint_validation_max_clean_identity_product_log_l1
                 ) - float(anchor[key]),
             )
-        elif suffix == "clean_contact_max":
+        elif suffix == "fidelity_contact":
             relative[key] = 0.0
             absolute[key] = max(
                 0.0,
@@ -1286,6 +1320,80 @@ def _group_guard_tolerances(anchor, cfg):
             relative[key] = 0.0
             absolute[key] = base_absolute
     return relative, absolute
+
+
+def _group_guard_metric_metadata(anchor, relative, absolute, cfg):
+    """Describe every fixed Guard component and its unchanged source limit."""
+    limits = physical_quality.PhysicalQualityLimits.from_environment()
+    configured = {
+        "joint_jerk_p95": limits.joint_jerk_mps3_p95,
+        "joint_jerk_max": limits.joint_jerk_mps3_max,
+        "joint_jerk_window_p95": limits.joint_jerk_window_p95_max_mps3,
+        "extremity_jerk_p95": limits.extremity_jerk_mps3_p95,
+        "extremity_jerk_window_p95": (
+            limits.extremity_jerk_window_p95_max_mps3
+        ),
+        "foot_skate_p95": limits.foot_skate_mps_p95,
+        "foot_skate_max": limits.foot_skate_mps_max,
+        "support_drift_p95": limits.foot_support_drift_m_p95,
+        "support_drift_max": limits.foot_support_drift_m_max,
+        "penetration": limits.foot_penetration_min_m,
+        "observable_endpoint_0p03": (
+            cfg.checkpoint_validation_min_endpoint_repair_gain
+        ),
+        "observable_temporal_0p03": (
+            cfg.checkpoint_validation_min_temporal_repair_gain
+        ),
+        "fidelity_geometry": (
+            cfg.checkpoint_validation_max_clean_identity_product_log_l1
+        ),
+        "fidelity_contact": (
+            cfg.checkpoint_validation_max_clean_identity_contact_l1
+        ),
+    }
+    categories = {
+        "joint_jerk_p95": "joint_jerk",
+        "joint_jerk_max": "joint_jerk",
+        "joint_jerk_window_p95": "joint_jerk",
+        "extremity_jerk_p95": "extremity_jerk",
+        "extremity_jerk_window_p95": "extremity_jerk",
+        "foot_skate_p95": "foot_skate",
+        "foot_skate_max": "foot_skate",
+        "support_drift_p95": "support_drift",
+        "support_drift_max": "support_drift",
+        "penetration": "penetration",
+        "fixed_support": "fixed_support",
+        "boundary": "boundary",
+        "fidelity_geometry": "fidelity",
+        "fidelity_contact": "fidelity",
+        "fidelity_temporal": "fidelity",
+        "fidelity_support": "fidelity",
+        "observable_endpoint_0p03": "observable_0p03",
+        "observable_temporal_0p03": "observable_0p03",
+    }
+    metadata = {}
+    for key, fixed_anchor in anchor.items():
+        suffix = key.split(".", 1)[1]
+        allowance = max(
+            abs(float(fixed_anchor)) * float(relative[key]),
+            float(absolute[key]),
+        )
+        metadata[key] = {
+            "category": categories[suffix],
+            "guard_value_domain": (
+                "exact_stage_signed_residual_or_observable_fidelity_metric"
+            ),
+            "metric_direction": "high",
+            "fixed_anchor": float(fixed_anchor),
+            "guard_absolute_limit": float(fixed_anchor) + allowance,
+            "absolute_upper_limit": float(fixed_anchor) + allowance,
+            "configured_absolute_limit": (
+                float(configured[suffix]) if suffix in configured else None
+            ),
+            "allowance": allowance,
+            "rolling_tolerance_accumulation": False,
+        }
+    return metadata
 
 
 def _tuple_dot(left, right):
@@ -1365,15 +1473,29 @@ def _deterministic_mgda_weights(gram):
     return alpha, iterations, duality_gap
 
 
-def _pareto_common_descent_backward(model, total_loss, terms, cfg):
-    """Backpropagate an eight-objective deterministic MGDA direction.
+def _pareto_common_descent_backward(
+    model,
+    total_loss,
+    terms,
+    cfg,
+    *,
+    fixed_guard_values=None,
+    guard_reference=None,
+    guard_relative_tolerance=None,
+    guard_absolute_tolerance=None,
+    guard_metadata=None,
+):
+    """Backpropagate an exact-Guard-constrained eight-objective direction.
 
     Gradients are separated by role, width and observable, then normalized by
     their parameter RMS before the minimum-norm simplex problem is solved.  A
     near-zero convex-hull projection is reported as Pareto stationary and does
     not enter line search.  The non-scientific remainder is admitted only while
     every subgroup directional derivative remains non-positive for the actual
-    update direction.  Exact closure and fixed-anchor guards remain decisive.
+    update direction.  V15.12f additionally differentiates active constraints
+    on the exact immutable Guard bank and projects the common direction into
+    their linearized non-regression halfspaces before any real candidate is
+    constructed. Exact closure and fixed-anchor guards remain decisive.
     """
     objectives = _subgroup_scientific_objectives(terms, cfg)
     parameters = [p for p in model.parameters() if p.requires_grad]
@@ -1410,6 +1532,71 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
         m.torch.zeros_like(parameter) if gradient is None else gradient
         for parameter, gradient in zip(parameters, aggregate_raw)
     ]
+    constraint_records = {}
+    constraint_gradients = []
+    constraint_names = []
+    guard_enabled = fixed_guard_values is not None
+    if guard_enabled:
+        mappings = (
+            guard_reference,
+            guard_relative_tolerance,
+            guard_absolute_tolerance,
+            guard_metadata,
+        )
+        if any(value is None for value in mappings):
+            raise ValueError("exact Guard constraints require complete metadata")
+        keys = set(fixed_guard_values)
+        if any(set(value) != keys for value in mappings):
+            raise ValueError("exact Guard constraint keys differ")
+        for name, objective in fixed_guard_values.items():
+            current = float(objective.detach())
+            reference = float(guard_reference[name])
+            allowance = max(
+                abs(reference) * float(guard_relative_tolerance[name]),
+                float(guard_absolute_tolerance[name]),
+            )
+            allowed = reference + allowance
+            remaining = allowed - current
+            numeric_tolerance = max(
+                1.0e-12,
+                abs(allowed) * 1.0e-9,
+                allowance * 1.0e-6,
+            )
+            active_band = max(
+                numeric_tolerance,
+                allowance * EXACT_GUARD_ACTIVE_MARGIN_FRACTION,
+            )
+            record = {
+                **dict(guard_metadata[name]),
+                "current": current,
+                "allowed": allowed,
+                "remaining_margin": remaining,
+                "numeric_tolerance": numeric_tolerance,
+                "active_margin_band": active_band,
+                "active": bool(
+                    remaining <= active_band
+                    or guard_metadata[name]["category"] == "observable_0p03"
+                    or (
+                        guard_metadata[name]["category"] != "fidelity"
+                        and current > numeric_tolerance
+                    )
+                ),
+            }
+            constraint_records[name] = record
+            if not record["active"]:
+                continue
+            raw = m.torch.autograd.grad(
+                objective,
+                parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            gradient = [
+                m.torch.zeros_like(parameter) if value is None else value
+                for parameter, value in zip(parameters, raw)
+            ]
+            constraint_names.append(name)
+            constraint_gradients.append(gradient)
     total_loss.backward()
     total_grad = [
         m.torch.zeros_like(p) if p.grad is None else p.grad.detach().clone()
@@ -1483,9 +1670,10 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
     else:
         normalized_common = [m.torch.zeros_like(value) for value in parameters]
         mgda_min_norm = 0.0
-    common_exists = bool(
+    unconstrained_common_exists = bool(
         mgda_min_norm > MGDA_COMMON_DESCENT_RMS_EPSILON
     )
+    common_exists = unconstrained_common_exists
     nonzero_norms = [
         rms_norms[index] for index in active_indices
     ]
@@ -1498,6 +1686,43 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
         value * target_rms.to(value.dtype)
         for value in normalized_common
     ]
+    projection_passes = 0
+    active_constraint_gradients = []
+    active_constraint_raw_gradients = []
+    active_constraint_names = []
+    for name, gradient in zip(constraint_names, constraint_gradients):
+        norm_square = _tuple_dot(gradient, gradient)
+        rms = (norm_square / count_tensor).clamp_min(0.0).sqrt()
+        constraint_records[name]["gradient_rms"] = float(rms.detach())
+        if float(rms.detach()) <= 1.0e-12:
+            constraint_records[name]["active"] = False
+            constraint_records[name]["inactive_reason"] = "zero_constraint_gradient"
+            continue
+        active_constraint_names.append(name)
+        active_constraint_raw_gradients.append(gradient)
+        active_constraint_gradients.append([
+            value / rms.to(value.dtype)
+            for value in gradient
+        ])
+    if common_exists and active_constraint_gradients:
+        for projection_passes in range(1, EXACT_GUARD_PROJECTION_MAX_PASSES + 1):
+            changed = False
+            for gradient in active_constraint_gradients:
+                dot = _tuple_dot(common, gradient)
+                denominator = _tuple_dot(gradient, gradient).clamp_min(1.0e-24)
+                tolerance = EXACT_GUARD_DERIVATIVE_EPSILON * max(
+                    1.0,
+                    abs(float(dot.detach())),
+                )
+                if float(dot.detach()) < -tolerance:
+                    coefficient = dot / denominator
+                    common = [
+                        value - coefficient.to(value.dtype) * normal
+                        for value, normal in zip(common, gradient)
+                    ]
+                    changed = True
+            if not changed:
+                break
     remainder = [
         total - science
         for total, science in zip(total_grad, aggregate_science_grad)
@@ -1506,6 +1731,16 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
     for task_gradient in task_gradients:
         common_dot = _tuple_dot(common, task_gradient)
         remainder_dot = _tuple_dot(remainder, task_gradient)
+        common_value = float(common_dot.detach())
+        remainder_value = float(remainder_dot.detach())
+        if remainder_value < 0.0:
+            remainder_scale = min(
+                remainder_scale,
+                max(0.0, 0.95 * common_value / (-remainder_value)),
+            )
+    for constraint_gradient in active_constraint_gradients:
+        common_dot = _tuple_dot(common, constraint_gradient)
+        remainder_dot = _tuple_dot(remainder, constraint_gradient)
         common_value = float(common_dot.detach())
         remainder_value = float(remainder_dot.detach())
         if remainder_value < 0.0:
@@ -1525,6 +1760,13 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
         name: float(-_tuple_dot(final_grad, gradient).detach())
         for name, gradient in zip(task_names, task_gradients)
     }
+    constraint_directional_derivatives = {
+        name: float(-_tuple_dot(final_grad, gradient).detach())
+        for name, gradient in zip(
+            active_constraint_names,
+            active_constraint_raw_gradients,
+        )
+    }
     derivative_scale = max(
         1.0,
         max(abs(value) for value in directional_derivatives.values()),
@@ -1538,16 +1780,45 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
         value < -derivative_tolerance
         for value in directional_derivatives.values()
     )
-    common_exists = bool(common_exists and all_nonpositive and one_strict)
+    constraint_scale = max(
+        1.0,
+        max(
+            (abs(value) for value in constraint_directional_derivatives.values()),
+            default=0.0,
+        ),
+    )
+    constraint_tolerance = EXACT_GUARD_DERIVATIVE_EPSILON * constraint_scale
+    constraints_nonpositive = all(
+        value <= constraint_tolerance
+        for value in constraint_directional_derivatives.values()
+    )
+    common_exists = bool(
+        common_exists
+        and all_nonpositive
+        and one_strict
+        and constraints_nonpositive
+    )
     if not common_exists:
         final_grad = [m.torch.zeros_like(value) for value in parameters]
         directional_derivatives = {
             name: 0.0 for name in task_names
         }
+        constraint_directional_derivatives = {
+            name: 0.0 for name in active_constraint_names
+        }
     for parameter, gradient in zip(parameters, final_grad):
         parameter.grad = gradient
+    for name, derivative in constraint_directional_derivatives.items():
+        constraint_records[name]["directional_derivative"] = derivative
+
+    def guard_directional_derivatives(direction):
+        return {
+            name: float(_tuple_dot(gradient, direction).detach())
+            for name, gradient in zip(constraint_names, constraint_gradients)
+        }
+
     return {
-        "protocol": "deterministic_subgroup_mgda_rms_normalized_v1",
+        "protocol": "deterministic_exact_guard_constrained_subgroup_mgda_v1",
         "active": True,
         "task_names": task_names,
         "gradient_cosine_matrix": cosine_matrix,
@@ -1563,17 +1834,36 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
         "mgda_iterations": int(iterations),
         "mgda_duality_gap": float(duality_gap),
         "common_direction_exists": common_exists,
+        "unconstrained_common_descent_exists": (
+            unconstrained_common_exists
+        ),
         "common_descent_exists": common_exists,
+        "constrained_common_descent_exists": common_exists,
         "reason": (
-            "subgroup_common_descent"
+            "exact_guard_constrained_subgroup_common_descent"
             if common_exists
-            else "pareto_stationary_or_no_common_descent"
+            else (
+                "no_exact_guard_constrained_common_descent"
+                if active_constraint_names
+                else "pareto_stationary_or_no_common_descent"
+            )
         ),
         "directional_derivatives": directional_derivatives,
         "all_directional_derivatives_nonpositive": all_nonpositive,
         "at_least_one_directional_derivative_strict": one_strict,
         "gradient_rms_rescale": float(target_rms.detach()),
         "non_scientific_remainder_scale": float(remainder_scale),
+        "active_constraint_gradients": active_constraint_names,
+        "active_constraint_count": len(active_constraint_names),
+        "constraint_projection_passes": int(projection_passes),
+        "constraint_directional_derivatives": (
+            constraint_directional_derivatives
+        ),
+        "all_constraint_derivatives_nonpositive": constraints_nonpositive,
+        "constraint_metrics": constraint_records,
+        "_guard_directional_derivative_callback": (
+            guard_directional_derivatives if guard_enabled else None
+        ),
     }
 
 
@@ -1640,6 +1930,26 @@ def _decoder_amplitude_summary(trace, seam=None):
         result[f"{name}_tangent_abs_max"] = float(
             selected.abs().max().detach()
         ) if selected.numel() else 0.0
+    return result
+
+
+def _decoder_amplitude_by_group(trace, seam, group):
+    """Report output magnitude separately for all four scientific groups."""
+    result = {}
+    for index, label in enumerate(m.REFINER_GROUP_LABELS):
+        selected = group == index
+        if not bool(selected.any()):
+            continue
+        repair = trace.get("repair", {})
+        sliced = {
+            key: value[selected]
+            for key, value in repair.items()
+            if m.torch.is_tensor(value) and value.shape[0] == group.shape[0]
+        }
+        result[label] = _decoder_amplitude_summary(
+            {"repair": sliced},
+            seam[selected],
+        )
     return result
 
 
@@ -1752,7 +2062,7 @@ def run(args):
         guard = report.get("group_guard_contract", {})
         if (
             guard.get("schema")
-            != "refiner_fixed_gate_metric_anchor_guard_v3"
+            != "refiner_exact_metric_anchor_guard_v4"
             or guard.get("bank") != "complete_seen_train_anchor"
             or guard.get("fixed_across_all_steps") is not True
             or guard.get("rolling_pre_step_reference_forbidden") is not True
@@ -1851,6 +2161,12 @@ def run(args):
         guard_relative_tolerance,
         guard_absolute_tolerance,
     ) = _group_guard_tolerances(fixed_guard_anchor, cfg)
+    guard_metric_metadata = _group_guard_metric_metadata(
+        fixed_guard_anchor,
+        guard_relative_tolerance,
+        guard_absolute_tolerance,
+        cfg,
+    )
     destination.mkdir(parents=True)
     report = {"schema":SCHEMA,"protocol":m.BOUNDARY_PROTOCOL,"fingerprint":fingerprint(args,cfg),
               "completed":False,"published":False,"independent_validation":False,
@@ -1859,15 +2175,21 @@ def run(args):
               "foundation_report":str(Path(args.foundation_report).resolve()),
               "fit_bank":fit_bank_contract(args.windows, cfg),
               "source_separation":separation,"recipes":recipes,"target_steps":args.steps,
+              "candidate_audit_artifact": str(
+                  (destination / "optimizer_updates.jsonl").resolve()
+              ),
+              "gradient_audit_artifact": str(
+                  (destination / "gradients.jsonl").resolve()
+              ),
               "windows":[{"path":str(db["paths"][i]),"sha256":common.file_sha256(db["paths"][i])} for i in selected],
               "baseline":{},"history":[],
               "group_guard_contract": {
-                  "schema": "refiner_fixed_gate_metric_anchor_guard_v3",
+                  "schema": "refiner_exact_metric_anchor_guard_v4",
                   "bank": "complete_seen_train_anchor",
                   "fixed_across_all_steps": True,
                   "rolling_pre_step_reference_forbidden": True,
                   "historical_component_minimum_intersection": False,
-                  "joint_reference": "best_so_far",
+                  "joint_reference": "not_used",
                   "component_reference": "immutable_initial_anchor",
                   "relative_tolerance": dict(guard_relative_tolerance),
                   "absolute_tolerance": dict(guard_absolute_tolerance),
@@ -1884,6 +2206,8 @@ def run(args):
                   "initial_anchor": dict(fixed_guard_anchor),
                   "best_so_far": dict(fixed_guard_best),
                   "current": dict(fixed_guard_current),
+                  "metric_metadata": guard_metric_metadata,
+                  "coarse_feasibility_sum_removed": True,
               },
               "output_amplitude_contract": {
                   "schema": "refiner_output_head_trust_warmup_v1",
@@ -1893,9 +2217,9 @@ def run(args):
                   "decoder_caps_changed": False,
               },
               "multiobjective_contract": {
-                  "schema": "refiner_subgroup_mgda_v1",
+                  "schema": "refiner_exact_guard_constrained_subgroup_mgda_v2",
                   "protocol":
-                      "deterministic_subgroup_mgda_rms_normalized",
+                      "deterministic_exact_guard_constrained_subgroup_mgda",
                   "objectives": [
                       f"{label}.{component}"
                       for label in m.REFINER_GROUP_LABELS
@@ -1912,12 +2236,21 @@ def run(args):
                       "pareto_stationary_or_no_common_descent",
                   "actual_loss_closure_required": True,
                   "physical_remainder_requires_scientific_nonregression": True,
+                  "fixed_guard_gradient_scope": "complete_seen_train_anchor",
+                  "active_margin_fraction": EXACT_GUARD_ACTIVE_MARGIN_FRACTION,
+                  "constraint_projection_max_passes": (
+                      EXACT_GUARD_PROJECTION_MAX_PASSES
+                  ),
+                  "minimum_effective_scale": EXACT_GUARD_MIN_EFFECTIVE_SCALE,
                   "production_gate_thresholds_changed": False,
               },
               "multiobjective_diagnostics": {
                   "steps_evaluated": 0,
                   "common_descent_steps": 0,
                   "pareto_stationary_steps": 0,
+                  "constrained_common_descent_steps": 0,
+                  "no_constrained_common_descent_steps": 0,
+                  "active_constraint_counts": {},
                   "last": None,
               }}
     report["fit_bank_artifact"] = save_fit_bank(
@@ -1963,6 +2296,17 @@ def run(args):
             trace=amplitude_trace,
         )
         loss = repair + cfg.product_refiner_clean_identity_weight * protection
+        _, fixed_guard_values = _diagnostic_guarded_loss(
+            model,
+            fixed_guard_batch,
+            cfg,
+        )
+        group_guard_before = {
+            key: float(value.detach())
+            for key, value in fixed_guard_values.items()
+        }
+        if set(group_guard_before) != set(fixed_guard_current):
+            raise RuntimeError("fixed Guard metric layout changed during fitting")
         gradient = m._refiner_gradient_diagnostics(model,repair,protection,cfg.product_refiner_clean_identity_weight) if logging else None
         components = m._refiner_component_gradients(model,terms,cfg) if logging else None
         optimizer.zero_grad(set_to_none=True)
@@ -1971,9 +2315,16 @@ def run(args):
             loss,
             terms,
             cfg,
+            fixed_guard_values=fixed_guard_values,
+            guard_reference=fixed_guard_anchor,
+            guard_relative_tolerance=guard_relative_tolerance,
+            guard_absolute_tolerance=guard_absolute_tolerance,
+            guard_metadata=guard_metric_metadata,
+        )
+        guard_derivative_callback = pareto_gradient.pop(
+            "_guard_directional_derivative_callback"
         )
         norm = float(m.torch.nn.utils.clip_grad_norm_(model.parameters(),1,error_if_nonfinite=True))
-        group_guard_before = dict(fixed_guard_current)
         group_guard_best_before = dict(fixed_guard_best)
         group_guard_reference = _mixed_group_guard_reference(
             fixed_guard_anchor,
@@ -1993,11 +2344,17 @@ def run(args):
             group_guard_reference=group_guard_reference,
             group_guard_relative_tolerance=guard_relative_tolerance,
             group_guard_absolute_tolerance=guard_absolute_tolerance,
+            group_guard_metric_metadata=guard_metric_metadata,
+            group_guard_directional_derivative=guard_derivative_callback,
+            required_guard_improvement_keys=tuple(
+                f"{label}.observable_{component}_0p03"
+                for label in m.REFINER_GROUP_LABELS
+                for component in ("endpoint", "temporal")
+            ),
+            minimum_effective_scale=EXACT_GUARD_MIN_EFFECTIVE_SCALE,
         )
         if not pareto_gradient["common_descent_exists"]:
-            update["reason"] = (
-                "pareto_stationary_or_no_common_descent"
-            )
+            update["reason"] = pareto_gradient["reason"]
         update["subgroup_directional_derivatives"] = dict(
             pareto_gradient["directional_derivatives"]
         )
@@ -2008,8 +2365,20 @@ def run(args):
         multiobjective["steps_evaluated"] += 1
         if pareto_gradient["common_descent_exists"]:
             multiobjective["common_descent_steps"] += 1
+            multiobjective["constrained_common_descent_steps"] += 1
         else:
-            multiobjective["pareto_stationary_steps"] += 1
+            if not pareto_gradient[
+                "unconstrained_common_descent_exists"
+            ]:
+                multiobjective["pareto_stationary_steps"] += 1
+            multiobjective["no_constrained_common_descent_steps"] += 1
+        active_counts = Counter(
+            multiobjective.get("active_constraint_counts", {})
+        )
+        active_counts.update(pareto_gradient["active_constraint_gradients"])
+        multiobjective["active_constraint_counts"] = dict(
+            sorted(active_counts.items())
+        )
         multiobjective["last"] = dict(pareto_gradient)
         if update["optimizer_update_accepted"]:
             fixed_guard_current = dict(update["group_guard_after"])
@@ -2022,7 +2391,7 @@ def run(args):
             }
         update["group_guard_anchor"] = dict(fixed_guard_anchor)
         update["group_guard_reference_policy"] = (
-            "fixed_component_anchor_with_best_joint_envelope"
+            "immutable_fixed_metric_anchor"
         )
         update["group_guard_best_before"] = group_guard_best_before
         update["group_guard_best_after"] = dict(fixed_guard_best)
@@ -2056,15 +2425,25 @@ def run(args):
             gradient = m._refiner_gradient_diagnostics(model,r,p,cfg.product_refiner_clean_identity_weight)
             components = m._refiner_component_gradients(model,t,cfg)
         if logging or stopped_early:
+            amplitude_summary = _decoder_amplitude_summary(
+                amplitude_trace or {}, batch.get("seam")
+            )
+            amplitude_by_group = _decoder_amplitude_by_group(
+                amplitude_trace or {}, batch["seam"], batch["group"]
+            )
+            report["output_amplitude_diagnostics"] = {
+                "step": step,
+                "aggregate": amplitude_summary,
+                "by_group": amplitude_by_group,
+            }
             save_diagnostic_state(destination,model,optimizer,report,step)
             row = {"stage":"observable_bridge_fit","step":step,"target_steps":args.steps,
                    "repair":float(repair.detach()),"clean":float(protection.detach()),
                    "terms":{k:float(v.detach()) for k,v in terms.items()},"gradient":gradient,
                    "component_gradients":components,"clip_norm_before":norm,
                    "pareto_gradient":pareto_gradient,
-                   "decoder_output_amplitude":_decoder_amplitude_summary(
-                       amplitude_trace or {}, batch.get("seam")
-                   ),
+                   "decoder_output_amplitude":amplitude_summary,
+                   "decoder_output_amplitude_by_group":amplitude_by_group,
                    "output_warmup":warmup,
                    "optimizer_update":update,
                    "fit_context_index":fit_context_index,
@@ -2120,7 +2499,10 @@ def run(args):
                          "learning_scope_diagnosis":scope_diagnosis,
                          "group_guard_contract":report["group_guard_contract"],
                          "multiobjective_contract":report["multiobjective_contract"],
-                         "multiobjective_diagnostics":report["multiobjective_diagnostics"],
+                          "multiobjective_diagnostics":report["multiobjective_diagnostics"],
+                          "output_amplitude_diagnostics":report.get(
+                              "output_amplitude_diagnostics"
+                          ),
                          "optimizer_updates":report["optimizer_updates"],
                          "fit_bank":report["fit_bank"],
                          "fit_bank_artifact":report["fit_bank_artifact"],

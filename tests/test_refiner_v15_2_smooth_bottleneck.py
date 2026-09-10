@@ -8,12 +8,12 @@ from training import refiner_bridge_diagnostics as d
 def test_v15_2_protocol_contract():
     assert (
         m.REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL
-        == "gate_aligned_temporal_group_rms_fixed_anchor_guard_observable_v15_12b"
+        == "gate_aligned_temporal_exact_guard_observable_v15_12f"
     )
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12e"
+        == "refiner_observable_bridge_diagnostic_v15_12f"
     )
 
     assert (

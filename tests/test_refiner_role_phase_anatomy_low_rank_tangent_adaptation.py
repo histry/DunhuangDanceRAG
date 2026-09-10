@@ -423,5 +423,7 @@ def test_termination_protocol_does_not_change_optimizer_contract_constants():
     # The fixed-point correction lives outside refiner_optimizer and does not
     # change the scientific Armijo/group-guard implementation.
     from training import refiner_optimizer as optimizer
-    assert optimizer.REFINER_UPDATE_PROTOCOL == "fixed_anchor_best_so_far_guard_armijo_v8"
+    assert optimizer.REFINER_UPDATE_PROTOCOL == (
+        "exact_guard_constrained_fixed_anchor_armijo_v9"
+    )
     assert optimizer.MAX_BACKTRACK_TRIALS == 12

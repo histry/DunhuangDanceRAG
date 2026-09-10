@@ -121,9 +121,11 @@ REFINER_CONDITION_PATH_PROTOCOL = (
 )
 REFINER_CONDITION_PATH_FEATURE_DIM = 4
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
-REFINER_REPAIR_SAFETY_PROTOCOL = "stage_registry_smooth_tail_support_root_v4"
+REFINER_REPAIR_SAFETY_PROTOCOL = (
+    "stage_registry_exact_signed_guard_tail_support_root_v5"
+)
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
-    "gate_aligned_temporal_group_rms_fixed_anchor_guard_observable_v15_12b"
+    "gate_aligned_temporal_exact_guard_observable_v15_12f"
 )
 REFINER_CONFIDENCE_PRECONDITION_PROTOCOL = (
     "identity_weights_after_v15_7_rejection_v2"
@@ -4346,14 +4348,25 @@ def _reference_support_statistics_torch(predicted_joints, clean_joints, clean_co
     return stats(clean_feet, baseline), stats(pred_feet, candidate), static
 
 
-def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_contacts, cfg, *, reduction="mean", stage_relative=False):
+def _clean_support_tolerance_loss_torch(
+    predicted_joints,
+    clean_joints,
+    clean_contacts,
+    cfg,
+    *,
+    reduction="mean",
+    stage_relative=False,
+    return_terms=False,
+):
     """Tolerance-only loss, using fixed reference speed AND segment drift."""
     if predicted_joints.shape[1] < 2:
-        return predicted_joints.sum() * 0.0
+        zero = predicted_joints.sum() * 0.0
+        return (zero, {}) if return_terms else zero
     before, after, _ = _reference_support_statistics_torch(predicted_joints, clean_joints, clean_contacts, cfg)
     policy = StageAcceptancePolicy.from_environment()
     from contracts.physical_quality import physical_metric_specs, PhysicalQualityLimits
     penalties = []
+    terms = {}
     for spec in physical_metric_specs(PhysicalQualityLimits.from_environment(), policy):
         if spec.key not in before:
             continue
@@ -4364,14 +4377,33 @@ def _clean_support_tolerance_loss_torch(predicted_joints, clean_joints, clean_co
             # Repair-input budget: match ratio PLUS margin and epsilon from
             # evaluate_stage_candidate. Do not apply this to clean identity,
             # whose separate fidelity audit uses max(ratio, margin).
-            penalties.append(_smooth_stage_safety_excess(pred, ref, spec))
+            penalty, allowed, epsilon, signed_margin = (
+                _stage_high_guard_terms_torch(pred, ref, spec)
+            )
         else:
             # Keep the existing clean-protection surrogate unchanged.
             allowed = torch.where(ref > spec.absolute_limit, ref,
                 torch.minimum(torch.maximum(ref * ratio, ref + margin), ref.new_tensor(spec.absolute_limit)))
-            penalties.append(torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4))
+            penalty = torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4)
+            epsilon = torch.zeros_like(pred)
+            signed_margin = pred - allowed
+        penalties.append(penalty)
+        terms[f"repair_{spec.key}_excess"] = penalty
+        terms[f"repair_{spec.key}_value"] = pred
+        terms[f"repair_{spec.key}_reference"] = ref
+        terms[f"repair_{spec.key}_allowed"] = allowed
+        terms[f"repair_{spec.key}_comparison_epsilon"] = epsilon
+        terms[f"repair_{spec.key}_signed_margin"] = signed_margin
     loss = sum(penalties) / max(1, len(penalties))
-    return loss if reduction=="none" else loss.mean()
+    reduced = loss if reduction == "none" else loss.mean()
+    if return_terms:
+        reduced_terms = (
+            terms
+            if reduction == "none"
+            else {key: value.mean() for key, value in terms.items()}
+        )
+        return reduced, reduced_terms
+    return reduced
 
 
 def _fixed_support_stage_gate(reference, prediction, cfg, *, before_audit=None, after_audit=None):
@@ -4460,6 +4492,56 @@ def _clean_jerk_tolerance_loss_torch(predicted_joints, clean_joints, cfg):
     return sum(terms.values()) / len(terms), terms
 
 
+def _stage_high_guard_terms_torch(predicted, baseline, spec):
+    """Return the exact high-is-bad stage boundary and signed residual."""
+    if (not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1
+            or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0):
+        raise ValueError("invalid repair safety policy")
+    baseline = baseline.detach()
+    allowed = torch.where(
+        baseline <= spec.absolute_limit,
+        (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(
+            spec.absolute_limit
+        ),
+        baseline,
+    )
+    epsilon = (baseline.abs() * 1e-6).clamp_min(
+        max(1e-8, abs(spec.absolute_limit) * 1e-9)
+    )
+    signed_margin = predicted - allowed - epsilon
+    scale = (allowed - baseline).clamp_min(
+        max(1e-4, spec.stage_margin)
+    )
+    gap = torch.relu(signed_margin) / scale
+    shoulder = gap.clamp_max(1.0)
+    penalty = 0.5 * shoulder.square() + (gap - shoulder)
+    return penalty, allowed, epsilon, signed_margin
+
+
+def _stage_low_guard_terms_torch(predicted, baseline, spec):
+    """Return the exact low-is-bad stage boundary and signed residual."""
+    if not np.isfinite(spec.stage_margin) or spec.stage_margin < 0:
+        raise ValueError("invalid repair safety policy")
+    baseline = baseline.detach()
+    floor = baseline.new_tensor(float(spec.absolute_limit))
+    allowed = torch.where(
+        baseline >= spec.absolute_limit,
+        torch.maximum(floor, baseline - spec.stage_margin),
+        baseline,
+    )
+    epsilon = (baseline.abs() * 1e-6).clamp_min(
+        max(1e-8, abs(spec.absolute_limit) * 1e-9)
+    )
+    signed_margin = allowed - predicted - epsilon
+    scale = (baseline - allowed).clamp_min(
+        max(1e-4, spec.stage_margin)
+    )
+    gap = torch.relu(signed_margin) / scale
+    shoulder = gap.clamp_max(1.0)
+    penalty = 0.5 * shoulder.square() + (gap - shoulder)
+    return penalty, allowed, epsilon, signed_margin
+
+
 def _smooth_stage_safety_excess(predicted, baseline, spec):
     """Differentiable surrogate with the stage registry's UNCHANGED budget.
 
@@ -4470,23 +4552,7 @@ def _smooth_stage_safety_excess(predicted, baseline, spec):
     zero slope, inside the exact budget. Its normalization margin is never added
     to the acceptance budget; the independent stage audit remains authoritative.
     """
-    if (not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1
-            or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0):
-        raise ValueError("invalid repair safety policy")
-    baseline = baseline.detach()
-    allowed = torch.where(
-        baseline <= spec.absolute_limit,
-        (baseline * spec.stage_ratio + spec.stage_margin).clamp_max(spec.absolute_limit),
-        baseline,
-    )
-    epsilon = (baseline.abs() * 1e-6).clamp_min(
-        max(1e-8, abs(spec.absolute_limit) * 1e-9)
-    )
-    scale = (allowed - baseline).clamp_min(max(1e-4, spec.stage_margin))
-    gap = torch.relu(predicted - allowed - epsilon) / scale
-    shoulder = gap.clamp_max(1.0)
-    # Keep the small quadratic term out of the gap-minus-shoulder cancellation.
-    return 0.5 * shoulder.square() + (gap - shoulder)
+    return _stage_high_guard_terms_torch(predicted, baseline, spec)[0]
 
 
 def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
@@ -4518,12 +4584,20 @@ def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
     specs = {spec.key: spec for spec in physical_metric_specs(
         PhysicalQualityLimits.from_environment(), StageAcceptancePolicy.from_environment())}
     terms = {}
+    penalties = []
     for label, key in labels.items():
         spec, baseline = specs[key], before[label]
-        terms[f"repair_jerk_{label}_excess"] = _smooth_stage_safety_excess(
-            after[label], baseline, spec
+        penalty, allowed, epsilon, signed_margin = (
+            _stage_high_guard_terms_torch(after[label], baseline, spec)
         )
-    return sum(terms.values()), terms
+        penalties.append(penalty)
+        terms[f"repair_jerk_{label}_excess"] = penalty
+        terms[f"repair_{key}_value"] = after[label]
+        terms[f"repair_{key}_reference"] = baseline
+        terms[f"repair_{key}_allowed"] = allowed
+        terms[f"repair_{key}_comparison_epsilon"] = epsilon
+        terms[f"repair_{key}_signed_margin"] = signed_margin
+    return sum(penalties), terms
 
 
 def _root_vertical_statistics_torch(motion, cfg):
@@ -7692,6 +7766,61 @@ def _refiner_batch_objectives(model, batch, cfg, *, group_objectives=None, trace
                     "root_vertical_safety_excess",
                 ):
                     terms[f"group_{label}_{key}"] = case_terms[key][selected].mean()
+                # V15.12f keeps the fixed-bank guard in the same metric domain
+                # as the differentiable stage audit.  Preserve sparse peaks by
+                # grouping safety excesses with max rather than a case mean.
+                for key in (
+                    "repair_jerk_p95_excess",
+                    "repair_jerk_max_excess",
+                    "repair_jerk_window_p95_excess",
+                    "repair_jerk_extremity_p95_excess",
+                    "repair_jerk_extremity_window_p95_excess",
+                    "repair_foot_skate_mps_p95_excess",
+                    "repair_foot_skate_mps_max_excess",
+                    "repair_foot_support_drift_m_p95_excess",
+                    "repair_foot_support_drift_m_max_excess",
+                    "penetration_excess",
+                    "observable_trust_excess",
+                    "jerk",
+                ):
+                    terms[f"group_{label}_{key}_max"] = case_terms[key][
+                        selected
+                    ].max()
+                for key in (
+                    "repair_joint_jerk_mps3_p95_signed_margin",
+                    "repair_joint_jerk_mps3_max_signed_margin",
+                    "repair_joint_jerk_window_p95_max_mps3_signed_margin",
+                    "repair_extremity_jerk_mps3_p95_signed_margin",
+                    "repair_extremity_jerk_window_p95_max_mps3_signed_margin",
+                    "repair_foot_skate_mps_p95_signed_margin",
+                    "repair_foot_skate_mps_max_signed_margin",
+                    "repair_foot_support_drift_m_p95_signed_margin",
+                    "repair_foot_support_drift_m_max_signed_margin",
+                    "repair_foot_penetration_min_m_signed_margin",
+                    "boundary_jerk_signed_margin",
+                ):
+                    terms[f"group_{label}_{key}_max"] = case_terms[key][
+                        selected
+                    ].max()
+                for key in (
+                    "repair_joint_jerk_mps3_p95_value",
+                    "repair_joint_jerk_mps3_max_value",
+                    "repair_joint_jerk_window_p95_max_mps3_value",
+                    "repair_extremity_jerk_mps3_p95_value",
+                    "repair_extremity_jerk_window_p95_max_mps3_value",
+                    "repair_foot_skate_mps_p95_value",
+                    "repair_foot_skate_mps_max_value",
+                    "repair_foot_support_drift_m_p95_value",
+                    "repair_foot_support_drift_m_max_value",
+                ):
+                    terms[f"group_{label}_{key}_max"] = case_terms[key][
+                        selected
+                    ].max()
+                terms[
+                    f"group_{label}_repair_foot_penetration_min_m_value_min"
+                ] = case_terms[
+                    "repair_foot_penetration_min_m_value"
+                ][selected].min()
     protection, identity_terms = _product_refiner_clean_identity_loss(
         identity,
         batch["clean"],
@@ -8242,13 +8371,42 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         raise ValueError("minimum-edit weight must be finite and non-negative")
     outside = (delta.abs() * (1.0 - seam)).mean((1,2))
     contact = (prediction[..., :4] - reference[..., :4]).square().mean((1,2))
-    support = _clean_support_tolerance_loss_torch(proposed_joints, reference_joints, reference[..., :4], cfg,
-        reduction="none", stage_relative=True)
+    support, support_terms = _clean_support_tolerance_loss_torch(
+        proposed_joints,
+        reference_joints,
+        reference[..., :4],
+        cfg,
+        reduction="none",
+        stage_relative=True,
+        return_terms=True,
+    )
     feet = list(DEFAULT_FOOT_JOINTS)
     floor = torch.quantile(reference_joints[..., feet, 1].flatten(1), .05, dim=1).detach()
-    penetration = torch.relu(floor[:, None, None] - proposed_joints[..., feet, 1] - .008).mean((1,2))
-    reference_penetration = torch.relu(floor[:, None, None] - reference_joints[..., feet, 1] - .008).mean((1,2)).detach()
-    penetration = torch.relu(penetration - reference_penetration)
+    proposed_foot_height = proposed_joints[..., feet, 1] - floor[:, None, None]
+    reference_foot_height = reference_joints[..., feet, 1] - floor[:, None, None]
+    penetration_min = proposed_foot_height.flatten(1).amin(dim=1)
+    reference_penetration_min = reference_foot_height.flatten(1).amin(dim=1).detach()
+    physical_specs = {
+        spec.key: spec
+        for spec in physical_metric_specs(
+            PhysicalQualityLimits.from_environment(),
+            StageAcceptancePolicy.from_environment(),
+        )
+    }
+    (
+        penetration,
+        penetration_allowed,
+        penetration_epsilon,
+        penetration_signed_margin,
+    ) = _stage_low_guard_terms_torch(
+        penetration_min,
+        reference_penetration_min,
+        physical_specs["foot_penetration_min_m"],
+    )
+    boundary_allowed = 1.02 * before["seam_jerk_mps3"] + 1.0e-6
+    boundary_signed_margin = (
+        proposed["seam_jerk_mps3"] - boundary_allowed
+    )
     # Both exact observable requirements remain active until their respective
     # buffered training targets are satisfied.
     scientific_observable = joint_scientific
@@ -8312,10 +8470,22 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         "seam_jerk": proposed["seam_jerk_mps3"], "relative_temporal": temporal,
         "physics": physics, "contact": contact, "outside": outside,
         "jerk": jerk,
+        "boundary_jerk_allowed": boundary_allowed,
+        "boundary_jerk_signed_margin": boundary_signed_margin,
         "jerk_safety_excess": jerk_safety, **jerk_safety_terms,
         "root_vertical_safety_excess":root_safety, **root_safety_terms,
         "observable_trust_excess": trust, "support_excess": support,
+        **support_terms,
         "penetration_excess": penetration,
+        "repair_foot_penetration_min_m_value": penetration_min,
+        "repair_foot_penetration_min_m_reference": reference_penetration_min,
+        "repair_foot_penetration_min_m_allowed": penetration_allowed,
+        "repair_foot_penetration_min_m_comparison_epsilon": (
+            penetration_epsilon
+        ),
+        "repair_foot_penetration_min_m_signed_margin": (
+            penetration_signed_margin
+        ),
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }
     return (loss,terms) if reduction=="none" else (loss.mean(),{k:v.mean() for k,v in terms.items()})
