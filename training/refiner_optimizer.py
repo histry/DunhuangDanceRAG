@@ -183,6 +183,9 @@ def checked_refiner_step(
         "group_guard_after": None,
         "group_guard_rejected_trials": 0,
         "group_guard_last_violations": {},
+        "minimum_audited_scale": None,
+        "minimum_accepted_scale": None,
+        "minimum_acceptable_scale": None,
         "trials": [],
     }
     maximum_gradient = torch.stack([g.abs().max() for g in gradients]).max()
@@ -269,10 +272,23 @@ def checked_refiner_step(
 
                 candidate_loss, candidate_groups = evaluate_closure()
                 report["trial_evaluations"] += 1
+                report["minimum_audited_scale"] = (
+                    scale
+                    if report["minimum_audited_scale"] is None
+                    else min(report["minimum_audited_scale"], scale)
+                )
                 required = max(minimum_decrease, -ARMIJO_FACTOR * scale * slope)
                 loss_ok = math.isfinite(candidate_loss) and before - candidate_loss >= required
                 violations = subgroup_violations(candidate_groups) if loss_ok else {}
                 guard_ok = not violations
+                residual_delta = (
+                    {
+                        key: candidate_groups[key] - guard_reference[key]
+                        for key in guard_reference
+                    }
+                    if guard_enabled
+                    else {}
+                )
                 report["trials"].append(
                     {
                         "direction": name,
@@ -282,6 +298,8 @@ def checked_refiner_step(
                         "directional_derivative": slope,
                         "group_guard_passed": guard_ok if guard_enabled and loss_ok else None,
                         "group_guard_violations": violations,
+                        "group_guard_residual_delta": residual_delta,
+                        "group_guard_blocking_reasons": sorted(violations),
                     }
                 )
                 if report["trial_evaluations"] == 1:
@@ -300,6 +318,8 @@ def checked_refiner_step(
                             else "same_batch_loss_decreased"
                         ),
                         group_guard_after=(candidate_groups if guard_enabled else None),
+                        minimum_accepted_scale=scale,
+                        minimum_acceptable_scale=scale,
                     )
                     return True
                 if loss_ok and violations:
@@ -368,6 +388,29 @@ def record_update(summary, update):
     }
     for name, value in counts.items():
         summary[name] = summary.get(name, 0) + value
+    reasons = dict(summary.get("group_guard_rejection_reasons", {}))
+    for trial in update.get("trials", []):
+        for reason in trial.get("group_guard_blocking_reasons", []):
+            reasons[reason] = reasons.get(reason, 0) + 1
+    summary["group_guard_rejection_reasons"] = dict(
+        sorted(reasons.items())
+    )
+    audited_scale = update.get("minimum_audited_scale")
+    if audited_scale is not None:
+        current = summary.get("minimum_audited_scale")
+        summary["minimum_audited_scale"] = (
+            float(audited_scale)
+            if current is None
+            else min(float(current), float(audited_scale))
+        )
+    accepted_scale = update.get("minimum_accepted_scale")
+    if accepted_scale is not None:
+        current = summary.get("minimum_accepted_scale")
+        summary["minimum_accepted_scale"] = (
+            float(accepted_scale)
+            if current is None
+            else min(float(current), float(accepted_scale))
+        )
 
 
 def validate_update_summary(summary, expected_steps):

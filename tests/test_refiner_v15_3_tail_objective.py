@@ -52,7 +52,7 @@ def test_v15_3_1_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12d"
+        == "refiner_observable_bridge_diagnostic_v15_12e"
     )
 
     assert d.FIT_CONTEXT_COUNT == 5
@@ -384,3 +384,4 @@ def test_smooth_cvar_fails_closed():
         raise AssertionError(
             "negative scientific deficit must fail closed"
         )
+

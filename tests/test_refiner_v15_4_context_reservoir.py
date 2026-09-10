@@ -12,7 +12,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_4_contract_preserves_scientific_objective():
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12d"
+        == "refiner_observable_bridge_diagnostic_v15_12e"
     )
 
     assert (
@@ -464,3 +464,4 @@ def test_production_run_materializes_only_current_reservoir_transaction():
         '"fit_transaction_materialization":"lazy_current_step_only"'
         in compact
     )
+

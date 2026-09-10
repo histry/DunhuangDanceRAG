@@ -408,3 +408,12 @@ def test_group_guard_accepts_exact_per_metric_tolerance_maps():
     )
     assert report['optimizer_update_accepted']
     assert isinstance(report['group_guard_absolute_tolerance'],dict)
+    assert report['minimum_audited_scale'] is not None
+    assert report['minimum_accepted_scale'] == report['step_scale']
+    assert report['minimum_acceptable_scale'] == report['step_scale']
+    accepted = report['trials'][-1]
+    assert set(accepted['group_guard_residual_delta']) == {
+        'single_short.endpoint',
+        'cross_short.support',
+    }
+    assert accepted['group_guard_blocking_reasons'] == []

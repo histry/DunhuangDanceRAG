@@ -13,7 +13,7 @@ def test_v15_2_protocol_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12d"
+        == "refiner_observable_bridge_diagnostic_v15_12e"
     )
 
     assert (
@@ -195,3 +195,4 @@ def test_smooth_bottleneck_rejects_shape_mismatch():
             endpoint,
             temporal,
         )
+

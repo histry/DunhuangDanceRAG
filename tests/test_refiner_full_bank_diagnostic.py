@@ -1016,7 +1016,22 @@ def test_v15_12d_gate_metric_tolerances_are_nonaccumulating():
     )
 
 
-def test_v15_12d_pcgrad_keeps_endpoint_and_temporal_descent_products():
+def _eight_subgroup_objectives(endpoint, temporal):
+    terms = {
+        "endpoint_training_objective": endpoint,
+        "temporal_training_objective": temporal,
+    }
+    for label in m.REFINER_GROUP_LABELS:
+        terms[
+            f"group_{label}_endpoint_scientific_tail_risk"
+        ] = endpoint
+        terms[
+            f"group_{label}_temporal_scientific_tail_risk"
+        ] = temporal / m.REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+    return terms
+
+
+def test_v15_12e_mgda_keeps_all_subgroup_derivatives_nonpositive():
     model = torch.nn.Linear(2, 1, bias=False)
     with torch.no_grad():
         model.weight.zero_()
@@ -1029,16 +1044,44 @@ def test_v15_12d_pcgrad_keeps_endpoint_and_temporal_descent_products():
     report = d._pareto_common_descent_backward(
         model,
         total,
-        {
-            "endpoint_training_objective": endpoint,
-            "temporal_training_objective": temporal,
-        },
+        _eight_subgroup_objectives(endpoint, temporal),
         m.MotionGenerationConfig(),
     )
 
     assert report["active"]
-    assert report["conflict"]
-    assert report["common_direction_exists"]
-    assert report["amplitude_preserving_scale"] > 0.0
-    assert report["final_endpoint_directional_product"] >= 0.0
-    assert report["final_temporal_directional_product"] >= 0.0
+    assert report["common_descent_exists"]
+    assert len(report["task_names"]) == 8
+    assert len(report["gradient_cosine_matrix"]) == 8
+    assert set(report["mgda_weights"]) == set(report["task_names"])
+    assert sum(report["mgda_weights"].values()) == pytest.approx(1.0)
+    assert report["mgda_min_norm"] > 0.0
+    assert all(
+        value <= 1.0e-10
+        for value in report["directional_derivatives"].values()
+    )
+    assert any(
+        value < -1.0e-10
+        for value in report["directional_derivatives"].values()
+    )
+
+
+def test_v15_12e_mgda_reports_pareto_stationary_opposition():
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.zero_()
+    prediction = model.weight.reshape(-1)[0]
+    endpoint = (prediction - 1.0).square()
+    temporal = (prediction + 1.0).square()
+    total = endpoint + temporal
+
+    report = d._pareto_common_descent_backward(
+        model,
+        total,
+        _eight_subgroup_objectives(endpoint, temporal),
+        m.MotionGenerationConfig(),
+    )
+
+    assert not report["common_descent_exists"]
+    assert report["reason"] == "pareto_stationary_or_no_common_descent"
+    assert report["mgda_min_norm"] <= d.MGDA_COMMON_DESCENT_RMS_EPSILON
+    assert all(value == 0.0 for value in report["directional_derivatives"].values())

@@ -26,8 +26,8 @@ from motion_geometry import product_manifold, physical
 from contracts import physical_quality
 
 
-SCHEMA = "refiner_observable_bridge_diagnostic_v15_12d"
-FIT_PROTOCOL = "pcgrad_gate_metric_context_reservoir_transaction_v5"
+SCHEMA = "refiner_observable_bridge_diagnostic_v15_12e"
+FIT_PROTOCOL = "subgroup_mgda_context_reservoir_transaction_v6"
 
 CONTEXT_RESERVOIR_PROTOCOL = (
     "all_probe_safe_farthest_order_rotating_c5_v1"
@@ -40,6 +40,9 @@ PROBE_START_GUARD_FRAMES = 6
 
 OUTPUT_WARMUP_STEPS = 50
 OUTPUT_WARMUP_LR_MULTIPLIER = 10.0
+MGDA_MAX_ITERATIONS = 512
+MGDA_DUALITY_GAP_TOLERANCE = 1.0e-10
+MGDA_COMMON_DESCENT_RMS_EPSILON = 1.0e-8
 
 
 def fingerprint(args, cfg):
@@ -86,7 +89,9 @@ def fingerprint(args, cfg):
     value["fit_protocol"] = FIT_PROTOCOL
     value["context_reservoir_protocol"] = CONTEXT_RESERVOIR_PROTOCOL
     value["probe_scope"] = PROBE_SCOPE
-    value["pareto_gradient_protocol"] = "symmetric_pcgrad_rms_scaled_v1"
+    value["pareto_gradient_protocol"] = (
+        "deterministic_subgroup_mgda_rms_normalized_v1"
+    )
     value["guard_envelope_protocol"] = "fixed_component_anchor_best_joint_v1"
     value["output_warmup_steps"] = OUTPUT_WARMUP_STEPS
     value["output_warmup_lr_multiplier"] = OUTPUT_WARMUP_LR_MULTIPLIER
@@ -476,7 +481,7 @@ def fit_bank_contract(
             False,
 
         "endpoint_temporal_gradient_protocol":
-            "symmetric_pcgrad_rms_scaled",
+            "deterministic_subgroup_mgda_rms_normalized",
 
         "output_warmup_steps": OUTPUT_WARMUP_STEPS,
 
@@ -517,7 +522,11 @@ def fixed_bank_stalled(update):
     """A retained V12 update already represents the complete context cycle."""
     return (
         not update["optimizer_update_accepted"]
-        and update["reason"] in {"bounded_search_no_descent", "zero_gradient"}
+        and update["reason"] in {
+            "bounded_search_no_descent",
+            "zero_gradient",
+            "pareto_stationary_or_no_common_descent",
+        }
     )
 
 def _cpu_tree(value):
@@ -1287,103 +1296,216 @@ def _tuple_dot(left, right):
     return m.torch.stack(values).sum()
 
 
-def _pareto_common_descent_backward(model, total_loss, terms, cfg):
-    """Backpropagate an RMS-scaled symmetric PCGrad scientific direction.
+def _subgroup_scientific_objectives(terms, cfg):
+    """Return the eight guarded role/width scientific objectives."""
+    objectives = {}
+    scientific_weight = float(
+        cfg.product_refiner_repair_margin_weight
+    )
+    temporal_weight = float(
+        m.REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+    )
+    for label in m.REFINER_GROUP_LABELS:
+        endpoint_key = (
+            f"group_{label}_endpoint_scientific_tail_risk"
+        )
+        temporal_key = (
+            f"group_{label}_temporal_scientific_tail_risk"
+        )
+        if endpoint_key not in terms or temporal_key not in terms:
+            raise RuntimeError(
+                f"missing subgroup scientific objectives for {label}"
+            )
+        objectives[f"{label}.endpoint"] = (
+            scientific_weight * terms[endpoint_key]
+        )
+        objectives[f"{label}.temporal"] = (
+            scientific_weight
+            * temporal_weight
+            * terms[temporal_key]
+        )
+    return objectives
 
-    The endpoint and temporal gradients are projected symmetrically when they
-    conflict. Their common direction is rescaled to the RMS task norm so a
-    negative cosine cannot collapse output amplitude. The remaining physical,
-    trust and fidelity gradient is admitted only as far as both scientific
-    directional derivatives stay nonnegative. Actual candidate acceptance is
-    still decided by the deterministic loss closure and fixed guard envelope.
+
+def _deterministic_mgda_weights(gram):
+    """Minimize alpha.T @ gram @ alpha on the probability simplex.
+
+    The problem has only eight variables.  Exact line-search Frank-Wolfe is
+    deterministic, dependency-free and sufficient for deciding whether the
+    normalized subgroup gradients contain a nonzero common descent vector.
     """
-    endpoint = terms.get("endpoint_training_objective")
-    temporal = terms.get("temporal_training_objective")
-    if endpoint is None or temporal is None:
-        total_loss.backward()
-        return {
-            "protocol": "symmetric_pcgrad_rms_scaled_v1",
-            "active": False,
-            "reason": "scientific_components_unavailable",
-        }
-    weight = float(cfg.product_refiner_repair_margin_weight)
-    endpoint = weight * endpoint
-    temporal = weight * temporal
+    if gram.ndim != 2 or gram.shape[0] != gram.shape[1]:
+        raise ValueError("MGDA Gram matrix must be square")
+    count = int(gram.shape[0])
+    if count < 1:
+        raise ValueError("MGDA requires at least one active gradient")
+    alpha = gram.new_zeros((count,))
+    alpha[int(m.torch.argmin(m.torch.diagonal(gram)).item())] = 1.0
+    duality_gap = float("inf")
+    iterations = 0
+    for iterations in range(1, MGDA_MAX_ITERATIONS + 1):
+        gradient = 2.0 * gram.mv(alpha)
+        vertex_index = int(m.torch.argmin(gradient).item())
+        vertex = gram.new_zeros((count,))
+        vertex[vertex_index] = 1.0
+        direction = vertex - alpha
+        duality_gap = float(
+            (alpha.dot(gradient) - gradient[vertex_index]).detach()
+        )
+        if duality_gap <= MGDA_DUALITY_GAP_TOLERANCE:
+            break
+        denominator = direction.dot(gram.mv(direction))
+        if float(denominator.detach()) <= 0.0:
+            break
+        numerator = -alpha.dot(gram.mv(direction))
+        step = (numerator / denominator).clamp(0.0, 1.0)
+        alpha = alpha + step * direction
+    alpha = alpha.clamp_min(0.0)
+    alpha = alpha / alpha.sum().clamp_min(1.0e-24)
+    return alpha, iterations, duality_gap
+
+
+def _pareto_common_descent_backward(model, total_loss, terms, cfg):
+    """Backpropagate an eight-objective deterministic MGDA direction.
+
+    Gradients are separated by role, width and observable, then normalized by
+    their parameter RMS before the minimum-norm simplex problem is solved.  A
+    near-zero convex-hull projection is reported as Pareto stationary and does
+    not enter line search.  The non-scientific remainder is admitted only while
+    every subgroup directional derivative remains non-positive for the actual
+    update direction.  Exact closure and fixed-anchor guards remain decisive.
+    """
+    objectives = _subgroup_scientific_objectives(terms, cfg)
     parameters = [p for p in model.parameters() if p.requires_grad]
-    endpoint_raw = m.torch.autograd.grad(
-        endpoint,
+    parameter_count = sum(parameter.numel() for parameter in parameters)
+    if parameter_count < 1:
+        raise RuntimeError("MGDA found no trainable Refiner parameters")
+    task_names = list(objectives)
+    task_gradients = []
+    for objective in objectives.values():
+        raw = m.torch.autograd.grad(
+            objective,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        task_gradients.append([
+            m.torch.zeros_like(parameter) if gradient is None else gradient
+            for parameter, gradient in zip(parameters, raw)
+        ])
+    scientific_weight = float(
+        cfg.product_refiner_repair_margin_weight
+    )
+    aggregate_scientific = scientific_weight * (
+        terms["endpoint_training_objective"]
+        + terms["temporal_training_objective"]
+    )
+    aggregate_raw = m.torch.autograd.grad(
+        aggregate_scientific,
         parameters,
         retain_graph=True,
         allow_unused=True,
     )
-    temporal_raw = m.torch.autograd.grad(
-        temporal,
-        parameters,
-        retain_graph=True,
-        allow_unused=True,
-    )
-    endpoint_grad = [
-        m.torch.zeros_like(p) if g is None else g
-        for p, g in zip(parameters, endpoint_raw)
-    ]
-    temporal_grad = [
-        m.torch.zeros_like(p) if g is None else g
-        for p, g in zip(parameters, temporal_raw)
+    aggregate_science_grad = [
+        m.torch.zeros_like(parameter) if gradient is None else gradient
+        for parameter, gradient in zip(parameters, aggregate_raw)
     ]
     total_loss.backward()
     total_grad = [
         m.torch.zeros_like(p) if p.grad is None else p.grad.detach().clone()
         for p in parameters
     ]
-    endpoint_norm_sq = _tuple_dot(endpoint_grad, endpoint_grad)
-    temporal_norm_sq = _tuple_dot(temporal_grad, temporal_grad)
-    dot = _tuple_dot(endpoint_grad, temporal_grad)
     epsilon = total_loss.new_tensor(1.0e-24, dtype=m.torch.float64)
-    endpoint_norm = endpoint_norm_sq.clamp_min(epsilon).sqrt()
-    temporal_norm = temporal_norm_sq.clamp_min(epsilon).sqrt()
-    cosine = dot / (endpoint_norm * temporal_norm)
-    conflict = bool(float(dot.detach()) < 0.0)
-    if conflict:
-        endpoint_projected = [
-            ge - dot.to(ge.dtype) / temporal_norm_sq.clamp_min(epsilon).to(ge.dtype) * gt
-            for ge, gt in zip(endpoint_grad, temporal_grad)
+    count_tensor = total_loss.new_tensor(
+        float(parameter_count), dtype=m.torch.float64
+    )
+    norm_squares = m.torch.stack([
+        _tuple_dot(gradient, gradient)
+        for gradient in task_gradients
+    ])
+    rms_norms = (norm_squares / count_tensor).clamp_min(0.0).sqrt()
+    active_indices = [
+        index for index, value in enumerate(rms_norms)
+        if float(value.detach()) > 1.0e-12
+    ]
+    normalized = []
+    for index in active_indices:
+        divisor = rms_norms[index].clamp_min(epsilon)
+        normalized.append([
+            value / divisor.to(value.dtype)
+            for value in task_gradients[index]
+        ])
+    cosine_matrix = []
+    for left_index, left in enumerate(task_gradients):
+        row = []
+        for right_index, right in enumerate(task_gradients):
+            denominator = (
+                norm_squares[left_index].clamp_min(epsilon).sqrt()
+                * norm_squares[right_index].clamp_min(epsilon).sqrt()
+            )
+            value = _tuple_dot(left, right) / denominator
+            if not (
+                float(rms_norms[left_index].detach()) > 1.0e-12
+                and float(rms_norms[right_index].detach()) > 1.0e-12
+            ):
+                value = value.new_zeros(())
+            row.append(float(value.detach()))
+        cosine_matrix.append(row)
+    full_weights = total_loss.new_zeros(
+        (len(task_names),), dtype=m.torch.float64
+    )
+    iterations = 0
+    duality_gap = 0.0
+    if normalized:
+        gram = m.torch.stack([
+            m.torch.stack([
+                _tuple_dot(left, right) / count_tensor
+                for right in normalized
+            ])
+            for left in normalized
+        ])
+        active_weights, iterations, duality_gap = (
+            _deterministic_mgda_weights(gram)
+        )
+        for offset, index in enumerate(active_indices):
+            full_weights[index] = active_weights[offset]
+        normalized_common = [
+            sum(
+                active_weights[index].to(values[0].dtype) * values[parameter]
+                for index, values in enumerate(normalized)
+            )
+            for parameter in range(len(parameters))
         ]
-        temporal_projected = [
-            gt - dot.to(gt.dtype) / endpoint_norm_sq.clamp_min(epsilon).to(gt.dtype) * ge
-            for ge, gt in zip(endpoint_grad, temporal_grad)
-        ]
+        mgda_min_norm = float(
+            (_tuple_dot(normalized_common, normalized_common)
+             / count_tensor).clamp_min(0.0).sqrt().detach()
+        )
     else:
-        endpoint_projected = endpoint_grad
-        temporal_projected = temporal_grad
+        normalized_common = [m.torch.zeros_like(value) for value in parameters]
+        mgda_min_norm = 0.0
+    common_exists = bool(
+        mgda_min_norm > MGDA_COMMON_DESCENT_RMS_EPSILON
+    )
+    nonzero_norms = [
+        rms_norms[index] for index in active_indices
+    ]
+    target_rms = (
+        m.torch.stack(nonzero_norms).median()
+        if nonzero_norms
+        else total_loss.new_zeros((), dtype=m.torch.float64)
+    )
     common = [
-        0.5 * (ge + gt)
-        for ge, gt in zip(endpoint_projected, temporal_projected)
+        value * target_rms.to(value.dtype)
+        for value in normalized_common
     ]
-    common_norm = _tuple_dot(common, common).clamp_min(epsilon).sqrt()
-    target_norm = (0.5 * (endpoint_norm_sq + temporal_norm_sq)).sqrt()
-    common_exists = bool(float(common_norm.detach()) > 1.0e-12)
-    if common_exists:
-        amplitude_scale = target_norm / common_norm
-        common = [
-            value * amplitude_scale.to(value.dtype)
-            for value in common
-        ]
-    else:
-        amplitude_scale = common_norm.new_zeros(())
-        common = [m.torch.zeros_like(value) for value in common]
     remainder = [
-        total - ge - gt
-        for total, ge, gt in zip(total_grad, endpoint_grad, temporal_grad)
+        total - science
+        for total, science in zip(total_grad, aggregate_science_grad)
     ]
-    common_endpoint_dot = _tuple_dot(common, endpoint_grad)
-    common_temporal_dot = _tuple_dot(common, temporal_grad)
-    remainder_endpoint_dot = _tuple_dot(remainder, endpoint_grad)
-    remainder_temporal_dot = _tuple_dot(remainder, temporal_grad)
     remainder_scale = 1.0
-    for common_dot, remainder_dot in (
-        (common_endpoint_dot, remainder_endpoint_dot),
-        (common_temporal_dot, remainder_temporal_dot),
-    ):
+    for task_gradient in task_gradients:
+        common_dot = _tuple_dot(common, task_gradient)
+        remainder_dot = _tuple_dot(remainder, task_gradient)
         common_value = float(common_dot.detach())
         remainder_value = float(remainder_dot.detach())
         if remainder_value < 0.0:
@@ -1391,28 +1513,67 @@ def _pareto_common_descent_backward(model, total_loss, terms, cfg):
                 remainder_scale,
                 max(0.0, 0.95 * common_value / (-remainder_value)),
             )
-    final_grad = [
-        science + remainder_scale * other
-        for science, other in zip(common, remainder)
-    ]
+    final_grad = (
+        [
+            science + remainder_scale * other
+            for science, other in zip(common, remainder)
+        ]
+        if common_exists
+        else [m.torch.zeros_like(value) for value in parameters]
+    )
+    directional_derivatives = {
+        name: float(-_tuple_dot(final_grad, gradient).detach())
+        for name, gradient in zip(task_names, task_gradients)
+    }
+    derivative_scale = max(
+        1.0,
+        max(abs(value) for value in directional_derivatives.values()),
+    )
+    derivative_tolerance = 1.0e-10 * derivative_scale
+    all_nonpositive = all(
+        value <= derivative_tolerance
+        for value in directional_derivatives.values()
+    )
+    one_strict = any(
+        value < -derivative_tolerance
+        for value in directional_derivatives.values()
+    )
+    common_exists = bool(common_exists and all_nonpositive and one_strict)
+    if not common_exists:
+        final_grad = [m.torch.zeros_like(value) for value in parameters]
+        directional_derivatives = {
+            name: 0.0 for name in task_names
+        }
     for parameter, gradient in zip(parameters, final_grad):
         parameter.grad = gradient
     return {
-        "protocol": "symmetric_pcgrad_rms_scaled_v1",
+        "protocol": "deterministic_subgroup_mgda_rms_normalized_v1",
         "active": True,
-        "conflict": conflict,
+        "task_names": task_names,
+        "gradient_cosine_matrix": cosine_matrix,
+        "gradient_norms_before_normalization": {
+            name: float(rms.detach())
+            for name, rms in zip(task_names, rms_norms)
+        },
+        "mgda_weights": {
+            name: float(value.detach())
+            for name, value in zip(task_names, full_weights)
+        },
+        "mgda_min_norm": mgda_min_norm,
+        "mgda_iterations": int(iterations),
+        "mgda_duality_gap": float(duality_gap),
         "common_direction_exists": common_exists,
-        "endpoint_gradient_norm": float(endpoint_norm.detach()),
-        "temporal_gradient_norm": float(temporal_norm.detach()),
-        "endpoint_temporal_cosine": float(cosine.detach()),
-        "amplitude_preserving_scale": float(amplitude_scale.detach()),
+        "common_descent_exists": common_exists,
+        "reason": (
+            "subgroup_common_descent"
+            if common_exists
+            else "pareto_stationary_or_no_common_descent"
+        ),
+        "directional_derivatives": directional_derivatives,
+        "all_directional_derivatives_nonpositive": all_nonpositive,
+        "at_least_one_directional_derivative_strict": one_strict,
+        "gradient_rms_rescale": float(target_rms.detach()),
         "non_scientific_remainder_scale": float(remainder_scale),
-        "final_endpoint_directional_product": float(
-            _tuple_dot(final_grad, endpoint_grad).detach()
-        ),
-        "final_temporal_directional_product": float(
-            _tuple_dot(final_grad, temporal_grad).detach()
-        ),
     }
 
 
@@ -1732,10 +1893,32 @@ def run(args):
                   "decoder_caps_changed": False,
               },
               "multiobjective_contract": {
-                  "schema": "refiner_endpoint_temporal_pcgrad_v1",
-                  "protocol": "symmetric_pcgrad_rms_scaled",
+                  "schema": "refiner_subgroup_mgda_v1",
+                  "protocol":
+                      "deterministic_subgroup_mgda_rms_normalized",
+                  "objectives": [
+                      f"{label}.{component}"
+                      for label in m.REFINER_GROUP_LABELS
+                      for component in ("endpoint", "temporal")
+                  ],
+                  "gradient_count": 8,
+                  "solver": "deterministic_frank_wolfe_exact_line_search",
+                  "max_iterations": MGDA_MAX_ITERATIONS,
+                  "duality_gap_tolerance":
+                      MGDA_DUALITY_GAP_TOLERANCE,
+                  "common_descent_rms_epsilon":
+                      MGDA_COMMON_DESCENT_RMS_EPSILON,
+                  "near_zero_policy":
+                      "pareto_stationary_or_no_common_descent",
                   "actual_loss_closure_required": True,
                   "physical_remainder_requires_scientific_nonregression": True,
+                  "production_gate_thresholds_changed": False,
+              },
+              "multiobjective_diagnostics": {
+                  "steps_evaluated": 0,
+                  "common_descent_steps": 0,
+                  "pareto_stationary_steps": 0,
+                  "last": None,
               }}
     report["fit_bank_artifact"] = save_fit_bank(
         destination,
@@ -1811,6 +1994,23 @@ def run(args):
             group_guard_relative_tolerance=guard_relative_tolerance,
             group_guard_absolute_tolerance=guard_absolute_tolerance,
         )
+        if not pareto_gradient["common_descent_exists"]:
+            update["reason"] = (
+                "pareto_stationary_or_no_common_descent"
+            )
+        update["subgroup_directional_derivatives"] = dict(
+            pareto_gradient["directional_derivatives"]
+        )
+        update["common_descent_exists"] = bool(
+            pareto_gradient["common_descent_exists"]
+        )
+        multiobjective = report["multiobjective_diagnostics"]
+        multiobjective["steps_evaluated"] += 1
+        if pareto_gradient["common_descent_exists"]:
+            multiobjective["common_descent_steps"] += 1
+        else:
+            multiobjective["pareto_stationary_steps"] += 1
+        multiobjective["last"] = dict(pareto_gradient)
         if update["optimizer_update_accepted"]:
             fixed_guard_current = dict(update["group_guard_after"])
             fixed_guard_best = {
@@ -1919,6 +2119,8 @@ def run(args):
                          "fit_context_evaluation":fit_context_summary,
                          "learning_scope_diagnosis":scope_diagnosis,
                          "group_guard_contract":report["group_guard_contract"],
+                         "multiobjective_contract":report["multiobjective_contract"],
+                         "multiobjective_diagnostics":report["multiobjective_diagnostics"],
                          "optimizer_updates":report["optimizer_updates"],
                          "fit_bank":report["fit_bank"],
                          "fit_bank_artifact":report["fit_bank_artifact"],
