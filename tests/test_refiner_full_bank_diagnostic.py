@@ -699,6 +699,8 @@ def test_unlogged_stall_records_gradients_exact_state_and_return_code(
 
         terms = {
             "endpoint": r,
+            "endpoint_training_objective": r,
+            "temporal_training_objective": r,
         }
 
         for label in m.REFINER_GROUP_LABELS:
