@@ -233,6 +233,103 @@ def _masked_residual_summary(error, active):
     }
 
 
+def _scientific_motion_tangent_gradients(
+    model,
+    batch,
+    cfg,
+    motion,
+    identity,
+):
+    """Differentiate the fixed-bank observable Guard in motion tangent space."""
+    with m.torch.enable_grad():
+        zero = m.torch.zeros(
+            motion.shape[:-1] + (75,),
+            dtype=motion.dtype,
+            device=motion.device,
+            requires_grad=True,
+        )
+        probe = product_exp_torch(motion.detach(), zero)
+        values = _guard_values_for_prediction(
+            model,
+            batch,
+            cfg,
+            probe,
+            identity.detach(),
+        )
+        selected = {
+            key: value
+            for key, value in values.items()
+            if ".observable_" in key
+        }
+        gradients = {}
+        for index, (key, value) in enumerate(selected.items()):
+            gradient = m.torch.autograd.grad(
+                value,
+                zero,
+                retain_graph=index + 1 < len(selected),
+                allow_unused=False,
+            )[0]
+            gradients[key] = gradient.detach()
+    return gradients
+
+
+def _project_scientific_nonregression(
+    tangent,
+    gradients,
+    owned,
+    *,
+    max_passes=16,
+):
+    """Project an IK tangent into observable non-regression halfspaces."""
+    allowed = m.torch.zeros_like(tangent)
+    allowed[..., :3] = owned[..., None]
+    for joint_id in IK_JOINTS:
+        start = 3 + 3 * joint_id
+        allowed[..., start:start + 3] = owned[..., None]
+    normals = {
+        key: gradient * allowed
+        for key, gradient in gradients.items()
+    }
+    projected = tangent
+    before = {
+        key: float((normal.double() * projected.double()).sum().detach())
+        for key, normal in normals.items()
+    }
+    passes = 0
+    for passes in range(1, int(max_passes) + 1):
+        changed = False
+        for normal in normals.values():
+            dot = (normal.double() * projected.double()).sum()
+            norm_square = normal.double().square().sum().clamp_min(1.0e-24)
+            tolerance = 1.0e-10 * max(1.0, abs(float(dot.detach())))
+            if float(dot.detach()) > tolerance:
+                projected = projected - (dot / norm_square).to(
+                    projected.dtype
+                ) * normal
+                changed = True
+        if not changed:
+            break
+    after = {
+        key: float((normal.double() * projected.double()).sum().detach())
+        for key, normal in normals.items()
+    }
+    scale = max(1.0, *(abs(value) for value in after.values()))
+    tolerance = 1.0e-10 * scale
+    return projected, {
+        "enabled": True,
+        "protocol": "fixed_bank_observable_tangent_halfspace_projection_v1",
+        "active_constraints": list(normals),
+        "active_constraint_count": len(normals),
+        "projection_passes": int(passes),
+        "directional_derivatives_before": before,
+        "directional_derivatives_after": after,
+        "all_directional_derivatives_nonpositive": all(
+            value <= tolerance for value in after.values()
+        ),
+        "derivative_tolerance": tolerance,
+    }
+
+
 def weighted_dls_contact_project_torch(
     reference,
     baseline,
@@ -246,6 +343,7 @@ def weighted_dls_contact_project_torch(
     stiffness_ceiling=1.0e4,
     acceleration_regularization=1.0e-2,
     jerk_regularization=1.0e-3,
+    scientific_context=None,
 ):
     """Project only candidate-induced constraint regressions.
 
@@ -288,6 +386,7 @@ def weighted_dls_contact_project_torch(
     motion = candidate
     iteration_residuals = []
     initial_constraint_counts = None
+    scientific_projection_history = []
 
     def difference_matrix(width, order, dtype, device):
         if width <= order:
@@ -385,12 +484,29 @@ def weighted_dls_contact_project_torch(
         case_active = active.any(dim=(1, 2))
         solution = coupled_solve(matrix, rhs, owned & case_active[:, None])
         tangent = _ik_tangent_from_solution(solution, motion)
+        if scientific_context is not None:
+            gradients = _scientific_motion_tangent_gradients(
+                scientific_context["model"],
+                scientific_context["batch"],
+                cfg,
+                motion,
+                scientific_context["identity"],
+            )
+            tangent, scientific_projection = (
+                _project_scientific_nonregression(
+                    tangent,
+                    gradients,
+                    owned & case_active[:, None],
+                )
+            )
+            scientific_projection["iteration"] = iteration
+            scientific_projection_history.append(scientific_projection)
         updated = product_exp_torch(motion, tangent)
         motion = m.torch.where(
             case_active[:, None, None],
             updated,
             motion,
-        )
+        ).detach()
 
     feet = m.fk_24_torch(motion)[..., list(m.DEFAULT_FOOT_JOINTS), :]
     final_masks, _ = _active_constraint_masks(
@@ -439,6 +555,12 @@ def weighted_dls_contact_project_torch(
         "taper_injected_in_normal_equation": True,
         "temporal_regularization_in_normal_equation": True,
         "post_solve_taper_multiplication": False,
+        "scientific_nonregression_projection_enabled": (
+            scientific_context is not None
+        ),
+        "scientific_nonregression_projection_history": (
+            scientific_projection_history
+        ),
         "identity_preserving_target": "baseline_candidate_induced_violation",
         "support_mask_source": "observed_reference_only",
         "static_support_samples": int(static.sum().detach()),
