@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Server-only V15.14 projected-candidate feasibility probe; never training.
+# Server-only V15.14b identity-preserving projected-candidate feasibility probe; never training.
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,18 +22,18 @@ test -s "$SOURCE_DIAGNOSTIC/diagnostic_state.pt"
 test -s "$SOURCE_DIAGNOSTIC/fit_bank.pt"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
-TAG="refiner_v15_14_weighted_dls_projected_candidate_probe_${STAMP}"
+TAG="refiner_v15_14b_identity_active_set_projected_candidate_probe_${STAMP}"
 PROBE_DIR="$OUT_ROOT/checkpoints/$TAG/projected_candidate_probe"
-LOG="logs/refiner_v15_14_projected_candidate_probe_${STAMP}.log"
-STATUS="outputs/refiner_v15_14_projected_candidate_probe_${STAMP}.exit_status.txt"
-SCIENTIFIC_STATUS="outputs/refiner_v15_14_projected_candidate_probe_${STAMP}.scientific_status.txt"
+LOG="logs/refiner_v15_14b_identity_projector_probe_${STAMP}.log"
+STATUS="outputs/refiner_v15_14b_identity_projector_probe_${STAMP}.exit_status.txt"
+SCIENTIFIC_STATUS="outputs/refiner_v15_14b_identity_projector_probe_${STAMP}.scientific_status.txt"
 
 mkdir -p "$PROBE_DIR" logs outputs
-printf '%s\n' "$TAG" > outputs/LATEST_REFINER_V15_14_PROJECTED_PROBE_TAG
-printf '%s\n' "$LOG" > outputs/LATEST_REFINER_V15_14_PROJECTED_PROBE_LOG
-printf '%s\n' "$STATUS" > outputs/LATEST_REFINER_V15_14_PROJECTED_PROBE_STATUS
+printf '%s\n' "$TAG" > outputs/LATEST_REFINER_V15_14B_IDENTITY_PROBE_TAG
+printf '%s\n' "$LOG" > outputs/LATEST_REFINER_V15_14B_IDENTITY_PROBE_LOG
+printf '%s\n' "$STATUS" > outputs/LATEST_REFINER_V15_14B_IDENTITY_PROBE_STATUS
 printf '%s\n' "$SCIENTIFIC_STATUS" \
-  > outputs/LATEST_REFINER_V15_14_PROJECTED_PROBE_SCIENTIFIC_STATUS
+  > outputs/LATEST_REFINER_V15_14B_IDENTITY_PROBE_SCIENTIFIC_STATUS
 trap 'rc=$?; printf "%s\n" "$rc" > "$STATUS"; echo "exit_status=$rc"; date --iso-8601=seconds' EXIT
 exec > >(tee -a "$LOG") 2>&1
 
@@ -63,7 +63,7 @@ set -e
 printf '%s\n' "$PROBE_STATUS" > "$SCIENTIFIC_STATUS"
 
 if [[ "$PROBE_STATUS" -ne 0 && "$PROBE_STATUS" -ne 2 ]]; then
-  echo "[FATAL] V15.14 probe execution failed with status $PROBE_STATUS"
+  echo "[FATAL] V15.14b probe execution failed with status $PROBE_STATUS"
   exit "$PROBE_STATUS"
 fi
 
@@ -84,9 +84,13 @@ print(json.dumps({
         "effective_projected_candidate_count"
     ),
     "projected_direction_exists": report.get("projected_direction_exists"),
+    "projector_identity_control": report.get(
+        "projector_identity_control"
+    ),
     "scope_safe": report.get("scope_safe"),
     "numeric_audit_complete": report.get("numeric_audit_complete"),
     "guard_blocker_counts": report.get("guard_blocker_counts"),
+    "raw_guard_blocker_counts": report.get("raw_guard_blocker_counts"),
     "candidate_summary": [
         {
             "target_output_tangent_rms": row.get(
@@ -101,8 +105,26 @@ print(json.dumps({
             "ik_residual_after_n_iters": row.get(
                 "projector", {}
             ).get("ik_residual_after_n_iters"),
+            "initial_active_constraint_counts": row.get(
+                "projector", {}
+            ).get("initial_active_constraint_counts"),
+            "final_active_constraint_counts": row.get(
+                "projector", {}
+            ).get("final_active_constraint_counts"),
+            "raw_fixed_exact_guard_passed": row.get(
+                "raw_fixed_exact_guard_passed"
+            ),
+            "raw_strict_observable_descent": row.get(
+                "raw_strict_observable_descent"
+            ),
+            "raw_observable_residual_delta": row.get(
+                "raw_observable_residual_delta"
+            ),
             "fixed_exact_guard_passed": row.get(
                 "fixed_exact_guard_passed"
+            ),
+            "projected_observable_residual_delta": row.get(
+                "observable_residual_delta"
             ),
             "strict_observable_descent": row.get(
                 "strict_observable_descent"
@@ -118,6 +140,5 @@ print(json.dumps({
 }, ensure_ascii=False, indent=2))
 PY
 
-echo "V15.14 projected-candidate probe completed; scientific_status=$PROBE_STATUS"
+echo "V15.14b identity-preserving projected-candidate probe completed; scientific_status=$PROBE_STATUS"
 echo "No training, pilot, promotion, full replay, or generation was launched."
-

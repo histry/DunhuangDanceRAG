@@ -23,8 +23,10 @@ from training import motion_models as m
 from training import refiner_bridge_diagnostics as diagnostic
 
 
-SCHEMA = "refiner_v15_14_weighted_dls_projected_candidate_probe_v1"
-PROJECTOR_PROTOCOL = "ownership_c2_stiffness_weighted_dls_solve_v1"
+SCHEMA = "refiner_v15_14b_identity_active_set_projected_candidate_probe_v1"
+PROJECTOR_PROTOCOL = (
+    "identity_preserving_active_set_c2_weighted_temporal_dls_solve_v1"
+)
 DEFAULT_TARGET_RMS = (1.0e-4, 3.0e-4, 1.0e-3, 3.0e-3)
 IK_JOINTS = (0, 1, 2, 4, 5, 7, 8)
 
@@ -117,7 +119,72 @@ def _reference_static_support(reference, cfg):
         1,
         anchor_index[..., None].expand(-1, -1, -1, 3),
     ).detach()
-    return static.detach(), anchors, feet.detach()
+    return (
+        static.detach(),
+        anchors,
+        feet.detach(),
+        anchor_index.detach(),
+        floor.detach(),
+    )
+
+
+def _foot_speed(feet, fps):
+    speed = m.torch.zeros(
+        feet.shape[:-1],
+        dtype=feet.dtype,
+        device=feet.device,
+    )
+    if feet.shape[1] > 1:
+        speed[:, 1:] = m.torch.linalg.vector_norm(
+            m.torch.diff(feet[..., (0, 2)], dim=1),
+            dim=-1,
+        ) * float(fps)
+    return speed
+
+
+def _support_drift(feet, anchor_index):
+    xz = feet[..., (0, 2)]
+    anchor = xz.gather(
+        1,
+        anchor_index[..., None].expand(-1, -1, -1, 2),
+    )
+    return m.torch.linalg.vector_norm(xz - anchor, dim=-1)
+
+
+def _active_constraint_masks(
+    baseline_feet,
+    candidate_feet,
+    static,
+    anchor_index,
+    floor,
+    cfg,
+    *,
+    numeric_tolerance=1.0e-8,
+):
+    baseline_speed = _foot_speed(baseline_feet, cfg.fps)
+    candidate_speed = _foot_speed(candidate_feet, cfg.fps)
+    baseline_drift = _support_drift(baseline_feet, anchor_index)
+    candidate_drift = _support_drift(candidate_feet, anchor_index)
+    baseline_height = baseline_feet[..., 1] - floor[:, None, None]
+    candidate_height = candidate_feet[..., 1] - floor[:, None, None]
+    tolerance = float(numeric_tolerance)
+    masks = {
+        "foot_skate": static & (
+            candidate_speed > baseline_speed + tolerance
+        ),
+        "support_drift": static & (
+            candidate_drift > baseline_drift + tolerance
+        ),
+        "penetration": candidate_height < baseline_height - tolerance,
+    }
+    return masks, {
+        "baseline_foot_skate_mps": baseline_speed,
+        "candidate_foot_skate_mps": candidate_speed,
+        "baseline_support_drift_m": baseline_drift,
+        "candidate_support_drift_m": candidate_drift,
+        "baseline_penetration_height_m": baseline_height,
+        "candidate_penetration_height_m": candidate_height,
+    }
 
 
 def _ik_tangent_from_solution(solution, reference):
@@ -168,6 +235,7 @@ def _masked_residual_summary(error, active):
 
 def weighted_dls_contact_project_torch(
     reference,
+    baseline,
     candidate,
     seam,
     cfg,
@@ -176,30 +244,42 @@ def weighted_dls_contact_project_torch(
     damping=1.0e-4,
     jacobian_epsilon=1.0e-4,
     stiffness_ceiling=1.0e4,
+    acceleration_regularization=1.0e-2,
+    jerk_regularization=1.0e-3,
 ):
-    """Project support anchors with ownership/C2 stiffness inside the solve.
+    """Project only candidate-induced constraint regressions.
 
-    The taper is never multiplied into a solved joint update.  Frozen frames
-    have no active residual rows, while the smooth ownership activity enters
-    the diagonal DLS stiffness.  ``torch.linalg.solve`` is retained so this
-    operator can later be unrolled without replacing its linear algebra.
+    The baseline is an exact fixed point: if a candidate introduces no new
+    skate, support-drift or penetration regression, the original tensor is
+    returned without retraction.  Active residual rows target the baseline
+    foot trajectory rather than a segment-start world anchor. Ownership/C2
+    stiffness and D2/D3 temporal regularizers are part of the coupled normal
+    equation; no solved update is tapered afterward.
     """
-    if reference.shape != candidate.shape or reference.ndim != 3:
-        raise ValueError("reference and candidate must share [B,T,151]")
+    if (
+        reference.shape != baseline.shape
+        or reference.shape != candidate.shape
+        or reference.ndim != 3
+    ):
+        raise ValueError("reference, baseline and candidate must share [B,T,151]")
     if iterations < 1:
         raise ValueError("iterations must be positive")
     if not damping > 0.0 or not jacobian_epsilon > 0.0:
         raise ValueError("DLS damping and Jacobian epsilon must be positive")
     if stiffness_ceiling < 1.0:
         raise ValueError("stiffness ceiling must be at least one")
+    if acceleration_regularization < 0.0 or jerk_regularization < 0.0:
+        raise ValueError("temporal regularization weights must be non-negative")
 
-    static, anchors, _ = _reference_static_support(reference, cfg)
+    static, _, _, anchor_index, floor = _reference_static_support(reference, cfg)
+    baseline_feet = m.fk_24_torch(baseline)[
+        ..., list(m.DEFAULT_FOOT_JOINTS), :
+    ].detach()
     taper_frames = max(
         1,
         int(getattr(cfg, "product_refiner_residual_taper_frames", 3)),
     )
     owned, activity = _ownership_c2_activity(seam, taper_frames)
-    active = static & owned[..., None]
     stiffness = 1.0 + (float(stiffness_ceiling) - 1.0) * (
         1.0 - activity
     ).square()
@@ -207,16 +287,92 @@ def weighted_dls_contact_project_torch(
     stiffness = stiffness[..., None].expand(-1, -1, variable_count)
     motion = candidate
     iteration_residuals = []
+    initial_constraint_counts = None
+
+    def difference_matrix(width, order, dtype, device):
+        if width <= order:
+            return m.torch.zeros((0, width), dtype=dtype, device=device)
+        eye = m.torch.eye(width, dtype=dtype, device=device)
+        return m.torch.diff(eye, n=order, dim=0)
+
+    def coupled_solve(frame_matrix, frame_rhs, owned_mask):
+        solution = frame_rhs.new_zeros(frame_rhs.shape)
+        solve_dtype = m.torch.float64
+        identity = m.torch.eye(
+            variable_count,
+            dtype=solve_dtype,
+            device=frame_rhs.device,
+        )
+        for batch_index in range(frame_rhs.shape[0]):
+            indices = m.torch.nonzero(
+                owned_mask[batch_index], as_tuple=False
+            ).flatten()
+            if indices.numel() == 0:
+                continue
+            left = int(indices[0].detach())
+            right = int(indices[-1].detach()) + 1
+            width = right - left
+            blocks = [
+                frame_matrix[batch_index, frame].to(solve_dtype)
+                for frame in range(left, right)
+            ]
+            matrix = m.torch.block_diag(*blocks)
+            d2 = difference_matrix(width, 2, solve_dtype, frame_rhs.device)
+            d3 = difference_matrix(width, 3, solve_dtype, frame_rhs.device)
+            if d2.numel():
+                temporal = (d2.transpose(0, 1) @ d2).contiguous()
+                matrix = matrix + float(acceleration_regularization) * (
+                    m.torch.kron(temporal, identity)
+                )
+            if d3.numel():
+                temporal = (d3.transpose(0, 1) @ d3).contiguous()
+                matrix = matrix + float(jerk_regularization) * (
+                    m.torch.kron(temporal, identity)
+                )
+            rhs = frame_rhs[batch_index, left:right].to(solve_dtype).reshape(-1)
+            solved = m.torch.linalg.solve(matrix, rhs).to(frame_rhs.dtype)
+            solution[batch_index, left:right] = solved.reshape(
+                width, variable_count
+            )
+        return solution
 
     for iteration in range(int(iterations)):
         feet = m.fk_24_torch(motion)[..., list(m.DEFAULT_FOOT_JOINTS), :]
-        error = anchors - feet
+        masks, _ = _active_constraint_masks(
+            baseline_feet,
+            feet,
+            static,
+            anchor_index,
+            floor,
+            cfg,
+        )
+        masks = {
+            name: value & owned[..., None]
+            for name, value in masks.items()
+        }
+        active = m.torch.stack(list(masks.values()), dim=0).any(dim=0)
+        counts = {
+            name: int(value.sum().detach())
+            for name, value in masks.items()
+        }
+        if initial_constraint_counts is None:
+            initial_constraint_counts = counts
+        error = baseline_feet - feet
         summary = _masked_residual_summary(error, active)
         summary["iteration"] = iteration
+        summary["active_constraint_counts"] = counts
         iteration_residuals.append(summary)
 
+        if not bool(active.any()):
+            break
+
         jacobian = _foot_jacobian(motion, jacobian_epsilon)
-        row_mask = active[..., None].expand(-1, -1, -1, 3).flatten(-2)
+        horizontal = masks["foot_skate"] | masks["support_drift"]
+        coordinate_active = m.torch.stack(
+            [horizontal, masks["penetration"], horizontal],
+            dim=-1,
+        )
+        row_mask = coordinate_active.flatten(-2)
         solve_dtype = m.torch.float64
         weighted_jacobian = jacobian.to(solve_dtype) * row_mask[..., None]
         weighted_error = error.flatten(-2).to(solve_dtype) * row_mask
@@ -226,12 +382,31 @@ def weighted_dls_contact_project_torch(
             float(damping) * stiffness.to(solve_dtype)
         )
         rhs = (transpose @ weighted_error[..., None]).squeeze(-1)
-        solution = m.torch.linalg.solve(matrix, rhs).to(motion.dtype)
+        case_active = active.any(dim=(1, 2))
+        solution = coupled_solve(matrix, rhs, owned & case_active[:, None])
         tangent = _ik_tangent_from_solution(solution, motion)
-        motion = product_exp_torch(motion, tangent)
+        updated = product_exp_torch(motion, tangent)
+        motion = m.torch.where(
+            case_active[:, None, None],
+            updated,
+            motion,
+        )
 
     feet = m.fk_24_torch(motion)[..., list(m.DEFAULT_FOOT_JOINTS), :]
-    error = anchors - feet
+    final_masks, _ = _active_constraint_masks(
+        baseline_feet,
+        feet,
+        static,
+        anchor_index,
+        floor,
+        cfg,
+    )
+    final_masks = {
+        name: value & owned[..., None]
+        for name, value in final_masks.items()
+    }
+    active = m.torch.stack(list(final_masks.values()), dim=0).any(dim=0)
+    error = baseline_feet - feet
     final_summary = _masked_residual_summary(error, active)
     final_summary["iterations"] = int(iterations)
     by_foot = {}
@@ -259,9 +434,23 @@ def weighted_dls_contact_project_torch(
         "damping": float(damping),
         "jacobian_epsilon": float(jacobian_epsilon),
         "stiffness_ceiling": float(stiffness_ceiling),
+        "acceleration_regularization": float(acceleration_regularization),
+        "jerk_regularization": float(jerk_regularization),
         "taper_injected_in_normal_equation": True,
+        "temporal_regularization_in_normal_equation": True,
         "post_solve_taper_multiplication": False,
-        "static_support_samples": int(active.sum().detach()),
+        "identity_preserving_target": "baseline_candidate_induced_violation",
+        "support_mask_source": "observed_reference_only",
+        "static_support_samples": int(static.sum().detach()),
+        "initial_active_constraint_counts": initial_constraint_counts or {
+            "foot_skate": 0,
+            "support_drift": 0,
+            "penetration": 0,
+        },
+        "final_active_constraint_counts": {
+            name: int(value.sum().detach())
+            for name, value in final_masks.items()
+        },
         "iteration_residuals": iteration_residuals,
         "ik_residual_after_n_iters": final_summary,
         "ik_residual_after_n_iters_by_side": by_side,
@@ -434,10 +623,43 @@ def run(args):
     guard_absolute = contract["absolute_tolerance"]
     if set(guard_anchor) != set(baseline_guard):
         raise RuntimeError("source fixed Guard and reconstructed bank differ")
+    baseline_guard_passed, baseline_blockers, baseline_guard_details = (
+        _audit_guard_candidate(
+            baseline_guard,
+            guard_anchor,
+            guard_relative,
+            guard_absolute,
+        )
+    )
+
+    identity_projected, identity_projector = weighted_dls_contact_project_torch(
+        anchor_batch["bad"],
+        baseline,
+        baseline,
+        anchor_batch["seam"],
+        cfg,
+        iterations=args.ik_iterations,
+        damping=args.damping,
+        jacobian_epsilon=args.jacobian_epsilon,
+        stiffness_ceiling=args.stiffness_ceiling,
+        acceleration_regularization=args.acceleration_regularization,
+        jerk_regularization=args.jerk_regularization,
+    )
+    identity_delta_rms = _motion_edit_rms(
+        baseline, identity_projected, anchor_batch["seam"]
+    )
+    identity_delta_abs_max = float(
+        (identity_projected - baseline).abs().max().detach()
+    )
+    identity_control_passed = bool(
+        identity_delta_rms <= 1.0e-12
+        and identity_delta_abs_max <= 1.0e-12
+    )
 
     targets = tuple(float(value) for value in args.target_rms.split(","))
     rows = []
     blocker_counts = Counter()
+    raw_blocker_counts = Counter()
     selected = None
     for target in targets:
         candidate_started = time.perf_counter()
@@ -452,8 +674,31 @@ def run(args):
             target,
         )
         raw_physical = m.batch_physical_audit_torch(raw, cfg)
+        raw_guard_values = _float_guard(
+            _guard_values_for_prediction(
+                model, anchor_batch, cfg, raw, identity
+            )
+        )
+        raw_guard_passed, raw_blockers, raw_guard_details = (
+            _audit_guard_candidate(
+                raw_guard_values,
+                guard_anchor,
+                guard_relative,
+                guard_absolute,
+            )
+        )
+        raw_blocker_counts.update(raw_blockers)
+        raw_observable_delta = {
+            key: raw_guard_values[key] - baseline_guard[key]
+            for key in raw_guard_values
+            if ".observable_" in key
+        }
+        raw_strict_observable_descent = any(
+            value < -1.0e-7 for value in raw_observable_delta.values()
+        )
         projected, ik = weighted_dls_contact_project_torch(
             anchor_batch["bad"],
+            baseline,
             raw,
             anchor_batch["seam"],
             cfg,
@@ -461,6 +706,8 @@ def run(args):
             damping=args.damping,
             jacobian_epsilon=args.jacobian_epsilon,
             stiffness_ceiling=args.stiffness_ceiling,
+            acceleration_regularization=args.acceleration_regularization,
+            jerk_regularization=args.jerk_regularization,
         )
         projected_physical = m.batch_physical_audit_torch(projected, cfg)
         guard_values = _float_guard(
@@ -484,7 +731,9 @@ def run(args):
             value < -1.0e-7 for value in observable_delta.values()
         )
         effective = bool(
-            guard_passed
+            identity_control_passed
+            and raw_strict_observable_descent
+            and guard_passed
             and strict_contact_or_trajectory_descent
             and ik["scope_safe"]
         )
@@ -500,6 +749,11 @@ def run(args):
             "gpu_batch_audit_after_projection": _physical_summary(
                 projected_physical
             ),
+            "raw_fixed_exact_guard_passed": raw_guard_passed,
+            "raw_strict_observable_descent": raw_strict_observable_descent,
+            "raw_observable_residual_delta": raw_observable_delta,
+            "raw_guard_blockers": raw_blockers,
+            "raw_guard_metrics": raw_guard_details,
             "fixed_exact_guard_passed": guard_passed,
             "strict_observable_descent": strict_contact_or_trajectory_descent,
             "effective_projected_candidate": effective,
@@ -530,6 +784,17 @@ def run(args):
         "source_completed_steps": source_report.get("completed_steps"),
         "transaction_context_indices": list(schedule),
         "projector_protocol": PROJECTOR_PROTOCOL,
+        "projector_identity_control": {
+            "passed": identity_control_passed,
+            "edit_tangent_rms": identity_delta_rms,
+            "state_abs_max": identity_delta_abs_max,
+            "projector": identity_projector,
+            "failure_reason": (
+                None
+                if identity_control_passed
+                else "projector_not_identity_at_anchor"
+            ),
+        },
         "unconstrained_subgroup_mgda": mgda,
         "candidate_count": len(rows),
         "effective_projected_candidate_count": sum(
@@ -544,6 +809,10 @@ def run(args):
         "boundary_gate_changed": False,
         "observable_0p03_gate_changed": False,
         "guard_blocker_counts": dict(blocker_counts),
+        "raw_guard_blocker_counts": dict(raw_blocker_counts),
+        "baseline_fixed_exact_guard_passed": baseline_guard_passed,
+        "baseline_guard_blockers": baseline_blockers,
+        "baseline_guard_metrics": baseline_guard_details,
         "baseline_guard_values": baseline_guard,
         "candidates": rows,
         "scope_safe": all(row["projector"]["scope_safe"] for row in rows),
@@ -576,6 +845,10 @@ def main():
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
     parser.add_argument("--stiffness-ceiling", type=float, default=1.0e4)
+    parser.add_argument(
+        "--acceleration-regularization", type=float, default=1.0e-2
+    )
+    parser.add_argument("--jerk-regularization", type=float, default=1.0e-3)
     return run(parser.parse_args())
 
 
