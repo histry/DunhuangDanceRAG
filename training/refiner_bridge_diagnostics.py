@@ -1933,8 +1933,10 @@ def _decoder_amplitude_summary(trace, seam=None):
     return result
 
 
-def _decoder_amplitude_by_group(trace, seam, group):
+def _decoder_amplitude_by_group(trace, seam=None, group=None):
     """Report output magnitude separately for all four scientific groups."""
+    if seam is None or group is None:
+        return {}
     result = {}
     for index, label in enumerate(m.REFINER_GROUP_LABELS):
         selected = group == index
@@ -2429,7 +2431,7 @@ def run(args):
                 amplitude_trace or {}, batch.get("seam")
             )
             amplitude_by_group = _decoder_amplitude_by_group(
-                amplitude_trace or {}, batch["seam"], batch["group"]
+                amplitude_trace or {}, batch.get("seam"), batch.get("group")
             )
             report["output_amplitude_diagnostics"] = {
                 "step": step,

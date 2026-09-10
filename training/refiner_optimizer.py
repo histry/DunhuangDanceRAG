@@ -348,8 +348,8 @@ def checked_refiner_step(
                     for key in guard_before:
                         baseline = guard_reference[key]
                         allowance = max(
-                            abs(baseline) * group_guard_relative_tolerance[key],
-                            group_guard_absolute_tolerance[key],
+                            abs(baseline) * guard_relative_tolerance[key],
+                            guard_absolute_tolerance[key],
                         )
                         allowed = baseline + allowance
                         predicted_directional = predicted_derivatives.get(key)
@@ -397,7 +397,7 @@ def checked_refiner_step(
                         improvement > max(
                             1.0e-12,
                             abs(guard_before[key]) * 1.0e-9,
-                            group_guard_absolute_tolerance[key] * 1.0e-6,
+                            guard_absolute_tolerance[key] * 1.0e-6,
                         )
                         for key, improvement in improvement_deltas.items()
                     )
