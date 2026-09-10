@@ -1034,6 +1034,28 @@ def _eight_subgroup_objectives(endpoint, temporal):
     return terms
 
 
+def test_v15_13_film_optimizer_preserves_exact_guard_parameter_order():
+    model = m.ProductManifoldTemporalRefiner(
+        hidden=16,
+        film_conditioning=True,
+    )
+    optimizer = d._diagnostic_optimizer(
+        model,
+        m.MotionGenerationConfig(),
+    )
+    expected = [
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    actual = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    assert actual == expected
+
+
 def test_v15_12f_mgda_keeps_all_subgroup_derivatives_nonpositive():
     model = torch.nn.Linear(2, 1, bias=False)
     with torch.no_grad():

@@ -1869,15 +1869,28 @@ def _pareto_common_descent_backward(
 
 def _diagnostic_optimizer(model, cfg):
     """Warm the residual projection and optional FiLM modulation together."""
-    output_parameters = list(getattr(model, "out", model).parameters())
+    ordered_parameters = [
+        parameter for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    warm_parameter_ids = {
+        id(parameter)
+        for parameter in getattr(model, "out", model).parameters()
+    }
     film_generator = getattr(model, "film_generator", None)
     if film_generator is not None:
-        output_parameters.extend(film_generator.parameters())
-    output_ids = {id(parameter) for parameter in output_parameters}
+        warm_parameter_ids.update(
+            id(parameter) for parameter in film_generator.parameters()
+        )
     backbone = [
         parameter
-        for parameter in model.parameters()
-        if id(parameter) not in output_ids
+        for parameter in ordered_parameters
+        if id(parameter) not in warm_parameter_ids
+    ]
+    output_parameters = [
+        parameter
+        for parameter in ordered_parameters
+        if id(parameter) in warm_parameter_ids
     ]
     groups = []
     if backbone:
@@ -1891,7 +1904,20 @@ def _diagnostic_optimizer(model, cfg):
         "lr": cfg.lr * OUTPUT_WARMUP_LR_MULTIPLIER,
         "diagnostic_role": "output_and_film",
     })
-    return m.torch.optim.AdamW(groups, weight_decay=1.0e-4)
+    optimizer = m.torch.optim.AdamW(groups, weight_decay=1.0e-4)
+    optimizer_order = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    if [id(parameter) for parameter in optimizer_order] != [
+        id(parameter) for parameter in ordered_parameters
+    ]:
+        raise RuntimeError(
+            "Refiner optimizer parameter order differs from exact-Guard "
+            "gradient order"
+        )
+    return optimizer
 
 
 def _set_diagnostic_learning_rates(optimizer, cfg, step):
