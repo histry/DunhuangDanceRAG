@@ -1,4 +1,4 @@
-"""V15.15 short observable-conditioned Adapter distillation probe.
+"""V15.15c exact-radius constraint-aware Adapter development probe.
 
 The probe freezes the V15.13 shared Refiner, fits only the zero-initialized
 75D Adapter against frozen V15.14h projected directions, and performs exact
@@ -20,7 +20,9 @@ from training import refiner_group_local_nullspace_cone_probe as group_probe
 from training import refiner_projected_candidate_probe as projected_probe
 
 
-SCHEMA = "refiner_v15_15b_exact_scope_observable_cross_adapter_probe_v2"
+SCHEMA = "refiner_v15_15c_exact_radius_constraint_adapter_probe_v3"
+EXACT_RADIUS_NORMALIZATION_EPS = 1.0e-8
+FORMAL_READINESS_CASES = (16, 18, 20, 29)
 
 
 def _to_device(value, device):
@@ -180,6 +182,65 @@ def _masked_rms(value, mask):
     if selected.numel() == 0:
         return value.sum() * 0.0
     return m.torch.sqrt(selected.square().mean().clamp_min(1.0e-24))
+
+
+def _safe_exact_radius_tangent(
+    tangent,
+    ownership,
+    samples,
+    target_rms,
+    *,
+    eps=EXACT_RADIUS_NORMALIZATION_EPS,
+):
+    """Normalize each cross case on its applied ownership support.
+
+    A detached lower branch keeps the derivative finite at the zero
+    initialized Adapter. Above that safety floor the ordinary vector norm is
+    used, so every resolved proposal lies exactly on the requested RMS sphere.
+    ``torch.linalg.vector_norm`` intentionally is not passed a nonexistent
+    ``eps`` argument.
+    """
+    result = m.torch.zeros_like(tangent)
+    diagnostics = {}
+    visited = set()
+    for sample in samples:
+        if sample["teacher_kind"] != "exact_projected_direction":
+            continue
+        case_index = int(sample["case_index"])
+        if case_index in visited:
+            raise RuntimeError(f"duplicate Adapter teacher case {case_index}")
+        visited.add(case_index)
+        permitted = _owned_case_mask(ownership, tangent, case_index)
+        active = tangent[permitted]
+        if active.numel() == 0:
+            raise RuntimeError(f"empty ownership support for case {case_index}")
+        count = active.new_tensor(float(active.numel()))
+        raw_norm = m.torch.linalg.vector_norm(active)
+        norm_floor = float(eps) * m.torch.sqrt(count)
+        stable_norm = m.torch.where(
+            raw_norm >= norm_floor,
+            raw_norm,
+            norm_floor.detach(),
+        )
+        scale = float(target_rms) * m.torch.sqrt(count) / stable_norm
+        local = tangent * permitted.to(tangent.dtype) * scale
+        result = result + local
+        normalized_rms = _masked_rms(local, permitted)
+        diagnostics[str(case_index)] = {
+            "normalization_eps": float(eps),
+            "active_coordinate_count": int(active.numel()),
+            "input_rms": float(_masked_rms(tangent, permitted).detach()),
+            "normalization_scale": float(scale.detach()),
+            "normalization_floor_active": bool(
+                float(raw_norm.detach()) < float(norm_floor.detach())
+            ),
+            "normalized_tangent_rms": float(normalized_rms.detach()),
+            "radius_equality_resolved": bool(
+                abs(float(normalized_rms.detach()) - float(target_rms))
+                <= max(1.0e-12, float(target_rms) * 1.0e-6)
+            ),
+        }
+    return result, diagnostics
 
 
 def _isolated_fixed_radius_candidate(
@@ -432,16 +493,33 @@ def run(args):
             ~permitted,
             0.0,
         )
+        if args.exact_radius_training:
+            training_tangent, radius_normalization = (
+                _safe_exact_radius_tangent(
+                    applied_adapter_tangent,
+                    ownership,
+                    samples,
+                    float(args.target_rms),
+                    eps=float(args.normalization_eps),
+                )
+            )
+        else:
+            training_tangent = applied_adapter_tangent
+            radius_normalization = {}
         # Scientific losses and Guard penalties see the same fixed Anchor and
-        # exact-scope tangent that the exact closure auditor receives.
+        # exact-scope tangent that the exact closure auditor receives. V15.15c
+        # additionally evaluates every cross case on the required 1e-4 sphere.
         prediction = product_exp_torch(
-            baseline.detach(), applied_adapter_tangent
+            baseline.detach(), training_tangent
         )
         case_terms = oracle.case_probe._case_terms(prediction, batch, cfg)
         direction_losses = []
         magnitude_losses = []
         scientific_losses = []
+        nonregression_losses = []
+        case20_temporal_losses = []
         control_losses = []
+        exact_radius_constraints = {}
         amplitude = {}
         gate = {}
         for sample in samples:
@@ -484,7 +562,6 @@ def run(args):
                 dim=-1,
                 eps=1.0e-12,
             ).mean()
-            direction_losses.append(1.0 - cosine)
             magnitude_losses.append(
                 m.torch.relu(predicted_rms - 1.25 * target_rms).square()
             )
@@ -494,13 +571,87 @@ def run(args):
             temporal_scale = max(
                 abs(float(baseline_terms["temporal"][case_index])), 1.0e-6
             )
+            endpoint_anchor = baseline_terms["endpoint"][case_index].detach()
+            temporal_anchor = baseline_terms["temporal"][case_index].detach()
+            endpoint_tolerance = max(
+                1.0e-12, abs(float(endpoint_anchor)) * 1.0e-9
+            )
+            temporal_tolerance = max(
+                1.0e-12, abs(float(temporal_anchor)) * 1.0e-9
+            )
+            endpoint_delta = (
+                case_terms["endpoint"][case_index] - endpoint_anchor
+            )
+            temporal_delta = (
+                case_terms["temporal"][case_index] - temporal_anchor
+            )
+            endpoint_nonregression = m.torch.relu(
+                endpoint_delta - endpoint_tolerance
+            ) / endpoint_scale
+            temporal_nonregression = m.torch.relu(
+                temporal_delta - temporal_tolerance
+            ) / temporal_scale
+            nonregression_losses.extend([
+                endpoint_nonregression,
+                temporal_nonregression,
+            ])
+            if case_index == 20:
+                case20_temporal_losses.append(temporal_nonregression)
+            violates_nonregression = bool(
+                float(
+                    (
+                        endpoint_nonregression
+                        + temporal_nonregression
+                    ).detach()
+                ) > 0.0
+            )
+            direction_weight = (
+                float(args.violating_direction_weight)
+                if violates_nonregression else 1.0
+            )
+            direction_losses.append(direction_weight * (1.0 - cosine))
             scientific_losses.extend([
                 case_terms["endpoint"][case_index] / endpoint_scale,
                 case_terms["temporal"][case_index] / temporal_scale,
             ])
+            exact_radius_constraints[str(case_index)] = {
+                "endpoint_anchor": float(endpoint_anchor),
+                "endpoint_candidate": float(
+                    case_terms["endpoint"][case_index].detach()
+                ),
+                "endpoint_delta": float(endpoint_delta.detach()),
+                "endpoint_numeric_tolerance": endpoint_tolerance,
+                "endpoint_nonregression": bool(
+                    float(endpoint_delta.detach()) <= endpoint_tolerance
+                ),
+                "endpoint_nonregression_hinge": float(
+                    endpoint_nonregression.detach()
+                ),
+                "temporal_anchor": float(temporal_anchor),
+                "temporal_candidate": float(
+                    case_terms["temporal"][case_index].detach()
+                ),
+                "temporal_delta": float(temporal_delta.detach()),
+                "temporal_numeric_tolerance": temporal_tolerance,
+                "temporal_nonregression": bool(
+                    float(temporal_delta.detach()) <= temporal_tolerance
+                ),
+                "temporal_nonregression_hinge": float(
+                    temporal_nonregression.detach()
+                ),
+                "direction_distillation_weight": direction_weight,
+            }
         direction_loss = m.torch.stack(direction_losses).mean()
         magnitude_loss = m.torch.stack(magnitude_losses).mean()
         scientific_loss = m.torch.stack(scientific_losses).mean()
+        nonregression_loss = m.torch.stack(
+            nonregression_losses
+        ).mean()
+        case20_temporal_loss = (
+            m.torch.stack(case20_temporal_losses).mean()
+            if case20_temporal_losses
+            else applied_adapter_tangent.sum() * 0.0
+        )
         control_loss = (
             m.torch.stack(control_losses).mean()
             if control_losses else applied_adapter_tangent.sum() * 0.0
@@ -518,6 +669,8 @@ def run(args):
         loss = (
             direction_loss
             + 0.10 * scientific_loss
+            + float(args.nonregression_weight) * nonregression_loss
+            + float(args.case20_temporal_weight) * case20_temporal_loss
             + 10.0 * magnitude_loss
             + 10.0 * control_loss
             + 10.0 * guard_loss
@@ -552,11 +705,19 @@ def run(args):
             "loss": float(loss.detach()),
             "directional_cosine_loss": float(direction_loss.detach()),
             "scientific_loss": float(scientific_loss.detach()),
+            "exact_radius_nonregression_loss": float(
+                nonregression_loss.detach()
+            ),
+            "case20_temporal_signed_residual_loss": float(
+                case20_temporal_loss.detach()
+            ),
             "magnitude_upper_bound_loss": float(magnitude_loss.detach()),
             "identity_control_loss": float(control_loss.detach()),
             "differentiable_fixed_guard_excess": float(guard_loss.detach()),
             "adapter_output_rms_by_case": amplitude,
             "adapter_gate_mean_by_case": gate,
+            "exact_radius_normalization_by_case": radius_normalization,
+            "exact_radius_constraints_by_case": exact_radius_constraints,
             "exact_audits": audits,
         }
         history.append(row)
@@ -565,6 +726,12 @@ def run(args):
             "step": step,
             "loss": row["loss"],
             "directional_cosine_loss": row["directional_cosine_loss"],
+            "exact_radius_nonregression_loss": row[
+                "exact_radius_nonregression_loss"
+            ],
+            "case20_temporal_signed_residual_loss": row[
+                "case20_temporal_signed_residual_loss"
+            ],
             "identity_control_loss": row["identity_control_loss"],
             "projected_passes": sum(
                 audit["effective_projected_candidate"] for audit in audits
@@ -629,6 +796,82 @@ def run(args):
         default=0.0,
     )
     route_ready = bool(route_ready and final_scope_safe)
+    audit_by_case = {
+        int(row["case_index"]): row for row in final_audits
+    }
+    required_case_status = {}
+    for case_index in FORMAL_READINESS_CASES:
+        audit = audit_by_case.get(case_index)
+        if audit is None:
+            required_case_status[str(case_index)] = {
+                "present": False,
+                "scope_safe": False,
+                "endpoint_nonregression": False,
+                "temporal_nonregression": False,
+                "fixed_guard_passed": False,
+            }
+            continue
+        raw = audit["raw_audit"]
+        scientific = raw["case_scientific"]
+        tolerances = scientific["numeric_tolerance"]
+        required_case_status[str(case_index)] = {
+            "present": True,
+            "scope_safe": bool(raw["scope"]["scope_safe"]),
+            "endpoint_nonregression": bool(
+                float(scientific["endpoint_delta"])
+                <= float(tolerances["endpoint"])
+            ),
+            "temporal_nonregression": bool(
+                float(scientific["temporal_delta"])
+                <= float(tolerances["temporal"])
+            ),
+            "fixed_guard_passed": bool(raw["fixed_guard_passed"]),
+            "raw_passed": bool(raw["passed"]),
+            "projector_invoked": audit["projector_result"] is not None,
+            "effective_projected_candidate": bool(
+                audit["effective_projected_candidate"]
+            ),
+        }
+    formal_readiness_criteria = {
+        "required_cases_present": all(
+            row["present"] for row in required_case_status.values()
+        ),
+        "required_cases_scope_safe": all(
+            row["scope_safe"] for row in required_case_status.values()
+        ),
+        "required_cases_endpoint_nonregression": all(
+            row["endpoint_nonregression"]
+            for row in required_case_status.values()
+        ),
+        "required_cases_temporal_nonregression": all(
+            row["temporal_nonregression"]
+            for row in required_case_status.values()
+        ),
+        "required_cases_fixed_guard_passed": all(
+            row["fixed_guard_passed"]
+            for row in required_case_status.values()
+        ),
+        "cross_short_projected_candidate_exists": bool(
+            projected_by_group["cross_short"] > 0
+        ),
+        "cross_long_projected_candidate_exists": bool(
+            projected_by_group["cross_long"] > 0
+        ),
+        "single_control_gate_is_zero": bool(
+            single_control_gate_max == 0.0
+        ),
+        "single_control_tangent_is_conservative": bool(
+            single_control_applied_rms_max <= 1.0e-7
+        ),
+        "numeric_audit_complete": bool(final_audits),
+        "fixed_guard_thresholds_unchanged": True,
+    }
+    ready_for_formal_adapter_training = bool(
+        args.exact_radius_training
+        and all(formal_readiness_criteria.values())
+    )
+    if args.exact_radius_training:
+        route_ready = ready_for_formal_adapter_training
     destination = Path(args.output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     state_path = destination / "observable_adapter_probe_state.pt"
@@ -650,6 +893,13 @@ def run(args):
         "formal_training_allowed": False,
         "publish_allowed": False,
         "audit_only": bool(args.audit_only),
+        "exact_radius_training": bool(args.exact_radius_training),
+        "exact_radius_normalization_eps": float(args.normalization_eps),
+        "nonregression_weight": float(args.nonregression_weight),
+        "case20_temporal_weight": float(args.case20_temporal_weight),
+        "violating_direction_weight": float(
+            args.violating_direction_weight
+        ),
         "resumed_adapter_state": (
             str(adapter_state_path.resolve())
             if adapter_state_path is not None else None
@@ -699,6 +949,11 @@ def run(args):
             projected_by_group
         ),
         "ready_for_expanded_adapter_training": route_ready,
+        "required_case_status": required_case_status,
+        "formal_readiness_criteria": formal_readiness_criteria,
+        "ready_for_formal_adapter_training": (
+            ready_for_formal_adapter_training
+        ),
         "probe_state": str(state_path.resolve()),
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
@@ -709,6 +964,9 @@ def run(args):
         "stage": "v15_15_observable_adapter_probe_complete",
         "report": str(report_path.resolve()),
         "ready_for_expanded_adapter_training": route_ready,
+        "ready_for_formal_adapter_training": (
+            ready_for_formal_adapter_training
+        ),
         "effective_projected_candidate_count_by_group": dict(
             projected_by_group
         ),
@@ -728,6 +986,17 @@ def main():
     parser.add_argument("--target-rms", type=float, default=1.0e-4)
     parser.add_argument("--adapter-state")
     parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument("--exact-radius-training", action="store_true")
+    parser.add_argument(
+        "--normalization-eps",
+        type=float,
+        default=EXACT_RADIUS_NORMALIZATION_EPS,
+    )
+    parser.add_argument("--nonregression-weight", type=float, default=25.0)
+    parser.add_argument("--case20-temporal-weight", type=float, default=25.0)
+    parser.add_argument(
+        "--violating-direction-weight", type=float, default=0.10
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -741,6 +1010,14 @@ def main():
         parser.error("--target-rms must remain exactly 1e-4")
     if args.eval_every < 1:
         parser.error("evaluation interval must be positive")
+    if not 0.0 < args.normalization_eps <= 1.0e-6:
+        parser.error("normalization epsilon must be in (0, 1e-6]")
+    if args.nonregression_weight <= 0.0:
+        parser.error("nonregression weight must be positive")
+    if args.case20_temporal_weight <= 0.0:
+        parser.error("case-20 temporal weight must be positive")
+    if not 0.0 <= args.violating_direction_weight <= 1.0:
+        parser.error("violating direction weight must be in [0, 1]")
     if args.audit_only:
         if args.steps != 0:
             parser.error("--audit-only requires --steps 0")

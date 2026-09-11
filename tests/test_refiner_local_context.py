@@ -260,6 +260,72 @@ def test_observable_adapter_exact_scope_mask_is_case_and_window_local():
     assert torch.count_nonzero(scoped[1, 1:3]) == 2 * 75
 
 
+def test_exact_radius_adapter_normalization_is_finite_and_case_local():
+    from training import refiner_observable_adapter_probe as probe
+
+    ownership = torch.tensor([
+        [[False], [True], [True], [False]],
+        [[False], [True], [True], [False]],
+    ])
+    tangent = torch.zeros((2, 4, 75), requires_grad=True)
+    with torch.no_grad():
+        tangent[1, 1:3] = 0.25
+    samples = [
+        {
+            "case_index": 0,
+            "teacher_kind": "identity_control",
+        },
+        {
+            "case_index": 1,
+            "teacher_kind": "exact_projected_direction",
+        },
+    ]
+
+    normalized, diagnostics = probe._safe_exact_radius_tangent(
+        tangent,
+        ownership,
+        samples,
+        1.0e-4,
+    )
+    permitted = probe._owned_case_mask(ownership, tangent, case_index=1)
+    normalized[permitted].sum().backward()
+
+    assert torch.count_nonzero(normalized[0]) == 0
+    assert torch.count_nonzero(normalized[1, [0, 3]]) == 0
+    assert torch.isfinite(tangent.grad).all()
+    torch.testing.assert_close(
+        normalized[permitted].square().mean().sqrt(),
+        torch.tensor(1.0e-4),
+        atol=1.0e-10,
+        rtol=1.0e-6,
+    )
+    assert diagnostics["1"]["radius_equality_resolved"] is True
+
+
+def test_zero_adapter_normalization_has_finite_gradient_and_unresolved_radius():
+    from training import refiner_observable_adapter_probe as probe
+
+    ownership = torch.tensor([[[False], [True], [True], [False]]])
+    tangent = torch.zeros((1, 4, 75), requires_grad=True)
+    samples = [{
+        "case_index": 0,
+        "teacher_kind": "exact_projected_direction",
+    }]
+
+    normalized, diagnostics = probe._safe_exact_radius_tangent(
+        tangent,
+        ownership,
+        samples,
+        1.0e-4,
+    )
+    normalized.sum().backward()
+
+    assert torch.count_nonzero(normalized) == 0
+    assert torch.isfinite(tangent.grad).all()
+    assert diagnostics["0"]["normalization_floor_active"] is True
+    assert diagnostics["0"]["radius_equality_resolved"] is False
+
+
 def test_observable_adapter_contract_is_opt_in_and_label_free():
     legacy = m.MotionGenerationConfig()
     assert "refiner_observable_adapter" not in m.motion_checkpoint_contract(
