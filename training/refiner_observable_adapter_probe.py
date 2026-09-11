@@ -13,14 +13,14 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from motion_geometry.product_manifold import product_log_torch
+from motion_geometry.product_manifold import product_exp_torch, product_log_torch
 from training import motion_models as m
 from training import refiner_case_local_full_tangent_oracle as oracle
 from training import refiner_group_local_nullspace_cone_probe as group_probe
 from training import refiner_projected_candidate_probe as projected_probe
 
 
-SCHEMA = "refiner_v15_15_observable_cross_adapter_probe_v1"
+SCHEMA = "refiner_v15_15b_exact_scope_observable_cross_adapter_probe_v2"
 
 
 def _to_device(value, device):
@@ -50,10 +50,24 @@ def _adapter_batch_outputs(model, batch, cfg):
     prediction = m._decode_product_refiner_output(
         batch["bad"], outputs, *repair_masks, cfg
     )
+    adapter_output = m.torch.cat(
+        [
+            m.torch.zeros_like(outputs[..., :4]),
+            adapter_trace["tangent"],
+        ],
+        dim=-1,
+    )
+    shared_prediction = m._decode_product_refiner_output(
+        batch["bad"], outputs - adapter_output, *repair_masks, cfg
+    )
+    adapter_trace["decoder_consistent_tangent"] = product_log_torch(
+        shared_prediction,
+        prediction,
+    )
     return prediction, adapter_trace
 
 
-def _load_source_model(source, cfg, device):
+def _load_source_model(source, cfg, device, adapter_state_path=None):
     state = m.torch.load(
         source / "diagnostic_state.pt",
         map_location="cpu",
@@ -83,6 +97,33 @@ def _load_source_model(source, cfg, device):
             "invalid_missing_keys": invalid_missing,
             "unexpected_keys": unexpected,
         })
+    if adapter_state_path is not None:
+        payload = m.torch.load(
+            adapter_state_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        adapter_state = payload.get("adapter_state_dict")
+        if not isinstance(adapter_state, dict) or not adapter_state:
+            raise RuntimeError("adapter state does not contain Adapter weights")
+        invalid_keys = [
+            key for key in adapter_state
+            if not key.startswith("observable_adapter_")
+        ]
+        if invalid_keys:
+            raise RuntimeError({"invalid_adapter_state_keys": invalid_keys})
+        current_state = model.state_dict()
+        for key, value in adapter_state.items():
+            if key not in current_state:
+                raise RuntimeError({"unknown_adapter_state_key": key})
+            if current_state[key].shape != value.shape:
+                raise RuntimeError({
+                    "adapter_state_shape_mismatch": key,
+                    "expected": tuple(current_state[key].shape),
+                    "actual": tuple(value.shape),
+                })
+            current_state[key] = value
+        model.load_state_dict(current_state, strict=True)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     for module in (
@@ -128,27 +169,97 @@ def _fixed_guard_penalty(
     return m.torch.stack(terms).mean(), values
 
 
+def _owned_case_mask(ownership, tangent, case_index):
+    selected = m.torch.zeros_like(ownership, dtype=m.torch.bool)
+    selected[int(case_index)] = True
+    return (selected & ownership).expand_as(tangent)
+
+
+def _masked_rms(value, mask):
+    selected = value[mask]
+    if selected.numel() == 0:
+        return value.sum() * 0.0
+    return m.torch.sqrt(selected.square().mean().clamp_min(1.0e-24))
+
+
 def _isolated_fixed_radius_candidate(
-    baseline, prediction, batch, case_index, target_rms
+    baseline,
+    decoder_adapter_tangent,
+    pre_taper_adapter_tangent,
+    c2_taper,
+    ownership,
+    batch,
+    case_index,
+    target_rms,
 ):
-    tangent = product_log_torch(baseline, prediction)
-    selected = m.torch.zeros_like(tangent)
-    selected[int(case_index)] = tangent[int(case_index)]
+    permitted = _owned_case_mask(
+        ownership, decoder_adapter_tangent, case_index
+    )
+    outside = ~permitted
+    outside_before = (
+        float(decoder_adapter_tangent[outside].abs().max().detach())
+        if bool(outside.any()) else 0.0
+    )
+    selected = decoder_adapter_tangent.masked_fill(~permitted, 0.0)
+    # The fixed-radius contract is defined on the actual decoder-consistent
+    # tangent after tapering.  Pre-taper RMS is reported separately so an
+    # unexpectedly large taper compensation cannot be hidden by normalization.
+    pre_taper_permitted = _owned_case_mask(
+        ownership, pre_taper_adapter_tangent, case_index
+    )
+    pre_taper_rms = _masked_rms(
+        pre_taper_adapter_tangent, pre_taper_permitted
+    )
+    tapered_model_rms = _masked_rms(selected, permitted)
+    taper_values = c2_taper.expand_as(pre_taper_adapter_tangent)
+    tapered_pre_decode = (
+        pre_taper_adapter_tangent * taper_values
+    ).masked_fill(~pre_taper_permitted, 0.0)
+    tapered_pre_decode_rms = _masked_rms(
+        tapered_pre_decode, pre_taper_permitted
+    )
     action = group_probe._product_action(selected)
-    return oracle.case_probe._candidate_from_action(
+    candidate, scale, achieved = oracle.case_probe._candidate_from_action(
         baseline,
         action,
         batch["seam"],
         target_rms,
         case_index,
-    )[0]
+    )
+    outside_after = (
+        float(selected[outside].abs().max().detach())
+        if bool(outside.any()) else 0.0
+    )
+    inflation = (
+        float(tapered_model_rms.detach() / pre_taper_rms.detach())
+        if float(pre_taper_rms.detach()) > 1.0e-12 else None
+    )
+    return candidate, {
+        "outside_scope_abs_max_before_final_mask": outside_before,
+        "outside_scope_masked_action_abs_max": outside_after,
+        "scope_audit_reference": "fixed_teacher_bank_baseline_prediction",
+        "scope_audit_space": "79d_product_tangent_action",
+        "pre_taper_owned_rms": float(pre_taper_rms.detach()),
+        "tapered_pre_decode_owned_rms": float(
+            tapered_pre_decode_rms.detach()
+        ),
+        "decoder_consistent_owned_rms_before_radius_normalization": float(
+            tapered_model_rms.detach()
+        ),
+        "decoder_to_pre_taper_rms_ratio": inflation,
+        "fixed_radius_scale": float(scale),
+        "fixed_radius_achieved_rms": float(achieved),
+    }
 
 
 def _audit_step(
     model,
     batch,
     cfg,
-    prediction,
+    decoder_adapter_tangent,
+    pre_taper_adapter_tangent,
+    c2_taper,
+    ownership,
     baseline,
     baseline_identity,
     baseline_guard,
@@ -165,8 +276,15 @@ def _audit_step(
             continue
         case_index = int(sample["case_index"])
         group_name = str(sample["audit_group"])
-        candidate = _isolated_fixed_radius_candidate(
-            baseline, prediction, batch, case_index, target_rms
+        candidate, scope_diagnostics = _isolated_fixed_radius_candidate(
+            baseline,
+            decoder_adapter_tangent,
+            pre_taper_adapter_tangent,
+            c2_taper,
+            ownership,
+            batch,
+            case_index,
+            target_rms,
         )
         baseline_case = {
             key: float(baseline_terms[key][case_index].detach())
@@ -188,6 +306,14 @@ def _audit_step(
             target_rms,
             workspace_floor,
         )
+        scope_diagnostics[
+            "outside_scope_abs_max_after_final_mask"
+        ] = float(
+            raw_audit["scope"][
+                "outside_case_group_or_ownership_abs_max"
+            ]
+        )
+        raw_audit.update(scope_diagnostics)
         projection = None
         if raw_audit["passed"]:
             _, projection = oracle._project_raw_candidate(
@@ -244,13 +370,25 @@ def run(args):
         raise RuntimeError("V15.15 Adapter probe requires CUDA")
     batch = _to_device(teacher["batch"], device)
     samples = teacher["samples"]
-    model, missing = _load_source_model(source, cfg, device)
+    adapter_state_path = (
+        Path(args.adapter_state) if args.adapter_state else None
+    )
+    if args.audit_only and adapter_state_path is None:
+        raise RuntimeError("--audit-only requires --adapter-state")
+    if args.audit_only and int(args.steps) != 0:
+        raise RuntimeError("--audit-only requires --steps 0")
+    model, missing = _load_source_model(
+        source,
+        cfg,
+        device,
+        adapter_state_path=adapter_state_path,
+    )
     model.observable_adapter_gate_floor.copy_(m.torch.as_tensor(
         float(teacher["observable_adapter_gate_floor"]),
         dtype=model.observable_adapter_gate_floor.dtype,
         device=device,
     ))
-    model.train()
+    model.train(not args.audit_only)
     parameters = [
         parameter for parameter in model.parameters()
         if parameter.requires_grad
@@ -281,14 +419,24 @@ def run(args):
 
     for step in range(int(args.steps) + 1):
         optimizer.zero_grad(set_to_none=True)
-        prediction, adapter_trace = _adapter_batch_outputs(
+        _, adapter_trace = _adapter_batch_outputs(
             model, batch, cfg
         )
         adapter_tangent = adapter_trace["tangent"]
-        applied_adapter_tangent = product_log_torch(
-            baseline.detach(), prediction
+        ownership = adapter_trace["ownership"].to(m.torch.bool)
+        decoder_adapter_tangent = adapter_trace[
+            "decoder_consistent_tangent"
+        ]
+        permitted = ownership.expand_as(decoder_adapter_tangent)
+        applied_adapter_tangent = decoder_adapter_tangent.masked_fill(
+            ~permitted,
+            0.0,
         )
-        ownership = adapter_trace["ownership"]
+        # Scientific losses and Guard penalties see the same fixed Anchor and
+        # exact-scope tangent that the exact closure auditor receives.
+        prediction = product_exp_torch(
+            baseline.detach(), applied_adapter_tangent
+        )
         case_terms = oracle.case_probe._case_terms(prediction, batch, cfg)
         direction_losses = []
         magnitude_losses = []
@@ -380,7 +528,10 @@ def run(args):
                 model,
                 batch,
                 cfg,
-                prediction.detach(),
+                applied_adapter_tangent.detach(),
+                adapter_trace["owned_pre_taper_tangent"].detach(),
+                adapter_trace["c2_taper"].detach(),
+                ownership.detach(),
                 baseline,
                 baseline_identity,
                 baseline_guard,
@@ -461,6 +612,23 @@ def run(args):
         and projected_by_group["cross_long"] > 0
         and single_conservative_path_preserved
     )
+    final_scope_safe = bool(
+        final_audits
+        and all(
+            row["raw_audit"]["scope"]["scope_safe"]
+            for row in final_audits
+        )
+    )
+    outside_after_max = max(
+        (
+            float(row["raw_audit"].get(
+                "outside_scope_abs_max_after_final_mask", 0.0
+            ))
+            for row in final_audits
+        ),
+        default=0.0,
+    )
+    route_ready = bool(route_ready and final_scope_safe)
     destination = Path(args.output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     state_path = destination / "observable_adapter_probe_state.pt"
@@ -481,6 +649,11 @@ def run(args):
         "formal_checkpoint": False,
         "formal_training_allowed": False,
         "publish_allowed": False,
+        "audit_only": bool(args.audit_only),
+        "resumed_adapter_state": (
+            str(adapter_state_path.resolve())
+            if adapter_state_path is not None else None
+        ),
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
         "teacher_bank": str(teacher_path.resolve()),
         "source_diagnostic": str(source.resolve()),
@@ -500,7 +673,7 @@ def run(args):
         "single_control_deadzone_floor": float(
             model.observable_adapter_gate_floor
         ),
-        "adapter_zero_initialized": True,
+        "adapter_zero_initialized": adapter_state_path is None,
         "projector_gradient_protocol": "stop_gradient_initial_probe",
         "gradient_clip": float(args.gradient_clip),
         "source_checkpoint_missing_adapter_keys": missing,
@@ -518,6 +691,10 @@ def run(args):
         "single_conservative_path_preserved": (
             single_conservative_path_preserved
         ),
+        "adapter_gate_mean_by_case": final_gate,
+        "outside_scope_abs_max_after_final_mask": outside_after_max,
+        "scope_safe": final_scope_safe,
+        "numeric_audit_complete": bool(final_audits),
         "effective_projected_candidate_count_by_group": dict(
             projected_by_group
         ),
@@ -549,6 +726,8 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--target-rms", type=float, default=1.0e-4)
+    parser.add_argument("--adapter-state")
+    parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)

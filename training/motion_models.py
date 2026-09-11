@@ -3389,7 +3389,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
             adapter_input = torch.cat(
                 [h, features.transpose(1, 2)], dim=1
             )
-            adapter_tangent = self.observable_adapter_net(
+            raw_adapter_tangent = self.observable_adapter_net(
                 adapter_input
             ).transpose(1, 2)
             raw_gate = self.observable_adapter_gate(
@@ -3401,11 +3401,19 @@ class ProductManifoldTemporalRefiner(nn.Module):
             )
             continuous_support = 1.0 - torch.exp(-excess.square())
             gate = torch.sigmoid(raw_gate) * continuous_support
-            adapter_tangent = (
-                adapter_tangent
+            owned_pre_taper_tangent = (
+                raw_adapter_tangent
                 * gate
-                * taper
-                * ownership.to(adapter_tangent.dtype)
+                * ownership.to(raw_adapter_tangent.dtype)
+            )
+            adapter_tangent = owned_pre_taper_tangent * taper
+            # Keep the ownership support exact after every floating-point
+            # operation.  Decoder smoothing is allowed to spread the decoded
+            # proposal, so the probe performs a second, decoder-consistent
+            # scope projection before constructing an audited candidate.
+            adapter_tangent = adapter_tangent.masked_fill(
+                ~ownership.expand_as(adapter_tangent),
+                0.0,
             )
             adapter_output = torch.cat(
                 [torch.zeros_like(output[..., :4]), adapter_tangent], dim=-1
@@ -3418,6 +3426,8 @@ class ProductManifoldTemporalRefiner(nn.Module):
                     "gate": gate,
                     "c2_taper": taper,
                     "ownership": ownership,
+                    "raw_tangent": raw_adapter_tangent,
+                    "owned_pre_taper_tangent": owned_pre_taper_tangent,
                     "tangent": adapter_tangent,
                 })
         return output

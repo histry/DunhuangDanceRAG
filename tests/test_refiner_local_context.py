@@ -244,6 +244,22 @@ def test_observable_adapter_is_zero_initialized_and_ownership_local():
     assert torch.count_nonzero(output[..., :4]) == 0
 
 
+def test_observable_adapter_exact_scope_mask_is_case_and_window_local():
+    from training import refiner_observable_adapter_probe as probe
+
+    ownership = torch.tensor([
+        [[False], [True], [True], [False]],
+        [[False], [True], [True], [False]],
+    ])
+    tangent = torch.ones((2, 4, 75))
+    permitted = probe._owned_case_mask(ownership, tangent, case_index=1)
+    scoped = tangent.masked_fill(~permitted, 0.0)
+
+    assert torch.count_nonzero(scoped[0]) == 0
+    assert torch.count_nonzero(scoped[1, [0, 3]]) == 0
+    assert torch.count_nonzero(scoped[1, 1:3]) == 2 * 75
+
+
 def test_observable_adapter_contract_is_opt_in_and_label_free():
     legacy = m.MotionGenerationConfig()
     assert "refiner_observable_adapter" not in m.motion_checkpoint_contract(
