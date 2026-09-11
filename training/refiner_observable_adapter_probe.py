@@ -27,6 +27,9 @@ V15_15C_SCHEMA = "refiner_v15_15c_exact_radius_constraint_adapter_probe_v3"
 V15_15D_SCHEMA = (
     "refiner_v15_15d_case_isolated_fixed_guard_restoration_probe_v1"
 )
+V15_15E_TEACHER_SCHEMA = (
+    "refiner_v15_15e_multi_transaction_observable_adapter_teacher_bank_v1"
+)
 EXACT_RADIUS_NORMALIZATION_EPS = 1.0e-8
 FORMAL_READINESS_CASES = (16, 18, 20, 29)
 CROSS_GROUPS = ("cross_short", "cross_long")
@@ -38,6 +41,13 @@ def _to_device(value, device):
     if isinstance(value, dict):
         return {key: _to_device(item, device) for key, item in value.items()}
     return value
+
+
+def _slice_batch(batch, start, stop):
+    return {
+        key: value[int(start):int(stop)]
+        for key, value in batch.items()
+    }
 
 
 def _adapter_batch_outputs(model, batch, cfg):
@@ -307,6 +317,36 @@ def _balanced_cross_group_mean(values_by_group):
     }
 
 
+def _stratified_cross_group_mean(values_by_group, weights_by_group):
+    """Give each cross group equal mass and each transaction equal mass."""
+    missing = [
+        group for group in CROSS_GROUPS
+        if not values_by_group.get(group)
+    ]
+    if missing:
+        raise RuntimeError({
+            "missing_cross_group_training_objectives": missing,
+        })
+    group_means = []
+    details = {}
+    for group in CROSS_GROUPS:
+        values = m.torch.stack(values_by_group[group])
+        weights = values.new_tensor(weights_by_group[group])
+        if values.numel() != weights.numel():
+            if values.numel() % weights.numel() != 0:
+                raise RuntimeError("stratified weight/value count mismatch")
+            weights = weights.repeat_interleave(
+                values.numel() // weights.numel()
+            )
+        if not bool((weights > 0.0).all()):
+            raise RuntimeError("stratified weights must be positive")
+        normalized = weights / weights.sum()
+        mean = (values * normalized).sum()
+        group_means.append(mean)
+        details[group] = float(mean.detach())
+    return m.torch.stack(group_means).mean(), details
+
+
 def _owned_case_mask(ownership, tangent, case_index):
     selected = m.torch.zeros_like(ownership, dtype=m.torch.bool)
     selected[int(case_index)] = True
@@ -362,7 +402,8 @@ def _safe_exact_radius_tangent(
         local = tangent * permitted.to(tangent.dtype) * scale
         result = result + local
         normalized_rms = _masked_rms(local, permitted)
-        diagnostics[str(case_index)] = {
+        case_uid = str(sample.get("case_uid", case_index))
+        diagnostics[case_uid] = {
             "normalization_eps": float(eps),
             "active_coordinate_count": int(active.numel()),
             "input_rms": float(_masked_rms(tangent, permitted).detach()),
@@ -466,37 +507,63 @@ def _audit_step(
     target_rms,
     workspace_floor,
     args,
+    transaction_domains=None,
 ):
     rows = []
     for sample in samples:
         if sample["teacher_kind"] != "exact_projected_direction":
             continue
-        case_index = int(sample["case_index"])
+        global_case_index = int(sample["case_index"])
+        case_index = global_case_index
+        case_uid = str(sample.get("case_uid", case_index))
         group_name = str(sample["audit_group"])
+        local_batch = batch
+        local_decoder_tangent = decoder_adapter_tangent
+        local_pre_taper_tangent = pre_taper_adapter_tangent
+        local_c2_taper = c2_taper
+        local_ownership = ownership
+        local_baseline = baseline
+        local_identity = baseline_identity
+        local_baseline_guard = baseline_guard
+        local_contract = contract
+        if transaction_domains is not None:
+            transaction_id = str(sample["transaction_id"])
+            domain = transaction_domains[transaction_id]
+            case_index = int(sample["local_case_index"])
+            start, stop = domain["slice"]
+            local_batch = domain["batch"]
+            local_decoder_tangent = decoder_adapter_tangent[start:stop]
+            local_pre_taper_tangent = pre_taper_adapter_tangent[start:stop]
+            local_c2_taper = c2_taper[start:stop]
+            local_ownership = ownership[start:stop]
+            local_baseline = domain["baseline"]
+            local_identity = domain["identity"]
+            local_baseline_guard = domain["baseline_guard"]
+            local_contract = domain["contract"]
         candidate, scope_diagnostics = _isolated_fixed_radius_candidate(
-            baseline,
-            decoder_adapter_tangent,
-            pre_taper_adapter_tangent,
-            c2_taper,
-            ownership,
-            batch,
+            local_baseline,
+            local_decoder_tangent,
+            local_pre_taper_tangent,
+            local_c2_taper,
+            local_ownership,
+            local_batch,
             case_index,
             target_rms,
         )
         baseline_case = {
-            key: float(baseline_terms[key][case_index].detach())
+            key: float(baseline_terms[key][global_case_index].detach())
             for key in ("endpoint", "temporal")
         }
         raw_audit = oracle._exact_audit(
             model,
-            batch,
+            local_batch,
             cfg,
-            baseline,
-            baseline_identity,
-            baseline_guard,
-            contract["initial_anchor"],
-            contract["relative_tolerance"],
-            contract["absolute_tolerance"],
+            local_baseline,
+            local_identity,
+            local_baseline_guard,
+            local_contract["initial_anchor"],
+            local_contract["relative_tolerance"],
+            local_contract["absolute_tolerance"],
             candidate,
             case_index,
             baseline_case,
@@ -515,14 +582,14 @@ def _audit_step(
         if raw_audit["passed"]:
             _, projection = oracle._project_raw_candidate(
                 model=model,
-                batch=batch,
+                batch=local_batch,
                 cfg=cfg,
-                baseline=baseline,
-                identity=baseline_identity,
-                baseline_guard=baseline_guard,
-                guard_anchor=contract["initial_anchor"],
-                guard_relative=contract["relative_tolerance"],
-                guard_absolute=contract["absolute_tolerance"],
+                baseline=local_baseline,
+                identity=local_identity,
+                baseline_guard=local_baseline_guard,
+                guard_anchor=local_contract["initial_anchor"],
+                guard_relative=local_contract["relative_tolerance"],
+                guard_absolute=local_contract["absolute_tolerance"],
                 raw=candidate,
                 case_index=case_index,
                 baseline_case=baseline_case,
@@ -531,7 +598,12 @@ def _audit_step(
                 args=args,
             )
         rows.append({
-            "case_index": case_index,
+            "case_index": global_case_index,
+            "local_case_index": int(
+                sample.get("local_case_index", case_index)
+            ),
+            "transaction_id": sample.get("transaction_id"),
+            "case_uid": case_uid,
             "group": group_name,
             "raw_audit": raw_audit,
             "projector_stop_gradient": True,
@@ -550,12 +622,22 @@ def run(args):
     teacher = m.torch.load(
         teacher_path, map_location="cpu", weights_only=False
     )
-    if teacher.get("schema") != (
-        "refiner_v15_15_observable_adapter_teacher_bank_v1"
-    ):
+    if teacher.get("schema") not in {
+        "refiner_v15_15_observable_adapter_teacher_bank_v1",
+        V15_15E_TEACHER_SCHEMA,
+    }:
         raise RuntimeError("unsupported V15.15 teacher bank")
     if teacher.get("formal_training_allowed") is not False:
         raise RuntimeError("teacher bank is not development-only")
+    multi_transaction_teacher = bool(
+        teacher.get("schema") == V15_15E_TEACHER_SCHEMA
+    )
+    if multi_transaction_teacher and not teacher.get("teacher_bank_ready"):
+        raise RuntimeError("multi-transaction teacher split lacks both groups")
+    if multi_transaction_teacher and not args.case_isolated_guard_restoration:
+        raise RuntimeError(
+            "multi-transaction teachers require case-isolated Guard domains"
+        )
     source = Path(teacher["source_diagnostic"])
     source_report = json.loads(
         (source / "diagnostic_report.json").read_text(encoding="utf-8-sig")
@@ -600,15 +682,46 @@ def run(args):
         # unnecessary clean forward pass.
         baseline = teacher["baseline_prediction"].to(device)
         baseline_identity = teacher["baseline_identity"].to(device)
-        baseline_guard = projected_probe._float_guard(
-            projected_probe._guard_values_for_prediction(
-                model, batch, cfg, baseline, baseline_identity
+        baseline_guard = (
+            None
+            if multi_transaction_teacher
+            else projected_probe._float_guard(
+                projected_probe._guard_values_for_prediction(
+                    model, batch, cfg, baseline, baseline_identity
+                )
             )
         )
         baseline_terms = oracle.case_probe._case_terms(
             baseline, batch, cfg
         )
     contract = source_report["group_guard_contract"]
+    transaction_domains = None
+    if multi_transaction_teacher:
+        transaction_domains = {}
+        schedules = teacher["transaction_schedules"]
+        contracts = teacher["transaction_guard_contracts"]
+        for transaction_id, metadata in schedules.items():
+            start = int(metadata["global_case_offset"])
+            stop = start + int(metadata["case_count"])
+            local_batch = _slice_batch(batch, start, stop)
+            local_baseline = baseline[start:stop]
+            local_identity = baseline_identity[start:stop]
+            transaction_domains[transaction_id] = {
+                "slice": (start, stop),
+                "batch": local_batch,
+                "baseline": local_baseline,
+                "identity": local_identity,
+                "baseline_guard": projected_probe._float_guard(
+                    projected_probe._guard_values_for_prediction(
+                        model,
+                        local_batch,
+                        cfg,
+                        local_baseline,
+                        local_identity,
+                    )
+                ),
+                "contract": contracts[transaction_id],
+            }
     workspace_floor = max(1.0e-8, float(args.target_rms) * 0.01)
     history = []
     blocker_counts = Counter()
@@ -668,6 +781,9 @@ def run(args):
         guard_losses_by_group = {
             group: [] for group in CROSS_GROUPS
         }
+        stratified_weights_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
         case20_temporal_losses = []
         control_losses = []
         exact_radius_constraints = {}
@@ -677,6 +793,10 @@ def run(args):
         gate = {}
         for sample in samples:
             case_index = int(sample["case_index"])
+            local_case_index = int(
+                sample.get("local_case_index", case_index)
+            )
+            case_uid = str(sample.get("case_uid", case_index))
             group_name = str(sample["audit_group"])
             predicted, target = _case_vectors(
                 applied_adapter_tangent,
@@ -699,17 +819,23 @@ def run(args):
             raw_rms = m.torch.sqrt(
                 raw_predicted.square().mean().clamp_min(1.0e-24)
             ) if raw_predicted.numel() else adapter_tangent.sum() * 0.0
-            amplitude[str(case_index)] = {
+            amplitude[case_uid] = {
                 "raw_adapter_tangent_rms": float(raw_rms.detach()),
                 "applied_adapter_tangent_rms": float(predicted_rms.detach()),
             }
             active = ownership[case_index, :, 0]
-            gate[str(case_index)] = float(
+            gate[case_uid] = float(
                 adapter_trace["gate"][case_index, active].mean().detach()
             ) if bool(active.any()) else 0.0
             if sample["teacher_kind"] == "identity_control":
                 control_losses.append(predicted.square().mean())
                 continue
+            stratified_weight = float(
+                sample.get("stratified_sampling_weight", 1.0)
+            )
+            stratified_weights_by_group[group_name].append(
+                stratified_weight
+            )
             cosine = m.torch.nn.functional.cosine_similarity(
                 predicted.reshape(1, -1),
                 target.reshape(1, -1),
@@ -750,26 +876,45 @@ def run(args):
             )
             case_guard_pressure = nonregression_pressure * 0.0
             if args.case_isolated_guard_restoration:
+                guard_batch = batch
+                guard_baseline = baseline
+                guard_identity = baseline_identity
+                guard_tangent = training_tangent
+                guard_ownership = ownership
+                guard_case_index = case_index
+                guard_contract = contract
+                if transaction_domains is not None:
+                    domain = transaction_domains[str(
+                        sample["transaction_id"]
+                    )]
+                    start, stop = domain["slice"]
+                    guard_batch = domain["batch"]
+                    guard_baseline = domain["baseline"]
+                    guard_identity = domain["identity"]
+                    guard_tangent = training_tangent[start:stop]
+                    guard_ownership = ownership[start:stop]
+                    guard_case_index = local_case_index
+                    guard_contract = domain["contract"]
                 case_guard_pressure, guard_diagnostics = (
                     _case_isolated_fixed_guard_restoration(
                         model,
-                        batch,
+                        guard_batch,
                         cfg,
-                        baseline,
-                        baseline_identity,
-                        training_tangent,
-                        ownership,
-                        case_index,
-                        contract["initial_anchor"],
-                        contract["relative_tolerance"],
-                        contract["absolute_tolerance"],
+                        guard_baseline,
+                        guard_identity,
+                        guard_tangent,
+                        guard_ownership,
+                        guard_case_index,
+                        guard_contract["initial_anchor"],
+                        guard_contract["relative_tolerance"],
+                        guard_contract["absolute_tolerance"],
                         float(args.guard_safety_fraction),
                     )
                 )
                 guard_losses_by_group[group_name].append(
                     case_guard_pressure
                 )
-                case_isolated_guard[str(case_index)] = guard_diagnostics
+                case_isolated_guard[case_uid] = guard_diagnostics
                 direction_weight_tensor = _continuous_direction_weight(
                     case_guard_pressure,
                     nonregression_pressure,
@@ -812,10 +957,10 @@ def run(args):
                     case_terms["endpoint"][case_index] / endpoint_scale,
                     case_terms["temporal"][case_index] / temporal_scale,
                 ])
-            if case_index == 20:
+            if local_case_index == 20:
                 case20_temporal_losses.append(temporal_nonregression)
-            direction_weight_by_case[str(case_index)] = direction_weight
-            exact_radius_constraints[str(case_index)] = {
+            direction_weight_by_case[case_uid] = direction_weight
+            exact_radius_constraints[case_uid] = {
                 "endpoint_anchor": float(endpoint_anchor),
                 "endpoint_candidate": float(
                     case_terms["endpoint"][case_index].detach()
@@ -847,23 +992,55 @@ def run(args):
             }
         group_balanced_components = {}
         if args.case_isolated_guard_restoration:
-            direction_loss, group_balanced_components["direction"] = (
-                _balanced_cross_group_mean(direction_losses_by_group)
-            )
-            magnitude_loss, group_balanced_components["magnitude"] = (
-                _balanced_cross_group_mean(magnitude_losses_by_group)
-            )
-            scientific_loss, group_balanced_components["scientific"] = (
-                _balanced_cross_group_mean(scientific_losses_by_group)
-            )
-            nonregression_loss, group_balanced_components[
-                "nonregression"
-            ] = _balanced_cross_group_mean(
-                nonregression_losses_by_group
-            )
-            guard_loss, group_balanced_components["fixed_guard"] = (
-                _balanced_cross_group_mean(guard_losses_by_group)
-            )
+            if teacher.get("schema") == V15_15E_TEACHER_SCHEMA:
+                direction_loss, group_balanced_components["direction"] = (
+                    _stratified_cross_group_mean(
+                        direction_losses_by_group,
+                        stratified_weights_by_group,
+                    )
+                )
+                magnitude_loss, group_balanced_components["magnitude"] = (
+                    _stratified_cross_group_mean(
+                        magnitude_losses_by_group,
+                        stratified_weights_by_group,
+                    )
+                )
+                scientific_loss, group_balanced_components["scientific"] = (
+                    _stratified_cross_group_mean(
+                        scientific_losses_by_group,
+                        stratified_weights_by_group,
+                    )
+                )
+                nonregression_loss, group_balanced_components[
+                    "nonregression"
+                ] = _stratified_cross_group_mean(
+                    nonregression_losses_by_group,
+                    stratified_weights_by_group,
+                )
+                guard_loss, group_balanced_components["fixed_guard"] = (
+                    _stratified_cross_group_mean(
+                        guard_losses_by_group,
+                        stratified_weights_by_group,
+                    )
+                )
+            else:
+                direction_loss, group_balanced_components["direction"] = (
+                    _balanced_cross_group_mean(direction_losses_by_group)
+                )
+                magnitude_loss, group_balanced_components["magnitude"] = (
+                    _balanced_cross_group_mean(magnitude_losses_by_group)
+                )
+                scientific_loss, group_balanced_components["scientific"] = (
+                    _balanced_cross_group_mean(scientific_losses_by_group)
+                )
+                nonregression_loss, group_balanced_components[
+                    "nonregression"
+                ] = _balanced_cross_group_mean(
+                    nonregression_losses_by_group
+                )
+                guard_loss, group_balanced_components["fixed_guard"] = (
+                    _balanced_cross_group_mean(guard_losses_by_group)
+                )
         else:
             direction_loss = m.torch.stack(direction_losses).mean()
             magnitude_loss = m.torch.stack(magnitude_losses).mean()
@@ -918,6 +1095,7 @@ def run(args):
                 float(args.target_rms),
                 workspace_floor,
                 args,
+                transaction_domains=transaction_domains,
             )
             final_audits = audits
             for row in audits:
@@ -994,7 +1172,7 @@ def run(args):
         if row["effective_projected_candidate"]
     )
     control_indices = [
-        str(sample["case_index"])
+        str(sample.get("case_uid", sample["case_index"]))
         for sample in samples
         if sample["teacher_kind"] == "identity_control"
     ]
@@ -1037,29 +1215,11 @@ def run(args):
         default=0.0,
     )
     route_ready = bool(route_ready and final_scope_safe)
-    audit_by_case = {
-        int(row["case_index"]): row for row in final_audits
-    }
-    required_case_status = {}
-    for case_index in FORMAL_READINESS_CASES:
-        audit = audit_by_case.get(case_index)
-        if audit is None:
-            required_case_status[str(case_index)] = {
-                "present": False,
-                "scope_safe": False,
-                "endpoint_nonregression": False,
-                "temporal_nonregression": False,
-                "fixed_guard_passed": False,
-                "fixed_guard_blockers": ["missing_required_case"],
-                "raw_passed": False,
-                "projector_invoked": False,
-                "effective_projected_candidate": False,
-            }
-            continue
+    def readiness_status(audit):
         raw = audit["raw_audit"]
         scientific = raw["case_scientific"]
         tolerances = scientific["numeric_tolerance"]
-        required_case_status[str(case_index)] = {
+        return {
             "present": True,
             "scope_safe": bool(raw["scope"]["scope_safe"]),
             "endpoint_nonregression": bool(
@@ -1080,6 +1240,50 @@ def run(args):
                 audit["effective_projected_candidate"]
             ),
         }
+
+    audit_by_case = {
+        int(row["case_index"]): row for row in final_audits
+    }
+    case_uid_by_index = {
+        int(sample["case_index"]): str(
+            sample.get("case_uid", sample["case_index"])
+        )
+        for sample in samples
+        if sample["teacher_kind"] == "exact_projected_direction"
+    }
+    required_case_status = {}
+    required_cases = (
+        tuple(
+            int(sample["case_index"])
+            for sample in samples
+            if sample["teacher_kind"] == "exact_projected_direction"
+        )
+        if multi_transaction_teacher else FORMAL_READINESS_CASES
+    )
+    for case_index in required_cases:
+        audit = audit_by_case.get(case_index)
+        if audit is None:
+            missing_key = (
+                case_uid_by_index.get(case_index, str(case_index))
+                if multi_transaction_teacher else str(case_index)
+            )
+            required_case_status[missing_key] = {
+                "present": False,
+                "scope_safe": False,
+                "endpoint_nonregression": False,
+                "temporal_nonregression": False,
+                "fixed_guard_passed": False,
+                "fixed_guard_blockers": ["missing_required_case"],
+                "raw_passed": False,
+                "projector_invoked": False,
+                "effective_projected_candidate": False,
+            }
+            continue
+        key = (
+            str(audit.get("case_uid", case_index))
+            if multi_transaction_teacher else str(case_index)
+        )
+        required_case_status[key] = readiness_status(audit)
     formal_readiness_criteria = {
         "required_cases_present": all(
             row["present"] for row in required_case_status.values()
@@ -1106,18 +1310,6 @@ def run(args):
             row["projector_invoked"]
             for row in required_case_status.values()
         ),
-        "case_16_penetration_passed": bool(
-            required_case_status["16"]["present"]
-            and "cross_short.penetration" not in required_case_status[
-                "16"
-            ]["fixed_guard_blockers"]
-        ),
-        "case_29_support_drift_max_passed": bool(
-            required_case_status["29"]["present"]
-            and "cross_long.support_drift_max" not in required_case_status[
-                "29"
-            ]["fixed_guard_blockers"]
-        ),
         "cross_short_projected_candidate_exists": bool(
             projected_by_group["cross_short"] > 0
         ),
@@ -1132,7 +1324,27 @@ def run(args):
         ),
         "numeric_audit_complete": bool(final_audits),
         "fixed_guard_thresholds_unchanged": True,
+        "train_validation_case_disjoint": not bool(
+            teacher.get("train_validation_case_overlap", [])
+        ),
+        "train_validation_source_case_disjoint": not bool(
+            teacher.get("train_validation_source_case_overlap", [])
+        ),
     }
+    if not multi_transaction_teacher:
+        formal_readiness_criteria.update({
+            "case_16_penetration_passed": bool(
+                required_case_status["16"]["present"]
+                and "cross_short.penetration" not in required_case_status[
+                    "16"
+                ]["fixed_guard_blockers"]
+            ),
+            "case_29_support_drift_max_passed": bool(
+                required_case_status["29"]["present"]
+                and "cross_long.support_drift_max"
+                not in required_case_status["29"]["fixed_guard_blockers"]
+            ),
+        })
     ready_for_formal_adapter_training = bool(
         args.exact_radius_training
         and all(formal_readiness_criteria.values())
@@ -1199,6 +1411,11 @@ def run(args):
         ),
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
         "teacher_bank": str(teacher_path.resolve()),
+        "teacher_bank_schema": teacher.get("schema"),
+        "teacher_bank_split": teacher.get("split"),
+        "teacher_sampling_weight_protocol": teacher.get(
+            "sampling_weight_protocol"
+        ),
         "source_diagnostic": str(source.resolve()),
         "teacher_sample_count": len(samples),
         "projected_teacher_count_by_group": teacher.get(

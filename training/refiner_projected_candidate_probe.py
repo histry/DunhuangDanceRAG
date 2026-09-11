@@ -9,6 +9,7 @@ immutable fixed-bank Guard used by the diagnostic.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import time
@@ -39,14 +40,33 @@ def _to_device_tree(value, device):
     return value
 
 
-def _materialize_first_transaction(artifact, device):
+def _transaction_identity(transaction_index, selected_context_indices):
+    selected = tuple(int(value) for value in selected_context_indices)
+    payload = json.dumps(
+        {
+            "transaction_index": int(transaction_index),
+            "context_indices": list(selected),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:12]
+    return f"txn_{int(transaction_index):04d}_{digest}"
+
+
+def _materialize_transaction(artifact, device, transaction_index):
     anchor = _to_device_tree(artifact["anchor"], device)
     schedule = artifact["transaction_schedule"]
     if not schedule:
         raise RuntimeError("fit-bank artifact contains no transaction schedule")
-    selected = tuple(int(value) for value in schedule[0])
+    index = int(transaction_index)
+    if not 0 <= index < len(schedule):
+        raise IndexError(
+            f"transaction index {index} outside [0, {len(schedule)})"
+        )
+    selected = tuple(int(value) for value in schedule[index])
     if len(selected) != diagnostic.FIT_CONTEXT_COUNT:
-        raise RuntimeError("first fit-bank transaction is not rotating-C5")
+        raise RuntimeError("fit-bank transaction is not rotating-C5")
     batch = anchor
     for index in selected:
         context = _to_device_tree(
@@ -55,6 +75,10 @@ def _materialize_first_transaction(artifact, device):
         )
         batch = diagnostic._concat_fit_batches(batch, context)
     return anchor, batch, selected
+
+
+def _materialize_first_transaction(artifact, device):
+    return _materialize_transaction(artifact, device, 0)
 
 
 def _ownership_c2_activity(seam, taper_frames):

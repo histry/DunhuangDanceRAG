@@ -424,6 +424,8 @@ def _optimize_start(
     guard_absolute,
     case_index,
     group_name,
+    transaction_id,
+    case_uid,
     start_name,
     start_direction,
     weighted,
@@ -552,6 +554,8 @@ def _optimize_start(
         if step % 10 == 0 or audit["passed"]:
             print(json.dumps({
                 "stage": "v15_14h_oracle_step",
+                "transaction_id": transaction_id,
+                "case_uid": case_uid,
                 "case_index": int(case_index),
                 "group": group_name,
                 "start": start_name,
@@ -725,8 +729,18 @@ def run(args):
     device = m.torch.device(cfg.device)
     if device.type != "cuda":
         raise RuntimeError("V15.14h full-tangent oracle requires CUDA")
-    batch, _, schedule = projected_probe._materialize_first_transaction(
-        artifact, device
+    transaction_index = int(args.transaction_index)
+    anchor_batch, transaction_batch, schedule = (
+        projected_probe._materialize_transaction(
+            artifact, device, transaction_index
+        )
+    )
+    batch = (
+        transaction_batch
+        if args.transaction_fixed_guard else anchor_batch
+    )
+    transaction_id = projected_probe._transaction_identity(
+        transaction_index, schedule
     )
     selected_cases = _selected_cases(args, batch)
     primary_cases = tuple(
@@ -759,7 +773,10 @@ def run(args):
         )
     )
     contract = source_report["group_guard_contract"]
-    guard_anchor = contract["initial_anchor"]
+    guard_anchor = (
+        baseline_guard
+        if args.transaction_fixed_guard else contract["initial_anchor"]
+    )
     guard_relative = contract["relative_tolerance"]
     guard_absolute = contract["absolute_tolerance"]
     baseline_guard_passed, baseline_blockers, baseline_guard_details = (
@@ -780,6 +797,7 @@ def run(args):
     projected_counts = Counter()
     all_scope = []
     for case_index, group_name in selected_cases.items():
+        case_uid = f"{transaction_id}:{int(case_index)}"
         starts, start_rows, witnesses, weighted, taper_frames = (
             _build_multistarts(baseline, batch, cfg, case_index)
         )
@@ -799,6 +817,8 @@ def run(args):
         for start_name in START_MODES:
             if start_name not in starts:
                 trials.append({
+                    "transaction_id": transaction_id,
+                    "case_uid": case_uid,
                     "case_index": int(case_index),
                     "group": group_name,
                     "start": start_name,
@@ -819,6 +839,8 @@ def run(args):
                 guard_absolute=guard_absolute,
                 case_index=case_index,
                 group_name=group_name,
+                transaction_id=transaction_id,
+                case_uid=case_uid,
                 start_name=start_name,
                 start_direction=starts[start_name],
                 weighted=weighted,
@@ -843,7 +865,7 @@ def run(args):
         if best_candidate is not None:
             raw_best[case_index] = best_candidate
             np.save(
-                destination / f"raw_case_{case_index}.npy",
+                destination / f"raw_{case_uid}.npy",
                 best_candidate.detach().cpu().numpy(),
             )
             projected, projection = _project_raw_candidate(
@@ -867,7 +889,7 @@ def run(args):
                 projected_best[case_index] = projected
                 projected_counts.update([group_name])
                 np.save(
-                    destination / f"projected_case_{case_index}.npy",
+                    destination / f"projected_{case_uid}.npy",
                     projected.detach().cpu().numpy(),
                 )
         for trial in trials:
@@ -876,7 +898,11 @@ def run(args):
                 if scope:
                     all_scope.append(scope)
         case_reports.append({
+            "transaction_id": transaction_id,
+            "transaction_index": transaction_index,
+            "case_uid": case_uid,
             "case_index": int(case_index),
+            "local_case_index": int(case_index),
             "group": group_name,
             "role": "primary" if case_index in primary_cases else "control",
             "baseline_case_scientific": baseline_case,
@@ -887,8 +913,14 @@ def run(args):
             "guard_scales": guard_scales,
             "start_trials": trials,
             "raw_exact_candidate_found": bool(best_candidate is not None),
+            "raw_candidate_file": (
+                f"raw_{case_uid}.npy" if best_candidate is not None else None
+            ),
             "projector_result": projection,
             "effective_projected_candidate": bool(projected is not None),
+            "projected_candidate_file": (
+                f"projected_{case_uid}.npy" if projected is not None else None
+            ),
         })
 
     outside_max = max(
@@ -957,7 +989,31 @@ def run(args):
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
         "source_diagnostic": str(source.resolve()),
         "source_schema": source_report.get("schema"),
+        "transaction_id": transaction_id,
+        "transaction_index": transaction_index,
         "transaction_context_indices": list(schedule),
+        "transaction_case_uids": [
+            f"{transaction_id}:{int(index)}" for index in selected_cases
+        ],
+        "pre_oracle_manifest_sha256": args.manifest_sha256,
+        "teacher_split": args.teacher_split,
+        "transaction_batch_materialized": bool(
+            args.transaction_fixed_guard
+        ),
+        "fixed_guard_anchor_source": (
+            "immutable_transaction_baseline_pre_oracle"
+            if args.transaction_fixed_guard
+            else "source_diagnostic_seen_initial_anchor"
+        ),
+        "fixed_guard_relative_tolerance_source": (
+            "source_diagnostic_group_guard_contract"
+        ),
+        "fixed_guard_absolute_tolerance_source": (
+            "source_diagnostic_group_guard_contract"
+        ),
+        "fixed_guard_anchor": dict(guard_anchor),
+        "fixed_guard_relative_tolerance": dict(guard_relative),
+        "fixed_guard_absolute_tolerance": dict(guard_absolute),
         "selected_cases": selected_cases,
         "primary_cases": list(primary_cases),
         "start_modes": list(START_MODES),
@@ -1011,6 +1067,8 @@ def run(args):
     print(json.dumps({
         "stage": "refiner_v15_14h_full_tangent_oracle_complete",
         "report": str(report_path.resolve()),
+        "transaction_id": transaction_id,
+        "transaction_index": transaction_index,
         "raw_exact_candidate_count_by_group": dict(raw_counts),
         "raw_exact_candidate_start_count_by_group": dict(raw_start_counts),
         "effective_projected_candidate_count_by_group": dict(
@@ -1030,6 +1088,10 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config", default="configs/motion_model.json")
     parser.add_argument("--target-rms", type=float, default=DEFAULT_TARGET_RMS)
+    parser.add_argument("--transaction-index", type=int, default=0)
+    parser.add_argument("--transaction-fixed-guard", action="store_true")
+    parser.add_argument("--manifest-sha256")
+    parser.add_argument("--teacher-split", choices=("train", "validation"))
     parser.add_argument("--case-index", action="append", type=int)
     parser.add_argument("--all-cross-cases", action="store_true")
     parser.add_argument("--max-cases-per-group", type=int)
@@ -1049,6 +1111,12 @@ def main():
         parser.error(f"--target-rms must remain exactly {DEFAULT_TARGET_RMS:g}")
     if args.iterations < 1:
         parser.error("--iterations must be positive")
+    if args.transaction_index < 0:
+        parser.error("--transaction-index must be non-negative")
+    if bool(args.manifest_sha256) != bool(args.teacher_split):
+        parser.error(
+            "--manifest-sha256 and --teacher-split must be supplied together"
+        )
     if args.max_cases_per_group is not None and args.max_cases_per_group < 1:
         parser.error("--max-cases-per-group must be positive")
     if args.learning_rate <= 0.0 or args.initial_penalty <= 0.0:
