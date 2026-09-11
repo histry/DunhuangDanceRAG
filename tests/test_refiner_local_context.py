@@ -326,6 +326,60 @@ def test_zero_adapter_normalization_has_finite_gradient_and_unresolved_radius():
     assert diagnostics["0"]["radius_equality_resolved"] is False
 
 
+def test_case_isolated_guard_restoration_uses_allowance_scaled_sum():
+    from training import refiner_observable_adapter_probe as probe
+
+    first = torch.tensor(0.75, requires_grad=True)
+    second = torch.tensor(2.50, requires_grad=True)
+    loss, details = probe._fixed_guard_restoration_terms(
+        {"first": first, "second": second},
+        {"first": 0.0, "second": 2.0},
+        {"first": 0.0, "second": 0.0},
+        {"first": 1.0, "second": 2.0},
+        safety_fraction=0.25,
+    )
+    loss.backward()
+
+    # (0.75 - 0.25) / 1 + (2.50 - 2.50) / 2 = 0.5.
+    torch.testing.assert_close(loss, torch.tensor(0.5))
+    torch.testing.assert_close(first.grad, torch.tensor(1.0))
+    torch.testing.assert_close(second.grad, torch.tensor(0.0))
+    assert details["first"]["absolute_allowance"] == 1.0
+    assert details["first"]["final_absolute_limit"] == 1.0
+    assert details["first"]["training_safety_limit"] == 0.25
+    assert details["first"]["active"] is True
+
+
+def test_guard_direction_weight_decays_continuously_to_floor():
+    from training import refiner_observable_adapter_probe as probe
+
+    safe = probe._continuous_direction_weight(
+        torch.tensor(0.0), torch.tensor(0.0), floor=0.1, decay=1.0
+    )
+    pressured = probe._continuous_direction_weight(
+        torch.tensor(3.0), torch.tensor(0.0), floor=0.1, decay=1.0
+    )
+    severe = probe._continuous_direction_weight(
+        torch.tensor(30.0), torch.tensor(0.0), floor=0.1, decay=1.0
+    )
+
+    torch.testing.assert_close(safe, torch.tensor(1.0))
+    assert 0.1 < float(pressured) < 1.0
+    assert abs(float(severe) - 0.1) < 1.0e-6
+
+
+def test_cross_group_balance_prevents_teacher_count_dominance():
+    from training import refiner_observable_adapter_probe as probe
+
+    loss, groups = probe._balanced_cross_group_mean({
+        "cross_short": [torch.tensor(1.0)] * 6,
+        "cross_long": [torch.tensor(3.0)],
+    })
+
+    torch.testing.assert_close(loss, torch.tensor(2.0))
+    assert groups == {"cross_short": 1.0, "cross_long": 3.0}
+
+
 def test_observable_adapter_contract_is_opt_in_and_label_free():
     legacy = m.MotionGenerationConfig()
     assert "refiner_observable_adapter" not in m.motion_checkpoint_contract(

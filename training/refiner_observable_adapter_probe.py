@@ -1,13 +1,16 @@
-"""V15.15c exact-radius constraint-aware Adapter development probe.
+"""V15.15c/d exact-radius constraint-aware Adapter development probe.
 
 The probe freezes the V15.13 shared Refiner, fits only the zero-initialized
 75D Adapter against frozen V15.14h projected directions, and performs exact
-fixed-Guard audits. It cannot publish a formal checkpoint.
+fixed-Guard audits. V15.15d adds case-isolated, allowance-scaled Guard
+restoration and cross-group balanced optimization. It cannot publish a formal
+checkpoint.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from collections import Counter
@@ -20,9 +23,13 @@ from training import refiner_group_local_nullspace_cone_probe as group_probe
 from training import refiner_projected_candidate_probe as projected_probe
 
 
-SCHEMA = "refiner_v15_15c_exact_radius_constraint_adapter_probe_v3"
+V15_15C_SCHEMA = "refiner_v15_15c_exact_radius_constraint_adapter_probe_v3"
+V15_15D_SCHEMA = (
+    "refiner_v15_15d_case_isolated_fixed_guard_restoration_probe_v1"
+)
 EXACT_RADIUS_NORMALIZATION_EPS = 1.0e-8
 FORMAL_READINESS_CASES = (16, 18, 20, 29)
+CROSS_GROUPS = ("cross_short", "cross_long")
 
 
 def _to_device(value, device):
@@ -169,6 +176,135 @@ def _fixed_guard_penalty(
         scale = max(abs(limit), abs(float(anchor[key])), allowance, 1.0e-6)
         terms.append(m.torch.relu((value - limit) / scale).square())
     return m.torch.stack(terms).mean(), values
+
+
+def _fixed_guard_restoration_terms(
+    values,
+    anchor,
+    relative,
+    absolute,
+    safety_fraction,
+):
+    """Return an allowance-scaled sum over every unsafe Guard component.
+
+    The final fixed Guard is unchanged.  ``safety_fraction`` only moves the
+    differentiable training target inside the existing fixed allowance.  A
+    sum is intentional: every simultaneously active metric receives a
+    gradient, instead of the current maximum component monopolizing it.
+    """
+    terms = []
+    details = {}
+    for key in sorted(values):
+        anchor_value = float(anchor[key])
+        allowance = max(
+            abs(anchor_value) * float(relative[key]),
+            float(absolute[key]),
+        )
+        if not math.isfinite(allowance) or allowance <= 0.0:
+            raise RuntimeError({
+                "invalid_fixed_guard_allowance": key,
+                "allowance": allowance,
+            })
+        final_limit = anchor_value + allowance
+        training_limit = anchor_value + float(safety_fraction) * allowance
+        normalized = (values[key] - training_limit) / allowance
+        excess = m.torch.relu(normalized)
+        terms.append(excess)
+        details[key] = {
+            "fixed_anchor": anchor_value,
+            "absolute_allowance": allowance,
+            "final_absolute_limit": final_limit,
+            "training_safety_limit": training_limit,
+            "candidate": float(values[key].detach()),
+            "normalized_training_excess": float(excess.detach()),
+            "active": bool(float(excess.detach()) > 0.0),
+        }
+    if not terms:
+        raise RuntimeError("empty fixed Guard value set")
+    return m.torch.stack(terms).sum(), details
+
+
+def _case_isolated_fixed_guard_restoration(
+    model,
+    batch,
+    cfg,
+    baseline,
+    identity,
+    training_tangent,
+    ownership,
+    case_index,
+    anchor,
+    relative,
+    absolute,
+    safety_fraction,
+):
+    permitted = _owned_case_mask(
+        ownership, training_tangent, int(case_index)
+    )
+    isolated_tangent = training_tangent.masked_fill(~permitted, 0.0)
+    isolated_prediction = product_exp_torch(
+        baseline.detach(), isolated_tangent
+    )
+    values = projected_probe._guard_values_for_prediction(
+        model, batch, cfg, isolated_prediction, identity
+    )
+    loss, details = _fixed_guard_restoration_terms(
+        values,
+        anchor,
+        relative,
+        absolute,
+        safety_fraction,
+    )
+    outside = ~permitted
+    outside_max = (
+        float(isolated_tangent[outside].abs().max().detach())
+        if bool(outside.any()) else 0.0
+    )
+    return loss, {
+        "case_index": int(case_index),
+        "aggregation": "sum_normalized_relu",
+        "normalization_scale": "fixed_anchor_absolute_allowance",
+        "training_safety_fraction": float(safety_fraction),
+        "outside_case_or_ownership_abs_max": outside_max,
+        "active_metric_count": sum(
+            int(row["active"]) for row in details.values()
+        ),
+        "normalized_excess_sum": float(loss.detach()),
+        "metrics": details,
+    }
+
+
+def _continuous_direction_weight(
+    guard_pressure,
+    nonregression_pressure,
+    floor,
+    decay,
+):
+    pressure = (
+        guard_pressure.detach() + nonregression_pressure.detach()
+    ).clamp_min(0.0)
+    return float(floor) + (1.0 - float(floor)) * m.torch.exp(
+        -float(decay) * pressure
+    )
+
+
+def _balanced_cross_group_mean(values_by_group):
+    missing = [
+        group for group in CROSS_GROUPS
+        if not values_by_group.get(group)
+    ]
+    if missing:
+        raise RuntimeError({
+            "missing_cross_group_training_objectives": missing,
+        })
+    group_means = [
+        m.torch.stack(values_by_group[group]).mean()
+        for group in CROSS_GROUPS
+    ]
+    return m.torch.stack(group_means).mean(), {
+        group: float(value.detach())
+        for group, value in zip(CROSS_GROUPS, group_means)
+    }
 
 
 def _owned_case_mask(ownership, tangent, case_index):
@@ -517,13 +653,31 @@ def run(args):
         magnitude_losses = []
         scientific_losses = []
         nonregression_losses = []
+        direction_losses_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
+        magnitude_losses_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
+        scientific_losses_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
+        nonregression_losses_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
+        guard_losses_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
         case20_temporal_losses = []
         control_losses = []
         exact_radius_constraints = {}
+        case_isolated_guard = {}
+        direction_weight_by_case = {}
         amplitude = {}
         gate = {}
         for sample in samples:
             case_index = int(sample["case_index"])
+            group_name = str(sample["audit_group"])
             predicted, target = _case_vectors(
                 applied_adapter_tangent,
                 sample["teacher_tangent"],
@@ -591,29 +745,76 @@ def run(args):
             temporal_nonregression = m.torch.relu(
                 temporal_delta - temporal_tolerance
             ) / temporal_scale
-            nonregression_losses.extend([
-                endpoint_nonregression,
-                temporal_nonregression,
-            ])
+            nonregression_pressure = (
+                endpoint_nonregression + temporal_nonregression
+            )
+            case_guard_pressure = nonregression_pressure * 0.0
+            if args.case_isolated_guard_restoration:
+                case_guard_pressure, guard_diagnostics = (
+                    _case_isolated_fixed_guard_restoration(
+                        model,
+                        batch,
+                        cfg,
+                        baseline,
+                        baseline_identity,
+                        training_tangent,
+                        ownership,
+                        case_index,
+                        contract["initial_anchor"],
+                        contract["relative_tolerance"],
+                        contract["absolute_tolerance"],
+                        float(args.guard_safety_fraction),
+                    )
+                )
+                guard_losses_by_group[group_name].append(
+                    case_guard_pressure
+                )
+                case_isolated_guard[str(case_index)] = guard_diagnostics
+                direction_weight_tensor = _continuous_direction_weight(
+                    case_guard_pressure,
+                    nonregression_pressure,
+                    float(args.guard_direction_floor),
+                    float(args.guard_direction_decay),
+                )
+                direction_weight = float(direction_weight_tensor.detach())
+                direction_losses_by_group[group_name].append(
+                    direction_weight_tensor * (1.0 - cosine)
+                )
+                magnitude_losses_by_group[group_name].append(
+                    m.torch.relu(
+                        predicted_rms - 1.25 * target_rms
+                    ).square()
+                )
+                scientific_losses_by_group[group_name].extend([
+                    case_terms["endpoint"][case_index] / endpoint_scale,
+                    case_terms["temporal"][case_index] / temporal_scale,
+                ])
+                nonregression_losses_by_group[group_name].extend([
+                    endpoint_nonregression,
+                    temporal_nonregression,
+                ])
+            else:
+                nonregression_losses.extend([
+                    endpoint_nonregression,
+                    temporal_nonregression,
+                ])
+                violates_nonregression = bool(
+                    float(nonregression_pressure.detach()) > 0.0
+                )
+                direction_weight = (
+                    float(args.violating_direction_weight)
+                    if violates_nonregression else 1.0
+                )
+                direction_losses.append(
+                    direction_weight * (1.0 - cosine)
+                )
+                scientific_losses.extend([
+                    case_terms["endpoint"][case_index] / endpoint_scale,
+                    case_terms["temporal"][case_index] / temporal_scale,
+                ])
             if case_index == 20:
                 case20_temporal_losses.append(temporal_nonregression)
-            violates_nonregression = bool(
-                float(
-                    (
-                        endpoint_nonregression
-                        + temporal_nonregression
-                    ).detach()
-                ) > 0.0
-            )
-            direction_weight = (
-                float(args.violating_direction_weight)
-                if violates_nonregression else 1.0
-            )
-            direction_losses.append(direction_weight * (1.0 - cosine))
-            scientific_losses.extend([
-                case_terms["endpoint"][case_index] / endpoint_scale,
-                case_terms["temporal"][case_index] / temporal_scale,
-            ])
+            direction_weight_by_case[str(case_index)] = direction_weight
             exact_radius_constraints[str(case_index)] = {
                 "endpoint_anchor": float(endpoint_anchor),
                 "endpoint_candidate": float(
@@ -640,13 +841,46 @@ def run(args):
                     temporal_nonregression.detach()
                 ),
                 "direction_distillation_weight": direction_weight,
+                "case_isolated_fixed_guard_pressure": float(
+                    case_guard_pressure.detach()
+                ),
             }
-        direction_loss = m.torch.stack(direction_losses).mean()
-        magnitude_loss = m.torch.stack(magnitude_losses).mean()
-        scientific_loss = m.torch.stack(scientific_losses).mean()
-        nonregression_loss = m.torch.stack(
-            nonregression_losses
-        ).mean()
+        group_balanced_components = {}
+        if args.case_isolated_guard_restoration:
+            direction_loss, group_balanced_components["direction"] = (
+                _balanced_cross_group_mean(direction_losses_by_group)
+            )
+            magnitude_loss, group_balanced_components["magnitude"] = (
+                _balanced_cross_group_mean(magnitude_losses_by_group)
+            )
+            scientific_loss, group_balanced_components["scientific"] = (
+                _balanced_cross_group_mean(scientific_losses_by_group)
+            )
+            nonregression_loss, group_balanced_components[
+                "nonregression"
+            ] = _balanced_cross_group_mean(
+                nonregression_losses_by_group
+            )
+            guard_loss, group_balanced_components["fixed_guard"] = (
+                _balanced_cross_group_mean(guard_losses_by_group)
+            )
+        else:
+            direction_loss = m.torch.stack(direction_losses).mean()
+            magnitude_loss = m.torch.stack(magnitude_losses).mean()
+            scientific_loss = m.torch.stack(scientific_losses).mean()
+            nonregression_loss = m.torch.stack(
+                nonregression_losses
+            ).mean()
+            guard_loss, _ = _fixed_guard_penalty(
+                model,
+                batch,
+                cfg,
+                prediction,
+                baseline_identity,
+                contract["initial_anchor"],
+                contract["relative_tolerance"],
+                contract["absolute_tolerance"],
+            )
         case20_temporal_loss = (
             m.torch.stack(case20_temporal_losses).mean()
             if case20_temporal_losses
@@ -656,16 +890,6 @@ def run(args):
             m.torch.stack(control_losses).mean()
             if control_losses else applied_adapter_tangent.sum() * 0.0
         )
-        guard_loss, _ = _fixed_guard_penalty(
-            model,
-            batch,
-            cfg,
-            prediction,
-            baseline_identity,
-            contract["initial_anchor"],
-            contract["relative_tolerance"],
-            contract["absolute_tolerance"],
-        )
         loss = (
             direction_loss
             + 0.10 * scientific_loss
@@ -673,7 +897,7 @@ def run(args):
             + float(args.case20_temporal_weight) * case20_temporal_loss
             + 10.0 * magnitude_loss
             + 10.0 * control_loss
-            + 10.0 * guard_loss
+            + float(args.guard_restoration_weight) * guard_loss
         )
         audits = []
         if step % int(args.eval_every) == 0 or step == int(args.steps):
@@ -714,6 +938,16 @@ def run(args):
             "magnitude_upper_bound_loss": float(magnitude_loss.detach()),
             "identity_control_loss": float(control_loss.detach()),
             "differentiable_fixed_guard_excess": float(guard_loss.detach()),
+            "case_isolated_fixed_guard_restoration": bool(
+                args.case_isolated_guard_restoration
+            ),
+            "case_isolated_fixed_guard_by_case": case_isolated_guard,
+            "continuous_direction_weight_by_case": (
+                direction_weight_by_case
+            ),
+            "cross_group_balanced_loss_components": (
+                group_balanced_components
+            ),
             "adapter_output_rms_by_case": amplitude,
             "adapter_gate_mean_by_case": gate,
             "exact_radius_normalization_by_case": radius_normalization,
@@ -733,6 +967,13 @@ def run(args):
                 "case20_temporal_signed_residual_loss"
             ],
             "identity_control_loss": row["identity_control_loss"],
+            "differentiable_fixed_guard_excess": row[
+                "differentiable_fixed_guard_excess"
+            ],
+            "minimum_direction_distillation_weight": min(
+                row["continuous_direction_weight_by_case"].values(),
+                default=1.0,
+            ),
             "projected_passes": sum(
                 audit["effective_projected_candidate"] for audit in audits
             ),
@@ -809,6 +1050,10 @@ def run(args):
                 "endpoint_nonregression": False,
                 "temporal_nonregression": False,
                 "fixed_guard_passed": False,
+                "fixed_guard_blockers": ["missing_required_case"],
+                "raw_passed": False,
+                "projector_invoked": False,
+                "effective_projected_candidate": False,
             }
             continue
         raw = audit["raw_audit"]
@@ -826,6 +1071,9 @@ def run(args):
                 <= float(tolerances["temporal"])
             ),
             "fixed_guard_passed": bool(raw["fixed_guard_passed"]),
+            "fixed_guard_blockers": list(
+                raw.get("fixed_guard_blockers", [])
+            ),
             "raw_passed": bool(raw["passed"]),
             "projector_invoked": audit["projector_result"] is not None,
             "effective_projected_candidate": bool(
@@ -851,6 +1099,25 @@ def run(args):
             row["fixed_guard_passed"]
             for row in required_case_status.values()
         ),
+        "required_cases_raw_passed": all(
+            row["raw_passed"] for row in required_case_status.values()
+        ),
+        "required_cases_projector_invoked": all(
+            row["projector_invoked"]
+            for row in required_case_status.values()
+        ),
+        "case_16_penetration_passed": bool(
+            required_case_status["16"]["present"]
+            and "cross_short.penetration" not in required_case_status[
+                "16"
+            ]["fixed_guard_blockers"]
+        ),
+        "case_29_support_drift_max_passed": bool(
+            required_case_status["29"]["present"]
+            and "cross_long.support_drift_max" not in required_case_status[
+                "29"
+            ]["fixed_guard_blockers"]
+        ),
         "cross_short_projected_candidate_exists": bool(
             projected_by_group["cross_short"] > 0
         ),
@@ -875,8 +1142,13 @@ def run(args):
     destination = Path(args.output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     state_path = destination / "observable_adapter_probe_state.pt"
+    schema = (
+        V15_15D_SCHEMA
+        if args.case_isolated_guard_restoration
+        else V15_15C_SCHEMA
+    )
     m.torch.save({
-        "schema": SCHEMA,
+        "schema": schema,
         "formal_checkpoint": False,
         "formal_training_allowed": False,
         "adapter_state_dict": {
@@ -887,7 +1159,7 @@ def run(args):
         "gate_floor": float(model.observable_adapter_gate_floor),
     }, state_path)
     report = {
-        "schema": SCHEMA,
+        "schema": schema,
         "development_only": True,
         "formal_checkpoint": False,
         "formal_training_allowed": False,
@@ -899,6 +1171,27 @@ def run(args):
         "case20_temporal_weight": float(args.case20_temporal_weight),
         "violating_direction_weight": float(
             args.violating_direction_weight
+        ),
+        "case_isolated_fixed_guard_restoration": bool(
+            args.case_isolated_guard_restoration
+        ),
+        "fixed_guard_training_aggregation": (
+            "sum_normalized_relu"
+            if args.case_isolated_guard_restoration else "mean_squared_relu"
+        ),
+        "fixed_guard_training_scale": (
+            "fixed_anchor_absolute_allowance"
+            if args.case_isolated_guard_restoration
+            else "metric_absolute_magnitude"
+        ),
+        "guard_safety_fraction": float(args.guard_safety_fraction),
+        "guard_restoration_weight": float(
+            args.guard_restoration_weight
+        ),
+        "guard_direction_floor": float(args.guard_direction_floor),
+        "guard_direction_decay": float(args.guard_direction_decay),
+        "cross_group_balanced_training": bool(
+            args.case_isolated_guard_restoration
         ),
         "resumed_adapter_state": (
             str(adapter_state_path.resolve())
@@ -997,6 +1290,21 @@ def main():
     parser.add_argument(
         "--violating-direction-weight", type=float, default=0.10
     )
+    parser.add_argument(
+        "--case-isolated-guard-restoration", action="store_true"
+    )
+    parser.add_argument(
+        "--guard-safety-fraction", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--guard-restoration-weight", type=float, default=10.0
+    )
+    parser.add_argument(
+        "--guard-direction-floor", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--guard-direction-decay", type=float, default=1.0
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -1018,6 +1326,18 @@ def main():
         parser.error("case-20 temporal weight must be positive")
     if not 0.0 <= args.violating_direction_weight <= 1.0:
         parser.error("violating direction weight must be in [0, 1]")
+    if not 0.0 <= args.guard_safety_fraction < 1.0:
+        parser.error("Guard safety fraction must be in [0, 1)")
+    if args.guard_restoration_weight <= 0.0:
+        parser.error("Guard restoration weight must be positive")
+    if not 0.0 <= args.guard_direction_floor <= 1.0:
+        parser.error("Guard direction floor must be in [0, 1]")
+    if args.guard_direction_decay <= 0.0:
+        parser.error("Guard direction decay must be positive")
+    if args.case_isolated_guard_restoration and not args.exact_radius_training:
+        parser.error(
+            "case-isolated Guard restoration requires exact-radius training"
+        )
     if args.audit_only:
         if args.steps != 0:
             parser.error("--audit-only requires --steps 0")
