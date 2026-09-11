@@ -50,6 +50,38 @@ KINETIC_PRIOR_WEIGHT = 1.0e-6
 RADIUS_TOLERANCE = 1.0e-3
 
 
+def _selected_cases(args, batch):
+    if args.all_cross_cases and args.case_index:
+        raise ValueError("--all-cross-cases and --case-index are exclusive")
+    if args.all_cross_cases:
+        selected = {}
+        per_group = Counter()
+        for index in range(int(batch["bad"].shape[0])):
+            group = m.REFINER_GROUP_LABELS[int(batch["group"][index].detach())]
+            if not group.startswith("cross_"):
+                continue
+            if (
+                args.max_cases_per_group is not None
+                and per_group[group] >= int(args.max_cases_per_group)
+            ):
+                continue
+            selected[index] = group
+            per_group.update([group])
+        if not selected:
+            raise RuntimeError("no cross cases are present in the transaction")
+        return selected
+    if args.case_index:
+        selected = {}
+        for index in args.case_index:
+            if not 0 <= int(index) < int(batch["bad"].shape[0]):
+                raise ValueError(f"case index out of range: {index}")
+            selected[int(index)] = m.REFINER_GROUP_LABELS[
+                int(batch["group"][int(index)].detach())
+            ]
+        return selected
+    return dict(TARGET_CASES)
+
+
 def _mapped_tangent(local_direction, weighted):
     return weighted * local_direction.unsqueeze(0)
 
@@ -696,9 +728,15 @@ def run(args):
     batch, _, schedule = projected_probe._materialize_first_transaction(
         artifact, device
     )
-    if max(TARGET_CASES) >= int(batch["bad"].shape[0]):
+    selected_cases = _selected_cases(args, batch)
+    primary_cases = tuple(
+        index
+        for index, group in selected_cases.items()
+        if group.startswith("cross_")
+    )
+    if max(selected_cases) >= int(batch["bad"].shape[0]):
         raise RuntimeError("fixed oracle case indices are absent from the bank")
-    for case_index, expected_group in TARGET_CASES.items():
+    for case_index, expected_group in selected_cases.items():
         observed_group = m.REFINER_GROUP_LABELS[
             int(batch["group"][case_index].detach())
         ]
@@ -737,10 +775,11 @@ def run(args):
 
     case_reports = []
     raw_best = {}
+    projected_best = {}
     raw_start_counts = Counter()
     projected_counts = Counter()
     all_scope = []
-    for case_index, group_name in TARGET_CASES.items():
+    for case_index, group_name in selected_cases.items():
         starts, start_rows, witnesses, weighted, taper_frames = (
             _build_multistarts(baseline, batch, cfg, case_index)
         )
@@ -825,6 +864,7 @@ def run(args):
                 args=args,
             )
             if projected is not None:
+                projected_best[case_index] = projected
                 projected_counts.update([group_name])
                 np.save(
                     destination / f"projected_case_{case_index}.npy",
@@ -838,7 +878,7 @@ def run(args):
         case_reports.append({
             "case_index": int(case_index),
             "group": group_name,
-            "role": "primary" if case_index in PRIMARY_CASES else "control",
+            "role": "primary" if case_index in primary_cases else "control",
             "baseline_case_scientific": baseline_case,
             "taper_frames": taper_frames,
             "start_directions": start_rows,
@@ -858,7 +898,7 @@ def run(args):
         ),
         default=0.0,
     )
-    expected_trials = len(TARGET_CASES) * len(START_MODES)
+    expected_trials = len(selected_cases) * len(START_MODES)
     completed_trials = sum(
         len(case["start_trials"]) for case in case_reports
     )
@@ -882,17 +922,21 @@ def run(args):
             for row in trial.get("history", [])
         )
     )
-    raw_counts = Counter(TARGET_CASES[index] for index in raw_best)
+    raw_counts = Counter(selected_cases[index] for index in raw_best)
     ghost_candidate_count = sum(
         not row["exact_audit"]["workspace_observable_resolved"]
         for case in case_reports
         for trial in case["start_trials"]
         for row in trial.get("history", [])
     )
-    primary_raw = all(case_index in raw_best for case_index in PRIMARY_CASES)
+    primary_raw = bool(primary_cases) and all(
+        case_index in raw_best for case_index in primary_cases
+    )
     route_supported = bool(
-        projected_counts["cross_short"] > 0
-        and projected_counts["cross_long"] > 0
+        primary_cases
+        and all(case_index in projected_best for case_index in primary_cases)
+        and {selected_cases[index] for index in primary_cases}
+        >= {"cross_short", "cross_long"}
         and outside_max == 0.0
         and numeric_complete
     )
@@ -914,8 +958,8 @@ def run(args):
         "source_diagnostic": str(source.resolve()),
         "source_schema": source_report.get("schema"),
         "transaction_context_indices": list(schedule),
-        "selected_cases": TARGET_CASES,
-        "primary_cases": list(PRIMARY_CASES),
+        "selected_cases": selected_cases,
+        "primary_cases": list(primary_cases),
         "start_modes": list(START_MODES),
         "target_output_tangent_rms": float(args.target_rms),
         "smaller_radius_evidence_allowed": False,
@@ -986,6 +1030,9 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config", default="configs/motion_model.json")
     parser.add_argument("--target-rms", type=float, default=DEFAULT_TARGET_RMS)
+    parser.add_argument("--case-index", action="append", type=int)
+    parser.add_argument("--all-cross-cases", action="store_true")
+    parser.add_argument("--max-cases-per-group", type=int)
     parser.add_argument("--iterations", type=int, default=DEFAULT_ITERATIONS)
     parser.add_argument("--learning-rate", type=float, default=2.0e-2)
     parser.add_argument("--initial-penalty", type=float, default=10.0)
@@ -1002,6 +1049,8 @@ def main():
         parser.error(f"--target-rms must remain exactly {DEFAULT_TARGET_RMS:g}")
     if args.iterations < 1:
         parser.error("--iterations must be positive")
+    if args.max_cases_per_group is not None and args.max_cases_per_group < 1:
+        parser.error("--max-cases-per-group must be positive")
     if args.learning_rate <= 0.0 or args.initial_penalty <= 0.0:
         parser.error("optimizer values must be positive")
     return run(args)

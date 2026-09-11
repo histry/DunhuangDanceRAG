@@ -2216,6 +2216,10 @@ def run(args):
     model = m.ProductManifoldTemporalRefiner(
         fps=cfg.fps,
         film_conditioning=bool(cfg.product_refiner_film_conditioning),
+        observable_adapter=bool(cfg.product_refiner_observable_adapter),
+        residual_taper_frames=int(
+            cfg.product_refiner_residual_taper_frames
+        ),
     ).to(device)
     optimizer = _diagnostic_optimizer(model, cfg)
     fixed_guard_batch = fixed_fit_bank(banks, "seen")
@@ -2258,6 +2262,24 @@ def run(args):
                       "observable_anchor_fk_gap",
                       "observable_wrapped_root_yaw_gap",
                   ],
+                  "role_label_consumed": False,
+                  "hidden_clean_consumed": False,
+              },
+              "observable_cross_adapter": {
+                  "enabled": bool(cfg.product_refiner_observable_adapter),
+                  "protocol": (
+                      m.REFINER_OBSERVABLE_ADAPTER_PROTOCOL
+                      if cfg.product_refiner_observable_adapter
+                      else "disabled"
+                  ),
+                  "condition_dim": (
+                      m.REFINER_ADAPTER_CONDITION_DIM
+                      if cfg.product_refiner_observable_adapter
+                      else 0
+                  ),
+                  "output_tangent_dim": (
+                      75 if cfg.product_refiner_observable_adapter else 0
+                  ),
                   "role_label_consumed": False,
                   "hidden_clean_consumed": False,
               },

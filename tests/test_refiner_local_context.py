@@ -225,6 +225,39 @@ def test_film_checkpoint_contract_is_opt_in_and_fail_closed():
         )
 
 
+def test_observable_adapter_is_zero_initialized_and_ownership_local():
+    x, cond, seam, joint = sample("cpu")
+    model = m.ProductManifoldTemporalRefiner(
+        hidden=16,
+        observable_adapter=True,
+        residual_taper_frames=3,
+    )
+    trace = {}
+    output = model(x, cond, seam, joint, adapter_trace=trace)
+    assert torch.count_nonzero(output) == 0
+    assert trace["condition"].shape[-1] == m.REFINER_ADAPTER_CONDITION_DIM
+    assert trace["tangent"].shape[-1] == 75
+    owned = seam >= 0.5
+    assert torch.count_nonzero(trace["tangent"][~owned.expand_as(
+        trace["tangent"]
+    )]) == 0
+    assert torch.count_nonzero(output[..., :4]) == 0
+
+
+def test_observable_adapter_contract_is_opt_in_and_label_free():
+    legacy = m.MotionGenerationConfig()
+    assert "refiner_observable_adapter" not in m.motion_checkpoint_contract(
+        legacy, "boundary_refiner"
+    )
+    cfg = m.MotionGenerationConfig(product_refiner_observable_adapter=True)
+    contract = m.motion_checkpoint_contract(cfg, "boundary_refiner")
+    adapter = contract["refiner_observable_adapter"]
+    assert adapter["protocol"] == m.REFINER_OBSERVABLE_ADAPTER_PROTOCOL
+    assert adapter["condition_dim"] == m.REFINER_ADAPTER_CONDITION_DIM
+    assert adapter["output_tangent_dim"] == 75
+    assert adapter["role_label_consumed"] is False
+
+
 def test_input_protocol_is_checked_not_just_stored():
     cfg = m.MotionGenerationConfig()
     contract = m.motion_checkpoint_contract(cfg, 'boundary_refiner')

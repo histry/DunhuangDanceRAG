@@ -124,6 +124,14 @@ REFINER_FILM_CONDITION_DIM = 2
 REFINER_FILM_PROTOCOL = (
     "observable_anchor_fk_gap_and_root_yaw_film_v1"
 )
+REFINER_ADAPTER_PHASE_DIM = 6
+REFINER_ADAPTER_OBSERVABLE_DIM = 13
+REFINER_ADAPTER_CONDITION_DIM = (
+    REFINER_ADAPTER_OBSERVABLE_DIM + REFINER_ADAPTER_PHASE_DIM
+)
+REFINER_OBSERVABLE_ADAPTER_PROTOCOL = (
+    "case_agnostic_observable_gap_support_relative_phase_soft_gate_v1"
+)
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = (
     "stage_registry_exact_signed_guard_tail_support_root_v5"
@@ -797,6 +805,10 @@ class MotionGenerationConfig:
     # Optional V15.13 development architecture.  Its conditions are computed
     # only from the two observable anchors surrounding each edit region.
     product_refiner_film_conditioning: bool = False
+    # Optional V15.15 development architecture. The adapter consumes only
+    # inference-visible physical gaps, support and relative seam phase. It is
+    # zero initialized and cannot consume single/cross role labels.
+    product_refiner_observable_adapter: bool = False
     product_refiner_endpoint_continuity_weight: float = 0.50
     product_refiner_seam_velocity_weight: float = 0.20
     product_refiner_seam_acceleration_weight: float = 0.25
@@ -959,6 +971,9 @@ class MotionGenerationConfig:
             ),
             "MOTION_PRODUCT_REFINER_FILM_CONDITIONING": (
                 "product_refiner_film_conditioning", lambda x: bool(int(x)),
+            ),
+            "MOTION_PRODUCT_REFINER_OBSERVABLE_ADAPTER": (
+                "product_refiner_observable_adapter", lambda x: bool(int(x)),
             ),
             "MOTION_PRODUCT_REFINER_ENDPOINT_CONTINUITY_WEIGHT": (
                 "product_refiner_endpoint_continuity_weight",
@@ -1219,6 +1234,14 @@ def motion_checkpoint_contract(cfg: MotionGenerationConfig, role: str) -> Dict[s
                 "protocol": REFINER_FILM_PROTOCOL,
                 "condition_dim": REFINER_FILM_CONDITION_DIM,
             }
+        if bool(getattr(cfg, "product_refiner_observable_adapter", False)):
+            contract["refiner_observable_adapter"] = {
+                "enabled": True,
+                "protocol": REFINER_OBSERVABLE_ADAPTER_PROTOCOL,
+                "condition_dim": REFINER_ADAPTER_CONDITION_DIM,
+                "output_tangent_dim": 75,
+                "role_label_consumed": False,
+            }
     return contract
 
 
@@ -1269,6 +1292,15 @@ def assert_motion_checkpoint_contract(
                 mismatches.append(
                     "refiner_film_conditioning: "
                     f"checkpoint={actual_film!r}, runtime={expected_film!r}"
+                )
+        expected_adapter = expected.get("refiner_observable_adapter")
+        actual_adapter = actual.get("refiner_observable_adapter")
+        if expected_adapter is not None or actual_adapter is not None:
+            if actual_adapter != expected_adapter:
+                mismatches.append(
+                    "refiner_observable_adapter: "
+                    f"checkpoint={actual_adapter!r}, "
+                    f"runtime={expected_adapter!r}"
                 )
     if mismatches:
         raise RuntimeError(
@@ -3037,6 +3069,162 @@ def _refiner_film_condition_features(x, seam_mask):
     return features.to(dtype=x.dtype)
 
 
+def _refiner_relative_seam_phase_features(seam_mask, taper_frames):
+    """Return label-free relative phase and the decoder-consistent C2 taper."""
+    if seam_mask.ndim == 3:
+        seam = seam_mask[..., 0]
+    elif seam_mask.ndim == 2:
+        seam = seam_mask
+    else:
+        raise ValueError("Refiner Adapter requires [B,T] or [B,T,1] seams")
+    batch, frames = seam.shape
+    core = seam >= 0.5
+    index = torch.arange(frames, device=seam.device)[None].expand(batch, -1)
+    first = torch.where(
+        core,
+        index,
+        torch.full_like(index, frames),
+    ).amin(dim=1, keepdim=True)
+    last = torch.where(
+        core,
+        index,
+        -torch.ones_like(index),
+    ).amax(dim=1, keepdim=True)
+    valid = (first < frames) & (last >= first)
+    width = (last - first).clamp_min(1).to(seam.dtype)
+    q = ((index - first).to(seam.dtype) / width).clamp(0.0, 1.0)
+    inside = core.to(seam.dtype)
+    half_field = 0.5 * float(1 + 4 * sum((1, 2, 5)) - 1)
+    dist_left = ((index - first).to(seam.dtype) / half_field).clamp(-1.0, 1.0)
+    dist_right = ((last - index).to(seam.dtype) / half_field).clamp(-1.0, 1.0)
+    phase = torch.stack(
+        [
+            inside,
+            (2.0 * q - 1.0) * inside,
+            torch.sin(math.pi * q) * inside,
+            torch.cos(math.pi * q) * inside,
+            dist_left,
+            dist_right,
+        ],
+        dim=-1,
+    )
+    phase = torch.where(valid[:, None, :], phase, torch.zeros_like(phase))
+
+    active = core.to(seam.dtype).unsqueeze(1)
+    eroded = active
+    distance = active.clone()
+    for _ in range(max(0, int(taper_frames))):
+        eroded = -F.max_pool1d(
+            -F.pad(eroded, (1, 1), mode="replicate"), 3, stride=1
+        )
+        distance = distance + eroded
+    taper_phase = distance / float(max(0, int(taper_frames)) + 1)
+    taper = taper_phase.pow(3) * (
+        10.0 - 15.0 * taper_phase + 6.0 * taper_phase.square()
+    )
+    taper = taper.transpose(1, 2) * core.unsqueeze(-1).to(seam.dtype)
+    return phase.to(seam.dtype), taper, core.unsqueeze(-1)
+
+
+def _refiner_observable_adapter_features(x, seam_mask, fps, taper_frames):
+    """Build V15.15 Adapter inputs without role labels or hidden clean data."""
+    if seam_mask.ndim == 3:
+        seam = seam_mask[..., 0]
+    elif seam_mask.ndim == 2:
+        seam = seam_mask
+    else:
+        raise ValueError("Refiner Adapter seam mask rank is invalid")
+    if seam.shape != x.shape[:2]:
+        raise ValueError("Refiner Adapter seam mask must align with motion")
+    batch, frames = seam.shape
+    core = seam >= 0.5
+    index = torch.arange(frames, device=x.device)[None].expand(batch, -1)
+    first = torch.where(
+        core, index, torch.full_like(index, frames)
+    ).amin(dim=1, keepdim=True)
+    last = torch.where(
+        core, index, -torch.ones_like(index)
+    ).amax(dim=1, keepdim=True)
+    left = (first - 1).clamp(0, frames - 1)
+    right = (last + 1).clamp(0, frames - 1)
+    left_outer = (left - 1).clamp(0, frames - 1)
+    right_outer = (right + 1).clamp(0, frames - 1)
+    valid = (first > 0) & (last < frames - 1) & core.any(1, keepdim=True)
+
+    def gather(value, at):
+        trailing = value.shape[2:]
+        gather_index = at.reshape(
+            batch, 1, *([1] * len(trailing))
+        ).expand(batch, frames, *trailing)
+        return value.gather(1, gather_index)
+
+    root = x[..., [ROOT_X_IDX, ROOT_Y_IDX, ROOT_Z_IDX]].to(torch.float64)
+    # fk_24_torch already returns world-space joints, including root
+    # translation. Adding root again would make the Adapter condition depend
+    # on twice the observable translation gap.
+    joints = fk_24_torch(x.to(torch.float64))
+    left_joints = gather(joints, left)
+    right_joints = gather(joints, right)
+    left_velocity = (
+        left_joints - gather(joints, left_outer)
+    ) * float(fps)
+    right_velocity = (
+        gather(joints, right_outer) - right_joints
+    ) * float(fps)
+    fk_gap = torch.linalg.vector_norm(
+        right_joints - left_joints, dim=-1
+    ).mean(dim=-1)
+    temporal_gap = torch.linalg.vector_norm(
+        right_velocity - left_velocity, dim=-1
+    ).mean(dim=-1)
+    root_gap = torch.linalg.vector_norm(
+        gather(root, right) - gather(root, left), dim=-1
+    )
+    root_velocity_gap = torch.linalg.vector_norm(
+        (gather(root, right_outer) - gather(root, right)) * float(fps)
+        - (gather(root, left) - gather(root, left_outer)) * float(fps),
+        dim=-1,
+    )
+
+    rotation = rot6d_to_matrix_torch(
+        x[..., ROT6D_START:ROT6D_START + 6]
+    )
+    forward = rotation[..., :, 2]
+    yaw = torch.atan2(forward[..., 0], forward[..., 2]).unsqueeze(-1)
+    yaw_delta = gather(yaw, right) - gather(yaw, left)
+    yaw_gap = torch.atan2(
+        torch.sin(yaw_delta), torch.cos(yaw_delta)
+    ).abs().squeeze(-1) / math.pi
+    contact = x[..., :4].clamp(0.0, 1.0).to(torch.float64)
+    left_support = gather(contact, left)
+    right_support = gather(contact, right)
+    observables = torch.cat(
+        [
+            torch.log1p(fk_gap).unsqueeze(-1),
+            torch.log1p(temporal_gap).unsqueeze(-1),
+            torch.log1p(root_gap).unsqueeze(-1),
+            torch.log1p(root_velocity_gap).unsqueeze(-1),
+            yaw_gap.unsqueeze(-1),
+            left_support,
+            right_support,
+        ],
+        dim=-1,
+    )
+    observables = torch.where(
+        valid[:, None, :], observables, torch.zeros_like(observables)
+    )
+    phase, taper, ownership = _refiner_relative_seam_phase_features(
+        seam_mask, taper_frames
+    )
+    features = torch.cat([observables.to(x.dtype), phase.to(x.dtype)], dim=-1)
+    if features.shape[-1] != REFINER_ADAPTER_CONDITION_DIM:
+        raise RuntimeError("Refiner Adapter condition layout mismatch")
+    difficulty = torch.sqrt(
+        observables[..., :5].square().mean(dim=-1, keepdim=True).clamp_min(0.0)
+    ).to(x.dtype)
+    return features, difficulty, taper.to(x.dtype), ownership
+
+
 class ProductManifoldTemporalRefiner(nn.Module):
     """Boundary refiner with a joint-risk-conditioned 79D geometric output.
 
@@ -3054,6 +3242,8 @@ class ProductManifoldTemporalRefiner(nn.Module):
         fps: float = 30.0,
         output_init_std: float = 0.0,
         film_conditioning: bool = False,
+        observable_adapter: bool = False,
+        residual_taper_frames: int = 3,
     ):
         super().__init__()
         if not np.isfinite(float(fps)) or float(fps) <= 0:
@@ -3062,6 +3252,8 @@ class ProductManifoldTemporalRefiner(nn.Module):
             raise ValueError("Refiner output initialization std must be finite and nonnegative")
         self.fps = float(fps)
         self.film_conditioning = bool(film_conditioning)
+        self.observable_adapter = bool(observable_adapter)
+        self.residual_taper_frames = int(residual_taper_frames)
         # Kernel-5 dilations [1,2,5] give a 33-frame convolutional field. The
         # local horizontal difference needs one additional preceding frame;
         # explicit boundary features also read the two supplied anchors. A
@@ -3104,6 +3296,31 @@ class ProductManifoldTemporalRefiner(nn.Module):
             # zero-output safe start exactly.
             nn.init.zeros_(self.film_generator[-1].weight)
             nn.init.zeros_(self.film_generator[-1].bias)
+        if self.observable_adapter:
+            adapter_hidden = max(32, hidden // 2)
+            self.observable_adapter_net = nn.Sequential(
+                nn.Conv1d(
+                    hidden + REFINER_ADAPTER_CONDITION_DIM,
+                    adapter_hidden,
+                    1,
+                ),
+                FramewiseChannelNorm(adapter_hidden),
+                nn.SiLU(),
+                nn.Conv1d(adapter_hidden, 75, 1),
+            )
+            self.observable_adapter_gate = nn.Sequential(
+                nn.Linear(REFINER_ADAPTER_OBSERVABLE_DIM, adapter_hidden),
+                nn.SiLU(),
+                nn.Linear(adapter_hidden, 1),
+            )
+            self.register_buffer(
+                "observable_adapter_gate_floor",
+                torch.zeros((), dtype=torch.float32),
+            )
+            nn.init.zeros_(self.observable_adapter_net[-1].weight)
+            nn.init.zeros_(self.observable_adapter_net[-1].bias)
+            nn.init.zeros_(self.observable_adapter_gate[-1].weight)
+            nn.init.zeros_(self.observable_adapter_gate[-1].bias)
         self.out = nn.Conv1d(hidden, PRODUCT_STATE_DIM, 1)
         # Production remains exact-zero safe-start. A separate, nonpublishing
         # paired diagnostic may opt into small Gaussian weights. Its initial
@@ -3115,7 +3332,16 @@ class ProductManifoldTemporalRefiner(nn.Module):
             nn.init.normal_(self.out.weight, mean=0.0, std=float(output_init_std))
         nn.init.zeros_(self.out.bias)
 
-    def forward(self, x, cond, seam_mask, joint_mask, *, film_trace=None):
+    def forward(
+        self,
+        x,
+        cond,
+        seam_mask,
+        joint_mask,
+        *,
+        film_trace=None,
+        adapter_trace=None,
+    ):
         # x: B,T,151; cond: B,32 or B,T,32; seam: B,T,1.
         batch, frames, _ = x.shape
         c = _expand_temporal_condition_torch(cond, frames)
@@ -3150,7 +3376,51 @@ class ProductManifoldTemporalRefiner(nn.Module):
                     "gamma": gamma.transpose(1, 2).detach(),
                     "beta": beta.transpose(1, 2).detach(),
                 })
-        return self.out(h).transpose(1, 2)
+        output = self.out(h).transpose(1, 2)
+        if self.observable_adapter:
+            features, difficulty, taper, ownership = (
+                _refiner_observable_adapter_features(
+                    x,
+                    seam_mask,
+                    self.fps,
+                    self.residual_taper_frames,
+                )
+            )
+            adapter_input = torch.cat(
+                [h, features.transpose(1, 2)], dim=1
+            )
+            adapter_tangent = self.observable_adapter_net(
+                adapter_input
+            ).transpose(1, 2)
+            raw_gate = self.observable_adapter_gate(
+                features[..., :REFINER_ADAPTER_OBSERVABLE_DIM]
+            )
+            excess = torch.relu(
+                difficulty
+                - self.observable_adapter_gate_floor.to(difficulty.dtype)
+            )
+            continuous_support = 1.0 - torch.exp(-excess.square())
+            gate = torch.sigmoid(raw_gate) * continuous_support
+            adapter_tangent = (
+                adapter_tangent
+                * gate
+                * taper
+                * ownership.to(adapter_tangent.dtype)
+            )
+            adapter_output = torch.cat(
+                [torch.zeros_like(output[..., :4]), adapter_tangent], dim=-1
+            )
+            output = output + adapter_output
+            if adapter_trace is not None:
+                adapter_trace.update({
+                    "condition": features,
+                    "difficulty": difficulty,
+                    "gate": gate,
+                    "c2_taper": taper,
+                    "ownership": ownership,
+                    "tangent": adapter_tangent,
+                })
+        return output
 
 
 def _risk_masks_for_batch_np(
@@ -7234,13 +7504,30 @@ def _refiner_batch_outputs(model, batch, cfg, *, trace=None):
         torch.cat([batch["seam"], batch["seam"]]),
         torch.cat([batch["joint"], batch["clean_joint"]]),
     )
-    if trace is not None and bool(getattr(model, "film_conditioning", False)):
+    traced_conditioning = bool(
+        trace is not None
+        and (
+            getattr(model, "film_conditioning", False)
+            or getattr(model, "observable_adapter", False)
+        )
+    )
+    if traced_conditioning:
         film_trace = {}
-        outputs = model(*model_inputs, film_trace=film_trace)
-        trace["film"] = {
-            key: value[:count]
-            for key, value in film_trace.items()
-        }
+        adapter_trace = {}
+        outputs = model(
+            *model_inputs,
+            film_trace=film_trace,
+            adapter_trace=adapter_trace,
+        )
+        if film_trace:
+            trace["film"] = {
+                key: value[:count] for key, value in film_trace.items()
+            }
+        if adapter_trace:
+            trace["observable_adapter"] = {
+                key: value[:count].detach()
+                for key, value in adapter_trace.items()
+            }
     else:
         outputs = model(*model_inputs)
     pred = _decode_product_refiner_output(
@@ -8681,6 +8968,10 @@ def train_refiner(args: argparse.Namespace) -> int:
         32,
         fps=cfg.fps,
         film_conditioning=bool(cfg.product_refiner_film_conditioning),
+        observable_adapter=bool(cfg.product_refiner_observable_adapter),
+        residual_taper_frames=int(
+            cfg.product_refiner_residual_taper_frames
+        ),
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     steps = int(args.steps or cfg.refiner_train_steps)
@@ -9059,6 +9350,27 @@ def train_refiner(args: argparse.Namespace) -> int:
                     "observable_anchor_fk_gap_and_wrapped_root_yaw_gap"
                 ),
                 "diagnostic_role_labels_used": False,
+            },
+            "observable_adapter": {
+                "enabled": bool(cfg.product_refiner_observable_adapter),
+                "protocol": (
+                    REFINER_OBSERVABLE_ADAPTER_PROTOCOL
+                    if cfg.product_refiner_observable_adapter
+                    else "disabled"
+                ),
+                "condition_dim": (
+                    REFINER_ADAPTER_CONDITION_DIM
+                    if cfg.product_refiner_observable_adapter
+                    else 0
+                ),
+                "output_tangent_dim": (
+                    75 if cfg.product_refiner_observable_adapter else 0
+                ),
+                "role_label_consumed": False,
+                "hidden_clean_consumed": False,
+                "projector_gradient_protocol": (
+                    "stop_gradient_during_initial_teacher_probe"
+                ),
             },
             "temporal_priority": "endpoint_acceptance_active_set",
             "repair_target": "observable_endpoint_jump_and_actual_fk_dynamics",
@@ -10365,7 +10677,7 @@ def analytic_residual_refine(motion: np.ndarray, seam_positions: Sequence[int], 
 
 
 _INFERENCE_MODEL_CACHE: Dict[
-    Tuple[str, str, int, int, str, bool], Dict[str, Any]
+    Tuple[str, str, int, int, str, bool, bool], Dict[str, Any]
 ] = {}
 
 
@@ -10384,6 +10696,7 @@ def _cached_inference_model(
         int(stat.st_size),
         str(cfg.device),
         bool(getattr(cfg, "product_refiner_film_conditioning", False)),
+        bool(getattr(cfg, "product_refiner_observable_adapter", False)),
     )
     cached = _INFERENCE_MODEL_CACHE.get(key)
     if cached is None:
@@ -10400,6 +10713,12 @@ def _cached_inference_model(
                 fps=cfg.fps,
                 film_conditioning=bool(
                     cfg.product_refiner_film_conditioning
+                ),
+                observable_adapter=bool(
+                    cfg.product_refiner_observable_adapter
+                ),
+                residual_taper_frames=int(
+                    cfg.product_refiner_residual_taper_frames
                 ),
             ).to(cfg.device)
             schedule = None
