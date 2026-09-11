@@ -739,8 +739,13 @@ def main():
     args = parser.parse_args()
     if args.target_rms != 1.0e-4:
         parser.error("--target-rms must remain exactly 1e-4")
-    if args.steps < 1 or args.eval_every < 1:
-        parser.error("probe steps and evaluation interval must be positive")
+    if args.eval_every < 1:
+        parser.error("evaluation interval must be positive")
+    if args.audit_only:
+        if args.steps != 0:
+            parser.error("--audit-only requires --steps 0")
+    elif args.steps < 1:
+        parser.error("probe steps must be positive")
     return run(args)
 
 
