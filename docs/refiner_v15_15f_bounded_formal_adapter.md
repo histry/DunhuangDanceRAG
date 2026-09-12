@@ -21,6 +21,12 @@ terminates the trial with scientific status 2. A checkpoint is written only
 after every bounded audit passes. The checkpoint remains unpromoted and cannot
 authorize replay, publication or video generation by itself.
 
+Case-isolated fixed-Guard objectives use non-reentrant activation checkpointing.
+The transaction-level Anchor, objective, weighting and gradient remain the
+same, while each float64 FK graph is recomputed during backward instead of
+being retained for every cross teacher. Subprocess execution errors are
+reported separately from completed exact-closure failures.
+
 Server execution uses:
 
 ```bash
@@ -31,4 +37,3 @@ bash scripts/run_refiner_v15_15f_bounded_formal_adapter_server.sh
 
 `TOTAL_STEPS` defaults to 300 and must remain in `[200, 500]`.
 `AUDIT_EVERY` defaults to 20 and must remain in `[10, 20]`.
-

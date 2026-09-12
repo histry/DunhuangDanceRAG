@@ -16,6 +16,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
+
 from motion_geometry.product_manifold import product_exp_torch, product_log_torch
 from training import motion_models as m
 from training import refiner_case_local_full_tangent_oracle as oracle
@@ -251,13 +253,41 @@ def _case_isolated_fixed_guard_restoration(
     permitted = _owned_case_mask(
         ownership, training_tangent, int(case_index)
     )
-    isolated_tangent = training_tangent.masked_fill(~permitted, 0.0)
-    isolated_prediction = product_exp_torch(
-        baseline.detach(), isolated_tangent
+    guard_keys = tuple(sorted(anchor))
+
+    def checkpointed_guard_values(tangent):
+        """Recompute one case's FK/Guard graph during backward."""
+        isolated_tangent = tangent.masked_fill(~permitted, 0.0)
+        isolated_prediction = product_exp_torch(
+            baseline.detach(), isolated_tangent
+        )
+        result = projected_probe._guard_values_for_prediction(
+            model, batch, cfg, isolated_prediction, identity
+        )
+        missing = [key for key in guard_keys if key not in result]
+        extra = sorted(set(result) - set(guard_keys))
+        if missing or extra:
+            raise RuntimeError({
+                "fixed_guard_checkpoint_key_mismatch": {
+                    "missing": missing,
+                    "extra": extra,
+                },
+            })
+        return tuple(result[key] for key in guard_keys)
+
+    # A multi-transaction bank can contain dozens of cross teachers. Keeping
+    # one float64 FK graph per isolated candidate makes peak memory grow with
+    # teacher count. Recompute each graph during backward while preserving the
+    # exact objective and gradient.
+    checkpointed = activation_checkpoint(
+        checkpointed_guard_values,
+        training_tangent,
+        use_reentrant=False,
+        preserve_rng_state=False,
     )
-    values = projected_probe._guard_values_for_prediction(
-        model, batch, cfg, isolated_prediction, identity
-    )
+    if m.torch.is_tensor(checkpointed):
+        checkpointed = (checkpointed,)
+    values = dict(zip(guard_keys, checkpointed))
     loss, details = _fixed_guard_restoration_terms(
         values,
         anchor,
@@ -265,6 +295,7 @@ def _case_isolated_fixed_guard_restoration(
         absolute,
         safety_fraction,
     )
+    isolated_tangent = training_tangent.masked_fill(~permitted, 0.0)
     outside = ~permitted
     outside_max = (
         float(isolated_tangent[outside].abs().max().detach())
@@ -275,6 +306,8 @@ def _case_isolated_fixed_guard_restoration(
         "aggregation": "sum_normalized_relu",
         "normalization_scale": "fixed_anchor_absolute_allowance",
         "training_safety_fraction": float(safety_fraction),
+        "activation_checkpointed": True,
+        "checkpoint_reentrant": False,
         "outside_case_or_ownership_abs_max": outside_max,
         "active_metric_count": sum(
             int(row["active"]) for row in details.values()
@@ -1414,6 +1447,10 @@ def run(args):
             if args.case_isolated_guard_restoration
             else "metric_absolute_magnitude"
         ),
+        "fixed_guard_activation_checkpointing": bool(
+            args.case_isolated_guard_restoration
+        ),
+        "fixed_guard_checkpoint_reentrant": False,
         "guard_safety_fraction": float(args.guard_safety_fraction),
         "guard_restoration_weight": float(
             args.guard_restoration_weight

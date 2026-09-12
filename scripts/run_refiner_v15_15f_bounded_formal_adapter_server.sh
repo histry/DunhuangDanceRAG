@@ -59,6 +59,7 @@ export MOTION_GPU_PREPROCESSING=1
 export MOTION_PRODUCT_REFINER_FILM_CONDITIONING=1
 export MOTION_PRODUCT_REFINER_OBSERVABLE_ADAPTER=1
 export MOTION_CHECKPOINT_VALIDATION_FAIL_CLOSED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 set +e
 "$PY" -u -m training.refiner_v15_15f_bounded_formal_adapter \
@@ -74,11 +75,6 @@ set +e
 RUN_STATUS=$?
 set -e
 printf '%s\n' "$RUN_STATUS" > "$SCIENTIFIC_STATUS"
-if [[ "$RUN_STATUS" -ne 0 && "$RUN_STATUS" -ne 2 ]]; then
-  echo "[FATAL] V15.15f execution failed with status $RUN_STATUS"
-  exit "$RUN_STATUS"
-fi
-
 REPORT="$TRAIN_DIR/bounded_formal_adapter.report.json"
 test -s "$REPORT"
 printf '%s\n' "$REPORT" > outputs/LATEST_REFINER_V15_15F_BOUNDED_TRAINING_REPORT
@@ -94,10 +90,16 @@ print(json.dumps({
     "total_steps_completed": r.get("total_steps_completed"),
     "bounded_training_passed": r.get("bounded_training_passed"),
     "fail_closed_reason": r.get("fail_closed_reason"),
+    "fatal_execution_status": r.get("fatal_execution_status"),
     "split_contract": r.get("split_contract"),
     "formal_checkpoint": r.get("formal_checkpoint"),
 }, ensure_ascii=False, indent=2))
 PY
+
+if [[ "$RUN_STATUS" -ne 0 && "$RUN_STATUS" -ne 2 ]]; then
+  echo "[FATAL] V15.15f execution failed with status $RUN_STATUS"
+  exit "$RUN_STATUS"
+fi
 
 if [[ "$RUN_STATUS" -eq 0 ]]; then
   CHECKPOINT="$TRAIN_DIR/bounded_formal_adapter_state.pt"

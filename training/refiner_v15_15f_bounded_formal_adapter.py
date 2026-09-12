@@ -199,6 +199,7 @@ def run(args) -> int:
     current_state = initial_state
     completed_steps = 0
     fail_reason = None
+    fatal_status = None
     while completed_steps < int(args.total_steps):
         chunk = min(
             int(args.audit_every), int(args.total_steps) - completed_steps
@@ -235,6 +236,11 @@ def run(args) -> int:
             "train_passed": train_passed,
             "optimizer_state_resumed": bool(round_index > 1),
         }
+        if train_status not in (0, 2):
+            fail_reason = "train_execution_failed"
+            fatal_status = int(train_status)
+            rounds.append(round_record)
+            break
         completed_steps = step_stop
         if not train_passed:
             fail_reason = "train_exact_closure_failed"
@@ -274,6 +280,10 @@ def run(args) -> int:
             "stage": "v15_15f_bounded_training_round",
             **round_record,
         }), flush=True)
+        if validation_status not in (0, 2):
+            fail_reason = "validation_execution_failed"
+            fatal_status = int(validation_status)
+            break
         if not validation_passed:
             fail_reason = "validation_exact_closure_failed"
             break
@@ -322,6 +332,7 @@ def run(args) -> int:
         "split_contract": split_contract,
         "rounds": rounds,
         "fail_closed_reason": fail_reason,
+        "fatal_execution_status": fatal_status,
         "bounded_training_passed": passed,
         "formal_checkpoint": (
             str(checkpoint_path) if checkpoint_path is not None else None
@@ -340,6 +351,8 @@ def run(args) -> int:
         "checkpoint": report["formal_checkpoint"],
         "fail_closed_reason": fail_reason,
     }), flush=True)
+    if fatal_status is not None:
+        return int(fatal_status)
     return 0 if passed else 2
 
 
