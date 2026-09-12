@@ -23,6 +23,11 @@ single/cross discriminative conformal model, while every activated candidate
 is checked on its complete transaction against the frozen Guard anchor before
 selection.  A feasible Adapter is locked as the incumbent; correction is
 considered only when that incumbent fails exact raw closure.
+
+V15.15g1d keeps that activation and selection contract, but repairs a candidate
+inside its complete transaction.  Hard fixed-Guard shadows choose the active
+terms and accept line-search trials; train-frozen LogSumExp relaxations provide
+the gradient direction without changing the authoritative Guard thresholds.
 """
 from __future__ import annotations
 
@@ -40,6 +45,7 @@ from motion_geometry.product_manifold import (
     product_log_torch,
 )
 from training import motion_models as m
+from training import refiner_bridge_diagnostics as diagnostic
 from training import refiner_case_local_full_tangent_oracle as oracle
 from training import refiner_observable_adapter_probe as adapter
 from training import refiner_projected_candidate_probe as projected_probe
@@ -58,6 +64,9 @@ G1B_SCHEMA = (
 G1C_SCHEMA = (
     "refiner_v15_15g1c_fixed_guard_shadow_incumbent_lock_"
     "discriminative_conformal_v1"
+)
+G1D_SCHEMA = (
+    "refiner_v15_15g1d_full_transaction_shadow_gradient_repair_v1"
 )
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
 TEACHER_SCHEMA = adapter.V15_15E_TEACHER_SCHEMA
@@ -85,6 +94,29 @@ G1_GUARD_PROXY_TERMS = {
     "extremity_jerk_window_p95": (
         "repair_extremity_jerk_window_p95_max_mps3_signed_margin"
     ),
+    "boundary": "boundary_jerk_signed_margin",
+}
+FULL_GUARD_PHYSICAL_CASE_TERMS = {
+    "joint_jerk_p95": "repair_joint_jerk_mps3_p95_signed_margin",
+    "joint_jerk_max": "repair_joint_jerk_mps3_max_signed_margin",
+    "joint_jerk_window_p95": (
+        "repair_joint_jerk_window_p95_max_mps3_signed_margin"
+    ),
+    "extremity_jerk_p95": (
+        "repair_extremity_jerk_mps3_p95_signed_margin"
+    ),
+    "extremity_jerk_window_p95": (
+        "repair_extremity_jerk_window_p95_max_mps3_signed_margin"
+    ),
+    "foot_skate_p95": "repair_foot_skate_mps_p95_signed_margin",
+    "foot_skate_max": "repair_foot_skate_mps_max_signed_margin",
+    "support_drift_p95": (
+        "repair_foot_support_drift_m_p95_signed_margin"
+    ),
+    "support_drift_max": (
+        "repair_foot_support_drift_m_max_signed_margin"
+    ),
+    "penetration": "repair_foot_penetration_min_m_signed_margin",
     "boundary": "boundary_jerk_signed_margin",
 }
 G1_SEVERITY_CHANNELS = (
@@ -744,6 +776,280 @@ def _fixed_guard_shadow_from_details(details, relative, absolute):
     return shadow, audit
 
 
+def _fixed_guard_limit(contract, name):
+    """Return the exact immutable Guard limit and comparison tolerance."""
+    anchor = float(contract["initial_anchor"][name])
+    relative = float(contract["relative_tolerance"][name])
+    absolute = float(contract["absolute_tolerance"][name])
+    allowance = max(abs(anchor) * relative, absolute)
+    allowed = anchor + allowance
+    numeric = max(1.0e-12, abs(allowed) * 1.0e-9, allowance * 1.0e-6)
+    return {
+        "fixed_anchor": anchor,
+        "relative_tolerance": relative,
+        "absolute_tolerance": absolute,
+        "fixed_anchor_allowance": allowance,
+        "absolute_limit": allowed,
+        "numeric_tolerance": numeric,
+    }
+
+
+def _median(values):
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("median requires at least one value")
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def _freeze_train_full_shadow_repair_contract(
+    train_teacher,
+    *,
+    lse_allowance_fraction,
+    lse_temperature_floor,
+    projection_damping,
+    minimum_reduction_floor,
+):
+    """Freeze every g1d numerical choice from train transactions only."""
+    if train_teacher.get("split") != "train":
+        raise RuntimeError("g1d shadow repair calibration requires train split")
+    contracts = train_teacher.get("transaction_guard_contracts") or {}
+    if not contracts:
+        raise RuntimeError("g1d train bank lacks transaction Guard contracts")
+    allowances = {}
+    numerics = {}
+    transaction_ids = sorted(str(key) for key in contracts)
+    for transaction_id in transaction_ids:
+        contract = contracts[transaction_id]
+        for name in sorted(contract["initial_anchor"]):
+            limit = _fixed_guard_limit(contract, name)
+            allowances.setdefault(name, []).append(
+                limit["fixed_anchor_allowance"]
+            )
+            numerics.setdefault(name, []).append(limit["numeric_tolerance"])
+    temperatures = {
+        name: max(
+            float(lse_temperature_floor),
+            float(lse_allowance_fraction) * _median(values),
+        )
+        for name, values in allowances.items()
+    }
+    minimum_reductions = {
+        name: max(float(minimum_reduction_floor), _median(numerics[name]))
+        for name in sorted(numerics)
+    }
+    return {
+        "schema": "refiner_v15_15g1d_train_frozen_shadow_repair_contract_v1",
+        "calibration_split": "train",
+        "validation_consumed_for_calibration": False,
+        "transaction_ids": transaction_ids,
+        "transaction_count": len(transaction_ids),
+        "group_aggregation_gradient_relaxation": (
+            "logsumexp_train_frozen_temperature"
+        ),
+        "authoritative_forward_and_acceptance_aggregation": (
+            "exact_fixed_guard_hard_group_aggregation"
+        ),
+        "p95_active_index_frozen_within_line_search": True,
+        "lse_allowance_fraction": float(lse_allowance_fraction),
+        "lse_temperature_floor": float(lse_temperature_floor),
+        "lse_temperature_by_guard_term": temperatures,
+        "minimum_shadow_reduction_by_guard_term": minimum_reductions,
+        "projection_damping": float(projection_damping),
+        "line_search_acceptance": [
+            "full_transaction_fixed_guard_shadow_strictly_decreases",
+            "endpoint_and_temporal_strict_descent_pass",
+            "owned_tangent_radius_rms_equals_1e-4",
+            "outside_scope_abs_max_equals_0",
+        ],
+    }
+
+
+def _full_transaction_fixed_guard_shadows(
+    model,
+    batch,
+    cfg,
+    candidate,
+    identity,
+    contract,
+):
+    """Compute authoritative differentiable hard shadows on one transaction."""
+    groups = {}
+    _, _, terms, _ = m._refiner_batch_objectives(
+        model,
+        batch,
+        cfg,
+        group_objectives=groups,
+        prediction_override=candidate,
+        identity_override=identity,
+    )
+    values = diagnostic._diagnostic_group_guard_values(terms, groups)
+    expected = set(contract["initial_anchor"])
+    if set(values) != expected:
+        missing = sorted(expected - set(values))
+        unexpected = sorted(set(values) - expected)
+        raise RuntimeError(
+            "full-transaction Guard term mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    shadows = {}
+    limits = {}
+    for name, value in values.items():
+        limit = _fixed_guard_limit(contract, name)
+        shadows[name] = (
+            value
+            - float(limit["absolute_limit"])
+            - float(limit["numeric_tolerance"])
+        )
+        limits[name] = limit
+    return shadows, values, limits
+
+
+def _smooth_logsumexp(values, temperature):
+    if values.numel() == 0:
+        raise RuntimeError("cannot aggregate an empty Guard group")
+    if values.numel() == 1:
+        return values.reshape(-1)[0]
+    temperature = float(temperature)
+    flat = values.reshape(-1)
+    return temperature * m.torch.logsumexp(flat / temperature, dim=0)
+
+
+def _smooth_group_guard_value(
+    name,
+    *,
+    exact_value,
+    case_terms,
+    batch,
+    temperature,
+):
+    """Relax only the cross-case hard max; exact Guard remains authoritative."""
+    label, suffix = name.split(".", 1)
+    if suffix in FULL_GUARD_PHYSICAL_CASE_TERMS:
+        group_index = m.REFINER_GROUP_LABELS.index(label)
+        selected = batch["group"] == group_index
+        values = case_terms[FULL_GUARD_PHYSICAL_CASE_TERMS[suffix]][selected]
+        return _smooth_logsumexp(values, temperature)
+    if suffix == "fixed_support":
+        parts = [
+            _smooth_group_guard_value(
+                f"{label}.{part}",
+                exact_value=exact_value,
+                case_terms=case_terms,
+                batch=batch,
+                temperature=temperature,
+            )
+            for part in (
+                "foot_skate_p95",
+                "foot_skate_max",
+                "support_drift_p95",
+                "support_drift_max",
+                "penetration",
+            )
+        ]
+        return _smooth_logsumexp(m.torch.stack(parts), temperature)
+    return exact_value
+
+
+def _g1d_shadow_objective(
+    *,
+    model,
+    batch,
+    cfg,
+    baseline,
+    identity,
+    candidate,
+    contract,
+    local_case,
+    baseline_case,
+    local_tangent,
+    local_mask,
+    train_repair_contract,
+    temporal_smoothness_weight,
+):
+    hard_shadows, hard_values, limits = (
+        _full_transaction_fixed_guard_shadows(
+            model, batch, cfg, candidate, identity, contract
+        )
+    )
+    hard_float = {
+        name: float(value.detach()) for name, value in hard_shadows.items()
+    }
+    maximum_hard = max(hard_float.values())
+    active_names = sorted(
+        name for name, value in hard_float.items() if value > 0.0
+    )
+    _, case_terms = m._observable_refiner_objective(
+        candidate,
+        baseline.detach(),
+        batch["seam"],
+        cfg,
+        reduction="none",
+    )
+    science_terms = oracle.case_probe._case_terms(candidate, batch, cfg)
+    science_tensors = {
+        key: science_terms[key][int(local_case)]
+        for key in ("endpoint", "temporal")
+    }
+    scientific = oracle._case_scientific_status(
+        {key: float(value.detach()) for key, value in science_tensors.items()},
+        baseline_case,
+    )
+    smooth_shadows = {}
+    for name in active_names:
+        temperature = float(
+            train_repair_contract[
+                "lse_temperature_by_guard_term"
+            ][name]
+        )
+        value = _smooth_group_guard_value(
+            name,
+            exact_value=hard_values[name],
+            case_terms=case_terms,
+            batch=batch,
+            temperature=temperature,
+        )
+        smooth_shadows[name] = (
+            value
+            - float(limits[name]["absolute_limit"])
+            - float(limits[name]["numeric_tolerance"])
+        )
+    smoothness = _tangent_temporal_smoothness(local_tangent, local_mask)
+    if active_names:
+        primary = "full_transaction_fixed_guard_shadow"
+        primary_loss = m.torch.stack(
+            [m.torch.relu(smooth_shadows[name]) for name in active_names]
+        ).sum()
+    else:
+        primary = "endpoint_temporal"
+        primary_loss = (
+            case_terms["endpoint_scientific_deficit"][int(local_case)]
+            + case_terms["temporal_scientific_deficit"][int(local_case)]
+        )
+    loss = primary_loss + float(temporal_smoothness_weight) * smoothness
+    diagnostics = {
+        "primary_objective": primary,
+        "active_full_shadow_terms": active_names,
+        "full_transaction_fixed_guard_shadow_margin_by_term": hard_float,
+        "maximum_full_transaction_fixed_guard_shadow_margin": maximum_hard,
+        "smooth_full_shadow_margin_by_active_term": {
+            name: float(value.detach())
+            for name, value in smooth_shadows.items()
+        },
+        "p95_active_index_frozen_within_line_search": True,
+        "endpoint_delta": scientific["endpoint_delta"],
+        "temporal_delta": scientific["temporal_delta"],
+        "scientific_passed": bool(scientific["passed"]),
+        "scientific_numeric_tolerance": scientific.get(
+            "numeric_tolerance", {}
+        ),
+        "temporal_smoothness": float(smoothness.detach()),
+    }
+    return loss, primary_loss, diagnostics, science_tensors
+
+
 def _case_isolated_transaction_tangent(baseline, scoped, local_case):
     """Place one 75D product tangent into its complete transaction."""
     transaction_tangent = scoped.new_zeros(
@@ -1060,6 +1366,7 @@ def _project_guard_direction(
     current,
     mask,
     feasibility_gradients,
+    damping=0.0,
 ):
     """Project a Guard descent direction onto radius/science tangent cones."""
     result = direction.masked_fill(~mask, 0.0)
@@ -1072,15 +1379,17 @@ def _project_guard_direction(
     # Two alternating passes keep the radial and feasibility projections
     # consistent without changing the fixed 2/3/5 correction budget.
     for _ in range(2):
-        radial_norm = radial[mask].square().sum().clamp_min(1.0e-20)
+        radial_norm = (
+            radial[mask].square().sum() + float(damping)
+        ).clamp_min(1.0e-20)
         radial_dot = (result[mask] * radial[mask]).sum()
         result = result - (radial_dot / radial_norm) * radial
         for gradient in constraints:
             directional_change = (result[mask] * gradient[mask]).sum()
             if float(directional_change.detach()) > 0.0:
-                denominator = gradient[mask].square().sum().clamp_min(
-                    1.0e-20
-                )
+                denominator = (
+                    gradient[mask].square().sum() + float(damping)
+                ).clamp_min(1.0e-20)
                 result = result - (
                     directional_change / denominator
                 ) * gradient
@@ -1433,6 +1742,359 @@ def _correct_case(
         "tangent_second_third_difference_regularization": bool(
             contract_margin_active_set
         ),
+        "final_exact_radius_rms": _rms(current, mask),
+        "history": history,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+def _g1d_rejection_reason(
+    *,
+    radius_ok,
+    scope_ok,
+    science_ok,
+    shadow_ok,
+):
+    if not radius_ok:
+        return "exact_radius_normalization_failed"
+    if not scope_ok:
+        return "scope_leakage"
+    if not science_ok:
+        return "radius_normalization_broke_science_cone"
+    if not shadow_ok:
+        return "full_shadow_not_strictly_reduced"
+    return None
+
+
+def _correct_case_full_transaction_shadow(
+    *,
+    model,
+    method,
+    steps,
+    initial_tangent,
+    ownership,
+    c2_taper,
+    baseline,
+    identity,
+    batch,
+    cfg,
+    local_case,
+    baseline_case,
+    contract,
+    train_repair_contract,
+    target_rms,
+    step_size,
+    trust_fraction,
+    temporal_smoothness_weight,
+):
+    """Repair one local tangent using its complete transaction Guard shadow."""
+    mask = _owned_case_mask(ownership, initial_tangent, 0)
+    taper = c2_taper.expand_as(initial_tangent).detach()
+    current, normalized = _normalize_exact_radius(
+        initial_tangent, mask, target_rms
+    )
+    zero_start = not normalized
+    if zero_start:
+        current = m.torch.zeros_like(initial_tangent).masked_fill(~mask, 0.0)
+    history = []
+    numeric_failure = False
+    started = time.perf_counter()
+    damping = float(train_repair_contract["projection_damping"])
+
+    for iteration in range(int(steps)):
+        local_baseline = baseline[int(local_case):int(local_case) + 1]
+        if method == "euclidean_projected":
+            variable = m.torch.zeros_like(current).requires_grad_(True)
+            local_total = current.detach() + variable.masked_fill(
+                ~mask, 0.0
+            ) * taper
+            local_candidate = product_exp_torch(
+                local_baseline, local_total
+            )
+        elif method == "riemannian_retraction":
+            current_motion = product_exp_torch(local_baseline, current.detach())
+            variable = m.torch.zeros_like(current).requires_grad_(True)
+            local_candidate = product_exp_torch(
+                current_motion,
+                variable.masked_fill(~mask, 0.0) * taper,
+            )
+        else:
+            raise ValueError(f"unsupported correction method: {method}")
+        local_total = product_log_torch(local_baseline, local_candidate)
+        local_total = local_total.masked_fill(~mask, 0.0)
+        transaction_tangent = _case_isolated_transaction_tangent(
+            baseline, local_total, local_case
+        )
+        candidate = product_exp_torch(baseline, transaction_tangent)
+        loss, primary_loss, constraints, science_tensors = (
+            _g1d_shadow_objective(
+                model=model,
+                batch=batch,
+                cfg=cfg,
+                baseline=baseline,
+                identity=identity,
+                candidate=candidate,
+                contract=contract,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                local_tangent=local_total,
+                local_mask=mask,
+                train_repair_contract=train_repair_contract,
+                temporal_smoothness_weight=temporal_smoothness_weight,
+            )
+        )
+        primary_gradient = m.torch.autograd.grad(
+            primary_loss, variable, allow_unused=True, retain_graph=True
+        )[0]
+        gradient = m.torch.autograd.grad(
+            loss, variable, allow_unused=True, retain_graph=True
+        )[0]
+        if (
+            gradient is None
+            or not bool(m.torch.isfinite(gradient).all())
+            or primary_gradient is None
+            or not bool(m.torch.isfinite(primary_gradient).all())
+        ):
+            numeric_failure = True
+            history.append({
+                "iteration": iteration,
+                "accepted": False,
+                "step_rejection_reason": "shadow_gradient_zero_or_nonfinite",
+                "constraints": constraints,
+                "full_shadow_gradient_norm": math.nan,
+                "line_search_rejections": [],
+            })
+            break
+        raw_direction = (-gradient.detach()).masked_fill(~mask, 0.0)
+        full_shadow_gradient_norm = float(
+            m.torch.linalg.vector_norm(
+                primary_gradient.detach().masked_fill(~mask, 0.0)[mask]
+            ).detach()
+        )
+        if (
+            constraints["primary_objective"]
+            == "full_transaction_fixed_guard_shadow"
+            and full_shadow_gradient_norm <= 1.0e-20
+        ):
+            history.append({
+                "iteration": iteration,
+                "loss_before": float(loss.detach()),
+                "accepted": False,
+                "step_rejection_reason": "shadow_gradient_zero_or_nonfinite",
+                "constraints": constraints,
+                "full_shadow_gradient_norm": full_shadow_gradient_norm,
+                "line_search_rejections": [],
+            })
+            break
+        if constraints["primary_objective"] == (
+            "full_transaction_fixed_guard_shadow"
+        ):
+            feasibility_gradients = [
+                m.torch.autograd.grad(
+                    science_tensors[key],
+                    variable,
+                    allow_unused=True,
+                    retain_graph=position == 0,
+                )[0]
+                for position, key in enumerate(("endpoint", "temporal"))
+            ]
+            raw_direction = _project_guard_direction(
+                raw_direction,
+                current=current,
+                mask=mask,
+                feasibility_gradients=feasibility_gradients,
+                damping=damping,
+            )
+            raw_direction = raw_direction.masked_fill(~mask, 0.0)
+        direction, usable = _bounded_direction(
+            raw_direction,
+            mask,
+            float(target_rms) * float(trust_fraction),
+        )
+        if not usable:
+            history.append({
+                "iteration": iteration,
+                "loss_before": float(loss.detach()),
+                "accepted": False,
+                "step_rejection_reason": "shadow_gradient_zero_or_nonfinite",
+                "constraints": constraints,
+                "full_shadow_gradient_norm": full_shadow_gradient_norm,
+                "line_search_rejections": [],
+            })
+            break
+
+        current_shadow = float(
+            constraints[
+                "maximum_full_transaction_fixed_guard_shadow_margin"
+            ]
+        )
+        active_names = constraints["active_full_shadow_terms"]
+        minimum_reduction = max(
+            [
+                float(train_repair_contract[
+                    "minimum_shadow_reduction_by_guard_term"
+                ][name])
+                for name in active_names
+            ]
+            or [float(min(
+                train_repair_contract[
+                    "minimum_shadow_reduction_by_guard_term"
+                ].values()
+            ))]
+        )
+        accepted = False
+        accepted_tangent = current
+        accepted_scale = 0.0
+        accepted_shadow = current_shadow
+        rejection_rows = []
+        for backtrack in range(6):
+            alpha = float(step_size) * (0.5 ** backtrack)
+            if method == "euclidean_projected":
+                trial_raw = current + alpha * direction
+            else:
+                trial_motion = product_exp_torch(
+                    current_motion, alpha * direction
+                )
+                trial_raw = product_log_torch(local_baseline, trial_motion)
+            trial, trial_ok = _normalize_exact_radius(
+                trial_raw, mask, target_rms
+            )
+            if not trial_ok:
+                rejection_rows.append({
+                    "backtrack": backtrack,
+                    "step_scale": alpha,
+                    "reason": "exact_radius_normalization_failed",
+                })
+                continue
+            radius_rms = _rms(trial, mask)
+            radius_ok = bool(
+                math.isfinite(radius_rms)
+                and abs(radius_rms - float(target_rms))
+                <= max(1.0e-12, float(target_rms) * 1.0e-6)
+            )
+            outside_scope = float(
+                trial.masked_fill(mask, 0.0).abs().amax().detach()
+            )
+            scope_ok = outside_scope == 0.0
+            trial_transaction_tangent = _case_isolated_transaction_tangent(
+                baseline, trial, local_case
+            )
+            trial_candidate = product_exp_torch(
+                baseline, trial_transaction_tangent
+            )
+            with m.torch.no_grad():
+                trial_shadows, _, _ = _full_transaction_fixed_guard_shadows(
+                    model,
+                    batch,
+                    cfg,
+                    trial_candidate,
+                    identity,
+                    contract,
+                )
+                trial_shadow = max(
+                    float(value.detach()) for value in trial_shadows.values()
+                )
+                trial_case_terms = oracle.case_probe._case_terms(
+                    trial_candidate, batch, cfg
+                )
+            trial_scientific = oracle._case_scientific_status(
+                {
+                    key: float(
+                        trial_case_terms[key][int(local_case)].detach()
+                    )
+                    for key in ("endpoint", "temporal")
+                },
+                baseline_case,
+            )
+            science_ok = bool(trial_scientific["passed"])
+            shadow_ok = bool(
+                trial_shadow <= current_shadow - minimum_reduction
+            )
+            rejection = _g1d_rejection_reason(
+                radius_ok=radius_ok,
+                scope_ok=scope_ok,
+                science_ok=science_ok,
+                shadow_ok=shadow_ok,
+            )
+            if rejection is None:
+                accepted = True
+                accepted_tangent = trial.detach()
+                accepted_scale = alpha
+                accepted_shadow = trial_shadow
+                break
+            rejection_rows.append({
+                "backtrack": backtrack,
+                "step_scale": alpha,
+                "reason": rejection,
+                "trial_full_shadow": trial_shadow,
+                "trial_radius_rms": radius_rms,
+                "trial_outside_scope_abs_max": outside_scope,
+                "trial_scientific_passed": science_ok,
+            })
+        step_rejection_reason = None
+        if not accepted:
+            step_rejection_reason = (
+                rejection_rows[-1]["reason"]
+                if rejection_rows
+                else "line_search_step_reduced_to_zero"
+            )
+        reduction = current_shadow - accepted_shadow if accepted else 0.0
+        history.append({
+            "iteration": iteration,
+            "loss_before": float(loss.detach()),
+            "accepted": accepted,
+            "step_scale": accepted_scale,
+            "constraints": constraints,
+            "full_shadow_gradient_norm": full_shadow_gradient_norm,
+            "full_shadow_before": current_shadow,
+            "full_shadow_after": accepted_shadow,
+            "full_shadow_reduction": reduction,
+            "step_rejection_reason": step_rejection_reason,
+            "line_search_exhausted": bool(not accepted),
+            "line_search_terminal_reason": (
+                "line_search_step_reduced_to_zero" if not accepted else None
+            ),
+            "line_search_rejections": rejection_rows,
+            "exact_radius_rms": _rms(accepted_tangent, mask),
+            "outside_scope_abs_max": 0.0 if accepted else None,
+        })
+        if not accepted:
+            break
+        current = accepted_tangent
+
+    accepted_steps = sum(int(row.get("accepted", False)) for row in history)
+    reductions = [float(row.get("full_shadow_reduction", 0.0)) for row in history]
+    gradient_norms = [
+        float(row["full_shadow_gradient_norm"])
+        for row in history
+        if math.isfinite(float(row.get("full_shadow_gradient_norm", math.nan)))
+    ]
+    final_rejection = next(
+        (
+            row["step_rejection_reason"]
+            for row in reversed(history)
+            if row.get("step_rejection_reason")
+        ),
+        None,
+    )
+    return current.detach(), {
+        "method": method,
+        "steps_requested": int(steps),
+        "steps_completed": len(history),
+        "accepted_steps": accepted_steps,
+        "correction_accepted_steps": accepted_steps,
+        "numeric_failure": numeric_failure,
+        "zero_adapter_start": zero_start,
+        "full_transaction_shadow_gradient_repair": True,
+        "hard_shadow_authoritative_for_active_set_and_acceptance": True,
+        "smooth_shadow_used_for_gradient_only": True,
+        "gradient_scope": "current_case_c2_tapered_ownership_only",
+        "c2_taper_in_autograd_forward_parameterization": True,
+        "scientific_feasibility_projection": True,
+        "projection_damping": damping,
+        "full_shadow_gradient_norm": max(gradient_norms, default=0.0),
+        "full_shadow_reduction": sum(reductions),
+        "step_rejection_reason": final_rejection,
         "final_exact_radius_rms": _rms(current, mask),
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
@@ -2235,6 +2897,15 @@ def _g1c_fixed_guard_shadow_selection(
                             "accepted_case_physical_margin_reduction", 0.0
                         )
                     ),
+                    "full_shadow_gradient_norm": float(
+                        correction.get("full_shadow_gradient_norm", 0.0)
+                    ),
+                    "full_shadow_reduction": float(
+                        correction.get("full_shadow_reduction", 0.0)
+                    ),
+                    "step_rejection_reason": correction.get(
+                        "step_rejection_reason"
+                    ),
                     "eligible": eligible,
                 }
 
@@ -2339,10 +3010,13 @@ def _variant_summary(audits, correction_reports, elapsed):
 
 def run(args):
     started = time.perf_counter()
+    g1c_family = bool(
+        args.activation_aware_g1c or args.activation_aware_g1d
+    )
     g1_family = bool(
         args.activation_aware_g1
         or args.activation_aware_g1b
-        or args.activation_aware_g1c
+        or g1c_family
     )
     activation_enabled = bool(
         args.activation_aware or g1_family
@@ -2368,22 +3042,30 @@ def run(args):
     train_teacher = None
     severity_envelope = None
     severity_envelope_path = None
+    train_shadow_contract = None
+    train_shadow_contract_path = None
     train_teacher_path = None
     if g1_family:
         if not args.train_teacher_bank:
-            raise RuntimeError("V15.15g1/g1b/g1c requires --train-teacher-bank")
+            raise RuntimeError(
+                "V15.15g1/g1b/g1c/g1d requires --train-teacher-bank"
+            )
         train_teacher_path = Path(args.train_teacher_bank).resolve()
         train_teacher = m.torch.load(
             train_teacher_path, map_location="cpu", weights_only=False
         )
         if train_teacher.get("schema") != TEACHER_SCHEMA:
-            raise RuntimeError("V15.15g1/g1b/g1c train bank schema mismatch")
+            raise RuntimeError(
+                "V15.15g1/g1b/g1c/g1d train bank schema mismatch"
+            )
         if train_teacher.get("split") != "train":
             raise RuntimeError(
-                "V15.15g1/g1b/g1c envelope bank must be train split"
+                "V15.15g1/g1b/g1c/g1d envelope bank must be train split"
             )
         if not train_teacher.get("teacher_bank_ready"):
-            raise RuntimeError("V15.15g1/g1b/g1c train bank is not ready")
+            raise RuntimeError(
+                "V15.15g1/g1b/g1c/g1d train bank is not ready"
+            )
         if train_teacher.get("source_diagnostic") != teacher.get(
             "source_diagnostic"
         ):
@@ -2394,7 +3076,7 @@ def run(args):
         ):
             if train_teacher.get(key) != teacher.get(key):
                 raise RuntimeError(f"train/validation {key} mismatch")
-        if args.activation_aware_g1c:
+        if g1c_family:
             severity_envelope = _freeze_discriminative_transaction_conformal(
                 train_teacher,
                 shrinkage=float(args.severity_conformal_shrinkage),
@@ -2440,7 +3122,7 @@ def run(args):
         })
         severity_envelope_path = destination / (
             "discriminative_transaction_conformal_severity.json"
-            if args.activation_aware_g1c
+            if g1c_family
             else "transaction_conformal_severity_envelope.json"
             if args.activation_aware_g1b
             else "observable_severity_envelope.json"
@@ -2450,6 +3132,33 @@ def run(args):
             + "\n",
             encoding="utf-8",
         )
+        if args.activation_aware_g1d:
+            train_shadow_contract = _freeze_train_full_shadow_repair_contract(
+                train_teacher,
+                lse_allowance_fraction=float(
+                    args.full_shadow_lse_allowance_fraction
+                ),
+                lse_temperature_floor=float(
+                    args.full_shadow_lse_temperature_floor
+                ),
+                projection_damping=float(args.full_shadow_projection_damping),
+                minimum_reduction_floor=float(args.guard_minimum_reduction),
+            )
+            train_shadow_contract.update({
+                "train_teacher_bank": str(train_teacher_path),
+                "train_teacher_bank_sha256": _file_sha256(train_teacher_path),
+                "validation_teacher_bank_consumed": False,
+                "held_out_validation_evaluation_passes": 1,
+            })
+            train_shadow_contract_path = (
+                destination / "train_frozen_full_shadow_repair_contract.json"
+            )
+            train_shadow_contract_path.write_text(
+                json.dumps(
+                    train_shadow_contract, ensure_ascii=False, indent=2
+                ) + "\n",
+                encoding="utf-8",
+            )
 
     cfg = m.MotionGenerationConfig.from_json(args.config).apply_env()
     cfg.product_refiner_observable_adapter = True
@@ -2529,13 +3238,11 @@ def run(args):
                 local_case = int(sample["local_case_index"])
                 if activation_enabled:
                     group = None
-                    local_initial = initial[
-                        int(sample["case_index"]):
-                        int(sample["case_index"]) + 1
-                    ]
-                    local_ownership = ownership[
-                        int(sample["case_index"]):
-                        int(sample["case_index"]) + 1
+                    global_case = int(sample["case_index"])
+                    local_initial = initial[global_case:global_case + 1]
+                    local_ownership = ownership[global_case:global_case + 1]
+                    local_c2_taper = trace["c2_taper"][
+                        global_case:global_case + 1
                     ]
                     local_baseline = domain["baseline"][
                         local_case:local_case + 1
@@ -2569,45 +3276,71 @@ def run(args):
                         for key in ("endpoint", "temporal")
                     }
                     local_contract = domain["contract"]
-                corrected, correction_report = _correct_case(
-                    model=model,
-                    method=method,
-                    steps=budget,
-                    initial_tangent=local_initial,
-                    ownership=local_ownership,
-                    baseline=local_baseline,
-                    identity=local_identity,
-                    batch=local_batch,
-                    cfg=cfg,
-                    case_index=correction_case,
-                    group=group,
-                    baseline_case=baseline_case,
-                    contract=local_contract,
-                    target_rms=float(args.target_rms),
-                    step_size=float(args.step_size),
-                    trust_fraction=float(args.trust_fraction),
-                    activation_aware=activation_enabled,
-                    guard_aligned=g1_family,
-                    contract_margin_active_set=bool(
-                        args.activation_aware_g1b
-                        or args.activation_aware_g1c
-                    ),
-                    guard_proxy_tolerance=float(
-                        args.guard_proxy_nonregression_tolerance
-                    ),
-                    guard_proxy_scale_floor=float(
-                        args.guard_proxy_scale_floor
-                    ),
-                    guard_smooth_max_temperature=float(
-                        args.guard_smooth_max_temperature
-                    ),
-                    correction_temporal_smoothness_weight=float(
-                        args.correction_temporal_smoothness_weight
-                    ),
-                    guard_minimum_reduction=float(
-                        args.guard_minimum_reduction
-                    ),
-                )
+                if args.activation_aware_g1d:
+                    corrected, correction_report = (
+                        _correct_case_full_transaction_shadow(
+                            model=model,
+                            method=method,
+                            steps=budget,
+                            initial_tangent=local_initial,
+                            ownership=local_ownership,
+                            c2_taper=local_c2_taper,
+                            baseline=domain["baseline"],
+                            identity=domain["identity"],
+                            batch=domain["batch"],
+                            cfg=cfg,
+                            local_case=local_case,
+                            baseline_case=baseline_case,
+                            contract=domain["contract"],
+                            train_repair_contract=train_shadow_contract,
+                            target_rms=float(args.target_rms),
+                            step_size=float(args.step_size),
+                            trust_fraction=float(args.trust_fraction),
+                            temporal_smoothness_weight=float(
+                                args.correction_temporal_smoothness_weight
+                            ),
+                        )
+                    )
+                else:
+                    corrected, correction_report = _correct_case(
+                        model=model,
+                        method=method,
+                        steps=budget,
+                        initial_tangent=local_initial,
+                        ownership=local_ownership,
+                        baseline=local_baseline,
+                        identity=local_identity,
+                        batch=local_batch,
+                        cfg=cfg,
+                        case_index=correction_case,
+                        group=group,
+                        baseline_case=baseline_case,
+                        contract=local_contract,
+                        target_rms=float(args.target_rms),
+                        step_size=float(args.step_size),
+                        trust_fraction=float(args.trust_fraction),
+                        activation_aware=activation_enabled,
+                        guard_aligned=g1_family,
+                        contract_margin_active_set=bool(
+                            args.activation_aware_g1b
+                            or args.activation_aware_g1c
+                        ),
+                        guard_proxy_tolerance=float(
+                            args.guard_proxy_nonregression_tolerance
+                        ),
+                        guard_proxy_scale_floor=float(
+                            args.guard_proxy_scale_floor
+                        ),
+                        guard_smooth_max_temperature=float(
+                            args.guard_smooth_max_temperature
+                        ),
+                        correction_temporal_smoothness_weight=float(
+                            args.correction_temporal_smoothness_weight
+                        ),
+                        guard_minimum_reduction=float(
+                            args.guard_minimum_reduction
+                        ),
+                    )
                 if args.activation_aware_g1c:
                     correction_report = _g1c_name_case_physical_diagnostics(
                         correction_report
@@ -2691,7 +3424,7 @@ def run(args):
     activation_aware_supported = False
     if activation_enabled:
         selection_started = time.perf_counter()
-        if args.activation_aware_g1c:
+        if g1c_family:
             (
                 selected_tangent,
                 activation_decisions,
@@ -2854,7 +3587,7 @@ def run(args):
                 "selected_nonzero"
             ]
         )
-        if args.activation_aware_g1c:
+        if g1c_family:
             selected_proxy_nonregression_complete = all(
                 not decision["selected_nonzero"]
                 or (
@@ -2893,7 +3626,7 @@ def run(args):
             for reports in variant_correction_reports.values()
             for report in reports.values()
         )
-        if args.activation_aware_g1c:
+        if g1c_family:
             decision_numeric_complete = all(
                 all(
                     math.isfinite(float(value))
@@ -3046,10 +3779,17 @@ def run(args):
             "selection_protocol": (
                 (
                     "observable_discriminative_conformal_then_"
+                    "full_transaction_shadow_gradient_repair_then_"
+                    "complete_fixed_guard_incumbent_lock_v1"
+                )
+                if args.activation_aware_g1d
+                else
+                (
+                    "observable_discriminative_conformal_then_"
                     "complete_transaction_fixed_guard_shadow_"
                     "incumbent_lock_v1"
                 )
-                if args.activation_aware_g1c
+                if g1c_family
                 else
                 (
                     "transaction_conformal_contract_margin_"
@@ -3100,7 +3840,7 @@ def run(args):
                     "leave_one_train_transaction_out_single_cross_"
                     "mahalanobis_two_sided"
                 )
-                if args.activation_aware_g1c
+                if g1c_family
                 else
                 "leave_one_train_transaction_out_mahalanobis_max"
                 if args.activation_aware_g1b else None
@@ -3115,21 +3855,21 @@ def run(args):
             ),
             "single_conformal_distance_threshold": (
                 severity_envelope.get("single_distance_threshold")
-                if args.activation_aware_g1c else None
+                if g1c_family else None
             ),
             "cross_conformal_distance_threshold": (
                 severity_envelope.get("cross_distance_threshold")
-                if args.activation_aware_g1c else None
+                if g1c_family else None
             ),
             "activation_discriminant_threshold": (
                 severity_envelope.get(
                     "activation_discriminant_threshold"
                 )
-                if args.activation_aware_g1c else None
+                if g1c_family else None
             ),
             "conformal_class_overlap_in_calibration": (
                 severity_envelope.get("class_overlap_in_calibration")
-                if args.activation_aware_g1c else None
+                if g1c_family else None
             ),
             "conformal_fallback_case_uids": sorted(
                 uid
@@ -3149,8 +3889,22 @@ def run(args):
                 if args.activation_aware_g1b else None
             ),
             "correction_budget_unchanged": bool(
-                (args.activation_aware_g1b or args.activation_aware_g1c)
+                (args.activation_aware_g1b or g1c_family)
                 and budgets == (2, 3, 5)
+            ),
+            "train_frozen_full_shadow_repair_contract": (
+                str(train_shadow_contract_path)
+                if train_shadow_contract_path is not None else None
+            ),
+            "train_frozen_full_shadow_repair_contract_sha256": (
+                _file_sha256(train_shadow_contract_path)
+                if train_shadow_contract_path is not None else None
+            ),
+            "repair_parameters_frozen_before_validation": bool(
+                args.activation_aware_g1d
+            ),
+            "held_out_validation_evaluation_passes": (
+                1 if args.activation_aware_g1d else None
             ),
             "activation_decision_role_label_consumed": False,
             "activation_decision_teacher_kind_consumed": False,
@@ -3158,13 +3912,13 @@ def run(args):
             "activation_decision_hidden_clean_consumed": False,
             "activation_decision_fixed_guard_consumed": False,
             "fixed_guard_shadow_frozen_group_contract_consumed": bool(
-                args.activation_aware_g1c
+                g1c_family
             ),
             "candidate_acceptance_fixed_guard_shadow_consumed": bool(
-                args.activation_aware_g1c
+                g1c_family
             ),
             "fixed_guard_evaluation_only": bool(
-                not args.activation_aware_g1c
+                not g1c_family
             ),
             "selected_method_counts": selected_method_counts,
             "required_projected_count_by_group": dict(
@@ -3189,11 +3943,11 @@ def run(args):
             "numeric_audit_complete": numeric_audit_complete,
             "selected_guard_proxy_nonregression_complete": (
                 selected_proxy_nonregression_complete
-                if not args.activation_aware_g1c else None
+                if not g1c_family else None
             ),
             "selected_fixed_guard_shadow_complete": (
                 selected_proxy_nonregression_complete
-                if args.activation_aware_g1c else None
+                if g1c_family else None
             ),
             "selected_severity_condition_complete": (
                 selected_severity_condition_complete
@@ -3233,7 +3987,9 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            G1C_SCHEMA
+            G1D_SCHEMA
+            if args.activation_aware_g1d
+            else G1C_SCHEMA
             if args.activation_aware_g1c
             else G1B_SCHEMA
             if args.activation_aware_g1b
@@ -3269,21 +4025,21 @@ def run(args):
             g1_family
         ),
         "contract_margin_active_set": bool(
-            args.activation_aware_g1b or args.activation_aware_g1c
+            args.activation_aware_g1b or g1c_family
         ),
         "transaction_conformal_activation": bool(
-            args.activation_aware_g1b or args.activation_aware_g1c
+            args.activation_aware_g1b or g1c_family
         ),
         "discriminative_conformal_activation": bool(
-            args.activation_aware_g1c
+            g1c_family
         ),
         "fixed_guard_shadow_candidate_acceptance": bool(
-            args.activation_aware_g1c
+            g1c_family
         ),
-        "adapter_incumbent_lock": bool(args.activation_aware_g1c),
+        "adapter_incumbent_lock": bool(g1c_family),
         "activation_severity_source": (
             "train_single_cross_leave_one_transaction_out_mahalanobis"
-            if args.activation_aware_g1c
+            if g1c_family
             else
             "train_single_leave_one_transaction_out_mahalanobis"
             if args.activation_aware_g1b
@@ -3292,14 +4048,16 @@ def run(args):
             else None
         ),
         "correction_guard_proxy_source": (
-            "per_case_physical_stage_relative_signed_margins"
+            "complete_transaction_fixed_guard_shadow_gradient"
+            if args.activation_aware_g1d
+            else "per_case_physical_stage_relative_signed_margins"
             if args.activation_aware_g1c
             else "observable_refiner_objective_same_source_signed_margins"
             if g1_family else None
         ),
         "candidate_fixed_guard_shadow_source": (
             "complete_transaction_exact_fixed_guard_details"
-            if args.activation_aware_g1c else None
+            if g1c_family else None
         ),
         "guard_proxy_acceptance_contract": (
             "candidate_signed_margin_le_numeric_tolerance"
@@ -3307,18 +4065,18 @@ def run(args):
         ),
         "fixed_guard_shadow_acceptance_contract": (
             "full_transaction_fixed_guard_shadow_le_zero"
-            if args.activation_aware_g1c else None
+            if g1c_family else None
         ),
         "guard_active_set_science_feasibility_projection": bool(
-            args.activation_aware_g1b or args.activation_aware_g1c
+            args.activation_aware_g1b or g1c_family
         ),
         "correction_temporal_regularizer": (
             "owned_tangent_second_plus_third_difference_l2"
-            if (args.activation_aware_g1b or args.activation_aware_g1c)
+            if (args.activation_aware_g1b or g1c_family)
             else None
         ),
         "complete_fixed_guard_used_for_candidate_selection": bool(
-            args.activation_aware_g1c
+            g1c_family
         ),
         "complete_fixed_guard_used_for_final_acceptance": True,
         "inference_role_label_consumed": False,
@@ -3327,7 +4085,35 @@ def run(args):
         "inference_hidden_clean_consumed": False,
         "activation_inference_group_label_consumed": False,
         "fixed_guard_shadow_frozen_group_contract_consumed": bool(
-            args.activation_aware_g1c
+            g1c_family
+        ),
+        "full_transaction_shadow_gradient_repair": bool(
+            args.activation_aware_g1d
+        ),
+        "full_shadow_hard_acceptance_smooth_gradient": bool(
+            args.activation_aware_g1d
+        ),
+        "full_shadow_group_gradient_relaxation": (
+            "logsumexp"
+            if args.activation_aware_g1d else None
+        ),
+        "full_shadow_p95_active_index_frozen_within_line_search": bool(
+            args.activation_aware_g1d
+        ),
+        "train_frozen_full_shadow_repair_contract": (
+            str(train_shadow_contract_path)
+            if train_shadow_contract_path is not None else None
+        ),
+        "train_frozen_full_shadow_repair_contract_sha256": (
+            _file_sha256(train_shadow_contract_path)
+            if train_shadow_contract_path is not None else None
+        ),
+        "repair_parameter_calibration_split": (
+            "train" if args.activation_aware_g1d else None
+        ),
+        "held_out_validation_parameter_selection": False,
+        "held_out_validation_evaluation_passes": (
+            1 if args.activation_aware_g1d else None
         ),
         "activation_aware_summary": activation_summary,
         "activation_aware_supported": activation_aware_supported,
@@ -3359,7 +4145,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g1c_fixed_guard_shadow_complete"
+            "v15_15g1d_full_transaction_shadow_gradient_complete"
+            if args.activation_aware_g1d
+            else "v15_15g1c_fixed_guard_shadow_complete"
             if args.activation_aware_g1c
             else "v15_15g1b_contract_margin_conformal_complete"
             if args.activation_aware_g1b
@@ -3394,6 +4182,7 @@ def main():
     parser.add_argument("--activation-aware-g1", action="store_true")
     parser.add_argument("--activation-aware-g1b", action="store_true")
     parser.add_argument("--activation-aware-g1c", action="store_true")
+    parser.add_argument("--activation-aware-g1d", action="store_true")
     parser.add_argument(
         "--activation-proxy-tolerance", type=float, default=1.0e-6
     )
@@ -3439,6 +4228,21 @@ def main():
     parser.add_argument(
         "--guard-safe-interior-margin", type=float, default=1.0e-6
     )
+    parser.add_argument(
+        "--full-shadow-lse-allowance-fraction",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--full-shadow-lse-temperature-floor",
+        type=float,
+        default=1.0e-8,
+    )
+    parser.add_argument(
+        "--full-shadow-projection-damping",
+        type=float,
+        default=1.0e-12,
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -3463,15 +4267,17 @@ def main():
         args.activation_aware_g1,
         args.activation_aware_g1b,
         args.activation_aware_g1c,
+        args.activation_aware_g1d,
     ))) > 1:
         parser.error("choose one activation-aware protocol")
     if (
         args.activation_aware_g1
         or args.activation_aware_g1b
         or args.activation_aware_g1c
+        or args.activation_aware_g1d
     ) and not args.train_teacher_bank:
         parser.error(
-            "--activation-aware-g1/g1b/g1c requires --train-teacher-bank"
+            "--activation-aware-g1/g1b/g1c/g1d requires --train-teacher-bank"
         )
     if args.severity_envelope_margin_fraction < 0.0:
         parser.error("severity envelope margin fraction must be non-negative")
@@ -3495,6 +4301,12 @@ def main():
         parser.error("guard minimum reduction must be non-negative")
     if args.guard_safe_interior_margin < 0.0:
         parser.error("guard safe interior margin must be non-negative")
+    if args.full_shadow_lse_allowance_fraction <= 0.0:
+        parser.error("full-shadow LSE allowance fraction must be positive")
+    if args.full_shadow_lse_temperature_floor <= 0.0:
+        parser.error("full-shadow LSE temperature floor must be positive")
+    if args.full_shadow_projection_damping < 0.0:
+        parser.error("full-shadow projection damping must be non-negative")
     if not 0.0 < args.activation_relative_improvement < 1.0:
         parser.error(
             "--activation-relative-improvement must be in (0, 1)"
