@@ -11,6 +11,11 @@ controls, then selects among Adapter, Euclidean and Riemannian candidates only
 when the Anchor lies outside that envelope.  Five differentiable signed-margin
 terms from the fixed-Guard metric implementation prevent jerk/window/boundary
 regression. Offline role/group metadata is attached only after selection.
+
+V15.15g1b interprets those fields directly as contract signed margins, uses a
+Guard-first projected active set, and calibrates a multivariate observable
+severity score by leaving out each train transaction.  Its uncertainty band
+falls back to identity.  The correction budgets and starts remain unchanged.
 """
 from __future__ import annotations
 
@@ -39,6 +44,9 @@ ACTIVATION_AWARE_SCHEMA = (
 )
 G1_SCHEMA = (
     "refiner_v15_15g1_observable_severity_guard_aligned_correction_v1"
+)
+G1B_SCHEMA = (
+    "refiner_v15_15g1b_contract_margin_transaction_conformal_repair_v1"
 )
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
 TEACHER_SCHEMA = adapter.V15_15E_TEACHER_SCHEMA
@@ -313,6 +321,158 @@ def _severity_status(sample, envelope, scale_floor):
     }
 
 
+def _fit_multivariate_severity_model(rows, shrinkage, scale_floor):
+    matrix = m.torch.tensor(
+        [[row[key] for key in G1_SEVERITY_CHANNELS] for row in rows],
+        dtype=m.torch.float64,
+    )
+    if matrix.shape[0] < 2:
+        raise RuntimeError("multivariate severity model needs two controls")
+    center = matrix.median(dim=0).values
+    absolute_deviation = (matrix - center).abs().median(dim=0).values
+    mad_scale = 1.4826 * absolute_deviation
+    standard_scale = matrix.std(dim=0, unbiased=False)
+    scale = m.torch.where(
+        mad_scale > float(scale_floor),
+        mad_scale,
+        standard_scale.clamp_min(float(scale_floor)),
+    )
+    standardized = (matrix - center) / scale
+    covariance = (
+        standardized.transpose(0, 1) @ standardized
+        / float(max(1, matrix.shape[0] - 1))
+    )
+    dimension = covariance.shape[0]
+    covariance = (
+        (1.0 - float(shrinkage)) * covariance
+        + float(shrinkage)
+        * m.torch.eye(dimension, dtype=m.torch.float64)
+    )
+    precision = m.torch.linalg.pinv(covariance, hermitian=True)
+    if not bool(m.torch.isfinite(precision).all()):
+        raise RuntimeError("nonfinite multivariate severity precision")
+    return {
+        "center": center.tolist(),
+        "scale": scale.tolist(),
+        "precision": precision.tolist(),
+        "shrinkage": float(shrinkage),
+        "scale_floor": float(scale_floor),
+        "sample_count": int(matrix.shape[0]),
+    }
+
+
+def _multivariate_severity_score(values, model):
+    vector = m.torch.tensor(
+        [values[key] for key in G1_SEVERITY_CHANNELS],
+        dtype=m.torch.float64,
+    )
+    center = m.torch.tensor(model["center"], dtype=m.torch.float64)
+    scale = m.torch.tensor(model["scale"], dtype=m.torch.float64)
+    precision = m.torch.tensor(
+        model["precision"], dtype=m.torch.float64
+    )
+    standardized = (vector - center) / scale
+    squared = standardized @ precision @ standardized
+    return math.sqrt(max(0.0, float(squared)))
+
+
+def _freeze_transaction_conformal_envelope(
+    train_teacher,
+    *,
+    shrinkage,
+    scale_floor,
+    uncertainty_fraction,
+    absolute_margin,
+):
+    controls = [
+        sample for sample in train_teacher["samples"]
+        if sample.get("teacher_kind") == "identity_control"
+    ]
+    by_transaction = {}
+    rows_by_uid = {}
+    for sample in controls:
+        uid = str(sample["case_uid"])
+        transaction_id = str(sample["transaction_id"])
+        severity = _observable_severity(sample)
+        rows_by_uid[uid] = severity
+        by_transaction.setdefault(transaction_id, []).append((uid, severity))
+    if len(by_transaction) < 2:
+        raise RuntimeError(
+            "transaction-conformal envelope needs two train transactions"
+        )
+    fold_scores = {}
+    fold_maxima = {}
+    for held_out_transaction, held_out_rows in by_transaction.items():
+        fitting_rows = [
+            severity
+            for transaction_id, transaction_rows in by_transaction.items()
+            if transaction_id != held_out_transaction
+            for _, severity in transaction_rows
+        ]
+        model = _fit_multivariate_severity_model(
+            fitting_rows,
+            shrinkage,
+            scale_floor,
+        )
+        scores = {
+            uid: _multivariate_severity_score(severity, model)
+            for uid, severity in held_out_rows
+        }
+        fold_scores[held_out_transaction] = scores
+        fold_maxima[held_out_transaction] = max(scores.values())
+    conformal_threshold = max(fold_maxima.values())
+    activation_threshold = max(
+        conformal_threshold * (1.0 + float(uncertainty_fraction)),
+        conformal_threshold + float(absolute_margin),
+    )
+    final_model = _fit_multivariate_severity_model(
+        list(rows_by_uid.values()),
+        shrinkage,
+        scale_floor,
+    )
+    return {
+        "schema": (
+            "refiner_v15_15g1b_transaction_conformal_single_envelope_v1"
+        ),
+        "calibration_split": "train",
+        "calibration_role": "identity_control",
+        "calibration_role_used_offline_only": True,
+        "inference_role_label_consumed": False,
+        "channels": list(G1_SEVERITY_CHANNELS),
+        "control_count": len(controls),
+        "transaction_count": len(by_transaction),
+        "leave_one_transaction_out": True,
+        "fold_score_by_case": fold_scores,
+        "fold_maximum_score": fold_maxima,
+        "conformal_threshold": conformal_threshold,
+        "activation_threshold": activation_threshold,
+        "uncertainty_fraction": float(uncertainty_fraction),
+        "absolute_margin": float(absolute_margin),
+        "final_model": final_model,
+    }
+
+
+def _conformal_severity_status(sample, envelope):
+    values = _observable_severity(sample)
+    score = _multivariate_severity_score(values, envelope["final_model"])
+    conformal_threshold = float(envelope["conformal_threshold"])
+    activation_threshold = float(envelope["activation_threshold"])
+    abstained = bool(
+        conformal_threshold < score <= activation_threshold
+    )
+    return {
+        "values": values,
+        "severity_conformal_score": score,
+        "severity_conformal_threshold": conformal_threshold,
+        "severity_activation_threshold": activation_threshold,
+        "severity_abstained": abstained,
+        "conformal_fallback": abstained,
+        "outside_frozen_single_envelope": bool(
+            score > activation_threshold
+        ),
+    }
+
+
 def _guard_proxy_values(batch, cfg, baseline, candidate, case_index):
     _, terms = m._observable_refiner_objective(
         candidate,
@@ -392,6 +552,159 @@ def _guard_aligned_correction_objective(
     return loss, diagnostics
 
 
+def _tangent_temporal_smoothness(tangent, mask):
+    """Penalize local high-frequency correction without changing the Guard."""
+    scoped = tangent.masked_fill(~mask, 0.0)
+    frame_active = mask.any(dim=-1)
+    penalties = []
+    if scoped.shape[1] >= 3:
+        second = scoped[:, 2:] - 2.0 * scoped[:, 1:-1] + scoped[:, :-2]
+        valid = (
+            frame_active[:, 2:]
+            & frame_active[:, 1:-1]
+            & frame_active[:, :-2]
+        )
+        if bool(valid.any()):
+            penalties.append(second[valid].square().mean())
+    if scoped.shape[1] >= 4:
+        third = (
+            scoped[:, 3:]
+            - 3.0 * scoped[:, 2:-1]
+            + 3.0 * scoped[:, 1:-2]
+            - scoped[:, :-3]
+        )
+        valid = (
+            frame_active[:, 3:]
+            & frame_active[:, 2:-1]
+            & frame_active[:, 1:-2]
+            & frame_active[:, :-3]
+        )
+        if bool(valid.any()):
+            penalties.append(third[valid].square().mean())
+    if not penalties:
+        return scoped.square().sum() * 0.0
+    return m.torch.stack(penalties).sum()
+
+
+def _contract_margin_active_set_objective(
+    batch,
+    cfg,
+    baseline,
+    candidate,
+    case_index,
+    baseline_case,
+    tangent,
+    mask,
+    tolerance,
+    smooth_max_temperature,
+    temporal_smoothness_weight,
+):
+    """Use absolute contract margins, with Guard-first lexicographic repair."""
+    _, terms = m._observable_refiner_objective(
+        candidate,
+        baseline.detach(),
+        batch["seam"],
+        cfg,
+        reduction="none",
+    )
+    index = int(case_index)
+    scientific_deficits = {
+        "endpoint_scientific_deficit": terms[
+            "endpoint_scientific_deficit"
+        ][index],
+        "temporal_scientific_deficit": terms[
+            "temporal_scientific_deficit"
+        ][index],
+    }
+    candidate_proxy = {
+        name: terms[key][index]
+        for name, key in G1_GUARD_PROXY_TERMS.items()
+    }
+    proxy_vector = m.torch.stack(list(candidate_proxy.values()))
+    positive = m.torch.relu(proxy_vector - float(tolerance))
+    maximum_positive = m.torch.relu(proxy_vector).amax()
+    guard_active = bool(float(positive.amax().detach()) > 0.0)
+    temperature = float(smooth_max_temperature)
+    smooth_guard_violation = temperature * m.torch.logsumexp(
+        positive / temperature,
+        dim=0,
+    )
+    case_terms = oracle.case_probe._case_terms(candidate, batch, cfg)
+    candidate_case_tensors = {
+        key: case_terms[key][index] for key in ("endpoint", "temporal")
+    }
+    candidate_case = {
+        key: float(value.detach())
+        for key, value in candidate_case_tensors.items()
+    }
+    scientific = oracle._case_scientific_status(
+        candidate_case,
+        baseline_case,
+    )
+    smoothness = _tangent_temporal_smoothness(tangent, mask)
+    if guard_active:
+        loss = (
+            smooth_guard_violation
+            + float(temporal_smoothness_weight) * smoothness
+        )
+        primary_objective = "guard_violation"
+    else:
+        loss = m.torch.stack(list(scientific_deficits.values())).sum()
+        primary_objective = "endpoint_temporal"
+    diagnostics = {
+        "primary_objective": primary_objective,
+        "candidate_guard_signed_margin_by_term": {
+            key: float(value.detach())
+            for key, value in candidate_proxy.items()
+        },
+        "maximum_positive_guard_signed_margin": float(
+            maximum_positive.detach()
+        ),
+        "smooth_guard_violation": float(smooth_guard_violation.detach()),
+        "temporal_smoothness": float(smoothness.detach()),
+        "endpoint_delta": scientific["endpoint_delta"],
+        "temporal_delta": scientific["temporal_delta"],
+        "scientific_passed": bool(scientific["passed"]),
+        "scientific_numeric_tolerance": scientific.get(
+            "numeric_tolerance", {}
+        ),
+    }
+    return loss, diagnostics, candidate_case_tensors
+
+
+def _project_guard_direction(
+    direction,
+    *,
+    current,
+    mask,
+    feasibility_gradients,
+):
+    """Project a Guard descent direction onto radius/science tangent cones."""
+    result = direction.masked_fill(~mask, 0.0)
+    radial = current.detach().masked_fill(~mask, 0.0)
+    constraints = [
+        gradient.detach().masked_fill(~mask, 0.0)
+        for gradient in feasibility_gradients
+        if gradient is not None
+    ]
+    # Two alternating passes keep the radial and feasibility projections
+    # consistent without changing the fixed 2/3/5 correction budget.
+    for _ in range(2):
+        radial_norm = radial[mask].square().sum().clamp_min(1.0e-20)
+        radial_dot = (result[mask] * radial[mask]).sum()
+        result = result - (radial_dot / radial_norm) * radial
+        for gradient in constraints:
+            directional_change = (result[mask] * gradient[mask]).sum()
+            if float(directional_change.detach()) > 0.0:
+                denominator = gradient[mask].square().sum().clamp_min(
+                    1.0e-20
+                )
+                result = result - (
+                    directional_change / denominator
+                ) * gradient
+    return result.masked_fill(~mask, 0.0)
+
+
 def _bounded_direction(direction, mask, maximum_rms):
     masked = direction.masked_fill(~mask, 0.0)
     active = masked[mask]
@@ -422,8 +735,12 @@ def _correct_case(
     trust_fraction,
     activation_aware=False,
     guard_aligned=False,
+    contract_margin_active_set=False,
     guard_proxy_tolerance=1.0e-6,
     guard_proxy_scale_floor=1.0e-6,
+    guard_smooth_max_temperature=1.0e-3,
+    correction_temporal_smoothness_weight=0.05,
+    guard_minimum_reduction=1.0e-12,
 ):
     mask = _owned_case_mask(ownership, initial_tangent, case_index)
     current, normalized = _normalize_exact_radius(
@@ -471,7 +788,25 @@ def _correct_case(
         else:
             raise ValueError(f"unsupported correction method: {method}")
 
-        if guard_aligned:
+        science_tensors = None
+        if contract_margin_active_set:
+            total_tangent = product_log_torch(baseline, candidate)
+            loss, constraints, science_tensors = (
+                _contract_margin_active_set_objective(
+                    batch,
+                    cfg,
+                    baseline,
+                    candidate,
+                    case_index,
+                    baseline_case,
+                    total_tangent,
+                    mask,
+                    guard_proxy_tolerance,
+                    guard_smooth_max_temperature,
+                    correction_temporal_smoothness_weight,
+                )
+            )
+        elif guard_aligned:
             loss, constraints = _guard_aligned_correction_objective(
                 batch,
                 cfg,
@@ -504,13 +839,38 @@ def _correct_case(
                 contract,
             )
         gradient = m.torch.autograd.grad(
-            loss, variable, allow_unused=True
+            loss,
+            variable,
+            allow_unused=True,
+            retain_graph=bool(
+                contract_margin_active_set
+                and constraints["primary_objective"] == "guard_violation"
+            ),
         )[0]
         if gradient is None or not bool(m.torch.isfinite(gradient).all()):
             numeric_failure = True
             break
+        raw_direction = -gradient.detach()
+        if (
+            contract_margin_active_set
+            and constraints["primary_objective"] == "guard_violation"
+        ):
+            feasibility_gradients = []
+            for position, key in enumerate(("endpoint", "temporal")):
+                feasibility_gradients.append(m.torch.autograd.grad(
+                    science_tensors[key],
+                    variable,
+                    allow_unused=True,
+                    retain_graph=position == 0,
+                )[0])
+            raw_direction = _project_guard_direction(
+                raw_direction,
+                current=current,
+                mask=mask,
+                feasibility_gradients=feasibility_gradients,
+            )
         direction, usable = _bounded_direction(
-            -gradient.detach(),
+            raw_direction,
             mask,
             float(target_rms) * float(trust_fraction),
         )
@@ -528,6 +888,8 @@ def _correct_case(
         accepted_loss = float(loss.detach())
         accepted_scale = 0.0
         accepted_tangent = current
+        accepted_constraints = constraints
+        accepted_guard_margin_reduction = 0.0
         for backtrack in range(6):
             alpha = float(step_size) * (0.5 ** backtrack)
             if method == "euclidean_projected":
@@ -543,7 +905,26 @@ def _correct_case(
             if not trial_ok:
                 continue
             trial_candidate = product_exp_torch(baseline, trial)
-            if guard_aligned:
+            trial_outside_scope_abs_max = float(
+                trial.masked_fill(mask, 0.0).abs().amax().detach()
+            )
+            if contract_margin_active_set:
+                trial_loss, trial_constraints, _ = (
+                    _contract_margin_active_set_objective(
+                        batch,
+                        cfg,
+                        baseline,
+                        trial_candidate,
+                        case_index,
+                        baseline_case,
+                        trial,
+                        mask,
+                        guard_proxy_tolerance,
+                        guard_smooth_max_temperature,
+                        correction_temporal_smoothness_weight,
+                    )
+                )
+            elif guard_aligned:
                 trial_loss, _ = _guard_aligned_correction_objective(
                     batch,
                     cfg,
@@ -575,15 +956,54 @@ def _correct_case(
                     baseline_case,
                     contract,
                 )
-            if (
-                bool(m.torch.isfinite(trial_loss))
-                and float(trial_loss.detach())
-                <= float(loss.detach()) + 1.0e-12
-            ):
+            if contract_margin_active_set:
+                current_margin = float(
+                    constraints["maximum_positive_guard_signed_margin"]
+                )
+                trial_margin = float(
+                    trial_constraints[
+                        "maximum_positive_guard_signed_margin"
+                    ]
+                )
+                if constraints["primary_objective"] == "guard_violation":
+                    guard_improved = bool(
+                        trial_margin
+                        <= current_margin - float(guard_minimum_reduction)
+                    )
+                    accept_trial = bool(
+                        bool(m.torch.isfinite(trial_loss))
+                        and trial_constraints["scientific_passed"]
+                        and guard_improved
+                        and trial_outside_scope_abs_max == 0.0
+                    )
+                else:
+                    guard_improved = bool(
+                        trial_margin <= float(guard_proxy_tolerance)
+                    )
+                    accept_trial = bool(
+                        bool(m.torch.isfinite(trial_loss))
+                        and trial_constraints["scientific_passed"]
+                        and guard_improved
+                        and trial_outside_scope_abs_max == 0.0
+                        and float(trial_loss.detach())
+                        <= float(loss.detach()) + 1.0e-12
+                    )
+            else:
+                accept_trial = bool(
+                    bool(m.torch.isfinite(trial_loss))
+                    and float(trial_loss.detach())
+                    <= float(loss.detach()) + 1.0e-12
+                )
+            if accept_trial:
                 accepted = True
                 accepted_loss = float(trial_loss.detach())
                 accepted_scale = alpha
                 accepted_tangent = trial.detach()
+                if contract_margin_active_set:
+                    accepted_constraints = trial_constraints
+                    accepted_guard_margin_reduction = (
+                        current_margin - trial_margin
+                    )
                 break
         history.append({
             "iteration": iteration,
@@ -592,23 +1012,44 @@ def _correct_case(
             "accepted": accepted,
             "step_scale": accepted_scale,
             "constraints": constraints,
+            "accepted_constraints": accepted_constraints,
+            "accepted_guard_margin_reduction": (
+                accepted_guard_margin_reduction
+            ),
+            "outside_scope_abs_max": (
+                0.0 if accepted else None
+            ),
             "exact_radius_rms": _rms(accepted_tangent, mask),
         })
         if not accepted:
             break
         current = accepted_tangent
 
+    accepted_steps = sum(int(row["accepted"]) for row in history)
+    total_guard_margin_reduction = sum(
+        float(row.get("accepted_guard_margin_reduction", 0.0))
+        for row in history
+    )
     return current.detach(), {
         "method": method,
         "steps_requested": int(steps),
         "steps_completed": len(history),
-        "accepted_steps": sum(int(row["accepted"]) for row in history),
+        "accepted_steps": accepted_steps,
+        "correction_accepted_steps": accepted_steps,
+        "accepted_guard_margin_reduction": total_guard_margin_reduction,
         "numeric_failure": numeric_failure,
         "zero_adapter_start": zero_start,
         "role_or_group_consumed_by_correction": bool(
             not activation_aware and not guard_aligned
         ),
         "guard_aligned_correction": bool(guard_aligned),
+        "contract_margin_active_set": bool(contract_margin_active_set),
+        "scientific_feasibility_projection": bool(
+            contract_margin_active_set
+        ),
+        "tangent_second_third_difference_regularization": bool(
+            contract_margin_active_set
+        ),
         "final_exact_radius_rms": _rms(current, mask),
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
@@ -1042,6 +1483,264 @@ def _g1_observable_guard_selection(
     return selected, decisions, dict(method_counts)
 
 
+def _g1b_contract_margin_selection(
+    *,
+    variants,
+    correction_reports,
+    samples,
+    domains,
+    ownership,
+    baseline_terms,
+    cfg,
+    target_rms,
+    severity_envelope,
+    guard_proxy_tolerance,
+    guard_safe_interior_margin,
+):
+    """Select with absolute Guard margins and a conformal identity fallback."""
+    selected = m.torch.zeros_like(next(iter(variants.values())))
+    decisions = {}
+    method_counts = Counter()
+    for sample in samples:
+        uid = str(sample.get("case_uid", sample["case_index"]))
+        problem = _sample_problem(sample, domains, ownership)
+        case_index = problem["global_case_index"]
+        severity = _conformal_severity_status(sample, severity_envelope)
+        baseline_case = {
+            key: float(baseline_terms[key][case_index].detach())
+            for key in ("endpoint", "temporal")
+        }
+        candidates = {}
+        eligible = []
+        for method, tangent in variants.items():
+            local = tangent[case_index:case_index + 1]
+            mask = problem["ownership"].expand_as(local)
+            outside = local.masked_fill(mask, 0.0)
+            outside_scope_abs_max = (
+                float(outside.abs().amax().detach())
+                if outside.numel() else 0.0
+            )
+            scoped = local.masked_fill(~mask, 0.0)
+            active_rms = _rms(scoped, mask)
+            radius_resolved = bool(
+                math.isfinite(active_rms)
+                and abs(active_rms - float(target_rms))
+                <= max(1.0e-12, float(target_rms) * 1.0e-6)
+            )
+            candidate = product_exp_torch(problem["baseline"], scoped)
+            candidate_proxy = _guard_proxy_values(
+                problem["batch"],
+                cfg,
+                problem["baseline"],
+                candidate,
+                0,
+            )
+            signed_margins = {
+                name: float(value.detach())
+                for name, value in candidate_proxy.items()
+            }
+            maximum_signed_margin = max(signed_margins.values())
+            maximum_positive_margin = max(0.0, maximum_signed_margin)
+            proxy_passed = all(
+                value <= float(guard_proxy_tolerance)
+                for value in signed_margins.values()
+            )
+            case_terms = oracle.case_probe._case_terms(
+                candidate,
+                problem["batch"],
+                cfg,
+            )
+            candidate_case = {
+                key: float(case_terms[key][0].detach())
+                for key in ("endpoint", "temporal")
+            }
+            scientific = oracle._case_scientific_status(
+                candidate_case,
+                baseline_case,
+            )
+            scientific_score = sum(
+                float(scientific[f"{key}_delta"])
+                / max(abs(float(baseline_case[key])), 1.0e-12)
+                for key in ("endpoint", "temporal")
+            )
+            correction = correction_reports.get(method, {}).get(uid, {})
+            numeric_failure = bool(
+                correction.get("numeric_failure", False)
+            )
+            accepted = bool(
+                severity["outside_frozen_single_envelope"]
+                and not severity["severity_abstained"]
+                and scientific["passed"]
+                and proxy_passed
+                and radius_resolved
+                and outside_scope_abs_max == 0.0
+                and math.isfinite(scientific_score)
+                and not numeric_failure
+            )
+            safe_interior = bool(
+                maximum_signed_margin
+                <= -float(guard_safe_interior_margin)
+            )
+            candidates[method] = {
+                "objective": scientific_score,
+                "scientific_descent_score": scientific_score,
+                "severity_gate_passed": bool(
+                    severity["outside_frozen_single_envelope"]
+                ),
+                "severity_abstained": bool(
+                    severity["severity_abstained"]
+                ),
+                "guard_proxy_nonregression": proxy_passed,
+                "proxy_passed": proxy_passed,
+                "candidate_guard_signed_margin_by_term": signed_margins,
+                "maximum_positive_guard_signed_margin": (
+                    maximum_positive_margin
+                ),
+                "maximum_guard_signed_margin": maximum_signed_margin,
+                "guard_safe_interior": safe_interior,
+                "endpoint_delta": scientific["endpoint_delta"],
+                "temporal_delta": scientific["temporal_delta"],
+                "scientific_numeric_tolerance": scientific.get(
+                    "numeric_tolerance", {}
+                ),
+                "scientific_passed": bool(scientific["passed"]),
+                "radius_rms": active_rms,
+                "radius_equality_resolved": radius_resolved,
+                "outside_scope_abs_max": outside_scope_abs_max,
+                "scope_safe": outside_scope_abs_max == 0.0,
+                "numeric_failure": numeric_failure,
+                "accepted_guard_margin_reduction": float(
+                    correction.get("accepted_guard_margin_reduction", 0.0)
+                ),
+                "correction_accepted_steps": int(
+                    correction.get("correction_accepted_steps", 0)
+                ),
+                "eligible": accepted,
+                "eligible_after_adapter_incumbent": accepted,
+            }
+            if accepted:
+                if safe_interior:
+                    rank = (0, scientific_score, maximum_signed_margin, method)
+                else:
+                    rank = (1, maximum_signed_margin, scientific_score, method)
+                eligible.append((rank, method, scoped))
+
+        adapter_candidate = candidates.get("adapter")
+        if adapter_candidate and adapter_candidate["eligible"]:
+            retained = []
+            for row in eligible:
+                method = row[1]
+                candidate = candidates[method]
+                both_safely_interior = bool(
+                    adapter_candidate["guard_safe_interior"]
+                    and candidate["guard_safe_interior"]
+                )
+                if both_safely_interior:
+                    guard_dominates_adapter = True
+                    science_dominates_adapter = bool(
+                        candidate["scientific_descent_score"]
+                        <= adapter_candidate["scientific_descent_score"]
+                        + 1.0e-12
+                    )
+                    dominance_protocol = (
+                        "safe_interior_guard_equivalence_then_science"
+                    )
+                else:
+                    guard_dominates_adapter = all(
+                        candidate[
+                            "candidate_guard_signed_margin_by_term"
+                        ][name]
+                        <= adapter_candidate[
+                            "candidate_guard_signed_margin_by_term"
+                        ][name] + float(guard_proxy_tolerance)
+                        for name in G1_GUARD_PROXY_TERMS
+                    )
+                    endpoint_tolerance = float(
+                        adapter_candidate["scientific_numeric_tolerance"].get(
+                            "endpoint", 1.0e-12
+                        )
+                    )
+                    temporal_tolerance = float(
+                        adapter_candidate["scientific_numeric_tolerance"].get(
+                            "temporal", 1.0e-12
+                        )
+                    )
+                    science_dominates_adapter = bool(
+                        candidate["endpoint_delta"]
+                        <= adapter_candidate["endpoint_delta"]
+                        + endpoint_tolerance
+                        and candidate["temporal_delta"]
+                        <= adapter_candidate["temporal_delta"]
+                        + temporal_tolerance
+                    )
+                    dominance_protocol = "guard_and_science_pareto"
+                incumbent_safe = bool(
+                    method == "adapter"
+                    or (
+                        guard_dominates_adapter
+                        and science_dominates_adapter
+                    )
+                )
+                candidate["guard_dominates_adapter"] = (
+                    guard_dominates_adapter
+                )
+                candidate["science_dominates_adapter"] = (
+                    science_dominates_adapter
+                )
+                candidate["adapter_dominance_protocol"] = (
+                    dominance_protocol
+                )
+                candidate["eligible_after_adapter_incumbent"] = (
+                    incumbent_safe
+                )
+                if incumbent_safe:
+                    retained.append(row)
+            eligible = retained
+
+        if eligible:
+            _, selected_method, selected_tangent = min(
+                eligible,
+                key=lambda row: row[0],
+            )
+            selected[case_index:case_index + 1] = selected_tangent
+        else:
+            selected_method = "identity"
+        conformal_fallback = bool(
+            severity["severity_abstained"]
+            and selected_method == "identity"
+        )
+        method_counts.update([selected_method])
+        decisions[uid] = {
+            "selected_method": selected_method,
+            "selected_nonzero": bool(selected_method != "identity"),
+            "conformal_fallback": conformal_fallback,
+            "selection": {
+                "anchor_severity": severity,
+                "severity_conformal_score": severity[
+                    "severity_conformal_score"
+                ],
+                "severity_conformal_threshold": severity[
+                    "severity_conformal_threshold"
+                ],
+                "severity_abstained": severity["severity_abstained"],
+                "activation_condition": (
+                    "train_transaction_conformal_score_above_"
+                    "frozen_uncertainty_band"
+                ),
+                "guard_proxy_terms": dict(G1_GUARD_PROXY_TERMS),
+                "guard_proxy_contract": (
+                    "candidate_signed_margin_le_numeric_tolerance"
+                ),
+                "candidates": candidates,
+            },
+            "evaluation_only": {
+                "teacher_kind": sample.get("teacher_kind"),
+                "audit_group": sample.get("audit_group"),
+            },
+        }
+    return selected, decisions, dict(method_counts)
+
+
 def _variant_summary(audits, correction_reports, elapsed):
     raw_by_group = Counter()
     projected_by_group = Counter()
@@ -1068,8 +1767,11 @@ def _variant_summary(audits, correction_reports, elapsed):
 
 def run(args):
     started = time.perf_counter()
+    g1_family = bool(
+        args.activation_aware_g1 or args.activation_aware_g1b
+    )
     activation_enabled = bool(
-        args.activation_aware or args.activation_aware_g1
+        args.activation_aware or g1_family
     )
     destination = Path(args.output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=False)
@@ -1093,19 +1795,21 @@ def run(args):
     severity_envelope = None
     severity_envelope_path = None
     train_teacher_path = None
-    if args.activation_aware_g1:
+    if g1_family:
         if not args.train_teacher_bank:
-            raise RuntimeError("V15.15g1 requires --train-teacher-bank")
+            raise RuntimeError("V15.15g1/g1b requires --train-teacher-bank")
         train_teacher_path = Path(args.train_teacher_bank).resolve()
         train_teacher = m.torch.load(
             train_teacher_path, map_location="cpu", weights_only=False
         )
         if train_teacher.get("schema") != TEACHER_SCHEMA:
-            raise RuntimeError("V15.15g1 train bank schema mismatch")
+            raise RuntimeError("V15.15g1/g1b train bank schema mismatch")
         if train_teacher.get("split") != "train":
-            raise RuntimeError("V15.15g1 envelope bank must be train split")
+            raise RuntimeError(
+                "V15.15g1/g1b envelope bank must be train split"
+            )
         if not train_teacher.get("teacher_bank_ready"):
-            raise RuntimeError("V15.15g1 train bank is not ready")
+            raise RuntimeError("V15.15g1/g1b train bank is not ready")
         if train_teacher.get("source_diagnostic") != teacher.get(
             "source_diagnostic"
         ):
@@ -1116,11 +1820,28 @@ def run(args):
         ):
             if train_teacher.get(key) != teacher.get(key):
                 raise RuntimeError(f"train/validation {key} mismatch")
-        severity_envelope = _freeze_single_severity_envelope(
-            train_teacher,
-            margin_fraction=float(args.severity_envelope_margin_fraction),
-            absolute_margin=float(args.severity_envelope_absolute_margin),
-        )
+        if args.activation_aware_g1b:
+            severity_envelope = _freeze_transaction_conformal_envelope(
+                train_teacher,
+                shrinkage=float(args.severity_conformal_shrinkage),
+                scale_floor=float(args.severity_scale_floor),
+                uncertainty_fraction=float(
+                    args.severity_conformal_uncertainty_fraction
+                ),
+                absolute_margin=float(
+                    args.severity_envelope_absolute_margin
+                ),
+            )
+        else:
+            severity_envelope = _freeze_single_severity_envelope(
+                train_teacher,
+                margin_fraction=float(
+                    args.severity_envelope_margin_fraction
+                ),
+                absolute_margin=float(
+                    args.severity_envelope_absolute_margin
+                ),
+            )
         severity_envelope.update({
             "train_teacher_bank": str(train_teacher_path),
             "train_teacher_bank_sha256": _file_sha256(train_teacher_path),
@@ -1131,8 +1852,10 @@ def run(args):
                 "split_manifest_content_sha256"
             ),
         })
-        severity_envelope_path = (
-            destination / "observable_severity_envelope.json"
+        severity_envelope_path = destination / (
+            "transaction_conformal_severity_envelope.json"
+            if args.activation_aware_g1b
+            else "observable_severity_envelope.json"
         )
         severity_envelope_path.write_text(
             json.dumps(severity_envelope, ensure_ascii=False, indent=2)
@@ -1236,7 +1959,12 @@ def run(args):
                         domain["batch"], local_case, local_case + 1
                     )
                     correction_case = 0
-                    baseline_case = None
+                    baseline_case = {
+                        key: float(
+                            baseline_terms[key][int(sample["case_index"])]
+                        )
+                        for key in ("endpoint", "temporal")
+                    }
                     local_contract = None
                 else:
                     group = str(sample["audit_group"])
@@ -1270,12 +1998,24 @@ def run(args):
                     step_size=float(args.step_size),
                     trust_fraction=float(args.trust_fraction),
                     activation_aware=activation_enabled,
-                    guard_aligned=bool(args.activation_aware_g1),
+                    guard_aligned=g1_family,
+                    contract_margin_active_set=bool(
+                        args.activation_aware_g1b
+                    ),
                     guard_proxy_tolerance=float(
                         args.guard_proxy_nonregression_tolerance
                     ),
                     guard_proxy_scale_floor=float(
                         args.guard_proxy_scale_floor
+                    ),
+                    guard_smooth_max_temperature=float(
+                        args.guard_smooth_max_temperature
+                    ),
+                    correction_temporal_smoothness_weight=float(
+                        args.correction_temporal_smoothness_weight
+                    ),
+                    guard_minimum_reduction=float(
+                        args.guard_minimum_reduction
                     ),
                 )
                 if activation_enabled:
@@ -1357,7 +2097,29 @@ def run(args):
     activation_aware_supported = False
     if activation_enabled:
         selection_started = time.perf_counter()
-        if args.activation_aware_g1:
+        if args.activation_aware_g1b:
+            (
+                selected_tangent,
+                activation_decisions,
+                selected_method_counts,
+            ) = _g1b_contract_margin_selection(
+                variants=variant_tangents,
+                correction_reports=variant_correction_reports,
+                samples=samples,
+                domains=domains,
+                ownership=ownership,
+                baseline_terms=baseline_terms,
+                cfg=cfg,
+                target_rms=float(args.target_rms),
+                severity_envelope=severity_envelope,
+                guard_proxy_tolerance=float(
+                    args.guard_proxy_nonregression_tolerance
+                ),
+                guard_safe_interior_margin=float(
+                    args.guard_safe_interior_margin
+                ),
+            )
+        elif args.activation_aware_g1:
             (
                 selected_tangent,
                 activation_decisions,
@@ -1481,7 +2243,7 @@ def run(args):
             ]
         )
         selected_proxy_nonregression_complete = bool(
-            not args.activation_aware_g1
+            not g1_family
             or all(
                 not decision["selected_nonzero"]
                 or decision["selection"]["candidates"][
@@ -1491,7 +2253,7 @@ def run(args):
             )
         )
         selected_severity_condition_complete = bool(
-            not args.activation_aware_g1
+            not g1_family
             or all(
                 not decision["selected_nonzero"]
                 or decision["selection"]["anchor_severity"][
@@ -1505,7 +2267,35 @@ def run(args):
             for reports in variant_correction_reports.values()
             for report in reports.values()
         )
-        if args.activation_aware_g1:
+        if args.activation_aware_g1b:
+            decision_numeric_complete = all(
+                math.isfinite(float(decision["selection"][
+                    "severity_conformal_score"
+                ]))
+                and math.isfinite(float(decision["selection"][
+                    "severity_conformal_threshold"
+                ]))
+                and all(
+                    math.isfinite(float(candidate["objective"]))
+                    and math.isfinite(float(candidate[
+                        "outside_scope_abs_max"
+                    ]))
+                    and math.isfinite(float(candidate[
+                        "maximum_positive_guard_signed_margin"
+                    ]))
+                    and all(
+                        math.isfinite(float(value))
+                        for value in candidate[
+                            "candidate_guard_signed_margin_by_term"
+                        ].values()
+                    )
+                    for candidate in decision["selection"][
+                        "candidates"
+                    ].values()
+                )
+                for decision in activation_decisions.values()
+            )
+        elif args.activation_aware_g1:
             decision_numeric_complete = all(
                 math.isfinite(float(decision["selection"][
                     "anchor_severity"
@@ -1576,7 +2366,12 @@ def run(args):
         )
         activation_summary = {
             "selection_protocol": (
-                "severity_then_guard_proxy_lexicographic_v1"
+                (
+                    "transaction_conformal_contract_margin_"
+                    "active_set_lexicographic_v1"
+                )
+                if args.activation_aware_g1b
+                else "severity_then_guard_proxy_lexicographic_v1"
                 if args.activation_aware_g1
                 else "identity_or_lowest_observable_anchor_objective_v1"
             ),
@@ -1584,10 +2379,10 @@ def run(args):
             "nonidentity_candidate_radius_rms": float(args.target_rms),
             "activation_proxy_tolerance": float(
                 args.activation_proxy_tolerance
-            ) if not args.activation_aware_g1 else None,
+            ) if not g1_family else None,
             "activation_relative_improvement": (
                 float(args.activation_relative_improvement)
-                if not args.activation_aware_g1 else None
+                if not g1_family else None
             ),
             "observable_severity_envelope": (
                 str(severity_envelope_path)
@@ -1598,22 +2393,55 @@ def run(args):
                 if severity_envelope_path is not None else None
             ),
             "severity_envelope_calibration_split": (
-                "train" if args.activation_aware_g1 else None
+                "train" if g1_family else None
             ),
             "severity_envelope_role_used_offline_only": bool(
-                args.activation_aware_g1
+                g1_family
             ),
             "guard_aligned_proxy_terms": (
                 dict(G1_GUARD_PROXY_TERMS)
-                if args.activation_aware_g1 else None
+                if g1_family else None
             ),
             "guard_proxy_nonregression_tolerance": (
                 float(args.guard_proxy_nonregression_tolerance)
-                if args.activation_aware_g1 else None
+                if g1_family else None
             ),
             "observable_severity_channels": (
                 list(G1_SEVERITY_CHANNELS)
-                if args.activation_aware_g1 else None
+                if g1_family else None
+            ),
+            "severity_calibration_protocol": (
+                "leave_one_train_transaction_out_mahalanobis_max"
+                if args.activation_aware_g1b else None
+            ),
+            "severity_conformal_threshold": (
+                severity_envelope.get("conformal_threshold")
+                if args.activation_aware_g1b else None
+            ),
+            "severity_activation_threshold": (
+                severity_envelope.get("activation_threshold")
+                if args.activation_aware_g1b else None
+            ),
+            "conformal_fallback_case_uids": sorted(
+                uid
+                for uid, decision in activation_decisions.items()
+                if decision.get("conformal_fallback", False)
+            ),
+            "guard_safe_interior_margin": (
+                float(args.guard_safe_interior_margin)
+                if args.activation_aware_g1b else None
+            ),
+            "guard_active_set_smooth_max_temperature": (
+                float(args.guard_smooth_max_temperature)
+                if args.activation_aware_g1b else None
+            ),
+            "correction_temporal_smoothness_weight": (
+                float(args.correction_temporal_smoothness_weight)
+                if args.activation_aware_g1b else None
+            ),
+            "correction_budget_unchanged": bool(
+                args.activation_aware_g1b
+                and budgets == (2, 3, 5)
             ),
             "activation_decision_role_label_consumed": False,
             "activation_decision_teacher_kind_consumed": False,
@@ -1683,7 +2511,9 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            G1_SCHEMA
+            G1B_SCHEMA
+            if args.activation_aware_g1b
+            else G1_SCHEMA
             if args.activation_aware_g1
             else ACTIVATION_AWARE_SCHEMA
             if args.activation_aware
@@ -1712,15 +2542,33 @@ def run(args):
         "pseudo_teachers_generated": False,
         "activation_aware": activation_enabled,
         "observable_severity_guard_aligned": bool(
-            args.activation_aware_g1
+            g1_family
+        ),
+        "contract_margin_active_set": bool(args.activation_aware_g1b),
+        "transaction_conformal_activation": bool(
+            args.activation_aware_g1b
         ),
         "activation_severity_source": (
-            "frozen_train_single_observable_envelope"
-            if args.activation_aware_g1 else None
+            "train_single_leave_one_transaction_out_mahalanobis"
+            if args.activation_aware_g1b
+            else "frozen_train_single_observable_envelope"
+            if args.activation_aware_g1
+            else None
         ),
         "correction_guard_proxy_source": (
             "observable_refiner_objective_same_source_signed_margins"
-            if args.activation_aware_g1 else None
+            if g1_family else None
+        ),
+        "guard_proxy_acceptance_contract": (
+            "candidate_signed_margin_le_numeric_tolerance"
+            if args.activation_aware_g1b else None
+        ),
+        "guard_active_set_science_feasibility_projection": bool(
+            args.activation_aware_g1b
+        ),
+        "correction_temporal_regularizer": (
+            "owned_tangent_second_plus_third_difference_l2"
+            if args.activation_aware_g1b else None
         ),
         "complete_fixed_guard_used_for_candidate_selection": False,
         "complete_fixed_guard_used_for_final_acceptance": True,
@@ -1758,7 +2606,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g1_observable_guard_aligned_complete"
+            "v15_15g1b_contract_margin_conformal_complete"
+            if args.activation_aware_g1b
+            else "v15_15g1_observable_guard_aligned_complete"
             if args.activation_aware_g1
             else "v15_15g_activation_aware_complete"
             if args.activation_aware
@@ -1787,6 +2637,7 @@ def main():
     parser.add_argument("--trust-fraction", type=float, default=0.5)
     parser.add_argument("--activation-aware", action="store_true")
     parser.add_argument("--activation-aware-g1", action="store_true")
+    parser.add_argument("--activation-aware-g1b", action="store_true")
     parser.add_argument(
         "--activation-proxy-tolerance", type=float, default=1.0e-6
     )
@@ -1803,12 +2654,34 @@ def main():
         "--severity-scale-floor", type=float, default=1.0e-6
     )
     parser.add_argument(
+        "--severity-conformal-shrinkage", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--severity-conformal-uncertainty-fraction",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
         "--guard-proxy-nonregression-tolerance",
         type=float,
         default=1.0e-6,
     )
     parser.add_argument(
         "--guard-proxy-scale-floor", type=float, default=1.0e-6
+    )
+    parser.add_argument(
+        "--guard-smooth-max-temperature", type=float, default=1.0e-3
+    )
+    parser.add_argument(
+        "--correction-temporal-smoothness-weight",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--guard-minimum-reduction", type=float, default=1.0e-12
+    )
+    parser.add_argument(
+        "--guard-safe-interior-margin", type=float, default=1.0e-6
     )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
@@ -1829,20 +2702,38 @@ def main():
         parser.error("--trust-fraction must be in (0, 1]")
     if args.activation_proxy_tolerance < 0.0:
         parser.error("--activation-proxy-tolerance must be non-negative")
-    if args.activation_aware and args.activation_aware_g1:
+    if sum(map(int, (
+        args.activation_aware,
+        args.activation_aware_g1,
+        args.activation_aware_g1b,
+    ))) > 1:
         parser.error("choose one activation-aware protocol")
-    if args.activation_aware_g1 and not args.train_teacher_bank:
-        parser.error("--activation-aware-g1 requires --train-teacher-bank")
+    if (
+        args.activation_aware_g1 or args.activation_aware_g1b
+    ) and not args.train_teacher_bank:
+        parser.error("--activation-aware-g1/g1b requires --train-teacher-bank")
     if args.severity_envelope_margin_fraction < 0.0:
         parser.error("severity envelope margin fraction must be non-negative")
     if args.severity_envelope_absolute_margin < 0.0:
         parser.error("severity envelope absolute margin must be non-negative")
     if args.severity_scale_floor <= 0.0:
         parser.error("severity scale floor must be positive")
+    if not 0.0 < args.severity_conformal_shrinkage <= 1.0:
+        parser.error("severity conformal shrinkage must be in (0, 1]")
+    if args.severity_conformal_uncertainty_fraction < 0.0:
+        parser.error("severity conformal uncertainty must be non-negative")
     if args.guard_proxy_nonregression_tolerance < 0.0:
         parser.error("guard proxy tolerance must be non-negative")
     if args.guard_proxy_scale_floor <= 0.0:
         parser.error("guard proxy scale floor must be positive")
+    if args.guard_smooth_max_temperature <= 0.0:
+        parser.error("guard smooth-max temperature must be positive")
+    if args.correction_temporal_smoothness_weight < 0.0:
+        parser.error("correction temporal smoothness must be non-negative")
+    if args.guard_minimum_reduction < 0.0:
+        parser.error("guard minimum reduction must be non-negative")
+    if args.guard_safe_interior_margin < 0.0:
+        parser.error("guard safe interior margin must be non-negative")
     if not 0.0 < args.activation_relative_improvement < 1.0:
         parser.error(
             "--activation-relative-improvement must be in (0, 1)"
