@@ -29,9 +29,14 @@ V15_15C_SCHEMA = "refiner_v15_15c_exact_radius_constraint_adapter_probe_v3"
 V15_15D_SCHEMA = (
     "refiner_v15_15d_case_isolated_fixed_guard_restoration_probe_v1"
 )
+V15_15F1_SCHEMA = (
+    "refiner_v15_15f1_observable_gate_restoration_probe_v1"
+)
 V15_15E_TEACHER_SCHEMA = (
     "refiner_v15_15e_multi_transaction_observable_adapter_teacher_bank_v1"
 )
+PHYSICAL_GATE_MODE = "physical_scalar_deadzone_v1"
+LEARNED_GATE_MODE = "observable_residual_deadzone_v2"
 EXACT_RADIUS_NORMALIZATION_EPS = 1.0e-8
 FORMAL_READINESS_CASES = (16, 18, 20, 29)
 CROSS_GROUPS = ("cross_short", "cross_long")
@@ -88,16 +93,43 @@ def _adapter_batch_outputs(model, batch, cfg):
     return prediction, adapter_trace
 
 
-def _load_source_model(source, cfg, device, adapter_state_path=None):
+def _load_source_model(
+    source,
+    cfg,
+    device,
+    adapter_state_path=None,
+    observable_gate_restoration=False,
+):
     state = m.torch.load(
         source / "diagnostic_state.pt",
         map_location="cpu",
         weights_only=False,
     )
+    adapter_payload = None
+    stored_gate_mode = None
+    if adapter_state_path is not None:
+        adapter_payload = m.torch.load(
+            adapter_state_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        stored_gate_mode = adapter_payload.get("observable_adapter_gate_mode")
+        if stored_gate_mode not in {None, PHYSICAL_GATE_MODE, LEARNED_GATE_MODE}:
+            raise RuntimeError({
+                "unsupported_observable_adapter_gate_mode": stored_gate_mode,
+            })
+    gate_mode = (
+        LEARNED_GATE_MODE
+        if observable_gate_restoration or stored_gate_mode == LEARNED_GATE_MODE
+        else PHYSICAL_GATE_MODE
+    )
     model = m.ProductManifoldTemporalRefiner(
         fps=cfg.fps,
         film_conditioning=bool(cfg.product_refiner_film_conditioning),
         observable_adapter=True,
+        observable_adapter_learned_gate_residual=(
+            gate_mode == LEARNED_GATE_MODE
+        ),
         residual_taper_frames=int(cfg.product_refiner_residual_taper_frames),
     ).to(device)
     incompatible = model.load_state_dict(
@@ -108,6 +140,7 @@ def _load_source_model(source, cfg, device, adapter_state_path=None):
     allowed = (
         "observable_adapter_net.",
         "observable_adapter_gate.",
+        "observable_adapter_wake_residual.",
         "observable_adapter_gate_floor",
     )
     invalid_missing = [
@@ -119,12 +152,7 @@ def _load_source_model(source, cfg, device, adapter_state_path=None):
             "unexpected_keys": unexpected,
         })
     if adapter_state_path is not None:
-        payload = m.torch.load(
-            adapter_state_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        adapter_state = payload.get("adapter_state_dict")
+        adapter_state = adapter_payload.get("adapter_state_dict")
         if not isinstance(adapter_state, dict) or not adapter_state:
             raise RuntimeError("adapter state does not contain Adapter weights")
         invalid_keys = [
@@ -153,7 +181,10 @@ def _load_source_model(source, cfg, device, adapter_state_path=None):
     ):
         for parameter in module.parameters():
             parameter.requires_grad_(True)
-    return model, missing
+    if gate_mode == LEARNED_GATE_MODE:
+        for parameter in model.observable_adapter_wake_residual.parameters():
+            parameter.requires_grad_(True)
+    return model, missing, gate_mode
 
 
 def _case_vectors(adapter_tangent, teacher, ownership, case_index):
@@ -689,11 +720,14 @@ def run(args):
         raise RuntimeError("--audit-only requires --adapter-state")
     if args.audit_only and int(args.steps) != 0:
         raise RuntimeError("--audit-only requires --steps 0")
-    model, missing = _load_source_model(
+    model, missing, gate_mode = _load_source_model(
         source,
         cfg,
         device,
         adapter_state_path=adapter_state_path,
+        observable_gate_restoration=bool(
+            args.observable_gate_restoration
+        ),
     )
     if not args.preserve_adapter_gate_floor:
         model.observable_adapter_gate_floor.copy_(m.torch.as_tensor(
@@ -831,16 +865,21 @@ def run(args):
         guard_losses_by_group = {
             group: [] for group in CROSS_GROUPS
         }
+        gate_restoration_losses_by_group = {
+            group: [] for group in CROSS_GROUPS
+        }
         stratified_weights_by_group = {
             group: [] for group in CROSS_GROUPS
         }
         case20_temporal_losses = []
         control_losses = []
+        control_gate_restoration_losses = []
         exact_radius_constraints = {}
         case_isolated_guard = {}
         direction_weight_by_case = {}
         amplitude = {}
         gate = {}
+        wake_score_by_case = {}
         for sample in samples:
             case_index = int(sample["case_index"])
             local_case_index = int(
@@ -854,8 +893,14 @@ def run(args):
                 ownership,
                 case_index,
             )
-            raw_predicted, _ = _case_vectors(
+            post_gate_predicted, _ = _case_vectors(
                 adapter_tangent,
+                sample["teacher_tangent"],
+                ownership,
+                case_index,
+            )
+            ungated_predicted, _ = _case_vectors(
+                adapter_trace["raw_tangent"],
                 sample["teacher_tangent"],
                 ownership,
                 case_index,
@@ -866,19 +911,54 @@ def run(args):
             target_rms = m.torch.sqrt(
                 target.square().mean().clamp_min(1.0e-24)
             ) if target.numel() else adapter_tangent.sum() * 0.0
-            raw_rms = m.torch.sqrt(
-                raw_predicted.square().mean().clamp_min(1.0e-24)
-            ) if raw_predicted.numel() else adapter_tangent.sum() * 0.0
+            post_gate_rms = m.torch.sqrt(
+                post_gate_predicted.square().mean().clamp_min(1.0e-24)
+            ) if post_gate_predicted.numel() else adapter_tangent.sum() * 0.0
+            ungated_rms = m.torch.sqrt(
+                ungated_predicted.square().mean().clamp_min(1.0e-24)
+            ) if ungated_predicted.numel() else adapter_tangent.sum() * 0.0
             amplitude[case_uid] = {
-                "raw_adapter_tangent_rms": float(raw_rms.detach()),
+                "ungated_adapter_network_tangent_rms": float(
+                    ungated_rms.detach()
+                ),
+                "post_gate_taper_tangent_rms": float(
+                    post_gate_rms.detach()
+                ),
+                # Retained as a compatibility alias. Earlier reports called
+                # the post-gate tensor "raw" even though the hard dead-zone
+                # had already been applied.
+                "raw_adapter_tangent_rms": float(post_gate_rms.detach()),
                 "applied_adapter_tangent_rms": float(predicted_rms.detach()),
             }
             active = ownership[case_index, :, 0]
             gate[case_uid] = float(
                 adapter_trace["gate"][case_index, active].mean().detach()
             ) if bool(active.any()) else 0.0
+            wake_score = (
+                adapter_trace["wake_score"][case_index, active].mean()
+                if bool(active.any())
+                else adapter_tangent.sum() * 0.0
+            )
+            wake_score_by_case[case_uid] = float(wake_score.detach())
+            gate_floor = model.observable_adapter_gate_floor.to(
+                wake_score.dtype
+            )
+            gate_margin = float(args.gate_restoration_margin)
+            gate_scale = max(
+                abs(float(model.observable_adapter_gate_floor)),
+                gate_margin,
+                1.0e-3,
+            )
             if sample["teacher_kind"] == "identity_control":
                 control_losses.append(predicted.square().mean())
+                if args.observable_gate_restoration:
+                    control_gate_restoration_losses.append(
+                        (
+                            m.torch.relu(
+                                wake_score - (gate_floor - gate_margin)
+                            ) / gate_scale
+                        ).square()
+                    )
                 continue
             stratified_weight = float(
                 sample.get("stratified_sampling_weight", 1.0)
@@ -886,6 +966,14 @@ def run(args):
             stratified_weights_by_group[group_name].append(
                 stratified_weight
             )
+            if args.observable_gate_restoration:
+                gate_restoration_losses_by_group[group_name].append(
+                    (
+                        m.torch.relu(
+                            (gate_floor + gate_margin) - wake_score
+                        ) / gate_scale
+                    ).square()
+                )
             cosine = m.torch.nn.functional.cosine_similarity(
                 predicted.reshape(1, -1),
                 target.reshape(1, -1),
@@ -1108,6 +1196,40 @@ def run(args):
                 contract["relative_tolerance"],
                 contract["absolute_tolerance"],
             )
+        gate_restoration_loss = applied_adapter_tangent.sum() * 0.0
+        if args.observable_gate_restoration:
+            if not args.case_isolated_guard_restoration:
+                raise RuntimeError(
+                    "observable gate restoration requires case isolation"
+                )
+            if teacher.get("schema") == V15_15E_TEACHER_SCHEMA:
+                cross_gate_loss, gate_group_details = (
+                    _stratified_cross_group_mean(
+                        gate_restoration_losses_by_group,
+                        stratified_weights_by_group,
+                    )
+                )
+            else:
+                cross_gate_loss, gate_group_details = (
+                    _balanced_cross_group_mean(
+                        gate_restoration_losses_by_group
+                    )
+                )
+            if not control_gate_restoration_losses:
+                raise RuntimeError(
+                    "observable gate restoration requires identity controls"
+                )
+            control_gate_loss = m.torch.stack(
+                control_gate_restoration_losses
+            ).mean()
+            gate_restoration_loss = 0.5 * (
+                cross_gate_loss + control_gate_loss
+            )
+            group_balanced_components["gate_wakeup"] = {
+                **gate_group_details,
+                "identity_control": float(control_gate_loss.detach()),
+                "combined": float(gate_restoration_loss.detach()),
+            }
         case20_temporal_loss = (
             m.torch.stack(case20_temporal_losses).mean()
             if case20_temporal_losses
@@ -1125,6 +1247,7 @@ def run(args):
             + 10.0 * magnitude_loss
             + 10.0 * control_loss
             + float(args.guard_restoration_weight) * guard_loss
+            + float(args.gate_restoration_weight) * gate_restoration_loss
         )
         audits = []
         if step % int(args.eval_every) == 0 or step == int(args.steps):
@@ -1165,6 +1288,9 @@ def run(args):
             ),
             "magnitude_upper_bound_loss": float(magnitude_loss.detach()),
             "identity_control_loss": float(control_loss.detach()),
+            "observable_gate_restoration_loss": float(
+                gate_restoration_loss.detach()
+            ),
             "differentiable_fixed_guard_excess": float(guard_loss.detach()),
             "case_isolated_fixed_guard_restoration": bool(
                 args.case_isolated_guard_restoration
@@ -1178,6 +1304,7 @@ def run(args):
             ),
             "adapter_output_rms_by_case": amplitude,
             "adapter_gate_mean_by_case": gate,
+            "adapter_wake_score_mean_by_case": wake_score_by_case,
             "exact_radius_normalization_by_case": radius_normalization,
             "exact_radius_constraints_by_case": exact_radius_constraints,
             "exact_audits": audits,
@@ -1195,6 +1322,9 @@ def run(args):
                 "case20_temporal_signed_residual_loss"
             ],
             "identity_control_loss": row["identity_control_loss"],
+            "observable_gate_restoration_loss": row[
+                "observable_gate_restoration_loss"
+            ],
             "differentiable_fixed_guard_excess": row[
                 "differentiable_fixed_guard_excess"
             ],
@@ -1405,9 +1535,13 @@ def run(args):
     destination.mkdir(parents=True, exist_ok=True)
     state_path = destination / "observable_adapter_probe_state.pt"
     schema = (
-        V15_15D_SCHEMA
-        if args.case_isolated_guard_restoration
-        else V15_15C_SCHEMA
+        V15_15F1_SCHEMA
+        if gate_mode == LEARNED_GATE_MODE
+        else (
+            V15_15D_SCHEMA
+            if args.case_isolated_guard_restoration
+            else V15_15C_SCHEMA
+        )
     )
     m.torch.save({
         "schema": schema,
@@ -1420,6 +1554,7 @@ def run(args):
         },
         "optimizer_state_dict": optimizer.state_dict(),
         "gate_floor": float(model.observable_adapter_gate_floor),
+        "observable_adapter_gate_mode": gate_mode,
     }, state_path)
     report = {
         "schema": schema,
@@ -1485,6 +1620,16 @@ def run(args):
         "hidden_clean_consumed_by_adapter": False,
         "hidden_clean_used_for_fixed_guard_audit_only": True,
         "continuous_soft_gate": True,
+        "observable_adapter_gate_mode": gate_mode,
+        "observable_gate_restoration": bool(
+            args.observable_gate_restoration
+        ),
+        "gate_restoration_margin": float(
+            args.gate_restoration_margin
+        ),
+        "gate_restoration_weight": float(
+            args.gate_restoration_weight
+        ),
         "single_control_deadzone_floor": float(
             model.observable_adapter_gate_floor
         ),
@@ -1513,6 +1658,9 @@ def run(args):
             single_conservative_path_preserved
         ),
         "adapter_gate_mean_by_case": final_gate,
+        "adapter_wake_score_mean_by_case": history[-1][
+            "adapter_wake_score_mean_by_case"
+        ],
         "outside_scope_abs_max_after_final_mask": outside_after_max,
         "scope_safe": final_scope_safe,
         "numeric_audit_complete": bool(final_audits),
@@ -1559,6 +1707,15 @@ def main():
     parser.add_argument("--resume-optimizer", action="store_true")
     parser.add_argument(
         "--preserve-adapter-gate-floor", action="store_true"
+    )
+    parser.add_argument(
+        "--observable-gate-restoration", action="store_true"
+    )
+    parser.add_argument(
+        "--gate-restoration-margin", type=float, default=0.02
+    )
+    parser.add_argument(
+        "--gate-restoration-weight", type=float, default=1.0
     )
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--exact-radius-training", action="store_true")
@@ -1616,6 +1773,18 @@ def main():
         parser.error("Guard direction floor must be in [0, 1]")
     if args.guard_direction_decay <= 0.0:
         parser.error("Guard direction decay must be positive")
+    if args.gate_restoration_margin <= 0.0:
+        parser.error("gate restoration margin must be positive")
+    if args.gate_restoration_weight <= 0.0:
+        parser.error("gate restoration weight must be positive")
+    if args.observable_gate_restoration and not (
+        args.exact_radius_training
+        and args.case_isolated_guard_restoration
+    ):
+        parser.error(
+            "observable gate restoration requires exact-radius, "
+            "case-isolated training"
+        )
     if args.case_isolated_guard_restoration and not args.exact_radius_training:
         parser.error(
             "case-isolated Guard restoration requires exact-radius training"

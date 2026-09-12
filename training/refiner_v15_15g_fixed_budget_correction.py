@@ -355,7 +355,7 @@ def run(args):
     if device.type != "cuda":
         raise RuntimeError("V15.15g correction ablation requires CUDA")
     batch = adapter._to_device(teacher["batch"], device)
-    model, _ = adapter._load_source_model(
+    model, _, _gate_mode = adapter._load_source_model(
         Path(teacher["source_diagnostic"]),
         cfg,
         device,
@@ -541,6 +541,7 @@ def run(args):
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
         "validation_teacher_bank": str(teacher_path),
         "adapter_state": str(state_path),
+        "observable_adapter_gate_mode": _gate_mode,
         "adapter_role": "learner_warm_start",
         "correction_gradient_protocol": "stop_gradient",
         "future_end_to_end_gradient_protocol": IMPLICIT_BACKWARD_PROTOCOL,

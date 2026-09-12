@@ -18,7 +18,7 @@ TEACHER_ROOT="$OUT_ROOT/checkpoints/$TEACHER_TAG"
 TRAIN_BANK="$TEACHER_ROOT/teacher_bank_train/observable_adapter_teacher_bank.pt"
 VALIDATION_BANK=$(cat outputs/LATEST_REFINER_V15_15E_VALIDATION_BANK)
 SOURCE_TAG=$(cat outputs/LATEST_REFINER_V15_15D_GUARD_PROBE_TAG)
-SOURCE_STATE="$OUT_ROOT/checkpoints/$SOURCE_TAG/adapter_probe/observable_adapter_probe_state.pt"
+SOURCE_STATE="${SOURCE_STATE:-$OUT_ROOT/checkpoints/$SOURCE_TAG/adapter_probe/observable_adapter_probe_state.pt}"
 test -s "$TRAIN_BANK"
 test -s "$VALIDATION_BANK"
 test -s "$SOURCE_STATE"

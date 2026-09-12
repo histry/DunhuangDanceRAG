@@ -3243,6 +3243,7 @@ class ProductManifoldTemporalRefiner(nn.Module):
         output_init_std: float = 0.0,
         film_conditioning: bool = False,
         observable_adapter: bool = False,
+        observable_adapter_learned_gate_residual: bool = False,
         residual_taper_frames: int = 3,
     ):
         super().__init__()
@@ -3253,6 +3254,9 @@ class ProductManifoldTemporalRefiner(nn.Module):
         self.fps = float(fps)
         self.film_conditioning = bool(film_conditioning)
         self.observable_adapter = bool(observable_adapter)
+        self.observable_adapter_learned_gate_residual = bool(
+            observable_adapter_learned_gate_residual
+        )
         self.residual_taper_frames = int(residual_taper_frames)
         # Kernel-5 dilations [1,2,5] give a 33-frame convolutional field. The
         # local horizontal difference needs one additional preceding frame;
@@ -3313,6 +3317,12 @@ class ProductManifoldTemporalRefiner(nn.Module):
                 nn.SiLU(),
                 nn.Linear(adapter_hidden, 1),
             )
+            if self.observable_adapter_learned_gate_residual:
+                self.observable_adapter_wake_residual = nn.Sequential(
+                    nn.Linear(REFINER_ADAPTER_OBSERVABLE_DIM, adapter_hidden),
+                    nn.SiLU(),
+                    nn.Linear(adapter_hidden, 1),
+                )
             self.register_buffer(
                 "observable_adapter_gate_floor",
                 torch.zeros((), dtype=torch.float32),
@@ -3321,6 +3331,13 @@ class ProductManifoldTemporalRefiner(nn.Module):
             nn.init.zeros_(self.observable_adapter_net[-1].bias)
             nn.init.zeros_(self.observable_adapter_gate[-1].weight)
             nn.init.zeros_(self.observable_adapter_gate[-1].bias)
+            if self.observable_adapter_learned_gate_residual:
+                nn.init.zeros_(
+                    self.observable_adapter_wake_residual[-1].weight
+                )
+                nn.init.zeros_(
+                    self.observable_adapter_wake_residual[-1].bias
+                )
         self.out = nn.Conv1d(hidden, PRODUCT_STATE_DIM, 1)
         # Production remains exact-zero safe-start. A separate, nonpublishing
         # paired diagnostic may opt into small Gaussian weights. Its initial
@@ -3395,8 +3412,16 @@ class ProductManifoldTemporalRefiner(nn.Module):
             raw_gate = self.observable_adapter_gate(
                 features[..., :REFINER_ADAPTER_OBSERVABLE_DIM]
             )
+            wake_score = difficulty
+            if self.observable_adapter_learned_gate_residual:
+                raw_wake_residual = self.observable_adapter_wake_residual(
+                    features[..., :REFINER_ADAPTER_OBSERVABLE_DIM]
+                )
+                wake_score = wake_score + raw_wake_residual
+            else:
+                raw_wake_residual = torch.zeros_like(difficulty)
             excess = torch.relu(
-                difficulty
+                wake_score
                 - self.observable_adapter_gate_floor.to(difficulty.dtype)
             )
             continuous_support = 1.0 - torch.exp(-excess.square())
@@ -3423,6 +3448,9 @@ class ProductManifoldTemporalRefiner(nn.Module):
                 adapter_trace.update({
                     "condition": features,
                     "difficulty": difficulty,
+                    "raw_gate": raw_gate,
+                    "raw_wake_residual": raw_wake_residual,
+                    "wake_score": wake_score,
                     "gate": gate,
                     "c2_taper": taper,
                     "ownership": ownership,

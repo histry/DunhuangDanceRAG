@@ -146,6 +146,14 @@ def _probe_command(
         command.append("--resume-optimizer")
     if preserve_gate_floor:
         command.append("--preserve-adapter-gate-floor")
+    if getattr(args, "observable_gate_restoration", False):
+        command.extend([
+            "--observable-gate-restoration",
+            "--gate-restoration-margin",
+            "0.02",
+            "--gate-restoration-weight",
+            "1",
+        ])
     return command
 
 
@@ -190,6 +198,20 @@ def run(args) -> int:
         "validation_teacher_bank": _sha256(validation_path),
         "initial_adapter_state": _sha256(initial_state),
     }
+    initial_payload = m.torch.load(
+        initial_state, map_location="cpu", weights_only=False
+    )
+    gate_mode = initial_payload.get(
+        "observable_adapter_gate_mode", "physical_scalar_deadzone_v1"
+    )
+    if gate_mode not in {
+        "physical_scalar_deadzone_v1",
+        "observable_residual_deadzone_v2",
+    }:
+        raise RuntimeError({"unsupported_observable_adapter_gate_mode": gate_mode})
+    args.observable_gate_restoration = bool(
+        gate_mode == "observable_residual_deadzone_v2"
+    )
     (destination / "frozen_inputs.sha256.json").write_text(
         json.dumps(frozen_inputs, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -326,6 +348,10 @@ def run(args) -> int:
         "total_steps_completed": int(completed_steps),
         "audit_every": int(args.audit_every),
         "optimizer_state_continuity": "adamw_state_resumed_between_chunks",
+        "observable_adapter_gate_mode": gate_mode,
+        "observable_gate_restoration_loss_enabled": bool(
+            args.observable_gate_restoration
+        ),
         "train_teacher_bank": str(train_path),
         "validation_teacher_bank": str(validation_path),
         "frozen_input_sha256": frozen_inputs,
