@@ -16,6 +16,13 @@ V15.15g1b interprets those fields directly as contract signed margins, uses a
 Guard-first projected active set, and calibrates a multivariate observable
 severity score by leaving out each train transaction.  Its uncertainty band
 falls back to identity.  The correction budgets and starts remain unchanged.
+
+V15.15g1c separates the per-case physical margins from the authoritative
+fixed-bank Guard contract.  Activation uses a train-only, transaction-held-out
+single/cross discriminative conformal model, while every activated candidate
+is checked on its complete transaction against the frozen Guard anchor before
+selection.  A feasible Adapter is locked as the incumbent; correction is
+considered only when that incumbent fails exact raw closure.
 """
 from __future__ import annotations
 
@@ -47,6 +54,10 @@ G1_SCHEMA = (
 )
 G1B_SCHEMA = (
     "refiner_v15_15g1b_contract_margin_transaction_conformal_repair_v1"
+)
+G1C_SCHEMA = (
+    "refiner_v15_15g1c_fixed_guard_shadow_incumbent_lock_"
+    "discriminative_conformal_v1"
 )
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
 TEACHER_SCHEMA = adapter.V15_15E_TEACHER_SCHEMA
@@ -473,6 +484,207 @@ def _conformal_severity_status(sample, envelope):
     }
 
 
+def _freeze_discriminative_transaction_conformal(
+    train_teacher,
+    *,
+    shrinkage,
+    scale_floor,
+    uncertainty_fraction,
+    absolute_margin,
+):
+    """Freeze a train-only two-sided single/cross conformal classifier.
+
+    Role labels are consumed only here.  Each held-out transaction is scored
+    by single and cross Mahalanobis models fitted without that transaction.
+    Runtime classification receives only the observable severity vector.
+    """
+    labelled = {"single": [], "cross": []}
+    for sample in train_teacher["samples"]:
+        kind = sample.get("teacher_kind")
+        if kind == "identity_control":
+            label = "single"
+        elif kind == "exact_projected_direction":
+            label = "cross"
+        else:
+            continue
+        labelled[label].append({
+            "case_uid": str(sample["case_uid"]),
+            "transaction_id": str(sample["transaction_id"]),
+            "severity": _observable_severity(sample),
+        })
+    for label, rows in labelled.items():
+        transactions = {row["transaction_id"] for row in rows}
+        if len(rows) < 2 or len(transactions) < 2:
+            raise RuntimeError(
+                "discriminative conformal calibration requires two "
+                f"{label} transactions"
+            )
+
+    transactions = sorted({
+        row["transaction_id"]
+        for rows in labelled.values()
+        for row in rows
+    })
+    fold_scores = {}
+    same_class_distances = {"single": [], "cross": []}
+    discriminants = {"single": [], "cross": []}
+    for held_out_transaction in transactions:
+        fit_rows = {
+            label: [
+                row["severity"]
+                for row in rows
+                if row["transaction_id"] != held_out_transaction
+            ]
+            for label, rows in labelled.items()
+        }
+        if any(len(rows) < 2 for rows in fit_rows.values()):
+            raise RuntimeError(
+                "transaction-held-out discriminative fold lacks calibration"
+            )
+        models = {
+            label: _fit_multivariate_severity_model(
+                rows, shrinkage, scale_floor
+            )
+            for label, rows in fit_rows.items()
+        }
+        held_out_scores = {}
+        for label, rows in labelled.items():
+            for row in rows:
+                if row["transaction_id"] != held_out_transaction:
+                    continue
+                single_distance = _multivariate_severity_score(
+                    row["severity"], models["single"]
+                )
+                cross_distance = _multivariate_severity_score(
+                    row["severity"], models["cross"]
+                )
+                discriminant = single_distance - cross_distance
+                held_out_scores[row["case_uid"]] = {
+                    "offline_label": label,
+                    "single_distance": single_distance,
+                    "cross_distance": cross_distance,
+                    "cross_discriminant": discriminant,
+                }
+                same_class_distances[label].append(
+                    single_distance if label == "single" else cross_distance
+                )
+                discriminants[label].append(discriminant)
+        if held_out_scores:
+            fold_scores[held_out_transaction] = held_out_scores
+
+    single_distance_threshold = max(same_class_distances["single"])
+    cross_distance_threshold = max(same_class_distances["cross"])
+    single_discriminant_upper = max(discriminants["single"])
+    cross_discriminant_lower = min(discriminants["cross"])
+    discriminant_scale = max(
+        1.0,
+        abs(single_discriminant_upper),
+        abs(cross_discriminant_lower),
+    )
+    uncertainty_margin = max(
+        discriminant_scale * float(uncertainty_fraction),
+        float(absolute_margin),
+    )
+    activation_discriminant_threshold = max(
+        cross_discriminant_lower,
+        single_discriminant_upper + uncertainty_margin,
+    )
+    final_models = {
+        label: _fit_multivariate_severity_model(
+            [row["severity"] for row in rows], shrinkage, scale_floor
+        )
+        for label, rows in labelled.items()
+    }
+    return {
+        "schema": (
+            "refiner_v15_15g1c_train_transaction_discriminative_"
+            "conformal_v1"
+        ),
+        "calibration_split": "train",
+        "calibration_labels": {
+            "single": "identity_control",
+            "cross": "exact_projected_direction",
+        },
+        "calibration_labels_used_offline_only": True,
+        "inference_role_label_consumed": False,
+        "inference_group_label_consumed": False,
+        "inference_hidden_clean_consumed": False,
+        "channels": list(G1_SEVERITY_CHANNELS),
+        "class_counts": {
+            label: len(rows) for label, rows in labelled.items()
+        },
+        "transaction_count": len(transactions),
+        "leave_one_transaction_out": True,
+        "fold_score_by_case": fold_scores,
+        "single_distance_threshold": single_distance_threshold,
+        "cross_distance_threshold": cross_distance_threshold,
+        "single_discriminant_upper": single_discriminant_upper,
+        "cross_discriminant_lower": cross_discriminant_lower,
+        "activation_discriminant_threshold": (
+            activation_discriminant_threshold
+        ),
+        "uncertainty_margin": uncertainty_margin,
+        "uncertainty_fraction": float(uncertainty_fraction),
+        "absolute_margin": float(absolute_margin),
+        "class_overlap_in_calibration": bool(
+            cross_discriminant_lower <= single_discriminant_upper
+        ),
+        "final_models": final_models,
+    }
+
+
+def _discriminative_conformal_status(sample, envelope):
+    """Classify from observable severity only; ambiguity is identity-safe."""
+    values = _observable_severity(sample)
+    single_distance = _multivariate_severity_score(
+        values, envelope["final_models"]["single"]
+    )
+    cross_distance = _multivariate_severity_score(
+        values, envelope["final_models"]["cross"]
+    )
+    discriminant = single_distance - cross_distance
+    single_inlier = bool(
+        single_distance <= float(envelope["single_distance_threshold"])
+    )
+    cross_inlier = bool(
+        cross_distance <= float(envelope["cross_distance_threshold"])
+    )
+    separated_cross = bool(
+        discriminant
+        > float(envelope["activation_discriminant_threshold"])
+    )
+    activated = bool(cross_inlier and not single_inlier and separated_cross)
+    confident_identity = bool(
+        single_inlier
+        and discriminant <= float(envelope["single_discriminant_upper"])
+    )
+    abstained = bool(not activated and not confident_identity)
+    return {
+        "values": values,
+        "single_conformal_distance": single_distance,
+        "cross_conformal_distance": cross_distance,
+        "single_distance_threshold": float(
+            envelope["single_distance_threshold"]
+        ),
+        "cross_distance_threshold": float(
+            envelope["cross_distance_threshold"]
+        ),
+        "cross_discriminant": discriminant,
+        "single_discriminant_upper": float(
+            envelope["single_discriminant_upper"]
+        ),
+        "activation_discriminant_threshold": float(
+            envelope["activation_discriminant_threshold"]
+        ),
+        "single_inlier": single_inlier,
+        "cross_inlier": cross_inlier,
+        "activation_supported_by_observables": activated,
+        "severity_abstained": abstained,
+        "conformal_fallback": abstained,
+        "outside_frozen_single_envelope": activated,
+    }
+
+
 def _guard_proxy_values(batch, cfg, baseline, candidate, case_index):
     _, terms = m._observable_refiner_objective(
         candidate,
@@ -485,6 +697,166 @@ def _guard_proxy_values(batch, cfg, baseline, candidate, case_index):
     return {
         name: terms[key][index]
         for name, key in G1_GUARD_PROXY_TERMS.items()
+    }
+
+
+def _fixed_guard_shadow_from_details(details, relative, absolute):
+    """Reproduce the exact fixed-Guard formula and retain its components."""
+    shadow = {}
+    audit = {}
+    for name, row in details.items():
+        fixed_anchor = float(row["fixed_anchor"])
+        relative_tolerance = float(relative[name])
+        absolute_tolerance = float(absolute[name])
+        allowance = max(
+            abs(fixed_anchor) * relative_tolerance,
+            absolute_tolerance,
+        )
+        absolute_limit = fixed_anchor + allowance
+        recorded_limit = float(row["absolute_limit"])
+        numeric_tolerance = float(row["numeric_tolerance"])
+        margin = (
+            float(row["candidate"])
+            - absolute_limit
+            - numeric_tolerance
+        )
+        shadow[name] = margin
+        audit[name] = {
+            "group_guard_value": float(row["candidate"]),
+            "fixed_anchor": fixed_anchor,
+            "relative_tolerance": relative_tolerance,
+            "absolute_tolerance": absolute_tolerance,
+            "fixed_anchor_allowance": allowance,
+            "absolute_limit": absolute_limit,
+            "recorded_absolute_limit": recorded_limit,
+            "absolute_limit_matches_exact_guard": bool(
+                math.isclose(
+                    absolute_limit,
+                    recorded_limit,
+                    rel_tol=0.0,
+                    abs_tol=max(1.0e-15, abs(recorded_limit) * 1.0e-12),
+                )
+            ),
+            "numeric_tolerance": numeric_tolerance,
+            "fixed_guard_shadow_margin": margin,
+            "passed": bool(margin <= 0.0),
+        }
+    return shadow, audit
+
+
+def _g1c_candidate_evidence(
+    *,
+    model,
+    sample,
+    tangent,
+    domains,
+    ownership,
+    baseline_terms,
+    cfg,
+    target_rms,
+    workspace_floor,
+):
+    """Audit one generated candidate in its complete frozen transaction."""
+    transaction_id = str(sample["transaction_id"])
+    domain = domains[transaction_id]
+    global_case = int(sample["case_index"])
+    local_case = int(sample["local_case_index"])
+    local = tangent[global_case:global_case + 1]
+    mask = ownership[global_case:global_case + 1].expand_as(local)
+    scoped = local.masked_fill(~mask, 0.0)
+    transaction_tangent = m.torch.zeros_like(domain["baseline"])
+    transaction_tangent[local_case:local_case + 1] = scoped
+    candidate = product_exp_torch(
+        domain["baseline"], transaction_tangent
+    )
+    baseline_case = {
+        key: float(baseline_terms[key][global_case].detach())
+        for key in ("endpoint", "temporal")
+    }
+    raw = oracle._exact_audit(
+        model,
+        domain["batch"],
+        cfg,
+        domain["baseline"],
+        domain["identity"],
+        domain["baseline_guard"],
+        domain["contract"]["initial_anchor"],
+        domain["contract"]["relative_tolerance"],
+        domain["contract"]["absolute_tolerance"],
+        candidate,
+        local_case,
+        baseline_case,
+        target_rms,
+        workspace_floor,
+    )
+    case_candidate = candidate[local_case:local_case + 1]
+    case_baseline = domain["baseline"][local_case:local_case + 1]
+    case_batch = adapter._slice_batch(
+        domain["batch"], local_case, local_case + 1
+    )
+    with m.torch.no_grad():
+        physical = _guard_proxy_values(
+            case_batch,
+            cfg,
+            case_baseline,
+            case_candidate,
+            0,
+        )
+    case_physical_margins = {
+        name: float(value.detach()) for name, value in physical.items()
+    }
+    fixed_guard_shadow, fixed_guard_shadow_audit = (
+        _fixed_guard_shadow_from_details(
+            raw["fixed_guard_details"],
+            domain["contract"]["relative_tolerance"],
+            domain["contract"]["absolute_tolerance"],
+        )
+    )
+    shadow_passed = bool(
+        fixed_guard_shadow
+        and all(value <= 0.0 for value in fixed_guard_shadow.values())
+    )
+    shadow_consistent = bool(
+        shadow_passed == bool(raw["fixed_guard_passed"])
+        and all(
+            row["absolute_limit_matches_exact_guard"]
+            for row in fixed_guard_shadow_audit.values()
+        )
+    )
+    maximum_shadow = max(fixed_guard_shadow.values(), default=math.inf)
+    return {
+        "case_physical_signed_margin_by_term": case_physical_margins,
+        "maximum_positive_case_physical_signed_margin": max(
+            0.0,
+            max(case_physical_margins.values(), default=math.inf),
+        ),
+        "full_transaction_fixed_guard_shadow_margin_by_term": (
+            fixed_guard_shadow
+        ),
+        "full_transaction_fixed_guard_shadow_detail_by_term": (
+            fixed_guard_shadow_audit
+        ),
+        "maximum_full_transaction_fixed_guard_shadow_margin": (
+            maximum_shadow
+        ),
+        "maximum_positive_full_transaction_fixed_guard_shadow_margin": max(
+            0.0, maximum_shadow
+        ),
+        "fixed_guard_shadow_passed": shadow_passed,
+        "fixed_guard_shadow_matches_exact_guard": shadow_consistent,
+        "exact_raw_closure_passed": bool(raw["passed"]),
+        "fixed_guard_passed": bool(raw["fixed_guard_passed"]),
+        "fixed_guard_blockers": list(raw["fixed_guard_blockers"]),
+        "case_scientific": dict(raw["case_scientific"]),
+        "radius_rms": float(raw["achieved_case_output_tangent_rms"]),
+        "radius_equality_resolved": bool(raw["radius_equality_resolved"]),
+        "workspace_observable_resolved": bool(
+            raw["workspace_observable_resolved"]
+        ),
+        "scope_safe": bool(raw["scope"]["scope_safe"]),
+        "outside_scope_abs_max": float(
+            raw["scope"]["outside_case_group_or_ownership_abs_max"]
+        ),
     }
 
 
@@ -718,6 +1090,7 @@ def _bounded_direction(direction, mask, maximum_rms):
 
 def _correct_case(
     *,
+    model,
     method,
     steps,
     initial_tangent,
@@ -1054,6 +1427,33 @@ def _correct_case(
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
     }
+
+
+def _g1c_name_case_physical_diagnostics(report):
+    """Remove ambiguous Guard names from g1c per-case proxy diagnostics."""
+    replacements = {
+        "candidate_guard_signed_margin_by_term": (
+            "candidate_case_physical_signed_margin_by_term"
+        ),
+        "maximum_positive_guard_signed_margin": (
+            "maximum_positive_case_physical_signed_margin"
+        ),
+        "accepted_guard_margin_reduction": (
+            "accepted_case_physical_margin_reduction"
+        ),
+    }
+
+    def visit(value):
+        if isinstance(value, dict):
+            renamed = {}
+            for key, item in value.items():
+                renamed[replacements.get(key, key)] = visit(item)
+            return renamed
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        return value
+
+    return visit(report)
 
 
 def _transaction_domains(teacher, batch, baseline, identity, model, cfg):
@@ -1741,6 +2141,168 @@ def _g1b_contract_margin_selection(
     return selected, decisions, dict(method_counts)
 
 
+def _g1c_fixed_guard_shadow_selection(
+    *,
+    model,
+    variants,
+    correction_reports,
+    samples,
+    domains,
+    ownership,
+    baseline_terms,
+    cfg,
+    target_rms,
+    workspace_floor,
+    severity_envelope,
+):
+    """Select with observable activation and authoritative Guard shadows.
+
+    The discriminative gate consumes no runtime role/group labels.  Once it
+    activates, each already-generated candidate is reconstructed inside the
+    complete transaction and compared with the exact immutable Guard contract.
+    A raw-feasible Adapter is retained without ranking against corrections.
+    """
+    selected = m.torch.zeros_like(next(iter(variants.values())))
+    decisions = {}
+    method_counts = Counter()
+    for sample in samples:
+        uid = str(sample.get("case_uid", sample["case_index"]))
+        case_index = int(sample["case_index"])
+        severity = _discriminative_conformal_status(
+            sample, severity_envelope
+        )
+        candidates = {}
+        selected_method = "identity"
+        incumbent_locked = False
+        if severity["activation_supported_by_observables"]:
+            for method, tangent in variants.items():
+                evidence = _g1c_candidate_evidence(
+                    model=model,
+                    sample=sample,
+                    tangent=tangent,
+                    domains=domains,
+                    ownership=ownership,
+                    baseline_terms=baseline_terms,
+                    cfg=cfg,
+                    target_rms=target_rms,
+                    workspace_floor=workspace_floor,
+                )
+                correction = correction_reports.get(method, {}).get(uid, {})
+                numeric_failure = bool(
+                    correction.get("numeric_failure", False)
+                )
+                scientific = evidence["case_scientific"]
+                baseline_case = {
+                    key: float(baseline_terms[key][case_index].detach())
+                    for key in ("endpoint", "temporal")
+                }
+                scientific_score = sum(
+                    float(scientific[f"{key}_delta"])
+                    / max(abs(baseline_case[key]), 1.0e-12)
+                    for key in ("endpoint", "temporal")
+                )
+                eligible = bool(
+                    evidence["fixed_guard_shadow_passed"]
+                    and evidence["fixed_guard_shadow_matches_exact_guard"]
+                    and evidence["fixed_guard_passed"]
+                    and scientific["passed"]
+                    and evidence["radius_equality_resolved"]
+                    and evidence["workspace_observable_resolved"]
+                    and evidence["scope_safe"]
+                    and evidence["outside_scope_abs_max"] == 0.0
+                    and math.isfinite(scientific_score)
+                    and not numeric_failure
+                )
+                candidates[method] = {
+                    **evidence,
+                    "scientific_descent_score": scientific_score,
+                    "numeric_failure": numeric_failure,
+                    "correction_accepted_steps": int(
+                        correction.get("correction_accepted_steps", 0)
+                    ),
+                    "accepted_case_physical_margin_reduction": float(
+                        correction.get(
+                            "accepted_case_physical_margin_reduction", 0.0
+                        )
+                    ),
+                    "eligible": eligible,
+                }
+
+            adapter_candidate = candidates.get("adapter")
+            if (
+                adapter_candidate is not None
+                and adapter_candidate["eligible"]
+                and adapter_candidate["exact_raw_closure_passed"]
+            ):
+                selected_method = "adapter"
+                incumbent_locked = True
+            else:
+                eligible_corrections = [
+                    (method, candidate)
+                    for method, candidate in candidates.items()
+                    if method != "adapter" and candidate["eligible"]
+                ]
+                if eligible_corrections:
+                    selected_method, _ = min(
+                        eligible_corrections,
+                        key=lambda row: (
+                            row[1][
+                                "maximum_full_transaction_fixed_guard_"
+                                "shadow_margin"
+                            ],
+                            row[1]["scientific_descent_score"],
+                            row[0],
+                        ),
+                    )
+            if selected_method != "identity":
+                local = variants[selected_method][
+                    case_index:case_index + 1
+                ]
+                mask = ownership[
+                    case_index:case_index + 1
+                ].expand_as(local)
+                selected[case_index:case_index + 1] = local.masked_fill(
+                    ~mask, 0.0
+                )
+
+        fallback_reason = None
+        if selected_method == "identity":
+            if severity["severity_abstained"]:
+                fallback_reason = "discriminative_conformal_uncertain"
+            elif not severity["activation_supported_by_observables"]:
+                fallback_reason = "observable_classifier_single"
+            else:
+                fallback_reason = "no_exact_guard_shadow_candidate"
+        method_counts.update([selected_method])
+        decisions[uid] = {
+            "selected_method": selected_method,
+            "selected_nonzero": bool(selected_method != "identity"),
+            "adapter_incumbent_locked": incumbent_locked,
+            "conformal_fallback": bool(severity["severity_abstained"]),
+            "identity_fallback_reason": fallback_reason,
+            "selection": {
+                "anchor_severity": severity,
+                "activation_condition": (
+                    "train_transaction_discriminative_conformal_"
+                    "cross_only"
+                ),
+                "case_physical_margin_contract": (
+                    "per_case_stage_relative_diagnostic_only"
+                ),
+                "fixed_guard_shadow_contract": (
+                    "complete_transaction_group_guard_value_minus_"
+                    "frozen_anchor_allowance_and_numeric_tolerance"
+                ),
+                "candidates": candidates,
+            },
+            "evaluation_only": {
+                "teacher_kind": sample.get("teacher_kind"),
+                "audit_group": sample.get("audit_group"),
+            },
+        }
+    return selected, decisions, dict(method_counts)
+
+
 def _variant_summary(audits, correction_reports, elapsed):
     raw_by_group = Counter()
     projected_by_group = Counter()
@@ -1768,7 +2330,9 @@ def _variant_summary(audits, correction_reports, elapsed):
 def run(args):
     started = time.perf_counter()
     g1_family = bool(
-        args.activation_aware_g1 or args.activation_aware_g1b
+        args.activation_aware_g1
+        or args.activation_aware_g1b
+        or args.activation_aware_g1c
     )
     activation_enabled = bool(
         args.activation_aware or g1_family
@@ -1797,19 +2361,19 @@ def run(args):
     train_teacher_path = None
     if g1_family:
         if not args.train_teacher_bank:
-            raise RuntimeError("V15.15g1/g1b requires --train-teacher-bank")
+            raise RuntimeError("V15.15g1/g1b/g1c requires --train-teacher-bank")
         train_teacher_path = Path(args.train_teacher_bank).resolve()
         train_teacher = m.torch.load(
             train_teacher_path, map_location="cpu", weights_only=False
         )
         if train_teacher.get("schema") != TEACHER_SCHEMA:
-            raise RuntimeError("V15.15g1/g1b train bank schema mismatch")
+            raise RuntimeError("V15.15g1/g1b/g1c train bank schema mismatch")
         if train_teacher.get("split") != "train":
             raise RuntimeError(
-                "V15.15g1/g1b envelope bank must be train split"
+                "V15.15g1/g1b/g1c envelope bank must be train split"
             )
         if not train_teacher.get("teacher_bank_ready"):
-            raise RuntimeError("V15.15g1/g1b train bank is not ready")
+            raise RuntimeError("V15.15g1/g1b/g1c train bank is not ready")
         if train_teacher.get("source_diagnostic") != teacher.get(
             "source_diagnostic"
         ):
@@ -1820,7 +2384,19 @@ def run(args):
         ):
             if train_teacher.get(key) != teacher.get(key):
                 raise RuntimeError(f"train/validation {key} mismatch")
-        if args.activation_aware_g1b:
+        if args.activation_aware_g1c:
+            severity_envelope = _freeze_discriminative_transaction_conformal(
+                train_teacher,
+                shrinkage=float(args.severity_conformal_shrinkage),
+                scale_floor=float(args.severity_scale_floor),
+                uncertainty_fraction=float(
+                    args.severity_conformal_uncertainty_fraction
+                ),
+                absolute_margin=float(
+                    args.severity_envelope_absolute_margin
+                ),
+            )
+        elif args.activation_aware_g1b:
             severity_envelope = _freeze_transaction_conformal_envelope(
                 train_teacher,
                 shrinkage=float(args.severity_conformal_shrinkage),
@@ -1853,7 +2429,9 @@ def run(args):
             ),
         })
         severity_envelope_path = destination / (
-            "transaction_conformal_severity_envelope.json"
+            "discriminative_transaction_conformal_severity.json"
+            if args.activation_aware_g1c
+            else "transaction_conformal_severity_envelope.json"
             if args.activation_aware_g1b
             else "observable_severity_envelope.json"
         )
@@ -1982,6 +2560,7 @@ def run(args):
                     }
                     local_contract = domain["contract"]
                 corrected, correction_report = _correct_case(
+                    model=model,
                     method=method,
                     steps=budget,
                     initial_tangent=local_initial,
@@ -2001,6 +2580,7 @@ def run(args):
                     guard_aligned=g1_family,
                     contract_margin_active_set=bool(
                         args.activation_aware_g1b
+                        or args.activation_aware_g1c
                     ),
                     guard_proxy_tolerance=float(
                         args.guard_proxy_nonregression_tolerance
@@ -2018,6 +2598,10 @@ def run(args):
                         args.guard_minimum_reduction
                     ),
                 )
+                if args.activation_aware_g1c:
+                    correction_report = _g1c_name_case_physical_diagnostics(
+                        correction_report
+                    )
                 if activation_enabled:
                     global_case = int(sample["case_index"])
                     tangent[global_case:global_case + 1] = corrected
@@ -2097,7 +2681,25 @@ def run(args):
     activation_aware_supported = False
     if activation_enabled:
         selection_started = time.perf_counter()
-        if args.activation_aware_g1b:
+        if args.activation_aware_g1c:
+            (
+                selected_tangent,
+                activation_decisions,
+                selected_method_counts,
+            ) = _g1c_fixed_guard_shadow_selection(
+                model=model,
+                variants=variant_tangents,
+                correction_reports=variant_correction_reports,
+                samples=samples,
+                domains=domains,
+                ownership=ownership,
+                baseline_terms=baseline_terms,
+                cfg=cfg,
+                target_rms=float(args.target_rms),
+                workspace_floor=workspace_floor,
+                severity_envelope=severity_envelope,
+            )
+        elif args.activation_aware_g1b:
             (
                 selected_tangent,
                 activation_decisions,
@@ -2242,16 +2844,30 @@ def run(args):
                 "selected_nonzero"
             ]
         )
-        selected_proxy_nonregression_complete = bool(
-            not g1_family
-            or all(
+        if args.activation_aware_g1c:
+            selected_proxy_nonregression_complete = all(
                 not decision["selected_nonzero"]
-                or decision["selection"]["candidates"][
-                    decision["selected_method"]
-                ]["guard_proxy_nonregression"]
+                or (
+                    decision["selection"]["candidates"][
+                        decision["selected_method"]
+                    ]["fixed_guard_shadow_passed"]
+                    and decision["selection"]["candidates"][
+                        decision["selected_method"]
+                    ]["fixed_guard_shadow_matches_exact_guard"]
+                )
                 for decision in activation_decisions.values()
             )
-        )
+        else:
+            selected_proxy_nonregression_complete = bool(
+                not g1_family
+                or all(
+                    not decision["selected_nonzero"]
+                    or decision["selection"]["candidates"][
+                        decision["selected_method"]
+                    ]["guard_proxy_nonregression"]
+                    for decision in activation_decisions.values()
+                )
+            )
         selected_severity_condition_complete = bool(
             not g1_family
             or all(
@@ -2267,7 +2883,59 @@ def run(args):
             for reports in variant_correction_reports.values()
             for report in reports.values()
         )
-        if args.activation_aware_g1b:
+        if args.activation_aware_g1c:
+            decision_numeric_complete = all(
+                all(
+                    math.isfinite(float(value))
+                    for value in (
+                        decision["selection"]["anchor_severity"][
+                            "single_conformal_distance"
+                        ],
+                        decision["selection"]["anchor_severity"][
+                            "cross_conformal_distance"
+                        ],
+                        decision["selection"]["anchor_severity"][
+                            "cross_discriminant"
+                        ],
+                    )
+                )
+                and all(
+                    math.isfinite(float(candidate[
+                        "scientific_descent_score"
+                    ]))
+                    and math.isfinite(float(candidate[
+                        "outside_scope_abs_max"
+                    ]))
+                    and math.isfinite(float(candidate[
+                        "maximum_positive_case_physical_signed_margin"
+                    ]))
+                    and math.isfinite(float(candidate[
+                        "maximum_positive_full_transaction_fixed_guard_"
+                        "shadow_margin"
+                    ]))
+                    and all(
+                        math.isfinite(float(value))
+                        for value in candidate[
+                            "case_physical_signed_margin_by_term"
+                        ].values()
+                    )
+                    and all(
+                        math.isfinite(float(value))
+                        for value in candidate[
+                            "full_transaction_fixed_guard_shadow_"
+                            "margin_by_term"
+                        ].values()
+                    )
+                    and candidate[
+                        "fixed_guard_shadow_matches_exact_guard"
+                    ]
+                    for candidate in decision["selection"][
+                        "candidates"
+                    ].values()
+                )
+                for decision in activation_decisions.values()
+            )
+        elif args.activation_aware_g1b:
             decision_numeric_complete = all(
                 math.isfinite(float(decision["selection"][
                     "severity_conformal_score"
@@ -2367,6 +3035,13 @@ def run(args):
         activation_summary = {
             "selection_protocol": (
                 (
+                    "observable_discriminative_conformal_then_"
+                    "complete_transaction_fixed_guard_shadow_"
+                    "incumbent_lock_v1"
+                )
+                if args.activation_aware_g1c
+                else
+                (
                     "transaction_conformal_contract_margin_"
                     "active_set_lexicographic_v1"
                 )
@@ -2411,6 +3086,12 @@ def run(args):
                 if g1_family else None
             ),
             "severity_calibration_protocol": (
+                (
+                    "leave_one_train_transaction_out_single_cross_"
+                    "mahalanobis_two_sided"
+                )
+                if args.activation_aware_g1c
+                else
                 "leave_one_train_transaction_out_mahalanobis_max"
                 if args.activation_aware_g1b else None
             ),
@@ -2421,6 +3102,24 @@ def run(args):
             "severity_activation_threshold": (
                 severity_envelope.get("activation_threshold")
                 if args.activation_aware_g1b else None
+            ),
+            "single_conformal_distance_threshold": (
+                severity_envelope.get("single_distance_threshold")
+                if args.activation_aware_g1c else None
+            ),
+            "cross_conformal_distance_threshold": (
+                severity_envelope.get("cross_distance_threshold")
+                if args.activation_aware_g1c else None
+            ),
+            "activation_discriminant_threshold": (
+                severity_envelope.get(
+                    "activation_discriminant_threshold"
+                )
+                if args.activation_aware_g1c else None
+            ),
+            "conformal_class_overlap_in_calibration": (
+                severity_envelope.get("class_overlap_in_calibration")
+                if args.activation_aware_g1c else None
             ),
             "conformal_fallback_case_uids": sorted(
                 uid
@@ -2440,7 +3139,7 @@ def run(args):
                 if args.activation_aware_g1b else None
             ),
             "correction_budget_unchanged": bool(
-                args.activation_aware_g1b
+                (args.activation_aware_g1b or args.activation_aware_g1c)
                 and budgets == (2, 3, 5)
             ),
             "activation_decision_role_label_consumed": False,
@@ -2448,7 +3147,15 @@ def run(args):
             "activation_decision_group_consumed": False,
             "activation_decision_hidden_clean_consumed": False,
             "activation_decision_fixed_guard_consumed": False,
-            "fixed_guard_evaluation_only": True,
+            "fixed_guard_shadow_frozen_group_contract_consumed": bool(
+                args.activation_aware_g1c
+            ),
+            "candidate_acceptance_fixed_guard_shadow_consumed": bool(
+                args.activation_aware_g1c
+            ),
+            "fixed_guard_evaluation_only": bool(
+                not args.activation_aware_g1c
+            ),
             "selected_method_counts": selected_method_counts,
             "required_projected_count_by_group": dict(
                 required_by_group
@@ -2472,6 +3179,11 @@ def run(args):
             "numeric_audit_complete": numeric_audit_complete,
             "selected_guard_proxy_nonregression_complete": (
                 selected_proxy_nonregression_complete
+                if not args.activation_aware_g1c else None
+            ),
+            "selected_fixed_guard_shadow_complete": (
+                selected_proxy_nonregression_complete
+                if args.activation_aware_g1c else None
             ),
             "selected_severity_condition_complete": (
                 selected_severity_condition_complete
@@ -2511,7 +3223,9 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            G1B_SCHEMA
+            G1C_SCHEMA
+            if args.activation_aware_g1c
+            else G1B_SCHEMA
             if args.activation_aware_g1b
             else G1_SCHEMA
             if args.activation_aware_g1
@@ -2544,11 +3258,23 @@ def run(args):
         "observable_severity_guard_aligned": bool(
             g1_family
         ),
-        "contract_margin_active_set": bool(args.activation_aware_g1b),
-        "transaction_conformal_activation": bool(
-            args.activation_aware_g1b
+        "contract_margin_active_set": bool(
+            args.activation_aware_g1b or args.activation_aware_g1c
         ),
+        "transaction_conformal_activation": bool(
+            args.activation_aware_g1b or args.activation_aware_g1c
+        ),
+        "discriminative_conformal_activation": bool(
+            args.activation_aware_g1c
+        ),
+        "fixed_guard_shadow_candidate_acceptance": bool(
+            args.activation_aware_g1c
+        ),
+        "adapter_incumbent_lock": bool(args.activation_aware_g1c),
         "activation_severity_source": (
+            "train_single_cross_leave_one_transaction_out_mahalanobis"
+            if args.activation_aware_g1c
+            else
             "train_single_leave_one_transaction_out_mahalanobis"
             if args.activation_aware_g1b
             else "frozen_train_single_observable_envelope"
@@ -2556,26 +3282,43 @@ def run(args):
             else None
         ),
         "correction_guard_proxy_source": (
-            "observable_refiner_objective_same_source_signed_margins"
+            "per_case_physical_stage_relative_signed_margins"
+            if args.activation_aware_g1c
+            else "observable_refiner_objective_same_source_signed_margins"
             if g1_family else None
+        ),
+        "candidate_fixed_guard_shadow_source": (
+            "complete_transaction_exact_fixed_guard_details"
+            if args.activation_aware_g1c else None
         ),
         "guard_proxy_acceptance_contract": (
             "candidate_signed_margin_le_numeric_tolerance"
             if args.activation_aware_g1b else None
         ),
+        "fixed_guard_shadow_acceptance_contract": (
+            "full_transaction_fixed_guard_shadow_le_zero"
+            if args.activation_aware_g1c else None
+        ),
         "guard_active_set_science_feasibility_projection": bool(
-            args.activation_aware_g1b
+            args.activation_aware_g1b or args.activation_aware_g1c
         ),
         "correction_temporal_regularizer": (
             "owned_tangent_second_plus_third_difference_l2"
-            if args.activation_aware_g1b else None
+            if (args.activation_aware_g1b or args.activation_aware_g1c)
+            else None
         ),
-        "complete_fixed_guard_used_for_candidate_selection": False,
+        "complete_fixed_guard_used_for_candidate_selection": bool(
+            args.activation_aware_g1c
+        ),
         "complete_fixed_guard_used_for_final_acceptance": True,
         "inference_role_label_consumed": False,
         "inference_teacher_kind_consumed": False,
         "inference_validation_label_consumed": False,
         "inference_hidden_clean_consumed": False,
+        "activation_inference_group_label_consumed": False,
+        "fixed_guard_shadow_frozen_group_contract_consumed": bool(
+            args.activation_aware_g1c
+        ),
         "activation_aware_summary": activation_summary,
         "activation_aware_supported": activation_aware_supported,
         "exact_radius_normalization_by_case": radius,
@@ -2606,7 +3349,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g1b_contract_margin_conformal_complete"
+            "v15_15g1c_fixed_guard_shadow_complete"
+            if args.activation_aware_g1c
+            else "v15_15g1b_contract_margin_conformal_complete"
             if args.activation_aware_g1b
             else "v15_15g1_observable_guard_aligned_complete"
             if args.activation_aware_g1
@@ -2638,6 +3383,7 @@ def main():
     parser.add_argument("--activation-aware", action="store_true")
     parser.add_argument("--activation-aware-g1", action="store_true")
     parser.add_argument("--activation-aware-g1b", action="store_true")
+    parser.add_argument("--activation-aware-g1c", action="store_true")
     parser.add_argument(
         "--activation-proxy-tolerance", type=float, default=1.0e-6
     )
@@ -2706,12 +3452,17 @@ def main():
         args.activation_aware,
         args.activation_aware_g1,
         args.activation_aware_g1b,
+        args.activation_aware_g1c,
     ))) > 1:
         parser.error("choose one activation-aware protocol")
     if (
-        args.activation_aware_g1 or args.activation_aware_g1b
+        args.activation_aware_g1
+        or args.activation_aware_g1b
+        or args.activation_aware_g1c
     ) and not args.train_teacher_bank:
-        parser.error("--activation-aware-g1/g1b requires --train-teacher-bank")
+        parser.error(
+            "--activation-aware-g1/g1b/g1c requires --train-teacher-bank"
+        )
     if args.severity_envelope_margin_fraction < 0.0:
         parser.error("severity envelope margin fraction must be non-negative")
     if args.severity_envelope_absolute_margin < 0.0:
