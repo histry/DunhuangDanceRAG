@@ -25,6 +25,20 @@ def test_fixed_guard_shadow_reconstructs_authoritative_formula():
     assert row["passed"] is True
 
 
+def test_case_isolated_transaction_tangent_uses_product_tangent_width():
+    baseline = torch.zeros((3, 120, 151))
+    scoped = torch.ones((1, 120, 75))
+
+    transaction_tangent = g._case_isolated_transaction_tangent(
+        baseline, scoped, 1
+    )
+
+    assert transaction_tangent.shape == (3, 120, 75)
+    assert torch.equal(transaction_tangent[1:2], scoped)
+    assert torch.count_nonzero(transaction_tangent[0]) == 0
+    assert torch.count_nonzero(transaction_tangent[2]) == 0
+
+
 def test_discriminative_status_uses_observables_and_abstains(monkeypatch):
     dimension = len(g.G1_SEVERITY_CHANNELS)
     identity = torch.eye(dimension, dtype=torch.float64).tolist()

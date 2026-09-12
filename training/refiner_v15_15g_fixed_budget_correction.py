@@ -744,6 +744,15 @@ def _fixed_guard_shadow_from_details(details, relative, absolute):
     return shadow, audit
 
 
+def _case_isolated_transaction_tangent(baseline, scoped, local_case):
+    """Place one 75D product tangent into its complete transaction."""
+    transaction_tangent = scoped.new_zeros(
+        (int(baseline.shape[0]), *scoped.shape[1:])
+    )
+    transaction_tangent[int(local_case):int(local_case) + 1] = scoped
+    return transaction_tangent
+
+
 def _g1c_candidate_evidence(
     *,
     model,
@@ -764,8 +773,9 @@ def _g1c_candidate_evidence(
     local = tangent[global_case:global_case + 1]
     mask = ownership[global_case:global_case + 1].expand_as(local)
     scoped = local.masked_fill(~mask, 0.0)
-    transaction_tangent = m.torch.zeros_like(domain["baseline"])
-    transaction_tangent[local_case:local_case + 1] = scoped
+    transaction_tangent = _case_isolated_transaction_tangent(
+        domain["baseline"], scoped, local_case
+    )
     candidate = product_exp_torch(
         domain["baseline"], transaction_tangent
     )
