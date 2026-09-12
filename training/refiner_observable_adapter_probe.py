@@ -662,11 +662,12 @@ def run(args):
         device,
         adapter_state_path=adapter_state_path,
     )
-    model.observable_adapter_gate_floor.copy_(m.torch.as_tensor(
-        float(teacher["observable_adapter_gate_floor"]),
-        dtype=model.observable_adapter_gate_floor.dtype,
-        device=device,
-    ))
+    if not args.preserve_adapter_gate_floor:
+        model.observable_adapter_gate_floor.copy_(m.torch.as_tensor(
+            float(teacher["observable_adapter_gate_floor"]),
+            dtype=model.observable_adapter_gate_floor.dtype,
+            device=device,
+        ))
     model.train(not args.audit_only)
     parameters = [
         parameter for parameter in model.parameters()
@@ -675,6 +676,22 @@ def run(args):
     optimizer = m.torch.optim.AdamW(
         parameters, lr=float(args.learning_rate), weight_decay=1.0e-4
     )
+    optimizer_state_resumed = False
+    if args.resume_optimizer:
+        if adapter_state_path is None:
+            raise RuntimeError("--resume-optimizer requires --adapter-state")
+        resume_payload = m.torch.load(
+            adapter_state_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        optimizer_state = resume_payload.get("optimizer_state_dict")
+        if not isinstance(optimizer_state, dict) or not optimizer_state:
+            raise RuntimeError(
+                "adapter state does not contain resumable optimizer state"
+            )
+        optimizer.load_state_dict(optimizer_state)
+        optimizer_state_resumed = True
     with m.torch.no_grad():
         # Reuse the exact frozen V15.13 outputs captured by the teacher bank.
         # Re-running the newly Adapter-enabled model here would make the
@@ -1368,6 +1385,7 @@ def run(args):
             for key, value in model.state_dict().items()
             if key.startswith("observable_adapter_")
         },
+        "optimizer_state_dict": optimizer.state_dict(),
         "gate_floor": float(model.observable_adapter_gate_floor),
     }, state_path)
     report = {
@@ -1436,6 +1454,12 @@ def run(args):
         "adapter_zero_initialized": adapter_state_path is None,
         "projector_gradient_protocol": "stop_gradient_initial_probe",
         "gradient_clip": float(args.gradient_clip),
+        "optimizer_state_resumed": optimizer_state_resumed,
+        "adapter_gate_floor_source": (
+            "resumed_training_state"
+            if args.preserve_adapter_gate_floor
+            else "current_teacher_bank_calibration"
+        ),
         "source_checkpoint_missing_adapter_keys": missing,
         "fixed_guard_thresholds_changed": False,
         "physical_gate_changed": False,
@@ -1495,6 +1519,10 @@ def main():
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--target-rms", type=float, default=1.0e-4)
     parser.add_argument("--adapter-state")
+    parser.add_argument("--resume-optimizer", action="store_true")
+    parser.add_argument(
+        "--preserve-adapter-gate-floor", action="store_true"
+    )
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--exact-radius-training", action="store_true")
     parser.add_argument(
@@ -1560,6 +1588,12 @@ def main():
             parser.error("--audit-only requires --steps 0")
     elif args.steps < 1:
         parser.error("probe steps must be positive")
+    if args.resume_optimizer and args.audit_only:
+        parser.error("audit-only runs cannot resume the optimizer")
+    if args.preserve_adapter_gate_floor and not args.adapter_state:
+        parser.error(
+            "--preserve-adapter-gate-floor requires --adapter-state"
+        )
     return run(args)
 
 
