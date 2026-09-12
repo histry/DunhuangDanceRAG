@@ -5,14 +5,17 @@ Anchor, ownership mask, exact 1e-4 tangent sphere, differentiable constraint
 bundle and final raw/Projector/Guard audit.  Correction outputs are detached;
 validation successes and failures are never recycled into training data.
 
-The activation-aware mode adds identity as an explicit zero-action candidate
-and selects among identity, Adapter, Euclidean and Riemannian candidates using
-only observable Anchor-relative objectives.  Offline role/group metadata is
-attached only after selection for exact closure reporting.
+The activation-aware modes add identity as an explicit zero-action candidate.
+V15.15g1 freezes an observable severity envelope from train-split single
+controls, then selects among Adapter, Euclidean and Riemannian candidates only
+when the Anchor lies outside that envelope.  Five differentiable signed-margin
+terms from the fixed-Guard metric implementation prevent jerk/window/boundary
+regression. Offline role/group metadata is attached only after selection.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -34,6 +37,9 @@ SCHEMA = "refiner_v15_15g_fixed_budget_manifold_correction_ablation_v1"
 ACTIVATION_AWARE_SCHEMA = (
     "refiner_v15_15g_activation_aware_manifold_selection_probe_v1"
 )
+G1_SCHEMA = (
+    "refiner_v15_15g1_observable_severity_guard_aligned_correction_v1"
+)
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
 TEACHER_SCHEMA = adapter.V15_15E_TEACHER_SCHEMA
 METHODS = ("adapter", "euclidean_projected", "riemannian_retraction")
@@ -49,6 +55,37 @@ ACTIVATION_PHYSICAL_PROXY_KEYS = (
     "outside",
     "contact",
 )
+G1_GUARD_PROXY_TERMS = {
+    "joint_jerk_p95": "repair_joint_jerk_mps3_p95_signed_margin",
+    "joint_jerk_window_p95": (
+        "repair_joint_jerk_window_p95_max_mps3_signed_margin"
+    ),
+    "extremity_jerk_p95": (
+        "repair_extremity_jerk_mps3_p95_signed_margin"
+    ),
+    "extremity_jerk_window_p95": (
+        "repair_extremity_jerk_window_p95_max_mps3_signed_margin"
+    ),
+    "boundary": "boundary_jerk_signed_margin",
+}
+G1_SEVERITY_CHANNELS = (
+    "endpoint_gap",
+    "temporal_gap",
+    "root_gap",
+    "root_velocity_gap",
+    "yaw_gap",
+    "support_mismatch",
+    "phase_coverage",
+    "phase_edge_density",
+)
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def negative_contrastive_penalty(predicted, rejected, *, margin=0.0):
@@ -172,6 +209,189 @@ def _label_free_activation_objective(
     }
 
 
+def _observable_severity(sample):
+    """Summarize serialized Adapter observables without using role labels."""
+    features = sample["observable_condition"].detach().to(
+        dtype=m.torch.float64, device="cpu"
+    )
+    ownership = sample["ownership"].detach().to(
+        dtype=m.torch.bool, device="cpu"
+    )
+    if features.ndim != 2 or features.shape[-1] != (
+        m.REFINER_ADAPTER_OBSERVABLE_DIM + m.REFINER_ADAPTER_PHASE_DIM
+    ):
+        raise RuntimeError("observable severity feature layout mismatch")
+    active = ownership[..., 0] if ownership.ndim == 2 else ownership
+    if active.ndim != 1 or active.shape[0] != features.shape[0]:
+        raise RuntimeError("observable severity ownership layout mismatch")
+    if not bool(active.any()):
+        raise RuntimeError("observable severity has empty ownership")
+    owned = features[active]
+    support_mismatch = (
+        owned[:, 5:9] - owned[:, 9:13]
+    ).abs().amax()
+    phase_start = m.REFINER_ADAPTER_OBSERVABLE_DIM
+    phase_coverage = features[:, phase_start].mean()
+    phase_edge_density = owned[:, phase_start + 1].abs().mean()
+    values = {
+        "endpoint_gap": owned[:, 0].amax(),
+        "temporal_gap": owned[:, 1].amax(),
+        "root_gap": owned[:, 2].amax(),
+        "root_velocity_gap": owned[:, 3].amax(),
+        "yaw_gap": owned[:, 4].amax(),
+        "support_mismatch": support_mismatch,
+        "phase_coverage": phase_coverage,
+        "phase_edge_density": phase_edge_density,
+    }
+    return {key: float(values[key]) for key in G1_SEVERITY_CHANNELS}
+
+
+def _freeze_single_severity_envelope(
+    train_teacher,
+    *,
+    margin_fraction,
+    absolute_margin,
+):
+    """Freeze an observable envelope from train-split single controls only."""
+    controls = [
+        sample for sample in train_teacher["samples"]
+        if sample.get("teacher_kind") == "identity_control"
+    ]
+    if not controls:
+        raise RuntimeError("train bank has no single controls for envelope")
+    rows = {
+        str(sample["case_uid"]): _observable_severity(sample)
+        for sample in controls
+    }
+    maxima = {
+        key: max(row[key] for row in rows.values())
+        for key in G1_SEVERITY_CHANNELS
+    }
+    limits = {
+        key: max(
+            maxima[key] * (1.0 + float(margin_fraction)),
+            maxima[key] + float(absolute_margin),
+        )
+        for key in G1_SEVERITY_CHANNELS
+    }
+    return {
+        "schema": "refiner_v15_15g1_single_severity_envelope_v1",
+        "calibration_split": "train",
+        "calibration_role": "identity_control",
+        "calibration_role_used_offline_only": True,
+        "inference_role_label_consumed": False,
+        "control_count": len(controls),
+        "channels": list(G1_SEVERITY_CHANNELS),
+        "maximum_by_channel": maxima,
+        "limit_by_channel": limits,
+        "margin_fraction": float(margin_fraction),
+        "absolute_margin": float(absolute_margin),
+        "case_severity": rows,
+    }
+
+
+def _severity_status(sample, envelope, scale_floor):
+    values = _observable_severity(sample)
+    limits = envelope["limit_by_channel"]
+    excess = {
+        key: values[key] - float(limits[key])
+        for key in G1_SEVERITY_CHANNELS
+    }
+    normalized = {
+        key: excess[key] / max(abs(float(limits[key])), float(scale_floor))
+        for key in G1_SEVERITY_CHANNELS
+    }
+    return {
+        "values": values,
+        "limits": dict(limits),
+        "excess": excess,
+        "normalized_excess": normalized,
+        "maximum_normalized_excess": max(normalized.values()),
+        "outside_frozen_single_envelope": any(
+            value > 0.0 for value in excess.values()
+        ),
+    }
+
+
+def _guard_proxy_values(batch, cfg, baseline, candidate, case_index):
+    _, terms = m._observable_refiner_objective(
+        candidate,
+        baseline.detach(),
+        batch["seam"],
+        cfg,
+        reduction="none",
+    )
+    index = int(case_index)
+    return {
+        name: terms[key][index]
+        for name, key in G1_GUARD_PROXY_TERMS.items()
+    }
+
+
+def _guard_aligned_correction_objective(
+    batch,
+    cfg,
+    baseline,
+    candidate,
+    case_index,
+    anchor_proxy,
+    tolerance,
+    scale_floor,
+):
+    _, terms = m._observable_refiner_objective(
+        candidate,
+        baseline.detach(),
+        batch["seam"],
+        cfg,
+        reduction="none",
+    )
+    index = int(case_index)
+    scientific = {
+        "endpoint_scientific_deficit": terms[
+            "endpoint_scientific_deficit"
+        ][index],
+        "temporal_scientific_deficit": terms[
+            "temporal_scientific_deficit"
+        ][index],
+    }
+    candidate_proxy = {
+        name: terms[key][index]
+        for name, key in G1_GUARD_PROXY_TERMS.items()
+    }
+    proxy_delta = {
+        name: candidate_proxy[name] - anchor_proxy[name]
+        for name in G1_GUARD_PROXY_TERMS
+    }
+    proxy_excess = {
+        name: m.torch.relu(delta - float(tolerance))
+        / anchor_proxy[name].abs().clamp_min(float(scale_floor))
+        for name, delta in proxy_delta.items()
+    }
+    loss = m.torch.stack(list(scientific.values())).sum()
+    loss = loss + m.torch.stack(list(proxy_excess.values())).square().sum()
+    diagnostics = {
+        **{
+            key: float(value.detach())
+            for key, value in scientific.items()
+        },
+        "guard_proxy_anchor": {
+            key: float(value.detach()) for key, value in anchor_proxy.items()
+        },
+        "guard_proxy_candidate": {
+            key: float(value.detach())
+            for key, value in candidate_proxy.items()
+        },
+        "guard_proxy_delta": {
+            key: float(value.detach()) for key, value in proxy_delta.items()
+        },
+        "guard_proxy_normalized_excess": {
+            key: float(value.detach())
+            for key, value in proxy_excess.items()
+        },
+    }
+    return loss, diagnostics
+
+
 def _bounded_direction(direction, mask, maximum_rms):
     masked = direction.masked_fill(~mask, 0.0)
     active = masked[mask]
@@ -201,6 +421,9 @@ def _correct_case(
     step_size,
     trust_fraction,
     activation_aware=False,
+    guard_aligned=False,
+    guard_proxy_tolerance=1.0e-6,
+    guard_proxy_scale_floor=1.0e-6,
 ):
     mask = _owned_case_mask(ownership, initial_tangent, case_index)
     current, normalized = _normalize_exact_radius(
@@ -223,6 +446,15 @@ def _correct_case(
         current = m.torch.zeros_like(initial_tangent).masked_fill(
             ~mask, 0.0
         )
+    anchor_proxy = None
+    if guard_aligned:
+        anchor_proxy = _guard_proxy_values(
+            batch,
+            cfg,
+            baseline,
+            baseline,
+            case_index,
+        )
 
     for iteration in range(int(steps)):
         if method == "euclidean_projected":
@@ -239,7 +471,18 @@ def _correct_case(
         else:
             raise ValueError(f"unsupported correction method: {method}")
 
-        if activation_aware:
+        if guard_aligned:
+            loss, constraints = _guard_aligned_correction_objective(
+                batch,
+                cfg,
+                baseline,
+                candidate,
+                case_index,
+                anchor_proxy,
+                guard_proxy_tolerance,
+                guard_proxy_scale_floor,
+            )
+        elif activation_aware:
             loss, _, constraints = _label_free_activation_objective(
                 batch,
                 cfg,
@@ -300,7 +543,18 @@ def _correct_case(
             if not trial_ok:
                 continue
             trial_candidate = product_exp_torch(baseline, trial)
-            if activation_aware:
+            if guard_aligned:
+                trial_loss, _ = _guard_aligned_correction_objective(
+                    batch,
+                    cfg,
+                    baseline,
+                    trial_candidate,
+                    case_index,
+                    anchor_proxy,
+                    guard_proxy_tolerance,
+                    guard_proxy_scale_floor,
+                )
+            elif activation_aware:
                 trial_loss, _, _ = _label_free_activation_objective(
                     batch,
                     cfg,
@@ -352,8 +606,9 @@ def _correct_case(
         "numeric_failure": numeric_failure,
         "zero_adapter_start": zero_start,
         "role_or_group_consumed_by_correction": bool(
-            not activation_aware
+            not activation_aware and not guard_aligned
         ),
+        "guard_aligned_correction": bool(guard_aligned),
         "final_exact_radius_rms": _rms(current, mask),
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
@@ -547,6 +802,7 @@ def _activation_aware_selection(
                 "radius_equality_resolved": radius_resolved,
                 "numeric_failure": numeric_failure,
                 "eligible": accepted,
+                "eligible_after_adapter_incumbent": accepted,
             }
             if accepted:
                 eligible.append((loss_value, method, scoped))
@@ -567,6 +823,215 @@ def _activation_aware_selection(
                     identity_physical.detach()
                 ),
                 "identity_proxy_components": identity_components,
+                "candidates": candidates,
+            },
+            "evaluation_only": {
+                "teacher_kind": sample.get("teacher_kind"),
+                "audit_group": sample.get("audit_group"),
+            },
+        }
+    return selected, decisions, dict(method_counts)
+
+
+def _g1_observable_guard_selection(
+    *,
+    variants,
+    correction_reports,
+    samples,
+    domains,
+    ownership,
+    baseline_terms,
+    cfg,
+    target_rms,
+    severity_envelope,
+    severity_scale_floor,
+    guard_proxy_tolerance,
+    guard_proxy_scale_floor,
+):
+    """Select a repair from severity and differentiable Guard proxies only."""
+    selected = m.torch.zeros_like(next(iter(variants.values())))
+    decisions = {}
+    method_counts = Counter()
+    for sample in samples:
+        uid = str(sample.get("case_uid", sample["case_index"]))
+        problem = _sample_problem(sample, domains, ownership)
+        case_index = problem["global_case_index"]
+        severity = _severity_status(
+            sample,
+            severity_envelope,
+            severity_scale_floor,
+        )
+        baseline_case = {
+            key: float(baseline_terms[key][case_index].detach())
+            for key in ("endpoint", "temporal")
+        }
+        anchor_proxy = _guard_proxy_values(
+            problem["batch"],
+            cfg,
+            problem["baseline"],
+            problem["baseline"],
+            0,
+        )
+        candidates = {}
+        eligible = []
+        for method, tangent in variants.items():
+            local = tangent[case_index:case_index + 1]
+            mask = problem["ownership"].expand_as(local)
+            outside = local.masked_fill(mask, 0.0)
+            outside_scope_abs_max = (
+                float(outside.abs().amax().detach())
+                if outside.numel() else 0.0
+            )
+            scoped = local.masked_fill(~mask, 0.0)
+            active_rms = _rms(scoped, mask)
+            radius_resolved = bool(
+                math.isfinite(active_rms)
+                and abs(active_rms - float(target_rms))
+                <= max(1.0e-12, float(target_rms) * 1.0e-6)
+            )
+            candidate = product_exp_torch(problem["baseline"], scoped)
+            objective, components = _guard_aligned_correction_objective(
+                problem["batch"],
+                cfg,
+                problem["baseline"],
+                candidate,
+                0,
+                anchor_proxy,
+                guard_proxy_tolerance,
+                guard_proxy_scale_floor,
+            )
+            candidate_proxy = _guard_proxy_values(
+                problem["batch"],
+                cfg,
+                problem["baseline"],
+                candidate,
+                0,
+            )
+            proxy_delta = {
+                name: float(
+                    (candidate_proxy[name] - anchor_proxy[name]).detach()
+                )
+                for name in G1_GUARD_PROXY_TERMS
+            }
+            normalized_proxy_delta = {
+                name: proxy_delta[name] / max(
+                    abs(float(anchor_proxy[name].detach())),
+                    float(guard_proxy_scale_floor),
+                )
+                for name in G1_GUARD_PROXY_TERMS
+            }
+            worst_proxy_delta = max(normalized_proxy_delta.values())
+            proxy_nonregression = all(
+                value <= float(guard_proxy_tolerance)
+                for value in proxy_delta.values()
+            )
+            case_terms = oracle.case_probe._case_terms(
+                candidate,
+                problem["batch"],
+                cfg,
+            )
+            candidate_case = {
+                key: float(case_terms[key][0].detach())
+                for key in ("endpoint", "temporal")
+            }
+            scientific = oracle._case_scientific_status(
+                candidate_case, baseline_case
+            )
+            numeric_failure = bool(
+                correction_reports.get(method, {}).get(uid, {}).get(
+                    "numeric_failure", False
+                )
+            )
+            objective_value = float(objective.detach())
+            accepted = bool(
+                severity["outside_frozen_single_envelope"]
+                and scientific["passed"]
+                and proxy_nonregression
+                and radius_resolved
+                and outside_scope_abs_max == 0.0
+                and math.isfinite(objective_value)
+                and not numeric_failure
+            )
+            candidates[method] = {
+                "objective": objective_value,
+                "severity_gate_passed": bool(
+                    severity["outside_frozen_single_envelope"]
+                ),
+                "guard_proxy_nonregression": proxy_nonregression,
+                "guard_proxy_delta": proxy_delta,
+                "guard_proxy_normalized_delta": normalized_proxy_delta,
+                "guard_proxy_worst_normalized_delta": worst_proxy_delta,
+                "proxy_components": components,
+                "endpoint_delta": scientific["endpoint_delta"],
+                "temporal_delta": scientific["temporal_delta"],
+                "scientific_passed": bool(scientific["passed"]),
+                "radius_rms": active_rms,
+                "radius_equality_resolved": radius_resolved,
+                "outside_scope_abs_max": outside_scope_abs_max,
+                "scope_safe": outside_scope_abs_max == 0.0,
+                "numeric_failure": numeric_failure,
+                "eligible": accepted,
+            }
+            if accepted:
+                eligible.append((
+                    worst_proxy_delta,
+                    objective_value,
+                    method,
+                    scoped,
+                ))
+        adapter_candidate = candidates.get("adapter")
+        if adapter_candidate and adapter_candidate["eligible"]:
+            retained = []
+            for row in eligible:
+                method = row[2]
+                candidate = candidates[method]
+                guard_dominates_adapter = all(
+                    candidate["guard_proxy_delta"][name]
+                    <= adapter_candidate["guard_proxy_delta"][name]
+                    + float(guard_proxy_tolerance)
+                    for name in G1_GUARD_PROXY_TERMS
+                )
+                science_dominates_adapter = bool(
+                    candidate["objective"]
+                    <= adapter_candidate["objective"] + 1.0e-12
+                )
+                incumbent_safe = bool(
+                    method == "adapter"
+                    or (
+                        guard_dominates_adapter
+                        and science_dominates_adapter
+                    )
+                )
+                candidate["guard_dominates_adapter"] = (
+                    guard_dominates_adapter
+                )
+                candidate["science_dominates_adapter"] = (
+                    science_dominates_adapter
+                )
+                candidate["eligible_after_adapter_incumbent"] = (
+                    incumbent_safe
+                )
+                if incumbent_safe:
+                    retained.append(row)
+            eligible = retained
+        if eligible:
+            _, _, selected_method, selected_tangent = min(
+                eligible,
+                key=lambda row: (row[0], row[1], row[2]),
+            )
+            selected[case_index:case_index + 1] = selected_tangent
+        else:
+            selected_method = "identity"
+        method_counts.update([selected_method])
+        decisions[uid] = {
+            "selected_method": selected_method,
+            "selected_nonzero": bool(selected_method != "identity"),
+            "selection": {
+                "anchor_severity": severity,
+                "activation_condition": (
+                    "anchor_outside_frozen_train_single_envelope"
+                ),
+                "guard_proxy_terms": dict(G1_GUARD_PROXY_TERMS),
                 "candidates": candidates,
             },
             "evaluation_only": {
@@ -603,6 +1068,9 @@ def _variant_summary(audits, correction_reports, elapsed):
 
 def run(args):
     started = time.perf_counter()
+    activation_enabled = bool(
+        args.activation_aware or args.activation_aware_g1
+    )
     destination = Path(args.output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=False)
     teacher_path = Path(args.validation_teacher_bank).resolve()
@@ -620,6 +1088,57 @@ def run(args):
         raise RuntimeError("validation bank reports train case overlap")
     if teacher.get("train_validation_source_case_overlap"):
         raise RuntimeError("validation bank reports source-case overlap")
+
+    train_teacher = None
+    severity_envelope = None
+    severity_envelope_path = None
+    train_teacher_path = None
+    if args.activation_aware_g1:
+        if not args.train_teacher_bank:
+            raise RuntimeError("V15.15g1 requires --train-teacher-bank")
+        train_teacher_path = Path(args.train_teacher_bank).resolve()
+        train_teacher = m.torch.load(
+            train_teacher_path, map_location="cpu", weights_only=False
+        )
+        if train_teacher.get("schema") != TEACHER_SCHEMA:
+            raise RuntimeError("V15.15g1 train bank schema mismatch")
+        if train_teacher.get("split") != "train":
+            raise RuntimeError("V15.15g1 envelope bank must be train split")
+        if not train_teacher.get("teacher_bank_ready"):
+            raise RuntimeError("V15.15g1 train bank is not ready")
+        if train_teacher.get("source_diagnostic") != teacher.get(
+            "source_diagnostic"
+        ):
+            raise RuntimeError("train/validation source diagnostic mismatch")
+        for key in (
+            "split_manifest_file_sha256",
+            "split_manifest_content_sha256",
+        ):
+            if train_teacher.get(key) != teacher.get(key):
+                raise RuntimeError(f"train/validation {key} mismatch")
+        severity_envelope = _freeze_single_severity_envelope(
+            train_teacher,
+            margin_fraction=float(args.severity_envelope_margin_fraction),
+            absolute_margin=float(args.severity_envelope_absolute_margin),
+        )
+        severity_envelope.update({
+            "train_teacher_bank": str(train_teacher_path),
+            "train_teacher_bank_sha256": _file_sha256(train_teacher_path),
+            "split_manifest_file_sha256": teacher.get(
+                "split_manifest_file_sha256"
+            ),
+            "split_manifest_content_sha256": teacher.get(
+                "split_manifest_content_sha256"
+            ),
+        })
+        severity_envelope_path = (
+            destination / "observable_severity_envelope.json"
+        )
+        severity_envelope_path.write_text(
+            json.dumps(severity_envelope, ensure_ascii=False, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
 
     cfg = m.MotionGenerationConfig.from_json(args.config).apply_env()
     cfg.product_refiner_observable_adapter = True
@@ -654,7 +1173,7 @@ def run(args):
         ~ownership.expand_as(trace["decoder_consistent_tangent"]), 0.0
     )
     samples = teacher["samples"]
-    if args.activation_aware:
+    if activation_enabled:
         initial, radius = _normalize_all_sample_tangents(
             initial,
             ownership,
@@ -689,7 +1208,7 @@ def run(args):
             tangent.zero_()
             for sample in samples:
                 if (
-                    not args.activation_aware
+                    not activation_enabled
                     and sample["teacher_kind"] != "exact_projected_direction"
                 ):
                     continue
@@ -697,7 +1216,7 @@ def run(args):
                 domain = domains[transaction_id]
                 start, stop = domain["slice"]
                 local_case = int(sample["local_case_index"])
-                if args.activation_aware:
+                if activation_enabled:
                     group = None
                     local_initial = initial[
                         int(sample["case_index"]):
@@ -750,9 +1269,16 @@ def run(args):
                     target_rms=float(args.target_rms),
                     step_size=float(args.step_size),
                     trust_fraction=float(args.trust_fraction),
-                    activation_aware=bool(args.activation_aware),
+                    activation_aware=activation_enabled,
+                    guard_aligned=bool(args.activation_aware_g1),
+                    guard_proxy_tolerance=float(
+                        args.guard_proxy_nonregression_tolerance
+                    ),
+                    guard_proxy_scale_floor=float(
+                        args.guard_proxy_scale_floor
+                    ),
                 )
-                if args.activation_aware:
+                if activation_enabled:
                     global_case = int(sample["case_index"])
                     tangent[global_case:global_case + 1] = corrected
                 else:
@@ -829,10 +1355,37 @@ def run(args):
 
     activation_summary = None
     activation_aware_supported = False
-    if args.activation_aware:
+    if activation_enabled:
         selection_started = time.perf_counter()
-        selected_tangent, activation_decisions, selected_method_counts = (
-            _activation_aware_selection(
+        if args.activation_aware_g1:
+            (
+                selected_tangent,
+                activation_decisions,
+                selected_method_counts,
+            ) = _g1_observable_guard_selection(
+                variants=variant_tangents,
+                correction_reports=variant_correction_reports,
+                samples=samples,
+                domains=domains,
+                ownership=ownership,
+                baseline_terms=baseline_terms,
+                cfg=cfg,
+                target_rms=float(args.target_rms),
+                severity_envelope=severity_envelope,
+                severity_scale_floor=float(args.severity_scale_floor),
+                guard_proxy_tolerance=float(
+                    args.guard_proxy_nonregression_tolerance
+                ),
+                guard_proxy_scale_floor=float(
+                    args.guard_proxy_scale_floor
+                ),
+            )
+        else:
+            (
+                selected_tangent,
+                activation_decisions,
+                selected_method_counts,
+            ) = _activation_aware_selection(
                 variants=variant_tangents,
                 correction_reports=variant_correction_reports,
                 samples=samples,
@@ -846,7 +1399,6 @@ def run(args):
                     args.activation_relative_improvement
                 ),
             )
-        )
         selected_audits = adapter._audit_step(
             model,
             batch,
@@ -928,26 +1480,69 @@ def run(args):
                 "selected_nonzero"
             ]
         )
+        selected_proxy_nonregression_complete = bool(
+            not args.activation_aware_g1
+            or all(
+                not decision["selected_nonzero"]
+                or decision["selection"]["candidates"][
+                    decision["selected_method"]
+                ]["guard_proxy_nonregression"]
+                for decision in activation_decisions.values()
+            )
+        )
+        selected_severity_condition_complete = bool(
+            not args.activation_aware_g1
+            or all(
+                not decision["selected_nonzero"]
+                or decision["selection"]["anchor_severity"][
+                    "outside_frozen_single_envelope"
+                ]
+                for decision in activation_decisions.values()
+            )
+        )
         correction_numeric_failures = sum(
             int(report.get("numeric_failure", False))
             for reports in variant_correction_reports.values()
             for report in reports.values()
         )
-        decision_numeric_complete = all(
-            math.isfinite(float(decision["selection"][
-                "identity_objective"
-            ]))
-            and all(
-                math.isfinite(float(candidate["objective"]))
-                and math.isfinite(float(candidate[
-                    "physical_proxy_excess"
-                ]))
-                for candidate in decision["selection"][
-                    "candidates"
-                ].values()
+        if args.activation_aware_g1:
+            decision_numeric_complete = all(
+                math.isfinite(float(decision["selection"][
+                    "anchor_severity"
+                ]["maximum_normalized_excess"]))
+                and all(
+                    math.isfinite(float(candidate["objective"]))
+                    and math.isfinite(float(candidate[
+                        "outside_scope_abs_max"
+                    ]))
+                    and all(
+                        math.isfinite(float(value))
+                        for value in candidate[
+                            "guard_proxy_delta"
+                        ].values()
+                    )
+                    for candidate in decision["selection"][
+                        "candidates"
+                    ].values()
+                )
+                for decision in activation_decisions.values()
             )
-            for decision in activation_decisions.values()
-        )
+        else:
+            decision_numeric_complete = all(
+                math.isfinite(float(decision["selection"][
+                    "identity_objective"
+                ]))
+                and all(
+                    math.isfinite(float(candidate["objective"]))
+                    and math.isfinite(float(candidate[
+                        "physical_proxy_excess"
+                    ]))
+                    for candidate in decision["selection"][
+                        "candidates"
+                    ].values()
+                )
+                for decision in activation_decisions.values()
+            )
         scope_safe = bool(
             selected_audits
             and all(
@@ -976,18 +1571,49 @@ def run(args):
             and single_identity_safe
             and scope_safe
             and numeric_audit_complete
+            and selected_proxy_nonregression_complete
+            and selected_severity_condition_complete
         )
         activation_summary = {
             "selection_protocol": (
-                "identity_or_lowest_observable_anchor_objective_v1"
+                "severity_then_guard_proxy_lexicographic_v1"
+                if args.activation_aware_g1
+                else "identity_or_lowest_observable_anchor_objective_v1"
             ),
             "identity_is_explicit_zero_candidate": True,
             "nonidentity_candidate_radius_rms": float(args.target_rms),
             "activation_proxy_tolerance": float(
                 args.activation_proxy_tolerance
+            ) if not args.activation_aware_g1 else None,
+            "activation_relative_improvement": (
+                float(args.activation_relative_improvement)
+                if not args.activation_aware_g1 else None
             ),
-            "activation_relative_improvement": float(
-                args.activation_relative_improvement
+            "observable_severity_envelope": (
+                str(severity_envelope_path)
+                if severity_envelope_path is not None else None
+            ),
+            "observable_severity_envelope_sha256": (
+                _file_sha256(severity_envelope_path)
+                if severity_envelope_path is not None else None
+            ),
+            "severity_envelope_calibration_split": (
+                "train" if args.activation_aware_g1 else None
+            ),
+            "severity_envelope_role_used_offline_only": bool(
+                args.activation_aware_g1
+            ),
+            "guard_aligned_proxy_terms": (
+                dict(G1_GUARD_PROXY_TERMS)
+                if args.activation_aware_g1 else None
+            ),
+            "guard_proxy_nonregression_tolerance": (
+                float(args.guard_proxy_nonregression_tolerance)
+                if args.activation_aware_g1 else None
+            ),
+            "observable_severity_channels": (
+                list(G1_SEVERITY_CHANNELS)
+                if args.activation_aware_g1 else None
             ),
             "activation_decision_role_label_consumed": False,
             "activation_decision_teacher_kind_consumed": False,
@@ -1016,6 +1642,12 @@ def run(args):
             "single_identity_safe": single_identity_safe,
             "scope_safe": scope_safe,
             "numeric_audit_complete": numeric_audit_complete,
+            "selected_guard_proxy_nonregression_complete": (
+                selected_proxy_nonregression_complete
+            ),
+            "selected_severity_condition_complete": (
+                selected_severity_condition_complete
+            ),
             "activation_aware_supported": activation_aware_supported,
             "decisions": activation_decisions,
         }
@@ -1051,9 +1683,16 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            ACTIVATION_AWARE_SCHEMA if args.activation_aware else SCHEMA
+            G1_SCHEMA
+            if args.activation_aware_g1
+            else ACTIVATION_AWARE_SCHEMA
+            if args.activation_aware
+            else SCHEMA
         ),
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
+        "train_teacher_bank": (
+            str(train_teacher_path) if train_teacher_path else None
+        ),
         "validation_teacher_bank": str(teacher_path),
         "adapter_state": str(state_path),
         "observable_adapter_gate_mode": _gate_mode,
@@ -1071,7 +1710,20 @@ def run(args):
         "same_checkpoint_cases_radius_and_budget": True,
         "validation_recycled_as_teacher": False,
         "pseudo_teachers_generated": False,
-        "activation_aware": bool(args.activation_aware),
+        "activation_aware": activation_enabled,
+        "observable_severity_guard_aligned": bool(
+            args.activation_aware_g1
+        ),
+        "activation_severity_source": (
+            "frozen_train_single_observable_envelope"
+            if args.activation_aware_g1 else None
+        ),
+        "correction_guard_proxy_source": (
+            "observable_refiner_objective_same_source_signed_margins"
+            if args.activation_aware_g1 else None
+        ),
+        "complete_fixed_guard_used_for_candidate_selection": False,
+        "complete_fixed_guard_used_for_final_acceptance": True,
         "inference_role_label_consumed": False,
         "inference_teacher_kind_consumed": False,
         "inference_validation_label_consumed": False,
@@ -1093,7 +1745,7 @@ def run(args):
         "numeric_audit_complete": bool(
             all(row["exact_audits"] for row in variants.values())
             and (
-                not args.activation_aware
+                not activation_enabled
                 or activation_summary["numeric_audit_complete"]
             )
         ),
@@ -1106,7 +1758,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g_activation_aware_complete"
+            "v15_15g1_observable_guard_aligned_complete"
+            if args.activation_aware_g1
+            else "v15_15g_activation_aware_complete"
             if args.activation_aware
             else "v15_15g_fixed_budget_correction_complete"
         ),
@@ -1115,7 +1769,7 @@ def run(args):
         "activation_aware_supported": activation_aware_supported,
         "numeric_audit_complete": report["numeric_audit_complete"],
     }), flush=True)
-    if args.activation_aware:
+    if activation_enabled:
         return 0 if activation_aware_supported else 2
     return 0 if report["numeric_audit_complete"] else 2
 
@@ -1123,6 +1777,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--validation-teacher-bank", required=True)
+    parser.add_argument("--train-teacher-bank")
     parser.add_argument("--adapter-state", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--config", default="configs/motion_model.json")
@@ -1131,11 +1786,29 @@ def main():
     parser.add_argument("--step-size", type=float, default=1.0)
     parser.add_argument("--trust-fraction", type=float, default=0.5)
     parser.add_argument("--activation-aware", action="store_true")
+    parser.add_argument("--activation-aware-g1", action="store_true")
     parser.add_argument(
         "--activation-proxy-tolerance", type=float, default=1.0e-6
     )
     parser.add_argument(
         "--activation-relative-improvement", type=float, default=1.0e-3
+    )
+    parser.add_argument(
+        "--severity-envelope-margin-fraction", type=float, default=0.05
+    )
+    parser.add_argument(
+        "--severity-envelope-absolute-margin", type=float, default=1.0e-6
+    )
+    parser.add_argument(
+        "--severity-scale-floor", type=float, default=1.0e-6
+    )
+    parser.add_argument(
+        "--guard-proxy-nonregression-tolerance",
+        type=float,
+        default=1.0e-6,
+    )
+    parser.add_argument(
+        "--guard-proxy-scale-floor", type=float, default=1.0e-6
     )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
@@ -1156,6 +1829,20 @@ def main():
         parser.error("--trust-fraction must be in (0, 1]")
     if args.activation_proxy_tolerance < 0.0:
         parser.error("--activation-proxy-tolerance must be non-negative")
+    if args.activation_aware and args.activation_aware_g1:
+        parser.error("choose one activation-aware protocol")
+    if args.activation_aware_g1 and not args.train_teacher_bank:
+        parser.error("--activation-aware-g1 requires --train-teacher-bank")
+    if args.severity_envelope_margin_fraction < 0.0:
+        parser.error("severity envelope margin fraction must be non-negative")
+    if args.severity_envelope_absolute_margin < 0.0:
+        parser.error("severity envelope absolute margin must be non-negative")
+    if args.severity_scale_floor <= 0.0:
+        parser.error("severity scale floor must be positive")
+    if args.guard_proxy_nonregression_tolerance < 0.0:
+        parser.error("guard proxy tolerance must be non-negative")
+    if args.guard_proxy_scale_floor <= 0.0:
+        parser.error("guard proxy scale floor must be positive")
     if not 0.0 < args.activation_relative_improvement < 1.0:
         parser.error(
             "--activation-relative-improvement must be in (0, 1)"
