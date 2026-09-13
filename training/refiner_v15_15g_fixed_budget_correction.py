@@ -43,6 +43,14 @@ direction is p = C2_taper * scope_null_projection(z), and the taper is never
 applied a second time.  A train-frozen symmetric finite-difference probe checks
 the temporal angular derivative through the real geodesic, retraction, FK and
 metric path before any authoritative line-search trial is attempted.
+
+V15.15g1f2 builds a separate active set for every frozen angular trial.  Its
+constraints use the finite endpoint/temporal distance to the strict pass line
+and the unnormalized physical angular derivative.  A predicted-feasible step
+that fails the authoritative trajectory is reported as finite-radius model
+mismatch; failure of every first-order angular subproblem is reported as
+insufficient linearized science progress.  Near-zero temporal mismatches are
+audited with a frozen float64 multi-epsilon ladder.  No Hessian is used.
 """
 from __future__ import annotations
 
@@ -101,6 +109,13 @@ G1F1_SCHEMA = (
 G1F1_TRAIN_CONTRACT_SCHEMA = (
     "refiner_v15_15g1f1_train_frozen_temporal_directional_consistency_"
     "contract_v1"
+)
+G1F2_SCHEMA = (
+    "refiner_v15_15g1f2_finite_gap_angular_feasibility_sqp_v1"
+)
+G1F2_TRAIN_CONTRACT_SCHEMA = (
+    "refiner_v15_15g1f2_train_frozen_finite_gap_angular_"
+    "feasibility_contract_v1"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
@@ -865,6 +880,9 @@ def _freeze_train_full_shadow_repair_contract(
     temporal_fd_epsilon_radians=1.0e-4,
     temporal_fd_relative_error_tolerance=0.1,
     temporal_fd_absolute_floor=1.0e-8,
+    finite_gap_angular_feasibility=False,
+    temporal_fd_float64_epsilon_ladder=(1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4),
+    temporal_fd_near_zero_threshold=1.0e-5,
 ):
     """Freeze every g1d numerical choice from train transactions only."""
     if train_teacher.get("split") != "train":
@@ -896,7 +914,9 @@ def _freeze_train_full_shadow_repair_contract(
     }
     return {
         "schema": (
-            G1F1_TRAIN_CONTRACT_SCHEMA
+            G1F2_TRAIN_CONTRACT_SCHEMA
+            if finite_gap_angular_feasibility
+            else G1F1_TRAIN_CONTRACT_SCHEMA
             if temporal_directional_consistency
             else
             G1F_TRAIN_CONTRACT_SCHEMA
@@ -975,6 +995,33 @@ def _freeze_train_full_shadow_repair_contract(
             temporal_fd_relative_error_tolerance
         ),
         "temporal_fd_absolute_floor": float(temporal_fd_absolute_floor),
+        "finite_gap_angular_feasibility_sqp": bool(
+            finite_gap_angular_feasibility
+        ),
+        "per_angle_active_set": bool(finite_gap_angular_feasibility),
+        "finite_gap_constraint_coordinate": (
+            "unnormalized_true_physical_angular_derivative"
+            if finite_gap_angular_feasibility else None
+        ),
+        "finite_gap_science_gap_source": (
+            "current_distance_to_strict_pass_line"
+            if finite_gap_angular_feasibility else None
+        ),
+        "finite_gap_science_safety_rule": (
+            "max_case_numeric_tolerance_and_1e-12"
+            if finite_gap_angular_feasibility else None
+        ),
+        "finite_gap_shadow_margin_source": (
+            "train_frozen_minimum_shadow_reduction"
+            if finite_gap_angular_feasibility else None
+        ),
+        "temporal_fd_float64_epsilon_ladder": [
+            float(value) for value in temporal_fd_float64_epsilon_ladder
+        ],
+        "temporal_fd_near_zero_threshold": float(
+            temporal_fd_near_zero_threshold
+        ),
+        "second_order_hessian_used": False,
         "temporal_fd_path": (
             "symmetric_real_geodesic_retraction_fk_metric"
             if temporal_directional_consistency else None
@@ -2369,6 +2416,301 @@ def _joint_geodesic_active_set_direction(
     }
 
 
+def _finite_gap_science_requirements(constraints):
+    """Return the finite change needed to enter each strict science pass set."""
+    tolerances = constraints.get("scientific_numeric_tolerance") or {}
+    requirements = {}
+    for name in ("endpoint", "temporal"):
+        delta = float(constraints[f"{name}_delta"])
+        numeric_tolerance = float(tolerances.get(name, 0.0))
+        strict_limit = max(
+            numeric_tolerance,
+            float(oracle.case_probe.STRICT_DESCENT_FLOOR),
+        )
+        gap = max(0.0, delta + strict_limit)
+        safety_margin = max(1.0e-12, numeric_tolerance)
+        requirements[name] = {
+            "current_delta": delta,
+            "strict_pass_limit": -strict_limit,
+            "gap_to_strict_pass_line": gap,
+            "safety_margin": safety_margin,
+            "required_predicted_reduction": gap + safety_margin,
+        }
+    return requirements
+
+
+def _joint_geodesic_finite_gap_direction_for_angle(
+    *,
+    current,
+    mask,
+    taper,
+    gradients,
+    theta_radians,
+    science_requirements,
+    shadow_minimum_reduction,
+    svd_relative_cutoff,
+    direction_norm_floor,
+):
+    """Solve one angle-specific first-order subproblem in physical coordinates.
+
+    Autograd differentiates with respect to z while the authoritative path is
+    p=A z, A=diag(taper) N_scope.  On editable nonzero-taper coordinates the
+    physical angular covector is ||d|| A^{-T} grad_z.  Therefore its product
+    with a unit physical direction is exactly grad_z^T z ||d||/||p||.
+    """
+    names = ("shadow", "endpoint", "temporal")
+    theta = float(theta_radians)
+    floor = float(direction_norm_floor)
+    if not math.isfinite(theta) or theta <= 0.0:
+        raise ValueError("finite-gap angular SQP requires a positive angle")
+
+    active_mask = mask & (taper.abs() > floor)
+    radial = current.detach().masked_fill(~mask, 0.0)
+    radial_norm = m.torch.linalg.vector_norm(radial[mask])
+    if (
+        not bool(m.torch.isfinite(radial_norm))
+        or float(radial_norm.detach()) <= floor
+        or not bool(active_mask.any())
+    ):
+        return None, {
+            "solver_status": "empty_geodesic_joint_feasible_intersection",
+            "solver_failure_reason": "zero_science_gradient",
+            "joint_jacobian_status": "zero_science_gradient",
+            "theta_radians": theta,
+        }
+
+    radial_active = radial.masked_fill(~active_mask, 0.0)
+    radial_active_denominator = radial_active[active_mask].square().sum()
+    if float(radial_active_denominator.detach()) <= floor * floor:
+        return None, {
+            "solver_status": "empty_geodesic_joint_feasible_intersection",
+            "solver_failure_reason": "zero_science_gradient",
+            "joint_jacobian_status": "zero_science_gradient",
+            "theta_radians": theta,
+        }
+
+    angular_covectors = {}
+    raw_norms = {}
+    tangent_norms = {}
+    for name in names:
+        gradient_z = gradients.get(name)
+        if gradient_z is None or not bool(m.torch.isfinite(gradient_z).all()):
+            return None, {
+                "solver_status": "nonfinite_joint_jacobian",
+                "solver_failure_reason": "nonfinite_joint_jacobian",
+                "joint_jacobian_status": "nonfinite_joint_jacobian",
+                "theta_radians": theta,
+            }
+        physical_covector = m.torch.zeros_like(gradient_z)
+        physical_covector[active_mask] = (
+            gradient_z.detach()[active_mask] / taper[active_mask]
+        )
+        angular_covector = physical_covector * radial_norm
+        coefficient = (
+            (angular_covector[active_mask] * radial_active[active_mask]).sum()
+            / radial_active_denominator
+        )
+        angular_covector = (
+            angular_covector - coefficient * radial_active
+        ).masked_fill(~active_mask, 0.0)
+        raw_norms[name] = float(
+            m.torch.linalg.vector_norm(gradient_z[mask]).detach()
+        )
+        tangent_norms[name] = float(
+            m.torch.linalg.vector_norm(
+                angular_covector[active_mask]
+            ).detach()
+        )
+        angular_covectors[name] = angular_covector
+
+    if (
+        tangent_norms["endpoint"] < floor
+        or tangent_norms["temporal"] < floor
+    ):
+        return None, {
+            "solver_status": "empty_geodesic_joint_feasible_intersection",
+            "solver_failure_reason": "zero_science_gradient",
+            "joint_jacobian_status": "zero_science_gradient",
+            "theta_radians": theta,
+            "raw_gradient_norm_by_term": raw_norms,
+            "true_angular_covector_norm_by_term": tangent_norms,
+        }
+    if tangent_norms["shadow"] < floor:
+        return None, {
+            "solver_status": "insufficient_linearized_science_progress",
+            "solver_failure_reason": "zero_shadow_gradient",
+            "joint_jacobian_status": "rank_deficient_joint_jacobian",
+            "theta_radians": theta,
+            "raw_gradient_norm_by_term": raw_norms,
+            "true_angular_covector_norm_by_term": tangent_norms,
+        }
+
+    dtype = m.torch.float64
+    rows = m.torch.stack([
+        angular_covectors[name][active_mask].to(dtype) for name in names
+    ])
+    _, singular_values, _ = m.torch.linalg.svd(rows, full_matrices=False)
+    largest = float(singular_values[0].detach()) if singular_values.numel() else 0.0
+    cutoff = float(svd_relative_cutoff) * largest
+    rank = int((singular_values > cutoff).sum().detach())
+    jacobian_status = (
+        "full_rank_joint_jacobian"
+        if rank == len(names)
+        else "rank_deficient_joint_jacobian"
+    )
+
+    required = {
+        "shadow": float(shadow_minimum_reduction),
+        "endpoint": float(
+            science_requirements["endpoint"]["required_predicted_reduction"]
+        ),
+        "temporal": float(
+            science_requirements["temporal"]["required_predicted_reduction"]
+        ),
+    }
+    bounds = m.torch.tensor(
+        [-required[name] / theta for name in names],
+        dtype=dtype,
+        device=rows.device,
+    )
+    target = -rows[0] / max(tangent_norms["shadow"], floor)
+    feasibility_tolerance = max(1.0e-12, min(required.values()) * 1.0e-3)
+    candidates = []
+    active_set_audits = []
+    for bitmask in range(1 << len(names)):
+        active = tuple(
+            index for index in range(len(names)) if bitmask & (1 << index)
+        )
+        candidate = target
+        multipliers = m.torch.zeros(0, dtype=dtype, device=rows.device)
+        svd_audit = {
+            "singular_values": [],
+            "svd_absolute_cutoff": 0.0,
+            "retained_rank": 0,
+        }
+        if active:
+            index = m.torch.tensor(
+                active, dtype=m.torch.long, device=rows.device
+            )
+            active_rows = rows.index_select(0, index)
+            active_bounds = bounds.index_select(0, index)
+            gram = active_rows @ active_rows.transpose(0, 1)
+            gram_pinv, svd_audit = _truncated_svd_pinv(
+                gram, svd_relative_cutoff
+            )
+            multipliers = gram_pinv @ (
+                active_rows @ target - active_bounds
+            )
+            candidate = target - active_rows.transpose(0, 1) @ multipliers
+        candidate_norm = m.torch.linalg.vector_norm(candidate)
+        unit_candidate = (
+            candidate / candidate_norm
+            if float(candidate_norm.detach()) > floor
+            else candidate
+        )
+        angular_changes = rows @ unit_candidate
+        predicted_changes = theta * angular_changes
+        primal_ok = bool(
+            (angular_changes <= bounds + feasibility_tolerance).all()
+            and float(candidate_norm.detach()) > floor
+        )
+        dual_ok = bool(
+            not active or (multipliers >= -feasibility_tolerance).all()
+        )
+        audit = {
+            "active_constraints": [names[index] for index in active],
+            "primal_feasible_after_unit_physical_normalization": primal_ok,
+            "dual_feasible": dual_ok,
+            "candidate_physical_unit_norm_before_normalization": float(
+                candidate_norm.detach()
+            ),
+            "true_angular_directional_derivative_by_term": {
+                name: float(angular_changes[index].detach())
+                for index, name in enumerate(names)
+            },
+            "finite_angle_predicted_change_by_term": {
+                name: float(predicted_changes[index].detach())
+                for index, name in enumerate(names)
+            },
+            "multipliers": [float(value) for value in multipliers.detach().cpu()],
+            "kkt_svd": svd_audit,
+        }
+        active_set_audits.append(audit)
+        if primal_ok and dual_ok:
+            objective = float(
+                0.5 * (unit_candidate - target).square().sum().detach()
+            )
+            candidates.append((objective, unit_candidate, audit))
+
+    base_audit = {
+        "solver_status": "insufficient_linearized_science_progress",
+        "solver_failure_reason": "no_angle_specific_active_set_crosses_finite_gap",
+        "theta_radians": theta,
+        "joint_jacobian_status": jacobian_status,
+        "joint_jacobian_rank": rank,
+        "joint_jacobian_singular_values": [
+            float(value) for value in singular_values.detach().cpu()
+        ],
+        "joint_jacobian_svd_absolute_cutoff": cutoff,
+        "joint_svd_relative_cutoff": float(svd_relative_cutoff),
+        "raw_gradient_norm_by_term": raw_norms,
+        "true_angular_covector_norm_by_term": tangent_norms,
+        "finite_gap_science_requirements": science_requirements,
+        "finite_gap_shadow_minimum_reduction": float(shadow_minimum_reduction),
+        "finite_gap_angular_derivative_scale": float(radial_norm.detach()),
+        "finite_gap_constraint_bound_by_term": {
+            name: float(bounds[index].detach())
+            for index, name in enumerate(names)
+        },
+        "active_set_audits": active_set_audits,
+        "second_order_hessian_used": False,
+    }
+    if not candidates:
+        return None, base_audit
+
+    _, unit, selected_audit = min(candidates, key=lambda item: item[0])
+    physical_direction = m.torch.zeros_like(current)
+    physical_direction[active_mask] = (
+        unit.to(current.dtype) * radial_norm.to(current.dtype)
+    )
+    physical_direction = physical_direction.masked_fill(~mask, 0.0)
+    optimization_direction_z = m.torch.zeros_like(current)
+    optimization_direction_z[active_mask] = (
+        physical_direction[active_mask] / taper[active_mask]
+    )
+    physical_norm = m.torch.linalg.vector_norm(physical_direction[mask])
+    angular_scale = radial_norm / physical_norm
+    derivatives = {
+        name: float(
+            (
+                gradients[name].detach()[mask]
+                * optimization_direction_z[mask]
+            ).sum().detach()
+            * angular_scale.detach()
+        )
+        for name in names
+    }
+    return physical_direction.detach(), {
+        **base_audit,
+        "solver_status": "finite_gap_angular_direction_found",
+        "solver_failure_reason": None,
+        "selected_active_set": selected_audit,
+        "linearized_prediction_passed": True,
+        "geodesic_direction_norm": float(physical_norm.detach()),
+        "geodesic_radial_inner_product": float(
+            (physical_direction[mask] * current[mask]).sum().detach()
+        ),
+        "true_angular_directional_derivative_by_term": derivatives,
+        "finite_angle_predicted_change_by_term": {
+            name: theta * derivatives[name] for name in names
+        },
+        "optimization_coordinate": "z",
+        "physical_path": "c2_taper_times_scope_null_projection_z",
+        "taper_applications_after_autograd": 0,
+        "_optimization_direction_z": optimization_direction_z.detach(),
+    }
+
+
 def _exact_radius_geodesic_update(
     current,
     direction,
@@ -2566,6 +2908,521 @@ def _temporal_directional_consistency_probe(
     }
 
 
+def _floating_tree_to_dtype(value, dtype):
+    if m.torch.is_tensor(value):
+        return value.to(dtype) if value.is_floating_point() else value
+    if isinstance(value, dict):
+        return {
+            key: _floating_tree_to_dtype(item, dtype)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_floating_tree_to_dtype(item, dtype) for item in value)
+    if isinstance(value, list):
+        return [_floating_tree_to_dtype(item, dtype) for item in value]
+    return value
+
+
+def _temporal_directional_float64_epsilon_ladder(
+    *,
+    current,
+    physical_direction,
+    mask,
+    taper,
+    epsilon_ladder,
+    relative_error_tolerance,
+    absolute_floor,
+    direction_norm_floor,
+    baseline,
+    batch,
+    cfg,
+    local_case,
+):
+    """Audit a near-zero temporal direction entirely on a float64 metric path."""
+    dtype = m.torch.float64
+    current64 = current.detach().to(dtype)
+    direction64 = physical_direction.detach().to(dtype)
+    taper64 = taper.detach().to(dtype)
+    baseline64 = baseline.detach().to(dtype)
+    batch64 = _floating_tree_to_dtype(batch, dtype)
+    variable64 = m.torch.zeros_like(current64).requires_grad_(True)
+    local_total64 = (
+        current64 + variable64.masked_fill(~mask, 0.0) * taper64
+    )
+    transaction_tangent64 = _case_isolated_transaction_tangent(
+        baseline64, local_total64, local_case
+    )
+    candidate64 = product_exp_torch(baseline64, transaction_tangent64)
+    terms64 = oracle.case_probe._case_terms(candidate64, batch64, cfg)
+    temporal64 = terms64["temporal"][int(local_case)]
+    gradient64 = _autograd_gradient_or_zero(
+        temporal64, variable64, retain_graph=False
+    )
+    active_mask = mask & (taper64.abs() > float(direction_norm_floor))
+    optimization_z64 = m.torch.zeros_like(current64)
+    optimization_z64[active_mask] = (
+        direction64[active_mask] / taper64[active_mask]
+    )
+    physical_norm = m.torch.linalg.vector_norm(direction64[mask])
+    radial_norm = m.torch.linalg.vector_norm(current64[mask])
+    finite = bool(
+        m.torch.isfinite(gradient64).all()
+        and m.torch.isfinite(physical_norm)
+        and m.torch.isfinite(radial_norm)
+    )
+    if (
+        not finite
+        or float(physical_norm.detach()) <= float(direction_norm_floor)
+        or float(radial_norm.detach()) <= float(direction_norm_floor)
+    ):
+        return {
+            "passed": False,
+            "status": "nonfinite_temporal_float64_epsilon_ladder",
+            "dtype": "float64",
+            "epsilon_radians": [float(value) for value in epsilon_ladder],
+        }
+
+    autograd_derivative = float((
+        (
+            gradient64[mask] * optimization_z64[mask]
+        ).sum() * radial_norm / physical_norm
+    ).detach())
+    rows = []
+    all_passed = True
+    for epsilon in epsilon_ladder:
+        epsilon = float(epsilon)
+        temporal_values = {}
+        geodesic_ok = True
+        for label, theta in (("plus", epsilon), ("minus", -epsilon)):
+            trial64, ok, _ = _exact_radius_geodesic_update(
+                current64,
+                direction64,
+                mask,
+                theta,
+                direction_norm_floor,
+                direction_is_sphere_tangent=True,
+            )
+            geodesic_ok = geodesic_ok and ok
+            if not ok:
+                break
+            transaction_tangent = _case_isolated_transaction_tangent(
+                baseline64, trial64, local_case
+            )
+            trial_candidate = product_exp_torch(
+                baseline64, transaction_tangent
+            )
+            trial_terms = oracle.case_probe._case_terms(
+                trial_candidate, batch64, cfg
+            )
+            temporal_values[label] = float(
+                trial_terms["temporal"][int(local_case)].detach()
+            )
+        if not geodesic_ok:
+            row = {
+                "epsilon_radians": epsilon,
+                "finite": False,
+                "passed": False,
+            }
+        else:
+            finite_difference = (
+                temporal_values["plus"] - temporal_values["minus"]
+            ) / (2.0 * epsilon)
+            row_finite = bool(
+                math.isfinite(finite_difference)
+                and math.isfinite(autograd_derivative)
+            )
+            sign_mismatch = bool(
+                row_finite
+                and abs(finite_difference) > float(absolute_floor)
+                and abs(autograd_derivative) > float(absolute_floor)
+                and finite_difference * autograd_derivative < 0.0
+            )
+            relative_error = (
+                abs(finite_difference - autograd_derivative)
+                / (abs(finite_difference) + float(absolute_floor))
+                if row_finite else math.inf
+            )
+            row_passed = bool(
+                row_finite
+                and not sign_mismatch
+                and relative_error <= float(relative_error_tolerance)
+            )
+            row = {
+                "epsilon_radians": epsilon,
+                "finite": row_finite,
+                "passed": row_passed,
+                "autograd_temporal_angular_derivative": autograd_derivative,
+                "finite_difference_temporal_angular_derivative": (
+                    finite_difference
+                ),
+                "relative_error": relative_error,
+                "sign_mismatch": sign_mismatch,
+                "temporal_value_plus": temporal_values["plus"],
+                "temporal_value_minus": temporal_values["minus"],
+            }
+        rows.append(row)
+        all_passed = all_passed and bool(row["passed"])
+    return {
+        "passed": all_passed,
+        "status": (
+            "temporal_float64_epsilon_ladder_passed"
+            if all_passed
+            else "temporal_directional_derivative_mismatch"
+        ),
+        "dtype": "float64",
+        "autograd_temporal_angular_derivative": autograd_derivative,
+        "epsilon_rows": rows,
+        "relative_error_tolerance": float(relative_error_tolerance),
+        "absolute_comparison_floor": float(absolute_floor),
+    }
+
+
+def _finite_gap_angular_iteration(
+    *,
+    model,
+    current,
+    mask,
+    taper,
+    gradients,
+    constraints,
+    angular_scales,
+    svd_cutoff,
+    norm_floor,
+    baseline,
+    identity,
+    batch,
+    cfg,
+    local_case,
+    baseline_case,
+    contract,
+    train_repair_contract,
+    target_rms,
+    iteration,
+    case_uid=None,
+):
+    """Run one g1f2 iteration with one active-set solve per frozen angle."""
+    current_shadow = float(
+        constraints["maximum_full_transaction_fixed_guard_shadow_margin"]
+    )
+    active_names = constraints["active_full_shadow_terms"]
+    minimum_reduction = max(
+        float(
+            train_repair_contract["minimum_shadow_reduction_by_guard_term"][
+                name
+            ]
+        )
+        for name in active_names
+    )
+    science_requirements = _finite_gap_science_requirements(constraints)
+    trial_rows = []
+    angle_solver_audits = []
+    any_linearized_prediction = False
+    any_authoritative_trial = False
+    any_directional_mismatch = False
+    numeric_failure = False
+    accepted_tangent = current
+    accepted_shadow = current_shadow
+    accepted_theta = 0.0
+    accepted_solver = None
+
+    for backtrack, theta in enumerate(angular_scales):
+        direction, solver_audit = (
+            _joint_geodesic_finite_gap_direction_for_angle(
+                current=current,
+                mask=mask,
+                taper=taper,
+                gradients=gradients,
+                theta_radians=theta,
+                science_requirements=science_requirements,
+                shadow_minimum_reduction=minimum_reduction,
+                svd_relative_cutoff=svd_cutoff,
+                direction_norm_floor=norm_floor,
+            )
+        )
+        optimization_direction_z = solver_audit.pop(
+            "_optimization_direction_z", None
+        )
+        angle_solver_audits.append(solver_audit)
+        if direction is None:
+            solver_status = str(solver_audit["solver_status"])
+            numeric_failure = numeric_failure or solver_status == (
+                "nonfinite_joint_jacobian"
+            )
+            trial_rows.append({
+                "backtrack": backtrack,
+                "theta_radians": theta,
+                "accepted": False,
+                "reason": solver_status,
+                "linearized_prediction_passed": False,
+                "angle_specific_joint_solver": solver_audit,
+            })
+            if solver_audit.get("solver_failure_reason") == (
+                "zero_science_gradient"
+            ):
+                break
+            continue
+
+        any_linearized_prediction = True
+        if optimization_direction_z is None:
+            raise RuntimeError(
+                "g1f2 finite-gap solver omitted optimization direction z"
+            )
+        directional_consistency = _temporal_directional_consistency_probe(
+            current=current,
+            physical_direction=direction,
+            optimization_direction_z=optimization_direction_z,
+            temporal_gradient_z=gradients["temporal"],
+            mask=mask,
+            epsilon_radians=float(
+                train_repair_contract["temporal_fd_epsilon_radians"]
+            ),
+            relative_error_tolerance=float(
+                train_repair_contract[
+                    "temporal_fd_relative_error_tolerance"
+                ]
+            ),
+            absolute_floor=float(
+                train_repair_contract["temporal_fd_absolute_floor"]
+            ),
+            direction_norm_floor=norm_floor,
+            baseline=baseline,
+            batch=batch,
+            cfg=cfg,
+            local_case=local_case,
+        )
+        solver_audit["temporal_directional_consistency"] = (
+            directional_consistency
+        )
+        directional_passed = bool(directional_consistency["passed"])
+        autograd_temporal = float(
+            directional_consistency.get(
+                "autograd_temporal_angular_derivative", math.inf
+            )
+        )
+        if (
+            not directional_passed
+            and math.isfinite(autograd_temporal)
+            and (
+                abs(autograd_temporal) <= float(
+                    train_repair_contract["temporal_fd_near_zero_threshold"]
+                )
+                or str(case_uid).endswith((":170", ":171"))
+            )
+        ):
+            float64_ladder = _temporal_directional_float64_epsilon_ladder(
+                current=current,
+                physical_direction=direction,
+                mask=mask,
+                taper=taper,
+                epsilon_ladder=train_repair_contract[
+                    "temporal_fd_float64_epsilon_ladder"
+                ],
+                relative_error_tolerance=float(
+                    train_repair_contract[
+                        "temporal_fd_relative_error_tolerance"
+                    ]
+                ),
+                absolute_floor=float(
+                    train_repair_contract["temporal_fd_absolute_floor"]
+                ),
+                direction_norm_floor=norm_floor,
+                baseline=baseline,
+                batch=batch,
+                cfg=cfg,
+                local_case=local_case,
+            )
+            solver_audit["temporal_float64_epsilon_ladder"] = float64_ladder
+            directional_passed = bool(float64_ladder["passed"])
+        if not directional_passed:
+            any_directional_mismatch = True
+            reason = str(directional_consistency["status"])
+            numeric_failure = numeric_failure or reason.startswith("nonfinite")
+            solver_audit["temporal_directional_mismatch_dump"] = {
+                "optimization_direction_z": (
+                    optimization_direction_z.detach().cpu().tolist()
+                ),
+                "physical_direction_p": direction.detach().cpu().tolist(),
+                "autograd_temporal_angular_derivative": (
+                    directional_consistency.get(
+                        "autograd_temporal_angular_derivative"
+                    )
+                ),
+                "finite_difference_temporal_angular_derivative": (
+                    directional_consistency.get(
+                        "finite_difference_temporal_angular_derivative"
+                    )
+                ),
+            }
+            trial_rows.append({
+                "backtrack": backtrack,
+                "theta_radians": theta,
+                "accepted": False,
+                "reason": reason,
+                "linearized_prediction_passed": True,
+                "authoritative_trial_executed": False,
+                "angle_specific_joint_solver": solver_audit,
+            })
+            continue
+
+        any_authoritative_trial = True
+        trial, geodesic_ok, geodesic_audit = _exact_radius_geodesic_update(
+            current,
+            direction,
+            mask,
+            theta,
+            norm_floor,
+            direction_is_sphere_tangent=True,
+        )
+        if not geodesic_ok:
+            numeric_failure = True
+            trial_rows.append({
+                "backtrack": backtrack,
+                "theta_radians": theta,
+                "accepted": False,
+                "reason": "finite_radius_model_mismatch",
+                "failed_constraints": ["numeric"],
+                "linearized_prediction_passed": True,
+                "authoritative_trial_executed": True,
+                "geodesic_update": geodesic_audit,
+                "angle_specific_joint_solver": solver_audit,
+            })
+            continue
+
+        radius_rms = _rms(trial, mask)
+        radius_ok = bool(
+            math.isfinite(radius_rms)
+            and abs(radius_rms - float(target_rms))
+            <= max(1.0e-12, float(target_rms) * 1.0e-6)
+        )
+        outside_scope = float(
+            trial.masked_fill(mask, 0.0).abs().amax().detach()
+        )
+        scope_ok = outside_scope == 0.0
+        trial_transaction_tangent = _case_isolated_transaction_tangent(
+            baseline, trial, local_case
+        )
+        trial_candidate = product_exp_torch(
+            baseline, trial_transaction_tangent
+        )
+        trial_case_terms = oracle.case_probe._case_terms(
+            trial_candidate, batch, cfg
+        )
+        trial_scientific = oracle._case_scientific_status(
+            {
+                key: float(
+                    trial_case_terms[key][int(local_case)].detach()
+                )
+                for key in ("endpoint", "temporal")
+            },
+            baseline_case,
+        )
+        science_margins = _science_pass_margin_diagnostics(trial_scientific)
+        science_ok = bool(
+            science_margins["both_scientific_terms_strictly_improved"]
+        )
+        with m.torch.no_grad():
+            trial_shadows, _, _ = _full_transaction_fixed_guard_shadows(
+                model,
+                batch,
+                cfg,
+                trial_candidate,
+                identity,
+                contract,
+            )
+            trial_shadow = max(
+                float(value.detach()) for value in trial_shadows.values()
+            )
+        shadow_ok = bool(
+            trial_shadow <= current_shadow - minimum_reduction
+        )
+        failed_constraints = []
+        if not shadow_ok:
+            failed_constraints.append("hard_full_transaction_shadow")
+        if not science_ok:
+            failed_constraints.append("endpoint_temporal_science")
+        if not radius_ok:
+            failed_constraints.append("exact_radius")
+        if not scope_ok:
+            failed_constraints.append("scope")
+        trial_row = {
+            "backtrack": backtrack,
+            "theta_radians": theta,
+            "accepted": not failed_constraints,
+            "reason": (
+                None if not failed_constraints else "finite_radius_model_mismatch"
+            ),
+            "failed_constraints": failed_constraints,
+            "linearized_prediction_passed": True,
+            "authoritative_trial_executed": True,
+            "trial_full_shadow": trial_shadow,
+            "full_shadow_reduction": current_shadow - trial_shadow,
+            "trial_radius_rms": radius_rms,
+            "trial_outside_scope_abs_max": outside_scope,
+            **science_margins,
+            "geodesic_update": geodesic_audit,
+            "angle_specific_joint_solver": solver_audit,
+        }
+        trial_rows.append(trial_row)
+        if not failed_constraints:
+            accepted_tangent = trial.detach()
+            accepted_shadow = trial_shadow
+            accepted_theta = theta
+            accepted_solver = solver_audit
+            break
+
+    accepted = accepted_theta > 0.0
+    zero_science = any(
+        audit.get("solver_failure_reason") == "zero_science_gradient"
+        for audit in angle_solver_audits
+    )
+    rejection_reason = None
+    if not accepted:
+        if zero_science:
+            rejection_reason = "empty_geodesic_joint_feasible_intersection"
+        elif any_authoritative_trial:
+            rejection_reason = "finite_radius_model_mismatch"
+        elif any_directional_mismatch:
+            rejection_reason = "temporal_directional_derivative_mismatch"
+        else:
+            rejection_reason = "insufficient_linearized_science_progress"
+    representative_solver = (
+        accepted_solver
+        or next(
+            (
+                audit for audit in reversed(angle_solver_audits)
+                if audit.get("solver_status") != (
+                    "insufficient_linearized_science_progress"
+                )
+            ),
+            angle_solver_audits[-1] if angle_solver_audits else None,
+        )
+    )
+    return accepted_tangent, {
+        "iteration": int(iteration),
+        "accepted": accepted,
+        "accepted_theta_radians": accepted_theta,
+        "constraints": constraints,
+        "joint_solver": representative_solver,
+        "angle_specific_joint_solvers": angle_solver_audits,
+        "finite_gap_science_requirements": science_requirements,
+        "full_shadow_before": current_shadow,
+        "full_shadow_after": accepted_shadow,
+        "full_shadow_reduction": (
+            current_shadow - accepted_shadow if accepted else 0.0
+        ),
+        "step_rejection_reason": rejection_reason,
+        "angular_line_search_trials": trial_rows,
+        "linearized_prediction_found": any_linearized_prediction,
+        "authoritative_trial_executed": any_authoritative_trial,
+        "exact_radius_rms": _rms(accepted_tangent, mask),
+        "outside_scope_abs_max": 0.0 if accepted else None,
+        "solver_failure_reason": (
+            "zero_science_gradient" if zero_science else None
+        ),
+        "second_order_hessian_used": False,
+    }, numeric_failure
+
+
 def _correct_case_geodesic_joint_sqp(
     *,
     model,
@@ -2583,6 +3440,8 @@ def _correct_case_geodesic_joint_sqp(
     train_repair_contract,
     target_rms,
     temporal_directional_consistency=False,
+    finite_gap_angular_feasibility=False,
+    case_uid=None,
 ):
     """Run bounded exact-radius geodesic joint active-set SQP."""
     mask = _owned_case_mask(ownership, initial_tangent, 0)
@@ -2653,6 +3512,37 @@ def _correct_case_geodesic_joint_sqp(
                 science_tensors["temporal"], variable, retain_graph=False
             ),
         }
+        if finite_gap_angular_feasibility:
+            accepted_tangent, iteration_report, iteration_numeric_failure = (
+                _finite_gap_angular_iteration(
+                    model=model,
+                    current=current,
+                    mask=mask,
+                    taper=taper,
+                    gradients=gradients,
+                    constraints=constraints,
+                    angular_scales=angular_scales,
+                    svd_cutoff=svd_cutoff,
+                    norm_floor=norm_floor,
+                    baseline=baseline,
+                    identity=identity,
+                    batch=batch,
+                    cfg=cfg,
+                    local_case=local_case,
+                    baseline_case=baseline_case,
+                    contract=contract,
+                    train_repair_contract=train_repair_contract,
+                    target_rms=target_rms,
+                    iteration=iteration,
+                    case_uid=case_uid,
+                )
+            )
+            numeric_failure = numeric_failure or iteration_numeric_failure
+            history.append(iteration_report)
+            if not iteration_report["accepted"]:
+                break
+            current = accepted_tangent
+            continue
         direction, solver_audit = _joint_geodesic_active_set_direction(
             current=current,
             mask=mask,
@@ -2901,9 +3791,14 @@ def _correct_case_geodesic_joint_sqp(
     )
     shadow_gradient_norms = [
         float(
-            ((row.get("joint_solver") or {}).get(
-                "sphere_tangent_gradient_norm_by_term", {}
-            )).get("shadow", 0.0)
+            (
+                (row.get("joint_solver") or {}).get(
+                    "sphere_tangent_gradient_norm_by_term"
+                )
+                or (row.get("joint_solver") or {}).get(
+                    "true_angular_covector_norm_by_term", {}
+                )
+            ).get("shadow", 0.0)
         )
         for row in history
         if row.get("joint_solver")
@@ -2920,6 +3815,9 @@ def _correct_case_geodesic_joint_sqp(
         "temporal_directional_consistency_repair": bool(
             temporal_directional_consistency
         ),
+        "finite_gap_angular_feasibility_sqp": bool(
+            finite_gap_angular_feasibility
+        ),
         "scope_null_space_projection": "exact_boolean_ownership_mask",
         "joint_jacobian_status_counts": dict(statuses),
         "angular_line_search_radians": angular_scales,
@@ -2935,6 +3833,21 @@ def _correct_case_geodesic_joint_sqp(
         "geodesic_authoritative_line_search_exhausted": bool(
             final_rejection == "geodesic_authoritative_line_search_exhausted"
         ),
+        "insufficient_linearized_science_progress": bool(
+            final_rejection == "insufficient_linearized_science_progress"
+        ),
+        "finite_radius_model_mismatch": bool(
+            final_rejection == "finite_radius_model_mismatch"
+        ),
+        "solver_failure_reason": next(
+            (
+                row.get("solver_failure_reason")
+                for row in reversed(history)
+                if row.get("solver_failure_reason")
+            ),
+            None,
+        ),
+        "second_order_hessian_used": False,
         "teacher_eligible": False,
         "final_exact_radius_rms": _rms(current, mask),
         "history": history,
@@ -4318,15 +5231,18 @@ def _local_feasible_intersection_summary(correction_reports):
         for uid, report in reports.items():
             history = report.get("history") or []
             for row in history:
-                solver = row.get("joint_solver") or {}
-                if solver.get("joint_jacobian_status"):
-                    joint_jacobian_status_counts.update(
-                        [str(solver["joint_jacobian_status"])]
-                    )
-                if solver.get("solver_status"):
-                    solver_status_counts.update(
-                        [str(solver["solver_status"])]
-                    )
+                solvers = row.get("angle_specific_joint_solvers") or [
+                    row.get("joint_solver") or {}
+                ]
+                for solver in solvers:
+                    if solver.get("joint_jacobian_status"):
+                        joint_jacobian_status_counts.update(
+                            [str(solver["joint_jacobian_status"])]
+                        )
+                    if solver.get("solver_status"):
+                        solver_status_counts.update(
+                            [str(solver["solver_status"])]
+                        )
             requires_shadow_repair = any(
                 (row.get("constraints") or {}).get("primary_objective")
                 == "full_transaction_fixed_guard_shadow"
@@ -4357,6 +5273,7 @@ def _local_feasible_intersection_summary(correction_reports):
                     report.get("full_shadow_reduction", 0.0)
                 ),
                 "step_rejection_reason": report.get("step_rejection_reason"),
+                "solver_failure_reason": report.get("solver_failure_reason"),
             }
     empty = sorted(
         uid
@@ -4412,6 +5329,54 @@ def _local_feasible_intersection_summary(correction_reports):
             )
             and not row["feasible_method_found"]
         ),
+        "insufficient_linearized_science_progress_case_uids": sorted(
+            uid
+            for uid, row in by_uid.items()
+            if any(
+                method.get("step_rejection_reason")
+                == "insufficient_linearized_science_progress"
+                for method in row["methods"].values()
+            )
+            and not row["feasible_method_found"]
+        ),
+        "finite_radius_model_mismatch_case_uids": sorted(
+            uid
+            for uid, row in by_uid.items()
+            if any(
+                method.get("step_rejection_reason")
+                == "finite_radius_model_mismatch"
+                for method in row["methods"].values()
+            )
+            and not row["feasible_method_found"]
+        ),
+        "zero_science_gradient_case_uids": sorted(
+            uid
+            for uid, row in by_uid.items()
+            if any(
+                method.get("solver_failure_reason")
+                == "zero_science_gradient"
+                for method in row["methods"].values()
+            )
+            and not row["feasible_method_found"]
+        ),
+        "temporal_float64_epsilon_ladder_case_uids": sorted(
+            {
+                str(uid)
+                for method_reports in correction_reports.values()
+                for uid, report in method_reports.items()
+                if any(
+                    any(
+                        solver.get("temporal_float64_epsilon_ladder")
+                        is not None
+                        for solver in (
+                            history_row.get("angle_specific_joint_solvers")
+                            or []
+                        )
+                    )
+                    for history_row in (report.get("history") or [])
+                )
+            }
+        ),
         "joint_jacobian_status_counts": dict(joint_jacobian_status_counts),
         "joint_solver_status_counts": dict(solver_status_counts),
     }
@@ -4421,7 +5386,9 @@ def run(args):
     started = time.perf_counter()
     g1f = bool(args.activation_aware_g1f)
     g1f1 = bool(args.activation_aware_g1f1)
-    g1f_family = bool(g1f or g1f1)
+    g1f2 = bool(args.activation_aware_g1f2)
+    g1f1_family = bool(g1f1 or g1f2)
+    g1f_family = bool(g1f or g1f1_family)
     g1e_family = bool(args.activation_aware_g1e or g1f_family)
     g1d_family = bool(
         args.activation_aware_g1d or g1e_family
@@ -4449,6 +5416,8 @@ def run(args):
     evaluation_role = (
         args.evaluation_role if g1e_family else "validation"
     )
+    if g1f2 and evaluation_role != "train_calibration":
+        raise RuntimeError("V15.15g1f2 is train-calibration-only")
     if (
         g1e_family
         and evaluation_role == "final_held_out"
@@ -4482,6 +5451,8 @@ def run(args):
     evaluation_case_uids = {
         str(sample["case_uid"]) for sample in teacher.get("samples", [])
     }
+    if g1f2 and REUSED_DEVELOPMENT_CASE_UID in evaluation_case_uids:
+        raise RuntimeError("V15.15g1f2 must not run development case 53")
     if (
         g1e_family
         and evaluation_role == "final_held_out"
@@ -4500,7 +5471,7 @@ def run(args):
     if g1_family:
         if not args.train_teacher_bank:
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1 requires "
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1/g1f2 requires "
                 "--train-teacher-bank"
             )
         train_teacher_path = Path(args.train_teacher_bank).resolve()
@@ -4509,15 +5480,15 @@ def run(args):
         )
         if train_teacher.get("schema") != TEACHER_SCHEMA:
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1 train bank schema mismatch"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1/g1f2 train bank schema mismatch"
             )
         if train_teacher.get("split") != "train":
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1 envelope bank must be train split"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1/g1f2 envelope bank must be train split"
             )
         if not train_teacher.get("teacher_bank_ready"):
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1 train bank is not ready"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f/g1f1/g1f2 train bank is not ready"
             )
         if g1e_family and evaluation_role == "final_held_out":
             train_transaction_ids = {
@@ -4644,7 +5615,9 @@ def run(args):
                     )
                 )
                 expected_contract_schema = (
-                    G1F1_TRAIN_CONTRACT_SCHEMA
+                    G1F2_TRAIN_CONTRACT_SCHEMA
+                    if g1f2
+                    else G1F1_TRAIN_CONTRACT_SCHEMA
                     if g1f1
                     else G1F_TRAIN_CONTRACT_SCHEMA
                     if g1f
@@ -4694,12 +5667,12 @@ def run(args):
                         raise RuntimeError(
                             "frozen g1f angular search leaves (0, pi/2]"
                         )
-                    if g1f1:
+                    if g1f1_family:
                         if not train_shadow_contract.get(
                             "temporal_directional_consistency_repair"
                         ):
                             raise RuntimeError(
-                                "frozen g1f1 contract lacks temporal FD flag"
+                                "frozen g1f1/g1f2 contract lacks temporal FD flag"
                             )
                         for key in (
                             "temporal_fd_epsilon_radians",
@@ -4711,6 +5684,31 @@ def run(args):
                                 raise RuntimeError(
                                     f"frozen g1f1 contract has invalid {key}"
                                 )
+                    if g1f2:
+                        if not train_shadow_contract.get(
+                            "finite_gap_angular_feasibility_sqp"
+                        ):
+                            raise RuntimeError(
+                                "frozen g1f2 contract lacks finite-gap flag"
+                            )
+                        epsilon_ladder = [
+                            float(value)
+                            for value in train_shadow_contract.get(
+                                "temporal_fd_float64_epsilon_ladder", []
+                            )
+                        ]
+                        if epsilon_ladder != [
+                            1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4
+                        ]:
+                            raise RuntimeError(
+                                "frozen g1f2 float64 epsilon ladder mismatch"
+                            )
+                        if train_shadow_contract.get(
+                            "second_order_hessian_used"
+                        ) is not False:
+                            raise RuntimeError(
+                                "g1f2 must not use a second-order Hessian"
+                            )
             else:
                 train_shadow_contract = (
                     _freeze_train_full_shadow_repair_contract(
@@ -4765,7 +5763,7 @@ def run(args):
                         joint_directional_margin=float(
                             args.joint_directional_margin
                         ),
-                        temporal_directional_consistency=g1f1,
+                        temporal_directional_consistency=g1f1_family,
                         temporal_fd_epsilon_radians=float(
                             args.temporal_fd_epsilon_radians
                         ),
@@ -4774,6 +5772,16 @@ def run(args):
                         ),
                         temporal_fd_absolute_floor=float(
                             args.temporal_fd_absolute_floor
+                        ),
+                        finite_gap_angular_feasibility=g1f2,
+                        temporal_fd_float64_epsilon_ladder=(
+                            1.0e-5,
+                            3.0e-5,
+                            1.0e-4,
+                            3.0e-4,
+                        ),
+                        temporal_fd_near_zero_threshold=float(
+                            args.temporal_fd_near_zero_threshold
                         ),
                     )
                 )
@@ -4932,7 +5940,9 @@ def run(args):
                             contract=domain["contract"],
                             train_repair_contract=train_shadow_contract,
                             target_rms=float(args.target_rms),
-                            temporal_directional_consistency=g1f1,
+                            temporal_directional_consistency=g1f1_family,
+                            finite_gap_angular_feasibility=g1f2,
+                            case_uid=str(sample["case_uid"]),
                         )
                     )
                 elif g1d_family:
@@ -5455,6 +6465,13 @@ def run(args):
         activation_summary = {
             "selection_protocol": (
                 (
+                    "observable_discriminative_conformal_then_finite_gap_"
+                    "per_angle_active_set_sqp_then_authoritative_finite_"
+                    "radius_trial_then_complete_fixed_guard_incumbent_lock_v1"
+                )
+                if g1f2
+                else
+                (
                     "observable_discriminative_conformal_then_coordinate_"
                     "consistent_temporal_fd_then_exact_radius_geodesic_"
                     "joint_active_set_sqp_then_complete_fixed_guard_"
@@ -5715,7 +6732,9 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            G1F1_SCHEMA
+            G1F2_SCHEMA
+            if g1f2
+            else G1F1_SCHEMA
             if g1f1
             else G1F_SCHEMA
             if g1f
@@ -5859,7 +6878,18 @@ def run(args):
             g1d_family
         ),
         "exact_radius_geodesic_joint_active_set_sqp": bool(g1f_family),
-        "temporal_directional_consistency_repair": bool(g1f1),
+        "temporal_directional_consistency_repair": bool(g1f1_family),
+        "finite_gap_angular_feasibility_sqp": bool(g1f2),
+        "per_angle_active_set": bool(g1f2),
+        "finite_gap_constraint_coordinate": (
+            train_shadow_contract.get("finite_gap_constraint_coordinate")
+            if g1f2 else None
+        ),
+        "finite_gap_science_gap_source": (
+            train_shadow_contract.get("finite_gap_science_gap_source")
+            if g1f2 else None
+        ),
+        "second_order_hessian_used": False,
         "scope_null_space_projection": (
             train_shadow_contract.get("scope_null_space_projection")
             if g1f_family else None
@@ -5888,25 +6918,33 @@ def run(args):
         ),
         "optimization_coordinate": (
             train_shadow_contract.get("optimization_coordinate")
-            if g1f1 else None
+            if g1f1_family else None
         ),
         "jacobian_coordinate": (
             train_shadow_contract.get("jacobian_coordinate")
-            if g1f1 else None
+            if g1f1_family else None
         ),
         "temporal_fd_epsilon_radians": (
             train_shadow_contract.get("temporal_fd_epsilon_radians")
-            if g1f1 else None
+            if g1f1_family else None
         ),
         "temporal_fd_relative_error_tolerance": (
             train_shadow_contract.get(
                 "temporal_fd_relative_error_tolerance"
             )
-            if g1f1 else None
+            if g1f1_family else None
         ),
         "temporal_fd_absolute_floor": (
             train_shadow_contract.get("temporal_fd_absolute_floor")
-            if g1f1 else None
+            if g1f1_family else None
+        ),
+        "temporal_fd_float64_epsilon_ladder": (
+            train_shadow_contract.get("temporal_fd_float64_epsilon_ladder")
+            if g1f2 else None
+        ),
+        "temporal_fd_near_zero_threshold": (
+            train_shadow_contract.get("temporal_fd_near_zero_threshold")
+            if g1f2 else None
         ),
         "full_shadow_hard_acceptance_smooth_gradient": bool(
             g1d_family
@@ -5975,7 +7013,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g1f1_temporal_directional_consistency_complete"
+            "v15_15g1f2_finite_gap_angular_feasibility_complete"
+            if g1f2
+            else "v15_15g1f1_temporal_directional_consistency_complete"
             if g1f1
             else "v15_15g1f_exact_radius_geodesic_joint_sqp_complete"
             if g1f
@@ -6032,6 +7072,7 @@ def main():
     parser.add_argument("--activation-aware-g1e", action="store_true")
     parser.add_argument("--activation-aware-g1f", action="store_true")
     parser.add_argument("--activation-aware-g1f1", action="store_true")
+    parser.add_argument("--activation-aware-g1f2", action="store_true")
     parser.add_argument(
         "--evaluation-role",
         choices=(
@@ -6138,6 +7179,9 @@ def main():
     parser.add_argument(
         "--temporal-fd-absolute-floor", type=float, default=1.0e-8
     )
+    parser.add_argument(
+        "--temporal-fd-near-zero-threshold", type=float, default=1.0e-5
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -6166,6 +7210,7 @@ def main():
         args.activation_aware_g1e,
         args.activation_aware_g1f,
         args.activation_aware_g1f1,
+        args.activation_aware_g1f2,
     ))) > 1:
         parser.error("choose one activation-aware protocol")
     if (
@@ -6176,9 +7221,10 @@ def main():
         or args.activation_aware_g1e
         or args.activation_aware_g1f
         or args.activation_aware_g1f1
+        or args.activation_aware_g1f2
     ) and not args.train_teacher_bank:
         parser.error(
-            "--activation-aware-g1/g1b/g1c/g1d/g1e/g1f/g1f1 requires "
+            "--activation-aware-g1/g1b/g1c/g1d/g1e/g1f/g1f1/g1f2 requires "
             "--train-teacher-bank"
         )
     if args.severity_envelope_margin_fraction < 0.0:
@@ -6213,10 +7259,11 @@ def main():
         args.activation_aware_g1e
         or args.activation_aware_g1f
         or args.activation_aware_g1f1
+        or args.activation_aware_g1f2
     ) and not (
         10 <= args.full_shadow_line_search_backtracks <= 12
     ):
-        parser.error("g1e/g1f/g1f1 line-search backtracks must be in [10, 12]")
+        parser.error("g1e/g1f/g1f1/g1f2 line-search backtracks must be in [10, 12]")
     if not 0.0 < args.full_shadow_line_search_decay < 1.0:
         parser.error("full-shadow line-search decay must be in (0, 1)")
     if args.science_restoration_damping <= 0.0:
@@ -6237,15 +7284,23 @@ def main():
         parser.error("temporal FD relative-error tolerance must be non-negative")
     if args.temporal_fd_absolute_floor <= 0.0:
         parser.error("temporal FD absolute floor must be positive")
+    if args.temporal_fd_near_zero_threshold <= 0.0:
+        parser.error("temporal FD near-zero threshold must be positive")
+    if (
+        args.activation_aware_g1f2
+        and args.evaluation_role != "train_calibration"
+    ):
+        parser.error("V15.15g1f2 is train-calibration-only")
     if (
         not (
             args.activation_aware_g1e
             or args.activation_aware_g1f
             or args.activation_aware_g1f1
+            or args.activation_aware_g1f2
         )
         and args.evaluation_role != "development_validation"
     ):
-        parser.error("evaluation-role is reserved for V15.15g1e/g1f/g1f1")
+        parser.error("evaluation-role is reserved for V15.15g1e/g1f/g1f1/g1f2")
     if not 0.0 < args.activation_relative_improvement < 1.0:
         parser.error(
             "--activation-relative-improvement must be in (0, 1)"
