@@ -34,6 +34,19 @@ _UNIT_GRID_CACHE = {}
 HVP_RECOVERY_EPSILON_RADIANS = (1.0e-4, 3.0e-4)
 HVP_RECOVERY_RELATIVE_TOLERANCE = 0.25
 HVP_RECOVERY_ABSOLUTE_TOLERANCE = 1.0e-6
+SECOND_ORDER_SQP_REFINEMENT_STARTS = 768
+SECOND_ORDER_SQP_REFINEMENT_ITERATIONS = 32
+SECOND_ORDER_SQP_SMOOTHING = (8.0, 32.0)
+SECOND_ORDER_SQP_LINE_SEARCH_RADIANS = (
+    0.25,
+    0.125,
+    0.0625,
+    0.03125,
+    0.015625,
+    0.0078125,
+    0.00390625,
+    0.001953125,
+)
 
 
 def _inner(left, right, mask):
@@ -569,6 +582,165 @@ def _deterministic_unit_grid(dimension: int, levels: int, *, device):
     return result
 
 
+def _quadratic_changes(models, directions, theta):
+    """Evaluate every frozen second-order constraint on device."""
+    names = ("shadow", "endpoint", "temporal")
+    first = m.torch.stack([models[name]["first"] for name in names])
+    hessian = m.torch.stack([models[name]["hessian"] for name in names])
+    linear = directions @ first.transpose(0, 1)
+    quadratic = m.torch.einsum(
+        "nd,kde,ne->nk", directions, hessian, directions
+    )
+    return theta * linear + 0.5 * theta * theta * quadratic
+
+
+def _constraint_scales(models, theta, required, floor):
+    """Build fixed positive scales without changing exact feasibility."""
+    names = ("shadow", "endpoint", "temporal")
+    rows = []
+    for index, name in enumerate(names):
+        first_scale = abs(theta) * m.torch.linalg.vector_norm(
+            models[name]["first"]
+        )
+        curvature_scale = (
+            0.5
+            * theta
+            * theta
+            * m.torch.linalg.matrix_norm(models[name]["hessian"])
+        )
+        rows.append(m.torch.stack([
+            required[index].abs(),
+            first_scale,
+            curvature_scale,
+            required.new_tensor(max(float(floor), 1.0e-12)),
+        ]).amax())
+    return m.torch.stack(rows)
+
+
+def _continuous_joint_sqp_refinement(
+    *,
+    models,
+    theta,
+    required,
+    scales,
+    coarse_directions,
+    feasibility_tolerance,
+):
+    """Refine the best coarse seeds on the coefficient unit sphere.
+
+    The three low-dimensional quadratic constraints are differentiated
+    analytically.  A deterministic Riemannian active-constraint iteration and
+    fixed angular line search minimize their worst normalized residual.  This
+    closes narrow feasible cones that a Cartesian direction grid can miss,
+    while all candidate evaluation and selection remain on the motion device.
+    """
+    coarse_changes = _quadratic_changes(models, coarse_directions, theta)
+    coarse_residual = (
+        coarse_changes + required.unsqueeze(0) - float(feasibility_tolerance)
+    ) / scales.unsqueeze(0)
+    coarse_worst = coarse_residual.amax(dim=1)
+    start_count = min(
+        int(SECOND_ORDER_SQP_REFINEMENT_STARTS),
+        int(coarse_directions.shape[0]),
+    )
+    start_indices = m.torch.argsort(
+        coarse_worst, stable=True
+    )[:start_count]
+    current = coarse_directions.index_select(0, start_indices).clone()
+    line_search = current.new_tensor(
+        SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
+    )
+    names = ("shadow", "endpoint", "temporal")
+    first = m.torch.stack([models[name]["first"] for name in names])
+    hessian = m.torch.stack([models[name]["hessian"] for name in names])
+
+    iteration_count = 0
+    for smoothing in SECOND_ORDER_SQP_SMOOTHING:
+        stage_iterations = int(SECOND_ORDER_SQP_REFINEMENT_ITERATIONS) // len(
+            SECOND_ORDER_SQP_SMOOTHING
+        )
+        for _ in range(stage_iterations):
+            iteration_count += 1
+            changes = _quadratic_changes(models, current, theta)
+            residual = (
+                changes
+                + required.unsqueeze(0)
+                - float(feasibility_tolerance)
+            ) / scales.unsqueeze(0)
+            weights = m.torch.softmax(
+                float(smoothing) * residual, dim=1
+            )
+            constraint_gradients = (
+                theta * first.unsqueeze(0)
+                + theta
+                * theta
+                * m.torch.einsum("kde,ne->nkd", hessian, current)
+            ) / scales.reshape(1, -1, 1)
+            gradient = (
+                weights.unsqueeze(-1) * constraint_gradients
+            ).sum(dim=1)
+            gradient = gradient - (
+                gradient * current
+            ).sum(dim=1, keepdim=True) * current
+            gradient_norm = m.torch.linalg.vector_norm(
+                gradient, dim=1, keepdim=True
+            )
+            movable = gradient_norm.squeeze(1) > 1.0e-15
+            unit_gradient = gradient / gradient_norm.clamp_min(1.0e-30)
+
+            trials = (
+                m.torch.cos(line_search).reshape(1, -1, 1)
+                * current.unsqueeze(1)
+                - m.torch.sin(line_search).reshape(1, -1, 1)
+                * unit_gradient.unsqueeze(1)
+            )
+            trial_changes = _quadratic_changes(
+                models, trials.reshape(-1, current.shape[1]), theta
+            ).reshape(current.shape[0], line_search.numel(), -1)
+            trial_residual = (
+                trial_changes
+                + required.reshape(1, 1, -1)
+                - float(feasibility_tolerance)
+            ) / scales.reshape(1, 1, -1)
+            trial_objective = m.torch.logsumexp(
+                float(smoothing) * trial_residual, dim=2
+            ) / float(smoothing)
+            current_objective = m.torch.logsumexp(
+                float(smoothing) * residual, dim=1
+            ) / float(smoothing)
+            combined = m.torch.cat(
+                [current_objective.unsqueeze(1), trial_objective], dim=1
+            )
+            selected = combined.argmin(dim=1)
+            selected_trial = (selected - 1).clamp_min(0)
+            replacement = trials[
+                m.torch.arange(current.shape[0], device=current.device),
+                selected_trial,
+            ]
+            improve = movable & (selected > 0)
+            current = m.torch.where(
+                improve.unsqueeze(1), replacement, current
+            )
+
+    refined_changes = _quadratic_changes(models, current, theta)
+    refined_residual = (
+        refined_changes + required.unsqueeze(0) - float(feasibility_tolerance)
+    ) / scales.unsqueeze(0)
+    return current, refined_changes, {
+        "continuous_sqp_start_count": start_count,
+        "continuous_sqp_iteration_count": iteration_count,
+        "continuous_sqp_smoothing": [
+            float(value) for value in SECOND_ORDER_SQP_SMOOTHING
+        ],
+        "continuous_sqp_line_search_radians": [
+            float(value) for value in SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
+        ],
+        "best_continuous_sqp_normalized_residual": float(
+            refined_residual.amax(dim=1).amin().detach()
+        ),
+    }
+
+
 def solve_angle_subproblem(
     *,
     models,
@@ -580,41 +752,92 @@ def solve_angle_subproblem(
     """Solve the frozen-angle joint quadratic model on the unit sphere."""
     names = ("shadow", "endpoint", "temporal")
     dimension = int(models["shadow"]["first"].numel())
-    directions = _deterministic_unit_grid(
+    coarse_directions = _deterministic_unit_grid(
         dimension, int(grid_levels), device=models["shadow"]["first"].device
     )
     theta = float(theta_radians)
-    predicted = {}
-    feasible = m.torch.ones(
-        directions.shape[0], dtype=m.torch.bool, device=directions.device
+    required = coarse_directions.new_tensor([
+        float(required_reduction[name]) for name in names
+    ])
+    scales = _constraint_scales(
+        models, theta, required, float(feasibility_tolerance)
     )
-    for name in names:
-        first = models[name]["first"]
-        hessian = models[name]["hessian"]
-        linear = directions @ first
-        quadratic = m.torch.einsum("ni,ij,nj->n", directions, hessian, directions)
-        change = theta * linear + 0.5 * theta * theta * quadratic
-        predicted[name] = change
-        feasible &= change <= (
-            -float(required_reduction[name]) + float(feasibility_tolerance)
+    coarse_changes = _quadratic_changes(models, coarse_directions, theta)
+    coarse_feasible = (
+        coarse_changes
+        <= -required.unsqueeze(0) + float(feasibility_tolerance)
+    ).all(dim=1)
+    if bool(coarse_feasible.any()):
+        directions = coarse_directions
+        changes = coarse_changes
+        refinement_audit = {
+            "continuous_sqp_executed": False,
+            "continuous_sqp_skip_reason": "coarse_joint_candidate_feasible",
+            "continuous_sqp_start_count": 0,
+            "continuous_sqp_iteration_count": 0,
+        }
+    else:
+        refined_directions, refined_changes, refinement_audit = (
+            _continuous_joint_sqp_refinement(
+                models=models,
+                theta=theta,
+                required=required,
+                scales=scales,
+                coarse_directions=coarse_directions,
+                feasibility_tolerance=float(feasibility_tolerance),
+            )
         )
+        refinement_audit["continuous_sqp_executed"] = True
+        directions = m.torch.cat(
+            [coarse_directions, refined_directions], dim=0
+        )
+        changes = m.torch.cat([coarse_changes, refined_changes], dim=0)
+    feasible = (
+        changes
+        <= -required.unsqueeze(0) + float(feasibility_tolerance)
+    ).all(dim=1)
+    required_audit = {
+        name: float(required_reduction[name]) for name in names
+    }
     if not bool(feasible.any()):
         best_progress = {
-            name: float(predicted[name].amin().detach()) for name in names
+            name: float(changes[:, index].amin().detach())
+            for index, name in enumerate(names)
         }
+        normalized_residual = (
+            changes
+            + required.unsqueeze(0)
+            - float(feasibility_tolerance)
+        ) / scales.unsqueeze(0)
+        nearest = normalized_residual.amax(dim=1).argmin()
         return None, {
             "solver_status": "insufficient_second_order_predicted_progress",
             "second_order_state": "insufficient_second_order_predicted_progress",
             "theta_radians": theta,
             "candidate_count": int(directions.shape[0]),
+            "coarse_candidate_count": int(coarse_directions.shape[0]),
             "feasible_candidate_count": 0,
             "best_predicted_change_by_term": best_progress,
+            "nearest_joint_predicted_change_by_term": {
+                name: float(changes[nearest, index].detach())
+                for index, name in enumerate(names)
+            },
+            "nearest_joint_maximum_normalized_residual": float(
+                normalized_residual[nearest].amax().detach()
+            ),
+            "required_reduction_by_term": required_audit,
+            "constraint_scale_by_term": {
+                name: float(scales[index].detach())
+                for index, name in enumerate(names)
+            },
+            **refinement_audit,
         }
     indices = m.torch.nonzero(feasible, as_tuple=False).reshape(-1)
     feasible_rows = directions.index_select(0, indices)
-    shadow = predicted["shadow"].index_select(0, indices)
-    endpoint = predicted["endpoint"].index_select(0, indices)
-    temporal = predicted["temporal"].index_select(0, indices)
+    feasible_changes = changes.index_select(0, indices)
+    shadow, endpoint, temporal = (
+        feasible_changes[:, index] for index in range(3)
+    )
     # Deterministic lexicographic ordering: strongest worst-constraint closure,
     # then shadow, endpoint, temporal, and finally the grid order.
     normalized = m.torch.stack(
@@ -640,13 +863,14 @@ def solve_angle_subproblem(
     chosen_global_tensor = indices[chosen_local_tensor]
     chosen_global = int(chosen_global_tensor.detach())
     coefficients = feasible_rows[chosen_local_tensor]
-    changes = {
-        name: float(predicted[name][chosen_global].detach()) for name in names
+    selected_changes = {
+        name: float(changes[chosen_global, index].detach())
+        for index, name in enumerate(names)
     }
     active = [
         name
         for name in names
-        if abs(changes[name] + float(required_reduction[name]))
+        if abs(selected_changes[name] + float(required_reduction[name]))
         <= max(float(feasibility_tolerance), 1.0e-12)
     ]
     return coefficients, {
@@ -654,13 +878,17 @@ def solve_angle_subproblem(
         "second_order_state": None,
         "theta_radians": theta,
         "candidate_count": int(directions.shape[0]),
+        "coarse_candidate_count": int(coarse_directions.shape[0]),
         "feasible_candidate_count": int(indices.numel()),
-        "selected_grid_index": chosen_global,
+        "selected_candidate_index": chosen_global,
         "selected_active_constraints": active,
-        "predicted_change_by_term": changes,
-        "required_reduction_by_term": {
-            name: float(required_reduction[name]) for name in names
+        "predicted_change_by_term": selected_changes,
+        "required_reduction_by_term": required_audit,
+        "constraint_scale_by_term": {
+            name: float(scales[index].detach())
+            for index, name in enumerate(names)
         },
+        **refinement_audit,
     }
 
 

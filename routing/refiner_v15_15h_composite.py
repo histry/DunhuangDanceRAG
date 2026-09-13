@@ -72,6 +72,28 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_grid_execution_device") ==
              "same_cuda_device_as_motion",
              "V15.15h candidate grid is not device-resident")
+    _require(fixed.get("second_order_joint_subproblem_solver") ==
+             "deterministic_device_resident_riemannian_continuous_sqp",
+             "V15.15h continuous joint SQP is absent")
+    _require(fixed.get("second_order_sqp_refinement_starts") ==
+             second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
+             "V15.15h SQP start count changed")
+    _require(fixed.get("second_order_sqp_refinement_iterations") ==
+             second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
+             "V15.15h SQP iteration count changed")
+    _require(fixed.get("second_order_sqp_smoothing") == [
+        float(value) for value in second_order.SECOND_ORDER_SQP_SMOOTHING
+    ], "V15.15h SQP smoothing schedule changed")
+    _require(fixed.get("second_order_sqp_line_search_radians") == [
+        float(value)
+        for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
+    ], "V15.15h SQP line search changed")
+    _require(fixed.get("finite_gap_required_reduction_formula") ==
+             "max(0,current_delta+strict_limit+safety_margin)",
+             "V15.15h finite-gap formula changed")
+    _require(fixed.get(
+        "finite_gap_already_safe_term_requires_fresh_descent"
+    ) is False, "V15.15h demands artificial descent from safe science terms")
     _require(fixed.get("second_order_host_candidate_sorting") is False,
              "V15.15h host candidate sorting is forbidden")
     _require(fixed.get("second_order_nonfinite_basis_policy") ==

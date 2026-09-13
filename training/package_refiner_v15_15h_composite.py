@@ -179,6 +179,21 @@ def run(args):
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":
                 "same_cuda_device_as_motion",
+            "second_order_joint_subproblem_solver": fixed[
+                "second_order_joint_subproblem_solver"
+            ],
+            "second_order_sqp_refinement_starts": int(
+                fixed["second_order_sqp_refinement_starts"]
+            ),
+            "second_order_sqp_refinement_iterations": int(
+                fixed["second_order_sqp_refinement_iterations"]
+            ),
+            "second_order_sqp_smoothing": list(
+                fixed["second_order_sqp_smoothing"]
+            ),
+            "second_order_sqp_line_search_radians": list(
+                fixed["second_order_sqp_line_search_radians"]
+            ),
             "second_order_host_candidate_sorting": False,
             "second_order_nonfinite_basis_policy":
                 "deterministic_verified_subspace_reduction",
@@ -197,6 +212,10 @@ def run(args):
             "second_order_feasibility_tolerance": float(
                 fixed["second_order_feasibility_tolerance"]
             ),
+            "finite_gap_required_reduction_formula": fixed[
+                "finite_gap_required_reduction_formula"
+            ],
+            "finite_gap_already_safe_term_requires_fresh_descent": False,
             "ownership": fixed.get("ownership"),
             "scope_null_space_projection": fixed.get(
                 "scope_null_space_projection"

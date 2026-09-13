@@ -15,6 +15,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from training import refiner_v15_15g1f3_second_order as second_order
+
 
 REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v1"
 FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v1"
@@ -86,6 +88,12 @@ def _unchanged_contract(report):
              "second-order Hessian evidence is absent")
     _require(report.get("second_order_joint_sqp") is True,
              "second-order joint SQP is absent")
+    _require(report.get("finite_gap_required_reduction_formula") ==
+             "max(0,current_delta+strict_limit+safety_margin)",
+             "finite-gap strict-boundary formula changed")
+    _require(report.get(
+        "finite_gap_already_safe_term_requires_fresh_descent"
+    ) is False, "already-safe science terms require artificial descent")
     _require(report.get("curvature_dtype") == "float64",
              "curvature dtype is not float64")
     _require(report.get("geodesic_acceleration_included") is True,
@@ -100,6 +108,22 @@ def _unchanged_contract(report):
     _require(report.get("second_order_grid_execution_device") ==
              "same_cuda_device_as_motion",
              "second-order candidate grid is not device-resident")
+    _require(report.get("second_order_joint_subproblem_solver") ==
+             "deterministic_device_resident_riemannian_continuous_sqp",
+             "second-order continuous joint SQP is absent")
+    _require(report.get("second_order_sqp_refinement_starts") ==
+             second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
+             "second-order SQP start count changed")
+    _require(report.get("second_order_sqp_refinement_iterations") ==
+             second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
+             "second-order SQP iteration count changed")
+    _require(report.get("second_order_sqp_smoothing") == [
+        float(value) for value in second_order.SECOND_ORDER_SQP_SMOOTHING
+    ], "second-order SQP smoothing schedule changed")
+    _require(report.get("second_order_sqp_line_search_radians") == [
+        float(value)
+        for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
+    ], "second-order SQP line search changed")
     _require(report.get("second_order_host_candidate_sorting") is False,
              "second-order candidates are sorted on the host")
     _require(report.get("second_order_nonfinite_basis_policy") ==
@@ -132,6 +156,21 @@ def _require_zero_scope(summary, label):
     )
 
 
+def _require_conformal_score_source(summary, expected, label):
+    decisions = summary.get("decisions") or {}
+    _require(bool(decisions), f"{label} has no conformal decisions")
+    for uid, decision in decisions.items():
+        severity = (
+            (decision.get("selection") or {}).get("anchor_severity") or {}
+        )
+        _require(
+            severity.get("score_source") == expected,
+            f"{label} conformal score source changed for {uid}",
+        )
+        _require(severity.get("offline_label_consumed") is False,
+                 f"{label} conformal gate consumed an offline label for {uid}")
+
+
 def _validate_train(report):
     _require(report.get("schema") == REPORT_SCHEMA, "train report schema mismatch")
     _require(report.get("evaluation_role") == "train_calibration",
@@ -155,6 +194,11 @@ def _validate_train(report):
              "required projected group coverage is incomplete")
     _require(summary.get("scope_safe") is True, "train scope audit failed")
     _require_zero_scope(summary, "train")
+    _require_conformal_score_source(
+        summary,
+        "train_leave_one_transaction_out_observable_models",
+        "train",
+    )
     _require(summary.get("runtime_case_whitelist_used") is False,
              "runtime case whitelist is forbidden")
     _require(summary.get("activation_aware_supported") is True,
@@ -177,6 +221,9 @@ def _validate_dev(report):
              "development replaced a closed Adapter incumbent")
     _require(summary.get("scope_safe") is True, "development scope audit failed")
     _require_zero_scope(summary, "development")
+    _require_conformal_score_source(
+        summary, "final_train_models", "development"
+    )
     _require(summary.get("single_identity_safe") is True,
              "development single identity control failed")
     counts = summary.get("selected_projected_count_by_group") or {}
@@ -286,6 +333,20 @@ def freeze_contract(args):
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":
                 "same_cuda_device_as_motion",
+            "second_order_joint_subproblem_solver":
+                "deterministic_device_resident_riemannian_continuous_sqp",
+            "second_order_sqp_refinement_starts": int(
+                repair["second_order_sqp_refinement_starts"]
+            ),
+            "second_order_sqp_refinement_iterations": int(
+                repair["second_order_sqp_refinement_iterations"]
+            ),
+            "second_order_sqp_smoothing": list(
+                repair["second_order_sqp_smoothing"]
+            ),
+            "second_order_sqp_line_search_radians": list(
+                repair["second_order_sqp_line_search_radians"]
+            ),
             "second_order_host_candidate_sorting": False,
             "second_order_nonfinite_basis_policy":
                 "deterministic_verified_subspace_reduction",
@@ -304,6 +365,10 @@ def freeze_contract(args):
             "second_order_feasibility_tolerance": float(
                 repair["second_order_feasibility_tolerance"]
             ),
+            "finite_gap_required_reduction_formula": repair[
+                "finite_gap_required_reduction_formula"
+            ],
+            "finite_gap_already_safe_term_requires_fresh_descent": False,
             "ownership": "exact_boolean_transaction_ownership_mask",
             "scope_null_space_projection": repair.get(
                 "scope_null_space_projection"
@@ -545,6 +610,9 @@ def verify_held_out(args):
              "held-out replaced a closed cross-short incumbent")
     _require(summary.get("scope_safe") is True, "held-out scope leaked")
     _require_zero_scope(summary, "held-out")
+    _require_conformal_score_source(
+        summary, "final_train_models", "held-out"
+    )
     _require(summary.get("runtime_case_whitelist_used") is False,
              "held-out used a case whitelist")
     states = {

@@ -738,16 +738,49 @@ def _freeze_discriminative_transaction_conformal(
     }
 
 
-def _discriminative_conformal_status(sample, envelope):
-    """Classify from observable severity only; ambiguity is identity-safe."""
+def _discriminative_conformal_status(
+    sample,
+    envelope,
+    *,
+    use_transaction_held_out_calibration_score=False,
+):
+    """Classify from observable severity only; ambiguity is identity-safe.
+
+    Train calibration must be evaluated with the already-frozen
+    leave-one-transaction-out score.  Scoring a calibration row with final
+    models that were fitted on that same row is in-sample leakage and can turn
+    a cross calibration example into a false ``single``.  Development,
+    held-out, and runtime always use the final train-only models.
+    """
     values = _observable_severity(sample)
-    single_distance = _multivariate_severity_score(
-        values, envelope["final_models"]["single"]
-    )
-    cross_distance = _multivariate_severity_score(
-        values, envelope["final_models"]["cross"]
-    )
-    discriminant = single_distance - cross_distance
+    score_source = "final_train_models"
+    if use_transaction_held_out_calibration_score:
+        transaction_id = str(sample["transaction_id"])
+        case_uid = str(sample["case_uid"])
+        fold = (
+            envelope.get("fold_score_by_case", {})
+            .get(transaction_id, {})
+            .get(case_uid)
+        )
+        if fold is None:
+            raise RuntimeError(
+                "train calibration row lacks its transaction-held-out "
+                f"conformal score: {case_uid}"
+            )
+        # Deliberately consume only the three observable-model scores.  The
+        # stored offline label remains evaluation metadata and is not read.
+        single_distance = float(fold["single_distance"])
+        cross_distance = float(fold["cross_distance"])
+        discriminant = float(fold["cross_discriminant"])
+        score_source = "train_leave_one_transaction_out_observable_models"
+    else:
+        single_distance = _multivariate_severity_score(
+            values, envelope["final_models"]["single"]
+        )
+        cross_distance = _multivariate_severity_score(
+            values, envelope["final_models"]["cross"]
+        )
+        discriminant = single_distance - cross_distance
     single_inlier = bool(
         single_distance <= float(envelope["single_distance_threshold"])
     )
@@ -756,9 +789,15 @@ def _discriminative_conformal_status(sample, envelope):
     )
     separated_cross = bool(
         discriminant
-        > float(envelope["activation_discriminant_threshold"])
+        >= float(envelope["activation_discriminant_threshold"])
     )
-    activated = bool(cross_inlier and not single_inlier and separated_cross)
+    # The discriminant threshold already sits beyond the largest calibrated
+    # single discriminant plus its uncertainty margin. Requiring the point to
+    # also lie outside the (overlapping) single distance ellipsoid can reject
+    # an otherwise separated cross observation and is not a conformal class
+    # condition. Equality is accepted because the threshold is the frozen
+    # lower order statistic of the cross calibration distribution.
+    activated = bool(cross_inlier and separated_cross)
     confident_identity = bool(
         single_inlier
         and discriminant <= float(envelope["single_discriminant_upper"])
@@ -787,6 +826,11 @@ def _discriminative_conformal_status(sample, envelope):
         "severity_abstained": abstained,
         "conformal_fallback": abstained,
         "outside_frozen_single_envelope": activated,
+        "score_source": score_source,
+        "transaction_held_out_calibration_score_used": bool(
+            use_transaction_held_out_calibration_score
+        ),
+        "offline_label_consumed": False,
     }
 
 
@@ -1049,6 +1093,13 @@ def _freeze_train_full_shadow_repair_contract(
             "max_case_numeric_tolerance_and_1e-12"
             if finite_gap_angular_feasibility else None
         ),
+        "finite_gap_required_reduction_formula": (
+            "max(0,current_delta+strict_limit+safety_margin)"
+            if finite_gap_angular_feasibility else None
+        ),
+        "finite_gap_already_safe_term_requires_fresh_descent": (
+            False if finite_gap_angular_feasibility else None
+        ),
         "finite_gap_shadow_margin_source": (
             "train_frozen_minimum_shadow_reduction"
             if finite_gap_angular_feasibility else None
@@ -1094,6 +1145,32 @@ def _freeze_train_full_shadow_repair_contract(
         ),
         "second_order_grid_execution_device": (
             "same_cuda_device_as_motion" if second_order_joint_sqp else None
+        ),
+        "second_order_joint_subproblem_solver": (
+            "deterministic_device_resident_riemannian_continuous_sqp"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_sqp_refinement_starts": (
+            int(second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_sqp_refinement_iterations": (
+            int(second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_sqp_smoothing": (
+            [
+                float(value)
+                for value in second_order.SECOND_ORDER_SQP_SMOOTHING
+            ]
+            if second_order_joint_sqp else None
+        ),
+        "second_order_sqp_line_search_radians": (
+            [
+                float(value)
+                for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
+            ]
+            if second_order_joint_sqp else None
         ),
         "second_order_host_candidate_sorting": (
             False if second_order_joint_sqp else None
@@ -2554,14 +2631,22 @@ def _finite_gap_science_requirements(constraints):
             numeric_tolerance,
             float(oracle.case_probe.STRICT_DESCENT_FLOOR),
         )
-        gap = max(0.0, delta + strict_limit)
         safety_margin = max(1.0e-12, numeric_tolerance)
+        # The quadratic constraint is expressed as a change from the current
+        # iterate.  Therefore only the remaining distance to the safe strict
+        # boundary is required.  Adding ``safety_margin`` after clamping the
+        # raw gap incorrectly demands fresh descent from a term that is
+        # already safely inside its pass set and can make the three-way joint
+        # subproblem spuriously infeasible.
+        gap = max(0.0, delta + strict_limit)
+        safe_gap = max(0.0, delta + strict_limit + safety_margin)
         requirements[name] = {
             "current_delta": delta,
             "strict_pass_limit": -strict_limit,
             "gap_to_strict_pass_line": gap,
             "safety_margin": safety_margin,
-            "required_predicted_reduction": gap + safety_margin,
+            "safe_strict_pass_limit": -strict_limit - safety_margin,
+            "required_predicted_reduction": safe_gap,
         }
     return requirements
 
@@ -5638,6 +5723,7 @@ def _g1c_fixed_guard_shadow_selection(
     target_rms,
     workspace_floor,
     severity_envelope,
+    evaluation_role="inference",
 ):
     """Select with observable activation and authoritative Guard shadows.
 
@@ -5652,9 +5738,16 @@ def _g1c_fixed_guard_shadow_selection(
     for sample in samples:
         uid = str(sample.get("case_uid", sample["case_index"]))
         case_index = int(sample["case_index"])
-        severity = _discriminative_conformal_status(
-            sample, severity_envelope
-        )
+        if evaluation_role == "train_calibration":
+            severity = _discriminative_conformal_status(
+                sample,
+                severity_envelope,
+                use_transaction_held_out_calibration_score=True,
+            )
+        else:
+            severity = _discriminative_conformal_status(
+                sample, severity_envelope
+            )
         candidates = {}
         selected_method = "identity"
         incumbent_locked = False
@@ -6766,6 +6859,7 @@ def run(args):
                 target_rms=float(args.target_rms),
                 workspace_floor=workspace_floor,
                 severity_envelope=severity_envelope,
+                evaluation_role=evaluation_role,
             )
         elif args.activation_aware_g1b:
             (
@@ -7632,6 +7726,16 @@ def run(args):
             train_shadow_contract.get("finite_gap_science_gap_source")
             if g1f2_family else None
         ),
+        "finite_gap_required_reduction_formula": (
+            train_shadow_contract.get(
+                "finite_gap_required_reduction_formula"
+            ) if g1f2_family else None
+        ),
+        "finite_gap_already_safe_term_requires_fresh_descent": (
+            train_shadow_contract.get(
+                "finite_gap_already_safe_term_requires_fresh_descent"
+            ) if g1f2_family else None
+        ),
         "second_order_hessian_used": bool(g1f3),
         "second_order_joint_sqp": bool(g1f3),
         "curvature_dtype": (
@@ -7661,6 +7765,30 @@ def run(args):
         "second_order_grid_execution_device": (
             train_shadow_contract.get("second_order_grid_execution_device")
             if g1f3 else None
+        ),
+        "second_order_joint_subproblem_solver": (
+            train_shadow_contract.get(
+                "second_order_joint_subproblem_solver"
+            ) if g1f3 else None
+        ),
+        "second_order_sqp_refinement_starts": (
+            train_shadow_contract.get(
+                "second_order_sqp_refinement_starts"
+            ) if g1f3 else None
+        ),
+        "second_order_sqp_refinement_iterations": (
+            train_shadow_contract.get(
+                "second_order_sqp_refinement_iterations"
+            ) if g1f3 else None
+        ),
+        "second_order_sqp_smoothing": (
+            train_shadow_contract.get("second_order_sqp_smoothing")
+            if g1f3 else None
+        ),
+        "second_order_sqp_line_search_radians": (
+            train_shadow_contract.get(
+                "second_order_sqp_line_search_radians"
+            ) if g1f3 else None
         ),
         "second_order_host_candidate_sorting": (
             train_shadow_contract.get("second_order_host_candidate_sorting")
