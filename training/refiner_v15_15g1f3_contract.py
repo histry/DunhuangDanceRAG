@@ -123,6 +123,12 @@ def _unchanged_contract(report):
     _require(report.get("second_order_sqp_constraint_scaling") ==
              "absolute_signed_boundary_gap_floor_1e-12",
              "second-order SQP constraint scaling changed")
+    _require(report.get("second_order_budget_semantics") ==
+             "remaining_joint_closure_gap_divided_by_remaining_steps",
+             "second-order budget is not genuinely multi-step")
+    _require(report.get("second_order_intermediate_acceptance") ==
+             "authoritative_endpoint_temporal_shadow_step_progress",
+             "second-order intermediate acceptance changed")
     _require(report.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -202,6 +208,12 @@ def _validate_train(report):
         ) is True
         for uid in TARGET_CASE_UIDS
     ), "a declared train calibration probe was not evaluated")
+    _require(all(
+        decision.get("train_calibration_probe_forced_evaluation") is True
+        for decision in decisions.values()
+        if (decision.get("evaluation_only") or {}).get("teacher_kind")
+        == "exact_projected_direction"
+    ), "a train cross calibration row was not evaluated")
     _require(summary.get("g1f3_train_target_closure_complete") is True,
              "five train target cases did not all close")
     _require(summary.get("adapter_incumbent_preserved") is True,
@@ -341,6 +353,8 @@ def freeze_contract(args):
                 TARGET_CASE_UIDS
             ),
             "declared_train_probe_uids_packaged_for_runtime_activation": False,
+            "train_cross_roles_used_for_calibration_audit_only": True,
+            "train_cross_roles_packaged_for_runtime_activation": False,
         },
         "fixed_parameters": {
             "correction_budgets": [2, 3, 5],
@@ -366,6 +380,12 @@ def freeze_contract(args):
             ),
             "second_order_sqp_constraint_scaling": repair[
                 "second_order_sqp_constraint_scaling"
+            ],
+            "second_order_budget_semantics": repair[
+                "second_order_budget_semantics"
+            ],
+            "second_order_intermediate_acceptance": repair[
+                "second_order_intermediate_acceptance"
             ],
             "second_order_sqp_line_search_radians": list(
                 repair["second_order_sqp_line_search_radians"]

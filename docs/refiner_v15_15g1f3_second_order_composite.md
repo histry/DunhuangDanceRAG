@@ -36,6 +36,12 @@ endpoint/temporal 的有符号有限 gap 按
 项可在不越过安全边界的前提下使用余量，不再人为要求每一步继续下降；最终
 是否通过仍由真实 trial 和完整 Guard 决定。
 
+`k=2/3/5` 是真实多步预算：每一迭代把当前 endpoint、temporal 和最坏完整
+Guard shadow 到安全闭包边界的剩余有符号 gap 除以剩余步数。真实 trial 必须
+完成这一步三项联合进度；最后一步必须进入 endpoint/temporal 严格通过域且
+Guard shadow 不大于零。若提前达到真实 raw 闭包则停止该预算，随后仍须经过
+复合 selector、Projector 和完整 transaction Guard 才能称为稳定通过。
+
 train 校准行使用包络中已经冻结的 leave-one-transaction-out observable
 分数；禁止再用包含该行的最终模型给该行做 in-sample 判定。此规则不读取
 fold 中保存的 offline label。development、一次性 held-out 和整曲推断仍只
@@ -45,6 +51,9 @@ fold 中保存的 offline label。development、一次性 held-out 和整曲推�
 强制进入候选生成、Projector 与完整 Guard 闭包审计，因为它们不是现有
 conformal 包络的 cross 拟合成员。该探针集合只用于校准验收，不写入 V15.15h
 运行时激活逻辑；development、held-out 和整曲均不能用这些 UID 激活候选。
+同理，train bank 中已有 `exact_projected_direction` 行作为离线 cross 校准行
+必须全部进入 train selector 非回归审计，避免 conformal uncertainty 让冻结
+bank 的 required projected count 无法验证；该离线角色也不进入任何运行时入口。
 
 若某个基方向的方向 HvP 非有限，该方向会在建模前被确定性排除；若组合方向
 失败，则排除索引较后的基向量并重新构建已验证子空间。模型不会消费 NaN，

@@ -87,6 +87,12 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_sqp_constraint_scaling") ==
              "absolute_signed_boundary_gap_floor_1e-12",
              "V15.15h SQP constraint scaling changed")
+    _require(fixed.get("second_order_budget_semantics") ==
+             "remaining_joint_closure_gap_divided_by_remaining_steps",
+             "V15.15h second-order budget is not multi-step")
+    _require(fixed.get("second_order_intermediate_acceptance") ==
+             "authoritative_endpoint_temporal_shadow_step_progress",
+             "V15.15h intermediate acceptance changed")
     _require(fixed.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -439,8 +445,11 @@ def _apply_one_transaction(
                         "temporal": values["temporal"],
                     }
 
+                remaining_steps = int(budget) - int(iteration)
                 required = {
-                    name: max(0.0, float(value.detach()))
+                    name: (
+                        float(value.detach()) + feasibility_tolerance
+                    ) / float(remaining_steps)
                     for name, value in scalar_terms.items()
                 }
                 try:
@@ -499,6 +508,8 @@ def _apply_one_transaction(
                         "angle_index": angle_index,
                         "theta_radians": theta,
                         "prediction_active_guard_term": frozen_active_name,
+                        "remaining_steps_including_current": remaining_steps,
+                        "required_step_reduction_by_term": dict(required),
                         "solver": solver,
                         "second_order_model_preparation": (
                             preparation_audit if angle_index == 0 else None
@@ -574,19 +585,16 @@ def _apply_one_transaction(
                         name: float(value.detach())
                         for name, value in scalar_terms.items()
                     }
-                    actual_progress = bool(
-                        all(
-                            math.isfinite(trial_scalar[name])
-                            and trial_scalar[name]
-                            <= expansion_scalar[name] + feasibility_tolerance
-                            for name in trial_scalar
-                        )
-                        and any(
-                            trial_scalar[name]
-                            < expansion_scalar[name] - feasibility_tolerance
-                            for name in trial_scalar
-                        )
-                    )
+                    actual_change = {
+                        name: trial_scalar[name] - expansion_scalar[name]
+                        for name in trial_scalar
+                    }
+                    actual_progress = bool(all(
+                        math.isfinite(actual_change[name])
+                        and actual_change[name]
+                        <= -required[name] + feasibility_tolerance
+                        for name in trial_scalar
+                    ))
                     attempt.update({
                         "authoritative_active_guard_term": authoritative_active,
                         "active_set_transition": active_transition,
@@ -595,10 +603,13 @@ def _apply_one_transaction(
                         "scope_leakage_abs_max": scope_leakage,
                         "authoritative_metric_before": expansion_scalar,
                         "authoritative_metric_after": trial_scalar,
+                        "authoritative_metric_change": actual_change,
                         "authoritative_progress": actual_progress,
                         "state": (
                             "second_order_closure_succeeded"
                             if full_closed
+                            else "second_order_trial_succeeded"
+                            if actual_progress
                             else "active_set_transition_model_mismatch"
                             if active_transition
                             else "second_order_finite_radius_model_mismatch"

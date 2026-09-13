@@ -194,6 +194,12 @@ def run(args):
             "second_order_sqp_constraint_scaling": fixed[
                 "second_order_sqp_constraint_scaling"
             ],
+            "second_order_budget_semantics": fixed[
+                "second_order_budget_semantics"
+            ],
+            "second_order_intermediate_acceptance": fixed[
+                "second_order_intermediate_acceptance"
+            ],
             "second_order_sqp_line_search_radians": list(
                 fixed["second_order_sqp_line_search_radians"]
             ),

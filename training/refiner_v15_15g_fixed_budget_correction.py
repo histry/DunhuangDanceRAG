@@ -1169,6 +1169,14 @@ def _freeze_train_full_shadow_repair_contract(
             "absolute_signed_boundary_gap_floor_1e-12"
             if second_order_joint_sqp else None
         ),
+        "second_order_budget_semantics": (
+            "remaining_joint_closure_gap_divided_by_remaining_steps"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_intermediate_acceptance": (
+            "authoritative_endpoint_temporal_shadow_step_progress"
+            if second_order_joint_sqp else None
+        ),
         "second_order_sqp_line_search_radians": (
             [
                 float(value)
@@ -1219,7 +1227,12 @@ def _freeze_train_full_shadow_repair_contract(
         ),
         "line_search_acceptance": [
             "full_transaction_fixed_guard_shadow_strictly_decreases",
-            "endpoint_and_temporal_strict_descent_pass",
+            (
+                "endpoint_temporal_remaining_gap_step_progress_then_final_"
+                "strict_descent_pass"
+                if second_order_joint_sqp
+                else "endpoint_and_temporal_strict_descent_pass"
+            ),
             "owned_tangent_radius_rms_equals_1e-4",
             "outside_scope_abs_max_equals_0",
         ],
@@ -1328,6 +1341,7 @@ def _g1d_shadow_objective(
     train_repair_contract,
     temporal_smoothness_weight,
     prediction_active_names=None,
+    require_shadow_constraint=False,
 ):
     hard_shadows, hard_values, limits = (
         _full_transaction_fixed_guard_shadows(
@@ -1342,7 +1356,12 @@ def _g1d_shadow_objective(
         name for name, value in hard_float.items() if value > 0.0
     )
     if prediction_active_names is None:
-        active_names = authoritative_active_names
+        if require_shadow_constraint:
+            active_names = [max(
+                sorted(hard_float), key=lambda name: hard_float[name]
+            )]
+        else:
+            active_names = authoritative_active_names
     else:
         active_names = [str(name) for name in prediction_active_names]
         unexpected = sorted(set(active_names) - set(hard_shadows))
@@ -1389,9 +1408,14 @@ def _g1d_shadow_objective(
     smoothness = _tangent_temporal_smoothness(local_tangent, local_mask)
     if active_names:
         primary = "full_transaction_fixed_guard_shadow"
-        primary_loss = m.torch.stack(
-            [m.torch.relu(smooth_shadows[name]) for name in active_names]
-        ).sum()
+        if require_shadow_constraint:
+            primary_loss = m.torch.stack(
+                [smooth_shadows[name] for name in active_names]
+            ).sum()
+        else:
+            primary_loss = m.torch.stack(
+                [m.torch.relu(smooth_shadows[name]) for name in active_names]
+            ).sum()
     else:
         primary = "endpoint_temporal"
         primary_loss = (
@@ -1407,6 +1431,12 @@ def _g1d_shadow_objective(
         ),
         "prediction_active_set_frozen": bool(
             prediction_active_names is not None
+        ),
+        "signed_shadow_constraint_required": bool(
+            require_shadow_constraint
+        ),
+        "safe_shadow_boundary_proxy": bool(
+            require_shadow_constraint and not authoritative_active_names
         ),
         "full_transaction_fixed_guard_shadow_margin_by_term": hard_float,
         "maximum_full_transaction_fixed_guard_shadow_margin": maximum_hard,
@@ -3659,6 +3689,7 @@ def _second_order_angular_iteration(
     train_repair_contract,
     target_rms,
     iteration,
+    remaining_steps,
     case_uid=None,
 ):
     """Run one g1f3 iteration with a real-path second-order model per angle."""
@@ -3666,6 +3697,8 @@ def _second_order_angular_iteration(
         constraints["maximum_full_transaction_fixed_guard_shadow_margin"]
     )
     frozen_active_names = tuple(constraints["active_full_shadow_terms"])
+    if int(remaining_steps) <= 0:
+        raise ValueError("g1f3 remaining_steps must be positive")
     minimum_reduction = max(
         (
             float(
@@ -3678,14 +3711,15 @@ def _second_order_angular_iteration(
         default=0.0,
     )
     science_requirements = _finite_gap_science_requirements(constraints)
+    signed_shadow_gap = current_shadow + minimum_reduction
     required_reduction = {
-        "shadow": minimum_reduction,
+        "shadow": signed_shadow_gap / float(remaining_steps),
         "endpoint": float(
             science_requirements["endpoint"]["required_predicted_reduction"]
-        ),
+        ) / float(remaining_steps),
         "temporal": float(
             science_requirements["temporal"]["required_predicted_reduction"]
-        ),
+        ) / float(remaining_steps),
     }
 
     dtype = m.torch.float64
@@ -3715,6 +3749,7 @@ def _second_order_angular_iteration(
             train_repair_contract=train_repair_contract,
             temporal_smoothness_weight=0.0,
             prediction_active_names=frozen_active_names,
+            require_shadow_constraint=True,
         )
         if tuple(diagnostics64["active_full_shadow_terms"]) != (
             frozen_active_names
@@ -3934,9 +3969,41 @@ def _second_order_angular_iteration(
             baseline_case,
         )
         science_margins = _science_pass_margin_diagnostics(trial_scientific)
-        science_ok = bool(
-            science_margins["both_scientific_terms_strictly_improved"]
+        science_step_change = {
+            name: float(trial_scientific[f"{name}_delta"])
+            - float(constraints[f"{name}_delta"])
+            for name in ("endpoint", "temporal")
+        }
+        science_step_tolerance = {
+            name: max(
+                float(
+                    (constraints.get("scientific_numeric_tolerance") or {})
+                    .get(name, 0.0)
+                ),
+                float(
+                    train_repair_contract[
+                        "second_order_feasibility_tolerance"
+                    ]
+                ),
+            )
+            for name in ("endpoint", "temporal")
+        }
+        science_step_margin = {
+            name: -float(required_reduction[name])
+            - science_step_change[name]
+            for name in ("endpoint", "temporal")
+        }
+        science_ok = all(
+            science_step_margin[name] >= -science_step_tolerance[name]
+            for name in ("endpoint", "temporal")
         )
+        if int(remaining_steps) == 1:
+            science_ok = bool(
+                science_ok
+                and science_margins[
+                    "both_scientific_terms_strictly_improved"
+                ]
+            )
         with m.torch.no_grad():
             trial_shadows, _, _ = _full_transaction_fixed_guard_shadows(
                 model,
@@ -3953,17 +4020,28 @@ def _second_order_angular_iteration(
         trial_active_names = tuple(sorted(
             name for name, value in trial_shadow_values.items() if value > 0.0
         ))
-        active_transition = trial_active_names != frozen_active_names
+        expansion_authoritative_active_names = tuple(
+            constraints.get("authoritative_active_full_shadow_terms") or []
+        )
+        active_transition = (
+            trial_active_names != expansion_authoritative_active_names
+        )
         any_active_transition = any_active_transition or active_transition
         trial_shadow = max(trial_shadow_values.values())
+        shadow_step_tolerance = float(
+            train_repair_contract["second_order_feasibility_tolerance"]
+        )
         shadow_ok = bool(
-            trial_shadow <= current_shadow - minimum_reduction
+            trial_shadow
+            <= current_shadow
+            - float(required_reduction["shadow"])
+            + shadow_step_tolerance
         )
         failed_constraints = []
         if not shadow_ok:
             failed_constraints.append("hard_full_transaction_shadow")
         if not science_ok:
-            failed_constraints.append("endpoint_temporal_science")
+            failed_constraints.append("endpoint_temporal_step_progress")
         if not radius_ok:
             failed_constraints.append("exact_radius")
         if not scope_ok:
@@ -3978,12 +4056,24 @@ def _second_order_angular_iteration(
             # This is deliberately not called closure: final closure belongs to
             # the composite selector + Projector + complete Guard audit below.
             reason = None
+        authoritative_step_closure = bool(
+            not failed_constraints
+            and trial_shadow <= 0.0
+            and science_margins[
+                "both_scientific_terms_strictly_improved"
+            ]
+            and radius_ok
+            and scope_ok
+        )
         trial_row = {
             "backtrack": backtrack,
             "theta_radians": float(theta),
             "accepted": not failed_constraints,
             "reason": reason,
             "second_order_trial_succeeded": not failed_constraints,
+            "authoritative_step_closure_succeeded": (
+                authoritative_step_closure
+            ),
             "failed_constraints": failed_constraints,
             "second_order_prediction_passed": True,
             "authoritative_trial_executed": True,
@@ -3992,6 +4082,10 @@ def _second_order_angular_iteration(
             "active_set_transition": active_transition,
             "trial_full_shadow": trial_shadow,
             "full_shadow_reduction": current_shadow - trial_shadow,
+            "remaining_steps_including_current": int(remaining_steps),
+            "required_step_reduction_by_term": dict(required_reduction),
+            "trial_science_change_by_term": science_step_change,
+            "trial_science_step_margin_by_term": science_step_margin,
             "trial_radius_rms": radius_rms,
             "trial_outside_scope_abs_max": outside_scope,
             **science_margins,
@@ -4007,6 +4101,14 @@ def _second_order_angular_iteration(
             break
 
     accepted = accepted_theta > 0.0
+    accepted_authoritative_closure = bool(
+        accepted
+        and any(
+            row.get("accepted")
+            and row.get("authoritative_step_closure_succeeded")
+            for row in trial_rows
+        )
+    )
     if accepted:
         rejection_reason = None
     elif any_authoritative_trial and any_active_transition:
@@ -4043,6 +4145,9 @@ def _second_order_angular_iteration(
         "second_order_model_preparation": model_preparation_audit,
         "angle_specific_second_order_solvers": solver_audits,
         "finite_gap_science_requirements": science_requirements,
+        "remaining_steps_including_current": int(remaining_steps),
+        "required_step_reduction_by_term": dict(required_reduction),
+        "signed_full_shadow_gap_to_safe_boundary": signed_shadow_gap,
         "full_shadow_before": current_shadow,
         "full_shadow_after": accepted_shadow,
         "full_shadow_reduction": (
@@ -4062,6 +4167,9 @@ def _second_order_angular_iteration(
         ),
         "second_order_hessian_used": True,
         "second_order_trial_succeeded": accepted,
+        "authoritative_step_closure_succeeded": (
+            accepted_authoritative_closure
+        ),
         "second_order_closure_succeeded": False,
         "closure_deferred_to_composite_selector": True,
     }, numeric_failure
@@ -4133,6 +4241,7 @@ def _correct_case_geodesic_joint_sqp(
             temporal_smoothness_weight=float(
                 train_repair_contract["temporal_smoothness_weight"]
             ),
+            require_shadow_constraint=bool(second_order_joint_sqp),
         )
         if constraints["primary_objective"] != (
             "full_transaction_fixed_guard_shadow"
@@ -4178,6 +4287,7 @@ def _correct_case_geodesic_joint_sqp(
                     train_repair_contract=train_repair_contract,
                     target_rms=target_rms,
                     iteration=iteration,
+                    remaining_steps=int(steps) - iteration,
                     case_uid=case_uid,
                 )
             )
@@ -4186,6 +4296,10 @@ def _correct_case_geodesic_joint_sqp(
             if not iteration_report["accepted"]:
                 break
             current = accepted_tangent
+            if iteration_report.get(
+                "authoritative_step_closure_succeeded"
+            ):
+                break
             continue
         if finite_gap_angular_feasibility:
             accepted_tangent, iteration_report, iteration_numeric_failure = (
@@ -5755,9 +5869,16 @@ def _g1c_fixed_guard_shadow_selection(
         candidates = {}
         selected_method = "identity"
         incumbent_locked = False
-        calibration_probe_forced_evaluation = bool(
+        declared_target_probe = bool(
             evaluation_role == "train_calibration"
             and uid in G1F3_TRAIN_TARGET_CASE_UIDS
+        )
+        train_cross_calibration_probe = bool(
+            evaluation_role == "train_calibration"
+            and sample.get("teacher_kind") == "exact_projected_direction"
+        )
+        calibration_probe_forced_evaluation = bool(
+            declared_target_probe or train_cross_calibration_probe
         )
         candidate_evaluation_authorized = bool(
             severity["activation_supported_by_observables"]
@@ -5883,6 +6004,11 @@ def _g1c_fixed_guard_shadow_selection(
             "train_calibration_probe_forced_evaluation": (
                 calibration_probe_forced_evaluation
             ),
+            "declared_g1f3_target_probe": declared_target_probe,
+            "train_cross_calibration_probe": train_cross_calibration_probe,
+            "offline_role_consumed_for_train_calibration_audit": bool(
+                train_cross_calibration_probe
+            ),
             "runtime_activation_supported_by_observables": bool(
                 severity["activation_supported_by_observables"]
             ),
@@ -5890,7 +6016,7 @@ def _g1c_fixed_guard_shadow_selection(
                 "anchor_severity": severity,
                 "activation_condition": (
                     "train_transaction_discriminative_conformal_"
-                    "cross_or_train_only_declared_g1f3_calibration_probe"
+                    "cross_or_train_only_calibration_audit_probe"
                 ),
                 "case_physical_margin_contract": (
                     "per_case_stage_relative_diagnostic_only"
@@ -7837,6 +7963,15 @@ def run(args):
         "second_order_sqp_constraint_scaling": (
             train_shadow_contract.get(
                 "second_order_sqp_constraint_scaling"
+            ) if g1f3 else None
+        ),
+        "second_order_budget_semantics": (
+            train_shadow_contract.get("second_order_budget_semantics")
+            if g1f3 else None
+        ),
+        "second_order_intermediate_acceptance": (
+            train_shadow_contract.get(
+                "second_order_intermediate_acceptance"
             ) if g1f3 else None
         ),
         "second_order_sqp_line_search_radians": (
