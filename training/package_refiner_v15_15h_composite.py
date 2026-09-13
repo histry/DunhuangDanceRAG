@@ -191,6 +191,9 @@ def run(args):
             "second_order_sqp_smoothing": list(
                 fixed["second_order_sqp_smoothing"]
             ),
+            "second_order_sqp_constraint_scaling": fixed[
+                "second_order_sqp_constraint_scaling"
+            ],
             "second_order_sqp_line_search_radians": list(
                 fixed["second_order_sqp_line_search_radians"]
             ),
@@ -215,7 +218,7 @@ def run(args):
             "finite_gap_required_reduction_formula": fixed[
                 "finite_gap_required_reduction_formula"
             ],
-            "finite_gap_already_safe_term_requires_fresh_descent": False,
+            "finite_gap_already_safe_term_may_use_safe_slack": True,
             "ownership": fixed.get("ownership"),
             "scope_null_space_projection": fixed.get(
                 "scope_null_space_projection"

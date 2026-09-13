@@ -25,20 +25,26 @@ Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 tria
 
 曲率模型与角度无关，因此每次 SQP 迭代只构建一次，并由全部 12 个冻结角度
 复用。仅当网格没有共同可行点时，每个角度才以全部网格方向（至多 768 个）
-为起点，在低维单位球面上执行固定 32 次连续 Riemannian 联合 SQP 精化；约束
+为起点，在低维单位球面上执行固定 64 次连续 Riemannian 联合 SQP 精化；约束
 值、解析梯度、固定角度线搜索及最终
 词典序选择都在 motion 所在 CUDA device 上完成。网格不再作为“无共同可行
-方向”的最终判据。Projector 与完整 Guard 继续走原有权威实现。
+方向”的最终判据。三个约束按各自有符号安全边界 gap 归一化，不能再用指标
+动态范围掩盖正的 Guard 违反。Projector 与完整 Guard 继续走原有权威实现。
 
-endpoint/temporal 的有限 gap 按
-`max(0, current_delta + strict_limit + safety_margin)` 计算。已经安全进入严格
-通过域的项只要求不回退，不再人为要求每一步继续下降一个 safety margin；
-最终是否通过仍由真实 trial 和完整 Guard 决定。
+endpoint/temporal 的有符号有限 gap 按
+`current_delta + strict_limit + safety_margin` 计算。已经安全进入严格通过域的
+项可在不越过安全边界的前提下使用余量，不再人为要求每一步继续下降；最终
+是否通过仍由真实 trial 和完整 Guard 决定。
 
 train 校准行使用包络中已经冻结的 leave-one-transaction-out observable
 分数；禁止再用包含该行的最终模型给该行做 in-sample 判定。此规则不读取
 fold 中保存的 offline label。development、一次性 held-out 和整曲推断仍只
 使用 train 冻结的 final models，因而不会把 train UID 或案例白名单带入运行时。
+
+五个已声明的 g1f2 mismatch UID 在 `train_calibration` 角色中作为离线数值探针
+强制进入候选生成、Projector 与完整 Guard 闭包审计，因为它们不是现有
+conformal 包络的 cross 拟合成员。该探针集合只用于校准验收，不写入 V15.15h
+运行时激活逻辑；development、held-out 和整曲均不能用这些 UID 激活候选。
 
 若某个基方向的方向 HvP 非有限，该方向会在建模前被确定性排除；若组合方向
 失败，则排除索引较后的基向量并重新构建已验证子空间。模型不会消费 NaN，

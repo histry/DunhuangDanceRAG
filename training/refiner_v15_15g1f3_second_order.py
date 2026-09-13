@@ -35,8 +35,8 @@ HVP_RECOVERY_EPSILON_RADIANS = (1.0e-4, 3.0e-4)
 HVP_RECOVERY_RELATIVE_TOLERANCE = 0.25
 HVP_RECOVERY_ABSOLUTE_TOLERANCE = 1.0e-6
 SECOND_ORDER_SQP_REFINEMENT_STARTS = 768
-SECOND_ORDER_SQP_REFINEMENT_ITERATIONS = 32
-SECOND_ORDER_SQP_SMOOTHING = (8.0, 32.0)
+SECOND_ORDER_SQP_REFINEMENT_ITERATIONS = 64
+SECOND_ORDER_SQP_SMOOTHING = (1.0, 8.0, 64.0, 512.0)
 SECOND_ORDER_SQP_LINE_SEARCH_RADIANS = (
     0.25,
     0.125,
@@ -46,6 +46,12 @@ SECOND_ORDER_SQP_LINE_SEARCH_RADIANS = (
     0.0078125,
     0.00390625,
     0.001953125,
+    0.0009765625,
+    0.00048828125,
+    0.000244140625,
+    0.0001220703125,
+    0.00006103515625,
+    0.000030517578125,
 )
 
 
@@ -595,26 +601,16 @@ def _quadratic_changes(models, directions, theta):
 
 
 def _constraint_scales(models, theta, required, floor):
-    """Build fixed positive scales without changing exact feasibility."""
-    names = ("shadow", "endpoint", "temporal")
-    rows = []
-    for index, name in enumerate(names):
-        first_scale = abs(theta) * m.torch.linalg.vector_norm(
-            models[name]["first"]
-        )
-        curvature_scale = (
-            0.5
-            * theta
-            * theta
-            * m.torch.linalg.matrix_norm(models[name]["hessian"])
-        )
-        rows.append(m.torch.stack([
-            required[index].abs(),
-            first_scale,
-            curvature_scale,
-            required.new_tensor(max(float(floor), 1.0e-12)),
-        ]).amax())
-    return m.torch.stack(rows)
+    """Normalize by each signed boundary gap, not metric dynamic range.
+
+    Dynamic-range normalization can declare a large positive Guard violation
+    numerically small merely because that Guard has high curvature.  Gap
+    normalization makes zero the equally authoritative feasibility boundary
+    for all three constraints.  ``models`` and ``theta`` remain explicit in
+    the signature so the frozen solver interface records its inputs.
+    """
+    del models, theta
+    return required.abs().clamp_min(max(float(floor), 1.0e-12))
 
 
 def _continuous_joint_sqp_refinement(
@@ -840,14 +836,9 @@ def solve_angle_subproblem(
     )
     # Deterministic lexicographic ordering: strongest worst-constraint closure,
     # then shadow, endpoint, temporal, and finally the grid order.
-    normalized = m.torch.stack(
-        [
-            shadow / max(float(required_reduction["shadow"]), 1.0e-30),
-            endpoint / max(float(required_reduction["endpoint"]), 1.0e-30),
-            temporal / max(float(required_reduction["temporal"]), 1.0e-30),
-        ],
-        dim=1,
-    )
+    normalized = (
+        feasible_changes + required.unsqueeze(0)
+    ) / scales.unsqueeze(0)
     worst = normalized.amax(dim=1)
     # Resolve the exact lexicographic order on-device.  This avoids one host
     # synchronization per feasible row while retaining deterministic ties.

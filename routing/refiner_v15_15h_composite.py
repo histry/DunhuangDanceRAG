@@ -84,16 +84,19 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_sqp_smoothing") == [
         float(value) for value in second_order.SECOND_ORDER_SQP_SMOOTHING
     ], "V15.15h SQP smoothing schedule changed")
+    _require(fixed.get("second_order_sqp_constraint_scaling") ==
+             "absolute_signed_boundary_gap_floor_1e-12",
+             "V15.15h SQP constraint scaling changed")
     _require(fixed.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
     ], "V15.15h SQP line search changed")
     _require(fixed.get("finite_gap_required_reduction_formula") ==
-             "max(0,current_delta+strict_limit+safety_margin)",
+             "current_delta+strict_limit+safety_margin",
              "V15.15h finite-gap formula changed")
     _require(fixed.get(
-        "finite_gap_already_safe_term_requires_fresh_descent"
-    ) is False, "V15.15h demands artificial descent from safe science terms")
+        "finite_gap_already_safe_term_may_use_safe_slack"
+    ) is True, "V15.15h safe science slack is unavailable")
     _require(fixed.get("second_order_host_candidate_sorting") is False,
              "V15.15h host candidate sorting is forbidden")
     _require(fixed.get("second_order_nonfinite_basis_policy") ==

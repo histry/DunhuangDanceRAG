@@ -572,14 +572,22 @@ def _audit_step(
     workspace_floor,
     args,
     transaction_domains=None,
+    additional_case_uids=(),
 ):
     rows = []
+    additional_case_uids = {
+        str(value) for value in additional_case_uids
+    }
     for sample in samples:
-        if sample["teacher_kind"] != "exact_projected_direction":
+        sample_uid = str(sample.get("case_uid", sample["case_index"]))
+        if (
+            sample["teacher_kind"] != "exact_projected_direction"
+            and sample_uid not in additional_case_uids
+        ):
             continue
         global_case_index = int(sample["case_index"])
         case_index = global_case_index
-        case_uid = str(sample.get("case_uid", case_index))
+        case_uid = sample_uid
         group_name = str(sample["audit_group"])
         local_batch = batch
         local_decoder_tangent = decoder_adapter_tangent

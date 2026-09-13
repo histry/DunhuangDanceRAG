@@ -89,11 +89,11 @@ def _unchanged_contract(report):
     _require(report.get("second_order_joint_sqp") is True,
              "second-order joint SQP is absent")
     _require(report.get("finite_gap_required_reduction_formula") ==
-             "max(0,current_delta+strict_limit+safety_margin)",
+             "current_delta+strict_limit+safety_margin",
              "finite-gap strict-boundary formula changed")
     _require(report.get(
-        "finite_gap_already_safe_term_requires_fresh_descent"
-    ) is False, "already-safe science terms require artificial descent")
+        "finite_gap_already_safe_term_may_use_safe_slack"
+    ) is True, "already-safe science slack is unavailable")
     _require(report.get("curvature_dtype") == "float64",
              "curvature dtype is not float64")
     _require(report.get("geodesic_acceleration_included") is True,
@@ -120,6 +120,9 @@ def _unchanged_contract(report):
     _require(report.get("second_order_sqp_smoothing") == [
         float(value) for value in second_order.SECOND_ORDER_SQP_SMOOTHING
     ], "second-order SQP smoothing schedule changed")
+    _require(report.get("second_order_sqp_constraint_scaling") ==
+             "absolute_signed_boundary_gap_floor_1e-12",
+             "second-order SQP constraint scaling changed")
     _require(report.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -186,6 +189,19 @@ def _validate_train(report):
     summary = _summary(report)
     _require(summary.get("g1f3_train_target_case_uids") == list(TARGET_CASE_UIDS),
              "train target cases changed")
+    _require(summary.get("g1f3_train_calibration_probe_case_uids") ==
+             list(TARGET_CASE_UIDS),
+             "train-only g1f3 calibration probes changed")
+    _require(summary.get(
+        "g1f3_train_calibration_probes_excluded_from_single_controls"
+    ) is True, "declared mismatch probes were audited as single controls")
+    decisions = summary.get("decisions") or {}
+    _require(all(
+        (decisions.get(uid) or {}).get(
+            "train_calibration_probe_forced_evaluation"
+        ) is True
+        for uid in TARGET_CASE_UIDS
+    ), "a declared train calibration probe was not evaluated")
     _require(summary.get("g1f3_train_target_closure_complete") is True,
              "five train target cases did not all close")
     _require(summary.get("adapter_incumbent_preserved") is True,
@@ -321,6 +337,10 @@ def freeze_contract(args):
             "development_parameter_selection": False,
             "held_out_parameter_selection": False,
             "runtime_case_whitelist_allowed": False,
+            "declared_train_probe_uids_used_for_calibration_audit_only": list(
+                TARGET_CASE_UIDS
+            ),
+            "declared_train_probe_uids_packaged_for_runtime_activation": False,
         },
         "fixed_parameters": {
             "correction_budgets": [2, 3, 5],
@@ -344,6 +364,9 @@ def freeze_contract(args):
             "second_order_sqp_smoothing": list(
                 repair["second_order_sqp_smoothing"]
             ),
+            "second_order_sqp_constraint_scaling": repair[
+                "second_order_sqp_constraint_scaling"
+            ],
             "second_order_sqp_line_search_radians": list(
                 repair["second_order_sqp_line_search_radians"]
             ),
@@ -368,7 +391,7 @@ def freeze_contract(args):
             "finite_gap_required_reduction_formula": repair[
                 "finite_gap_required_reduction_formula"
             ],
-            "finite_gap_already_safe_term_requires_fresh_descent": False,
+            "finite_gap_already_safe_term_may_use_safe_slack": True,
             "ownership": "exact_boolean_transaction_ownership_mask",
             "scope_null_space_projection": repair.get(
                 "scope_null_space_projection"

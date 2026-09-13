@@ -1094,11 +1094,11 @@ def _freeze_train_full_shadow_repair_contract(
             if finite_gap_angular_feasibility else None
         ),
         "finite_gap_required_reduction_formula": (
-            "max(0,current_delta+strict_limit+safety_margin)"
+            "current_delta+strict_limit+safety_margin"
             if finite_gap_angular_feasibility else None
         ),
-        "finite_gap_already_safe_term_requires_fresh_descent": (
-            False if finite_gap_angular_feasibility else None
+        "finite_gap_already_safe_term_may_use_safe_slack": (
+            True if finite_gap_angular_feasibility else None
         ),
         "finite_gap_shadow_margin_source": (
             "train_frozen_minimum_shadow_reduction"
@@ -1163,6 +1163,10 @@ def _freeze_train_full_shadow_repair_contract(
                 float(value)
                 for value in second_order.SECOND_ORDER_SQP_SMOOTHING
             ]
+            if second_order_joint_sqp else None
+        ),
+        "second_order_sqp_constraint_scaling": (
+            "absolute_signed_boundary_gap_floor_1e-12"
             if second_order_joint_sqp else None
         ),
         "second_order_sqp_line_search_radians": (
@@ -2639,14 +2643,14 @@ def _finite_gap_science_requirements(constraints):
         # already safely inside its pass set and can make the three-way joint
         # subproblem spuriously infeasible.
         gap = max(0.0, delta + strict_limit)
-        safe_gap = max(0.0, delta + strict_limit + safety_margin)
+        signed_safe_gap = delta + strict_limit + safety_margin
         requirements[name] = {
             "current_delta": delta,
             "strict_pass_limit": -strict_limit,
             "gap_to_strict_pass_line": gap,
             "safety_margin": safety_margin,
             "safe_strict_pass_limit": -strict_limit - safety_margin,
-            "required_predicted_reduction": safe_gap,
+            "required_predicted_reduction": signed_safe_gap,
         }
     return requirements
 
@@ -5751,7 +5755,15 @@ def _g1c_fixed_guard_shadow_selection(
         candidates = {}
         selected_method = "identity"
         incumbent_locked = False
-        if severity["activation_supported_by_observables"]:
+        calibration_probe_forced_evaluation = bool(
+            evaluation_role == "train_calibration"
+            and uid in G1F3_TRAIN_TARGET_CASE_UIDS
+        )
+        candidate_evaluation_authorized = bool(
+            severity["activation_supported_by_observables"]
+            or calibration_probe_forced_evaluation
+        )
+        if candidate_evaluation_authorized:
             for method, tangent in variants.items():
                 evidence = _g1c_candidate_evidence(
                     model=model,
@@ -5853,7 +5865,9 @@ def _g1c_fixed_guard_shadow_selection(
 
         fallback_reason = None
         if selected_method == "identity":
-            if severity["severity_abstained"]:
+            if calibration_probe_forced_evaluation:
+                fallback_reason = "train_calibration_probe_no_exact_candidate"
+            elif severity["severity_abstained"]:
                 fallback_reason = "discriminative_conformal_uncertain"
             elif not severity["activation_supported_by_observables"]:
                 fallback_reason = "observable_classifier_single"
@@ -5866,11 +5880,17 @@ def _g1c_fixed_guard_shadow_selection(
             "adapter_incumbent_locked": incumbent_locked,
             "conformal_fallback": bool(severity["severity_abstained"]),
             "identity_fallback_reason": fallback_reason,
+            "train_calibration_probe_forced_evaluation": (
+                calibration_probe_forced_evaluation
+            ),
+            "runtime_activation_supported_by_observables": bool(
+                severity["activation_supported_by_observables"]
+            ),
             "selection": {
                 "anchor_severity": severity,
                 "activation_condition": (
                     "train_transaction_discriminative_conformal_"
-                    "cross_only"
+                    "cross_or_train_only_declared_g1f3_calibration_probe"
                 ),
                 "case_physical_margin_contract": (
                     "per_case_stage_relative_diagnostic_only"
@@ -6788,6 +6808,9 @@ def run(args):
             workspace_floor,
             args,
             transaction_domains=domains,
+            additional_case_uids=(
+                G1F3_TRAIN_TARGET_CASE_UIDS if g1f3 else ()
+            ),
         )
         key = method if method == "adapter" else f"{method}_k{budget}"
         variant_tangents[key] = tangent.detach().clone()
@@ -6943,6 +6966,9 @@ def run(args):
             workspace_floor,
             args,
             transaction_domains=domains,
+            additional_case_uids=(
+                G1F3_TRAIN_TARGET_CASE_UIDS if g1f3 else ()
+            ),
         )
         selected_summary = _variant_summary(
             selected_audits,
@@ -6960,6 +6986,12 @@ def run(args):
         identity_samples = [
             sample for sample in samples
             if sample["teacher_kind"] == "identity_control"
+            and not (
+                g1f3
+                and evaluation_role == "train_calibration"
+                and str(sample["case_uid"])
+                in G1F3_TRAIN_TARGET_CASE_UIDS
+            )
         ]
         required_by_group = Counter(
             str(sample["audit_group"]) for sample in cross_samples
@@ -7037,6 +7069,13 @@ def run(args):
                 or decision["selection"]["anchor_severity"][
                     "outside_frozen_single_envelope"
                 ]
+                or bool(
+                    g1f3
+                    and evaluation_role == "train_calibration"
+                    and decision.get(
+                        "train_calibration_probe_forced_evaluation"
+                    )
+                )
                 for decision in activation_decisions.values()
             )
         )
@@ -7506,6 +7545,16 @@ def run(args):
             "g1f3_train_target_case_uids": (
                 list(G1F3_TRAIN_TARGET_CASE_UIDS) if g1f3 else None
             ),
+            "g1f3_train_calibration_probe_case_uids": (
+                list(G1F3_TRAIN_TARGET_CASE_UIDS)
+                if g1f3 and evaluation_role == "train_calibration"
+                else [] if g1f3 else None
+            ),
+            "g1f3_train_calibration_probes_excluded_from_single_controls": (
+                True
+                if g1f3 and evaluation_role == "train_calibration"
+                else None
+            ),
             "g1f3_train_target_closure_complete": (
                 target_second_order_closure_complete if g1f3 else None
             ),
@@ -7731,9 +7780,9 @@ def run(args):
                 "finite_gap_required_reduction_formula"
             ) if g1f2_family else None
         ),
-        "finite_gap_already_safe_term_requires_fresh_descent": (
+        "finite_gap_already_safe_term_may_use_safe_slack": (
             train_shadow_contract.get(
-                "finite_gap_already_safe_term_requires_fresh_descent"
+                "finite_gap_already_safe_term_may_use_safe_slack"
             ) if g1f2_family else None
         ),
         "second_order_hessian_used": bool(g1f3),
@@ -7784,6 +7833,11 @@ def run(args):
         "second_order_sqp_smoothing": (
             train_shadow_contract.get("second_order_sqp_smoothing")
             if g1f3 else None
+        ),
+        "second_order_sqp_constraint_scaling": (
+            train_shadow_contract.get(
+                "second_order_sqp_constraint_scaling"
+            ) if g1f3 else None
         ),
         "second_order_sqp_line_search_radians": (
             train_shadow_contract.get(
