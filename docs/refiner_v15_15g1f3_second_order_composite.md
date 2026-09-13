@@ -41,6 +41,10 @@ Guard shadow 到安全闭包边界的剩余有符号 gap 除以剩余步数。�
 完成这一步三项联合进度；最后一步必须进入 endpoint/temporal 严格通过域且
 Guard shadow 不大于零。若提前达到真实 raw 闭包则停止该预算，随后仍须经过
 复合 selector、Projector 和完整 transaction Guard 才能称为稳定通过。
+若某一中间步的三项等分配额在冻结二阶模型中不可行，求解器显式进入
+restoration/filter 子问题，选择最小联合归一化残差方向。真实 trial 只有在
+不越过已经安全的边界且正的联合闭包缺口严格下降时才可继续；最后一步不接受
+filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback。
 
 train 校准行使用包络中已经冻结的 leave-one-transaction-out observable
 分数；禁止再用包含该行的最终模型给该行做 in-sample 判定。此规则不读取

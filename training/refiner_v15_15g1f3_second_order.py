@@ -744,6 +744,7 @@ def solve_angle_subproblem(
     required_reduction: Mapping[str, float],
     grid_levels: int,
     feasibility_tolerance: float,
+    permit_restoration_candidate: bool = False,
 ):
     """Solve the frozen-angle joint quadratic model on the unit sphere."""
     names = ("shadow", "endpoint", "temporal")
@@ -806,7 +807,7 @@ def solve_angle_subproblem(
             - float(feasibility_tolerance)
         ) / scales.unsqueeze(0)
         nearest = normalized_residual.amax(dim=1).argmin()
-        return None, {
+        infeasible_audit = {
             "solver_status": "insufficient_second_order_predicted_progress",
             "second_order_state": "insufficient_second_order_predicted_progress",
             "theta_radians": theta,
@@ -827,6 +828,20 @@ def solve_angle_subproblem(
                 for index, name in enumerate(names)
             },
             **refinement_audit,
+        }
+        if not bool(permit_restoration_candidate):
+            return None, infeasible_audit
+        return directions[nearest], {
+            **infeasible_audit,
+            "solver_status": "second_order_restoration_angle_subproblem_solved",
+            "second_order_state": None,
+            "joint_predicted_feasible": False,
+            "restoration_candidate": True,
+            "selected_candidate_index": int(nearest.detach()),
+            "predicted_change_by_term": {
+                name: float(changes[nearest, index].detach())
+                for index, name in enumerate(names)
+            },
         }
     indices = m.torch.nonzero(feasible, as_tuple=False).reshape(-1)
     feasible_rows = directions.index_select(0, indices)
@@ -871,6 +886,8 @@ def solve_angle_subproblem(
         "candidate_count": int(directions.shape[0]),
         "coarse_candidate_count": int(coarse_directions.shape[0]),
         "feasible_candidate_count": int(indices.numel()),
+        "joint_predicted_feasible": True,
+        "restoration_candidate": False,
         "selected_candidate_index": chosen_global,
         "selected_active_constraints": active,
         "predicted_change_by_term": selected_changes,
@@ -955,6 +972,7 @@ def solve_prepared_second_order_angle(
     required_reduction,
     grid_levels,
     feasibility_tolerance,
+    permit_restoration_candidate=False,
 ):
     """Solve one angle using a prepared on-device curvature model."""
     coefficients, solver_audit = solve_angle_subproblem(
@@ -963,6 +981,7 @@ def solve_prepared_second_order_angle(
         required_reduction=required_reduction,
         grid_levels=int(grid_levels),
         feasibility_tolerance=float(feasibility_tolerance),
+        permit_restoration_candidate=bool(permit_restoration_candidate),
     )
     audit = {
         **solver_audit,
@@ -1014,6 +1033,7 @@ def second_order_direction_for_angle(
     grid_levels,
     direction_norm_floor,
     feasibility_tolerance,
+    permit_restoration_candidate=False,
 ):
     """Build and solve one frozen-angle g1f3 joint subproblem."""
     prepared, preparation_audit = prepare_second_order_subproblem(
@@ -1036,6 +1056,7 @@ def second_order_direction_for_angle(
         required_reduction=required_reduction,
         grid_levels=int(grid_levels),
         feasibility_tolerance=float(feasibility_tolerance),
+        permit_restoration_candidate=bool(permit_restoration_candidate),
     )
     audit = {
         **preparation_audit,

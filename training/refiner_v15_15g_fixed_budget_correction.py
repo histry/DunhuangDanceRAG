@@ -1174,8 +1174,19 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_intermediate_acceptance": (
-            "authoritative_endpoint_temporal_shadow_step_progress"
+            "authoritative_remaining_gap_share_or_joint_gap_filter_progress"
             if second_order_joint_sqp else None
+        ),
+        "second_order_infeasible_joint_policy": (
+            "deterministic_minimum_normalized_residual_restoration"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_restoration_acceptance": (
+            "authoritative_safe_boundary_and_positive_gap_merit_decrease"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_restoration_final_step_allowed": (
+            False if second_order_joint_sqp else None
         ),
         "second_order_sqp_line_search_radians": (
             [
@@ -1229,7 +1240,7 @@ def _freeze_train_full_shadow_repair_contract(
             "full_transaction_fixed_guard_shadow_strictly_decreases",
             (
                 "endpoint_temporal_remaining_gap_step_progress_then_final_"
-                "strict_descent_pass"
+                "strict_descent_pass_with_explicit_intermediate_gap_filter"
                 if second_order_joint_sqp
                 else "endpoint_and_temporal_strict_descent_pass"
             ),
@@ -3721,6 +3732,23 @@ def _second_order_angular_iteration(
             science_requirements["temporal"]["required_predicted_reduction"]
         ) / float(remaining_steps),
     }
+    current_signed_gap = {
+        "shadow": signed_shadow_gap,
+        "endpoint": float(
+            science_requirements["endpoint"]["required_predicted_reduction"]
+        ),
+        "temporal": float(
+            science_requirements["temporal"]["required_predicted_reduction"]
+        ),
+    }
+    signed_gap_scale = {
+        name: max(abs(value), 1.0e-12)
+        for name, value in current_signed_gap.items()
+    }
+    current_positive_gap_merit = sum(
+        (max(value, 0.0) / signed_gap_scale[name]) ** 2
+        for name, value in current_signed_gap.items()
+    )
 
     dtype = m.torch.float64
     current64 = current.detach().to(dtype)
@@ -3821,6 +3849,7 @@ def _second_order_angular_iteration(
                                 "second_order_feasibility_tolerance"
                             ]
                         ),
+                        permit_restoration_candidate=True,
                     )
                 )
                 if direction is not None:
@@ -3910,7 +3939,12 @@ def _second_order_angular_iteration(
                 "directional_inconsistency_channel_preserved": bool(
                     str(case_uid).endswith(":42")
                 ),
-                "second_order_prediction_passed": True,
+                "second_order_prediction_passed": bool(
+                    solver_audit.get("joint_predicted_feasible", True)
+                ),
+                "second_order_restoration_candidate": bool(
+                    solver_audit.get("restoration_candidate", False)
+                ),
                 "authoritative_trial_executed": False,
                 "angle_specific_second_order_solver": solver_audit,
             })
@@ -3933,7 +3967,12 @@ def _second_order_angular_iteration(
                 "accepted": False,
                 "reason": "nonfinite_or_unverified_curvature",
                 "failed_constraints": ["numeric"],
-                "second_order_prediction_passed": True,
+                "second_order_prediction_passed": bool(
+                    solver_audit.get("joint_predicted_feasible", True)
+                ),
+                "second_order_restoration_candidate": bool(
+                    solver_audit.get("restoration_candidate", False)
+                ),
                 "authoritative_trial_executed": True,
                 "geodesic_update": geodesic_audit,
                 "angle_specific_second_order_solver": solver_audit,
@@ -3993,17 +4032,10 @@ def _second_order_angular_iteration(
             - science_step_change[name]
             for name in ("endpoint", "temporal")
         }
-        science_ok = all(
+        science_quota_ok = all(
             science_step_margin[name] >= -science_step_tolerance[name]
             for name in ("endpoint", "temporal")
         )
-        if int(remaining_steps) == 1:
-            science_ok = bool(
-                science_ok
-                and science_margins[
-                    "both_scientific_terms_strictly_improved"
-                ]
-            )
         with m.torch.no_grad():
             trial_shadows, _, _ = _full_transaction_fixed_guard_shadows(
                 model,
@@ -4037,11 +4069,82 @@ def _second_order_angular_iteration(
             - float(required_reduction["shadow"])
             + shadow_step_tolerance
         )
+        trial_signed_gap = {
+            "shadow": trial_shadow + minimum_reduction,
+            **{
+                name: (
+                    float(trial_scientific[f"{name}_delta"])
+                    - float(science_requirements[name]["strict_pass_limit"])
+                    + float(science_requirements[name]["safety_margin"])
+                )
+                for name in ("endpoint", "temporal")
+            },
+        }
+        trial_positive_gap_merit = sum(
+            (max(value, 0.0) / signed_gap_scale[name]) ** 2
+            for name, value in trial_signed_gap.items()
+        )
+        filter_boundary_tolerance = {
+            "shadow": shadow_step_tolerance,
+            **science_step_tolerance,
+        }
+        filter_safe_boundary_ok = all(
+            math.isfinite(trial_signed_gap[name])
+            and trial_signed_gap[name]
+            <= max(current_signed_gap[name], 0.0)
+            + filter_boundary_tolerance[name]
+            for name in current_signed_gap
+        )
+        filter_merit_progress = bool(
+            math.isfinite(trial_positive_gap_merit)
+            and trial_positive_gap_merit
+            < current_positive_gap_merit
+            - float(
+                train_repair_contract[
+                    "second_order_feasibility_tolerance"
+                ]
+            )
+        )
+        authoritative_filter_progress = bool(
+            filter_safe_boundary_ok and filter_merit_progress
+        )
+        authoritative_step_closure = bool(
+            trial_shadow <= 0.0
+            and science_margins[
+                "both_scientific_terms_strictly_improved"
+            ]
+            and radius_ok
+            and scope_ok
+        )
+        quota_progress = bool(shadow_ok and science_quota_ok)
+        if int(remaining_steps) == 1:
+            accepted_progress = authoritative_step_closure
+            accepted_progress_mode = (
+                "authoritative_full_closure"
+                if accepted_progress else None
+            )
+        else:
+            accepted_progress = bool(
+                authoritative_step_closure
+                or quota_progress
+                or authoritative_filter_progress
+            )
+            accepted_progress_mode = (
+                "authoritative_full_closure"
+                if authoritative_step_closure
+                else "remaining_gap_share"
+                if quota_progress
+                else "authoritative_joint_gap_filter"
+                if authoritative_filter_progress
+                else None
+            )
         failed_constraints = []
-        if not shadow_ok:
-            failed_constraints.append("hard_full_transaction_shadow")
-        if not science_ok:
-            failed_constraints.append("endpoint_temporal_step_progress")
+        if not accepted_progress:
+            if not shadow_ok:
+                failed_constraints.append("hard_full_transaction_shadow")
+            if not science_quota_ok:
+                failed_constraints.append("endpoint_temporal_step_progress")
+            failed_constraints.append("authoritative_joint_gap_filter")
         if not radius_ok:
             failed_constraints.append("exact_radius")
         if not scope_ok:
@@ -4056,15 +4159,6 @@ def _second_order_angular_iteration(
             # This is deliberately not called closure: final closure belongs to
             # the composite selector + Projector + complete Guard audit below.
             reason = None
-        authoritative_step_closure = bool(
-            not failed_constraints
-            and trial_shadow <= 0.0
-            and science_margins[
-                "both_scientific_terms_strictly_improved"
-            ]
-            and radius_ok
-            and scope_ok
-        )
         trial_row = {
             "backtrack": backtrack,
             "theta_radians": float(theta),
@@ -4075,7 +4169,12 @@ def _second_order_angular_iteration(
                 authoritative_step_closure
             ),
             "failed_constraints": failed_constraints,
-            "second_order_prediction_passed": True,
+            "second_order_prediction_passed": bool(
+                solver_audit.get("joint_predicted_feasible", True)
+            ),
+            "second_order_restoration_candidate": bool(
+                solver_audit.get("restoration_candidate", False)
+            ),
             "authoritative_trial_executed": True,
             "prediction_active_terms": list(frozen_active_names),
             "authoritative_trial_active_terms": list(trial_active_names),
@@ -4086,6 +4185,17 @@ def _second_order_angular_iteration(
             "required_step_reduction_by_term": dict(required_reduction),
             "trial_science_change_by_term": science_step_change,
             "trial_science_step_margin_by_term": science_step_margin,
+            "current_signed_closure_gap_by_term": current_signed_gap,
+            "trial_signed_closure_gap_by_term": trial_signed_gap,
+            "signed_closure_gap_scale_by_term": signed_gap_scale,
+            "current_positive_closure_gap_merit": (
+                current_positive_gap_merit
+            ),
+            "trial_positive_closure_gap_merit": trial_positive_gap_merit,
+            "authoritative_filter_safe_boundary": filter_safe_boundary_ok,
+            "authoritative_filter_merit_progress": filter_merit_progress,
+            "authoritative_filter_progress": authoritative_filter_progress,
+            "authoritative_progress_mode": accepted_progress_mode,
             "trial_radius_rms": radius_rms,
             "trial_outside_scope_abs_max": outside_scope,
             **science_margins,
@@ -7972,6 +8082,21 @@ def run(args):
         "second_order_intermediate_acceptance": (
             train_shadow_contract.get(
                 "second_order_intermediate_acceptance"
+            ) if g1f3 else None
+        ),
+        "second_order_infeasible_joint_policy": (
+            train_shadow_contract.get(
+                "second_order_infeasible_joint_policy"
+            ) if g1f3 else None
+        ),
+        "second_order_restoration_acceptance": (
+            train_shadow_contract.get(
+                "second_order_restoration_acceptance"
+            ) if g1f3 else None
+        ),
+        "second_order_restoration_final_step_allowed": (
+            train_shadow_contract.get(
+                "second_order_restoration_final_step_allowed"
             ) if g1f3 else None
         ),
         "second_order_sqp_line_search_radians": (

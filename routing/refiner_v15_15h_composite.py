@@ -91,8 +91,17 @@ def _load_composite(model_path, contract_path, cfg):
              "remaining_joint_closure_gap_divided_by_remaining_steps",
              "V15.15h second-order budget is not multi-step")
     _require(fixed.get("second_order_intermediate_acceptance") ==
-             "authoritative_endpoint_temporal_shadow_step_progress",
+             "authoritative_remaining_gap_share_or_joint_gap_filter_progress",
              "V15.15h intermediate acceptance changed")
+    _require(fixed.get("second_order_infeasible_joint_policy") ==
+             "deterministic_minimum_normalized_residual_restoration",
+             "V15.15h infeasible-joint policy changed")
+    _require(fixed.get("second_order_restoration_acceptance") ==
+             "authoritative_safe_boundary_and_positive_gap_merit_decrease",
+             "V15.15h restoration acceptance changed")
+    _require(fixed.get(
+        "second_order_restoration_final_step_allowed"
+    ) is False, "V15.15h restoration may replace final closure")
     _require(fixed.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -493,6 +502,7 @@ def _apply_one_transaction(
                             required_reduction=required,
                             grid_levels=grid_levels,
                             feasibility_tolerance=feasibility_tolerance,
+                            permit_restoration_candidate=True,
                         )
                         if direction is not None:
                             direction = direction.to(budget_current.dtype)
@@ -585,16 +595,65 @@ def _apply_one_transaction(
                         name: float(value.detach())
                         for name, value in scalar_terms.items()
                     }
+                    current_signed_gap = {
+                        name: expansion_scalar[name] + feasibility_tolerance
+                        for name in expansion_scalar
+                    }
+                    trial_signed_gap = {
+                        name: trial_scalar[name] + feasibility_tolerance
+                        for name in trial_scalar
+                    }
+                    gap_scale = {
+                        name: max(abs(value), 1.0e-12)
+                        for name, value in current_signed_gap.items()
+                    }
+                    current_gap_merit = sum(
+                        (max(value, 0.0) / gap_scale[name]) ** 2
+                        for name, value in current_signed_gap.items()
+                    )
+                    trial_gap_merit = sum(
+                        (max(value, 0.0) / gap_scale[name]) ** 2
+                        for name, value in trial_signed_gap.items()
+                    )
                     actual_change = {
                         name: trial_scalar[name] - expansion_scalar[name]
                         for name in trial_scalar
                     }
-                    actual_progress = bool(all(
+                    quota_progress = bool(all(
                         math.isfinite(actual_change[name])
                         and actual_change[name]
                         <= -required[name] + feasibility_tolerance
                         for name in trial_scalar
                     ))
+                    filter_boundary_ok = all(
+                        math.isfinite(trial_signed_gap[name])
+                        and trial_signed_gap[name]
+                        <= max(current_signed_gap[name], 0.0)
+                        + feasibility_tolerance
+                        for name in trial_scalar
+                    )
+                    filter_progress = bool(
+                        filter_boundary_ok
+                        and math.isfinite(trial_gap_merit)
+                        and trial_gap_merit
+                        < current_gap_merit - feasibility_tolerance
+                    )
+                    actual_progress = bool(
+                        full_closed
+                        or (
+                            remaining_steps > 1
+                            and (quota_progress or filter_progress)
+                        )
+                    )
+                    progress_mode = (
+                        "authoritative_full_closure"
+                        if full_closed
+                        else "remaining_gap_share"
+                        if quota_progress
+                        else "authoritative_joint_gap_filter"
+                        if filter_progress
+                        else None
+                    )
                     attempt.update({
                         "authoritative_active_guard_term": authoritative_active,
                         "active_set_transition": active_transition,
@@ -604,7 +663,20 @@ def _apply_one_transaction(
                         "authoritative_metric_before": expansion_scalar,
                         "authoritative_metric_after": trial_scalar,
                         "authoritative_metric_change": actual_change,
+                        "current_signed_closure_gap_by_term": current_signed_gap,
+                        "trial_signed_closure_gap_by_term": trial_signed_gap,
+                        "current_positive_closure_gap_merit": current_gap_merit,
+                        "trial_positive_closure_gap_merit": trial_gap_merit,
+                        "authoritative_filter_safe_boundary": filter_boundary_ok,
+                        "authoritative_filter_progress": filter_progress,
                         "authoritative_progress": actual_progress,
+                        "authoritative_progress_mode": progress_mode,
+                        "second_order_prediction_passed": bool(
+                            solver.get("joint_predicted_feasible", True)
+                        ),
+                        "second_order_restoration_candidate": bool(
+                            solver.get("restoration_candidate", False)
+                        ),
                         "state": (
                             "second_order_closure_succeeded"
                             if full_closed

@@ -127,8 +127,17 @@ def _unchanged_contract(report):
              "remaining_joint_closure_gap_divided_by_remaining_steps",
              "second-order budget is not genuinely multi-step")
     _require(report.get("second_order_intermediate_acceptance") ==
-             "authoritative_endpoint_temporal_shadow_step_progress",
+             "authoritative_remaining_gap_share_or_joint_gap_filter_progress",
              "second-order intermediate acceptance changed")
+    _require(report.get("second_order_infeasible_joint_policy") ==
+             "deterministic_minimum_normalized_residual_restoration",
+             "second-order infeasible-joint policy changed")
+    _require(report.get("second_order_restoration_acceptance") ==
+             "authoritative_safe_boundary_and_positive_gap_merit_decrease",
+             "second-order restoration acceptance changed")
+    _require(report.get(
+        "second_order_restoration_final_step_allowed"
+    ) is False, "second-order restoration may replace final closure")
     _require(report.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -386,6 +395,15 @@ def freeze_contract(args):
             ],
             "second_order_intermediate_acceptance": repair[
                 "second_order_intermediate_acceptance"
+            ],
+            "second_order_infeasible_joint_policy": repair[
+                "second_order_infeasible_joint_policy"
+            ],
+            "second_order_restoration_acceptance": repair[
+                "second_order_restoration_acceptance"
+            ],
+            "second_order_restoration_final_step_allowed": repair[
+                "second_order_restoration_final_step_allowed"
             ],
             "second_order_sqp_line_search_radians": list(
                 repair["second_order_sqp_line_search_radians"]
