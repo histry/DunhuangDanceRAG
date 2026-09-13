@@ -92,6 +92,16 @@ def _unchanged_contract(report):
              "geodesic acceleration is absent")
     _require(report.get("ambient_hessian_materialized") is False,
              "ambient Hessian was materialized")
+    _require(report.get("second_order_model_builds_per_iteration") == 1,
+             "second-order curvature model is rebuilt per angle")
+    _require(report.get(
+        "second_order_model_reused_across_frozen_angles"
+    ) is True, "second-order curvature model is not reused")
+    _require(report.get("second_order_grid_execution_device") ==
+             "same_cuda_device_as_motion",
+             "second-order candidate grid is not device-resident")
+    _require(report.get("second_order_host_candidate_sorting") is False,
+             "second-order candidates are sorted on the host")
 
 
 def _require_zero_scope(summary, label):
@@ -254,6 +264,11 @@ def freeze_contract(args):
             "curvature_dtype": "float64",
             "geodesic_acceleration_included": True,
             "ambient_hessian_materialized": False,
+            "second_order_model_builds_per_iteration": 1,
+            "second_order_model_reused_across_frozen_angles": True,
+            "second_order_grid_execution_device":
+                "same_cuda_device_as_motion",
+            "second_order_host_candidate_sorting": False,
             "second_order_basis_dimension": int(
                 repair["second_order_basis_dimension"]
             ),

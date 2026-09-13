@@ -18,6 +18,11 @@ ownership 球面切空间中的 shadow、endpoint、temporal 物理协向量构�
 Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 trial 会重算硬
 指标和完整 Guard。
 
+曲率模型与角度无关，因此每次 SQP 迭代只构建一次，并由全部 12 个冻结角度
+复用。二阶候选网格在 motion 所在 CUDA device 上生成、缓存和求值，最终的
+词典序选择也在 device 上完成，不逐候选同步到 CPU。Projector 与完整 Guard
+继续走原有权威实现，避免以性能优化为名改变验收合同。
+
 状态集合固定为：
 
 - `second_order_closure_succeeded`

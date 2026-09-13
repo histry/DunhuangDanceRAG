@@ -1082,6 +1082,18 @@ def _freeze_train_full_shadow_repair_contract(
             "low_dimensional_directional_hvp_with_polarization"
             if second_order_joint_sqp else None
         ),
+        "second_order_model_builds_per_iteration": (
+            1 if second_order_joint_sqp else None
+        ),
+        "second_order_model_reused_across_frozen_angles": (
+            True if second_order_joint_sqp else None
+        ),
+        "second_order_grid_execution_device": (
+            "same_cuda_device_as_motion" if second_order_joint_sqp else None
+        ),
+        "second_order_host_candidate_sorting": (
+            False if second_order_joint_sqp else None
+        ),
         "second_order_states": (
             list(second_order.SECOND_ORDER_STATES)
             if second_order_joint_sqp else None
@@ -3592,38 +3604,66 @@ def _second_order_angular_iteration(
     accepted_theta = 0.0
     accepted_solver = None
 
-    for backtrack, theta in enumerate(angular_scales):
-        try:
-            direction, solver_audit = second_order.second_order_direction_for_angle(
+    try:
+        prepared_model, model_preparation_audit = (
+            second_order.prepare_second_order_subproblem(
                 current=current,
                 mask=mask,
                 taper=taper,
                 gradients=gradients,
                 metric_builder=metric_builder,
-                theta_radians=float(theta),
-                required_reduction=required_reduction,
                 basis_dimension=int(
                     train_repair_contract["second_order_basis_dimension"]
                 ),
-                grid_levels=int(
-                    train_repair_contract["second_order_grid_levels"]
-                ),
                 direction_norm_floor=float(norm_floor),
-                feasibility_tolerance=float(
-                    train_repair_contract[
-                        "second_order_feasibility_tolerance"
-                    ]
-                ),
             )
-        except (RuntimeError, ValueError, FloatingPointError) as exc:
+        )
+    except (RuntimeError, ValueError, FloatingPointError) as exc:
+        prepared_model = None
+        model_preparation_audit = {
+            "status": "second_order_solver_failure",
+            "second_order_state": "second_order_solver_failure",
+            "exception": repr(exc),
+            "second_order_hessian_used": True,
+            "model_reused_across_frozen_angles": True,
+        }
+
+    for backtrack, theta in enumerate(angular_scales):
+        if prepared_model is None:
             direction = None
             solver_audit = {
-                "solver_status": "second_order_solver_failure",
-                "second_order_state": "second_order_solver_failure",
+                **model_preparation_audit,
                 "theta_radians": float(theta),
-                "exception": repr(exc),
-                "second_order_hessian_used": True,
             }
+        else:
+            try:
+                direction, solver_audit = (
+                    second_order.solve_prepared_second_order_angle(
+                        prepared=prepared_model,
+                        theta_radians=float(theta),
+                        required_reduction=required_reduction,
+                        grid_levels=int(
+                            train_repair_contract["second_order_grid_levels"]
+                        ),
+                        feasibility_tolerance=float(
+                            train_repair_contract[
+                                "second_order_feasibility_tolerance"
+                            ]
+                        ),
+                    )
+                )
+                if direction is not None:
+                    direction = direction.to(current.dtype)
+            except (RuntimeError, ValueError, FloatingPointError) as exc:
+                direction = None
+                solver_audit = {
+                    "solver_status": "second_order_solver_failure",
+                    "second_order_state": "second_order_solver_failure",
+                    "theta_radians": float(theta),
+                    "exception": repr(exc),
+                    "second_order_hessian_used": True,
+                    "curvature_model_reused": True,
+                }
         solver_audits.append(solver_audit)
         if direction is None:
             state = str(
@@ -3644,7 +3684,10 @@ def _second_order_angular_iteration(
                 "authoritative_trial_executed": False,
                 "angle_specific_second_order_solver": solver_audit,
             })
-            if solver_audit.get("reason") == "zero_science_gradient":
+            if (
+                prepared_model is None
+                or solver_audit.get("reason") == "zero_science_gradient"
+            ):
                 break
             continue
 
@@ -3857,6 +3900,7 @@ def _second_order_angular_iteration(
         "accepted_theta_radians": accepted_theta,
         "constraints": constraints,
         "joint_solver": representative_solver,
+        "second_order_model_preparation": model_preparation_audit,
         "angle_specific_second_order_solvers": solver_audits,
         "finite_gap_science_requirements": science_requirements,
         "full_shadow_before": current_shadow,
@@ -7551,6 +7595,24 @@ def run(args):
         ),
         "ambient_hessian_materialized": (
             train_shadow_contract.get("ambient_hessian_materialized")
+            if g1f3 else None
+        ),
+        "second_order_model_builds_per_iteration": (
+            train_shadow_contract.get(
+                "second_order_model_builds_per_iteration"
+            ) if g1f3 else None
+        ),
+        "second_order_model_reused_across_frozen_angles": (
+            train_shadow_contract.get(
+                "second_order_model_reused_across_frozen_angles"
+            ) if g1f3 else None
+        ),
+        "second_order_grid_execution_device": (
+            train_shadow_contract.get("second_order_grid_execution_device")
+            if g1f3 else None
+        ),
+        "second_order_host_candidate_sorting": (
+            train_shadow_contract.get("second_order_host_candidate_sorting")
             if g1f3 else None
         ),
         "second_order_states": (

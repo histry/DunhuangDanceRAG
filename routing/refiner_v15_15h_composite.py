@@ -67,6 +67,13 @@ def _load_composite(model_path, contract_path, cfg):
              "V15.15h curvature dtype changed")
     _require(fixed.get("geodesic_acceleration_included") is True,
              "V15.15h geodesic acceleration is absent")
+    _require(fixed.get("second_order_model_builds_per_iteration") == 1,
+             "V15.15h curvature model is rebuilt per angle")
+    _require(fixed.get("second_order_grid_execution_device") ==
+             "same_cuda_device_as_motion",
+             "V15.15h candidate grid is not device-resident")
+    _require(fixed.get("second_order_host_candidate_sorting") is False,
+             "V15.15h host candidate sorting is forbidden")
     _require(fixed.get("atomic_commit_or_identity") is True,
              "V15.15h atomic policy is absent")
     _require(fixed.get("runtime_case_labels_consumed") is False,
@@ -384,22 +391,51 @@ def _apply_one_transaction(
                     name: max(0.0, float(value.detach()))
                     for name, value in scalar_terms.items()
                 }
-                accepted_step = False
-                for angle_index, theta in enumerate(angular):
-                    try:
-                        direction, solver = second_order.second_order_direction_for_angle(
+                try:
+                    prepared_model, preparation_audit = (
+                        second_order.prepare_second_order_subproblem(
                             current=budget_current,
                             mask=mask,
                             taper=taper,
                             gradients=gradients,
                             metric_builder=metric_builder,
+                            basis_dimension=basis_dimension,
+                            direction_norm_floor=1.0e-8,
+                        )
+                    )
+                except (RuntimeError, ValueError, FloatingPointError) as exc:
+                    prepared_model = None
+                    preparation_audit = {
+                        "second_order_state": "second_order_solver_failure",
+                        "exception": repr(exc),
+                        "model_reused_across_frozen_angles": True,
+                    }
+                if prepared_model is None:
+                    report["attempts"].append({
+                        "budget": budget,
+                        "iteration": iteration,
+                        "state": preparation_audit.get(
+                            "second_order_state",
+                            preparation_audit.get(
+                                "status",
+                                "nonfinite_or_unverified_curvature",
+                            ),
+                        ),
+                        "second_order_model_preparation": preparation_audit,
+                    })
+                    break
+                accepted_step = False
+                for angle_index, theta in enumerate(angular):
+                    try:
+                        direction, solver = second_order.solve_prepared_second_order_angle(
+                            prepared=prepared_model,
                             theta_radians=theta,
                             required_reduction=required,
-                            basis_dimension=basis_dimension,
                             grid_levels=grid_levels,
-                            direction_norm_floor=1.0e-8,
                             feasibility_tolerance=feasibility_tolerance,
                         )
+                        if direction is not None:
+                            direction = direction.to(budget_current.dtype)
                     except (RuntimeError, ValueError, FloatingPointError) as exc:
                         direction = None
                         solver = {
@@ -413,6 +449,9 @@ def _apply_one_transaction(
                         "theta_radians": theta,
                         "prediction_active_guard_term": frozen_active_name,
                         "solver": solver,
+                        "second_order_model_preparation": (
+                            preparation_audit if angle_index == 0 else None
+                        ),
                     }
                     if direction is None:
                         attempt["state"] = solver.get(

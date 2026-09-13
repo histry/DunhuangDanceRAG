@@ -14,7 +14,6 @@ acceleration term; it is not merely ``q.T @ H @ q`` in a flat coordinate.
 """
 from __future__ import annotations
 
-import itertools
 import math
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -29,6 +28,9 @@ SECOND_ORDER_STATES = (
     "nonfinite_or_unverified_curvature",
     "second_order_solver_failure",
 )
+
+
+_UNIT_GRID_CACHE = {}
 
 
 def _inner(left, right, mask):
@@ -173,9 +175,9 @@ def _directional_jet(
         if not bool(m.torch.isfinite(second).all()):
             return None
         result[name] = (
-            float(value.detach()),
-            float(first.detach()),
-            float(second.detach()),
+            value.detach(),
+            first.detach(),
+            second.detach(),
         )
     return result
 
@@ -192,7 +194,7 @@ def build_second_order_models(
     count = int(basis.shape[0])
     diagonal = []
     first_columns = []
-    base_values: Optional[Dict[str, float]] = None
+    base_values: Optional[Dict[str, object]] = None
     for index in range(count):
         jet = _directional_jet(
             current=current,
@@ -247,11 +249,7 @@ def build_second_order_models(
                 hessians[name][right, left] = cross
 
     first = {
-        name: m.torch.tensor(
-            [column[name] for column in first_columns],
-            dtype=m.torch.float64,
-            device=current.device,
-        )
+        name: m.torch.stack([column[name] for column in first_columns])
         for name in names
     }
     finite = all(
@@ -266,7 +264,7 @@ def build_second_order_models(
         }
     return {
         name: {
-            "value": float(base_values[name]),
+            "value": base_values[name],
             "first": first[name],
             "hessian": hessians[name],
         }
@@ -287,21 +285,22 @@ def _deterministic_unit_grid(dimension: int, levels: int, *, device):
     levels = int(levels)
     if dimension <= 0 or levels < 3 or levels % 2 == 0:
         raise ValueError("second-order grid requires dimension>0 and odd levels>=3")
+    key = (str(device), int(dimension), levels)
+    cached = _UNIT_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
     coordinates = m.torch.linspace(
         -1.0, 1.0, levels, dtype=m.torch.float64, device=device
     )
-    rows = []
-    for values in itertools.product(range(levels), repeat=dimension):
-        row = m.torch.stack([coordinates[index] for index in values])
-        norm = m.torch.linalg.vector_norm(row)
-        if float(norm) <= 1.0e-15:
-            continue
-        rows.append(row / norm)
-    # Sorting the de-duplicated tuples makes CPU/GPU selection identical.
-    unique = sorted(
-        {tuple(round(float(value), 15) for value in row.cpu()) for row in rows}
-    )
-    return m.torch.tensor(unique, dtype=m.torch.float64, device=device)
+    rows = m.torch.cartesian_prod(
+        *([coordinates] * int(dimension))
+    ).reshape(-1, int(dimension))
+    norms = m.torch.linalg.vector_norm(rows, dim=1)
+    rows = rows[norms > 1.0e-15]
+    norms = m.torch.linalg.vector_norm(rows, dim=1, keepdim=True)
+    result = rows / norms
+    _UNIT_GRID_CACHE[key] = result
+    return result
 
 
 def solve_angle_subproblem(
@@ -361,19 +360,20 @@ def solve_angle_subproblem(
         dim=1,
     )
     worst = normalized.amax(dim=1)
-    order = sorted(
-        range(len(indices)),
-        key=lambda row: (
-            float(worst[row]),
-            float(shadow[row]),
-            float(endpoint[row]),
-            float(temporal[row]),
-            int(indices[row]),
-        ),
+    # Resolve the exact lexicographic order on-device.  This avoids one host
+    # synchronization per feasible row while retaining deterministic ties.
+    remaining = m.torch.arange(
+        indices.numel(), dtype=m.torch.long, device=indices.device
     )
-    chosen_local = int(order[0])
-    chosen_global = int(indices[chosen_local])
-    coefficients = feasible_rows[chosen_local]
+    for values in (worst, shadow, endpoint, temporal):
+        selected_values = values.index_select(0, remaining)
+        minimum = selected_values.amin()
+        remaining = remaining[selected_values == minimum]
+    chosen_local_tensor = remaining.amin()
+    chosen_local = int(chosen_local_tensor.detach())
+    chosen_global_tensor = indices[chosen_local_tensor]
+    chosen_global = int(chosen_global_tensor.detach())
+    coefficients = feasible_rows[chosen_local_tensor]
     changes = {
         name: float(predicted[name][chosen_global].detach()) for name in names
     }
@@ -398,6 +398,118 @@ def solve_angle_subproblem(
     }
 
 
+def prepare_second_order_subproblem(
+    *,
+    current,
+    mask,
+    taper,
+    gradients,
+    metric_builder,
+    basis_dimension,
+    direction_norm_floor,
+):
+    """Build one curvature model for reuse by every frozen angle."""
+    basis, basis_audit = build_owned_tangent_basis(
+        current=current,
+        mask=mask,
+        taper=taper,
+        gradients=gradients,
+        dimension=int(basis_dimension),
+        floor=float(direction_norm_floor),
+    )
+    if basis is None:
+        return None, basis_audit
+    current64 = current.detach().to(m.torch.float64)
+    models, curvature_audit = build_second_order_models(
+        current=current64,
+        mask=mask,
+        basis=basis,
+        metric_builder=metric_builder,
+    )
+    if models is None:
+        return None, {**basis_audit, **curvature_audit}
+    serial_models = {
+        name: {
+            "value": float(model["value"]),
+            "first_derivative_in_basis": [
+                float(value) for value in model["first"].detach().cpu()
+            ],
+            "hessian_in_basis": [
+                [float(value) for value in row]
+                for row in model["hessian"].detach().cpu()
+            ],
+        }
+        for name, model in models.items()
+    }
+    return {
+        "basis": basis,
+        "models": models,
+        "current64": current64,
+        "mask": mask,
+        "direction_norm_floor": float(direction_norm_floor),
+    }, {
+        **basis_audit,
+        **curvature_audit,
+        "low_dimensional_models": serial_models,
+        "second_order_hessian_used": True,
+        "full_hessian_formed": False,
+        "model_reused_across_frozen_angles": True,
+    }
+
+
+def solve_prepared_second_order_angle(
+    *,
+    prepared,
+    theta_radians,
+    required_reduction,
+    grid_levels,
+    feasibility_tolerance,
+):
+    """Solve one angle using a prepared on-device curvature model."""
+    coefficients, solver_audit = solve_angle_subproblem(
+        models=prepared["models"],
+        theta_radians=float(theta_radians),
+        required_reduction=required_reduction,
+        grid_levels=int(grid_levels),
+        feasibility_tolerance=float(feasibility_tolerance),
+    )
+    audit = {
+        **solver_audit,
+        "second_order_hessian_used": True,
+        "full_hessian_formed": False,
+        "curvature_model_reused": True,
+    }
+    if coefficients is None:
+        return None, audit
+    basis = prepared["basis"]
+    current64 = prepared["current64"]
+    mask = prepared["mask"]
+    floor = prepared["direction_norm_floor"]
+    unit = m.torch.einsum("i,i...->...", coefficients, basis)
+    unit = _unit_owned_sphere_tangent(
+        unit, current64, mask, floor=float(floor)
+    )
+    if unit is None or not bool(m.torch.isfinite(unit).all()):
+        return None, {
+            **audit,
+            "solver_status": "second_order_solver_failure",
+            "second_order_state": "second_order_solver_failure",
+            "reason": "selected_direction_normalization_failed",
+        }
+    radius = m.torch.linalg.vector_norm(current64[mask])
+    direction = (radius * unit).to(basis.dtype).masked_fill(~mask, 0.0)
+    audit["selected_basis_coefficients"] = [
+        float(value) for value in coefficients.detach().cpu()
+    ]
+    audit["geodesic_direction_norm"] = float(
+        m.torch.linalg.vector_norm(direction[mask]).detach()
+    )
+    audit["geodesic_radial_inner_product"] = float(
+        _inner(direction, current64, mask).detach()
+    )
+    return direction.detach(), audit
+
+
 def second_order_direction_for_angle(
     *,
     current,
@@ -413,79 +525,31 @@ def second_order_direction_for_angle(
     feasibility_tolerance,
 ):
     """Build and solve one frozen-angle g1f3 joint subproblem."""
-    basis, basis_audit = build_owned_tangent_basis(
+    prepared, preparation_audit = prepare_second_order_subproblem(
         current=current,
         mask=mask,
         taper=taper,
         gradients=gradients,
-        dimension=int(basis_dimension),
-        floor=float(direction_norm_floor),
-    )
-    if basis is None:
-        return None, {**basis_audit, "theta_radians": float(theta_radians)}
-    current64 = current.detach().to(m.torch.float64)
-    models, curvature_audit = build_second_order_models(
-        current=current64,
-        mask=mask,
-        basis=basis,
         metric_builder=metric_builder,
+        basis_dimension=int(basis_dimension),
+        direction_norm_floor=float(direction_norm_floor),
     )
-    if models is None:
+    if prepared is None:
         return None, {
-            **basis_audit,
-            **curvature_audit,
+            **preparation_audit,
             "theta_radians": float(theta_radians),
         }
-    coefficients, solver_audit = solve_angle_subproblem(
-        models=models,
+    direction, solver_audit = solve_prepared_second_order_angle(
+        prepared=prepared,
         theta_radians=float(theta_radians),
         required_reduction=required_reduction,
         grid_levels=int(grid_levels),
         feasibility_tolerance=float(feasibility_tolerance),
     )
-    serial_models = {
-        name: {
-            "value": float(model["value"]),
-            "first_derivative_in_basis": [
-                float(value) for value in model["first"].detach().cpu()
-            ],
-            "hessian_in_basis": [
-                [float(value) for value in row]
-                for row in model["hessian"].detach().cpu()
-            ],
-        }
-        for name, model in models.items()
-    }
     audit = {
-        **basis_audit,
-        **curvature_audit,
+        **preparation_audit,
         **solver_audit,
-        "low_dimensional_models": serial_models,
-        "second_order_hessian_used": True,
-        "full_hessian_formed": False,
     }
-    if coefficients is None:
+    if direction is None:
         return None, audit
-    unit = m.torch.einsum("i,i...->...", coefficients, basis)
-    unit = _unit_owned_sphere_tangent(
-        unit, current64, mask, floor=float(direction_norm_floor)
-    )
-    if unit is None or not bool(m.torch.isfinite(unit).all()):
-        return None, {
-            **audit,
-            "solver_status": "second_order_solver_failure",
-            "second_order_state": "second_order_solver_failure",
-            "reason": "selected_direction_normalization_failed",
-        }
-    radius = m.torch.linalg.vector_norm(current64[mask])
-    direction = (radius * unit).to(current.dtype).masked_fill(~mask, 0.0)
-    audit["selected_basis_coefficients"] = [
-        float(value) for value in coefficients.detach().cpu()
-    ]
-    audit["geodesic_direction_norm"] = float(
-        m.torch.linalg.vector_norm(direction[mask]).detach()
-    )
-    audit["geodesic_radial_inner_product"] = float(
-        _inner(direction, current, mask).detach()
-    )
-    return direction.detach(), audit
+    return direction.to(current.dtype).detach(), audit

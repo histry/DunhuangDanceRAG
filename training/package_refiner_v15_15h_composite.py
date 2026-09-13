@@ -175,6 +175,11 @@ def run(args):
             ],
             "curvature_dtype": "float64",
             "geodesic_acceleration_included": True,
+            "second_order_model_builds_per_iteration": 1,
+            "second_order_model_reused_across_frozen_angles": True,
+            "second_order_grid_execution_device":
+                "same_cuda_device_as_motion",
+            "second_order_host_candidate_sorting": False,
             "second_order_basis_dimension": int(
                 fixed["second_order_basis_dimension"]
             ),
