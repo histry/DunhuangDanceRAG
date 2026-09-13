@@ -116,6 +116,10 @@ def _unchanged_contract(report):
              "second-order HvP recovery method changed")
     _require(recovery.get("requires_consistent_estimates") is True,
              "second-order HvP recovery verification is absent")
+    _require(report.get(
+        "second_order_prediction_active_guard_terms_frozen_across_"
+        "curvature_evaluations"
+    ) is True, "prediction active Guard terms are not curvature-frozen")
 
 
 def _require_zero_scope(summary, label):
@@ -289,6 +293,8 @@ def freeze_contract(args):
             "second_order_hvp_recovery": dict(
                 repair["second_order_hvp_recovery"]
             ),
+            "second_order_prediction_active_guard_terms_frozen_across_"
+            "curvature_evaluations": True,
             "second_order_basis_dimension": int(
                 repair["second_order_basis_dimension"]
             ),

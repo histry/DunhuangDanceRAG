@@ -186,6 +186,8 @@ def run(args):
             "second_order_hvp_recovery": dict(
                 fixed["second_order_hvp_recovery"]
             ),
+            "second_order_prediction_active_guard_terms_frozen_across_"
+            "curvature_evaluations": True,
             "second_order_basis_dimension": int(
                 fixed["second_order_basis_dimension"]
             ),

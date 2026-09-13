@@ -97,6 +97,10 @@ def _load_composite(model_path, contract_path, cfg):
              "V15.15h HvP recovery absolute tolerance changed")
     _require(recovery.get("requires_consistent_estimates") is True,
              "V15.15h HvP recovery verification is absent")
+    _require(fixed.get(
+        "second_order_prediction_active_guard_terms_frozen_across_"
+        "curvature_evaluations"
+    ) is True, "V15.15h prediction active Guard terms are not frozen")
     _require(fixed.get("atomic_commit_or_identity") is True,
              "V15.15h atomic policy is absent")
     _require(fixed.get("runtime_case_labels_consumed") is False,

@@ -970,6 +970,10 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp
             else "line_search_gradient_model"
         ),
+        "second_order_prediction_active_guard_terms_frozen_across_"
+        "curvature_evaluations": (
+            True if second_order_joint_sqp else None
+        ),
         "lse_allowance_fraction": float(lse_allowance_fraction),
         "lse_temperature_floor": float(lse_temperature_floor),
         "lse_temperature_by_guard_term": temperatures,
@@ -1242,6 +1246,7 @@ def _g1d_shadow_objective(
     local_mask,
     train_repair_contract,
     temporal_smoothness_weight,
+    prediction_active_names=None,
 ):
     hard_shadows, hard_values, limits = (
         _full_transaction_fixed_guard_shadows(
@@ -1252,9 +1257,19 @@ def _g1d_shadow_objective(
         name: float(value.detach()) for name, value in hard_shadows.items()
     }
     maximum_hard = max(hard_float.values())
-    active_names = sorted(
+    authoritative_active_names = sorted(
         name for name, value in hard_float.items() if value > 0.0
     )
+    if prediction_active_names is None:
+        active_names = authoritative_active_names
+    else:
+        active_names = [str(name) for name in prediction_active_names]
+        unexpected = sorted(set(active_names) - set(hard_shadows))
+        if unexpected:
+            raise RuntimeError(
+                "frozen prediction Guard terms are unavailable: "
+                f"{unexpected}"
+            )
     _, case_terms = m._observable_refiner_objective(
         candidate,
         baseline.detach(),
@@ -1306,6 +1321,12 @@ def _g1d_shadow_objective(
     diagnostics = {
         "primary_objective": primary,
         "active_full_shadow_terms": active_names,
+        "authoritative_active_full_shadow_terms": (
+            authoritative_active_names
+        ),
+        "prediction_active_set_frozen": bool(
+            prediction_active_names is not None
+        ),
         "full_transaction_fixed_guard_shadow_margin_by_term": hard_float,
         "maximum_full_transaction_fixed_guard_shadow_margin": maximum_hard,
         "smooth_full_shadow_margin_by_active_term": {
@@ -3604,6 +3625,7 @@ def _second_order_angular_iteration(
             local_mask=mask,
             train_repair_contract=train_repair_contract,
             temporal_smoothness_weight=0.0,
+            prediction_active_names=frozen_active_names,
         )
         if tuple(diagnostics64["active_full_shadow_terms"]) != (
             frozen_active_names
@@ -7656,6 +7678,13 @@ def run(args):
         "second_order_hvp_recovery": (
             train_shadow_contract.get("second_order_hvp_recovery")
             if g1f3 else None
+        ),
+        "second_order_prediction_active_guard_terms_frozen_across_"
+        "curvature_evaluations": (
+            train_shadow_contract.get(
+                "second_order_prediction_active_guard_terms_frozen_across_"
+                "curvature_evaluations"
+            ) if g1f3 else None
         ),
         "second_order_states": (
             list(second_order.SECOND_ORDER_STATES) if g1f3 else None
