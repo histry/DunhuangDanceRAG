@@ -180,6 +180,12 @@ def run(args):
             "second_order_grid_execution_device":
                 "same_cuda_device_as_motion",
             "second_order_host_candidate_sorting": False,
+            "second_order_nonfinite_basis_policy":
+                "deterministic_verified_subspace_reduction",
+            "second_order_unverified_directions_used": False,
+            "second_order_hvp_recovery": dict(
+                fixed["second_order_hvp_recovery"]
+            ),
             "second_order_basis_dimension": int(
                 fixed["second_order_basis_dimension"]
             ),

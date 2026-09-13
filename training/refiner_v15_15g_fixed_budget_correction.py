@@ -1094,6 +1094,31 @@ def _freeze_train_full_shadow_repair_contract(
         "second_order_host_candidate_sorting": (
             False if second_order_joint_sqp else None
         ),
+        "second_order_nonfinite_basis_policy": (
+            "deterministic_verified_subspace_reduction"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_unverified_directions_used": (
+            False if second_order_joint_sqp else None
+        ),
+        "second_order_hvp_recovery": (
+            {
+                "trigger": "nonfinite_autograd_second_derivative_only",
+                "method": "symmetric_first_derivative_hvp_epsilon_ladder",
+                "epsilon_radians": [
+                    float(value)
+                    for value in second_order.HVP_RECOVERY_EPSILON_RADIANS
+                ],
+                "relative_tolerance": float(
+                    second_order.HVP_RECOVERY_RELATIVE_TOLERANCE
+                ),
+                "absolute_tolerance": float(
+                    second_order.HVP_RECOVERY_ABSOLUTE_TOLERANCE
+                ),
+                "requires_consistent_estimates": True,
+            }
+            if second_order_joint_sqp else None
+        ),
         "second_order_states": (
             list(second_order.SECOND_ORDER_STATES)
             if second_order_joint_sqp else None
@@ -3667,10 +3692,14 @@ def _second_order_angular_iteration(
         solver_audits.append(solver_audit)
         if direction is None:
             state = str(
-                solver_audit.get(
-                    "second_order_state", "second_order_solver_failure"
-                )
+                solver_audit.get("second_order_state")
+                or solver_audit.get("status")
+                or "second_order_solver_failure"
             )
+            if state not in second_order.SECOND_ORDER_STATES:
+                state = "second_order_solver_failure"
+            solver_audit["second_order_state"] = state
+            solver_audit.setdefault("solver_status", state)
             numeric_failure = numeric_failure or state in {
                 "nonfinite_or_unverified_curvature",
                 "second_order_solver_failure",
@@ -7613,6 +7642,19 @@ def run(args):
         ),
         "second_order_host_candidate_sorting": (
             train_shadow_contract.get("second_order_host_candidate_sorting")
+            if g1f3 else None
+        ),
+        "second_order_nonfinite_basis_policy": (
+            train_shadow_contract.get("second_order_nonfinite_basis_policy")
+            if g1f3 else None
+        ),
+        "second_order_unverified_directions_used": (
+            train_shadow_contract.get(
+                "second_order_unverified_directions_used"
+            ) if g1f3 else None
+        ),
+        "second_order_hvp_recovery": (
+            train_shadow_contract.get("second_order_hvp_recovery")
             if g1f3 else None
         ),
         "second_order_states": (

@@ -102,6 +102,20 @@ def _unchanged_contract(report):
              "second-order candidate grid is not device-resident")
     _require(report.get("second_order_host_candidate_sorting") is False,
              "second-order candidates are sorted on the host")
+    _require(report.get("second_order_nonfinite_basis_policy") ==
+             "deterministic_verified_subspace_reduction",
+             "second-order nonfinite-basis policy changed")
+    _require(report.get("second_order_unverified_directions_used") is False,
+             "unverified curvature directions were used")
+    recovery = report.get("second_order_hvp_recovery") or {}
+    _require(recovery.get("trigger") ==
+             "nonfinite_autograd_second_derivative_only",
+             "second-order HvP recovery trigger changed")
+    _require(recovery.get("method") ==
+             "symmetric_first_derivative_hvp_epsilon_ladder",
+             "second-order HvP recovery method changed")
+    _require(recovery.get("requires_consistent_estimates") is True,
+             "second-order HvP recovery verification is absent")
 
 
 def _require_zero_scope(summary, label):
@@ -269,6 +283,12 @@ def freeze_contract(args):
             "second_order_grid_execution_device":
                 "same_cuda_device_as_motion",
             "second_order_host_candidate_sorting": False,
+            "second_order_nonfinite_basis_policy":
+                "deterministic_verified_subspace_reduction",
+            "second_order_unverified_directions_used": False,
+            "second_order_hvp_recovery": dict(
+                repair["second_order_hvp_recovery"]
+            ),
             "second_order_basis_dimension": int(
                 repair["second_order_basis_dimension"]
             ),

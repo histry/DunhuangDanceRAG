@@ -31,6 +31,9 @@ SECOND_ORDER_STATES = (
 
 
 _UNIT_GRID_CACHE = {}
+HVP_RECOVERY_EPSILON_RADIANS = (1.0e-4, 3.0e-4)
+HVP_RECOVERY_RELATIVE_TOLERANCE = 0.25
+HVP_RECOVERY_ABSOLUTE_TOLERANCE = 1.0e-6
 
 
 def _inner(left, right, mask):
@@ -130,6 +133,143 @@ def differentiable_geodesic_trial(current, unit_direction, mask, theta):
     ).masked_fill(~mask, 0.0)
 
 
+def _directional_first_derivative(
+    *,
+    current,
+    mask,
+    unit_direction,
+    metric_builder,
+    name,
+    theta_radians,
+):
+    theta = current.new_tensor(
+        float(theta_radians), dtype=m.torch.float64, requires_grad=True
+    )
+    trial = differentiable_geodesic_trial(
+        current, unit_direction, mask, theta
+    )
+    value = metric_builder(trial)[name]
+    if value.numel() != 1 or not bool(m.torch.isfinite(value).all()):
+        return None
+    first = m.torch.autograd.grad(
+        value,
+        theta,
+        create_graph=False,
+        retain_graph=False,
+        allow_unused=True,
+    )[0]
+    if first is None:
+        first = m.torch.zeros_like(theta)
+    if not bool(m.torch.isfinite(first).all()):
+        return None
+    return value.detach(), first.detach()
+
+
+def _recover_directional_hvp(
+    *,
+    current,
+    mask,
+    unit_direction,
+    metric_builder,
+    name,
+):
+    """Recover a nonfinite autograd HvP from verified float64 first derivatives.
+
+    This is used only when the scalar value and first derivative at the
+    expansion point are finite but PyTorch's second backward encounters a
+    dormant zero-norm branch. Two symmetric radii must agree before the
+    direction is admitted to the curvature model.
+    """
+    estimates = []
+    rows = []
+    for epsilon in HVP_RECOVERY_EPSILON_RADIANS:
+        positive = _directional_first_derivative(
+            current=current,
+            mask=mask,
+            unit_direction=unit_direction,
+            metric_builder=metric_builder,
+            name=name,
+            theta_radians=epsilon,
+        )
+        negative = _directional_first_derivative(
+            current=current,
+            mask=mask,
+            unit_direction=unit_direction,
+            metric_builder=metric_builder,
+            name=name,
+            theta_radians=-epsilon,
+        )
+        if positive is None or negative is None:
+            return None, {
+                "status": "nonfinite_or_unverified_curvature",
+                "second_order_state": "nonfinite_or_unverified_curvature",
+                "metric": name,
+                "reason": "nonfinite_hvp_recovery_first_derivative",
+                "epsilon_radians": float(epsilon),
+            }
+        estimate = (positive[1] - negative[1]) / (2.0 * float(epsilon))
+        if not bool(m.torch.isfinite(estimate).all()):
+            return None, {
+                "status": "nonfinite_or_unverified_curvature",
+                "second_order_state": "nonfinite_or_unverified_curvature",
+                "metric": name,
+                "reason": "nonfinite_hvp_recovery_estimate",
+                "epsilon_radians": float(epsilon),
+            }
+        estimates.append(estimate)
+        rows.append({
+            "epsilon_radians": float(epsilon),
+            "positive_first_derivative": float(positive[1]),
+            "negative_first_derivative": float(negative[1]),
+            "second_derivative_estimate": float(estimate),
+        })
+
+    difference = (estimates[0] - estimates[1]).abs()
+    scale = m.torch.stack([
+        estimates[0].abs(),
+        estimates[1].abs(),
+        estimates[0].new_tensor(1.0),
+    ]).amax()
+    tolerance = (
+        float(HVP_RECOVERY_ABSOLUTE_TOLERANCE)
+        + float(HVP_RECOVERY_RELATIVE_TOLERANCE) * scale
+    )
+    if not bool(difference <= tolerance):
+        return None, {
+            "status": "nonfinite_or_unverified_curvature",
+            "second_order_state": "nonfinite_or_unverified_curvature",
+            "metric": name,
+            "reason": "inconsistent_hvp_recovery_epsilon_ladder",
+            "epsilon_ladder": rows,
+            "estimate_difference": float(difference),
+            "allowed_difference": float(tolerance),
+        }
+
+    small = float(HVP_RECOVERY_EPSILON_RADIANS[0])
+    large = float(HVP_RECOVERY_EPSILON_RADIANS[1])
+    recovered = (
+        large * large * estimates[0] - small * small * estimates[1]
+    ) / (large * large - small * small)
+    if not bool(m.torch.isfinite(recovered).all()):
+        return None, {
+            "status": "nonfinite_or_unverified_curvature",
+            "second_order_state": "nonfinite_or_unverified_curvature",
+            "metric": name,
+            "reason": "nonfinite_richardson_hvp_recovery",
+            "epsilon_ladder": rows,
+        }
+    return recovered.detach(), {
+        "status": "directional_curvature_verified",
+        "metric": name,
+        "recovery": "symmetric_first_derivative_hvp_epsilon_ladder",
+        "epsilon_ladder": rows,
+        "relative_tolerance": float(HVP_RECOVERY_RELATIVE_TOLERANCE),
+        "absolute_tolerance": float(HVP_RECOVERY_ABSOLUTE_TOLERANCE),
+        "active_branch_stability_verified": True,
+        "richardson_second_derivative": float(recovered),
+    }
+
+
 def _directional_jet(
     *,
     current,
@@ -138,15 +278,27 @@ def _directional_jet(
     metric_builder: Callable[[object], Mapping[str, object]],
     names: Sequence[str],
 ):
-    """Return F(0), dF/dtheta and d2F/dtheta2 for one real path."""
+    """Return F(0), dF/dtheta and d2F/dtheta2 for one real path.
+
+    The audit identifies the exact metric and derivative order that failed.
+    Callers may then remove that direction from the verified low-dimensional
+    curvature subspace; a nonfinite derivative is never replaced by zero.
+    """
     theta = current.new_zeros((), dtype=m.torch.float64, requires_grad=True)
     trial = differentiable_geodesic_trial(current, unit_direction, mask, theta)
     metrics = metric_builder(trial)
     result = {}
+    recovered_hvps = []
     for index, name in enumerate(names):
         value = metrics[name]
         if value.numel() != 1 or not bool(m.torch.isfinite(value).all()):
-            return None
+            return None, {
+                "status": "nonfinite_or_unverified_curvature",
+                "second_order_state": "nonfinite_or_unverified_curvature",
+                "metric": name,
+                "derivative_order": 0,
+                "reason": f"nonfinite_{name}_value",
+            }
         if value.requires_grad:
             first = m.torch.autograd.grad(
                 value,
@@ -160,7 +312,13 @@ def _directional_jet(
         if first is None:
             first = m.torch.zeros_like(theta)
         if not bool(m.torch.isfinite(first).all()):
-            return None
+            return None, {
+                "status": "nonfinite_or_unverified_curvature",
+                "second_order_state": "nonfinite_or_unverified_curvature",
+                "metric": name,
+                "derivative_order": 1,
+                "reason": f"nonfinite_{name}_first_derivative",
+            }
         if first.requires_grad:
             second = m.torch.autograd.grad(
                 first,
@@ -173,13 +331,31 @@ def _directional_jet(
         if second is None:
             second = m.torch.zeros_like(theta)
         if not bool(m.torch.isfinite(second).all()):
-            return None
+            second, recovery_audit = _recover_directional_hvp(
+                current=current,
+                mask=mask,
+                unit_direction=unit_direction,
+                metric_builder=metric_builder,
+                name=name,
+            )
+            if second is None:
+                return None, {
+                    **recovery_audit,
+                    "derivative_order": 2,
+                    "autograd_reason":
+                        f"nonfinite_{name}_second_derivative",
+                }
+            recovered_hvps.append(recovery_audit)
         result[name] = (
             value.detach(),
             first.detach(),
             second.detach(),
         )
-    return result
+    return result, {
+        "status": "directional_curvature_verified",
+        "derivative_order": 2,
+        "autograd_hvp_recovery": recovered_hvps,
+    }
 
 
 def build_second_order_models(
@@ -190,13 +366,21 @@ def build_second_order_models(
     metric_builder: Callable[[object], Mapping[str, object]],
     names: Sequence[str] = ("shadow", "endpoint", "temporal"),
 ):
-    """Build low-dimensional Hessians exclusively from directional HvPs."""
-    count = int(basis.shape[0])
-    diagonal = []
-    first_columns = []
-    base_values: Optional[Dict[str, object]] = None
-    for index in range(count):
-        jet = _directional_jet(
+    """Build a Hessian in the largest deterministic verified subspace.
+
+    Norm-based physical metrics can have undefined second derivatives on an
+    exactly zero vector. Such a direction is excluded before the model is
+    built. No NaN is consumed or replaced, and failure is returned if no
+    verified direction remains. Pair failures deterministically remove the
+    later basis vector and rebuild the model.
+    """
+    requested_count = int(basis.shape[0])
+    verified_indices = []
+    jets_by_index = {}
+    jet_audits_by_index = {}
+    dropped = []
+    for index in range(requested_count):
+        jet, jet_audit = _directional_jet(
             current=current,
             mask=mask,
             unit_direction=basis[index],
@@ -204,14 +388,81 @@ def build_second_order_models(
             names=names,
         )
         if jet is None:
-            return None, {
-                "status": "nonfinite_or_unverified_curvature",
-                "reason": f"basis_hvp_{index}_nonfinite",
-            }
-        if base_values is None:
-            base_values = {name: jet[name][0] for name in names}
-        first_columns.append({name: jet[name][1] for name in names})
-        diagonal.append({name: jet[name][2] for name in names})
+            dropped.append({
+                "basis_index": int(index),
+                "kind": "basis_direction",
+                **jet_audit,
+            })
+            continue
+        verified_indices.append(index)
+        jets_by_index[index] = jet
+        jet_audits_by_index[index] = jet_audit
+
+    if not verified_indices:
+        return None, {
+            "status": "nonfinite_or_unverified_curvature",
+            "second_order_state": "nonfinite_or_unverified_curvature",
+            "reason": "no_verified_basis_direction",
+            "requested_basis_dimension": requested_count,
+            "verified_basis_dimension": 0,
+            "dropped_directions": dropped,
+        }
+
+    pair_jets = {}
+    pair_audits = {}
+    while len(verified_indices) > 1:
+        failed_pair = None
+        pair_jets = {}
+        pair_audits = {}
+        for left_position, left_index in enumerate(verified_indices):
+            for right_index in verified_indices[left_position + 1:]:
+                direction = (
+                    basis[left_index] + basis[right_index]
+                ) / math.sqrt(2.0)
+                jet, jet_audit = _directional_jet(
+                    current=current,
+                    mask=mask,
+                    unit_direction=direction,
+                    metric_builder=metric_builder,
+                    names=names,
+                )
+                if jet is None:
+                    failed_pair = (left_index, right_index, jet_audit)
+                    break
+                pair_jets[(left_index, right_index)] = jet
+                pair_audits[(left_index, right_index)] = jet_audit
+            if failed_pair is not None:
+                break
+        if failed_pair is None:
+            break
+        left_index, right_index, jet_audit = failed_pair
+        dropped.append({
+            "basis_index": int(right_index),
+            "paired_with_basis_index": int(left_index),
+            "kind": "pair_direction",
+            **jet_audit,
+        })
+        verified_indices.remove(right_index)
+
+    count = len(verified_indices)
+    verified_basis = basis.index_select(
+        0,
+        m.torch.as_tensor(
+            verified_indices, dtype=m.torch.long, device=basis.device
+        ),
+    )
+    diagonal = [
+        {name: jets_by_index[index][name][2] for name in names}
+        for index in verified_indices
+    ]
+    first_columns = [
+        {name: jets_by_index[index][name][1] for name in names}
+        for index in verified_indices
+    ]
+    base_values: Optional[Dict[str, object]] = {
+        name: jets_by_index[verified_indices[0]][name][0]
+        for name in names
+    }
 
     hessians = {
         name: m.torch.zeros(
@@ -225,19 +476,8 @@ def build_second_order_models(
     pair_hvp_count = 0
     for left in range(count):
         for right in range(left + 1, count):
-            direction = (basis[left] + basis[right]) / math.sqrt(2.0)
-            jet = _directional_jet(
-                current=current,
-                mask=mask,
-                unit_direction=direction,
-                metric_builder=metric_builder,
-                names=names,
-            )
-            if jet is None:
-                return None, {
-                    "status": "nonfinite_or_unverified_curvature",
-                    "reason": f"pair_hvp_{left}_{right}_nonfinite",
-                }
+            source_pair = (verified_indices[left], verified_indices[right])
+            jet = pair_jets[source_pair]
             pair_hvp_count += 1
             for name in names:
                 cross = (
@@ -260,7 +500,11 @@ def build_second_order_models(
     if not finite:
         return None, {
             "status": "nonfinite_or_unverified_curvature",
+            "second_order_state": "nonfinite_or_unverified_curvature",
             "reason": "nonfinite_low_dimensional_model",
+            "requested_basis_dimension": requested_count,
+            "verified_basis_dimension": count,
+            "dropped_directions": dropped,
         }
     return {
         name: {
@@ -276,6 +520,28 @@ def build_second_order_models(
         "geodesic_acceleration_included": True,
         "ambient_hessian_materialized": False,
         "basis_dimension": count,
+        "requested_basis_dimension": requested_count,
+        "verified_basis_indices": [int(index) for index in verified_indices],
+        "verified_basis": verified_basis,
+        "curvature_subspace_reduced": count < requested_count,
+        "dropped_directions": dropped,
+        "verified_direction_audits": [
+            {
+                "basis_index": int(index),
+                **jet_audits_by_index[index],
+            }
+            for index in verified_indices
+        ],
+        "verified_pair_audits": [
+            {
+                "left_basis_index": int(left),
+                "right_basis_index": int(right),
+                **pair_audits[(left, right)],
+            }
+            for left, right in sorted(pair_audits)
+        ],
+        "unverified_directions_used": False,
+        "nonfinite_basis_policy": "deterministic_verified_subspace_reduction",
         "directional_hvp_count": count + pair_hvp_count,
         "polarization_used_for_cross_terms": True,
     }
@@ -428,6 +694,12 @@ def prepare_second_order_subproblem(
     )
     if models is None:
         return None, {**basis_audit, **curvature_audit}
+    verified_basis = curvature_audit.pop("verified_basis")
+    verified_indices = curvature_audit["verified_basis_indices"]
+    basis_sources = list(basis_audit.get("basis_sources") or [])
+    curvature_audit["verified_basis_sources"] = [
+        basis_sources[index] for index in verified_indices
+    ]
     serial_models = {
         name: {
             "value": float(model["value"]),
@@ -442,7 +714,7 @@ def prepare_second_order_subproblem(
         for name, model in models.items()
     }
     return {
-        "basis": basis,
+        "basis": verified_basis,
         "models": models,
         "current64": current64,
         "mask": mask,

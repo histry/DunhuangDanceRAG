@@ -23,6 +23,17 @@ Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 tria
 词典序选择也在 device 上完成，不逐候选同步到 CPU。Projector 与完整 Guard
 继续走原有权威实现，避免以性能优化为名改变验收合同。
 
+若某个基方向的方向 HvP 非有限，该方向会在建模前被确定性排除；若组合方向
+失败，则排除索引较后的基向量并重新构建已验证子空间。模型不会消费 NaN，
+也不会用零值伪造曲率；没有任何可验证方向时仍以
+`nonfinite_or_unverified_curvature` fail-closed。该规则不读取案例 ID，并由
+train 冻结合约锁定后原样用于 development、held-out 和整曲推断。
+
+仅当扩展点的一阶值有限、autograd 二阶反传因零范数支路非有限时，数值核会
+在真实路径上用冻结的 `1e-4/3e-4` 角半径计算 `F'(+eps)` 与 `F'(-eps)`，
+恢复方向 HvP。两级结果必须通过固定的相对/绝对一致性检查；不一致的方向按
+上述规则排除，而不是隐式 fallback 或放宽 Guard。
+
 状态集合固定为：
 
 - `second_order_closure_succeeded`

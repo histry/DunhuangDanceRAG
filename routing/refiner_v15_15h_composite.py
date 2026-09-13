@@ -74,6 +74,29 @@ def _load_composite(model_path, contract_path, cfg):
              "V15.15h candidate grid is not device-resident")
     _require(fixed.get("second_order_host_candidate_sorting") is False,
              "V15.15h host candidate sorting is forbidden")
+    _require(fixed.get("second_order_nonfinite_basis_policy") ==
+             "deterministic_verified_subspace_reduction",
+             "V15.15h nonfinite-basis policy changed")
+    _require(fixed.get("second_order_unverified_directions_used") is False,
+             "V15.15h unverified curvature directions are forbidden")
+    recovery = fixed.get("second_order_hvp_recovery") or {}
+    _require(recovery.get("trigger") ==
+             "nonfinite_autograd_second_derivative_only",
+             "V15.15h HvP recovery trigger changed")
+    _require(recovery.get("method") ==
+             "symmetric_first_derivative_hvp_epsilon_ladder",
+             "V15.15h HvP recovery method changed")
+    _require(recovery.get("epsilon_radians") == [
+        float(value) for value in second_order.HVP_RECOVERY_EPSILON_RADIANS
+    ], "V15.15h HvP recovery epsilon ladder changed")
+    _require(float(recovery.get("relative_tolerance", -1.0)) ==
+             float(second_order.HVP_RECOVERY_RELATIVE_TOLERANCE),
+             "V15.15h HvP recovery relative tolerance changed")
+    _require(float(recovery.get("absolute_tolerance", -1.0)) ==
+             float(second_order.HVP_RECOVERY_ABSOLUTE_TOLERANCE),
+             "V15.15h HvP recovery absolute tolerance changed")
+    _require(recovery.get("requires_consistent_estimates") is True,
+             "V15.15h HvP recovery verification is absent")
     _require(fixed.get("atomic_commit_or_identity") is True,
              "V15.15h atomic policy is absent")
     _require(fixed.get("runtime_case_labels_consumed") is False,
@@ -411,16 +434,15 @@ def _apply_one_transaction(
                         "model_reused_across_frozen_angles": True,
                     }
                 if prepared_model is None:
+                    preparation_state = (
+                        preparation_audit.get("second_order_state")
+                        or preparation_audit.get("status")
+                        or "nonfinite_or_unverified_curvature"
+                    )
                     report["attempts"].append({
                         "budget": budget,
                         "iteration": iteration,
-                        "state": preparation_audit.get(
-                            "second_order_state",
-                            preparation_audit.get(
-                                "status",
-                                "nonfinite_or_unverified_curvature",
-                            ),
-                        ),
+                        "state": preparation_state,
                         "second_order_model_preparation": preparation_audit,
                     })
                     break
@@ -454,9 +476,10 @@ def _apply_one_transaction(
                         ),
                     }
                     if direction is None:
-                        attempt["state"] = solver.get(
-                            "second_order_state",
-                            "insufficient_second_order_predicted_progress",
+                        attempt["state"] = (
+                            solver.get("second_order_state")
+                            or solver.get("status")
+                            or "insufficient_second_order_predicted_progress"
                         )
                         report["attempts"].append(attempt)
                         continue
