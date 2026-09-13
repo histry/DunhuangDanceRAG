@@ -44,6 +44,8 @@ ALL_AESD="$ALL_DB_DIR/events_aesd.npz"
 
 REFINER_CKPT="${REFINER_CKPT:-$OUT_ROOT/motion_refiner_train_only_refiner.pt}"
 MOTION_CKPT="${MOTION_CKPT:-$OUT_ROOT/motion_train_only_diffusion.pt}"
+REFINER_COMPOSITE_MODEL="${REFINER_COMPOSITE_MODEL:-}"
+REFINER_COMPOSITE_CONTRACT="${REFINER_COMPOSITE_CONTRACT:-}"
 REFINER_TRAINING_SNAPSHOT="${REFINER_TRAINING_SNAPSHOT:-$REFINER_CKPT.training_snapshot.pt}"
 DIFFUSION_TRAINING_SNAPSHOT="${DIFFUSION_TRAINING_SNAPSHOT:-$MOTION_CKPT.training_snapshot.pt}"
 
@@ -70,6 +72,20 @@ require_file() {
     exit 2
   }
 }
+
+COMPOSITE_REFINER_ARGS=()
+if [[ -n "$REFINER_COMPOSITE_MODEL" || -n "$REFINER_COMPOSITE_CONTRACT" ]]; then
+  if [[ -z "$REFINER_COMPOSITE_MODEL" || -z "$REFINER_COMPOSITE_CONTRACT" ]]; then
+    echo "[FATAL] REFINER_COMPOSITE_MODEL and REFINER_COMPOSITE_CONTRACT must be set together." >&2
+    exit 2
+  fi
+  require_file "$REFINER_COMPOSITE_MODEL" "V15.15h composite model"
+  require_file "$REFINER_COMPOSITE_CONTRACT" "V15.15h composite contract"
+  COMPOSITE_REFINER_ARGS+=(
+    --refiner_composite_model "$REFINER_COMPOSITE_MODEL"
+    --refiner_composite_contract "$REFINER_COMPOSITE_CONTRACT"
+  )
+fi
 
 for flag_name in \
   GENERATION_REBUILD_RETARGET_CACHE \
@@ -655,6 +671,7 @@ echo "========== 13. Fresh-Audio Generation HEADING/BOUNDARY CLOSED-LOOP GENERAT
   --slots_json "$ROUTING_MSSD" \
   --db "$GENERATION_DB" \
   --refiner "$REFINER_CKPT" \
+  "${COMPOSITE_REFINER_ARGS[@]}" \
   --diffusion "$MOTION_CKPT" \
   --out "$FINAL_NPY" \
   --json "$FINAL_REPORT"

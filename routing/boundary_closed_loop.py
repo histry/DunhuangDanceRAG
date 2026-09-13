@@ -73,6 +73,7 @@ from contracts.physical_quality import (
     StageAcceptancePolicy,
     build_repair_mask,
     evaluate_physical_audit,
+    evaluate_stage_candidate,
     run_stage_transaction,
 )
 from support.common import make_geodesic_transition
@@ -944,23 +945,71 @@ def apply_generators(
             fps=float(getattr(cfg, "fps", 30.0)),
         )
         stage["boundary_refiner_repair_mask"] = mask_report
-        motion, transaction = run_stage_transaction(
-            stage_name="refiner",
-            motion=motion,
-            apply_fn=lambda value: capture_candidate("refiner", motion_runtime.apply_refiner_model(
-                value,
+        composite_model = getattr(args, "refiner_composite_model", None)
+        composite_contract = getattr(args, "refiner_composite_contract", None)
+        if bool(composite_model) != bool(composite_contract):
+            raise RuntimeError(
+                "--refiner_composite_model and --refiner_composite_contract "
+                "must be provided together"
+            )
+        pre_refiner = motion.copy()
+        if composite_model:
+            from routing.refiner_v15_15h_composite import (
+                apply_composite_refiner,
+            )
+
+            motion, transaction = apply_composite_refiner(
+                motion,
                 cond,
                 refiner_mask,
-                getattr(args, "refiner", None),
+                composite_model,
+                composite_contract,
                 cfg,
-                sliding_support_eligible=sliding_support_eligible,
-            )),
-            audit_fn=audit_fn,
-            limits=limits,
-            policy=policy,
-            require_repair_gain=True,
-        )
+                audit_fn=audit_fn,
+                limits=limits,
+                policy=policy,
+            )
+            motion = capture_candidate("refiner_composite", motion)
+        else:
+            motion, transaction = run_stage_transaction(
+                stage_name="refiner",
+                motion=motion,
+                apply_fn=lambda value: capture_candidate("refiner", motion_runtime.apply_refiner_model(
+                    value,
+                    cond,
+                    refiner_mask,
+                    getattr(args, "refiner", None),
+                    cfg,
+                    sliding_support_eligible=sliding_support_eligible,
+                )),
+                audit_fn=audit_fn,
+                limits=limits,
+                policy=policy,
+                require_repair_gain=True,
+            )
         motion = restore_protected_geometry(motion)
+        if composite_model and transaction.get("accepted"):
+            protected_reaudit = audit_fn(motion)
+            protected_decision = evaluate_stage_candidate(
+                audit_fn(pre_refiner),
+                protected_reaudit,
+                limits=limits,
+                policy=policy,
+                require_repair_gain=True,
+            )
+            transaction["post_protected_restore_full_transaction_reaudit"] = (
+                protected_reaudit
+            )
+            transaction["post_protected_restore_guard"] = protected_decision
+            if not protected_decision["accepted"]:
+                motion = pre_refiner
+                transaction.update({
+                    "accepted": False,
+                    "rolled_back": True,
+                    "selection": "identity",
+                    "reason": "post_protected_restore_full_guard_failed",
+                    "selected_audit": audit_fn(pre_refiner),
+                })
         stage["boundary_refiner_transaction"] = transaction
         stage["boundary_refiner_audit"] = audit_fn(motion)
     stage["motion_activity_refiner"] = save_stage_snapshot(
@@ -2134,6 +2183,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--slot_seconds", type=float, default=4.0)
     p.add_argument("--db", required=True)
     p.add_argument("--refiner", default=None)
+    p.add_argument("--refiner_composite_model", default=None)
+    p.add_argument("--refiner_composite_contract", default=None)
     p.add_argument("--diffusion", default=None)
     p.add_argument("--out", required=True)
     p.add_argument("--json", default=None)
