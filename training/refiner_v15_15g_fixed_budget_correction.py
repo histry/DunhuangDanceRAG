@@ -32,6 +32,10 @@ the gradient direction without changing the authoritative Guard thresholds.
 V15.15g1e adds post-retraction science-feasibility restoration.  Its bounded
 search and restoration constants are frozen from train transactions before
 development or final evaluation.  Reused case 53 is development evidence.
+
+V15.15g1f replaces add-then-normalize restoration with an exact-radius
+geodesic update.  A train-frozen, truncated-SVD active-set SQP jointly handles
+the full-transaction shadow and endpoint/temporal directional constraints.
 """
 from __future__ import annotations
 
@@ -77,6 +81,12 @@ G1E_SCHEMA = (
 )
 G1E_TRAIN_CONTRACT_SCHEMA = (
     "refiner_v15_15g1e_train_frozen_science_restoration_contract_v1"
+)
+G1F_SCHEMA = (
+    "refiner_v15_15g1f_exact_radius_geodesic_joint_active_set_sqp_v1"
+)
+G1F_TRAIN_CONTRACT_SCHEMA = (
+    "refiner_v15_15g1f_train_frozen_geodesic_joint_sqp_contract_v1"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
@@ -832,6 +842,11 @@ def _freeze_train_full_shadow_repair_contract(
     temporal_smoothness_weight=0.05,
     target_rms=1.0e-4,
     correction_budgets=(2, 3, 5),
+    geodesic_joint_sqp=False,
+    angular_max_radians=math.pi / 4.0,
+    joint_svd_relative_cutoff=1.0e-6,
+    joint_direction_norm_floor=1.0e-8,
+    joint_directional_margin=1.0e-6,
 ):
     """Freeze every g1d numerical choice from train transactions only."""
     if train_teacher.get("split") != "train":
@@ -863,7 +878,9 @@ def _freeze_train_full_shadow_repair_contract(
     }
     return {
         "schema": (
-            G1E_TRAIN_CONTRACT_SCHEMA
+            G1F_TRAIN_CONTRACT_SCHEMA
+            if geodesic_joint_sqp
+            else G1E_TRAIN_CONTRACT_SCHEMA
             if post_retraction_restoration
             else "refiner_v15_15g1d_train_frozen_shadow_repair_contract_v1"
         ),
@@ -906,6 +923,22 @@ def _freeze_train_full_shadow_repair_contract(
         "correction_budgets": [int(value) for value in correction_budgets],
         "restoration_parameter_calibration_split": "train",
         "development_case_53_consumed_for_calibration": False,
+        "exact_radius_geodesic_joint_active_set_sqp": bool(
+            geodesic_joint_sqp
+        ),
+        "angular_max_radians": float(angular_max_radians),
+        "angular_line_search_radians": [
+            float(angular_max_radians) * float(line_search_decay) ** index
+            for index in range(int(line_search_backtrack_count))
+        ],
+        "angular_line_search_interval": "(0,pi_over_2]",
+        "joint_svd_relative_cutoff": float(joint_svd_relative_cutoff),
+        "joint_direction_norm_floor": float(joint_direction_norm_floor),
+        "joint_directional_margin": float(joint_directional_margin),
+        "scope_null_space_projection": (
+            "exact_boolean_ownership_mask_before_joint_jacobian"
+        ),
+        "geodesic_update_requires_post_normalization": False,
         "line_search_acceptance": [
             "full_transaction_fixed_guard_shadow_strictly_decreases",
             "endpoint_and_temporal_strict_descent_pass",
@@ -2019,6 +2052,563 @@ def _post_retraction_science_restoration(
     )
     diagnostics["restoration_exact_radius_normalized"] = bool(normalized)
     return restored.detach(), bool(normalized), diagnostics
+
+
+def _owned_sphere_tangent_projection(vector, current, mask, taper):
+    """Apply the exact ownership null space and sphere-tangent projector."""
+    scoped = vector.masked_fill(~mask, 0.0) * taper
+    radial = current.detach().masked_fill(~mask, 0.0)
+    denominator = radial[mask].square().sum().clamp_min(1.0e-30)
+    scoped = scoped - ((scoped[mask] * radial[mask]).sum() / denominator) * radial
+    return scoped.masked_fill(~mask, 0.0)
+
+
+def _truncated_svd_pinv(matrix, relative_cutoff):
+    """Return an explicit truncated-SVD pseudo-inverse and its audit data."""
+    u, singular_values, vh = m.torch.linalg.svd(matrix, full_matrices=False)
+    largest = float(singular_values[0].detach()) if singular_values.numel() else 0.0
+    threshold = float(relative_cutoff) * largest
+    retained = singular_values > threshold
+    inverse = m.torch.zeros_like(singular_values)
+    inverse[retained] = singular_values[retained].reciprocal()
+    pseudo_inverse = (vh.transpose(0, 1) * inverse) @ u.transpose(0, 1)
+    return pseudo_inverse, {
+        "singular_values": [float(value) for value in singular_values.detach().cpu()],
+        "svd_absolute_cutoff": threshold,
+        "retained_rank": int(retained.sum().detach()),
+    }
+
+
+def _autograd_gradient_or_zero(output, variable, *, retain_graph):
+    """Preserve zero-gradient diagnostics when a scalar has no graph edge."""
+    if output is None:
+        return m.torch.full_like(variable, float("nan"))
+    if not bool(m.torch.isfinite(output).all()):
+        return m.torch.full_like(variable, float("nan"))
+    if not output.requires_grad:
+        return m.torch.zeros_like(variable)
+    gradient = m.torch.autograd.grad(
+        output,
+        variable,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )[0]
+    return m.torch.zeros_like(variable) if gradient is None else gradient
+
+
+def _joint_geodesic_active_set_direction(
+    *,
+    current,
+    mask,
+    taper,
+    gradients,
+    svd_relative_cutoff,
+    direction_norm_floor,
+    directional_margin,
+):
+    """Solve the three-row shadow/science tangent QP by active-set enumeration."""
+    names = ("shadow", "endpoint", "temporal")
+    projected = {}
+    raw_norms = {}
+    tangent_norms = {}
+    for name in names:
+        gradient = gradients.get(name)
+        if gradient is None or not bool(m.torch.isfinite(gradient).all()):
+            return None, {
+                "solver_status": "nonfinite_joint_jacobian",
+                "joint_jacobian_status": "nonfinite_joint_jacobian",
+            }
+        raw_norms[name] = float(m.torch.linalg.vector_norm(gradient[mask]).detach())
+        tangent = _owned_sphere_tangent_projection(
+            gradient.detach(), current, mask, taper
+        )
+        tangent_norms[name] = float(
+            m.torch.linalg.vector_norm(tangent[mask]).detach()
+        )
+        projected[name] = tangent
+
+    floor = float(direction_norm_floor)
+    if tangent_norms["endpoint"] < floor or tangent_norms["temporal"] < floor:
+        return None, {
+            "solver_status": "zero_science_gradient",
+            "joint_jacobian_status": "zero_science_gradient",
+            "raw_gradient_norm_by_term": raw_norms,
+            "sphere_tangent_gradient_norm_by_term": tangent_norms,
+        }
+    if tangent_norms["shadow"] < floor:
+        return None, {
+            "solver_status": "empty_geodesic_joint_feasible_intersection",
+            "joint_jacobian_status": "rank_deficient_joint_jacobian",
+            "zero_shadow_gradient": True,
+            "raw_gradient_norm_by_term": raw_norms,
+            "sphere_tangent_gradient_norm_by_term": tangent_norms,
+        }
+
+    dtype = m.torch.float64
+    rows = m.torch.stack(
+        [projected[name][mask].to(dtype) / tangent_norms[name] for name in names]
+    )
+    if not bool(m.torch.isfinite(rows).all()):
+        return None, {
+            "solver_status": "nonfinite_joint_jacobian",
+            "joint_jacobian_status": "nonfinite_joint_jacobian",
+            "raw_gradient_norm_by_term": raw_norms,
+            "sphere_tangent_gradient_norm_by_term": tangent_norms,
+        }
+    _, jacobian_singular_values, _ = m.torch.linalg.svd(
+        rows, full_matrices=False
+    )
+    largest = float(jacobian_singular_values[0].detach())
+    jacobian_cutoff = float(svd_relative_cutoff) * largest
+    joint_rank = int((jacobian_singular_values > jacobian_cutoff).sum().detach())
+    jacobian_status = (
+        "full_rank_joint_jacobian"
+        if joint_rank == len(names)
+        else "rank_deficient_joint_jacobian"
+    )
+
+    target = -rows[0]
+    bounds = m.torch.tensor(
+        [-float(directional_margin)] * len(names),
+        dtype=dtype,
+        device=rows.device,
+    )
+    feasibility_tolerance = max(
+        1.0e-10,
+        float(directional_margin) * 1.0e-3,
+    )
+    candidates = []
+    active_set_audits = []
+    for bitmask in range(1 << len(names)):
+        active = tuple(index for index in range(len(names)) if bitmask & (1 << index))
+        candidate = target
+        multipliers = m.torch.zeros(0, dtype=dtype, device=rows.device)
+        svd_audit = {
+            "singular_values": [],
+            "svd_absolute_cutoff": 0.0,
+            "retained_rank": 0,
+        }
+        if active:
+            index = m.torch.tensor(active, dtype=m.torch.long, device=rows.device)
+            active_rows = rows.index_select(0, index)
+            active_bounds = bounds.index_select(0, index)
+            gram = active_rows @ active_rows.transpose(0, 1)
+            gram_pinv, svd_audit = _truncated_svd_pinv(
+                gram, svd_relative_cutoff
+            )
+            multipliers = gram_pinv @ (active_rows @ target - active_bounds)
+            candidate = target - active_rows.transpose(0, 1) @ multipliers
+        changes = rows @ candidate
+        primal_ok = bool((changes <= bounds + feasibility_tolerance).all())
+        dual_ok = bool(
+            not active or (multipliers >= -feasibility_tolerance).all()
+        )
+        audit = {
+            "active_constraints": [names[index] for index in active],
+            "primal_feasible": primal_ok,
+            "dual_feasible": dual_ok,
+            "directional_change_by_term": {
+                name: float(changes[index].detach())
+                for index, name in enumerate(names)
+            },
+            "multipliers": [float(value) for value in multipliers.detach().cpu()],
+            "kkt_svd": svd_audit,
+        }
+        active_set_audits.append(audit)
+        if primal_ok and dual_ok:
+            objective = float(
+                0.5 * (candidate - target).square().sum().detach()
+            )
+            candidates.append((objective, candidate, audit))
+
+    base_audit = {
+        "joint_jacobian_status": jacobian_status,
+        "joint_jacobian_rank": joint_rank,
+        "joint_jacobian_singular_values": [
+            float(value) for value in jacobian_singular_values.detach().cpu()
+        ],
+        "joint_jacobian_svd_absolute_cutoff": jacobian_cutoff,
+        "joint_svd_relative_cutoff": float(svd_relative_cutoff),
+        "raw_gradient_norm_by_term": raw_norms,
+        "sphere_tangent_gradient_norm_by_term": tangent_norms,
+        "scope_null_space_projection": "exact_boolean_ownership_mask",
+        "active_set_audits": active_set_audits,
+    }
+    if not candidates:
+        return None, {
+            **base_audit,
+            "solver_status": "empty_geodesic_joint_feasible_intersection",
+        }
+    _, flat, selected_audit = min(candidates, key=lambda item: item[0])
+    direction = m.torch.zeros_like(current)
+    direction[mask] = flat.to(current.dtype)
+    direction = _owned_sphere_tangent_projection(
+        direction, current, mask, m.torch.ones_like(taper)
+    )
+    norm = float(m.torch.linalg.vector_norm(direction[mask]).detach())
+    if not math.isfinite(norm):
+        return None, {
+            **base_audit,
+            "solver_status": "nonfinite_joint_jacobian",
+        }
+    if norm < floor:
+        return None, {
+            **base_audit,
+            "solver_status": "empty_geodesic_joint_feasible_intersection",
+            "geodesic_direction_norm": norm,
+        }
+    directional = {
+        name: float((projected[name][mask] * direction[mask]).sum().detach())
+        for name in names
+    }
+    return direction.detach(), {
+        **base_audit,
+        "solver_status": "geodesic_joint_direction_found",
+        "selected_active_set": selected_audit,
+        "geodesic_direction_norm": norm,
+        "geodesic_radial_inner_product": float(
+            (direction[mask] * current[mask]).sum().detach()
+        ),
+        "directional_derivative_by_term": directional,
+    }
+
+
+def _exact_radius_geodesic_update(current, direction, mask, theta, norm_floor):
+    """Rotate on the owned tangent sphere without add-then-normalize."""
+    radial = current.detach().masked_fill(~mask, 0.0)
+    tangent = direction.detach().masked_fill(~mask, 0.0)
+    radial_norm = m.torch.linalg.vector_norm(radial[mask])
+    tangent_norm = m.torch.linalg.vector_norm(tangent[mask])
+    if (
+        not bool(m.torch.isfinite(radial_norm))
+        or not bool(m.torch.isfinite(tangent_norm))
+        or float(radial_norm.detach()) <= float(norm_floor)
+        or float(tangent_norm.detach()) <= float(norm_floor)
+    ):
+        return current.detach(), False, {
+            "geodesic_update_status": "zero_or_nonfinite_geodesic_direction",
+        }
+    tangent = _owned_sphere_tangent_projection(
+        tangent,
+        radial,
+        mask,
+        m.torch.ones_like(tangent),
+    )
+    tangent_norm = m.torch.linalg.vector_norm(tangent[mask])
+    if float(tangent_norm.detach()) <= float(norm_floor):
+        return current.detach(), False, {
+            "geodesic_update_status": "zero_or_nonfinite_geodesic_direction",
+        }
+    theta_tensor = radial_norm.new_tensor(float(theta))
+    trial = (
+        m.torch.cos(theta_tensor) * radial
+        + m.torch.sin(theta_tensor) * radial_norm * tangent / tangent_norm
+    ).masked_fill(~mask, 0.0)
+    return trial.detach(), bool(m.torch.isfinite(trial).all()), {
+        "geodesic_update_status": "exact_radius_geodesic_update",
+        "theta_radians": float(theta),
+        "radius_norm_before": float(radial_norm.detach()),
+        "radius_norm_after": float(
+            m.torch.linalg.vector_norm(trial[mask]).detach()
+        ),
+        "post_update_normalization_applied": False,
+        "outside_scope_abs_max": float(
+            trial.masked_fill(mask, 0.0).abs().amax().detach()
+        ),
+    }
+
+
+def _correct_case_geodesic_joint_sqp(
+    *,
+    model,
+    steps,
+    initial_tangent,
+    ownership,
+    c2_taper,
+    baseline,
+    identity,
+    batch,
+    cfg,
+    local_case,
+    baseline_case,
+    contract,
+    train_repair_contract,
+    target_rms,
+):
+    """Run bounded exact-radius geodesic joint active-set SQP."""
+    mask = _owned_case_mask(ownership, initial_tangent, 0)
+    taper = c2_taper.expand_as(initial_tangent).detach()
+    current, normalized = _normalize_exact_radius(
+        initial_tangent, mask, target_rms
+    )
+    zero_start = not normalized
+    if zero_start:
+        current = m.torch.zeros_like(initial_tangent).masked_fill(~mask, 0.0)
+    history = []
+    numeric_failure = False
+    started = time.perf_counter()
+    norm_floor = float(train_repair_contract["joint_direction_norm_floor"])
+    svd_cutoff = float(train_repair_contract["joint_svd_relative_cutoff"])
+    directional_margin = float(
+        train_repair_contract["joint_directional_margin"]
+    )
+    angular_scales = [
+        float(value)
+        for value in train_repair_contract["angular_line_search_radians"]
+    ]
+
+    for iteration in range(int(steps)):
+        variable = m.torch.zeros_like(current).requires_grad_(True)
+        local_total = current.detach() + variable.masked_fill(~mask, 0.0) * taper
+        transaction_tangent = _case_isolated_transaction_tangent(
+            baseline, local_total, local_case
+        )
+        candidate = product_exp_torch(baseline, transaction_tangent)
+        _, primary_loss, constraints, science_tensors = _g1d_shadow_objective(
+            model=model,
+            batch=batch,
+            cfg=cfg,
+            baseline=baseline,
+            identity=identity,
+            candidate=candidate,
+            contract=contract,
+            local_case=local_case,
+            baseline_case=baseline_case,
+            local_tangent=local_total,
+            local_mask=mask,
+            train_repair_contract=train_repair_contract,
+            temporal_smoothness_weight=float(
+                train_repair_contract["temporal_smoothness_weight"]
+            ),
+        )
+        if constraints["primary_objective"] != (
+            "full_transaction_fixed_guard_shadow"
+        ):
+            history.append({
+                "iteration": iteration,
+                "accepted": False,
+                "step_rejection_reason": "full_shadow_not_active",
+                "constraints": constraints,
+                "joint_solver": None,
+                "angular_line_search_trials": [],
+            })
+            break
+        gradients = {
+            "shadow": _autograd_gradient_or_zero(
+                primary_loss, variable, retain_graph=True
+            ),
+            "endpoint": _autograd_gradient_or_zero(
+                science_tensors["endpoint"], variable, retain_graph=True
+            ),
+            "temporal": _autograd_gradient_or_zero(
+                science_tensors["temporal"], variable, retain_graph=False
+            ),
+        }
+        direction, solver_audit = _joint_geodesic_active_set_direction(
+            current=current,
+            mask=mask,
+            taper=taper,
+            gradients=gradients,
+            svd_relative_cutoff=svd_cutoff,
+            direction_norm_floor=norm_floor,
+            directional_margin=directional_margin,
+        )
+        if direction is None:
+            reason = str(solver_audit["solver_status"])
+            numeric_failure = numeric_failure or reason == "nonfinite_joint_jacobian"
+            history.append({
+                "iteration": iteration,
+                "accepted": False,
+                "step_rejection_reason": reason,
+                "constraints": constraints,
+                "joint_solver": solver_audit,
+                "angular_line_search_trials": [],
+            })
+            break
+
+        current_shadow = float(
+            constraints["maximum_full_transaction_fixed_guard_shadow_margin"]
+        )
+        active_names = constraints["active_full_shadow_terms"]
+        minimum_reduction = max(
+            float(
+                train_repair_contract["minimum_shadow_reduction_by_guard_term"][
+                    name
+                ]
+            )
+            for name in active_names
+        )
+        accepted = False
+        accepted_tangent = current
+        accepted_shadow = current_shadow
+        accepted_theta = 0.0
+        trial_rows = []
+        for backtrack, theta in enumerate(angular_scales):
+            trial, geodesic_ok, geodesic_audit = _exact_radius_geodesic_update(
+                current, direction, mask, theta, norm_floor
+            )
+            if not geodesic_ok:
+                trial_rows.append({
+                    "backtrack": backtrack,
+                    "theta_radians": theta,
+                    "accepted": False,
+                    "reason": "nonfinite_geodesic_update",
+                    "failed_constraints": ["numeric"],
+                    "geodesic_update": geodesic_audit,
+                })
+                continue
+            radius_rms = _rms(trial, mask)
+            radius_ok = bool(
+                math.isfinite(radius_rms)
+                and abs(radius_rms - float(target_rms))
+                <= max(1.0e-12, float(target_rms) * 1.0e-6)
+            )
+            outside_scope = float(
+                trial.masked_fill(mask, 0.0).abs().amax().detach()
+            )
+            scope_ok = outside_scope == 0.0
+            trial_transaction_tangent = _case_isolated_transaction_tangent(
+                baseline, trial, local_case
+            )
+            trial_candidate = product_exp_torch(
+                baseline, trial_transaction_tangent
+            )
+            trial_case_terms = oracle.case_probe._case_terms(
+                trial_candidate, batch, cfg
+            )
+            trial_scientific = oracle._case_scientific_status(
+                {
+                    key: float(
+                        trial_case_terms[key][int(local_case)].detach()
+                    )
+                    for key in ("endpoint", "temporal")
+                },
+                baseline_case,
+            )
+            science_margins = _science_pass_margin_diagnostics(
+                trial_scientific
+            )
+            science_ok = bool(
+                science_margins["both_scientific_terms_strictly_improved"]
+            )
+            with m.torch.no_grad():
+                trial_shadows, _, _ = _full_transaction_fixed_guard_shadows(
+                    model,
+                    batch,
+                    cfg,
+                    trial_candidate,
+                    identity,
+                    contract,
+                )
+                trial_shadow = max(
+                    float(value.detach()) for value in trial_shadows.values()
+                )
+            shadow_ok = bool(
+                trial_shadow <= current_shadow - minimum_reduction
+            )
+            failed_constraints = []
+            if not shadow_ok:
+                failed_constraints.append("hard_full_transaction_shadow")
+            if not science_ok:
+                failed_constraints.append("endpoint_temporal_science")
+            if not radius_ok:
+                failed_constraints.append("exact_radius")
+            if not scope_ok:
+                failed_constraints.append("scope")
+            trial_row = {
+                "backtrack": backtrack,
+                "theta_radians": theta,
+                "accepted": not failed_constraints,
+                "failed_constraints": failed_constraints,
+                "trial_full_shadow": trial_shadow,
+                "full_shadow_reduction": current_shadow - trial_shadow,
+                "trial_radius_rms": radius_rms,
+                "trial_outside_scope_abs_max": outside_scope,
+                **science_margins,
+                "geodesic_update": geodesic_audit,
+            }
+            trial_rows.append(trial_row)
+            if not failed_constraints:
+                accepted = True
+                accepted_tangent = trial.detach()
+                accepted_shadow = trial_shadow
+                accepted_theta = theta
+                break
+        rejection_reason = (
+            None if accepted else "empty_geodesic_joint_feasible_intersection"
+        )
+        history.append({
+            "iteration": iteration,
+            "accepted": accepted,
+            "accepted_theta_radians": accepted_theta,
+            "constraints": constraints,
+            "joint_solver": solver_audit,
+            "full_shadow_before": current_shadow,
+            "full_shadow_after": accepted_shadow,
+            "full_shadow_reduction": (
+                current_shadow - accepted_shadow if accepted else 0.0
+            ),
+            "step_rejection_reason": rejection_reason,
+            "angular_line_search_trials": trial_rows,
+            "exact_radius_rms": _rms(accepted_tangent, mask),
+            "outside_scope_abs_max": 0.0 if accepted else None,
+        })
+        if not accepted:
+            break
+        current = accepted_tangent
+
+    accepted_steps = sum(int(row.get("accepted", False)) for row in history)
+    reductions = [
+        float(row.get("full_shadow_reduction", 0.0)) for row in history
+    ]
+    final_rejection = next(
+        (
+            row["step_rejection_reason"]
+            for row in reversed(history)
+            if row.get("step_rejection_reason")
+        ),
+        None,
+    )
+    statuses = Counter(
+        str((row.get("joint_solver") or {}).get("joint_jacobian_status"))
+        for row in history
+        if row.get("joint_solver")
+    )
+    shadow_gradient_norms = [
+        float(
+            ((row.get("joint_solver") or {}).get(
+                "sphere_tangent_gradient_norm_by_term", {}
+            )).get("shadow", 0.0)
+        )
+        for row in history
+        if row.get("joint_solver")
+    ]
+    return current.detach(), {
+        "method": "geodesic_joint_sqp",
+        "steps_requested": int(steps),
+        "steps_completed": len(history),
+        "accepted_steps": accepted_steps,
+        "correction_accepted_steps": accepted_steps,
+        "numeric_failure": numeric_failure,
+        "zero_adapter_start": zero_start,
+        "exact_radius_geodesic_joint_active_set_sqp": True,
+        "scope_null_space_projection": "exact_boolean_ownership_mask",
+        "joint_jacobian_status_counts": dict(statuses),
+        "angular_line_search_radians": angular_scales,
+        "post_update_normalization_applied": False,
+        "full_shadow_gradient_norm": (
+            max(shadow_gradient_norms) if shadow_gradient_norms else 0.0
+        ),
+        "full_shadow_reduction": sum(reductions),
+        "step_rejection_reason": final_rejection,
+        "empty_geodesic_joint_feasible_intersection": bool(
+            final_rejection == "empty_geodesic_joint_feasible_intersection"
+        ),
+        "teacher_eligible": False,
+        "final_exact_radius_rms": _rms(current, mask),
+        "history": history,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
 
 
 def _correct_case_full_transaction_shadow(
@@ -3389,11 +3979,23 @@ def _variant_summary(audits, correction_reports, elapsed):
 
 
 def _local_feasible_intersection_summary(correction_reports):
-    """Summarize bounded g1e intersection evidence across all variants."""
+    """Summarize bounded train-frozen intersection evidence across variants."""
     by_uid = {}
+    joint_jacobian_status_counts = Counter()
+    solver_status_counts = Counter()
     for method, reports in correction_reports.items():
         for uid, report in reports.items():
             history = report.get("history") or []
+            for row in history:
+                solver = row.get("joint_solver") or {}
+                if solver.get("joint_jacobian_status"):
+                    joint_jacobian_status_counts.update(
+                        [str(solver["joint_jacobian_status"])]
+                    )
+                if solver.get("solver_status"):
+                    solver_status_counts.update(
+                        [str(solver["solver_status"])]
+                    )
             requires_shadow_repair = any(
                 (row.get("constraints") or {}).get("primary_objective")
                 == "full_transaction_fixed_guard_shadow"
@@ -3432,20 +4034,34 @@ def _local_feasible_intersection_summary(correction_reports):
     )
     return {
         "definition": (
-            "no_euclidean_or_riemannian_2_3_5_step_candidate_on_the_"
-            "train_frozen_post_retraction_logarithmic_search_ladder"
+            "no_requested_2_3_5_step_candidate_on_the_train_frozen_"
+            "authoritative_post_retraction_search_ladder"
         ),
         "by_case_uid": by_uid,
         "empty_local_feasible_intersection_case_uids": empty,
         "empty_local_feasible_intersection_count": len(empty),
         "local_feasible_intersection_complete": not empty,
+        "empty_geodesic_joint_feasible_intersection_case_uids": sorted(
+            uid
+            for uid, row in by_uid.items()
+            if any(
+                method.get("step_rejection_reason")
+                == "empty_geodesic_joint_feasible_intersection"
+                for method in row["methods"].values()
+            )
+            and not row["feasible_method_found"]
+        ),
+        "joint_jacobian_status_counts": dict(joint_jacobian_status_counts),
+        "joint_solver_status_counts": dict(solver_status_counts),
     }
 
 
 def run(args):
     started = time.perf_counter()
+    g1f = bool(args.activation_aware_g1f)
+    g1e_family = bool(args.activation_aware_g1e or g1f)
     g1d_family = bool(
-        args.activation_aware_g1d or args.activation_aware_g1e
+        args.activation_aware_g1d or g1e_family
     )
     g1c_family = bool(
         args.activation_aware_g1c or g1d_family
@@ -3468,10 +4084,10 @@ def run(args):
     if teacher.get("schema") != TEACHER_SCHEMA:
         raise RuntimeError("V15.15g requires a V15.15e bank")
     evaluation_role = (
-        args.evaluation_role if args.activation_aware_g1e else "validation"
+        args.evaluation_role if g1e_family else "validation"
     )
     if (
-        args.activation_aware_g1e
+        g1e_family
         and evaluation_role == "final_held_out"
         and (
             not args.frozen_full_shadow_repair_contract
@@ -3504,7 +4120,7 @@ def run(args):
         str(sample["case_uid"]) for sample in teacher.get("samples", [])
     }
     if (
-        args.activation_aware_g1e
+        g1e_family
         and evaluation_role == "final_held_out"
         and REUSED_DEVELOPMENT_CASE_UID in evaluation_case_uids
     ):
@@ -3521,7 +4137,8 @@ def run(args):
     if g1_family:
         if not args.train_teacher_bank:
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e requires --train-teacher-bank"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f requires "
+                "--train-teacher-bank"
             )
         train_teacher_path = Path(args.train_teacher_bank).resolve()
         train_teacher = m.torch.load(
@@ -3529,17 +4146,17 @@ def run(args):
         )
         if train_teacher.get("schema") != TEACHER_SCHEMA:
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e train bank schema mismatch"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f train bank schema mismatch"
             )
         if train_teacher.get("split") != "train":
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e envelope bank must be train split"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f envelope bank must be train split"
             )
         if not train_teacher.get("teacher_bank_ready"):
             raise RuntimeError(
-                "V15.15g1/g1b/g1c/g1d/g1e train bank is not ready"
+                "V15.15g1/g1b/g1c/g1d/g1e/g1f train bank is not ready"
             )
-        if args.activation_aware_g1e and evaluation_role == "final_held_out":
+        if g1e_family and evaluation_role == "final_held_out":
             train_transaction_ids = {
                 str(sample["transaction_id"])
                 for sample in train_teacher.get("samples", [])
@@ -3569,7 +4186,7 @@ def run(args):
         ):
             raise RuntimeError("train/validation source diagnostic mismatch")
         separate_final_manifest = bool(
-            args.activation_aware_g1e
+            g1e_family
             and evaluation_role == "final_held_out"
         )
         for key in (
@@ -3585,7 +4202,7 @@ def run(args):
                 and train_teacher.get(key) != teacher.get(key)
             ):
                 raise RuntimeError(f"train/validation {key} mismatch")
-        if args.activation_aware_g1e and args.frozen_severity_envelope:
+        if g1e_family and args.frozen_severity_envelope:
             severity_envelope = json.loads(
                 Path(args.frozen_severity_envelope).read_text(
                     encoding="utf-8-sig"
@@ -3655,7 +4272,7 @@ def run(args):
         )
         if g1d_family:
             if (
-                args.activation_aware_g1e
+                g1e_family
                 and args.frozen_full_shadow_repair_contract
             ):
                 train_shadow_contract = json.loads(
@@ -3663,10 +4280,12 @@ def run(args):
                         encoding="utf-8-sig"
                     )
                 )
-                if train_shadow_contract.get("schema") != (
-                    G1E_TRAIN_CONTRACT_SCHEMA
-                ):
-                    raise RuntimeError("frozen g1e repair contract mismatch")
+                expected_contract_schema = (
+                    G1F_TRAIN_CONTRACT_SCHEMA
+                    if g1f else G1E_TRAIN_CONTRACT_SCHEMA
+                )
+                if train_shadow_contract.get("schema") != expected_contract_schema:
+                    raise RuntimeError("frozen g1e/g1f repair contract mismatch")
                 if train_shadow_contract.get(
                     "train_teacher_bank_sha256"
                 ) != _file_sha256(train_teacher_path):
@@ -3681,6 +4300,34 @@ def run(args):
                     args.target_rms
                 ):
                     raise RuntimeError("frozen g1e target radius mismatch")
+                if g1f:
+                    angular_values = [
+                        float(value)
+                        for value in train_shadow_contract.get(
+                            "angular_line_search_radians", []
+                        )
+                    ]
+                    if not train_shadow_contract.get(
+                        "exact_radius_geodesic_joint_active_set_sqp"
+                    ):
+                        raise RuntimeError(
+                            "frozen g1f contract lacks geodesic SQP flag"
+                        )
+                    if len(angular_values) != int(
+                        train_shadow_contract.get(
+                            "line_search_backtrack_count", -1
+                        )
+                    ):
+                        raise RuntimeError(
+                            "frozen g1f angular search ladder mismatch"
+                        )
+                    if not angular_values or any(
+                        value <= 0.0 or value > math.pi / 2.0
+                        for value in angular_values
+                    ):
+                        raise RuntimeError(
+                            "frozen g1f angular search leaves (0, pi/2]"
+                        )
             else:
                 train_shadow_contract = (
                     _freeze_train_full_shadow_repair_contract(
@@ -3702,7 +4349,7 @@ def run(args):
                         ),
                         line_search_backtrack_count=int(
                             args.full_shadow_line_search_backtracks
-                            if args.activation_aware_g1e else 6
+                            if g1e_family else 6
                         ),
                         line_search_decay=float(
                             args.full_shadow_line_search_decay
@@ -3721,6 +4368,19 @@ def run(args):
                         target_rms=float(args.target_rms),
                         correction_budgets=tuple(
                             int(value) for value in args.steps
+                        ),
+                        geodesic_joint_sqp=g1f,
+                        angular_max_radians=float(
+                            args.geodesic_angular_max_radians
+                        ),
+                        joint_svd_relative_cutoff=float(
+                            args.joint_svd_relative_cutoff
+                        ),
+                        joint_direction_norm_floor=float(
+                            args.joint_direction_norm_floor
+                        ),
+                        joint_directional_margin=float(
+                            args.joint_directional_margin
                         ),
                     )
                 )
@@ -3794,11 +4454,17 @@ def run(args):
     variant_correction_reports = {}
     hard_negatives = []
     budgets = tuple(int(value) for value in args.steps)
-    specifications = [("adapter", 0)] + [
-        (method, budget)
-        for method in METHODS[1:]
-        for budget in budgets
-    ]
+    specifications = (
+        [("adapter", 0)]
+        + [("geodesic_joint_sqp", budget) for budget in budgets]
+        if g1f
+        else [("adapter", 0)]
+        + [
+            (method, budget)
+            for method in METHODS[1:]
+            for budget in budgets
+        ]
+    )
     workspace_floor = max(1.0e-8, float(args.target_rms) * 0.01)
     for method, budget in specifications:
         variant_started = time.perf_counter()
@@ -3856,7 +4522,26 @@ def run(args):
                         for key in ("endpoint", "temporal")
                     }
                     local_contract = domain["contract"]
-                if g1d_family:
+                if g1f:
+                    corrected, correction_report = (
+                        _correct_case_geodesic_joint_sqp(
+                            model=model,
+                            steps=budget,
+                            initial_tangent=local_initial,
+                            ownership=local_ownership,
+                            c2_taper=local_c2_taper,
+                            baseline=domain["baseline"],
+                            identity=domain["identity"],
+                            batch=domain["batch"],
+                            cfg=cfg,
+                            local_case=local_case,
+                            baseline_case=baseline_case,
+                            contract=domain["contract"],
+                            train_repair_contract=train_shadow_contract,
+                            target_rms=float(args.target_rms),
+                        )
+                    )
+                elif g1d_family:
                     corrected, correction_report = (
                         _correct_case_full_transaction_shadow(
                             model=model,
@@ -4016,7 +4701,7 @@ def run(args):
 
     feasible_intersection_summary = (
         _local_feasible_intersection_summary(variant_correction_reports)
-        if args.activation_aware_g1e else None
+        if g1e_family else None
     )
     activation_summary = None
     activation_aware_supported = False
@@ -4376,6 +5061,13 @@ def run(args):
         activation_summary = {
             "selection_protocol": (
                 (
+                    "observable_discriminative_conformal_then_exact_radius_"
+                    "geodesic_joint_active_set_sqp_then_complete_fixed_"
+                    "guard_incumbent_lock_v1"
+                )
+                if g1f
+                else
+                (
                     "observable_discriminative_conformal_then_"
                     "post_retraction_science_feasibility_restoration_then_"
                     "complete_fixed_guard_incumbent_lock_v1"
@@ -4510,19 +5202,19 @@ def run(args):
             ),
             "held_out_validation_evaluation_passes": (
                 int(evaluation_role == "final_held_out")
-                if args.activation_aware_g1e
+                if g1e_family
                 else 1 if args.activation_aware_g1d else None
             ),
             "evaluation_role": evaluation_role,
             "case_53_evidence_role": (
                 "development_validation_reused"
-                if args.activation_aware_g1e
+                if g1e_family
                 and REUSED_DEVELOPMENT_CASE_UID in evaluation_case_uids
                 else None
             ),
             "case_53_pristine_held_out": False,
             "final_held_out_required": bool(
-                args.activation_aware_g1e
+                g1e_family
                 and evaluation_role != "final_held_out"
             ),
             "activation_decision_role_label_consumed": False,
@@ -4579,22 +5271,37 @@ def run(args):
         "projected_pass_count_by_group"
     ].get("cross_long", 0)
     supported_budgets = []
-    for budget in budgets:
-        euclidean = variants[f"euclidean_projected_k{budget}"]
-        riemannian = variants[f"riemannian_retraction_k{budget}"]
-        riemannian_cross_long = riemannian[
-            "projected_pass_count_by_group"
-        ].get("cross_long", 0)
-        euclidean_cross_long = euclidean[
-            "projected_pass_count_by_group"
-        ].get("cross_long", 0)
-        if (
-            riemannian_cross_long > base_cross_long
-            and riemannian_cross_long > euclidean_cross_long
-            and riemannian["numeric_failure_count"] == 0
-        ):
-            supported_budgets.append(int(budget))
-    riemannian_supported = bool(supported_budgets)
+    geodesic_supported_budgets = []
+    if g1f:
+        for budget in budgets:
+            geodesic = variants[f"geodesic_joint_sqp_k{budget}"]
+            geodesic_cross_long = geodesic[
+                "projected_pass_count_by_group"
+            ].get("cross_long", 0)
+            if (
+                geodesic_cross_long > base_cross_long
+                and geodesic["numeric_failure_count"] == 0
+            ):
+                geodesic_supported_budgets.append(int(budget))
+        riemannian_supported = False
+    else:
+        for budget in budgets:
+            euclidean = variants[f"euclidean_projected_k{budget}"]
+            riemannian = variants[f"riemannian_retraction_k{budget}"]
+            riemannian_cross_long = riemannian[
+                "projected_pass_count_by_group"
+            ].get("cross_long", 0)
+            euclidean_cross_long = euclidean[
+                "projected_pass_count_by_group"
+            ].get("cross_long", 0)
+            if (
+                riemannian_cross_long > base_cross_long
+                and riemannian_cross_long > euclidean_cross_long
+                and riemannian["numeric_failure_count"] == 0
+            ):
+                supported_budgets.append(int(budget))
+        riemannian_supported = bool(supported_budgets)
+    geodesic_joint_sqp_supported = bool(geodesic_supported_budgets)
     hard_negative_path = destination / f"{expected_split}_hard_negatives.pt"
     m.torch.save({
         "schema": HARD_NEGATIVE_SCHEMA,
@@ -4606,7 +5313,9 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            G1E_SCHEMA
+            G1F_SCHEMA
+            if g1f
+            else G1E_SCHEMA
             if args.activation_aware_g1e
             else G1D_SCHEMA
             if args.activation_aware_g1d
@@ -4631,7 +5340,7 @@ def run(args):
         "evaluation_split": expected_split,
         "evaluation_role": evaluation_role,
         "separate_final_held_out_manifest": bool(
-            args.activation_aware_g1e
+            g1e_family
             and evaluation_role == "final_held_out"
         ),
         "train_split_manifest_file_sha256": (
@@ -4650,13 +5359,13 @@ def run(args):
         ),
         "case_53_evidence_role": (
             "development_validation_reused"
-            if args.activation_aware_g1e
+            if g1e_family
             and REUSED_DEVELOPMENT_CASE_UID in evaluation_case_uids
             else None
         ),
         "case_53_pristine_held_out": False,
         "final_held_out_required": bool(
-            args.activation_aware_g1e
+            g1e_family
             and evaluation_role != "final_held_out"
         ),
         "adapter_state": str(state_path),
@@ -4745,6 +5454,33 @@ def run(args):
         "full_transaction_shadow_gradient_repair": bool(
             g1d_family
         ),
+        "exact_radius_geodesic_joint_active_set_sqp": bool(g1f),
+        "scope_null_space_projection": (
+            train_shadow_contract.get("scope_null_space_projection")
+            if g1f else None
+        ),
+        "geodesic_update_requires_post_normalization": (
+            train_shadow_contract.get(
+                "geodesic_update_requires_post_normalization"
+            )
+            if g1f else None
+        ),
+        "angular_line_search_radians": (
+            train_shadow_contract.get("angular_line_search_radians")
+            if g1f else None
+        ),
+        "joint_svd_relative_cutoff": (
+            train_shadow_contract.get("joint_svd_relative_cutoff")
+            if g1f else None
+        ),
+        "joint_direction_norm_floor": (
+            train_shadow_contract.get("joint_direction_norm_floor")
+            if g1f else None
+        ),
+        "joint_directional_margin": (
+            train_shadow_contract.get("joint_directional_margin")
+            if g1f else None
+        ),
         "full_shadow_hard_acceptance_smooth_gradient": bool(
             g1d_family
         ),
@@ -4769,7 +5505,7 @@ def run(args):
         "held_out_validation_parameter_selection": False,
         "held_out_validation_evaluation_passes": (
             int(evaluation_role == "final_held_out")
-            if args.activation_aware_g1e
+            if g1e_family
             else 1 if args.activation_aware_g1d else None
         ),
         "post_retraction_science_feasibility_restoration": bool(
@@ -4786,6 +5522,10 @@ def run(args):
         "hard_negative_training_allowed": False,
         "riemannian_correction_supported": riemannian_supported,
         "riemannian_supported_budgets": supported_budgets,
+        "geodesic_joint_sqp_supported": geodesic_joint_sqp_supported,
+        "geodesic_joint_sqp_supported_budgets": (
+            geodesic_supported_budgets
+        ),
         "fixed_guard_thresholds_changed": False,
         "physical_gate_changed": False,
         "fixed_support_gate_changed": False,
@@ -4808,7 +5548,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g1e_post_retraction_science_restoration_complete"
+            "v15_15g1f_exact_radius_geodesic_joint_sqp_complete"
+            if g1f
+            else "v15_15g1e_post_retraction_science_restoration_complete"
             if args.activation_aware_g1e
             else "v15_15g1d_full_transaction_shadow_gradient_complete"
             if args.activation_aware_g1d
@@ -4824,10 +5566,11 @@ def run(args):
         ),
         "report": str(report_path),
         "riemannian_correction_supported": riemannian_supported,
+        "geodesic_joint_sqp_supported": geodesic_joint_sqp_supported,
         "activation_aware_supported": activation_aware_supported,
         "numeric_audit_complete": report["numeric_audit_complete"],
     }), flush=True)
-    if args.activation_aware_g1e and evaluation_role == "train_calibration":
+    if g1e_family and evaluation_role == "train_calibration":
         train_intersection_complete = bool(
             feasible_intersection_summary
             and feasible_intersection_summary[
@@ -4858,6 +5601,7 @@ def main():
     parser.add_argument("--activation-aware-g1c", action="store_true")
     parser.add_argument("--activation-aware-g1d", action="store_true")
     parser.add_argument("--activation-aware-g1e", action="store_true")
+    parser.add_argument("--activation-aware-g1f", action="store_true")
     parser.add_argument(
         "--evaluation-role",
         choices=(
@@ -4941,6 +5685,20 @@ def main():
     parser.add_argument(
         "--science-restoration-safety-fraction", type=float, default=0.25
     )
+    parser.add_argument(
+        "--geodesic-angular-max-radians",
+        type=float,
+        default=math.pi / 4.0,
+    )
+    parser.add_argument(
+        "--joint-svd-relative-cutoff", type=float, default=1.0e-6
+    )
+    parser.add_argument(
+        "--joint-direction-norm-floor", type=float, default=1.0e-8
+    )
+    parser.add_argument(
+        "--joint-directional-margin", type=float, default=1.0e-6
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -4967,6 +5725,7 @@ def main():
         args.activation_aware_g1c,
         args.activation_aware_g1d,
         args.activation_aware_g1e,
+        args.activation_aware_g1f,
     ))) > 1:
         parser.error("choose one activation-aware protocol")
     if (
@@ -4975,9 +5734,10 @@ def main():
         or args.activation_aware_g1c
         or args.activation_aware_g1d
         or args.activation_aware_g1e
+        or args.activation_aware_g1f
     ) and not args.train_teacher_bank:
         parser.error(
-            "--activation-aware-g1/g1b/g1c/g1d/g1e requires "
+            "--activation-aware-g1/g1b/g1c/g1d/g1e/g1f requires "
             "--train-teacher-bank"
         )
     if args.severity_envelope_margin_fraction < 0.0:
@@ -5008,21 +5768,29 @@ def main():
         parser.error("full-shadow LSE temperature floor must be positive")
     if args.full_shadow_projection_damping < 0.0:
         parser.error("full-shadow projection damping must be non-negative")
-    if args.activation_aware_g1e and not (
+    if (args.activation_aware_g1e or args.activation_aware_g1f) and not (
         10 <= args.full_shadow_line_search_backtracks <= 12
     ):
-        parser.error("g1e line-search backtracks must be in [10, 12]")
+        parser.error("g1e/g1f line-search backtracks must be in [10, 12]")
     if not 0.0 < args.full_shadow_line_search_decay < 1.0:
         parser.error("full-shadow line-search decay must be in (0, 1)")
     if args.science_restoration_damping <= 0.0:
         parser.error("science restoration damping must be positive")
     if args.science_restoration_safety_fraction < 0.0:
         parser.error("science restoration safety fraction must be non-negative")
+    if not 0.0 < args.geodesic_angular_max_radians <= math.pi / 2.0:
+        parser.error("geodesic angular maximum must be in (0, pi/2]")
+    if args.joint_svd_relative_cutoff <= 0.0:
+        parser.error("joint SVD relative cutoff must be positive")
+    if args.joint_direction_norm_floor <= 0.0:
+        parser.error("joint direction norm floor must be positive")
+    if args.joint_directional_margin <= 0.0:
+        parser.error("joint directional margin must be positive")
     if (
-        not args.activation_aware_g1e
+        not (args.activation_aware_g1e or args.activation_aware_g1f)
         and args.evaluation_role != "development_validation"
     ):
-        parser.error("evaluation-role is reserved for V15.15g1e")
+        parser.error("evaluation-role is reserved for V15.15g1e/g1f")
     if not 0.0 < args.activation_relative_improvement < 1.0:
         parser.error(
             "--activation-relative-improvement must be in (0, 1)"
