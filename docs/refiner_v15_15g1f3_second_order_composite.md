@@ -61,6 +61,9 @@ filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback�
 的真实违规 Guard 会作为独立约束行加入同一展开点并重建二阶 QCQP。约束生成只在
 至少新增一个合同内 Guard 行时继续，因此由有限 Guard 集合确定性终止；它不扩大
 固定 band、不放宽曲率验证，也不消耗额外 correction step。
+物理 Guard 的二阶预测行直接取被编辑 case 的精确 signed margin，不再对同组中
+其余不变 case 做 logsumexp。完整 transaction 的 hard max 仍在每个真实 trial
+上重新计算并作为唯一权威验收边界，因此这种局部隔离不会放宽 Guard。
 V15.15h 运行时只有五个 observable proxy Guard 行，因此直接隔离并建模完整五行
 集合，等价地消除了该小型运行时约束集合中的漏行切换。
 

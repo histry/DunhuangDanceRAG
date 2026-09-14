@@ -107,6 +107,27 @@ def test_g1f3_constraint_generation_adds_only_new_trial_violations():
     ]
 
 
+def test_g1f3_second_order_physical_row_isolates_edited_case():
+    cross_short = g.m.REFINER_GROUP_LABELS.index("cross_short")
+    values = torch.tensor(
+        [5.0, -0.25, 7.0], dtype=torch.float64, requires_grad=True
+    )
+    selected = g._case_isolated_second_order_guard_value(
+        "cross_short.extremity_jerk_p95",
+        exact_value=values.max(),
+        case_terms={
+            "repair_extremity_jerk_mps3_p95_signed_margin": values,
+        },
+        batch={"group": torch.tensor([cross_short] * 3)},
+        local_case=1,
+    )
+
+    selected.backward()
+
+    assert float(selected.detach()) == -0.25
+    assert values.grad.tolist() == [0.0, 1.0, 0.0]
+
+
 def test_v15h_runtime_models_complete_five_row_proxy_universe():
     margins = {
         "joint_jerk_p95": -3.0,
@@ -148,6 +169,9 @@ def test_g1f3_freezes_row_wise_qcqp_contract_from_train():
     )
     assert frozen["second_order_active_set_constraint_generation"] == (
         "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild"
+    )
+    assert frozen["second_order_physical_guard_row_scope"] == (
+        "edited_case_exact_signed_margin_no_cross_case_softmax"
     )
 
 
@@ -193,7 +217,11 @@ def test_g1f3_server_runner_pins_strict_guard_band():
 
 def test_g1f3_and_composite_do_not_aggregate_guard_rows_with_logsumexp():
     training_source = inspect.getsource(g._g1d_shadow_objective)
+    isolated_source = inspect.getsource(
+        g._case_isolated_second_order_guard_value
+    )
     composite_source = inspect.getsource(composite._apply_one_transaction)
 
-    assert "_smooth_logsumexp" not in training_source
+    assert "_case_isolated_second_order_guard_value" in training_source
+    assert "_smooth_logsumexp" not in isolated_source
     assert "_smooth_logsumexp" not in composite_source

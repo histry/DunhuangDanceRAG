@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v4"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v4"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v5"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v5"
 _CACHE = {}
 
 
@@ -88,6 +88,9 @@ def _load_composite(model_path, contract_path, cfg):
         "second_order_active_set_constraint_generation_termination"
     ) == "strict_new_guard_row_from_finite_contract_universe",
              "V15.15h active-set generation termination changed")
+    _require(fixed.get("second_order_physical_guard_row_scope") ==
+             "edited_case_exact_signed_margin_no_cross_case_softmax",
+             "V15.15h physical Guard row scope changed")
     _require(fixed.get("runtime_proxy_guard_row_policy") ==
              "complete_five_row_observable_proxy_universe",
              "V15.15h runtime proxy Guard row policy changed")

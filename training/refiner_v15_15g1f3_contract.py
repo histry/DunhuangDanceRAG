@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v4"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v4"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v5"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v5"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -121,6 +121,9 @@ def _unchanged_contract(report):
         "second_order_active_set_constraint_generation_termination"
     ) == "strict_new_guard_row_from_finite_contract_universe",
              "second-order active-set generation termination changed")
+    _require(report.get("second_order_physical_guard_row_scope") ==
+             "edited_case_exact_signed_margin_no_cross_case_softmax",
+             "second-order physical Guard row scope changed")
     _require(report.get(
         "second_order_model_reused_across_frozen_angles"
     ) is True, "second-order curvature model is not reused")
@@ -425,6 +428,9 @@ def freeze_contract(args):
             ],
             "second_order_active_set_constraint_generation_termination": repair[
                 "second_order_active_set_constraint_generation_termination"
+            ],
+            "second_order_physical_guard_row_scope": repair[
+                "second_order_physical_guard_row_scope"
             ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":

@@ -128,10 +128,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v4"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v5"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v4"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v5"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -1147,6 +1147,10 @@ def _freeze_train_full_shadow_repair_contract(
             "strict_new_guard_row_from_finite_contract_universe"
             if second_order_joint_sqp else None
         ),
+        "second_order_physical_guard_row_scope": (
+            "edited_case_exact_signed_margin_no_cross_case_softmax"
+            if second_order_joint_sqp else None
+        ),
         "curvature_dtype": "float64" if second_order_joint_sqp else None,
         "curvature_path": (
             "exact_geodesic_product_retraction_fk_metric"
@@ -1381,6 +1385,36 @@ def _smooth_group_guard_value(
     return exact_value
 
 
+def _case_isolated_second_order_guard_value(
+    name,
+    *,
+    exact_value,
+    case_terms,
+    batch,
+    local_case,
+):
+    """Model the only physical Guard value that this local edit can change."""
+    label, suffix = name.split(".", 1)
+    group_index = m.REFINER_GROUP_LABELS.index(label)
+    if int(batch["group"][int(local_case)]) != group_index:
+        return exact_value
+    if suffix in FULL_GUARD_PHYSICAL_CASE_TERMS:
+        key = FULL_GUARD_PHYSICAL_CASE_TERMS[suffix]
+        return case_terms[key][int(local_case)]
+    if suffix == "fixed_support":
+        return m.torch.stack([
+            case_terms[FULL_GUARD_PHYSICAL_CASE_TERMS[part]][int(local_case)]
+            for part in (
+                "foot_skate_p95",
+                "foot_skate_max",
+                "support_drift_p95",
+                "support_drift_max",
+                "penetration",
+            )
+        ]).max()
+    return exact_value
+
+
 def _select_second_order_guard_rows(hard_margins, band):
     """Freeze every violated row plus safe rows at the strict hard frontier."""
     maximum = max(float(value) for value in hard_margins.values())
@@ -1526,13 +1560,22 @@ def _g1d_shadow_objective(
                 "lse_temperature_by_guard_term"
             ][name]
         )
-        value = _smooth_group_guard_value(
-            name,
-            exact_value=hard_values[name],
-            case_terms=case_terms,
-            batch=batch,
-            temperature=temperature,
-        )
+        if require_shadow_constraint:
+            value = _case_isolated_second_order_guard_value(
+                name,
+                exact_value=hard_values[name],
+                case_terms=case_terms,
+                batch=batch,
+                local_case=local_case,
+            )
+        else:
+            value = _smooth_group_guard_value(
+                name,
+                exact_value=hard_values[name],
+                case_terms=case_terms,
+                batch=batch,
+                temperature=temperature,
+            )
         smooth_shadows[name] = (
             value
             - float(limits[name]["absolute_limit"])
@@ -1568,6 +1611,10 @@ def _g1d_shadow_objective(
         "prediction_guard_transition_bundle": transition_bundle,
         "prediction_guard_transition_aggregation": (
             "independent_row_wise_qcqp" if transition_bundle else None
+        ),
+        "prediction_physical_guard_row_scope": (
+            "edited_case_exact_signed_margin_no_cross_case_softmax"
+            if require_shadow_constraint else None
         ),
         "prediction_guard_transition_band": (
             float(
@@ -8536,6 +8583,10 @@ def run(args):
             train_shadow_contract.get(
                 "second_order_active_set_constraint_generation_termination"
             ) if g1f3 else None
+        ),
+        "second_order_physical_guard_row_scope": (
+            train_shadow_contract.get("second_order_physical_guard_row_scope")
+            if g1f3 else None
         ),
         "second_order_model_reused_across_frozen_angles": (
             train_shadow_contract.get(
