@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v3"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v3"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v4"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v4"
 _CACHE = {}
 
 
@@ -81,6 +81,16 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_guard_transition_threshold") ==
              "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band",
              "V15.15h Guard transition threshold changed")
+    _require(fixed.get("second_order_active_set_constraint_generation") ==
+             "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild",
+             "V15.15h active-set constraint generation changed")
+    _require(fixed.get(
+        "second_order_active_set_constraint_generation_termination"
+    ) == "strict_new_guard_row_from_finite_contract_universe",
+             "V15.15h active-set generation termination changed")
+    _require(fixed.get("runtime_proxy_guard_row_policy") ==
+             "complete_five_row_observable_proxy_universe",
+             "V15.15h runtime proxy Guard row policy changed")
     _require(fixed.get("second_order_grid_execution_device") ==
              "same_cuda_device_as_motion",
              "V15.15h candidate grid is not device-resident")
@@ -287,6 +297,10 @@ def _science_terms(candidate, baseline, seam, cfg):
     }
 
 
+def _runtime_proxy_guard_rows(guard_margins):
+    return tuple(sorted(guard_margins))
+
+
 def _project_and_guard(candidate, snapshot, cfg, audit_fn, limits, policy):
     projected, projector = m.enforce_edge151_contract_np(
         np.asarray(candidate, dtype=np.float32),
@@ -446,10 +460,6 @@ def _apply_one_transaction(
         feasibility_tolerance = float(
             fixed["second_order_feasibility_tolerance"]
         )
-        guard_transition_band = float(
-            fixed["second_order_guard_transition_band"]
-        )
-
         for budget in (2, 3, 5):
             report["budgets_attempted"].append(budget)
             budget_current = current.clone()
@@ -467,9 +477,7 @@ def _apply_one_transaction(
                     for name, value in expansion_terms["guard_terms"].items()
                 }
                 maximum_guard = max(guard_float.values())
-                active_names = tuple(g1f._select_second_order_guard_rows(
-                    guard_float, guard_transition_band
-                ))
+                active_names = _runtime_proxy_guard_rows(guard_float)
                 scalar_terms = {
                     **{
                         g1f._guard_constraint_name(name):

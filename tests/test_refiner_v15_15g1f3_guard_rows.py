@@ -75,6 +75,52 @@ def test_g1f3_filter_rejects_full_shadow_worsening_despite_row_progress():
     )
 
 
+def test_g1f3_constraint_generation_adds_only_new_trial_violations():
+    rows = [
+        {
+            "authoritative_trial_executed": False,
+            "authoritative_trial_active_terms": ["guard.not_executed"],
+        },
+        {
+            "authoritative_trial_executed": True,
+            "authoritative_trial_active_terms": [
+                "cross_short.observable_temporal_0p03",
+                "cross_short.extremity_jerk_p95",
+            ],
+        },
+        {
+            "authoritative_trial_executed": True,
+            "authoritative_trial_active_terms": [
+                "cross_short.joint_jerk_p95",
+                "cross_short.extremity_jerk_p95",
+            ],
+        },
+    ]
+
+    added = g._newly_violated_guard_terms(
+        rows, ("cross_short.observable_temporal_0p03",)
+    )
+
+    assert added == [
+        "cross_short.extremity_jerk_p95",
+        "cross_short.joint_jerk_p95",
+    ]
+
+
+def test_v15h_runtime_models_complete_five_row_proxy_universe():
+    margins = {
+        "joint_jerk_p95": -3.0,
+        "joint_jerk_window_p95": -2.0,
+        "extremity_jerk_p95": -1.0,
+        "extremity_jerk_window_p95": 0.0,
+        "boundary": 1.0,
+    }
+
+    assert composite._runtime_proxy_guard_rows(margins) == tuple(
+        sorted(margins)
+    )
+
+
 def test_g1f3_freezes_row_wise_qcqp_contract_from_train():
     frozen = g._freeze_train_full_shadow_repair_contract(
         {
@@ -99,6 +145,9 @@ def test_g1f3_freezes_row_wise_qcqp_contract_from_train():
     )
     assert frozen["second_order_guard_transition_threshold"] == (
         "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band"
+    )
+    assert frozen["second_order_active_set_constraint_generation"] == (
+        "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild"
     )
 
 

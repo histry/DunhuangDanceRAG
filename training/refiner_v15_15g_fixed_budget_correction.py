@@ -128,10 +128,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v3"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v4"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v3"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v4"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -1139,6 +1139,14 @@ def _freeze_train_full_shadow_repair_contract(
             "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band"
             if second_order_joint_sqp else None
         ),
+        "second_order_active_set_constraint_generation": (
+            "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_active_set_constraint_generation_termination": (
+            "strict_new_guard_row_from_finite_contract_universe"
+            if second_order_joint_sqp else None
+        ),
         "curvature_dtype": "float64" if second_order_joint_sqp else None,
         "curvature_path": (
             "exact_geodesic_product_retraction_fk_metric"
@@ -1422,6 +1430,17 @@ def _authoritative_full_shadow_strictly_decreased(
     return bool(
         float(trial_shadow) < float(current_shadow) - float(tolerance)
     )
+
+
+def _newly_violated_guard_terms(trial_rows, frozen_active_names):
+    frozen = set(frozen_active_names)
+    return sorted({
+        name
+        for row in trial_rows
+        if row.get("authoritative_trial_executed")
+        for name in row.get("authoritative_trial_active_terms") or []
+        if name not in frozen
+    })
 
 
 def _g1d_shadow_objective(
@@ -4396,6 +4415,129 @@ def _second_order_angular_iteration(
             break
 
     accepted = accepted_theta > 0.0
+    newly_violated_guard_terms = _newly_violated_guard_terms(
+        trial_rows, frozen_active_names
+    )
+    if (
+        not accepted
+        and newly_violated_guard_terms
+        and not numeric_failure
+    ):
+        expanded_active_names = tuple(dict.fromkeys((
+            *frozen_active_names,
+            *newly_violated_guard_terms,
+        )))
+        variable = m.torch.zeros_like(current).requires_grad_(True)
+        local_total = (
+            current.detach()
+            + variable.masked_fill(~mask, 0.0) * taper
+        )
+        transaction_tangent = _case_isolated_transaction_tangent(
+            baseline, local_total, local_case
+        )
+        candidate = product_exp_torch(baseline, transaction_tangent)
+        _, _, expanded_constraints, science_tensors, guard_rows = (
+            _g1d_shadow_objective(
+                model=model,
+                batch=batch,
+                cfg=cfg,
+                baseline=baseline,
+                identity=identity,
+                candidate=candidate,
+                contract=contract,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                local_tangent=local_total,
+                local_mask=mask,
+                train_repair_contract=train_repair_contract,
+                temporal_smoothness_weight=0.0,
+                prediction_active_names=expanded_active_names,
+                require_shadow_constraint=True,
+            )
+        )
+        guard_items = list(guard_rows.items())
+        gradient_terms = [
+            guard_items[0],
+            ("endpoint", science_tensors["endpoint"]),
+            ("temporal", science_tensors["temporal"]),
+            *guard_items[1:],
+        ]
+        expanded_gradients = {
+            name: _autograd_gradient_or_zero(
+                value,
+                variable,
+                retain_graph=index < len(gradient_terms) - 1,
+            )
+            for index, (name, value) in enumerate(gradient_terms)
+        }
+        enriched_tangent, enriched_report, enriched_numeric_failure = (
+            _second_order_angular_iteration(
+                model=model,
+                current=current,
+                mask=mask,
+                taper=taper,
+                gradients=expanded_gradients,
+                constraints=expanded_constraints,
+                angular_scales=angular_scales,
+                norm_floor=norm_floor,
+                baseline=baseline,
+                identity=identity,
+                batch=batch,
+                cfg=cfg,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                contract=contract,
+                train_repair_contract=train_repair_contract,
+                target_rms=target_rms,
+                iteration=iteration,
+                remaining_steps=remaining_steps,
+                case_uid=case_uid,
+            )
+        )
+        enrichment_round = {
+            "source_active_guard_terms": list(frozen_active_names),
+            "newly_violated_guard_terms": newly_violated_guard_terms,
+            "expanded_active_guard_terms": list(expanded_active_names),
+            "triggering_trial_count": sum(
+                bool(
+                    set(
+                        row.get("authoritative_trial_active_terms") or []
+                    )
+                    & set(newly_violated_guard_terms)
+                )
+                for row in trial_rows
+                if row.get("authoritative_trial_executed")
+            ),
+            "triggering_authoritative_trials": [
+                {
+                    "theta_radians": row.get("theta_radians"),
+                    "trial_full_shadow": row.get("trial_full_shadow"),
+                    "authoritative_trial_active_terms": row.get(
+                        "authoritative_trial_active_terms"
+                    ),
+                    "failed_constraints": row.get("failed_constraints"),
+                }
+                for row in trial_rows
+                if row.get("authoritative_trial_executed")
+                and set(row.get("authoritative_trial_active_terms") or [])
+                & set(newly_violated_guard_terms)
+            ],
+            "source_trial_rejection_reason": (
+                "active_set_transition_model_mismatch"
+            ),
+        }
+        enriched_report["active_set_constraint_generation"] = [
+            enrichment_round,
+            *enriched_report.get("active_set_constraint_generation", []),
+        ]
+        enriched_report["active_set_constraint_generation_round_count"] = (
+            len(enriched_report["active_set_constraint_generation"])
+        )
+        return (
+            enriched_tangent,
+            enriched_report,
+            bool(numeric_failure or enriched_numeric_failure),
+        )
     accepted_authoritative_closure = bool(
         accepted
         and any(
@@ -4468,6 +4610,9 @@ def _second_order_angular_iteration(
         ),
         "second_order_hessian_used": True,
         "second_order_trial_succeeded": accepted,
+        "newly_violated_guard_terms": newly_violated_guard_terms,
+        "active_set_constraint_generation": [],
+        "active_set_constraint_generation_round_count": 0,
         "authoritative_step_closure_succeeded": (
             accepted_authoritative_closure
         ),
@@ -8380,6 +8525,16 @@ def run(args):
         "second_order_guard_transition_threshold": (
             train_shadow_contract.get(
                 "second_order_guard_transition_threshold"
+            ) if g1f3 else None
+        ),
+        "second_order_active_set_constraint_generation": (
+            train_shadow_contract.get(
+                "second_order_active_set_constraint_generation"
+            ) if g1f3 else None
+        ),
+        "second_order_active_set_constraint_generation_termination": (
+            train_shadow_contract.get(
+                "second_order_active_set_constraint_generation_termination"
             ) if g1f3 else None
         ),
         "second_order_model_reused_across_frozen_angles": (

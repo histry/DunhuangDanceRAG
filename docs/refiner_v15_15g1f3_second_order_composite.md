@@ -57,6 +57,13 @@ filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback�
 剩余闭包配额，filter 步也必须让完整 hard max 严格下降；未建模 Guard 的切换
 不能以单行进展名义被接受，也不把真实 Guard 替换成平滑代理。
 
+若权威 trial 把当前 bundle 外的 Guard 推成正裕量，该 trial 保持拒绝，但新出现
+的真实违规 Guard 会作为独立约束行加入同一展开点并重建二阶 QCQP。约束生成只在
+至少新增一个合同内 Guard 行时继续，因此由有限 Guard 集合确定性终止；它不扩大
+固定 band、不放宽曲率验证，也不消耗额外 correction step。
+V15.15h 运行时只有五个 observable proxy Guard 行，因此直接隔离并建模完整五行
+集合，等价地消除了该小型运行时约束集合中的漏行切换。
+
 若保守 wake gate 使 Adapter 候选方向严格为零，二阶模块可使用同一冻结
 Adapter 解码器的门控前方向建立 `1e-4` 球面起点。这个方向仍只由运行时
 observable 产生，不读取 teacher、split、single/cross 标签或案例 UID；门控

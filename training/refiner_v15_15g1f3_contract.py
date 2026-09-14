@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v3"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v3"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v4"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v4"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -114,6 +114,13 @@ def _unchanged_contract(report):
     _require(report.get("second_order_guard_transition_threshold") ==
              "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band",
              "second-order Guard transition threshold changed")
+    _require(report.get("second_order_active_set_constraint_generation") ==
+             "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild",
+             "second-order active-set constraint generation changed")
+    _require(report.get(
+        "second_order_active_set_constraint_generation_termination"
+    ) == "strict_new_guard_row_from_finite_contract_universe",
+             "second-order active-set generation termination changed")
     _require(report.get(
         "second_order_model_reused_across_frozen_angles"
     ) is True, "second-order curvature model is not reused")
@@ -412,6 +419,12 @@ def freeze_contract(args):
             ],
             "second_order_guard_transition_threshold": repair[
                 "second_order_guard_transition_threshold"
+            ],
+            "second_order_active_set_constraint_generation": repair[
+                "second_order_active_set_constraint_generation"
+            ],
+            "second_order_active_set_constraint_generation_termination": repair[
+                "second_order_active_set_constraint_generation_termination"
             ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":
