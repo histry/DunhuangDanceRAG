@@ -8,8 +8,8 @@ metric graph.
 
 The Hessian is never materialised in the ambient motion coordinates.  A
 deterministic basis is formed from projected first derivatives and
-directional Hessian-vector products are polarised into a matrix of dimension at
-most three.  Because every directional derivative is taken with respect to the
+directional Hessian-vector products are polarised into a small matrix of
+train-frozen dimension.  Because every directional derivative is taken with respect to the
 geodesic angle itself, the second derivative includes the sphere-geodesic
 acceleration term; it is not merely ``q.T @ H @ q`` in a flat coordinate.
 """
@@ -989,7 +989,7 @@ def _continuous_joint_sqp_refinement(
 ):
     """Refine the best coarse seeds on the coefficient unit sphere.
 
-    The three low-dimensional quadratic constraints are differentiated
+    The low-dimensional quadratic constraints are differentiated
     analytically.  A deterministic Riemannian active-constraint iteration and
     fixed angular line search minimize their worst normalized residual.  This
     closes narrow feasible cones that a Cartesian direction grid can miss,

@@ -17,8 +17,8 @@ from training import motion_models as m
 
 MODEL_NAME = "v15_15h_adapter_second_order_composite.pt"
 CONTRACT_NAME = "v15_15h_adapter_second_order_composite.contract.json"
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v6"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v6"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v7"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v7"
 
 
 def _sha256(path):
@@ -60,7 +60,7 @@ def run(args):
     frozen = _read_json(args.g1f3_frozen_contract)
     held_out = _read_json(args.held_out_acceptance)
     one_shot = _read_json(args.held_out_one_shot_receipt)
-    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v6",
+    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v7",
              "g1f3 frozen contract schema mismatch")
     _require(frozen.get("immutable") is True, "g1f3 contract is not immutable")
     _require(frozen.get("implementation_commit") == args.implementation_commit,
@@ -94,6 +94,14 @@ def run(args):
              "frozen radius changed")
     _require(fixed.get("curvature_dtype") == "float64",
              "frozen curvature dtype changed")
+    _require(int(fixed.get("second_order_basis_dimension", 0)) == 5,
+             "frozen second-order basis dimension changed")
+    _require(fixed.get("second_order_basis_allocation") ==
+             "three_highest_margin_independent_guard_rows_plus_reserved_"
+             "endpoint_temporal",
+             "frozen second-order basis allocation changed")
+    _require(int(fixed.get("second_order_guard_basis_capacity", 0)) == 3,
+             "frozen Guard basis capacity changed")
 
     base_payload = m.torch.load(
         args.base_refiner_checkpoint, map_location="cpu", weights_only=False
@@ -281,6 +289,12 @@ def run(args):
             "curvature_evaluations": True,
             "second_order_basis_dimension": int(
                 fixed["second_order_basis_dimension"]
+            ),
+            "second_order_basis_allocation": fixed[
+                "second_order_basis_allocation"
+            ],
+            "second_order_guard_basis_capacity": int(
+                fixed["second_order_guard_basis_capacity"]
             ),
             "second_order_grid_levels": int(
                 fixed["second_order_grid_levels"]

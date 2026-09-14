@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v6"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v6"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v7"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v7"
 _CACHE = {}
 
 
@@ -120,6 +120,14 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_joint_subproblem_solver") ==
              "deterministic_device_resident_riemannian_continuous_sqp",
              "V15.15h continuous joint SQP is absent")
+    _require(int(fixed.get("second_order_basis_dimension", 0)) == 5,
+             "V15.15h second-order basis dimension changed")
+    _require(fixed.get("second_order_basis_allocation") ==
+             "three_highest_margin_independent_guard_rows_plus_reserved_"
+             "endpoint_temporal",
+             "V15.15h second-order basis allocation changed")
+    _require(int(fixed.get("second_order_guard_basis_capacity", 0)) == 3,
+             "V15.15h Guard basis capacity changed")
     _require(fixed.get("second_order_sqp_refinement_starts") ==
              second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
              "V15.15h SQP start count changed")
@@ -136,7 +144,7 @@ def _load_composite(model_path, contract_path, cfg):
              "remaining_joint_closure_gap_divided_by_remaining_steps",
              "V15.15h second-order budget is not multi-step")
     _require(fixed.get("second_order_intermediate_acceptance") ==
-             "authoritative_remaining_gap_share_or_joint_gap_filter_progress",
+             "authoritative_full_closure_or_remaining_gap_share",
              "V15.15h intermediate acceptance changed")
     _require(fixed.get("second_order_infeasible_joint_policy") ==
              "deterministic_full_remaining_gap_minimum_normalized_"
@@ -146,7 +154,7 @@ def _load_composite(model_path, contract_path, cfg):
              "complete_remaining_closure_gap",
              "V15.15h restoration is not terminal-gap directed")
     _require(fixed.get("second_order_restoration_acceptance") ==
-             "authoritative_safe_boundary_and_positive_gap_merit_decrease",
+             "authoritative_full_closure_or_remaining_gap_share",
              "V15.15h restoration acceptance changed")
     _require(fixed.get(
         "second_order_restoration_final_step_allowed"
@@ -554,14 +562,17 @@ def _apply_one_transaction(
                 }
                 gradients = {}
                 guard_constraint_names = tuple(witness_rows)
+                basis_guard_names = guard_constraint_names[
+                    :max(0, basis_dimension - 2)
+                ]
                 gradient_names = (
                     (
-                        guard_constraint_names[0],
+                        basis_guard_names[0],
                         "endpoint",
                         "temporal",
-                        *guard_constraint_names[1:],
+                        *basis_guard_names[1:],
                     )
-                    if guard_constraint_names
+                    if basis_guard_names
                     else ("endpoint", "temporal")
                 )
                 for index, name in enumerate(gradient_names):
@@ -897,18 +908,13 @@ def _apply_one_transaction(
                     )
                     actual_progress = bool(
                         full_closed
-                        or (
-                            remaining_steps > 1
-                            and (quota_progress or filter_progress)
-                        )
+                        or (remaining_steps > 1 and quota_progress)
                     )
                     progress_mode = (
                         "authoritative_full_closure"
                         if full_closed
                         else "remaining_gap_share"
                         if quota_progress
-                        else "authoritative_joint_gap_filter"
-                        if filter_progress
                         else None
                     )
                     attempt.update({

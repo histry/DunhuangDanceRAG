@@ -130,10 +130,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v6"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v7"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v6"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v7"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -953,7 +953,7 @@ def _freeze_train_full_shadow_repair_contract(
     temporal_fd_float64_epsilon_ladder=(1.0e-5, 3.0e-5, 1.0e-4, 3.0e-4),
     temporal_fd_near_zero_threshold=1.0e-5,
     second_order_joint_sqp=False,
-    second_order_basis_dimension=3,
+    second_order_basis_dimension=5,
     second_order_grid_levels=9,
     second_order_feasibility_tolerance=1.0e-12,
     second_order_guard_transition_band=1.0e-5,
@@ -1118,6 +1118,15 @@ def _freeze_train_full_shadow_repair_contract(
         "second_order_basis_dimension": (
             int(second_order_basis_dimension) if second_order_joint_sqp else None
         ),
+        "second_order_basis_allocation": (
+            "three_highest_margin_independent_guard_rows_plus_reserved_"
+            "endpoint_temporal"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_guard_basis_capacity": (
+            max(0, int(second_order_basis_dimension) - 2)
+            if second_order_joint_sqp else None
+        ),
         "second_order_grid_levels": (
             int(second_order_grid_levels) if second_order_joint_sqp else None
         ),
@@ -1229,7 +1238,7 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_intermediate_acceptance": (
-            "authoritative_remaining_gap_share_or_joint_gap_filter_progress"
+            "authoritative_full_closure_or_remaining_gap_share"
             if second_order_joint_sqp else None
         ),
         "second_order_infeasible_joint_policy": (
@@ -1242,7 +1251,7 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_restoration_acceptance": (
-            "authoritative_safe_boundary_and_positive_gap_merit_decrease"
+            "authoritative_full_closure_or_remaining_gap_share"
             if second_order_joint_sqp else None
         ),
         "second_order_restoration_final_step_allowed": (
@@ -4167,13 +4176,35 @@ def _second_order_angular_iteration(
     accepted_theta = 0.0
     accepted_solver = None
 
+    guard_basis_capacity = int(
+        train_repair_contract["second_order_guard_basis_capacity"]
+    )
+    basis_guard_names = sorted(
+        guard_constraint_names,
+        key=lambda name: (-current_guard_row_margin[name], name),
+    )[:guard_basis_capacity]
+    basis_gradient_names = (
+        (
+            basis_guard_names[0],
+            "endpoint",
+            "temporal",
+            *basis_guard_names[1:],
+        )
+        if basis_guard_names
+        else ("endpoint", "temporal")
+    )
+    basis_gradients = {
+        name: gradients[name]
+        for name in basis_gradient_names
+    }
+
     try:
         prepared_model, model_preparation_audit = (
             second_order.prepare_second_order_subproblem(
                 current=current,
                 mask=mask,
                 taper=taper,
-                gradients=gradients,
+                gradients=basis_gradients,
                 metric_builder=metric_builder,
                 metric_names=tuple(gradients),
                 basis_dimension=int(
@@ -4591,17 +4622,13 @@ def _second_order_angular_iteration(
             )
         else:
             accepted_progress = bool(
-                authoritative_step_closure
-                or quota_progress
-                or authoritative_filter_progress
+                authoritative_step_closure or quota_progress
             )
             accepted_progress_mode = (
                 "authoritative_full_closure"
                 if authoritative_step_closure
                 else "remaining_gap_share"
                 if quota_progress
-                else "authoritative_joint_gap_filter"
-                if authoritative_filter_progress
                 else None
             )
         failed_constraints = []
@@ -4610,7 +4637,7 @@ def _second_order_angular_iteration(
                 failed_constraints.append("hard_full_transaction_shadow")
             if not science_quota_ok:
                 failed_constraints.append("endpoint_temporal_step_progress")
-            failed_constraints.append("authoritative_joint_gap_filter")
+            failed_constraints.append("authoritative_remaining_gap_share")
         if not radius_ok:
             failed_constraints.append("exact_radius")
         if not scope_ok:
@@ -8818,6 +8845,18 @@ def run(args):
         ),
         "second_order_hessian_used": bool(g1f3),
         "second_order_joint_sqp": bool(g1f3),
+        "second_order_basis_dimension": (
+            train_shadow_contract.get("second_order_basis_dimension")
+            if g1f3 else None
+        ),
+        "second_order_basis_allocation": (
+            train_shadow_contract.get("second_order_basis_allocation")
+            if g1f3 else None
+        ),
+        "second_order_guard_basis_capacity": (
+            train_shadow_contract.get("second_order_guard_basis_capacity")
+            if g1f3 else None
+        ),
         "curvature_dtype": (
             train_shadow_contract.get("curvature_dtype") if g1f3 else None
         ),
@@ -9316,7 +9355,7 @@ def main():
         "--temporal-fd-near-zero-threshold", type=float, default=1.0e-5
     )
     parser.add_argument(
-        "--second-order-basis-dimension", type=int, default=3
+        "--second-order-basis-dimension", type=int, default=5
     )
     parser.add_argument(
         "--second-order-grid-levels", type=int, default=9
@@ -9434,8 +9473,8 @@ def main():
         parser.error("temporal FD absolute floor must be positive")
     if args.temporal_fd_near_zero_threshold <= 0.0:
         parser.error("temporal FD near-zero threshold must be positive")
-    if not 1 <= args.second_order_basis_dimension <= 3:
-        parser.error("second-order basis dimension must be in [1, 3]")
+    if not 3 <= args.second_order_basis_dimension <= 5:
+        parser.error("second-order basis dimension must be in [3, 5]")
     if (
         args.second_order_grid_levels < 3
         or args.second_order_grid_levels % 2 == 0

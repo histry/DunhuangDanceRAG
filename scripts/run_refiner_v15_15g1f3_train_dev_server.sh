@@ -84,7 +84,7 @@ COMMON_ARGS=(
   --temporal-fd-relative-error-tolerance 0.1
   --temporal-fd-absolute-floor 1e-8
   --temporal-fd-near-zero-threshold 1e-5
-  --second-order-basis-dimension 3
+  --second-order-basis-dimension 5
   --second-order-grid-levels 9
   --second-order-feasibility-tolerance 1e-12
   --second-order-guard-transition-band 1e-5

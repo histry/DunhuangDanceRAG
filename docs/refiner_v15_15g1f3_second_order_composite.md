@@ -13,8 +13,10 @@ ownership 半径、EDGE151 Projector、完整 Guard 和 `0.03` 修复门槛。
 新增数值核位于 `training/refiner_v15_15g1f3_second_order.py`。它对标量
 测地线角度沿 `geodesic -> product retraction -> FK -> metric` 的真实路径
 做 float64 一、二阶求导，因此二阶项包含球面测地线加速度。低维基由
-ownership 球面切空间中的 shadow、endpoint、temporal 物理协向量构造；
-只通过方向 HvP 和 polarization 形成最多 `3 x 3` 的模型，不形成环境维度
+ownership 球面切空间中的 Guard witness、endpoint、temporal 物理协向量构造。
+冻结的 5 维基为 endpoint/temporal 各保留一维，并按当前 signed margin 选择
+最多三个线性独立 Guard witness 方向；全部 witness 仍作为独立约束行参与求解。
+只通过方向 HvP 和 polarization 形成最多 `5 x 5` 的模型，不形成环境维度
 Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 trial 会重算硬
 指标和完整 Guard。
 
@@ -28,11 +30,12 @@ frame/joint argmax；线性 `p95` 固定排序位置两侧的原始 frame/joint 
 
 曲率模型与角度无关，因此每个冻结 witness bundle 的约束生成轮只构建一次，
 并由全部 12 个冻结角度复用；发现新 witness 后才在同一展开点进入下一生成轮。
-仅当网格没有共同可行点时，每个角度才以全部网格方向（至多 768 个）
-为起点，在低维单位球面上执行固定 64 次连续 Riemannian 联合 SQP 精化；约束
+仅当网格没有共同可行点时，每个角度才从完整 device-resident 网格中确定性选择
+至多 768 个最优方向为起点，在低维单位球面上执行固定 64 次连续 Riemannian
+联合 SQP 精化；约束
 值、解析梯度、固定角度线搜索及最终
 词典序选择都在 motion 所在 CUDA device 上完成。网格不再作为“无共同可行
-方向”的最终判据。三个约束按各自有符号安全边界 gap 归一化，不能再用指标
+方向”的最终判据。全部独立约束按各自有符号安全边界 gap 归一化，不能再用指标
 动态范围掩盖正的 Guard 违反。Projector 与完整 Guard 继续走原有权威实现。
 
 endpoint/temporal 的有符号有限 gap 按
@@ -45,12 +48,12 @@ Guard shadow 到安全闭包边界的剩余有符号 gap 除以剩余步数。�
 完成这一步三项联合进度；最后一步必须进入 endpoint/temporal 严格通过域且
 Guard shadow 不大于零。若提前达到真实 raw 闭包则停止该预算，随后仍须经过
 复合 selector、Projector 和完整 transaction Guard 才能称为稳定通过。
-若某一中间步的三项等分配额在冻结二阶模型中不可行，求解器显式进入
-restoration/filter 子问题，并从第一步起按完整剩余闭包 gap 重新执行连续
+若某一中间步的联合等分配额在冻结二阶模型中不可行，求解器显式进入
+restoration 子问题，并从第一步起按完整剩余闭包 gap 重新执行连续
 SQP，选择面向最终闭包的最小联合归一化残差方向，而不是继续围绕本步等分
-配额排序。真实 trial 只有在
-不越过已经安全的边界且正的联合闭包缺口严格下降时才可继续；最后一步不接受
-filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback。
+配额排序。restoration 只负责提出候选，真实 trial 仍必须完成当前剩余步数的
+权威闭包份额才能消耗一个 correction step；单纯 merit/filter 下降不再消耗
+2/3/5 步预算。最后一步只接受完整闭包，也不存在隐式一阶或白名单 fallback。
 
 每个二阶扩展点把全部 `hard_margin > 0` 的待闭包 Guard 行与满足
 `hard_margin >= max(0, M) - 1e-5` 的严格前沿行合并为 transition bundle，
@@ -58,8 +61,8 @@ filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback�
 本次曲率构建和 12 级角搜索中冻结；每个 Guard 项作为独立 QCQP 约束行求取一阶
 导数和 float64 二阶曲率，禁止在 Guard 行之间使用 logsumexp 聚合。真实 trial
 仍重新计算全部 hard Guard 和活跃集。所有中间步还必须满足完整 hard max 的
-剩余闭包配额，filter 步也必须让完整 hard max 严格下降；未建模 Guard 的切换
-不能以单行进展名义被接受，也不把真实 Guard 替换成平滑代理。
+剩余闭包配额；未达到该配额的 trial 即使让完整 hard max 严格下降也保持拒绝。
+未建模 Guard 的切换不能以单行进展名义被接受，也不把真实 Guard 替换成平滑代理。
 
 若权威 trial 把当前 bundle 外的 Guard 推成正裕量，或在某个已建模 Guard 内暴露
 新的 frame/joint/quantile-pair/window witness，该 trial 保持拒绝。新 Guard 或新

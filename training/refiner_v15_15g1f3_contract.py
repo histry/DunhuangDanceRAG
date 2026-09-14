@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v6"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v6"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v7"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v7"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -153,6 +153,14 @@ def _unchanged_contract(report):
     _require(report.get("second_order_joint_subproblem_solver") ==
              "deterministic_device_resident_riemannian_continuous_sqp",
              "second-order continuous joint SQP is absent")
+    _require(int(report.get("second_order_basis_dimension", 0)) == 5,
+             "second-order basis dimension changed")
+    _require(report.get("second_order_basis_allocation") ==
+             "three_highest_margin_independent_guard_rows_plus_reserved_"
+             "endpoint_temporal",
+             "second-order basis allocation changed")
+    _require(int(report.get("second_order_guard_basis_capacity", 0)) == 3,
+             "second-order Guard basis capacity changed")
     _require(report.get("second_order_sqp_refinement_starts") ==
              second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
              "second-order SQP start count changed")
@@ -169,7 +177,7 @@ def _unchanged_contract(report):
              "remaining_joint_closure_gap_divided_by_remaining_steps",
              "second-order budget is not genuinely multi-step")
     _require(report.get("second_order_intermediate_acceptance") ==
-             "authoritative_remaining_gap_share_or_joint_gap_filter_progress",
+             "authoritative_full_closure_or_remaining_gap_share",
              "second-order intermediate acceptance changed")
     _require(report.get("second_order_infeasible_joint_policy") ==
              "deterministic_full_remaining_gap_minimum_normalized_"
@@ -179,7 +187,7 @@ def _unchanged_contract(report):
              "complete_remaining_closure_gap",
              "second-order restoration is not terminal-gap directed")
     _require(report.get("second_order_restoration_acceptance") ==
-             "authoritative_safe_boundary_and_positive_gap_merit_decrease",
+             "authoritative_full_closure_or_remaining_gap_share",
              "second-order restoration acceptance changed")
     _require(report.get(
         "second_order_restoration_final_step_allowed"
@@ -531,6 +539,12 @@ def freeze_contract(args):
             "curvature_evaluations": True,
             "second_order_basis_dimension": int(
                 repair["second_order_basis_dimension"]
+            ),
+            "second_order_basis_allocation": repair[
+                "second_order_basis_allocation"
+            ],
+            "second_order_guard_basis_capacity": int(
+                repair["second_order_guard_basis_capacity"]
             ),
             "second_order_grid_levels": int(
                 repair["second_order_grid_levels"]
