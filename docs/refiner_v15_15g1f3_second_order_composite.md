@@ -42,9 +42,17 @@ Guard shadow 到安全闭包边界的剩余有符号 gap 除以剩余步数。�
 Guard shadow 不大于零。若提前达到真实 raw 闭包则停止该预算，随后仍须经过
 复合 selector、Projector 和完整 transaction Guard 才能称为稳定通过。
 若某一中间步的三项等分配额在冻结二阶模型中不可行，求解器显式进入
-restoration/filter 子问题，选择最小联合归一化残差方向。真实 trial 只有在
+restoration/filter 子问题，并从第一步起按完整剩余闭包 gap 重新执行连续
+SQP，选择面向最终闭包的最小联合归一化残差方向，而不是继续围绕本步等分
+配额排序。真实 trial 只有在
 不越过已经安全的边界且正的联合闭包缺口严格下降时才可继续；最后一步不接受
 filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback。
+
+若保守 wake gate 使 Adapter 候选方向严格为零，二阶模块可使用同一冻结
+Adapter 解码器的门控前方向建立 `1e-4` 球面起点。这个方向仍只由运行时
+observable 产生，不读取 teacher、split、single/cross 标签或案例 UID；门控
+后的 Adapter 候选身份不变，也不能因此跳过 Projector 或完整 Guard。门控前
+方向仍为零时继续 `zero_gradient_abstention`，不制造教师。
 
 train 校准行使用包络中已经冻结的 leave-one-transaction-out observable
 分数；禁止再用包含该行的最终模型给该行做 in-sample 判定。此规则不读取

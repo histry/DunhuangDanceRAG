@@ -1178,7 +1178,12 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_infeasible_joint_policy": (
-            "deterministic_minimum_normalized_residual_restoration"
+            "deterministic_full_remaining_gap_minimum_normalized_"
+            "residual_restoration"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_restoration_target": (
+            "complete_remaining_closure_gap"
             if second_order_joint_sqp else None
         ),
         "second_order_restoration_acceptance": (
@@ -1186,6 +1191,13 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_restoration_final_step_allowed": (
+            False if second_order_joint_sqp else None
+        ),
+        "second_order_zero_start_seed_policy": (
+            "observable_ungated_frozen_adapter_decoder_direction"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_zero_start_seed_teacher_or_label_consumed": (
             False if second_order_joint_sqp else None
         ),
         "second_order_sqp_line_search_radians": (
@@ -3850,6 +3862,7 @@ def _second_order_angular_iteration(
                             ]
                         ),
                         permit_restoration_candidate=True,
+                        restoration_required_reduction=current_signed_gap,
                     )
                 )
                 if direction is not None:
@@ -6842,6 +6855,43 @@ def run(args):
             float(args.target_rms),
             eps=1.0e-8,
         )
+    correction_initial = initial.detach().clone()
+    zero_start_seed_diagnostics = {}
+    if g1f3:
+        ungated = trace["decoder_consistent_ungated_tangent"].masked_fill(
+            ~ownership.expand_as(
+                trace["decoder_consistent_ungated_tangent"]
+            ),
+            0.0,
+        )
+        ungated_normalized, ungated_radius = _normalize_all_sample_tangents(
+            ungated,
+            ownership,
+            samples,
+            float(args.target_rms),
+        )
+        for sample in samples:
+            uid = str(sample["case_uid"])
+            case_index = int(sample["case_index"])
+            gated_resolved = bool(
+                (radius.get(uid) or {}).get("radius_equality_resolved", False)
+            )
+            ungated_resolved = bool(
+                (ungated_radius.get(uid) or {}).get(
+                    "radius_equality_resolved", False
+                )
+            )
+            recovered = bool(not gated_resolved and ungated_resolved)
+            if recovered:
+                correction_initial[case_index:case_index + 1] = (
+                    ungated_normalized[case_index:case_index + 1]
+                )
+            zero_start_seed_diagnostics[uid] = {
+                "gated_adapter_radius_resolved": gated_resolved,
+                "observable_ungated_seed_radius_resolved": ungated_resolved,
+                "observable_ungated_seed_used": recovered,
+                "teacher_or_label_consumed": False,
+            }
 
     variants = {}
     variant_tangents = {}
@@ -6879,7 +6929,9 @@ def run(args):
                 if activation_enabled:
                     group = None
                     global_case = int(sample["case_index"])
-                    local_initial = initial[global_case:global_case + 1]
+                    local_initial = correction_initial[
+                        global_case:global_case + 1
+                    ]
                     local_ownership = ownership[global_case:global_case + 1]
                     local_c2_taper = trace["c2_taper"][
                         global_case:global_case + 1
@@ -6903,7 +6955,7 @@ def run(args):
                     local_contract = None
                 else:
                     group = str(sample["audit_group"])
-                    local_initial = initial[start:stop]
+                    local_initial = correction_initial[start:stop]
                     local_ownership = ownership[start:stop]
                     local_baseline = domain["baseline"]
                     local_identity = domain["identity"]
@@ -7923,6 +7975,9 @@ def run(args):
         "adapter_state": str(state_path),
         "observable_adapter_gate_mode": _gate_mode,
         "adapter_role": "learner_warm_start",
+        "second_order_zero_start_seed_by_case": (
+            zero_start_seed_diagnostics if g1f3 else None
+        ),
         "correction_gradient_protocol": "stop_gradient",
         "future_end_to_end_gradient_protocol": IMPLICIT_BACKWARD_PROTOCOL,
         "unrolled_backward_allowed": False,
@@ -8096,6 +8151,10 @@ def run(args):
                 "second_order_infeasible_joint_policy"
             ) if g1f3 else None
         ),
+        "second_order_restoration_target": (
+            train_shadow_contract.get("second_order_restoration_target")
+            if g1f3 else None
+        ),
         "second_order_restoration_acceptance": (
             train_shadow_contract.get(
                 "second_order_restoration_acceptance"
@@ -8104,6 +8163,15 @@ def run(args):
         "second_order_restoration_final_step_allowed": (
             train_shadow_contract.get(
                 "second_order_restoration_final_step_allowed"
+            ) if g1f3 else None
+        ),
+        "second_order_zero_start_seed_policy": (
+            train_shadow_contract.get("second_order_zero_start_seed_policy")
+            if g1f3 else None
+        ),
+        "second_order_zero_start_seed_teacher_or_label_consumed": (
+            train_shadow_contract.get(
+                "second_order_zero_start_seed_teacher_or_label_consumed"
             ) if g1f3 else None
         ),
         "second_order_sqp_line_search_radians": (

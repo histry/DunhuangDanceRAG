@@ -203,11 +203,20 @@ def run(args):
             "second_order_infeasible_joint_policy": fixed[
                 "second_order_infeasible_joint_policy"
             ],
+            "second_order_restoration_target": fixed[
+                "second_order_restoration_target"
+            ],
             "second_order_restoration_acceptance": fixed[
                 "second_order_restoration_acceptance"
             ],
             "second_order_restoration_final_step_allowed": fixed[
                 "second_order_restoration_final_step_allowed"
+            ],
+            "second_order_zero_start_seed_policy": fixed[
+                "second_order_zero_start_seed_policy"
+            ],
+            "second_order_zero_start_seed_teacher_or_label_consumed": fixed[
+                "second_order_zero_start_seed_teacher_or_label_consumed"
             ],
             "second_order_sqp_line_search_radians": list(
                 fixed["second_order_sqp_line_search_radians"]

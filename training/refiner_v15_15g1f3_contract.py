@@ -130,14 +130,24 @@ def _unchanged_contract(report):
              "authoritative_remaining_gap_share_or_joint_gap_filter_progress",
              "second-order intermediate acceptance changed")
     _require(report.get("second_order_infeasible_joint_policy") ==
-             "deterministic_minimum_normalized_residual_restoration",
+             "deterministic_full_remaining_gap_minimum_normalized_"
+             "residual_restoration",
              "second-order infeasible-joint policy changed")
+    _require(report.get("second_order_restoration_target") ==
+             "complete_remaining_closure_gap",
+             "second-order restoration is not terminal-gap directed")
     _require(report.get("second_order_restoration_acceptance") ==
              "authoritative_safe_boundary_and_positive_gap_merit_decrease",
              "second-order restoration acceptance changed")
     _require(report.get(
         "second_order_restoration_final_step_allowed"
     ) is False, "second-order restoration may replace final closure")
+    _require(report.get("second_order_zero_start_seed_policy") ==
+             "observable_ungated_frozen_adapter_decoder_direction",
+             "second-order zero-start seed policy changed")
+    _require(report.get(
+        "second_order_zero_start_seed_teacher_or_label_consumed"
+    ) is False, "second-order zero-start seed consumed offline evidence")
     _require(report.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -399,11 +409,20 @@ def freeze_contract(args):
             "second_order_infeasible_joint_policy": repair[
                 "second_order_infeasible_joint_policy"
             ],
+            "second_order_restoration_target": repair[
+                "second_order_restoration_target"
+            ],
             "second_order_restoration_acceptance": repair[
                 "second_order_restoration_acceptance"
             ],
             "second_order_restoration_final_step_allowed": repair[
                 "second_order_restoration_final_step_allowed"
+            ],
+            "second_order_zero_start_seed_policy": repair[
+                "second_order_zero_start_seed_policy"
+            ],
+            "second_order_zero_start_seed_teacher_or_label_consumed": repair[
+                "second_order_zero_start_seed_teacher_or_label_consumed"
             ],
             "second_order_sqp_line_search_radians": list(
                 repair["second_order_sqp_line_search_radians"]

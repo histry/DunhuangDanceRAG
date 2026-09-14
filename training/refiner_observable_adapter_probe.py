@@ -90,6 +90,34 @@ def _adapter_batch_outputs(model, batch, cfg):
         shared_prediction,
         prediction,
     )
+    # Preserve an observable-only direction for the second-order module when
+    # the conservative wake gate is exactly closed.  This is the same frozen
+    # Adapter decoder with only its scalar gate removed; it is not a teacher,
+    # case label, or case-specific fallback.  The normal Adapter candidate
+    # remains the gated prediction above.
+    if not model.training:
+        ungated_tangent = (
+            adapter_trace["raw_tangent"]
+            * adapter_trace["ownership"].to(
+                adapter_trace["raw_tangent"].dtype
+            )
+            * adapter_trace["c2_taper"]
+        ).masked_fill(
+            ~adapter_trace["ownership"].expand_as(
+                adapter_trace["raw_tangent"]
+            ),
+            0.0,
+        )
+        ungated_output = m.torch.cat(
+            [m.torch.zeros_like(outputs[..., :4]), ungated_tangent], dim=-1
+        )
+        ungated_prediction = m._decode_product_refiner_output(
+            batch["bad"], outputs - adapter_output + ungated_output,
+            *repair_masks, cfg
+        )
+        adapter_trace["decoder_consistent_ungated_tangent"] = (
+            product_log_torch(shared_prediction, ungated_prediction)
+        )
     return prediction, adapter_trace
 
 

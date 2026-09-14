@@ -745,6 +745,7 @@ def solve_angle_subproblem(
     grid_levels: int,
     feasibility_tolerance: float,
     permit_restoration_candidate: bool = False,
+    restoration_required_reduction: Mapping[str, float] | None = None,
 ):
     """Solve the frozen-angle joint quadratic model on the unit sphere."""
     names = ("shadow", "endpoint", "temporal")
@@ -831,17 +832,70 @@ def solve_angle_subproblem(
         }
         if not bool(permit_restoration_candidate):
             return None, infeasible_audit
-        return directions[nearest], {
+        restoration_required = directions.new_tensor([
+            float(
+                (restoration_required_reduction or required_reduction)[name]
+            )
+            for name in names
+        ])
+        restoration_scales = _constraint_scales(
+            models,
+            theta,
+            restoration_required,
+            float(feasibility_tolerance),
+        )
+        # A quota-infeasible direction must aim at the complete remaining
+        # closure gap, not merely be the least-bad direction for this step's
+        # divided quota.  Refine again against that terminal objective so the
+        # early steps of a 2/3/5 budget enter a basin that can actually close.
+        restoration_directions, restoration_changes, restoration_audit = (
+            _continuous_joint_sqp_refinement(
+                models=models,
+                theta=theta,
+                required=restoration_required,
+                scales=restoration_scales,
+                coarse_directions=directions,
+                feasibility_tolerance=float(feasibility_tolerance),
+            )
+        )
+        restoration_pool = m.torch.cat(
+            [directions, restoration_directions], dim=0
+        )
+        restoration_change_pool = m.torch.cat(
+            [changes, restoration_changes], dim=0
+        )
+        restoration_residual = (
+            restoration_change_pool
+            + restoration_required.unsqueeze(0)
+            - float(feasibility_tolerance)
+        ) / restoration_scales.unsqueeze(0)
+        nearest_restoration = restoration_residual.amax(dim=1).argmin()
+        return restoration_pool[nearest_restoration], {
             **infeasible_audit,
             "solver_status": "second_order_restoration_angle_subproblem_solved",
             "second_order_state": None,
             "joint_predicted_feasible": False,
             "restoration_candidate": True,
-            "selected_candidate_index": int(nearest.detach()),
+            "selected_candidate_index": int(nearest_restoration.detach()),
             "predicted_change_by_term": {
-                name: float(changes[nearest, index].detach())
+                name: float(
+                    restoration_change_pool[nearest_restoration, index].detach()
+                )
                 for index, name in enumerate(names)
             },
+            "restoration_target": "complete_remaining_closure_gap",
+            "restoration_required_reduction_by_term": {
+                name: float(restoration_required[index].detach())
+                for index, name in enumerate(names)
+            },
+            "restoration_constraint_scale_by_term": {
+                name: float(restoration_scales[index].detach())
+                for index, name in enumerate(names)
+            },
+            "restoration_maximum_normalized_residual": float(
+                restoration_residual[nearest_restoration].amax().detach()
+            ),
+            "restoration_refinement": restoration_audit,
         }
     indices = m.torch.nonzero(feasible, as_tuple=False).reshape(-1)
     feasible_rows = directions.index_select(0, indices)
@@ -973,6 +1027,7 @@ def solve_prepared_second_order_angle(
     grid_levels,
     feasibility_tolerance,
     permit_restoration_candidate=False,
+    restoration_required_reduction=None,
 ):
     """Solve one angle using a prepared on-device curvature model."""
     coefficients, solver_audit = solve_angle_subproblem(
@@ -982,6 +1037,7 @@ def solve_prepared_second_order_angle(
         grid_levels=int(grid_levels),
         feasibility_tolerance=float(feasibility_tolerance),
         permit_restoration_candidate=bool(permit_restoration_candidate),
+        restoration_required_reduction=restoration_required_reduction,
     )
     audit = {
         **solver_audit,
@@ -1034,6 +1090,7 @@ def second_order_direction_for_angle(
     direction_norm_floor,
     feasibility_tolerance,
     permit_restoration_candidate=False,
+    restoration_required_reduction=None,
 ):
     """Build and solve one frozen-angle g1f3 joint subproblem."""
     prepared, preparation_audit = prepare_second_order_subproblem(
@@ -1057,6 +1114,7 @@ def second_order_direction_for_angle(
         grid_levels=int(grid_levels),
         feasibility_tolerance=float(feasibility_tolerance),
         permit_restoration_candidate=bool(permit_restoration_candidate),
+        restoration_required_reduction=restoration_required_reduction,
     )
     audit = {
         **preparation_audit,

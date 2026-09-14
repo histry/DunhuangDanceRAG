@@ -94,14 +94,24 @@ def _load_composite(model_path, contract_path, cfg):
              "authoritative_remaining_gap_share_or_joint_gap_filter_progress",
              "V15.15h intermediate acceptance changed")
     _require(fixed.get("second_order_infeasible_joint_policy") ==
-             "deterministic_minimum_normalized_residual_restoration",
+             "deterministic_full_remaining_gap_minimum_normalized_"
+             "residual_restoration",
              "V15.15h infeasible-joint policy changed")
+    _require(fixed.get("second_order_restoration_target") ==
+             "complete_remaining_closure_gap",
+             "V15.15h restoration is not terminal-gap directed")
     _require(fixed.get("second_order_restoration_acceptance") ==
              "authoritative_safe_boundary_and_positive_gap_merit_decrease",
              "V15.15h restoration acceptance changed")
     _require(fixed.get(
         "second_order_restoration_final_step_allowed"
     ) is False, "V15.15h restoration may replace final closure")
+    _require(fixed.get("second_order_zero_start_seed_policy") ==
+             "observable_ungated_frozen_adapter_decoder_direction",
+             "V15.15h zero-start seed policy changed")
+    _require(fixed.get(
+        "second_order_zero_start_seed_teacher_or_label_consumed"
+    ) is False, "V15.15h zero-start seed consumed offline evidence")
     _require(fixed.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -338,57 +348,77 @@ def _apply_one_transaction(
                 model, batch, cfg
             )
         mask = ownership.expand_as(trace["decoder_consistent_tangent"])
-        initial, normalized = g1f._normalize_exact_radius(
+        gated_initial, normalized = g1f._normalize_exact_radius(
             trace["decoder_consistent_tangent"], mask, 1.0e-4
         )
-        if not normalized:
-            report["reason"] = "zero_gradient_abstention"
-            report["selected_audit"] = dict(audit_fn(snapshot))
-            return snapshot, report
         baseline = batch["bad"]
-        adapter_exact = product_exp_torch(baseline, initial)
-        adapter_np = adapter_exact[0].detach().cpu().numpy()
-        adapter_projected, adapter_guard = _project_and_guard(
-            adapter_np, snapshot, cfg, audit_fn, limits, policy
-        )
-        adapter_tensor = m.torch.as_tensor(
-            adapter_projected[None], dtype=m.torch.float32, device=device
-        )
-        adapter_science = _science_terms(
-            adapter_tensor, baseline, batch["seam"], cfg
-        )
-        adapter_scope = float(
-            product_log_torch(baseline, adapter_tensor)
-            .masked_fill(mask, 0.0)
-            .abs()
-            .amax()
-            .detach()
-        )
-        adapter_science_closed = all(
-            float(adapter_science[name].detach()) <= 1.0e-12
-            for name in ("endpoint", "temporal")
-        )
-        report["adapter_incumbent"] = {
-            **adapter_guard,
-            "scientific_closed": adapter_science_closed,
-            "scope_leakage_abs_max": adapter_scope,
-        }
-        if (
-            adapter_guard["full_transaction_guard"]["accepted"]
-            and adapter_science_closed
-            and adapter_scope == 0.0
-        ):
-            final_audit = dict(audit_fn(adapter_projected))
-            report.update({
-                "selection": "adapter",
-                "adapter_incumbent_locked": True,
-                "accepted": True,
-                "rolled_back": False,
-                "reason": "adapter_full_guard_closure_locked",
-                "selected_audit": final_audit,
-                "post_commit_full_transaction_reaudit": final_audit,
-            })
-            return adapter_projected.astype(np.float32), report
+        if not normalized:
+            initial, ungated_normalized = g1f._normalize_exact_radius(
+                trace["decoder_consistent_ungated_tangent"], mask, 1.0e-4
+            )
+            report["second_order_zero_start_seed"] = {
+                "policy": "observable_ungated_frozen_adapter_decoder_direction",
+                "used": bool(ungated_normalized),
+                "teacher_or_label_consumed": False,
+            }
+            report["adapter_incumbent"] = {
+                "available": False,
+                "reason": "gated_adapter_zero_direction",
+            }
+            if not ungated_normalized:
+                report["reason"] = "zero_gradient_abstention"
+                report["selected_audit"] = dict(audit_fn(snapshot))
+                return snapshot, report
+        else:
+            initial = gated_initial
+            report["second_order_zero_start_seed"] = {
+                "policy": "observable_ungated_frozen_adapter_decoder_direction",
+                "used": False,
+                "teacher_or_label_consumed": False,
+            }
+            adapter_exact = product_exp_torch(baseline, initial)
+            adapter_np = adapter_exact[0].detach().cpu().numpy()
+            adapter_projected, adapter_guard = _project_and_guard(
+                adapter_np, snapshot, cfg, audit_fn, limits, policy
+            )
+            adapter_tensor = m.torch.as_tensor(
+                adapter_projected[None], dtype=m.torch.float32, device=device
+            )
+            adapter_science = _science_terms(
+                adapter_tensor, baseline, batch["seam"], cfg
+            )
+            adapter_scope = float(
+                product_log_torch(baseline, adapter_tensor)
+                .masked_fill(mask, 0.0)
+                .abs()
+                .amax()
+                .detach()
+            )
+            adapter_science_closed = all(
+                float(adapter_science[name].detach()) <= 1.0e-12
+                for name in ("endpoint", "temporal")
+            )
+            report["adapter_incumbent"] = {
+                **adapter_guard,
+                "scientific_closed": adapter_science_closed,
+                "scope_leakage_abs_max": adapter_scope,
+            }
+            if (
+                adapter_guard["full_transaction_guard"]["accepted"]
+                and adapter_science_closed
+                and adapter_scope == 0.0
+            ):
+                final_audit = dict(audit_fn(adapter_projected))
+                report.update({
+                    "selection": "adapter",
+                    "adapter_incumbent_locked": True,
+                    "accepted": True,
+                    "rolled_back": False,
+                    "reason": "adapter_full_guard_closure_locked",
+                    "selected_audit": final_audit,
+                    "post_commit_full_transaction_reaudit": final_audit,
+                })
+                return adapter_projected.astype(np.float32), report
 
         current = initial.detach()
         taper = trace["c2_taper"].expand_as(current).detach()
@@ -461,6 +491,10 @@ def _apply_one_transaction(
                     ) / float(remaining_steps)
                     for name, value in scalar_terms.items()
                 }
+                remaining_closure_gap = {
+                    name: float(value.detach()) + feasibility_tolerance
+                    for name, value in scalar_terms.items()
+                }
                 try:
                     prepared_model, preparation_audit = (
                         second_order.prepare_second_order_subproblem(
@@ -503,6 +537,9 @@ def _apply_one_transaction(
                             grid_levels=grid_levels,
                             feasibility_tolerance=feasibility_tolerance,
                             permit_restoration_candidate=True,
+                            restoration_required_reduction=(
+                                remaining_closure_gap
+                            ),
                         )
                         if direction is not None:
                             direction = direction.to(budget_current.dtype)
@@ -520,6 +557,9 @@ def _apply_one_transaction(
                         "prediction_active_guard_term": frozen_active_name,
                         "remaining_steps_including_current": remaining_steps,
                         "required_step_reduction_by_term": dict(required),
+                        "complete_remaining_closure_gap_by_term": dict(
+                            remaining_closure_gap
+                        ),
                         "solver": solver,
                         "second_order_model_preparation": (
                             preparation_audit if angle_index == 0 else None
