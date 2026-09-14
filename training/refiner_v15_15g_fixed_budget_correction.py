@@ -7718,11 +7718,14 @@ def run(args):
                         and decision.get("adapter_incumbent_locked")
                         and selected_method == "adapter"
                     )
-        target_second_order_closure_complete = bool(
+        target_composite_closure_complete = bool(
             g1f3
             and all(
                 composite_closure_by_case.get(uid, {}).get("state")
-                == "second_order_closure_succeeded"
+                in {
+                    "adapter_incumbent_locked",
+                    "second_order_closure_succeeded",
+                }
                 for uid in G1F3_TRAIN_TARGET_CASE_UIDS
             )
         )
@@ -7986,7 +7989,7 @@ def run(args):
                 else None
             ),
             "g1f3_train_target_closure_complete": (
-                target_second_order_closure_complete if g1f3 else None
+                target_composite_closure_complete if g1f3 else None
             ),
             "adapter_incumbent_preserved": (
                 adapter_incumbent_preserved if g1f3 else None

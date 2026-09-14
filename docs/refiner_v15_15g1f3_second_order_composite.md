@@ -100,7 +100,9 @@ train 冻结合约锁定后原样用于 development、held-out 和整曲推断�
 - `second_order_solver_failure`
 
 case 42 继续作为方向导数不一致通道；case 131 的零梯度继续 abstain。五个
-train 校准目标只用于验收，未进入推断白名单。
+train 校准目标只用于验收，未进入推断白名单。目标闭包按复合 selector 的
+最终闭包计算：既接受完整锁定的 Adapter incumbent，也接受通过二阶修复的
+候选；不会把“必须由二阶方法选中”误当成稳定通过条件。
 
 ## 服务器执行顺序
 
