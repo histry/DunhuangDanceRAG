@@ -148,6 +148,12 @@ def _unchanged_contract(report):
     _require(report.get(
         "second_order_zero_start_seed_teacher_or_label_consumed"
     ) is False, "second-order zero-start seed consumed offline evidence")
+    _require(report.get("second_order_candidate_generation_scope") ==
+             "observable_activation_or_train_calibration_audit_only",
+             "second-order generation scope changed")
+    _require(report.get("second_order_closed_incumbent_reuse") ==
+             "raw_projector_full_guard_audited_tangent_across_larger_budgets",
+             "second-order closed-incumbent reuse changed")
     _require(report.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
@@ -423,6 +429,12 @@ def freeze_contract(args):
             ],
             "second_order_zero_start_seed_teacher_or_label_consumed": repair[
                 "second_order_zero_start_seed_teacher_or_label_consumed"
+            ],
+            "second_order_candidate_generation_scope": repair[
+                "second_order_candidate_generation_scope"
+            ],
+            "second_order_closed_incumbent_reuse": repair[
+                "second_order_closed_incumbent_reuse"
             ],
             "second_order_sqp_line_search_radians": list(
                 repair["second_order_sqp_line_search_radians"]

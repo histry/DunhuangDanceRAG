@@ -218,6 +218,12 @@ def run(args):
             "second_order_zero_start_seed_teacher_or_label_consumed": fixed[
                 "second_order_zero_start_seed_teacher_or_label_consumed"
             ],
+            "second_order_candidate_generation_scope": fixed[
+                "second_order_candidate_generation_scope"
+            ],
+            "second_order_closed_incumbent_reuse": fixed[
+                "second_order_closed_incumbent_reuse"
+            ],
             "second_order_sqp_line_search_radians": list(
                 fixed["second_order_sqp_line_search_radians"]
             ),

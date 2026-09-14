@@ -54,6 +54,12 @@ observable 产生，不读取 teacher、split、single/cross 标签或案例 UID
 后的 Adapter 候选身份不变，也不能因此跳过 Projector 或完整 Guard。门控前
 方向仍为零时继续 `zero_gradient_abstention`，不制造教师。
 
+为避免重复曲率计算，二阶候选只对 observable 已激活的 transaction 生成；
+train 中额外声明的目标和 exact cross 行仍按既有离线校准规则执行。某候选一旦
+通过 raw、Projector 与完整 Guard 审计，其 tangent 可在更大的 `k` 预算中直接
+复用并再次接受权威审计，不再重建相同的 float64 Hessian/HvP。Adapter incumbent
+同样直接锁定。该缓存不跨冷启动进程，三次独立复跑要求不变。
+
 train 校准行使用包络中已经冻结的 leave-one-transaction-out observable
 分数；禁止再用包含该行的最终模型给该行做 in-sample 判定。此规则不读取
 fold 中保存的 offline label。development、一次性 held-out 和整曲推断仍只

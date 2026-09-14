@@ -1200,6 +1200,14 @@ def _freeze_train_full_shadow_repair_contract(
         "second_order_zero_start_seed_teacher_or_label_consumed": (
             False if second_order_joint_sqp else None
         ),
+        "second_order_candidate_generation_scope": (
+            "observable_activation_or_train_calibration_audit_only"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_closed_incumbent_reuse": (
+            "raw_projector_full_guard_audited_tangent_across_larger_budgets"
+            if second_order_joint_sqp else None
+        ),
         "second_order_sqp_line_search_radians": (
             [
                 float(value)
@@ -6897,6 +6905,12 @@ def run(args):
     variant_tangents = {}
     variant_correction_reports = {}
     hard_negatives = []
+    # Exact closures are immutable incumbents.  Reuse their already-audited
+    # tangent across larger budgets instead of rebuilding identical float64
+    # curvature models.  The cache is populated only after the same raw,
+    # Projector and full-Guard audit used by final selection.
+    g1f3_closure_tangent_by_uid = {}
+    g1f3_closure_source_by_uid = {}
     budgets = tuple(int(value) for value in args.steps)
     specifications = (
         [("adapter", 0)]
@@ -6922,6 +6936,56 @@ def run(args):
                     and sample["teacher_kind"] != "exact_projected_direction"
                 ):
                     continue
+                uid = str(sample["case_uid"])
+                global_case = int(sample["case_index"])
+                if g1f3:
+                    if evaluation_role == "train_calibration":
+                        severity = _discriminative_conformal_status(
+                            sample,
+                            severity_envelope,
+                            use_transaction_held_out_calibration_score=True,
+                        )
+                    else:
+                        severity = _discriminative_conformal_status(
+                            sample, severity_envelope
+                        )
+                    forced_train_audit = bool(
+                        evaluation_role == "train_calibration"
+                        and (
+                            uid in G1F3_TRAIN_TARGET_CASE_UIDS
+                            or sample.get("teacher_kind")
+                            == "exact_projected_direction"
+                        )
+                    )
+                    generation_authorized = bool(
+                        severity["activation_supported_by_observables"]
+                        or forced_train_audit
+                    )
+                    if not generation_authorized:
+                        correction_reports[uid] = {
+                            "execution_skipped": True,
+                            "execution_skip_reason": (
+                                "observable_activation_not_authorized"
+                            ),
+                            "runtime_case_label_consumed": False,
+                            "numeric_failure": False,
+                        }
+                        continue
+                    cached = g1f3_closure_tangent_by_uid.get(uid)
+                    if cached is not None:
+                        tangent[global_case:global_case + 1] = cached
+                        correction_reports[uid] = {
+                            "execution_skipped": True,
+                            "execution_skip_reason": (
+                                "previous_exact_composite_incumbent_reused"
+                            ),
+                            "closure_source": (
+                                g1f3_closure_source_by_uid[uid]
+                            ),
+                            "raw_projector_full_guard_reaudit_required": True,
+                            "numeric_failure": False,
+                        }
+                        continue
                 transaction_id = str(sample["transaction_id"])
                 domain = domains[transaction_id]
                 start, stop = domain["slice"]
@@ -7116,6 +7180,26 @@ def run(args):
             time.perf_counter() - variant_started,
         )
         audit_by_uid = {str(row["case_uid"]): row for row in audits}
+        if g1f3:
+            sample_by_uid = {
+                str(sample["case_uid"]): sample for sample in samples
+            }
+            for uid, audit in audit_by_uid.items():
+                sample = sample_by_uid.get(uid)
+                if sample is None:
+                    continue
+                if not (
+                    audit["raw_audit"]["passed"]
+                    and audit.get("projector_result") is not None
+                    and audit["effective_projected_candidate"]
+                ):
+                    continue
+                case_index = int(sample["case_index"])
+                g1f3_closure_tangent_by_uid.setdefault(
+                    uid,
+                    tangent[case_index:case_index + 1].detach().clone(),
+                )
+                g1f3_closure_source_by_uid.setdefault(uid, key)
         for sample in samples:
             if sample["teacher_kind"] != "exact_projected_direction":
                 continue
@@ -8173,6 +8257,15 @@ def run(args):
             train_shadow_contract.get(
                 "second_order_zero_start_seed_teacher_or_label_consumed"
             ) if g1f3 else None
+        ),
+        "second_order_candidate_generation_scope": (
+            train_shadow_contract.get(
+                "second_order_candidate_generation_scope"
+            ) if g1f3 else None
+        ),
+        "second_order_closed_incumbent_reuse": (
+            train_shadow_contract.get("second_order_closed_incumbent_reuse")
+            if g1f3 else None
         ),
         "second_order_sqp_line_search_radians": (
             train_shadow_contract.get(

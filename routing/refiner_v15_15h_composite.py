@@ -112,6 +112,12 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get(
         "second_order_zero_start_seed_teacher_or_label_consumed"
     ) is False, "V15.15h zero-start seed consumed offline evidence")
+    _require(fixed.get("second_order_candidate_generation_scope") ==
+             "observable_activation_or_train_calibration_audit_only",
+             "V15.15h second-order generation scope changed")
+    _require(fixed.get("second_order_closed_incumbent_reuse") ==
+             "raw_projector_full_guard_audited_tangent_across_larger_budgets",
+             "V15.15h closed-incumbent reuse changed")
     _require(fixed.get("second_order_sqp_line_search_radians") == [
         float(value)
         for value in second_order.SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
