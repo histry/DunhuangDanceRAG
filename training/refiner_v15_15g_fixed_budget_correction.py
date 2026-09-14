@@ -128,10 +128,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v2"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v3"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v2"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v3"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -1124,7 +1124,7 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_guard_transition_bundle": (
-            "strict_authoritative_margin_guard_rows"
+            "all_violated_plus_strict_frontier_guard_rows"
             if second_order_joint_sqp else None
         ),
         "second_order_guard_transition_band": (
@@ -1136,7 +1136,7 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_guard_transition_threshold": (
-            "hard_margin_greater_equal_max_zero_and_hard_max_minus_band"
+            "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band"
             if second_order_joint_sqp else None
         ),
         "curvature_dtype": "float64" if second_order_joint_sqp else None,
@@ -1374,14 +1374,14 @@ def _smooth_group_guard_value(
 
 
 def _select_second_order_guard_rows(hard_margins, band):
-    """Freeze only authoritative Guard rows at the strict hard-margin frontier."""
+    """Freeze every violated row plus safe rows at the strict hard frontier."""
     maximum = max(float(value) for value in hard_margins.values())
     threshold = max(0.0, maximum) - float(band)
     return sorted(
         (
             name
             for name, value in hard_margins.items()
-            if float(value) >= threshold
+            if float(value) > 0.0 or float(value) >= threshold
         ),
         key=lambda name: (-float(hard_margins[name]), name),
     )
@@ -1389,6 +1389,39 @@ def _select_second_order_guard_rows(hard_margins, band):
 
 def _guard_constraint_name(name):
     return f"guard::{name}"
+
+
+def _authoritative_full_shadow_required_reduction(
+    current_shadow, remaining_steps, closure_margin
+):
+    return (
+        float(current_shadow) + float(closure_margin)
+    ) / float(remaining_steps)
+
+
+def _authoritative_full_shadow_quota(
+    current_shadow,
+    trial_shadow,
+    remaining_steps,
+    closure_margin,
+    tolerance,
+):
+    required_reduction = _authoritative_full_shadow_required_reduction(
+        current_shadow, remaining_steps, closure_margin
+    )
+    passed = bool(
+        float(trial_shadow)
+        <= float(current_shadow) - required_reduction + float(tolerance)
+    )
+    return required_reduction, passed
+
+
+def _authoritative_full_shadow_strictly_decreased(
+    current_shadow, trial_shadow, tolerance
+):
+    return bool(
+        float(trial_shadow) < float(current_shadow) - float(tolerance)
+    )
 
 
 def _g1d_shadow_objective(
@@ -1424,7 +1457,7 @@ def _g1d_shadow_objective(
     transition_bundle = bool(
         require_shadow_constraint
         and train_repair_contract.get("second_order_guard_transition_bundle")
-        == "strict_authoritative_margin_guard_rows"
+        == "all_violated_plus_strict_frontier_guard_rows"
     )
     if prediction_active_names is None:
         if require_shadow_constraint:
@@ -3808,6 +3841,22 @@ def _second_order_angular_iteration(
         )
         for name in frozen_active_names
     }
+    authoritative_full_shadow_margin = max(
+        float(
+            train_repair_contract[
+                "minimum_shadow_reduction_by_guard_term"
+            ][name]
+        )
+        for name in frozen_active_names
+    )
+    authoritative_full_shadow_gap = (
+        current_shadow + authoritative_full_shadow_margin
+    )
+    authoritative_full_shadow_required_reduction = (
+        _authoritative_full_shadow_required_reduction(
+            current_shadow, remaining_steps, authoritative_full_shadow_margin
+        )
+    )
     required_reduction = {
         **{
             name: value / float(remaining_steps)
@@ -4152,12 +4201,24 @@ def _second_order_angular_iteration(
             train_repair_contract["second_order_feasibility_tolerance"]
         )
         guard_row_names = tuple(guard_signed_gaps)
-        shadow_ok = all(
+        row_wise_shadow_ok = all(
             trial_shadow_values[name.removeprefix("guard::")]
             <= hard_margins[name.removeprefix("guard::")]
             - float(required_reduction[name])
             + shadow_step_tolerance
             for name in guard_row_names
+        )
+        _, authoritative_full_shadow_ok = (
+            _authoritative_full_shadow_quota(
+                current_shadow,
+                trial_shadow,
+                remaining_steps,
+                authoritative_full_shadow_margin,
+                shadow_step_tolerance,
+            )
+        )
+        shadow_ok = bool(
+            row_wise_shadow_ok and authoritative_full_shadow_ok
         )
         trial_signed_gap = {
             **{
@@ -4207,8 +4268,15 @@ def _second_order_angular_iteration(
                 ]
             )
         )
+        full_shadow_strict_decrease = (
+            _authoritative_full_shadow_strictly_decreased(
+                current_shadow, trial_shadow, shadow_step_tolerance
+            )
+        )
         authoritative_filter_progress = bool(
-            filter_safe_boundary_ok and filter_merit_progress
+            filter_safe_boundary_ok
+            and filter_merit_progress
+            and full_shadow_strict_decrease
         )
         authoritative_step_closure = bool(
             trial_shadow <= 0.0
@@ -4285,6 +4353,13 @@ def _second_order_angular_iteration(
             "full_shadow_reduction": current_shadow - trial_shadow,
             "remaining_steps_including_current": int(remaining_steps),
             "required_step_reduction_by_term": dict(required_reduction),
+            "authoritative_full_shadow_required_reduction": (
+                authoritative_full_shadow_required_reduction
+            ),
+            "row_wise_shadow_progress_passed": row_wise_shadow_ok,
+            "authoritative_full_shadow_progress_passed": (
+                authoritative_full_shadow_ok
+            ),
             "trial_science_change_by_term": science_step_change,
             "trial_science_step_margin_by_term": science_step_margin,
             "current_signed_closure_gap_by_term": current_signed_gap,
@@ -4301,6 +4376,9 @@ def _second_order_angular_iteration(
                 if value <= 0.0
             ),
             "authoritative_filter_merit_progress": filter_merit_progress,
+            "authoritative_full_shadow_strictly_decreased": (
+                full_shadow_strict_decrease
+            ),
             "authoritative_filter_progress": authoritative_filter_progress,
             "authoritative_progress_mode": accepted_progress_mode,
             "trial_radius_rms": radius_rms,
@@ -4364,6 +4442,12 @@ def _second_order_angular_iteration(
         "finite_gap_science_requirements": science_requirements,
         "remaining_steps_including_current": int(remaining_steps),
         "required_step_reduction_by_term": dict(required_reduction),
+        "authoritative_full_shadow_required_reduction": (
+            authoritative_full_shadow_required_reduction
+        ),
+        "signed_authoritative_full_shadow_gap_to_safe_boundary": (
+            authoritative_full_shadow_gap
+        ),
         "signed_guard_row_gap_to_safe_boundary": dict(guard_signed_gaps),
         "full_shadow_before": current_shadow,
         "full_shadow_after": accepted_shadow,

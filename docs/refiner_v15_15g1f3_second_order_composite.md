@@ -48,12 +48,14 @@ SQP，选择面向最终闭包的最小联合归一化残差方向，而不是�
 不越过已经安全的边界且正的联合闭包缺口严格下降时才可继续；最后一步不接受
 filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback。
 
-每个二阶扩展点按 `hard_margin >= max(0, M) - 1e-5` 构造严格 transition
-bundle，其中 `M` 是当前全部 hard Guard 裕量的最大值。该 bundle 的具体项在
+每个二阶扩展点把全部 `hard_margin > 0` 的待闭包 Guard 行与满足
+`hard_margin >= max(0, M) - 1e-5` 的严格前沿行合并为 transition bundle，
+其中 `M` 是当前全部 hard Guard 裕量的最大值。该 bundle 的具体项在
 本次曲率构建和 12 级角搜索中冻结；每个 Guard 项作为独立 QCQP 约束行求取一阶
 导数和 float64 二阶曲率，禁止在 Guard 行之间使用 logsumexp 聚合。真实 trial
-仍重新计算全部 hard Guard 和活跃集。这样允许模型预见临界项接管，同时不把
-真实 Guard 替换成平滑代理。
+仍重新计算全部 hard Guard 和活跃集。所有中间步还必须满足完整 hard max 的
+剩余闭包配额，filter 步也必须让完整 hard max 严格下降；未建模 Guard 的切换
+不能以单行进展名义被接受，也不把真实 Guard 替换成平滑代理。
 
 若保守 wake gate 使 Adapter 候选方向严格为零，二阶模块可使用同一冻结
 Adapter 解码器的门控前方向建立 `1e-4` 球面起点。这个方向仍只由运行时

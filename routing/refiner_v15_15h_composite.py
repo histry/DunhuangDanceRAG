@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v2"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v2"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v3"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v3"
 _CACHE = {}
 
 
@@ -70,7 +70,7 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_model_builds_per_iteration") == 1,
              "V15.15h curvature model is rebuilt per angle")
     _require(fixed.get("second_order_guard_transition_bundle") ==
-             "strict_authoritative_margin_guard_rows",
+             "all_violated_plus_strict_frontier_guard_rows",
              "V15.15h Guard transition bundle changed")
     _require(float(fixed.get("second_order_guard_transition_band", 0.0)) ==
              1.0e-5,
@@ -79,7 +79,7 @@ def _load_composite(model_path, contract_path, cfg):
              "independent_row_wise_qcqp",
              "V15.15h Guard transition aggregation changed")
     _require(fixed.get("second_order_guard_transition_threshold") ==
-             "hard_margin_greater_equal_max_zero_and_hard_max_minus_band",
+             "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band",
              "V15.15h Guard transition threshold changed")
     _require(fixed.get("second_order_grid_execution_device") ==
              "same_cuda_device_as_motion",
@@ -466,6 +466,7 @@ def _apply_one_transaction(
                     name: float(value.detach())
                     for name, value in expansion_terms["guard_terms"].items()
                 }
+                maximum_guard = max(guard_float.values())
                 active_names = tuple(g1f._select_second_order_guard_rows(
                     guard_float, guard_transition_band
                 ))
@@ -537,6 +538,13 @@ def _apply_one_transaction(
                     }
 
                 remaining_steps = int(budget) - int(iteration)
+                authoritative_full_shadow_required_reduction = (
+                    g1f._authoritative_full_shadow_required_reduction(
+                        maximum_guard,
+                        remaining_steps,
+                        feasibility_tolerance,
+                    )
+                )
                 required = {
                     name: (value + feasibility_tolerance)
                     / float(remaining_steps)
@@ -689,6 +697,10 @@ def _apply_one_transaction(
                         "endpoint": float(trial_terms["endpoint"].detach()),
                         "temporal": float(trial_terms["temporal"].detach()),
                     }
+                    trial_maximum_guard = max(
+                        float(value.detach())
+                        for value in trial_terms["guard_terms"].values()
+                    )
                     expansion_scalar = dict(authoritative_scalar_terms)
                     current_signed_gap = {
                         name: expansion_scalar[name] + feasibility_tolerance
@@ -714,12 +726,25 @@ def _apply_one_transaction(
                         name: trial_scalar[name] - expansion_scalar[name]
                         for name in trial_scalar
                     }
-                    quota_progress = bool(all(
+                    row_wise_quota_progress = bool(all(
                         math.isfinite(actual_change[name])
                         and actual_change[name]
                         <= -required[name] + feasibility_tolerance
                         for name in trial_scalar
                     ))
+                    _, authoritative_full_shadow_quota_progress = (
+                        g1f._authoritative_full_shadow_quota(
+                            maximum_guard,
+                            trial_maximum_guard,
+                            remaining_steps,
+                            feasibility_tolerance,
+                            feasibility_tolerance,
+                        )
+                    )
+                    quota_progress = bool(
+                        row_wise_quota_progress
+                        and authoritative_full_shadow_quota_progress
+                    )
                     filter_boundary_ok = all(
                         math.isfinite(trial_signed_gap[name])
                         and (
@@ -731,6 +756,11 @@ def _apply_one_transaction(
                     )
                     filter_progress = bool(
                         filter_boundary_ok
+                        and g1f._authoritative_full_shadow_strictly_decreased(
+                            maximum_guard,
+                            trial_maximum_guard,
+                            feasibility_tolerance,
+                        )
                         and math.isfinite(trial_gap_merit)
                         and trial_gap_merit
                         < current_gap_merit - feasibility_tolerance
@@ -760,6 +790,15 @@ def _apply_one_transaction(
                         "authoritative_metric_before": expansion_scalar,
                         "authoritative_metric_after": trial_scalar,
                         "authoritative_metric_change": actual_change,
+                        "authoritative_full_shadow_before": maximum_guard,
+                        "authoritative_full_shadow_after": trial_maximum_guard,
+                        "authoritative_full_shadow_required_reduction": (
+                            authoritative_full_shadow_required_reduction
+                        ),
+                        "row_wise_quota_progress": row_wise_quota_progress,
+                        "authoritative_full_shadow_quota_progress": (
+                            authoritative_full_shadow_quota_progress
+                        ),
                         "current_signed_closure_gap_by_term": current_signed_gap,
                         "trial_signed_closure_gap_by_term": trial_signed_gap,
                         "current_positive_closure_gap_merit": current_gap_merit,
