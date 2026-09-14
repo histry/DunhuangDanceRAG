@@ -17,8 +17,8 @@ from training import motion_models as m
 
 MODEL_NAME = "v15_15h_adapter_second_order_composite.pt"
 CONTRACT_NAME = "v15_15h_adapter_second_order_composite.contract.json"
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v1"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v1"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v2"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v2"
 
 
 def _sha256(path):
@@ -60,7 +60,7 @@ def run(args):
     frozen = _read_json(args.g1f3_frozen_contract)
     held_out = _read_json(args.held_out_acceptance)
     one_shot = _read_json(args.held_out_one_shot_receipt)
-    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v1",
+    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v2",
              "g1f3 frozen contract schema mismatch")
     _require(frozen.get("immutable") is True, "g1f3 contract is not immutable")
     _require(frozen.get("implementation_commit") == args.implementation_commit,
@@ -184,6 +184,9 @@ def run(args):
             ),
             "second_order_guard_transition_aggregation": fixed[
                 "second_order_guard_transition_aggregation"
+            ],
+            "second_order_guard_transition_threshold": fixed[
+                "second_order_guard_transition_threshold"
             ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":

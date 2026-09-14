@@ -128,10 +128,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v1"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v2"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v1"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v2"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -954,7 +954,7 @@ def _freeze_train_full_shadow_repair_contract(
     second_order_basis_dimension=3,
     second_order_grid_levels=9,
     second_order_feasibility_tolerance=1.0e-12,
-    second_order_guard_transition_temperature=1.0e-3,
+    second_order_guard_transition_band=1.0e-5,
 ):
     """Freeze every g1d numerical choice from train transactions only."""
     if train_teacher.get("split") != "train":
@@ -1124,15 +1124,19 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_guard_transition_bundle": (
-            "all_fixed_guard_terms_within_frozen_band_of_hard_max"
+            "strict_authoritative_margin_guard_rows"
             if second_order_joint_sqp else None
         ),
         "second_order_guard_transition_band": (
-            float(second_order_guard_transition_temperature)
+            float(second_order_guard_transition_band)
             if second_order_joint_sqp else None
         ),
         "second_order_guard_transition_aggregation": (
-            "frozen_bundle_logsumexp"
+            "independent_row_wise_qcqp"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_guard_transition_threshold": (
+            "hard_margin_greater_equal_max_zero_and_hard_max_minus_band"
             if second_order_joint_sqp else None
         ),
         "curvature_dtype": "float64" if second_order_joint_sqp else None,
@@ -1369,6 +1373,24 @@ def _smooth_group_guard_value(
     return exact_value
 
 
+def _select_second_order_guard_rows(hard_margins, band):
+    """Freeze only authoritative Guard rows at the strict hard-margin frontier."""
+    maximum = max(float(value) for value in hard_margins.values())
+    threshold = max(0.0, maximum) - float(band)
+    return sorted(
+        (
+            name
+            for name, value in hard_margins.items()
+            if float(value) >= threshold
+        ),
+        key=lambda name: (-float(hard_margins[name]), name),
+    )
+
+
+def _guard_constraint_name(name):
+    return f"guard::{name}"
+
+
 def _g1d_shadow_objective(
     *,
     model,
@@ -1402,7 +1424,7 @@ def _g1d_shadow_objective(
     transition_bundle = bool(
         require_shadow_constraint
         and train_repair_contract.get("second_order_guard_transition_bundle")
-        == "all_fixed_guard_terms_within_frozen_band_of_hard_max"
+        == "strict_authoritative_margin_guard_rows"
     )
     if prediction_active_names is None:
         if require_shadow_constraint:
@@ -1412,9 +1434,8 @@ def _g1d_shadow_objective(
                         "second_order_guard_transition_band"
                     ]
                 )
-                active_names = sorted(
-                    name for name, value in hard_float.items()
-                    if value >= maximum_hard - band
+                active_names = _select_second_order_guard_rows(
+                    hard_float, band
                 )
             else:
                 active_names = [max(
@@ -1469,20 +1490,9 @@ def _g1d_shadow_objective(
     if active_names:
         primary = "full_transaction_fixed_guard_shadow"
         if require_shadow_constraint:
-            stacked_shadows = m.torch.stack(
+            primary_loss = m.torch.stack(
                 [smooth_shadows[name] for name in active_names]
-            )
-            if transition_bundle:
-                primary_loss = _smooth_logsumexp(
-                    stacked_shadows,
-                    float(
-                        train_repair_contract[
-                            "second_order_guard_transition_band"
-                        ]
-                    ),
-                )
-            else:
-                primary_loss = stacked_shadows.sum()
+            ).sum()
         else:
             primary_loss = m.torch.stack(
                 [m.torch.relu(smooth_shadows[name]) for name in active_names]
@@ -1504,6 +1514,9 @@ def _g1d_shadow_objective(
             prediction_active_names is not None
         ),
         "prediction_guard_transition_bundle": transition_bundle,
+        "prediction_guard_transition_aggregation": (
+            "independent_row_wise_qcqp" if transition_bundle else None
+        ),
         "prediction_guard_transition_band": (
             float(
                 train_repair_contract[
@@ -1532,7 +1545,11 @@ def _g1d_shadow_objective(
         ),
         "temporal_smoothness": float(smoothness.detach()),
     }
-    return loss, primary_loss, diagnostics, science_tensors
+    guard_rows = {
+        _guard_constraint_name(name): smooth_shadows[name]
+        for name in active_names
+    }
+    return loss, primary_loss, diagnostics, science_tensors, guard_rows
 
 
 def _case_isolated_transaction_tangent(baseline, scoped, local_case):
@@ -3778,21 +3795,24 @@ def _second_order_angular_iteration(
     frozen_active_names = tuple(constraints["active_full_shadow_terms"])
     if int(remaining_steps) <= 0:
         raise ValueError("g1f3 remaining_steps must be positive")
-    minimum_reduction = max(
-        (
-            float(
-                train_repair_contract[
-                    "minimum_shadow_reduction_by_guard_term"
-                ][name]
-            )
-            for name in frozen_active_names
-        ),
-        default=0.0,
-    )
     science_requirements = _finite_gap_science_requirements(constraints)
-    signed_shadow_gap = current_shadow + minimum_reduction
+    hard_margins = constraints[
+        "full_transaction_fixed_guard_shadow_margin_by_term"
+    ]
+    guard_signed_gaps = {
+        _guard_constraint_name(name): float(hard_margins[name])
+        + float(
+            train_repair_contract[
+                "minimum_shadow_reduction_by_guard_term"
+            ][name]
+        )
+        for name in frozen_active_names
+    }
     required_reduction = {
-        "shadow": signed_shadow_gap / float(remaining_steps),
+        **{
+            name: value / float(remaining_steps)
+            for name, value in guard_signed_gaps.items()
+        },
         "endpoint": float(
             science_requirements["endpoint"]["required_predicted_reduction"]
         ) / float(remaining_steps),
@@ -3801,7 +3821,7 @@ def _second_order_angular_iteration(
         ) / float(remaining_steps),
     }
     current_signed_gap = {
-        "shadow": signed_shadow_gap,
+        **guard_signed_gaps,
         "endpoint": float(
             science_requirements["endpoint"]["required_predicted_reduction"]
         ),
@@ -3819,8 +3839,6 @@ def _second_order_angular_iteration(
     )
 
     dtype = m.torch.float64
-    current64 = current.detach().to(dtype)
-    taper64 = taper.detach().to(dtype)
     baseline64 = baseline.detach().to(dtype)
     identity64 = identity.detach().to(dtype)
     batch64 = _floating_tree_to_dtype(batch, dtype)
@@ -3830,7 +3848,7 @@ def _second_order_angular_iteration(
             baseline64, trial64, local_case
         )
         candidate64 = product_exp_torch(baseline64, transaction_tangent64)
-        _, shadow64, diagnostics64, science64 = _g1d_shadow_objective(
+        _, _, diagnostics64, science64, guard_rows64 = _g1d_shadow_objective(
             model=model,
             batch=batch64,
             cfg=cfg,
@@ -3854,7 +3872,7 @@ def _second_order_angular_iteration(
                 "g1f3 expansion-point active set changed while building curvature"
             )
         return {
-            "shadow": shadow64,
+            **guard_rows64,
             "endpoint": science64["endpoint"],
             "temporal": science64["temporal"],
         }
@@ -3879,6 +3897,7 @@ def _second_order_angular_iteration(
                 taper=taper,
                 gradients=gradients,
                 metric_builder=metric_builder,
+                metric_names=tuple(gradients),
                 basis_dimension=int(
                     train_repair_contract["second_order_basis_dimension"]
                 ),
@@ -4132,14 +4151,24 @@ def _second_order_angular_iteration(
         shadow_step_tolerance = float(
             train_repair_contract["second_order_feasibility_tolerance"]
         )
-        shadow_ok = bool(
-            trial_shadow
-            <= current_shadow
-            - float(required_reduction["shadow"])
+        guard_row_names = tuple(guard_signed_gaps)
+        shadow_ok = all(
+            trial_shadow_values[name.removeprefix("guard::")]
+            <= hard_margins[name.removeprefix("guard::")]
+            - float(required_reduction[name])
             + shadow_step_tolerance
+            for name in guard_row_names
         )
         trial_signed_gap = {
-            "shadow": trial_shadow + minimum_reduction,
+            **{
+                name: trial_shadow_values[name.removeprefix("guard::")]
+                + float(
+                    train_repair_contract[
+                        "minimum_shadow_reduction_by_guard_term"
+                    ][name.removeprefix("guard::")]
+                )
+                for name in guard_row_names
+            },
             **{
                 name: (
                     float(trial_scientific[f"{name}_delta"])
@@ -4154,7 +4183,9 @@ def _second_order_angular_iteration(
             for name, value in trial_signed_gap.items()
         )
         filter_boundary_tolerance = {
-            "shadow": shadow_step_tolerance,
+            **{
+                name: shadow_step_tolerance for name in guard_row_names
+            },
             **science_step_tolerance,
         }
         filter_safe_boundary_ok = all(
@@ -4333,7 +4364,7 @@ def _second_order_angular_iteration(
         "finite_gap_science_requirements": science_requirements,
         "remaining_steps_including_current": int(remaining_steps),
         "required_step_reduction_by_term": dict(required_reduction),
-        "signed_full_shadow_gap_to_safe_boundary": signed_shadow_gap,
+        "signed_guard_row_gap_to_safe_boundary": dict(guard_signed_gaps),
         "full_shadow_before": current_shadow,
         "full_shadow_after": accepted_shadow,
         "full_shadow_reduction": (
@@ -4411,7 +4442,8 @@ def _correct_case_geodesic_joint_sqp(
             baseline, local_total, local_case
         )
         candidate = product_exp_torch(baseline, transaction_tangent)
-        _, primary_loss, constraints, science_tensors = _g1d_shadow_objective(
+        _, primary_loss, constraints, science_tensors, guard_rows = (
+            _g1d_shadow_objective(
             model=model,
             batch=batch,
             cfg=cfg,
@@ -4428,6 +4460,7 @@ def _correct_case_geodesic_joint_sqp(
                 train_repair_contract["temporal_smoothness_weight"]
             ),
             require_shadow_constraint=bool(second_order_joint_sqp),
+            )
         )
         if constraints["primary_objective"] != (
             "full_transaction_fixed_guard_shadow"
@@ -4441,16 +4474,20 @@ def _correct_case_geodesic_joint_sqp(
                 "angular_line_search_trials": [],
             })
             break
+        guard_items = list(guard_rows.items())
+        gradient_terms = [
+            guard_items[0],
+            ("endpoint", science_tensors["endpoint"]),
+            ("temporal", science_tensors["temporal"]),
+            *guard_items[1:],
+        ]
         gradients = {
-            "shadow": _autograd_gradient_or_zero(
-                primary_loss, variable, retain_graph=True
-            ),
-            "endpoint": _autograd_gradient_or_zero(
-                science_tensors["endpoint"], variable, retain_graph=True
-            ),
-            "temporal": _autograd_gradient_or_zero(
-                science_tensors["temporal"], variable, retain_graph=False
-            ),
+            name: _autograd_gradient_or_zero(
+                value,
+                variable,
+                retain_graph=index < len(gradient_terms) - 1,
+            )
+            for index, (name, value) in enumerate(gradient_terms)
         }
         if second_order_joint_sqp:
             accepted_tangent, iteration_report, iteration_numeric_failure = (
@@ -4912,7 +4949,7 @@ def _correct_case_full_transaction_shadow(
             baseline, local_total, local_case
         )
         candidate = product_exp_torch(baseline, transaction_tangent)
-        loss, primary_loss, constraints, science_tensors = _g1d_shadow_objective(
+        loss, primary_loss, constraints, science_tensors, _ = _g1d_shadow_objective(
             model=model,
             batch=batch,
             cfg=cfg,
@@ -6845,8 +6882,8 @@ def run(args):
                         second_order_feasibility_tolerance=float(
                             args.second_order_feasibility_tolerance
                         ),
-                        second_order_guard_transition_temperature=float(
-                            args.guard_smooth_max_temperature
+                        second_order_guard_transition_band=float(
+                            args.second_order_guard_transition_band
                         ),
                     )
                 )
@@ -8256,6 +8293,11 @@ def run(args):
                 "second_order_guard_transition_aggregation"
             ) if g1f3 else None
         ),
+        "second_order_guard_transition_threshold": (
+            train_shadow_contract.get(
+                "second_order_guard_transition_threshold"
+            ) if g1f3 else None
+        ),
         "second_order_model_reused_across_frozen_angles": (
             train_shadow_contract.get(
                 "second_order_model_reused_across_frozen_angles"
@@ -8685,6 +8727,9 @@ def main():
     parser.add_argument(
         "--second-order-feasibility-tolerance", type=float, default=1.0e-12
     )
+    parser.add_argument(
+        "--second-order-guard-transition-band", type=float, default=1.0e-5
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -8801,6 +8846,8 @@ def main():
         parser.error("second-order grid levels must be odd and >=3")
     if args.second_order_feasibility_tolerance < 0.0:
         parser.error("second-order feasibility tolerance must be non-negative")
+    if not 0.0 < args.second_order_guard_transition_band <= 1.0e-5:
+        parser.error("second-order Guard transition band must be in (0, 1e-5]")
     if (
         args.activation_aware_g1f2
         and args.evaluation_role != "train_calibration"

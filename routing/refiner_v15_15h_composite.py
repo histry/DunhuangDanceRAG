@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v1"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v1"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v2"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v2"
 _CACHE = {}
 
 
@@ -70,14 +70,17 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get("second_order_model_builds_per_iteration") == 1,
              "V15.15h curvature model is rebuilt per angle")
     _require(fixed.get("second_order_guard_transition_bundle") ==
-             "all_fixed_guard_terms_within_frozen_band_of_hard_max",
+             "strict_authoritative_margin_guard_rows",
              "V15.15h Guard transition bundle changed")
     _require(float(fixed.get("second_order_guard_transition_band", 0.0)) ==
-             1.0e-3,
+             1.0e-5,
              "V15.15h Guard transition band changed")
     _require(fixed.get("second_order_guard_transition_aggregation") ==
-             "frozen_bundle_logsumexp",
+             "independent_row_wise_qcqp",
              "V15.15h Guard transition aggregation changed")
+    _require(fixed.get("second_order_guard_transition_threshold") ==
+             "hard_margin_greater_equal_max_zero_and_hard_max_minus_band",
+             "V15.15h Guard transition threshold changed")
     _require(fixed.get("second_order_grid_execution_device") ==
              "same_cuda_device_as_motion",
              "V15.15h candidate grid is not device-resident")
@@ -463,33 +466,45 @@ def _apply_one_transaction(
                     name: float(value.detach())
                     for name, value in expansion_terms["guard_terms"].items()
                 }
-                maximum_guard = max(guard_float.values())
-                active_names = tuple(sorted(
-                    name for name, value in guard_float.items()
-                    if value >= maximum_guard - guard_transition_band
+                active_names = tuple(g1f._select_second_order_guard_rows(
+                    guard_float, guard_transition_band
                 ))
-                smooth_shadow = g1f._smooth_logsumexp(
-                    m.torch.stack([
-                        expansion_terms["guard_terms"][name]
-                        for name in active_names
-                    ]),
-                    guard_transition_band,
-                )
                 scalar_terms = {
-                    "shadow": smooth_shadow,
+                    **{
+                        g1f._guard_constraint_name(name):
+                            expansion_terms["guard_terms"][name]
+                        for name in active_names
+                    },
                     "endpoint": expansion_terms["endpoint"],
                     "temporal": expansion_terms["temporal"],
                 }
                 authoritative_scalar_terms = {
-                    "shadow": maximum_guard,
+                    **{
+                        g1f._guard_constraint_name(name): guard_float[name]
+                        for name in active_names
+                    },
                     "endpoint": float(expansion_terms["endpoint"].detach()),
                     "temporal": float(expansion_terms["temporal"].detach()),
                 }
                 gradients = {}
-                for index, name in enumerate(("shadow", "endpoint", "temporal")):
+                guard_constraint_names = tuple(
+                    g1f._guard_constraint_name(name) for name in active_names
+                )
+                gradient_names = (
+                    (
+                        guard_constraint_names[0],
+                        "endpoint",
+                        "temporal",
+                        *guard_constraint_names[1:],
+                    )
+                    if guard_constraint_names
+                    else ("endpoint", "temporal")
+                )
+                for index, name in enumerate(gradient_names):
                     gradients[name] = m.torch.autograd.grad(
                         scalar_terms[name], variable,
-                        retain_graph=index < 2, allow_unused=True,
+                        retain_graph=index < len(gradient_names) - 1,
+                        allow_unused=True,
                     )[0]
                 if any(value is None for value in gradients.values()):
                     report["attempts"].append({
@@ -512,13 +527,11 @@ def _apply_one_transaction(
                         cfg,
                     )
                     return {
-                        "shadow": g1f._smooth_logsumexp(
-                            m.torch.stack([
+                        **{
+                            g1f._guard_constraint_name(name):
                                 values["guard_terms"][name]
-                                for name in frozen_active_names
-                            ]),
-                            guard_transition_band,
-                        ),
+                            for name in frozen_active_names
+                        },
                         "endpoint": values["endpoint"],
                         "temporal": values["temporal"],
                     }
@@ -543,6 +556,7 @@ def _apply_one_transaction(
                             metric_builder=metric_builder,
                             basis_dimension=basis_dimension,
                             direction_norm_floor=1.0e-8,
+                            metric_names=tuple(scalar_terms),
                         )
                     )
                 except (RuntimeError, ValueError, FloatingPointError) as exc:
@@ -666,10 +680,12 @@ def _apply_one_transaction(
                         and scope_leakage == 0.0
                     )
                     trial_scalar = {
-                        "shadow": max(
-                            float(value.detach())
-                            for value in trial_terms["guard_terms"].values()
-                        ),
+                        **{
+                            g1f._guard_constraint_name(name): float(
+                                trial_terms["guard_terms"][name].detach()
+                            )
+                            for name in frozen_active_names
+                        },
                         "endpoint": float(trial_terms["endpoint"].detach()),
                         "temporal": float(trial_terms["temporal"].detach()),
                     }

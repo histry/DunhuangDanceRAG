@@ -87,6 +87,7 @@ COMMON_ARGS=(
   --second-order-basis-dimension 3
   --second-order-grid-levels 9
   --second-order-feasibility-tolerance 1e-12
+  --second-order-guard-transition-band 1e-5
   --steps 2 3 5
   --target-rms 1e-4
 )

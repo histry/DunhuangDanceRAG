@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v1"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v1"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v2"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v2"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -103,14 +103,17 @@ def _unchanged_contract(report):
     _require(report.get("second_order_model_builds_per_iteration") == 1,
              "second-order curvature model is rebuilt per angle")
     _require(report.get("second_order_guard_transition_bundle") ==
-             "all_fixed_guard_terms_within_frozen_band_of_hard_max",
+             "strict_authoritative_margin_guard_rows",
              "second-order Guard transition bundle changed")
     _require(float(report.get("second_order_guard_transition_band", 0.0)) ==
-             1.0e-3,
+             1.0e-5,
              "second-order Guard transition band changed")
     _require(report.get("second_order_guard_transition_aggregation") ==
-             "frozen_bundle_logsumexp",
+             "independent_row_wise_qcqp",
              "second-order Guard transition aggregation changed")
+    _require(report.get("second_order_guard_transition_threshold") ==
+             "hard_margin_greater_equal_max_zero_and_hard_max_minus_band",
+             "second-order Guard transition threshold changed")
     _require(report.get(
         "second_order_model_reused_across_frozen_angles"
     ) is True, "second-order curvature model is not reused")
@@ -406,6 +409,9 @@ def freeze_contract(args):
             ),
             "second_order_guard_transition_aggregation": repair[
                 "second_order_guard_transition_aggregation"
+            ],
+            "second_order_guard_transition_threshold": repair[
+                "second_order_guard_transition_threshold"
             ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":

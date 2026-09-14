@@ -15,7 +15,7 @@ acceleration term; it is not merely ``q.T @ H @ q`` in a flat coordinate.
 from __future__ import annotations
 
 import math
-from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 from training import motion_models as m
 
@@ -97,8 +97,7 @@ def build_owned_tangent_basis(
     active = mask & (taper64.abs() > float(floor))
     rows = []
     source_names = []
-    for name in ("shadow", "endpoint", "temporal"):
-        gradient = gradients.get(name)
+    for name, gradient in gradients.items():
         if gradient is None:
             continue
         gradient64 = gradient.detach().to(dtype)
@@ -590,7 +589,7 @@ def _deterministic_unit_grid(dimension: int, levels: int, *, device):
 
 def _quadratic_changes(models, directions, theta):
     """Evaluate every frozen second-order constraint on device."""
-    names = ("shadow", "endpoint", "temporal")
+    names = tuple(models)
     first = m.torch.stack([models[name]["first"] for name in names])
     hessian = m.torch.stack([models[name]["hessian"] for name in names])
     linear = directions @ first.transpose(0, 1)
@@ -646,7 +645,7 @@ def _continuous_joint_sqp_refinement(
     line_search = current.new_tensor(
         SECOND_ORDER_SQP_LINE_SEARCH_RADIANS
     )
-    names = ("shadow", "endpoint", "temporal")
+    names = tuple(models)
     first = m.torch.stack([models[name]["first"] for name in names])
     hessian = m.torch.stack([models[name]["hessian"] for name in names])
 
@@ -748,10 +747,13 @@ def solve_angle_subproblem(
     restoration_required_reduction: Mapping[str, float] | None = None,
 ):
     """Solve the frozen-angle joint quadratic model on the unit sphere."""
-    names = ("shadow", "endpoint", "temporal")
-    dimension = int(models["shadow"]["first"].numel())
+    names = tuple(models)
+    if not names:
+        raise ValueError("second-order subproblem requires at least one constraint")
+    first_name = names[0]
+    dimension = int(models[first_name]["first"].numel())
     coarse_directions = _deterministic_unit_grid(
-        dimension, int(grid_levels), device=models["shadow"]["first"].device
+        dimension, int(grid_levels), device=models[first_name]["first"].device
     )
     theta = float(theta_radians)
     required = coarse_directions.new_tensor([
@@ -900,11 +902,8 @@ def solve_angle_subproblem(
     indices = m.torch.nonzero(feasible, as_tuple=False).reshape(-1)
     feasible_rows = directions.index_select(0, indices)
     feasible_changes = changes.index_select(0, indices)
-    shadow, endpoint, temporal = (
-        feasible_changes[:, index] for index in range(3)
-    )
     # Deterministic lexicographic ordering: strongest worst-constraint closure,
-    # then shadow, endpoint, temporal, and finally the grid order.
+    # then each independent constraint row, and finally the grid order.
     normalized = (
         feasible_changes + required.unsqueeze(0)
     ) / scales.unsqueeze(0)
@@ -914,12 +913,11 @@ def solve_angle_subproblem(
     remaining = m.torch.arange(
         indices.numel(), dtype=m.torch.long, device=indices.device
     )
-    for values in (worst, shadow, endpoint, temporal):
+    for values in (worst, *feasible_changes.unbind(dim=1)):
         selected_values = values.index_select(0, remaining)
         minimum = selected_values.amin()
         remaining = remaining[selected_values == minimum]
     chosen_local_tensor = remaining.amin()
-    chosen_local = int(chosen_local_tensor.detach())
     chosen_global_tensor = indices[chosen_local_tensor]
     chosen_global = int(chosen_global_tensor.detach())
     coefficients = feasible_rows[chosen_local_tensor]
@@ -944,6 +942,7 @@ def solve_angle_subproblem(
         "restoration_candidate": False,
         "selected_candidate_index": chosen_global,
         "selected_active_constraints": active,
+        "constraint_names": list(names),
         "predicted_change_by_term": selected_changes,
         "required_reduction_by_term": required_audit,
         "constraint_scale_by_term": {
@@ -963,6 +962,7 @@ def prepare_second_order_subproblem(
     metric_builder,
     basis_dimension,
     direction_norm_floor,
+    metric_names=None,
 ):
     """Build one curvature model for reuse by every frozen angle."""
     basis, basis_audit = build_owned_tangent_basis(
@@ -981,6 +981,7 @@ def prepare_second_order_subproblem(
         mask=mask,
         basis=basis,
         metric_builder=metric_builder,
+        names=tuple(metric_names or gradients),
     )
     if models is None:
         return None, {**basis_audit, **curvature_audit}
@@ -1091,6 +1092,7 @@ def second_order_direction_for_angle(
     feasibility_tolerance,
     permit_restoration_candidate=False,
     restoration_required_reduction=None,
+    metric_names=None,
 ):
     """Build and solve one frozen-angle g1f3 joint subproblem."""
     prepared, preparation_audit = prepare_second_order_subproblem(
@@ -1101,6 +1103,7 @@ def second_order_direction_for_angle(
         metric_builder=metric_builder,
         basis_dimension=int(basis_dimension),
         direction_norm_floor=float(direction_norm_floor),
+        metric_names=metric_names,
     )
     if prepared is None:
         return None, {
