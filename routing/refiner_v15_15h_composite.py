@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v5"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v5"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v6"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v6"
 _CACHE = {}
 
 
@@ -67,8 +67,9 @@ def _load_composite(model_path, contract_path, cfg):
              "V15.15h curvature dtype changed")
     _require(fixed.get("geodesic_acceleration_included") is True,
              "V15.15h geodesic acceleration is absent")
-    _require(fixed.get("second_order_model_builds_per_iteration") == 1,
-             "V15.15h curvature model is rebuilt per angle")
+    _require(fixed.get("second_order_model_builds_per_iteration") ==
+             "one_per_frozen_bundle_generation_round",
+             "V15.15h curvature build policy changed")
     _require(fixed.get("second_order_guard_transition_bundle") ==
              "all_violated_plus_strict_frontier_guard_rows",
              "V15.15h Guard transition bundle changed")
@@ -82,15 +83,34 @@ def _load_composite(model_path, contract_path, cfg):
              "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band",
              "V15.15h Guard transition threshold changed")
     _require(fixed.get("second_order_active_set_constraint_generation") ==
-             "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild",
+             "authoritative_trial_new_positive_guard_rows_or_internal_"
+             "witnesses_same_expansion_rebuild_no_step",
              "V15.15h active-set constraint generation changed")
     _require(fixed.get(
         "second_order_active_set_constraint_generation_termination"
-    ) == "strict_new_guard_row_from_finite_contract_universe",
+    ) == "strict_new_guard_row_or_internal_witness_from_finite_"
+         "transaction_case_frame_joint_window_universe",
              "V15.15h active-set generation termination changed")
     _require(fixed.get("second_order_physical_guard_row_scope") ==
              "edited_case_exact_signed_margin_no_cross_case_softmax",
              "V15.15h physical Guard row scope changed")
+    _require(fixed.get("second_order_internal_witness_bundle") ==
+             "frozen_argmax_linear_p95_pair_active_window_p95_and_"
+             "boundary_support",
+             "V15.15h internal witness bundle changed")
+    _require(fixed.get("second_order_internal_witness_aggregation") ==
+             "independent_qcqp_rows_no_logsumexp",
+             "V15.15h internal witness aggregation changed")
+    _require(fixed.get("second_order_internal_witness_transition") ==
+             "reject_trial_add_new_witness_rebuild_same_expansion_no_"
+             "correction_step",
+             "V15.15h internal witness transition changed")
+    _require(fixed.get("second_order_internal_witness_universe") ==
+             "finite_transaction_case_frame_joint_quantile_pair_window_set",
+             "V15.15h internal witness universe changed")
+    _require(fixed.get(
+        "second_order_internal_witnesses_frozen_across_curvature_evaluations"
+    ) is True, "V15.15h internal witnesses are not curvature-frozen")
     _require(fixed.get("runtime_proxy_guard_row_policy") ==
              "complete_five_row_observable_proxy_universe",
              "V15.15h runtime proxy Guard row policy changed")
@@ -288,8 +308,13 @@ def _severity(model_input, cfg):
 
 
 def _science_terms(candidate, baseline, seam, cfg):
-    _, terms = m._observable_refiner_objective(
-        candidate, baseline.detach(), seam, cfg, reduction="none"
+    _, terms, witness_context = m._observable_refiner_objective(
+        candidate,
+        baseline.detach(),
+        seam,
+        cfg,
+        reduction="none",
+        return_witness_context=True,
     )
     return {
         "endpoint": terms["endpoint_scientific_deficit"][0],
@@ -297,6 +322,8 @@ def _science_terms(candidate, baseline, seam, cfg):
         "guard_terms": {
             name: terms[key][0] for name, key in g1f.G1_GUARD_PROXY_TERMS.items()
         },
+        "case_terms": terms,
+        "witness_context": witness_context,
     }
 
 
@@ -466,7 +493,9 @@ def _apply_one_transaction(
         for budget in (2, 3, 5):
             report["budgets_attempted"].append(budget)
             budget_current = current.clone()
-            for iteration in range(budget):
+            iteration = 0
+            frozen_internal_witnesses = None
+            while iteration < budget:
                 variable = m.torch.zeros_like(budget_current).requires_grad_(True)
                 local_physical = (budget_current + taper * variable).masked_fill(
                     ~mask, 0.0
@@ -481,27 +510,50 @@ def _apply_one_transaction(
                 }
                 maximum_guard = max(guard_float.values())
                 active_names = _runtime_proxy_guard_rows(guard_float)
+                if frozen_internal_witnesses is None:
+                    frozen_internal_witnesses = (
+                        second_order.freeze_internal_guard_witnesses(
+                            prediction=expansion,
+                            seam=batch["seam"],
+                            cfg=cfg,
+                            local_case=0,
+                            guard_names=active_names,
+                            witness_sources=expansion_terms[
+                                "witness_context"
+                            ],
+                        )
+                    )
+                witness_rows, witness_row_metadata = (
+                    second_order.evaluate_internal_guard_witness_rows(
+                        prediction=expansion,
+                        reference=baseline,
+                        seam=batch["seam"],
+                        cfg=cfg,
+                        case_terms=expansion_terms["case_terms"],
+                        local_case=0,
+                        witnesses=frozen_internal_witnesses,
+                        witness_sources=expansion_terms["witness_context"],
+                    )
+                )
+                witness_rows = dict(sorted(
+                    witness_rows.items(),
+                    key=lambda item: (-float(item[1].detach()), item[0]),
+                ))
                 scalar_terms = {
-                    **{
-                        g1f._guard_constraint_name(name):
-                            expansion_terms["guard_terms"][name]
-                        for name in active_names
-                    },
+                    **witness_rows,
                     "endpoint": expansion_terms["endpoint"],
                     "temporal": expansion_terms["temporal"],
                 }
                 authoritative_scalar_terms = {
                     **{
-                        g1f._guard_constraint_name(name): guard_float[name]
-                        for name in active_names
+                        name: float(value.detach())
+                        for name, value in witness_rows.items()
                     },
                     "endpoint": float(expansion_terms["endpoint"].detach()),
                     "temporal": float(expansion_terms["temporal"].detach()),
                 }
                 gradients = {}
-                guard_constraint_names = tuple(
-                    g1f._guard_constraint_name(name) for name in active_names
-                )
+                guard_constraint_names = tuple(witness_rows)
                 gradient_names = (
                     (
                         guard_constraint_names[0],
@@ -527,6 +579,7 @@ def _apply_one_transaction(
                     })
                     break
                 frozen_active_names = active_names
+                frozen_witness_rows = tuple(witness_rows)
 
                 def metric_builder(trial64):
                     candidate64 = product_exp_torch(
@@ -538,12 +591,28 @@ def _apply_one_transaction(
                         batch["seam"].to(m.torch.float64),
                         cfg,
                     )
+                    trial_witness_rows, _ = (
+                        second_order.evaluate_internal_guard_witness_rows(
+                            prediction=candidate64,
+                            reference=baseline.to(m.torch.float64),
+                            seam=batch["seam"].to(m.torch.float64),
+                            cfg=cfg,
+                            case_terms=values["case_terms"],
+                            local_case=0,
+                            witnesses=frozen_internal_witnesses,
+                            witness_sources=values["witness_context"],
+                        )
+                    )
+                    if set(trial_witness_rows) != set(frozen_witness_rows):
+                        raise RuntimeError(
+                            "runtime internal witness rows changed during curvature"
+                        )
+                    trial_witness_rows = {
+                        name: trial_witness_rows[name]
+                        for name in frozen_witness_rows
+                    }
                     return {
-                        **{
-                            g1f._guard_constraint_name(name):
-                                values["guard_terms"][name]
-                            for name in frozen_active_names
-                        },
+                        **trial_witness_rows,
                         "endpoint": values["endpoint"],
                         "temporal": values["temporal"],
                     }
@@ -599,6 +668,7 @@ def _apply_one_transaction(
                     })
                     break
                 accepted_step = False
+                rebuild_same_expansion = False
                 for angle_index, theta in enumerate(angular):
                     try:
                         direction, solver = second_order.solve_prepared_second_order_angle(
@@ -627,6 +697,9 @@ def _apply_one_transaction(
                         "theta_radians": theta,
                         "prediction_active_guard_terms": list(
                             frozen_active_names
+                        ),
+                        "prediction_internal_witness_row_metadata": (
+                            witness_row_metadata
                         ),
                         "remaining_steps_including_current": remaining_steps,
                         "required_step_reduction_by_term": dict(required),
@@ -663,6 +736,41 @@ def _apply_one_transaction(
                     trial_terms = _science_terms(
                         trial_tensor, baseline, batch["seam"], cfg
                     )
+                    discovered_internal_witnesses = (
+                        second_order.freeze_internal_guard_witnesses(
+                            prediction=trial_tensor,
+                            seam=batch["seam"],
+                            cfg=cfg,
+                            local_case=0,
+                            guard_names=frozen_active_names,
+                            witness_sources=trial_terms["witness_context"],
+                        )
+                    )
+                    (
+                        expanded_internal_witnesses,
+                        newly_exposed_internal_witnesses,
+                    ) = second_order.merge_internal_guard_witnesses(
+                        frozen_internal_witnesses,
+                        discovered_internal_witnesses,
+                    )
+                    if newly_exposed_internal_witnesses:
+                        frozen_internal_witnesses = (
+                            expanded_internal_witnesses
+                        )
+                        rebuild_same_expansion = True
+                        attempt.update({
+                            "state": "active_set_transition_model_mismatch",
+                            "reason": "new_internal_guard_witness",
+                            "internal_active_witness_transition": True,
+                            "newly_exposed_internal_witnesses": (
+                                newly_exposed_internal_witnesses
+                            ),
+                            "constraint_generation_consumed_correction_step": (
+                                False
+                            ),
+                        })
+                        report["attempts"].append(attempt)
+                        break
                     authoritative_active = max(
                         sorted(trial_terms["guard_terms"]),
                         key=lambda name: float(
@@ -700,10 +808,21 @@ def _apply_one_transaction(
                     )
                     trial_scalar = {
                         **{
-                            g1f._guard_constraint_name(name): float(
-                                trial_terms["guard_terms"][name].detach()
-                            )
-                            for name in frozen_active_names
+                            name: float(value.detach())
+                            for name, value in (
+                                second_order.evaluate_internal_guard_witness_rows(
+                                    prediction=trial_tensor,
+                                    reference=baseline,
+                                    seam=batch["seam"],
+                                    cfg=cfg,
+                                    case_terms=trial_terms["case_terms"],
+                                    local_case=0,
+                                    witnesses=frozen_internal_witnesses,
+                                    witness_sources=trial_terms[
+                                        "witness_context"
+                                    ],
+                                )[0]
+                            ).items()
                         },
                         "endpoint": float(trial_terms["endpoint"].detach()),
                         "temporal": float(trial_terms["temporal"].detach()),
@@ -856,8 +975,12 @@ def _apply_one_transaction(
                         budget_current = trial.detach()
                         accepted_step = True
                         break
+                if rebuild_same_expansion:
+                    continue
                 if not accepted_step:
                     break
+                frozen_internal_witnesses = None
+                iteration += 1
 
         report["reason"] = (
             report["attempts"][-1]["state"]

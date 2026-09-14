@@ -59,7 +59,9 @@ owned sphere tangent; the ambient Hessian is never formed.  The frozen active
 indices are prediction-only and every trial is accepted solely by the complete
 authoritative Guard.  Scientific success is reported only after the composite
 selector and Projector audit close, never merely because a nonzero correction
-was produced.
+was produced. Physical max/linear-p95/window-p95 witnesses are independent
+QCQP rows; a real trial that exposes a new discrete witness is rejected and
+rebuilds curvature at the same expansion without consuming a correction step.
 """
 from __future__ import annotations
 
@@ -128,10 +130,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v5"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v6"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v5"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v6"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -1140,15 +1142,35 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_active_set_constraint_generation": (
-            "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild"
+            "authoritative_trial_new_positive_guard_rows_or_internal_"
+            "witnesses_same_expansion_rebuild_no_step"
             if second_order_joint_sqp else None
         ),
         "second_order_active_set_constraint_generation_termination": (
-            "strict_new_guard_row_from_finite_contract_universe"
+            "strict_new_guard_row_or_internal_witness_from_finite_"
+            "transaction_case_frame_joint_window_universe"
             if second_order_joint_sqp else None
         ),
         "second_order_physical_guard_row_scope": (
             "edited_case_exact_signed_margin_no_cross_case_softmax"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_internal_witness_bundle": (
+            "frozen_argmax_linear_p95_pair_active_window_p95_and_"
+            "boundary_support"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_internal_witness_aggregation": (
+            "independent_qcqp_rows_no_logsumexp"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_internal_witness_transition": (
+            "reject_trial_add_new_witness_rebuild_same_expansion_no_"
+            "correction_step"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_internal_witness_universe": (
+            "finite_transaction_case_frame_joint_quantile_pair_window_set"
             if second_order_joint_sqp else None
         ),
         "curvature_dtype": "float64" if second_order_joint_sqp else None,
@@ -1167,9 +1189,13 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_model_builds_per_iteration": (
-            1 if second_order_joint_sqp else None
+            "one_per_frozen_bundle_generation_round"
+            if second_order_joint_sqp else None
         ),
         "second_order_model_reused_across_frozen_angles": (
+            True if second_order_joint_sqp else None
+        ),
+        "second_order_internal_witnesses_frozen_across_curvature_evaluations": (
             True if second_order_joint_sqp else None
         ),
         "second_order_grid_execution_device": (
@@ -1493,6 +1519,7 @@ def _g1d_shadow_objective(
     train_repair_contract,
     temporal_smoothness_weight,
     prediction_active_names=None,
+    prediction_internal_witnesses=None,
     require_shadow_constraint=False,
 ):
     hard_shadows, hard_values, limits = (
@@ -1537,13 +1564,19 @@ def _g1d_shadow_objective(
                 "frozen prediction Guard terms are unavailable: "
                 f"{unexpected}"
             )
-    _, case_terms = m._observable_refiner_objective(
+    objective_result = m._observable_refiner_objective(
         candidate,
         baseline.detach(),
         batch["seam"],
         cfg,
         reduction="none",
+        return_witness_context=bool(require_shadow_constraint),
     )
+    if require_shadow_constraint:
+        _, case_terms, witness_context = objective_result
+    else:
+        _, case_terms = objective_result
+        witness_context = None
     science_terms = oracle.case_probe._case_terms(candidate, batch, cfg)
     science_tensors = {
         key: science_terms[key][int(local_case)]
@@ -1581,6 +1614,70 @@ def _g1d_shadow_objective(
             - float(limits[name]["absolute_limit"])
             - float(limits[name]["numeric_tolerance"])
         )
+    local_group = m.REFINER_GROUP_LABELS[
+        int(batch["group"][int(local_case)])
+    ]
+    witness_guard_names = tuple(
+        name
+        for name in active_names
+        if name.split(".", 1)[0] == local_group
+        and name.split(".", 1)[-1]
+        in second_order.INTERNAL_GUARD_WITNESS_SUFFIXES
+    )
+    if require_shadow_constraint:
+        if prediction_internal_witnesses is None:
+            internal_witnesses = second_order.freeze_internal_guard_witnesses(
+                prediction=candidate,
+                seam=batch["seam"],
+                cfg=cfg,
+                local_case=local_case,
+                guard_names=witness_guard_names,
+                witness_sources=witness_context,
+            )
+        else:
+            internal_witnesses = {
+                str(name): [dict(row) for row in rows]
+                for name, rows in prediction_internal_witnesses.items()
+            }
+            unexpected_witness_terms = sorted(
+                set(internal_witnesses) - set(witness_guard_names)
+            )
+            if unexpected_witness_terms:
+                raise RuntimeError(
+                    "frozen internal witnesses target unavailable Guard rows: "
+                    f"{unexpected_witness_terms}"
+                )
+            missing_witness_terms = sorted(
+                set(witness_guard_names) - set(internal_witnesses)
+            )
+            if missing_witness_terms:
+                raise RuntimeError(
+                    "supported physical Guard rows have no frozen internal "
+                    f"witness: {missing_witness_terms}"
+                )
+        internal_rows, internal_metadata = (
+            second_order.evaluate_internal_guard_witness_rows(
+                prediction=candidate,
+                reference=baseline,
+                seam=batch["seam"],
+                cfg=cfg,
+                case_terms=case_terms,
+                local_case=local_case,
+                witnesses=internal_witnesses,
+                witness_sources=witness_context,
+            )
+        )
+        for row_name, value in list(internal_rows.items()):
+            base_name = internal_metadata[row_name]["base_guard_name"]
+            internal_rows[row_name] = (
+                value
+                - float(limits[base_name]["absolute_limit"])
+                - float(limits[base_name]["numeric_tolerance"])
+            )
+    else:
+        internal_witnesses = {}
+        internal_rows = {}
+        internal_metadata = {}
     smoothness = _tangent_temporal_smoothness(local_tangent, local_mask)
     if active_names:
         primary = "full_transaction_fixed_guard_shadow"
@@ -1616,6 +1713,20 @@ def _g1d_shadow_objective(
             "edited_case_exact_signed_margin_no_cross_case_softmax"
             if require_shadow_constraint else None
         ),
+        "prediction_internal_witness_bundle": (
+            internal_witnesses if require_shadow_constraint else None
+        ),
+        "prediction_internal_witness_row_metadata": (
+            internal_metadata if require_shadow_constraint else None
+        ),
+        "prediction_internal_witness_row_margin": {
+            name: float(value.detach())
+            for name, value in internal_rows.items()
+        } if require_shadow_constraint else None,
+        "prediction_internal_witness_aggregation": (
+            "independent_qcqp_rows_no_logsumexp"
+            if require_shadow_constraint else None
+        ),
         "prediction_guard_transition_band": (
             float(
                 train_repair_contract[
@@ -1644,10 +1755,25 @@ def _g1d_shadow_objective(
         ),
         "temporal_smoothness": float(smoothness.detach()),
     }
-    guard_rows = {
-        _guard_constraint_name(name): smooth_shadows[name]
-        for name in active_names
-    }
+    guard_rows = {}
+    for name in active_names:
+        witness_names = sorted(
+            (
+                row_name
+                for row_name, metadata in internal_metadata.items()
+                if metadata["base_guard_name"] == name
+            ),
+            key=lambda row_name: (
+                -float(internal_rows[row_name].detach()), row_name
+            ),
+        )
+        if witness_names:
+            guard_rows.update({
+                row_name: internal_rows[row_name]
+                for row_name in witness_names
+            })
+        else:
+            guard_rows[_guard_constraint_name(name)] = smooth_shadows[name]
     return loss, primary_loss, diagnostics, science_tensors, guard_rows
 
 
@@ -3892,20 +4018,50 @@ def _second_order_angular_iteration(
         constraints["maximum_full_transaction_fixed_guard_shadow_margin"]
     )
     frozen_active_names = tuple(constraints["active_full_shadow_terms"])
+    frozen_internal_witnesses = {
+        str(name): [dict(row) for row in rows]
+        for name, rows in (
+            constraints.get("prediction_internal_witness_bundle") or {}
+        ).items()
+    }
+    internal_row_metadata = (
+        constraints.get("prediction_internal_witness_row_metadata") or {}
+    )
     if int(remaining_steps) <= 0:
         raise ValueError("g1f3 remaining_steps must be positive")
     science_requirements = _finite_gap_science_requirements(constraints)
     hard_margins = constraints[
         "full_transaction_fixed_guard_shadow_margin_by_term"
     ]
+    guard_constraint_names = tuple(
+        name for name in gradients if name not in {"endpoint", "temporal"}
+    )
+    guard_row_base_name = {}
+    current_guard_row_margin = {}
+    internal_row_margin = (
+        constraints.get("prediction_internal_witness_row_margin") or {}
+    )
+    for row_name in guard_constraint_names:
+        if row_name in internal_row_metadata:
+            base_name = internal_row_metadata[row_name]["base_guard_name"]
+            row_margin = float(internal_row_margin[row_name])
+        else:
+            base_name = row_name.removeprefix("guard::")
+            if base_name not in frozen_active_names:
+                raise RuntimeError(
+                    f"unknown frozen Guard constraint row: {row_name}"
+                )
+            row_margin = float(hard_margins[base_name])
+        guard_row_base_name[row_name] = base_name
+        current_guard_row_margin[row_name] = row_margin
     guard_signed_gaps = {
-        _guard_constraint_name(name): float(hard_margins[name])
+        row_name: current_guard_row_margin[row_name]
         + float(
             train_repair_contract[
                 "minimum_shadow_reduction_by_guard_term"
-            ][name]
+            ][guard_row_base_name[row_name]]
         )
-        for name in frozen_active_names
+        for row_name in guard_constraint_names
     }
     authoritative_full_shadow_margin = max(
         float(
@@ -3978,6 +4134,7 @@ def _second_order_angular_iteration(
             train_repair_contract=train_repair_contract,
             temporal_smoothness_weight=0.0,
             prediction_active_names=frozen_active_names,
+            prediction_internal_witnesses=frozen_internal_witnesses,
             require_shadow_constraint=True,
         )
         if tuple(diagnostics64["active_full_shadow_terms"]) != (
@@ -3985,6 +4142,12 @@ def _second_order_angular_iteration(
         ):
             raise RuntimeError(
                 "g1f3 expansion-point active set changed while building curvature"
+            )
+        if diagnostics64.get("prediction_internal_witness_bundle") != (
+            frozen_internal_witnesses
+        ):
+            raise RuntimeError(
+                "g1f3 internal witness bundle changed while building curvature"
             )
         return {
             **guard_rows64,
@@ -4198,9 +4361,20 @@ def _second_order_angular_iteration(
         trial_candidate = product_exp_torch(
             baseline, trial_transaction_tangent
         )
-        trial_case_terms = oracle.case_probe._case_terms(
-            trial_candidate, batch, cfg
+        _, trial_objective_terms, trial_witness_context = (
+            m._observable_refiner_objective(
+                trial_candidate,
+                baseline.detach(),
+                batch["seam"],
+                cfg,
+                reduction="none",
+                return_witness_context=True,
+            )
         )
+        trial_case_terms = {
+            name: trial_objective_terms[f"{name}_scientific_deficit"]
+            for name in ("endpoint", "temporal")
+        }
         trial_scientific = oracle._case_scientific_status(
             {
                 key: float(
@@ -4240,17 +4414,38 @@ def _second_order_angular_iteration(
             for name in ("endpoint", "temporal")
         )
         with m.torch.no_grad():
-            trial_shadows, _, _ = _full_transaction_fixed_guard_shadows(
-                model,
-                batch,
-                cfg,
-                trial_candidate,
-                identity,
-                contract,
+            (
+                _,
+                _,
+                trial_guard_diagnostics,
+                _,
+                trial_frozen_witness_rows,
+            ) = _g1d_shadow_objective(
+                model=model,
+                batch=batch,
+                cfg=cfg,
+                baseline=baseline,
+                identity=identity,
+                candidate=trial_candidate,
+                contract=contract,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                local_tangent=trial,
+                local_mask=mask,
+                train_repair_contract=train_repair_contract,
+                temporal_smoothness_weight=0.0,
+                prediction_active_names=frozen_active_names,
+                prediction_internal_witnesses=frozen_internal_witnesses,
+                require_shadow_constraint=True,
             )
-            trial_shadow_values = {
+            trial_shadow_values = dict(
+                trial_guard_diagnostics[
+                    "full_transaction_fixed_guard_shadow_margin_by_term"
+                ]
+            )
+            trial_frozen_witness_values = {
                 name: float(value.detach())
-                for name, value in trial_shadows.items()
+                for name, value in trial_frozen_witness_rows.items()
             }
         trial_active_names = tuple(sorted(
             name for name, value in trial_shadow_values.items() if value > 0.0
@@ -4261,6 +4456,41 @@ def _second_order_angular_iteration(
         active_transition = (
             trial_active_names != expansion_authoritative_active_names
         )
+        local_group = m.REFINER_GROUP_LABELS[
+            int(batch["group"][int(local_case)])
+        ]
+        discoverable_guard_names = tuple(
+            name
+            for name in dict.fromkeys((
+                *frozen_active_names,
+                *trial_active_names,
+            ))
+            if name.split(".", 1)[0] == local_group
+            and name.split(".", 1)[-1]
+            in second_order.INTERNAL_GUARD_WITNESS_SUFFIXES
+        )
+        discovered_internal_witnesses = (
+            second_order.freeze_internal_guard_witnesses(
+                prediction=trial_candidate,
+                seam=batch["seam"],
+                cfg=cfg,
+                local_case=local_case,
+                guard_names=discoverable_guard_names,
+                witness_sources=trial_witness_context,
+            )
+        )
+        _, newly_exposed_internal_witnesses = (
+            second_order.merge_internal_guard_witnesses(
+                frozen_internal_witnesses,
+                discovered_internal_witnesses,
+            )
+        )
+        internal_witness_transition = bool(
+            newly_exposed_internal_witnesses
+        )
+        active_transition = bool(
+            active_transition or internal_witness_transition
+        )
         any_active_transition = any_active_transition or active_transition
         trial_shadow = max(trial_shadow_values.values())
         shadow_step_tolerance = float(
@@ -4268,8 +4498,8 @@ def _second_order_angular_iteration(
         )
         guard_row_names = tuple(guard_signed_gaps)
         row_wise_shadow_ok = all(
-            trial_shadow_values[name.removeprefix("guard::")]
-            <= hard_margins[name.removeprefix("guard::")]
+            trial_frozen_witness_values[name]
+            <= current_guard_row_margin[name]
             - float(required_reduction[name])
             + shadow_step_tolerance
             for name in guard_row_names
@@ -4288,11 +4518,11 @@ def _second_order_angular_iteration(
         )
         trial_signed_gap = {
             **{
-                name: trial_shadow_values[name.removeprefix("guard::")]
+                name: trial_frozen_witness_values[name]
                 + float(
                     train_repair_contract[
                         "minimum_shadow_reduction_by_guard_term"
-                    ][name.removeprefix("guard::")]
+                    ][guard_row_base_name[name]]
                 )
                 for name in guard_row_names
             },
@@ -4385,6 +4615,8 @@ def _second_order_angular_iteration(
             failed_constraints.append("exact_radius")
         if not scope_ok:
             failed_constraints.append("scope")
+        if internal_witness_transition:
+            failed_constraints.append("internal_active_witness_transition")
         if failed_constraints:
             reason = (
                 "active_set_transition_model_mismatch"
@@ -4415,6 +4647,18 @@ def _second_order_angular_iteration(
             "prediction_active_terms": list(frozen_active_names),
             "authoritative_trial_active_terms": list(trial_active_names),
             "active_set_transition": active_transition,
+            "internal_active_witness_transition": (
+                internal_witness_transition
+            ),
+            "authoritative_trial_internal_witness_bundle": (
+                discovered_internal_witnesses
+            ),
+            "newly_exposed_internal_witnesses": (
+                newly_exposed_internal_witnesses
+            ),
+            "prediction_internal_witness_row_margin": dict(
+                trial_frozen_witness_values
+            ),
             "trial_full_shadow": trial_shadow,
             "full_shadow_reduction": current_shadow - trial_shadow,
             "remaining_steps_including_current": int(remaining_steps),
@@ -4465,9 +4709,25 @@ def _second_order_angular_iteration(
     newly_violated_guard_terms = _newly_violated_guard_terms(
         trial_rows, frozen_active_names
     )
+    discovered_witness_union = {}
+    for row in trial_rows:
+        if not row.get("authoritative_trial_executed"):
+            continue
+        discovered_witness_union, _ = (
+            second_order.merge_internal_guard_witnesses(
+                discovered_witness_union,
+                row.get("authoritative_trial_internal_witness_bundle") or {},
+            )
+        )
+    expanded_internal_witnesses, newly_exposed_internal_witnesses = (
+        second_order.merge_internal_guard_witnesses(
+            frozen_internal_witnesses,
+            discovered_witness_union,
+        )
+    )
     if (
         not accepted
-        and newly_violated_guard_terms
+        and (newly_violated_guard_terms or newly_exposed_internal_witnesses)
         and not numeric_failure
     ):
         expanded_active_names = tuple(dict.fromkeys((
@@ -4499,6 +4759,9 @@ def _second_order_angular_iteration(
                 train_repair_contract=train_repair_contract,
                 temporal_smoothness_weight=0.0,
                 prediction_active_names=expanded_active_names,
+                prediction_internal_witnesses=(
+                    expanded_internal_witnesses
+                ),
                 require_shadow_constraint=True,
             )
         )
@@ -4544,6 +4807,15 @@ def _second_order_angular_iteration(
         enrichment_round = {
             "source_active_guard_terms": list(frozen_active_names),
             "newly_violated_guard_terms": newly_violated_guard_terms,
+            "source_internal_witness_count": sum(
+                len(rows) for rows in frozen_internal_witnesses.values()
+            ),
+            "newly_exposed_internal_witnesses": (
+                newly_exposed_internal_witnesses
+            ),
+            "expanded_internal_witness_count": sum(
+                len(rows) for rows in expanded_internal_witnesses.values()
+            ),
             "expanded_active_guard_terms": list(expanded_active_names),
             "triggering_trial_count": sum(
                 bool(
@@ -4551,6 +4823,7 @@ def _second_order_angular_iteration(
                         row.get("authoritative_trial_active_terms") or []
                     )
                     & set(newly_violated_guard_terms)
+                    or row.get("newly_exposed_internal_witnesses")
                 )
                 for row in trial_rows
                 if row.get("authoritative_trial_executed")
@@ -4562,12 +4835,17 @@ def _second_order_angular_iteration(
                     "authoritative_trial_active_terms": row.get(
                         "authoritative_trial_active_terms"
                     ),
+                    "newly_exposed_internal_witnesses": row.get(
+                        "newly_exposed_internal_witnesses"
+                    ),
                     "failed_constraints": row.get("failed_constraints"),
                 }
                 for row in trial_rows
-                if row.get("authoritative_trial_executed")
-                and set(row.get("authoritative_trial_active_terms") or [])
-                & set(newly_violated_guard_terms)
+                if row.get("authoritative_trial_executed") and (
+                    set(row.get("authoritative_trial_active_terms") or [])
+                    & set(newly_violated_guard_terms)
+                    or row.get("newly_exposed_internal_witnesses")
+                )
             ],
             "source_trial_rejection_reason": (
                 "active_set_transition_model_mismatch"
@@ -4658,6 +4936,10 @@ def _second_order_angular_iteration(
         "second_order_hessian_used": True,
         "second_order_trial_succeeded": accepted,
         "newly_violated_guard_terms": newly_violated_guard_terms,
+        "newly_exposed_internal_witnesses": (
+            newly_exposed_internal_witnesses
+        ),
+        "frozen_internal_witness_bundle": frozen_internal_witnesses,
         "active_set_constraint_generation": [],
         "active_set_constraint_generation_round_count": 0,
         "authoritative_step_closure_succeeded": (
@@ -8588,9 +8870,34 @@ def run(args):
             train_shadow_contract.get("second_order_physical_guard_row_scope")
             if g1f3 else None
         ),
+        "second_order_internal_witness_bundle": (
+            train_shadow_contract.get("second_order_internal_witness_bundle")
+            if g1f3 else None
+        ),
+        "second_order_internal_witness_aggregation": (
+            train_shadow_contract.get(
+                "second_order_internal_witness_aggregation"
+            ) if g1f3 else None
+        ),
+        "second_order_internal_witness_transition": (
+            train_shadow_contract.get(
+                "second_order_internal_witness_transition"
+            ) if g1f3 else None
+        ),
+        "second_order_internal_witness_universe": (
+            train_shadow_contract.get(
+                "second_order_internal_witness_universe"
+            ) if g1f3 else None
+        ),
         "second_order_model_reused_across_frozen_angles": (
             train_shadow_contract.get(
                 "second_order_model_reused_across_frozen_angles"
+            ) if g1f3 else None
+        ),
+        "second_order_internal_witnesses_frozen_across_curvature_evaluations": (
+            train_shadow_contract.get(
+                "second_order_internal_witnesses_frozen_across_"
+                "curvature_evaluations"
             ) if g1f3 else None
         ),
         "second_order_grid_execution_device": (

@@ -18,13 +18,17 @@ ownership 球面切空间中的 shadow、endpoint、temporal 物理协向量构�
 Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 trial 会重算硬
 指标和完整 Guard。
 
-扩展点的 Guard 活跃项在 `theta=0` 记录后，会显式传入全部 float64 曲率
-求值（包括 HvP 恢复的正负 epsilon 路径）；epsilon 路径观察到的硬活跃集
-变化不会改写预测合同。只有随后真实有限半径 trial 的重新计算结果具有权威
-验收效力，变化会报告为 `active_set_transition_model_mismatch`。
+扩展点的 Guard 活跃项及其内部离散 witness 在 `theta=0` 记录后，会显式传入
+全部 float64 曲率求值（包括 HvP 恢复的正负 epsilon 路径）。`max` 固定实际
+frame/joint argmax；线性 `p95` 固定排序位置两侧的原始 frame/joint 索引与插值
+权重；`window_p95` 还固定活跃 window；boundary 行记录固定 seam support、frame
+和 joint 集。epsilon 路径观察到的硬活跃集变化不会改写预测合同。只有随后真实
+有限半径 trial 的重新计算结果具有权威验收效力，变化会报告为
+`active_set_transition_model_mismatch`。
 
-曲率模型与角度无关，因此每次 SQP 迭代只构建一次，并由全部 12 个冻结角度
-复用。仅当网格没有共同可行点时，每个角度才以全部网格方向（至多 768 个）
+曲率模型与角度无关，因此每个冻结 witness bundle 的约束生成轮只构建一次，
+并由全部 12 个冻结角度复用；发现新 witness 后才在同一展开点进入下一生成轮。
+仅当网格没有共同可行点时，每个角度才以全部网格方向（至多 768 个）
 为起点，在低维单位球面上执行固定 64 次连续 Riemannian 联合 SQP 精化；约束
 值、解析梯度、固定角度线搜索及最终
 词典序选择都在 motion 所在 CUDA device 上完成。网格不再作为“无共同可行
@@ -57,15 +61,18 @@ filter 进展代替完整闭包，也不存在隐式一阶或白名单 fallback�
 剩余闭包配额，filter 步也必须让完整 hard max 严格下降；未建模 Guard 的切换
 不能以单行进展名义被接受，也不把真实 Guard 替换成平滑代理。
 
-若权威 trial 把当前 bundle 外的 Guard 推成正裕量，该 trial 保持拒绝，但新出现
-的真实违规 Guard 会作为独立约束行加入同一展开点并重建二阶 QCQP。约束生成只在
-至少新增一个合同内 Guard 行时继续，因此由有限 Guard 集合确定性终止；它不扩大
-固定 band、不放宽曲率验证，也不消耗额外 correction step。
+若权威 trial 把当前 bundle 外的 Guard 推成正裕量，或在某个已建模 Guard 内暴露
+新的 frame/joint/quantile-pair/window witness，该 trial 保持拒绝。新 Guard 或新
+witness 会作为独立约束行加入同一展开点并重建二阶 QCQP，不在 witness 间使用
+logsumexp，也不消耗 correction step。每轮必须加入此前不存在的真实 witness；
+transaction case、frame、joint、量化插值对和 window 的有限组合保证确定性终止。
+该过程不扩大固定 band，也不放宽曲率验证。
 物理 Guard 的二阶预测行直接取被编辑 case 的精确 signed margin，不再对同组中
 其余不变 case 做 logsumexp。完整 transaction 的 hard max 仍在每个真实 trial
 上重新计算并作为唯一权威验收边界，因此这种局部隔离不会放宽 Guard。
-V15.15h 运行时只有五个 observable proxy Guard 行，因此直接隔离并建模完整五行
-集合，等价地消除了该小型运行时约束集合中的漏行切换。
+V15.15h 运行时只有五个 observable proxy Guard 项，但也使用同一个内部 witness
+算子。真实 trial 暴露新 witness 时同样拒绝并在原展开点重建，直到固定五项及已
+发现的全部 witness 共同进入独立 QCQP 行；该轮不会推进运行时 correction 计数。
 
 若保守 wake gate 使 Adapter 候选方向严格为零，二阶模块可使用同一冻结
 Adapter 解码器的门控前方向建立 `1e-4` 球面起点。这个方向仍只由运行时

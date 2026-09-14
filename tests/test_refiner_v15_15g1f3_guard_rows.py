@@ -168,10 +168,18 @@ def test_g1f3_freezes_row_wise_qcqp_contract_from_train():
         "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band"
     )
     assert frozen["second_order_active_set_constraint_generation"] == (
-        "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild"
+        "authoritative_trial_new_positive_guard_rows_or_internal_"
+        "witnesses_same_expansion_rebuild_no_step"
     )
     assert frozen["second_order_physical_guard_row_scope"] == (
         "edited_case_exact_signed_margin_no_cross_case_softmax"
+    )
+    assert frozen["second_order_internal_witness_aggregation"] == (
+        "independent_qcqp_rows_no_logsumexp"
+    )
+    assert frozen["second_order_internal_witness_transition"] == (
+        "reject_trial_add_new_witness_rebuild_same_expansion_no_"
+        "correction_step"
     )
 
 

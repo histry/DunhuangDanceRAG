@@ -17,8 +17,8 @@ from training import motion_models as m
 
 MODEL_NAME = "v15_15h_adapter_second_order_composite.pt"
 CONTRACT_NAME = "v15_15h_adapter_second_order_composite.contract.json"
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v5"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v5"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v6"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v6"
 
 
 def _sha256(path):
@@ -60,7 +60,7 @@ def run(args):
     frozen = _read_json(args.g1f3_frozen_contract)
     held_out = _read_json(args.held_out_acceptance)
     one_shot = _read_json(args.held_out_one_shot_receipt)
-    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v5",
+    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v6",
              "g1f3 frozen contract schema mismatch")
     _require(frozen.get("immutable") is True, "g1f3 contract is not immutable")
     _require(frozen.get("implementation_commit") == args.implementation_commit,
@@ -175,7 +175,9 @@ def run(args):
             ],
             "curvature_dtype": "float64",
             "geodesic_acceleration_included": True,
-            "second_order_model_builds_per_iteration": 1,
+            "second_order_model_builds_per_iteration": fixed[
+                "second_order_model_builds_per_iteration"
+            ],
             "second_order_guard_transition_bundle": fixed[
                 "second_order_guard_transition_bundle"
             ],
@@ -196,6 +198,23 @@ def run(args):
             ],
             "second_order_physical_guard_row_scope": fixed[
                 "second_order_physical_guard_row_scope"
+            ],
+            "second_order_internal_witness_bundle": fixed[
+                "second_order_internal_witness_bundle"
+            ],
+            "second_order_internal_witness_aggregation": fixed[
+                "second_order_internal_witness_aggregation"
+            ],
+            "second_order_internal_witness_transition": fixed[
+                "second_order_internal_witness_transition"
+            ],
+            "second_order_internal_witness_universe": fixed[
+                "second_order_internal_witness_universe"
+            ],
+            "second_order_internal_witnesses_frozen_across_"
+            "curvature_evaluations": fixed[
+                "second_order_internal_witnesses_frozen_across_"
+                "curvature_evaluations"
             ],
             "runtime_proxy_guard_row_policy": (
                 "complete_five_row_observable_proxy_universe"

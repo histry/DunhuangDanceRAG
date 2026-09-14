@@ -8720,7 +8720,15 @@ def _endpoint_feasibility_gate(proposed, baseline, minimum_gain):
     return torch.where(informative, progress, zero_scale_safe).detach()
 
 
-def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction="mean"):
+def _observable_refiner_objective(
+    prediction,
+    reference,
+    seam,
+    cfg,
+    *,
+    reduction="mean",
+    return_witness_context=False,
+):
     """Repair observable boundary defects, with no hidden clean target.
 
     The clean-input dead-band branch remains separate and unchanged. Physical
@@ -8977,7 +8985,23 @@ def _observable_refiner_objective(prediction, reference, seam, cfg, *, reduction
         ),
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }
-    return (loss,terms) if reduction=="none" else (loss.mean(),{k:v.mean() for k,v in terms.items()})
+    result = (
+        (loss, terms)
+        if reduction == "none"
+        else (loss.mean(), {key: value.mean() for key, value in terms.items()})
+    )
+    if not return_witness_context:
+        return result
+    proposed_jerk = torch.linalg.vector_norm(
+        torch.diff(
+            proposed_metric_joints.to(torch.float64), n=3, dim=1
+        ) * float(cfg.fps) ** 3,
+        dim=-1,
+    )
+    return (*result, {
+        "joint_jerk": proposed_jerk,
+        "extremity_jerk": proposed_jerk[..., list(EXTREMITY_JOINTS)],
+    })
 
 
 def train_refiner(args: argparse.Namespace) -> int:

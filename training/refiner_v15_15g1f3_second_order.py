@@ -2,11 +2,12 @@
 
 This module contains only the numerical kernel shared by train calibration and
 formal inference.  It never reads split, role, ``single``/``cross`` or teacher
-labels.  The caller supplies three scalar metric functions evaluated through
-the real geodesic -> product retraction -> FK -> metric graph.
+labels.  The caller supplies independent scalar Guard-witness and science
+metrics evaluated through the real geodesic -> product retraction -> FK ->
+metric graph.
 
 The Hessian is never materialised in the ambient motion coordinates.  A
-deterministic basis is formed from the three projected first derivatives and
+deterministic basis is formed from projected first derivatives and
 directional Hessian-vector products are polarised into a matrix of dimension at
 most three.  Because every directional derivative is taken with respect to the
 geodesic angle itself, the second derivative includes the sphere-geodesic
@@ -14,6 +15,8 @@ acceleration term; it is not merely ``q.T @ H @ q`` in a flat coordinate.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from typing import Callable, Dict, Mapping, Optional, Sequence
 
@@ -53,6 +56,369 @@ SECOND_ORDER_SQP_LINE_SEARCH_RADIANS = (
     0.00006103515625,
     0.000030517578125,
 )
+
+
+INTERNAL_GUARD_WITNESS_SUFFIXES = {
+    "joint_jerk_p95": "quantile",
+    "joint_jerk_max": "maximum",
+    "joint_jerk_window_p95": "window_quantile_maximum",
+    "extremity_jerk_p95": "quantile",
+    "extremity_jerk_window_p95": "window_quantile_maximum",
+    "boundary": "fixed_boundary_support_mean",
+}
+_JERK_GUARD_KEYS = {
+    "joint_jerk_p95": "joint_jerk_mps3_p95",
+    "joint_jerk_max": "joint_jerk_mps3_max",
+    "joint_jerk_window_p95": "joint_jerk_window_p95_max_mps3",
+    "extremity_jerk_p95": "extremity_jerk_mps3_p95",
+    "extremity_jerk_window_p95": (
+        "extremity_jerk_window_p95_max_mps3"
+    ),
+}
+
+
+def _canonical_witness_payload(descriptor):
+    return json.dumps(
+        descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+
+
+def internal_guard_witness_id(descriptor):
+    """Return a stable identity for one discrete metric witness."""
+    return hashlib.sha256(
+        _canonical_witness_payload(descriptor).encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def internal_guard_witness_constraint_name(guard_name, descriptor):
+    return (
+        f"guard::{guard_name}::witness::"
+        f"{internal_guard_witness_id(descriptor)}"
+    )
+
+
+def _quantile_pair_descriptor(
+    values, *, guard_name, source, quantile=0.95, joint_indices=None
+):
+    flat = values.reshape(-1)
+    count = int(flat.numel())
+    if count < 1:
+        raise RuntimeError("cannot freeze an empty quantile witness")
+    order = m.torch.argsort(flat.detach(), stable=True)
+    position = float(quantile) * float(count - 1)
+    lower_rank = int(math.floor(position))
+    upper_rank = int(math.ceil(position))
+    lower_flat = int(order[lower_rank].detach())
+    upper_flat = int(order[upper_rank].detach())
+    joint_count = int(values.shape[-1])
+    joint_indices = (
+        list(range(joint_count))
+        if joint_indices is None
+        else [int(value) for value in joint_indices]
+    )
+    if len(joint_indices) != joint_count:
+        raise ValueError("witness joint index map has the wrong length")
+
+    def coordinate(flat_index):
+        source_joint_index = int(flat_index % joint_count)
+        return {
+            "frame": int(flat_index // joint_count),
+            "joint": joint_indices[source_joint_index],
+            "source_joint_index": source_joint_index,
+            "flat_index": int(flat_index),
+        }
+
+    return {
+        "guard_name": str(guard_name),
+        "source": str(source),
+        "kind": "linear_quantile_pair",
+        "quantile": float(quantile),
+        "sample_count": count,
+        "lower_rank": lower_rank,
+        "upper_rank": upper_rank,
+        "upper_weight": float(position - lower_rank),
+        "lower": coordinate(lower_flat),
+        "upper": coordinate(upper_flat),
+    }
+
+
+def _maximum_descriptor(
+    values, *, guard_name, source, joint_indices=None
+):
+    flat_index = int(values.reshape(-1).detach().argmax())
+    joint_count = int(values.shape[-1])
+    source_joint_index = int(flat_index % joint_count)
+    joint_indices = (
+        list(range(joint_count))
+        if joint_indices is None
+        else [int(value) for value in joint_indices]
+    )
+    if len(joint_indices) != joint_count:
+        raise ValueError("witness joint index map has the wrong length")
+    return {
+        "guard_name": str(guard_name),
+        "source": str(source),
+        "kind": "maximum",
+        "sample_count": int(values.numel()),
+        "frame": int(flat_index // joint_count),
+        "joint": joint_indices[source_joint_index],
+        "source_joint_index": source_joint_index,
+        "flat_index": flat_index,
+    }
+
+
+def _window_quantile_descriptor(
+    values, *, guard_name, source, fps, quantile=0.95, joint_indices=None
+):
+    length = int(values.shape[0])
+    window = min(length, max(1, int(round(float(fps)))))
+    hop = max(1, window // 2)
+    starts = list(range(0, max(1, length - window + 1), hop))
+    if starts[-1] != length - window:
+        starts.append(length - window)
+    rows = [
+        m.torch.quantile(
+            values[start:start + window].reshape(-1),
+            float(quantile),
+        )
+        for start in starts
+    ]
+    window_index = int(m.torch.stack(rows).detach().argmax())
+    start = int(starts[window_index])
+    descriptor = _quantile_pair_descriptor(
+        values[start:start + window],
+        guard_name=guard_name,
+        source=source,
+        quantile=quantile,
+        joint_indices=joint_indices,
+    )
+    descriptor.update({
+        "kind": "window_linear_quantile_pair",
+        "window_index": window_index,
+        "window_start": start,
+        "window_stop": start + window,
+        "window_count": len(starts),
+        "window_hop": hop,
+    })
+    for side in ("lower", "upper"):
+        descriptor[side]["frame"] += start
+        descriptor[side]["flat_index"] = (
+            descriptor[side]["frame"] * int(values.shape[-1])
+            + descriptor[side]["source_joint_index"]
+        )
+    return descriptor
+
+
+def _jerk_witness_sources(prediction, cfg, witness_sources=None):
+    if witness_sources is not None:
+        expected = {"joint_jerk", "extremity_jerk"}
+        if set(witness_sources) != expected:
+            raise RuntimeError("incomplete internal Guard witness sources")
+        return witness_sources
+    joints = m._observable_boundary_joints_torch(prediction)
+    jerk = m.torch.diff(joints.to(m.torch.float64), n=3, dim=1)
+    jerk = m.torch.linalg.vector_norm(
+        jerk * float(cfg.fps) ** 3, dim=-1
+    )
+    extremity_indices = list(m.EXTREMITY_JOINTS)
+    return {
+        "joint_jerk": jerk,
+        "extremity_jerk": jerk[..., extremity_indices],
+    }
+
+
+def freeze_internal_guard_witnesses(
+    *, prediction, seam, cfg, local_case, guard_names, witness_sources=None
+):
+    """Freeze the active discrete witness of every supported physical row.
+
+    Quantile interpolation is represented by its two original samples and
+    weight. Window quantiles additionally retain the active window. The
+    boundary observable is an exact mean over a seam-fixed support, so its
+    support set is recorded even though it has no value-dependent reordering.
+    """
+    guard_names = tuple(guard_names)
+    if not guard_names:
+        return {}
+    sources = _jerk_witness_sources(prediction, cfg, witness_sources)
+    result = {}
+    for guard_name in guard_names:
+        suffix = str(guard_name).split(".", 1)[-1]
+        kind = INTERNAL_GUARD_WITNESS_SUFFIXES.get(suffix)
+        if kind is None:
+            continue
+        if suffix == "boundary":
+            core = seam[..., 0] >= 0.5 if seam.ndim == 3 else seam >= 0.5
+            length = int(core.shape[1]) - 3
+            support = m.torch.stack([
+                core[:, offset:offset + length] for offset in range(4)
+            ]).any(0)
+            frame_indices = m.torch.nonzero(
+                support[int(local_case)], as_tuple=False
+            ).reshape(-1).detach().cpu().tolist()
+            result[str(guard_name)] = [{
+                "guard_name": str(guard_name),
+                "source": "boundary_seam_jerk",
+                "kind": "fixed_boundary_support_mean",
+                "case": int(local_case),
+                "derivative_order": 3,
+                "frame_indices": [int(value) for value in frame_indices],
+                "joint_indices": list(range(
+                    int(sources["joint_jerk"].shape[-1])
+                )),
+                "joint_reduction": "mean",
+            }]
+            continue
+        source = (
+            "extremity_jerk"
+            if suffix.startswith("extremity_")
+            else "joint_jerk"
+        )
+        values = sources[source][int(local_case)]
+        joint_indices = (
+            list(m.EXTREMITY_JOINTS)
+            if source == "extremity_jerk"
+            else list(range(int(values.shape[-1])))
+        )
+        if kind == "maximum":
+            descriptor = _maximum_descriptor(
+                values,
+                guard_name=guard_name,
+                source=source,
+                joint_indices=joint_indices,
+            )
+        elif kind == "quantile":
+            descriptor = _quantile_pair_descriptor(
+                values,
+                guard_name=guard_name,
+                source=source,
+                joint_indices=joint_indices,
+            )
+        elif kind == "window_quantile_maximum":
+            descriptor = _window_quantile_descriptor(
+                values,
+                guard_name=guard_name,
+                source=source,
+                fps=cfg.fps,
+                joint_indices=joint_indices,
+            )
+        else:
+            raise RuntimeError(f"unsupported internal witness kind: {kind}")
+        result[str(guard_name)] = [descriptor]
+    return result
+
+
+def merge_internal_guard_witnesses(existing, discovered):
+    """Union witness bundles without permitting a duplicate/no-op round."""
+    merged = {
+        str(name): [dict(row) for row in rows]
+        for name, rows in (existing or {}).items()
+    }
+    added = []
+    known = {
+        internal_guard_witness_id(row)
+        for rows in merged.values()
+        for row in rows
+    }
+    for name in sorted(discovered or {}):
+        for descriptor in discovered[name]:
+            witness_id = internal_guard_witness_id(descriptor)
+            if witness_id in known:
+                continue
+            merged.setdefault(str(name), []).append(dict(descriptor))
+            known.add(witness_id)
+            added.append({
+                "guard_name": str(name),
+                "witness_id": witness_id,
+                "descriptor": dict(descriptor),
+            })
+    return merged, added
+
+
+def evaluate_internal_guard_witness_rows(
+    *,
+    prediction,
+    reference,
+    seam,
+    cfg,
+    case_terms,
+    local_case,
+    witnesses,
+    witness_sources=None,
+):
+    """Evaluate frozen witness rows as exact signed physical margins."""
+    del reference, seam
+    if not witnesses:
+        return {}, {}
+    sources = _jerk_witness_sources(prediction, cfg, witness_sources)
+    rows = {}
+    metadata = {}
+    for guard_name in sorted(witnesses or {}):
+        suffix = str(guard_name).split(".", 1)[-1]
+        for descriptor in witnesses[guard_name]:
+            kind = descriptor["kind"]
+            if kind == "fixed_boundary_support_mean":
+                values = sources["joint_jerk"][int(local_case)].mean(dim=-1)
+                frame_indices = descriptor["frame_indices"]
+                if frame_indices:
+                    index = m.torch.as_tensor(
+                        frame_indices,
+                        dtype=m.torch.long,
+                        device=values.device,
+                    )
+                    boundary = values.index_select(0, index).mean()
+                else:
+                    boundary = values.sum() * 0.0
+                signed = (
+                    boundary
+                    - case_terms["boundary_jerk_allowed"][int(local_case)]
+                )
+            else:
+                values = sources[descriptor["source"]][int(local_case)]
+                if kind == "maximum":
+                    raw = values.reshape(-1)[int(descriptor["flat_index"])]
+                elif kind in {
+                    "linear_quantile_pair",
+                    "window_linear_quantile_pair",
+                }:
+                    lower = descriptor["lower"]
+                    upper = descriptor["upper"]
+                    raw = (
+                        (1.0 - float(descriptor["upper_weight"]))
+                        * values[
+                            int(lower["frame"]),
+                            int(lower["source_joint_index"]),
+                        ]
+                        + float(descriptor["upper_weight"])
+                        * values[
+                            int(upper["frame"]),
+                            int(upper["source_joint_index"]),
+                        ]
+                    )
+                else:
+                    raise RuntimeError(
+                        f"unsupported frozen witness kind: {kind}"
+                    )
+                key = _JERK_GUARD_KEYS[suffix]
+                signed = (
+                    raw
+                    - case_terms[f"repair_{key}_allowed"][int(local_case)]
+                    - case_terms[
+                        f"repair_{key}_comparison_epsilon"
+                    ][int(local_case)]
+                )
+            row_name = internal_guard_witness_constraint_name(
+                guard_name, descriptor
+            )
+            if row_name in rows:
+                raise RuntimeError(f"duplicate internal witness row: {row_name}")
+            rows[row_name] = signed
+            metadata[row_name] = {
+                "base_guard_name": str(guard_name),
+                "witness_id": internal_guard_witness_id(descriptor),
+                "descriptor": dict(descriptor),
+            }
+    return rows, metadata
 
 
 def _inner(left, right, mask):

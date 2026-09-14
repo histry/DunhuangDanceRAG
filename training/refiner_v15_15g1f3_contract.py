@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v5"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v5"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v6"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v6"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -100,8 +100,9 @@ def _unchanged_contract(report):
              "geodesic acceleration is absent")
     _require(report.get("ambient_hessian_materialized") is False,
              "ambient Hessian was materialized")
-    _require(report.get("second_order_model_builds_per_iteration") == 1,
-             "second-order curvature model is rebuilt per angle")
+    _require(report.get("second_order_model_builds_per_iteration") ==
+             "one_per_frozen_bundle_generation_round",
+             "second-order curvature build policy changed")
     _require(report.get("second_order_guard_transition_bundle") ==
              "all_violated_plus_strict_frontier_guard_rows",
              "second-order Guard transition bundle changed")
@@ -115,15 +116,34 @@ def _unchanged_contract(report):
              "hard_margin_positive_or_greater_equal_max_zero_and_hard_max_minus_band",
              "second-order Guard transition threshold changed")
     _require(report.get("second_order_active_set_constraint_generation") ==
-             "authoritative_trial_new_positive_guard_rows_same_expansion_rebuild",
+             "authoritative_trial_new_positive_guard_rows_or_internal_"
+             "witnesses_same_expansion_rebuild_no_step",
              "second-order active-set constraint generation changed")
     _require(report.get(
         "second_order_active_set_constraint_generation_termination"
-    ) == "strict_new_guard_row_from_finite_contract_universe",
+    ) == "strict_new_guard_row_or_internal_witness_from_finite_"
+         "transaction_case_frame_joint_window_universe",
              "second-order active-set generation termination changed")
     _require(report.get("second_order_physical_guard_row_scope") ==
              "edited_case_exact_signed_margin_no_cross_case_softmax",
              "second-order physical Guard row scope changed")
+    _require(report.get("second_order_internal_witness_bundle") ==
+             "frozen_argmax_linear_p95_pair_active_window_p95_and_"
+             "boundary_support",
+             "second-order internal witness bundle changed")
+    _require(report.get("second_order_internal_witness_aggregation") ==
+             "independent_qcqp_rows_no_logsumexp",
+             "second-order internal witness aggregation changed")
+    _require(report.get("second_order_internal_witness_transition") ==
+             "reject_trial_add_new_witness_rebuild_same_expansion_no_"
+             "correction_step",
+             "second-order internal witness transition changed")
+    _require(report.get("second_order_internal_witness_universe") ==
+             "finite_transaction_case_frame_joint_quantile_pair_window_set",
+             "second-order internal witness universe changed")
+    _require(report.get(
+        "second_order_internal_witnesses_frozen_across_curvature_evaluations"
+    ) is True, "internal witnesses are not curvature-frozen")
     _require(report.get(
         "second_order_model_reused_across_frozen_angles"
     ) is True, "second-order curvature model is not reused")
@@ -410,7 +430,8 @@ def freeze_contract(args):
             "curvature_dtype": "float64",
             "geodesic_acceleration_included": True,
             "ambient_hessian_materialized": False,
-            "second_order_model_builds_per_iteration": 1,
+            "second_order_model_builds_per_iteration":
+                "one_per_frozen_bundle_generation_round",
             "second_order_guard_transition_bundle": repair[
                 "second_order_guard_transition_bundle"
             ],
@@ -431,6 +452,23 @@ def freeze_contract(args):
             ],
             "second_order_physical_guard_row_scope": repair[
                 "second_order_physical_guard_row_scope"
+            ],
+            "second_order_internal_witness_bundle": repair[
+                "second_order_internal_witness_bundle"
+            ],
+            "second_order_internal_witness_aggregation": repair[
+                "second_order_internal_witness_aggregation"
+            ],
+            "second_order_internal_witness_transition": repair[
+                "second_order_internal_witness_transition"
+            ],
+            "second_order_internal_witness_universe": repair[
+                "second_order_internal_witness_universe"
+            ],
+            "second_order_internal_witnesses_frozen_across_"
+            "curvature_evaluations": repair[
+                "second_order_internal_witnesses_frozen_across_"
+                "curvature_evaluations"
             ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":
