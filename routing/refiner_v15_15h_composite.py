@@ -69,6 +69,15 @@ def _load_composite(model_path, contract_path, cfg):
              "V15.15h geodesic acceleration is absent")
     _require(fixed.get("second_order_model_builds_per_iteration") == 1,
              "V15.15h curvature model is rebuilt per angle")
+    _require(fixed.get("second_order_guard_transition_bundle") ==
+             "all_fixed_guard_terms_within_frozen_band_of_hard_max",
+             "V15.15h Guard transition bundle changed")
+    _require(float(fixed.get("second_order_guard_transition_band", 0.0)) ==
+             1.0e-3,
+             "V15.15h Guard transition band changed")
+    _require(fixed.get("second_order_guard_transition_aggregation") ==
+             "frozen_bundle_logsumexp",
+             "V15.15h Guard transition aggregation changed")
     _require(fixed.get("second_order_grid_execution_device") ==
              "same_cuda_device_as_motion",
              "V15.15h candidate grid is not device-resident")
@@ -434,6 +443,9 @@ def _apply_one_transaction(
         feasibility_tolerance = float(
             fixed["second_order_feasibility_tolerance"]
         )
+        guard_transition_band = float(
+            fixed["second_order_guard_transition_band"]
+        )
 
         for budget in (2, 3, 5):
             report["budgets_attempted"].append(budget)
@@ -447,16 +459,31 @@ def _apply_one_transaction(
                 expansion_terms = _science_terms(
                     expansion, baseline, batch["seam"], cfg
                 )
-                active_name = max(
-                    sorted(expansion_terms["guard_terms"]),
-                    key=lambda name: float(
-                        expansion_terms["guard_terms"][name].detach()
-                    ),
+                guard_float = {
+                    name: float(value.detach())
+                    for name, value in expansion_terms["guard_terms"].items()
+                }
+                maximum_guard = max(guard_float.values())
+                active_names = tuple(sorted(
+                    name for name, value in guard_float.items()
+                    if value >= maximum_guard - guard_transition_band
+                ))
+                smooth_shadow = g1f._smooth_logsumexp(
+                    m.torch.stack([
+                        expansion_terms["guard_terms"][name]
+                        for name in active_names
+                    ]),
+                    guard_transition_band,
                 )
                 scalar_terms = {
-                    "shadow": expansion_terms["guard_terms"][active_name],
+                    "shadow": smooth_shadow,
                     "endpoint": expansion_terms["endpoint"],
                     "temporal": expansion_terms["temporal"],
+                }
+                authoritative_scalar_terms = {
+                    "shadow": maximum_guard,
+                    "endpoint": float(expansion_terms["endpoint"].detach()),
+                    "temporal": float(expansion_terms["temporal"].detach()),
                 }
                 gradients = {}
                 for index, name in enumerate(("shadow", "endpoint", "temporal")):
@@ -472,7 +499,7 @@ def _apply_one_transaction(
                         "reason": "missing_metric_gradient",
                     })
                     break
-                frozen_active_name = active_name
+                frozen_active_names = active_names
 
                 def metric_builder(trial64):
                     candidate64 = product_exp_torch(
@@ -485,21 +512,26 @@ def _apply_one_transaction(
                         cfg,
                     )
                     return {
-                        "shadow": values["guard_terms"][frozen_active_name],
+                        "shadow": g1f._smooth_logsumexp(
+                            m.torch.stack([
+                                values["guard_terms"][name]
+                                for name in frozen_active_names
+                            ]),
+                            guard_transition_band,
+                        ),
                         "endpoint": values["endpoint"],
                         "temporal": values["temporal"],
                     }
 
                 remaining_steps = int(budget) - int(iteration)
                 required = {
-                    name: (
-                        float(value.detach()) + feasibility_tolerance
-                    ) / float(remaining_steps)
-                    for name, value in scalar_terms.items()
+                    name: (value + feasibility_tolerance)
+                    / float(remaining_steps)
+                    for name, value in authoritative_scalar_terms.items()
                 }
                 remaining_closure_gap = {
-                    name: float(value.detach()) + feasibility_tolerance
-                    for name, value in scalar_terms.items()
+                    name: value + feasibility_tolerance
+                    for name, value in authoritative_scalar_terms.items()
                 }
                 try:
                     prepared_model, preparation_audit = (
@@ -560,7 +592,9 @@ def _apply_one_transaction(
                         "iteration": iteration,
                         "angle_index": angle_index,
                         "theta_radians": theta,
-                        "prediction_active_guard_term": frozen_active_name,
+                        "prediction_active_guard_terms": list(
+                            frozen_active_names
+                        ),
                         "remaining_steps_including_current": remaining_steps,
                         "required_step_reduction_by_term": dict(required),
                         "complete_remaining_closure_gap_by_term": dict(
@@ -602,7 +636,9 @@ def _apply_one_transaction(
                             trial_terms["guard_terms"][name].detach()
                         ),
                     )
-                    active_transition = authoritative_active != frozen_active_name
+                    active_transition = bool(
+                        authoritative_active not in frozen_active_names
+                    )
                     trial_np = trial_tensor[0].detach().cpu().numpy()
                     projected, guard = _project_and_guard(
                         trial_np, snapshot, cfg, audit_fn, limits, policy
@@ -637,10 +673,7 @@ def _apply_one_transaction(
                         "endpoint": float(trial_terms["endpoint"].detach()),
                         "temporal": float(trial_terms["temporal"].detach()),
                     }
-                    expansion_scalar = {
-                        name: float(value.detach())
-                        for name, value in scalar_terms.items()
-                    }
+                    expansion_scalar = dict(authoritative_scalar_terms)
                     current_signed_gap = {
                         name: expansion_scalar[name] + feasibility_tolerance
                         for name in expansion_scalar

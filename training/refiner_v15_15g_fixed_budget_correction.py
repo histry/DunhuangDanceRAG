@@ -954,6 +954,7 @@ def _freeze_train_full_shadow_repair_contract(
     second_order_basis_dimension=3,
     second_order_grid_levels=9,
     second_order_feasibility_tolerance=1.0e-12,
+    second_order_guard_transition_temperature=1.0e-3,
 ):
     """Freeze every g1d numerical choice from train transactions only."""
     if train_teacher.get("split") != "train":
@@ -1120,6 +1121,18 @@ def _freeze_train_full_shadow_repair_contract(
         ),
         "second_order_feasibility_tolerance": (
             float(second_order_feasibility_tolerance)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_guard_transition_bundle": (
+            "all_fixed_guard_terms_within_frozen_band_of_hard_max"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_guard_transition_band": (
+            float(second_order_guard_transition_temperature)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_guard_transition_aggregation": (
+            "frozen_bundle_logsumexp"
             if second_order_joint_sqp else None
         ),
         "curvature_dtype": "float64" if second_order_joint_sqp else None,
@@ -1386,11 +1399,27 @@ def _g1d_shadow_objective(
     authoritative_active_names = sorted(
         name for name, value in hard_float.items() if value > 0.0
     )
+    transition_bundle = bool(
+        require_shadow_constraint
+        and train_repair_contract.get("second_order_guard_transition_bundle")
+        == "all_fixed_guard_terms_within_frozen_band_of_hard_max"
+    )
     if prediction_active_names is None:
         if require_shadow_constraint:
-            active_names = [max(
-                sorted(hard_float), key=lambda name: hard_float[name]
-            )]
+            if transition_bundle:
+                band = float(
+                    train_repair_contract[
+                        "second_order_guard_transition_band"
+                    ]
+                )
+                active_names = sorted(
+                    name for name, value in hard_float.items()
+                    if value >= maximum_hard - band
+                )
+            else:
+                active_names = [max(
+                    sorted(hard_float), key=lambda name: hard_float[name]
+                )]
         else:
             active_names = authoritative_active_names
     else:
@@ -1440,9 +1469,20 @@ def _g1d_shadow_objective(
     if active_names:
         primary = "full_transaction_fixed_guard_shadow"
         if require_shadow_constraint:
-            primary_loss = m.torch.stack(
+            stacked_shadows = m.torch.stack(
                 [smooth_shadows[name] for name in active_names]
-            ).sum()
+            )
+            if transition_bundle:
+                primary_loss = _smooth_logsumexp(
+                    stacked_shadows,
+                    float(
+                        train_repair_contract[
+                            "second_order_guard_transition_band"
+                        ]
+                    ),
+                )
+            else:
+                primary_loss = stacked_shadows.sum()
         else:
             primary_loss = m.torch.stack(
                 [m.torch.relu(smooth_shadows[name]) for name in active_names]
@@ -1462,6 +1502,14 @@ def _g1d_shadow_objective(
         ),
         "prediction_active_set_frozen": bool(
             prediction_active_names is not None
+        ),
+        "prediction_guard_transition_bundle": transition_bundle,
+        "prediction_guard_transition_band": (
+            float(
+                train_repair_contract[
+                    "second_order_guard_transition_band"
+                ]
+            ) if transition_bundle else None
         ),
         "signed_shadow_constraint_required": bool(
             require_shadow_constraint
@@ -6797,6 +6845,9 @@ def run(args):
                         second_order_feasibility_tolerance=float(
                             args.second_order_feasibility_tolerance
                         ),
+                        second_order_guard_transition_temperature=float(
+                            args.guard_smooth_max_temperature
+                        ),
                     )
                 )
             train_shadow_contract.update({
@@ -8186,6 +8237,20 @@ def run(args):
         "second_order_model_builds_per_iteration": (
             train_shadow_contract.get(
                 "second_order_model_builds_per_iteration"
+            ) if g1f3 else None
+        ),
+        "second_order_guard_transition_bundle": (
+            train_shadow_contract.get(
+                "second_order_guard_transition_bundle"
+            ) if g1f3 else None
+        ),
+        "second_order_guard_transition_band": (
+            train_shadow_contract.get("second_order_guard_transition_band")
+            if g1f3 else None
+        ),
+        "second_order_guard_transition_aggregation": (
+            train_shadow_contract.get(
+                "second_order_guard_transition_aggregation"
             ) if g1f3 else None
         ),
         "second_order_model_reused_across_frozen_angles": (

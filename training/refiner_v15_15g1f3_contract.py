@@ -102,6 +102,15 @@ def _unchanged_contract(report):
              "ambient Hessian was materialized")
     _require(report.get("second_order_model_builds_per_iteration") == 1,
              "second-order curvature model is rebuilt per angle")
+    _require(report.get("second_order_guard_transition_bundle") ==
+             "all_fixed_guard_terms_within_frozen_band_of_hard_max",
+             "second-order Guard transition bundle changed")
+    _require(float(report.get("second_order_guard_transition_band", 0.0)) ==
+             1.0e-3,
+             "second-order Guard transition band changed")
+    _require(report.get("second_order_guard_transition_aggregation") ==
+             "frozen_bundle_logsumexp",
+             "second-order Guard transition aggregation changed")
     _require(report.get(
         "second_order_model_reused_across_frozen_angles"
     ) is True, "second-order curvature model is not reused")
@@ -389,6 +398,15 @@ def freeze_contract(args):
             "geodesic_acceleration_included": True,
             "ambient_hessian_materialized": False,
             "second_order_model_builds_per_iteration": 1,
+            "second_order_guard_transition_bundle": repair[
+                "second_order_guard_transition_bundle"
+            ],
+            "second_order_guard_transition_band": float(
+                repair["second_order_guard_transition_band"]
+            ),
+            "second_order_guard_transition_aggregation": repair[
+                "second_order_guard_transition_aggregation"
+            ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":
                 "same_cuda_device_as_motion",

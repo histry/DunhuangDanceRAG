@@ -176,6 +176,15 @@ def run(args):
             "curvature_dtype": "float64",
             "geodesic_acceleration_included": True,
             "second_order_model_builds_per_iteration": 1,
+            "second_order_guard_transition_bundle": fixed[
+                "second_order_guard_transition_bundle"
+            ],
+            "second_order_guard_transition_band": float(
+                fixed["second_order_guard_transition_band"]
+            ),
+            "second_order_guard_transition_aggregation": fixed[
+                "second_order_guard_transition_aggregation"
+            ],
             "second_order_model_reused_across_frozen_angles": True,
             "second_order_grid_execution_device":
                 "same_cuda_device_as_motion",
