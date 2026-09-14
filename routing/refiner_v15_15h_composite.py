@@ -627,9 +627,11 @@ def _apply_one_transaction(
                     ))
                     filter_boundary_ok = all(
                         math.isfinite(trial_signed_gap[name])
-                        and trial_signed_gap[name]
-                        <= max(current_signed_gap[name], 0.0)
-                        + feasibility_tolerance
+                        and (
+                            current_signed_gap[name] > 0.0
+                            or trial_signed_gap[name]
+                            <= feasibility_tolerance
+                        )
                         for name in trial_scalar
                     )
                     filter_progress = bool(
@@ -668,6 +670,11 @@ def _apply_one_transaction(
                         "current_positive_closure_gap_merit": current_gap_merit,
                         "trial_positive_closure_gap_merit": trial_gap_merit,
                         "authoritative_filter_safe_boundary": filter_boundary_ok,
+                        "authoritative_filter_locked_safe_terms": sorted(
+                            name
+                            for name, value in current_signed_gap.items()
+                            if value <= 0.0
+                        ),
                         "authoritative_filter_progress": filter_progress,
                         "authoritative_progress": actual_progress,
                         "authoritative_progress_mode": progress_mode,
