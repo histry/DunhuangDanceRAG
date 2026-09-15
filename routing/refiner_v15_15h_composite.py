@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v7"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v7"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v8"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v8"
 _CACHE = {}
 
 
@@ -123,11 +123,18 @@ def _load_composite(model_path, contract_path, cfg):
     _require(int(fixed.get("second_order_basis_dimension", 0)) == 5,
              "V15.15h second-order basis dimension changed")
     _require(fixed.get("second_order_basis_allocation") ==
-             "three_highest_margin_independent_guard_rows_plus_reserved_"
+             "up_to_three_highest_margin_independent_guard_rows_plus_reserved_"
              "endpoint_temporal",
              "V15.15h second-order basis allocation changed")
+    _require(fixed.get("second_order_basis_growth_policy") ==
+             "base_three_add_one_guard_direction_per_constraint_generation_"
+             "round_up_to_five",
+             "V15.15h second-order basis growth policy changed")
     _require(int(fixed.get("second_order_guard_basis_capacity", 0)) == 3,
              "V15.15h Guard basis capacity changed")
+    _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
+             second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
+             "V15.15h coarse grid bound changed")
     _require(fixed.get("second_order_sqp_refinement_starts") ==
              second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
              "V15.15h SQP start count changed")
@@ -503,6 +510,7 @@ def _apply_one_transaction(
             budget_current = current.clone()
             iteration = 0
             frozen_internal_witnesses = None
+            constraint_generation_depth = 0
             while iteration < budget:
                 variable = m.torch.zeros_like(budget_current).requires_grad_(True)
                 local_physical = (budget_current + taper * variable).masked_fill(
@@ -562,8 +570,12 @@ def _apply_one_transaction(
                 }
                 gradients = {}
                 guard_constraint_names = tuple(witness_rows)
+                effective_guard_basis_capacity = min(
+                    int(fixed["second_order_guard_basis_capacity"]),
+                    1 + int(constraint_generation_depth),
+                )
                 basis_guard_names = guard_constraint_names[
-                    :max(0, basis_dimension - 2)
+                    :effective_guard_basis_capacity
                 ]
                 gradient_names = (
                     (
@@ -653,7 +665,10 @@ def _apply_one_transaction(
                             taper=taper,
                             gradients=gradients,
                             metric_builder=metric_builder,
-                            basis_dimension=basis_dimension,
+                            basis_dimension=min(
+                                basis_dimension,
+                                effective_guard_basis_capacity + 2,
+                            ),
                             direction_norm_floor=1.0e-8,
                             metric_names=tuple(scalar_terms),
                         )
@@ -704,6 +719,12 @@ def _apply_one_transaction(
                     attempt = {
                         "budget": budget,
                         "iteration": iteration,
+                        "constraint_generation_depth": int(
+                            constraint_generation_depth
+                        ),
+                        "effective_guard_basis_capacity": int(
+                            effective_guard_basis_capacity
+                        ),
                         "angle_index": angle_index,
                         "theta_radians": theta,
                         "prediction_active_guard_terms": list(
@@ -768,6 +789,7 @@ def _apply_one_transaction(
                         frozen_internal_witnesses = (
                             expanded_internal_witnesses
                         )
+                        constraint_generation_depth += 1
                         rebuild_same_expansion = True
                         attempt.update({
                             "state": "active_set_transition_model_mismatch",
@@ -986,6 +1008,7 @@ def _apply_one_transaction(
                 if not accepted_step:
                     break
                 frozen_internal_witnesses = None
+                constraint_generation_depth = 0
                 iteration += 1
 
         report["reason"] = (

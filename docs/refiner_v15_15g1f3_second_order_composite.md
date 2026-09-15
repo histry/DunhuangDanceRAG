@@ -14,8 +14,10 @@ ownership 半径、EDGE151 Projector、完整 Guard 和 `0.03` 修复门槛。
 测地线角度沿 `geodesic -> product retraction -> FK -> metric` 的真实路径
 做 float64 一、二阶求导，因此二阶项包含球面测地线加速度。低维基由
 ownership 球面切空间中的 Guard witness、endpoint、temporal 物理协向量构造。
-冻结的 5 维基为 endpoint/temporal 各保留一维，并按当前 signed margin 选择
-最多三个线性独立 Guard witness 方向；全部 witness 仍作为独立约束行参与求解。
+冻结的基从 3 维开始，为 endpoint/temporal 各保留一维，并选择当前 signed
+margin 最高的一条 Guard witness 方向。只有真实 trial 触发同一展开点的约束生成
+时，每轮再增加一条 Guard 方向，最多增长到 5 维、三条线性独立 Guard 方向；
+全部 witness 始终作为独立约束行参与求解。
 只通过方向 HvP 和 polarization 形成最多 `5 x 5` 的模型，不形成环境维度
 Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 trial 会重算硬
 指标和完整 Guard。
@@ -30,8 +32,10 @@ frame/joint argmax；线性 `p95` 固定排序位置两侧的原始 frame/joint 
 
 曲率模型与角度无关，因此每个冻结 witness bundle 的约束生成轮只构建一次，
 并由全部 12 个冻结角度复用；发现新 witness 后才在同一展开点进入下一生成轮。
-仅当网格没有共同可行点时，每个角度才从完整 device-resident 网格中确定性选择
-至多 768 个最优方向为起点，在低维单位球面上执行固定 64 次连续 Riemannian
+5 维笛卡尔网格不会完整进入每个角度的 QCQP：候选始终在 CUDA device 上按
+固定均匀索引与正负坐标轴确定性限制为最多 8192 个。仅当该有界网格没有共同
+可行点时，每个角度才从中选择至多 768 个最优方向为起点，执行固定 64 次
+连续 Riemannian
 联合 SQP 精化；约束
 值、解析梯度、固定角度线搜索及最终
 词典序选择都在 motion 所在 CUDA device 上完成。网格不再作为“无共同可行

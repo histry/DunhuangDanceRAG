@@ -39,6 +39,7 @@ HVP_RECOVERY_RELATIVE_TOLERANCE = 0.25
 HVP_RECOVERY_ABSOLUTE_TOLERANCE = 1.0e-6
 SECOND_ORDER_SQP_REFINEMENT_STARTS = 768
 SECOND_ORDER_SQP_REFINEMENT_ITERATIONS = 64
+SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS = 8192
 SECOND_ORDER_SQP_SMOOTHING = (1.0, 8.0, 64.0, 512.0)
 SECOND_ORDER_SQP_LINE_SEARCH_RADIANS = (
     0.25,
@@ -948,7 +949,30 @@ def _deterministic_unit_grid(dimension: int, levels: int, *, device):
     norms = m.torch.linalg.vector_norm(rows, dim=1)
     rows = rows[norms > 1.0e-15]
     norms = m.torch.linalg.vector_norm(rows, dim=1, keepdim=True)
-    result = rows / norms
+    rows = rows / norms
+    maximum = int(SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS)
+    if int(rows.shape[0]) > maximum:
+        axes = m.torch.cat([
+            m.torch.eye(
+                int(dimension), dtype=m.torch.float64, device=device
+            ),
+            -m.torch.eye(
+                int(dimension), dtype=m.torch.float64, device=device
+            ),
+        ], dim=0)
+        sample_count = maximum - int(axes.shape[0])
+        indices = m.torch.div(
+            m.torch.arange(
+                sample_count, dtype=m.torch.long, device=device
+            ) * int(rows.shape[0]),
+            sample_count,
+            rounding_mode="floor",
+        )
+        result = m.torch.cat(
+            [axes, rows.index_select(0, indices)], dim=0
+        )
+    else:
+        result = rows
     _UNIT_GRID_CACHE[key] = result
     return result
 

@@ -130,10 +130,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v7"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v8"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v7"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v8"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -1119,8 +1119,13 @@ def _freeze_train_full_shadow_repair_contract(
             int(second_order_basis_dimension) if second_order_joint_sqp else None
         ),
         "second_order_basis_allocation": (
-            "three_highest_margin_independent_guard_rows_plus_reserved_"
+            "up_to_three_highest_margin_independent_guard_rows_plus_reserved_"
             "endpoint_temporal"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_basis_growth_policy": (
+            "base_three_add_one_guard_direction_per_constraint_generation_"
+            "round_up_to_five"
             if second_order_joint_sqp else None
         ),
         "second_order_guard_basis_capacity": (
@@ -1129,6 +1134,10 @@ def _freeze_train_full_shadow_repair_contract(
         ),
         "second_order_grid_levels": (
             int(second_order_grid_levels) if second_order_joint_sqp else None
+        ),
+        "second_order_max_coarse_grid_directions": (
+            int(second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS)
+            if second_order_joint_sqp else None
         ),
         "second_order_feasibility_tolerance": (
             float(second_order_feasibility_tolerance)
@@ -4021,6 +4030,7 @@ def _second_order_angular_iteration(
     iteration,
     remaining_steps,
     case_uid=None,
+    constraint_generation_depth=0,
 ):
     """Run one g1f3 iteration with a real-path second-order model per angle."""
     current_shadow = float(
@@ -4176,8 +4186,12 @@ def _second_order_angular_iteration(
     accepted_theta = 0.0
     accepted_solver = None
 
-    guard_basis_capacity = int(
+    maximum_guard_basis_capacity = int(
         train_repair_contract["second_order_guard_basis_capacity"]
+    )
+    guard_basis_capacity = min(
+        maximum_guard_basis_capacity,
+        1 + int(constraint_generation_depth),
     )
     basis_guard_names = sorted(
         guard_constraint_names,
@@ -4207,8 +4221,9 @@ def _second_order_angular_iteration(
                 gradients=basis_gradients,
                 metric_builder=metric_builder,
                 metric_names=tuple(gradients),
-                basis_dimension=int(
-                    train_repair_contract["second_order_basis_dimension"]
+                basis_dimension=min(
+                    int(train_repair_contract["second_order_basis_dimension"]),
+                    guard_basis_capacity + 2,
                 ),
                 direction_norm_floor=float(norm_floor),
             )
@@ -4829,6 +4844,9 @@ def _second_order_angular_iteration(
                 iteration=iteration,
                 remaining_steps=remaining_steps,
                 case_uid=case_uid,
+                constraint_generation_depth=(
+                    int(constraint_generation_depth) + 1
+                ),
             )
         )
         enrichment_round = {
@@ -4932,6 +4950,8 @@ def _second_order_angular_iteration(
         "constraints": constraints,
         "joint_solver": representative_solver,
         "second_order_model_preparation": model_preparation_audit,
+        "constraint_generation_depth": int(constraint_generation_depth),
+        "effective_guard_basis_capacity": int(guard_basis_capacity),
         "angle_specific_second_order_solvers": solver_audits,
         "finite_gap_science_requirements": science_requirements,
         "remaining_steps_including_current": int(remaining_steps),
@@ -8853,9 +8873,18 @@ def run(args):
             train_shadow_contract.get("second_order_basis_allocation")
             if g1f3 else None
         ),
+        "second_order_basis_growth_policy": (
+            train_shadow_contract.get("second_order_basis_growth_policy")
+            if g1f3 else None
+        ),
         "second_order_guard_basis_capacity": (
             train_shadow_contract.get("second_order_guard_basis_capacity")
             if g1f3 else None
+        ),
+        "second_order_max_coarse_grid_directions": (
+            train_shadow_contract.get(
+                "second_order_max_coarse_grid_directions"
+            ) if g1f3 else None
         ),
         "curvature_dtype": (
             train_shadow_contract.get("curvature_dtype") if g1f3 else None

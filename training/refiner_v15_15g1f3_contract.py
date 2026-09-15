@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v7"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v7"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v8"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v8"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -156,11 +156,18 @@ def _unchanged_contract(report):
     _require(int(report.get("second_order_basis_dimension", 0)) == 5,
              "second-order basis dimension changed")
     _require(report.get("second_order_basis_allocation") ==
-             "three_highest_margin_independent_guard_rows_plus_reserved_"
+             "up_to_three_highest_margin_independent_guard_rows_plus_reserved_"
              "endpoint_temporal",
              "second-order basis allocation changed")
+    _require(report.get("second_order_basis_growth_policy") ==
+             "base_three_add_one_guard_direction_per_constraint_generation_"
+             "round_up_to_five",
+             "second-order basis growth policy changed")
     _require(int(report.get("second_order_guard_basis_capacity", 0)) == 3,
              "second-order Guard basis capacity changed")
+    _require(int(report.get("second_order_max_coarse_grid_directions", 0)) ==
+             second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
+             "second-order coarse grid bound changed")
     _require(report.get("second_order_sqp_refinement_starts") ==
              second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
              "second-order SQP start count changed")
@@ -543,8 +550,14 @@ def freeze_contract(args):
             "second_order_basis_allocation": repair[
                 "second_order_basis_allocation"
             ],
+            "second_order_basis_growth_policy": repair[
+                "second_order_basis_growth_policy"
+            ],
             "second_order_guard_basis_capacity": int(
                 repair["second_order_guard_basis_capacity"]
+            ),
+            "second_order_max_coarse_grid_directions": int(
+                repair["second_order_max_coarse_grid_directions"]
             ),
             "second_order_grid_levels": int(
                 repair["second_order_grid_levels"]
