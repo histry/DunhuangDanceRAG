@@ -84,6 +84,7 @@ from training import refiner_case_local_full_tangent_oracle as oracle
 from training import refiner_observable_adapter_probe as adapter
 from training import refiner_projected_candidate_probe as projected_probe
 from training import refiner_v15_15g1f3_second_order as second_order
+from training import refiner_v15_15g1f4_policies as g1f4_policies
 
 
 SCHEMA = "refiner_v15_15g_fixed_budget_manifold_correction_ablation_v1"
@@ -134,6 +135,10 @@ G1F3_SCHEMA = (
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
     "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v9"
+)
+G1F4_SCHEMA = "refiner_v15_15g1f4_policy_metric_factorial_probe_v1"
+G1F4_TRAIN_CONTRACT_SCHEMA = (
+    "refiner_v15_15g1f4_train_frozen_policy_metric_contract_v1"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -957,6 +962,8 @@ def _freeze_train_full_shadow_repair_contract(
     second_order_grid_levels=9,
     second_order_feasibility_tolerance=1.0e-12,
     second_order_guard_transition_band=1.0e-5,
+    progress_policy=None,
+    metric_operator=None,
 ):
     """Freeze every g1d numerical choice from train transactions only."""
     if train_teacher.get("split") != "train":
@@ -986,9 +993,21 @@ def _freeze_train_full_shadow_repair_contract(
         name: max(float(minimum_reduction_floor), _median(numerics[name]))
         for name in sorted(numerics)
     }
+    progress_policy = progress_policy or g1f4_policies.ProgressPolicy(
+        g1f4_policies.CURRENT_EQUAL_SHARE
+    )
+    metric_operator = metric_operator or g1f4_policies.build_metric_operator(
+        g1f4_policies.IDENTITY_METRIC
+    )
+    g1f4_nonbaseline = bool(
+        progress_policy.mode != g1f4_policies.CURRENT_EQUAL_SHARE
+        or metric_operator.mode != g1f4_policies.IDENTITY_METRIC
+    )
     return {
         "schema": (
-            G1F3_TRAIN_CONTRACT_SCHEMA
+            G1F4_TRAIN_CONTRACT_SCHEMA
+            if second_order_joint_sqp and g1f4_nonbaseline
+            else G1F3_TRAIN_CONTRACT_SCHEMA
             if second_order_joint_sqp
             else G1F2_TRAIN_CONTRACT_SCHEMA
             if finite_gap_angular_feasibility
@@ -1002,6 +1021,12 @@ def _freeze_train_full_shadow_repair_contract(
             else "refiner_v15_15g1d_train_frozen_shadow_repair_contract_v1"
         ),
         "calibration_split": "train",
+        "g1f4_shared_policy_metric_path": bool(second_order_joint_sqp),
+        "progress_mode": progress_policy.mode,
+        "progress_policy_schema": "g1f4_progress_policy_v1",
+        "progress_debt_weights": "unit_by_constraint_row_v1",
+        "final_acceptance_unchanged": True,
+        **metric_operator.audit(),
         "validation_consumed_for_calibration": False,
         "transaction_ids": transaction_ids,
         "transaction_count": len(transaction_ids),
@@ -4034,6 +4059,8 @@ def _second_order_angular_iteration(
     target_rms,
     iteration,
     remaining_steps,
+    progress_policy,
+    metric_operator,
     case_uid=None,
     constraint_generation_depth=0,
 ):
@@ -4219,7 +4246,9 @@ def _second_order_angular_iteration(
 
     try:
         prepared_model, model_preparation_audit = (
-            second_order.prepare_second_order_subproblem(
+            metric_operator.execute(
+                "prepare_second_order_subproblem",
+                second_order.prepare_second_order_subproblem,
                 current=current,
                 mask=mask,
                 taper=taper,
@@ -4369,7 +4398,9 @@ def _second_order_angular_iteration(
             continue
 
         any_authoritative_trial = True
-        trial, geodesic_ok, geodesic_audit = _exact_radius_geodesic_update(
+        trial, geodesic_ok, geodesic_audit = metric_operator.execute(
+            "exact_radius_geodesic_update",
+            _exact_radius_geodesic_update,
             current,
             direction,
             mask,
@@ -4397,7 +4428,9 @@ def _second_order_angular_iteration(
             })
             continue
 
-        radius_rms = _rms(trial, mask)
+        radius_rms = metric_operator.execute(
+            "radius_rms", _rms, trial, mask
+        )
         radius_ok = bool(
             math.isfinite(radius_rms)
             and abs(radius_rms - float(target_rms))
@@ -4465,6 +4498,10 @@ def _second_order_angular_iteration(
             science_step_margin[name] >= -science_step_tolerance[name]
             for name in ("endpoint", "temporal")
         )
+        science_step_strict_improvement = all(
+            science_step_change[name] < -science_step_tolerance[name]
+            for name in ("endpoint", "temporal")
+        )
         with m.torch.no_grad():
             (
                 _,
@@ -4508,6 +4545,10 @@ def _second_order_angular_iteration(
         active_transition = (
             trial_active_names != expansion_authoritative_active_names
         )
+        newly_violated_guard_names = tuple(sorted(
+            set(trial_active_names) - set(frozen_active_names)
+        ))
+        new_guard_term_transition = bool(newly_violated_guard_names)
         local_group = m.REFINER_GROUP_LABELS[
             int(batch["group"][int(local_case)])
         ]
@@ -4641,24 +4682,41 @@ def _second_order_angular_iteration(
                 "authoritative_full_closure"
                 if accepted_progress else None
             )
+            progress_decision_audit = {
+                "progress_mode": progress_policy.mode,
+                "final_acceptance_unchanged": True,
+            }
         else:
-            accepted_progress = bool(
-                authoritative_step_closure or quota_progress
+            progress_decision = progress_policy.decide_intermediate(
+                authoritative_step_closure=authoritative_step_closure,
+                quota_progress=quota_progress,
+                authoritative_filter_progress=authoritative_filter_progress,
+                both_scientific_terms_strictly_improved=(
+                    science_step_strict_improvement
+                ),
+                new_guard_term_transition=new_guard_term_transition,
+                internal_active_witness_transition=(
+                    internal_witness_transition
+                ),
             )
-            accepted_progress_mode = (
-                "authoritative_full_closure"
-                if authoritative_step_closure
-                else "remaining_gap_share"
-                if quota_progress
-                else None
-            )
+            accepted_progress = progress_decision.accepted
+            accepted_progress_mode = progress_decision.acceptance_mode
+            progress_decision_audit = progress_decision.audit
         failed_constraints = []
         if not accepted_progress:
-            if not shadow_ok:
-                failed_constraints.append("hard_full_transaction_shadow")
-            if not science_quota_ok:
-                failed_constraints.append("endpoint_temporal_step_progress")
-            failed_constraints.append("authoritative_remaining_gap_share")
+            if progress_policy.mode == g1f4_policies.CURRENT_EQUAL_SHARE:
+                if not shadow_ok:
+                    failed_constraints.append("hard_full_transaction_shadow")
+                if not science_quota_ok:
+                    failed_constraints.append("endpoint_temporal_step_progress")
+                failed_constraints.append("authoritative_remaining_gap_share")
+            else:
+                if not authoritative_filter_progress:
+                    failed_constraints.append("weighted_debt_filter_progress")
+                if not science_step_strict_improvement:
+                    failed_constraints.append("strict_science_improvement")
+                if new_guard_term_transition:
+                    failed_constraints.append("new_guard_term_transition")
         if not radius_ok:
             failed_constraints.append("exact_radius")
         if not scope_ok:
@@ -4695,6 +4753,7 @@ def _second_order_angular_iteration(
             "prediction_active_terms": list(frozen_active_names),
             "authoritative_trial_active_terms": list(trial_active_names),
             "active_set_transition": active_transition,
+            "new_guard_term_transition": new_guard_term_transition,
             "internal_active_witness_transition": (
                 internal_witness_transition
             ),
@@ -4720,6 +4779,9 @@ def _second_order_angular_iteration(
             ),
             "trial_science_change_by_term": science_step_change,
             "trial_science_step_margin_by_term": science_step_margin,
+            "trial_science_step_strict_improvement": (
+                science_step_strict_improvement
+            ),
             "current_signed_closure_gap_by_term": current_signed_gap,
             "trial_signed_closure_gap_by_term": trial_signed_gap,
             "signed_closure_gap_scale_by_term": signed_gap_scale,
@@ -4739,6 +4801,8 @@ def _second_order_angular_iteration(
             ),
             "authoritative_filter_progress": authoritative_filter_progress,
             "authoritative_progress_mode": accepted_progress_mode,
+            "progress_policy_decision": progress_decision_audit,
+            "metric_operator": metric_operator.audit(),
             "trial_radius_rms": radius_rms,
             "trial_outside_scope_abs_max": outside_scope,
             **science_margins,
@@ -4849,6 +4913,8 @@ def _second_order_angular_iteration(
                 target_rms=target_rms,
                 iteration=iteration,
                 remaining_steps=remaining_steps,
+                progress_policy=progress_policy,
+                metric_operator=metric_operator,
                 case_uid=case_uid,
                 constraint_generation_depth=(
                     int(constraint_generation_depth) + 1
@@ -4978,7 +5044,9 @@ def _second_order_angular_iteration(
         "angular_line_search_trials": trial_rows,
         "second_order_prediction_found": any_prediction,
         "authoritative_trial_executed": any_authoritative_trial,
-        "exact_radius_rms": _rms(accepted_tangent, mask),
+        "exact_radius_rms": metric_operator.execute(
+            "radius_rms", _rms, accepted_tangent, mask
+        ),
         "outside_scope_abs_max": 0.0 if accepted else None,
         "solver_failure_reason": (
             "zero_science_gradient" if zero_science else None
@@ -5000,6 +5068,8 @@ def _second_order_angular_iteration(
         ),
         "second_order_closure_succeeded": False,
         "closure_deferred_to_composite_selector": True,
+        "progress_mode": progress_policy.mode,
+        "metric_operator": metric_operator.audit(),
     }, numeric_failure
 
 
@@ -5022,13 +5092,25 @@ def _correct_case_geodesic_joint_sqp(
     temporal_directional_consistency=False,
     finite_gap_angular_feasibility=False,
     second_order_joint_sqp=False,
+    progress_policy=None,
+    metric_operator=None,
     case_uid=None,
 ):
     """Run bounded exact-radius geodesic joint active-set SQP."""
     mask = _owned_case_mask(ownership, initial_tangent, 0)
     taper = c2_taper.expand_as(initial_tangent).detach()
-    current, normalized = _normalize_exact_radius(
-        initial_tangent, mask, target_rms
+    progress_policy = progress_policy or g1f4_policies.ProgressPolicy(
+        g1f4_policies.CURRENT_EQUAL_SHARE
+    )
+    metric_operator = metric_operator or g1f4_policies.build_metric_operator(
+        g1f4_policies.IDENTITY_METRIC
+    )
+    current, normalized = metric_operator.execute(
+        "normalize_exact_radius",
+        _normalize_exact_radius,
+        initial_tangent,
+        mask,
+        target_rms,
     )
     zero_start = not normalized
     if zero_start:
@@ -5122,6 +5204,8 @@ def _correct_case_geodesic_joint_sqp(
                     target_rms=target_rms,
                     iteration=iteration,
                     remaining_steps=int(steps) - iteration,
+                    progress_policy=progress_policy,
+                    metric_operator=metric_operator,
                     case_uid=case_uid,
                 )
             )
@@ -5442,6 +5526,8 @@ def _correct_case_geodesic_joint_sqp(
             finite_gap_angular_feasibility
         ),
         "second_order_joint_sqp": bool(second_order_joint_sqp),
+        "progress_mode": progress_policy.mode,
+        "metric_operator": metric_operator.audit(),
         "scope_null_space_projection": "exact_boolean_ownership_mask",
         "joint_jacobian_status_counts": dict(statuses),
         "angular_line_search_radians": angular_scales,
@@ -5484,7 +5570,9 @@ def _correct_case_geodesic_joint_sqp(
             second_order_joint_sqp
         ),
         "teacher_eligible": False,
-        "final_exact_radius_rms": _rms(current, mask),
+        "final_exact_radius_rms": metric_operator.execute(
+            "radius_rms", _rms, current, mask
+        ),
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
     }
@@ -7064,6 +7152,23 @@ def run(args):
     g1f1 = bool(args.activation_aware_g1f1)
     g1f2 = bool(args.activation_aware_g1f2)
     g1f3 = bool(args.activation_aware_g1f3)
+    progress_policy = g1f4_policies.ProgressPolicy(args.progress_mode)
+    metric_operator = g1f4_policies.build_metric_operator(
+        args.metric_mode,
+        calibration_path=args.metric_radius_calibration,
+    )
+    g1f4 = bool(
+        g1f3
+        and (
+            progress_policy.mode != g1f4_policies.CURRENT_EQUAL_SHARE
+            or metric_operator.mode != g1f4_policies.IDENTITY_METRIC
+        )
+    )
+    if not g1f3 and (
+        progress_policy.mode != g1f4_policies.CURRENT_EQUAL_SHARE
+        or metric_operator.mode != g1f4_policies.IDENTITY_METRIC
+    ):
+        raise RuntimeError("g1f4 policy/metric modes require --activation-aware-g1f3")
     g1f2_family = bool(g1f2 or g1f3)
     g1f1_family = bool(g1f1 or g1f2_family)
     g1f_family = bool(g1f or g1f1_family)
@@ -7293,7 +7398,9 @@ def run(args):
                     )
                 )
                 expected_contract_schema = (
-                    G1F3_TRAIN_CONTRACT_SCHEMA
+                    G1F4_TRAIN_CONTRACT_SCHEMA
+                    if g1f4
+                    else G1F3_TRAIN_CONTRACT_SCHEMA
                     if g1f3
                     else G1F2_TRAIN_CONTRACT_SCHEMA
                     if g1f2
@@ -7305,6 +7412,13 @@ def run(args):
                 )
                 if train_shadow_contract.get("schema") != expected_contract_schema:
                     raise RuntimeError("frozen g1e/g1f repair contract mismatch")
+                if g1f3 and (
+                    train_shadow_contract.get("progress_mode")
+                    != progress_policy.mode
+                    or train_shadow_contract.get("metric_mode")
+                    != metric_operator.mode
+                ):
+                    raise RuntimeError("frozen g1f4 policy/metric mode mismatch")
                 if train_shadow_contract.get(
                     "train_teacher_bank_sha256"
                 ) != _file_sha256(train_teacher_path):
@@ -7496,6 +7610,8 @@ def run(args):
                         second_order_guard_transition_band=float(
                             args.second_order_guard_transition_band
                         ),
+                        progress_policy=progress_policy,
+                        metric_operator=metric_operator,
                     )
                 )
             train_shadow_contract.update({
@@ -7751,6 +7867,8 @@ def run(args):
                             temporal_directional_consistency=g1f1_family,
                             finite_gap_angular_feasibility=g1f2_family,
                             second_order_joint_sqp=g1f3,
+                            progress_policy=progress_policy,
+                            metric_operator=metric_operator,
                             case_uid=str(sample["case_uid"]),
                         )
                     )
@@ -8697,7 +8815,9 @@ def run(args):
     }, hard_negative_path)
     report = {
         "schema": (
-            G1F3_SCHEMA
+            G1F4_SCHEMA
+            if g1f4
+            else G1F3_SCHEMA
             if g1f3
             else G1F2_SCHEMA
             if g1f2
@@ -8720,6 +8840,20 @@ def run(args):
             else SCHEMA
         ),
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
+        "g1f4_shared_policy_metric_path": bool(g1f3),
+        "progress_mode": progress_policy.mode,
+        "metric_operator": metric_operator.audit(),
+        "g1f4_mode": (
+            "baseline"
+            if progress_policy.mode == g1f4_policies.CURRENT_EQUAL_SHARE
+            and metric_operator.mode == g1f4_policies.IDENTITY_METRIC
+            else "p_only"
+            if progress_policy.mode == g1f4_policies.WEIGHTED_DEBT_FILTER
+            and metric_operator.mode == g1f4_policies.IDENTITY_METRIC
+            else "m_only"
+            if progress_policy.mode == g1f4_policies.CURRENT_EQUAL_SHARE
+            else "pm"
+        ),
         "train_teacher_bank": (
             str(train_teacher_path) if train_teacher_path else None
         ),
@@ -9212,7 +9346,9 @@ def run(args):
     )
     print(json.dumps({
         "stage": (
-            "v15_15g1f3_second_order_composite_closure_complete"
+            "v15_15g1f4_policy_metric_probe_complete"
+            if g1f4
+            else "v15_15g1f3_second_order_composite_closure_complete"
             if g1f3
             else "v15_15g1f2_finite_gap_angular_feasibility_complete"
             if g1f2
@@ -9285,6 +9421,23 @@ def main():
     parser.add_argument("--activation-aware-g1f1", action="store_true")
     parser.add_argument("--activation-aware-g1f2", action="store_true")
     parser.add_argument("--activation-aware-g1f3", action="store_true")
+    parser.add_argument(
+        "--progress-mode",
+        choices=g1f4_policies.PROGRESS_MODES,
+        default=g1f4_policies.CURRENT_EQUAL_SHARE,
+    )
+    parser.add_argument(
+        "--metric-mode",
+        choices=g1f4_policies.METRIC_MODES,
+        default=g1f4_policies.IDENTITY_METRIC,
+    )
+    parser.add_argument(
+        "--metric-radius-calibration",
+        help=(
+            "train-only equivalent-radius calibration; required before "
+            "anchor_kinematic execution"
+        ),
+    )
     parser.add_argument(
         "--evaluation-role",
         choices=(
@@ -9415,6 +9568,21 @@ def main():
     )
     parser.add_argument("--jerk-regularization", type=float, default=1.0e-3)
     args = parser.parse_args()
+    if args.metric_mode == g1f4_policies.IDENTITY_METRIC and (
+        args.metric_radius_calibration
+    ):
+        parser.error("identity metric must not receive --metric-radius-calibration")
+    if args.metric_mode == g1f4_policies.ANCHOR_KINEMATIC_METRIC and not (
+        args.metric_radius_calibration
+    ):
+        parser.error(
+            "anchor_kinematic requires train-only --metric-radius-calibration"
+        )
+    if (
+        args.progress_mode != g1f4_policies.CURRENT_EQUAL_SHARE
+        or args.metric_mode != g1f4_policies.IDENTITY_METRIC
+    ) and not args.activation_aware_g1f3:
+        parser.error("non-baseline g1f4 modes require --activation-aware-g1f3")
     if args.target_rms != 1.0e-4:
         parser.error("--target-rms must remain exactly 1e-4")
     if tuple(sorted(set(args.steps))) != (2, 3, 5):
