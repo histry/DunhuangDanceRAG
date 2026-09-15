@@ -450,6 +450,7 @@ def build_owned_tangent_basis(
     gradients: Mapping[str, object],
     dimension: int,
     floor: float,
+    maximum_guard_directions: int | None = None,
 ):
     """Build a deterministic physical basis in the ownership-sphere tangent.
 
@@ -464,7 +465,15 @@ def build_owned_tangent_basis(
     active = mask & (taper64.abs() > float(floor))
     rows = []
     source_names = []
+    guard_source_count = 0
     for name, gradient in gradients.items():
+        is_guard = name not in {"endpoint", "temporal"}
+        if (
+            is_guard
+            and maximum_guard_directions is not None
+            and guard_source_count >= int(maximum_guard_directions)
+        ):
+            continue
         if gradient is None:
             continue
         gradient64 = gradient.detach().to(dtype)
@@ -489,6 +498,8 @@ def build_owned_tangent_basis(
             continue
         rows.append(unit)
         source_names.append(name)
+        if is_guard:
+            guard_source_count += 1
         if len(rows) >= int(dimension):
             break
     if not rows:
@@ -501,6 +512,11 @@ def build_owned_tangent_basis(
         "status": "second_order_basis_ready",
         "basis_dimension": len(rows),
         "basis_sources": source_names,
+        "guard_basis_source_count": int(guard_source_count),
+        "maximum_guard_directions": (
+            int(maximum_guard_directions)
+            if maximum_guard_directions is not None else None
+        ),
         "ambient_hessian_materialized": False,
         "scope_null_space_projection": "exact_boolean_ownership_mask",
         "sphere_tangent_projection": True,
@@ -1353,6 +1369,7 @@ def prepare_second_order_subproblem(
     basis_dimension,
     direction_norm_floor,
     metric_names=None,
+    maximum_guard_directions=None,
 ):
     """Build one curvature model for reuse by every frozen angle."""
     basis, basis_audit = build_owned_tangent_basis(
@@ -1362,6 +1379,7 @@ def prepare_second_order_subproblem(
         gradients=gradients,
         dimension=int(basis_dimension),
         floor=float(direction_norm_floor),
+        maximum_guard_directions=maximum_guard_directions,
     )
     if basis is None:
         return None, basis_audit

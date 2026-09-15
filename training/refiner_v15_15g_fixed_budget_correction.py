@@ -130,10 +130,10 @@ G1F2_TRAIN_CONTRACT_SCHEMA = (
     "feasibility_contract_v1"
 )
 G1F3_SCHEMA = (
-    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v8"
+    "refiner_v15_15g1f3_second_order_composite_closure_sqp_v9"
 )
 G1F3_TRAIN_CONTRACT_SCHEMA = (
-    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v8"
+    "refiner_v15_15g1f3_train_frozen_second_order_joint_sqp_contract_v9"
 )
 REUSED_DEVELOPMENT_CASE_UID = "txn_0000_94bfdf553811:53"
 G1F3_TRAIN_TARGET_CASE_UIDS = (
@@ -1130,6 +1130,11 @@ def _freeze_train_full_shadow_repair_contract(
         ),
         "second_order_guard_basis_capacity": (
             max(0, int(second_order_basis_dimension) - 2)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_guard_basis_replenishment": (
+            "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
+            "linearly_dependent_projection"
             if second_order_joint_sqp else None
         ),
         "second_order_grid_levels": (
@@ -4196,7 +4201,7 @@ def _second_order_angular_iteration(
     basis_guard_names = sorted(
         guard_constraint_names,
         key=lambda name: (-current_guard_row_margin[name], name),
-    )[:guard_basis_capacity]
+    )
     basis_gradient_names = (
         (
             basis_guard_names[0],
@@ -4226,6 +4231,7 @@ def _second_order_angular_iteration(
                     guard_basis_capacity + 2,
                 ),
                 direction_norm_floor=float(norm_floor),
+                maximum_guard_directions=guard_basis_capacity,
             )
         )
     except (RuntimeError, ValueError, FloatingPointError) as exc:
@@ -8880,6 +8886,11 @@ def run(args):
         "second_order_guard_basis_capacity": (
             train_shadow_contract.get("second_order_guard_basis_capacity")
             if g1f3 else None
+        ),
+        "second_order_guard_basis_replenishment": (
+            train_shadow_contract.get(
+                "second_order_guard_basis_replenishment"
+            ) if g1f3 else None
         ),
         "second_order_max_coarse_grid_directions": (
             train_shadow_contract.get(

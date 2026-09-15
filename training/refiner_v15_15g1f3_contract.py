@@ -18,8 +18,8 @@ from pathlib import Path
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v8"
-FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v8"
+REPORT_SCHEMA = "refiner_v15_15g1f3_second_order_composite_closure_sqp_v9"
+FROZEN_SCHEMA = "refiner_v15_15g1f3_frozen_contract_v9"
 TARGET_CASE_UIDS = (
     "txn_0001_97ecf5fd6e62:169",
     "txn_0001_97ecf5fd6e62:43",
@@ -165,6 +165,10 @@ def _unchanged_contract(report):
              "second-order basis growth policy changed")
     _require(int(report.get("second_order_guard_basis_capacity", 0)) == 3,
              "second-order Guard basis capacity changed")
+    _require(report.get("second_order_guard_basis_replenishment") ==
+             "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
+             "linearly_dependent_projection",
+             "second-order Guard basis replenishment changed")
     _require(int(report.get("second_order_max_coarse_grid_directions", 0)) ==
              second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
              "second-order coarse grid bound changed")
@@ -556,6 +560,9 @@ def freeze_contract(args):
             "second_order_guard_basis_capacity": int(
                 repair["second_order_guard_basis_capacity"]
             ),
+            "second_order_guard_basis_replenishment": repair[
+                "second_order_guard_basis_replenishment"
+            ],
             "second_order_max_coarse_grid_directions": int(
                 repair["second_order_max_coarse_grid_directions"]
             ),

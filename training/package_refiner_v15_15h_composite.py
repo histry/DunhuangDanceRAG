@@ -18,8 +18,8 @@ from training import refiner_v15_15g1f3_second_order as second_order
 
 MODEL_NAME = "v15_15h_adapter_second_order_composite.pt"
 CONTRACT_NAME = "v15_15h_adapter_second_order_composite.contract.json"
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v8"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v8"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v9"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v9"
 
 
 def _sha256(path):
@@ -61,7 +61,7 @@ def run(args):
     frozen = _read_json(args.g1f3_frozen_contract)
     held_out = _read_json(args.held_out_acceptance)
     one_shot = _read_json(args.held_out_one_shot_receipt)
-    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v8",
+    _require(frozen.get("schema") == "refiner_v15_15g1f3_frozen_contract_v9",
              "g1f3 frozen contract schema mismatch")
     _require(frozen.get("immutable") is True, "g1f3 contract is not immutable")
     _require(frozen.get("implementation_commit") == args.implementation_commit,
@@ -107,6 +107,10 @@ def run(args):
              "frozen second-order basis growth policy changed")
     _require(int(fixed.get("second_order_guard_basis_capacity", 0)) == 3,
              "frozen Guard basis capacity changed")
+    _require(fixed.get("second_order_guard_basis_replenishment") ==
+             "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
+             "linearly_dependent_projection",
+             "frozen Guard basis replenishment changed")
     _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
              second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
              "frozen coarse grid bound changed")
@@ -307,6 +311,9 @@ def run(args):
             "second_order_guard_basis_capacity": int(
                 fixed["second_order_guard_basis_capacity"]
             ),
+            "second_order_guard_basis_replenishment": fixed[
+                "second_order_guard_basis_replenishment"
+            ],
             "second_order_max_coarse_grid_directions": int(
                 fixed["second_order_max_coarse_grid_directions"]
             ),

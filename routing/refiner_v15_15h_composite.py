@@ -23,8 +23,8 @@ from training import refiner_v15_15g_fixed_budget_correction as g1f
 from training import refiner_v15_15g1f3_second_order as second_order
 
 
-MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v8"
-CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v8"
+MODEL_SCHEMA = "v15_15h_adapter_second_order_repair_composite_v9"
+CONTRACT_SCHEMA = "v15_15h_adapter_second_order_repair_composite_contract_v9"
 _CACHE = {}
 
 
@@ -132,6 +132,10 @@ def _load_composite(model_path, contract_path, cfg):
              "V15.15h second-order basis growth policy changed")
     _require(int(fixed.get("second_order_guard_basis_capacity", 0)) == 3,
              "V15.15h Guard basis capacity changed")
+    _require(fixed.get("second_order_guard_basis_replenishment") ==
+             "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
+             "linearly_dependent_projection",
+             "V15.15h Guard basis replenishment changed")
     _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
              second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
              "V15.15h coarse grid bound changed")
@@ -574,9 +578,7 @@ def _apply_one_transaction(
                     int(fixed["second_order_guard_basis_capacity"]),
                     1 + int(constraint_generation_depth),
                 )
-                basis_guard_names = guard_constraint_names[
-                    :effective_guard_basis_capacity
-                ]
+                basis_guard_names = guard_constraint_names
                 gradient_names = (
                     (
                         basis_guard_names[0],
@@ -671,6 +673,9 @@ def _apply_one_transaction(
                             ),
                             direction_norm_floor=1.0e-8,
                             metric_names=tuple(scalar_terms),
+                            maximum_guard_directions=(
+                                effective_guard_basis_capacity
+                            ),
                         )
                     )
                 except (RuntimeError, ValueError, FloatingPointError) as exc:

@@ -18,6 +18,9 @@ ownership 球面切空间中的 Guard witness、endpoint、temporal 物理协向
 margin 最高的一条 Guard witness 方向。只有真实 trial 触发同一展开点的约束生成
 时，每轮再增加一条 Guard 方向，最多增长到 5 维、三条线性独立 Guard 方向；
 全部 witness 始终作为独立约束行参与求解。
+基构造按 signed margin 顺序扫描完整 witness bundle；若高优先级 witness 在
+ownership 球面切空间中为零梯度或与已有方向线性相关，会继续扫描后续 witness
+补位，直到达到本轮 Guard 容量或穷尽有限 witness 集。
 只通过方向 HvP 和 polarization 形成最多 `5 x 5` 的模型，不形成环境维度
 Hessian。max/p95 活跃集只在该角度的预测模型内冻结，真实 trial 会重算硬
 指标和完整 Guard。
