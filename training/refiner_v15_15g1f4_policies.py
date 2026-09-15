@@ -74,7 +74,9 @@ class ProgressPolicy:
             acceptance_mode=acceptance_mode,
             audit={
                 "progress_mode": self.mode,
-                "debt_weighting": "unit_by_constraint_row_v1",
+                "guard_debt_definition": "hard_guard_witness_rows_only",
+                "debt_weight_schema": "unit_by_constraint_row_v1",
+                "guard_debt_scale_source": "train_frozen_contract",
                 "safe_set_rule": "already_safe_rows_must_remain_safe",
                 "strict_hard_shadow_decrease_required": True,
                 "strict_science_improvement_required": bool(

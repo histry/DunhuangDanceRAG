@@ -76,7 +76,6 @@ COMMON_ARGS=(
   --second-order-grid-levels 9
   --second-order-feasibility-tolerance 1e-12
   --second-order-guard-transition-band 1e-5
-  --steps 2 3 5
   --target-rms 1e-4
   --validation-teacher-bank "$TRAIN_BANK"
   --evaluation-role train_calibration
@@ -87,6 +86,7 @@ BASELINE_DIR="$ROOT/current_equal_share_identity"
 set +e
 "$PY" -u -m training.refiner_v15_15g_fixed_budget_correction \
   "${COMMON_ARGS[@]}" \
+  --steps 2 3 5 \
   --progress-mode current_equal_share \
   --output-dir "$BASELINE_DIR"
 BASELINE_STATUS=$?
@@ -109,7 +109,11 @@ P_DIR="$ROOT/weighted_debt_filter_identity"
 set +e
 "$PY" -u -m training.refiner_v15_15g_fixed_budget_correction \
   "${COMMON_ARGS[@]}" \
+  --steps 5 \
   --progress-mode weighted_debt_filter \
+  --diagnostic-case-uid txn_0001_97ecf5fd6e62:169 \
+  --diagnostic-case-uid txn_0005_a6fbd294b71c:169 \
+  --diagnostic-case-uid txn_0007_0d8eea4df4f1:137 \
   --output-dir "$P_DIR"
 P_STATUS=$?
 set -e
@@ -117,5 +121,70 @@ P_REPORT="$P_DIR/fixed_budget_correction.report.json"
 test -s "$P_REPORT"
 printf '%s\n' "$P_REPORT" > outputs/LATEST_REFINER_V15_15G1F4_P_REPORT
 
-echo "g1f4 Gate 0 passed; P-only train report: $P_REPORT"
+P_SUMMARY="$ROOT/p_only_three_target_k5.summary.json"
+"$PY" - "$V9_REFERENCE_REPORT" "$P_REPORT" "$P_SUMMARY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+reference = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
+candidate = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8-sig"))
+output = Path(sys.argv[3])
+uids = (
+    "txn_0001_97ecf5fd6e62:169",
+    "txn_0005_a6fbd294b71c:169",
+    "txn_0007_0d8eea4df4f1:137",
+)
+
+def cases(report):
+    return report["variants"]["geodesic_joint_sqp_k5"]["correction_by_case"]
+
+def shadow(row):
+    history = row.get("history") or []
+    return history[-1].get("full_shadow_after") if history else None
+
+rows = {}
+for uid in uids:
+    old = cases(reference)[uid]
+    new = cases(candidate)[uid]
+    rows[uid] = {
+        "v9_accepted_steps": old.get("accepted_steps"),
+        "p_accepted_steps": new.get("accepted_steps"),
+        "v9_second_order_state": old.get("second_order_state"),
+        "p_second_order_state": new.get("second_order_state"),
+        "v9_final_shadow": shadow(old),
+        "p_final_shadow": shadow(new),
+        "accepted_additional_step": (
+            int(new.get("accepted_steps", 0)) > int(old.get("accepted_steps", 0))
+        ),
+    }
+
+value = {
+    "schema": "refiner_v15_15g1f4_p_three_target_k5_diagnostic_v1",
+    "diagnostic_only": True,
+    "train_acceptance_claimed": False,
+    "numeric_audit_complete": candidate.get("numeric_audit_complete"),
+    "guard_debt_definition": candidate.get("guard_debt_definition"),
+    "guard_debt_scale_sha256": candidate.get("guard_debt_scale_sha256"),
+    "debt_weight_schema": candidate.get("debt_weight_schema"),
+    "debt_weight_sha256": candidate.get("debt_weight_sha256"),
+    "by_case": rows,
+    "additional_step_case_count": sum(
+        int(row["accepted_additional_step"]) for row in rows.values()
+    ),
+}
+output.write_text(
+    json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+print(json.dumps({
+    "stage": "g1f4_p_three_target_k5_diagnostic",
+    "report": str(output),
+    "numeric_audit_complete": value["numeric_audit_complete"],
+    "additional_step_case_count": value["additional_step_case_count"],
+}), flush=True)
+PY
+printf '%s\n' "$P_SUMMARY" > outputs/LATEST_REFINER_V15_15G1F4_P_SUMMARY
+
+echo "g1f4 Gate 0 passed; P-only three-target k5 diagnostic: $P_REPORT"
 exit "$P_STATUS"

@@ -31,6 +31,12 @@ export V9_REFERENCE_REPORT=/absolute/path/to/v9/fixed_budget_correction.report.j
 bash scripts/run_refiner_v15_15g1f4_p_gate_server.sh
 ```
 
+After Gate 0, that entry point runs only the three frozen v9 failures at k5.
+The resulting report is marked `diagnostic_only=true`; its process success
+means the numeric audit completed, not that train acceptance passed. A full
+2/3/5 train run is a later gate and may start only after this diagnostic shows
+useful additional accepted steps or closure.
+
 ## P kernel: weighted debt filter
 
 The P kernel changes only intermediate-step acceptance. For every non-final
@@ -42,8 +48,16 @@ step it requires:
 - strict endpoint and temporal improvement;
 - strict authoritative hard-shadow decrease;
 - every already-safe modeled row remains safe; and
-- strict decrease of normalized positive debt
-  `sum_i [max(g_i / s_i, 0)]^2`, with first-version row weights `w_i=1`.
+- strict decrease of Guard-only normalized positive debt
+  `sum_i w_i [max(g_i / s_i, 0)]^2`. Endpoint and temporal terms are
+  excluded because they have their own strict-progress checks.
+
+The first-version weights are immutably `w_i=1`. Each `s_i` is frozen from
+train as the median fixed-Guard allowance or numeric tolerance (whichever is
+larger) for the row's base Guard term. Scale and weight maps carry independent
+canonical SHA256 values. A missing, non-positive, non-finite, non-unit, or
+hash-mismatched contract fails closed; scales are never inferred from the
+current iteration gap.
 
 It deliberately removes the v9 requirement that every modeled row repay an
 equal fraction of its remaining gap at every step. The last correction step
@@ -74,7 +88,8 @@ Development and held-out data are forbidden during that calibration.
 ## Experimental order
 
 1. Run Gate 0 and require exact canonical parity.
-2. Run P-only on train; inspect the three known failed targets at k5.
+2. Run P-only on the three frozen failures at k5; do not treat this diagnostic
+   as train acceptance.
 3. If promising, require all five targets, full group coverage, numeric audit,
    scope, single identity, and Adapter incumbent preservation.
 4. Run cold starts 2 and 3, then the frozen development bank.

@@ -148,6 +148,11 @@ G1F3_TRAIN_TARGET_CASE_UIDS = (
     "txn_0005_a6fbd294b71c:169",
     "txn_0007_0d8eea4df4f1:137",
 )
+G1F4_P_DIAGNOSTIC_CASE_UIDS = (
+    "txn_0001_97ecf5fd6e62:169",
+    "txn_0005_a6fbd294b71c:169",
+    "txn_0007_0d8eea4df4f1:137",
+)
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
 TEACHER_SCHEMA = adapter.V15_15E_TEACHER_SCHEMA
 METHODS = ("adapter", "euclidean_projected", "riemannian_retraction")
@@ -217,6 +222,17 @@ def _file_sha256(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_json_sha256(value):
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def negative_contrastive_penalty(predicted, rejected, *, margin=0.0):
@@ -993,6 +1009,18 @@ def _freeze_train_full_shadow_repair_contract(
         name: max(float(minimum_reduction_floor), _median(numerics[name]))
         for name in sorted(numerics)
     }
+    guard_debt_scales = {
+        name: max(_median(allowances[name]), _median(numerics[name]))
+        for name in sorted(allowances)
+    }
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in guard_debt_scales.values()
+    ):
+        raise RuntimeError("train-frozen Guard debt scales must be finite and positive")
+    guard_debt_weights = {
+        name: 1.0 for name in sorted(guard_debt_scales)
+    }
     progress_policy = progress_policy or g1f4_policies.ProgressPolicy(
         g1f4_policies.CURRENT_EQUAL_SHARE
     )
@@ -1024,7 +1052,19 @@ def _freeze_train_full_shadow_repair_contract(
         "g1f4_shared_policy_metric_path": bool(second_order_joint_sqp),
         "progress_mode": progress_policy.mode,
         "progress_policy_schema": "g1f4_progress_policy_v1",
-        "progress_debt_weights": "unit_by_constraint_row_v1",
+        "guard_debt_definition": "hard_guard_witness_rows_only",
+        "guard_debt_scale_schema": (
+            "train_median_fixed_guard_allowance_or_numeric_tolerance_v1"
+        ),
+        "guard_debt_scale_by_guard_term": guard_debt_scales,
+        "guard_debt_scale_sha256": _canonical_json_sha256(
+            guard_debt_scales
+        ),
+        "debt_weight_schema": "unit_by_constraint_row_v1",
+        "debt_weight_by_guard_term": guard_debt_weights,
+        "debt_weight_sha256": _canonical_json_sha256(
+            guard_debt_weights
+        ),
         "final_acceptance_unchanged": True,
         **metric_operator.audit(),
         "validation_consumed_for_calibration": False,
@@ -2560,6 +2600,7 @@ def _science_pass_margin_diagnostics(scientific):
         result[f"trial_{key}_margin_to_pass"] = strict_margin
         strict_passed = strict_passed and strict_margin > 0.0
     result["both_scientific_terms_strictly_improved"] = bool(strict_passed)
+    result["both_scientific_terms_strictly_passed"] = bool(strict_passed)
     return result
 
 
@@ -4159,6 +4200,48 @@ def _second_order_angular_iteration(
         (max(value, 0.0) / signed_gap_scale[name]) ** 2
         for name, value in current_signed_gap.items()
     )
+    weighted_guard_debt_enabled = bool(
+        progress_policy.mode == g1f4_policies.WEIGHTED_DEBT_FILTER
+    )
+    guard_debt_scale = {}
+    guard_debt_weight = {}
+    current_guard_positive_debt_merit = None
+    if weighted_guard_debt_enabled:
+        scale_contract = train_repair_contract.get(
+            "guard_debt_scale_by_guard_term"
+        )
+        weight_contract = train_repair_contract.get(
+            "debt_weight_by_guard_term"
+        )
+        if not isinstance(scale_contract, dict) or not isinstance(
+            weight_contract, dict
+        ):
+            raise RuntimeError(
+                "weighted_debt_filter requires frozen Guard debt scales and weights"
+            )
+        for row_name in guard_signed_gaps:
+            base_name = guard_row_base_name[row_name]
+            if base_name not in scale_contract or base_name not in weight_contract:
+                raise RuntimeError(
+                    f"weighted_debt_filter lacks frozen contract for {base_name}"
+                )
+            scale = float(scale_contract[base_name])
+            weight = float(weight_contract[base_name])
+            if not math.isfinite(scale) or scale <= 0.0:
+                raise RuntimeError(
+                    f"weighted_debt_filter invalid scale for {base_name}"
+                )
+            if weight != 1.0:
+                raise RuntimeError(
+                    f"first g1f4 P experiment requires unit weight for {base_name}"
+                )
+            guard_debt_scale[row_name] = scale
+            guard_debt_weight[row_name] = weight
+        current_guard_positive_debt_merit = sum(
+            guard_debt_weight[name]
+            * (max(value, 0.0) / guard_debt_scale[name]) ** 2
+            for name, value in guard_signed_gaps.items()
+        )
 
     dtype = m.torch.float64
     baseline64 = baseline.detach().to(dtype)
@@ -4632,6 +4715,30 @@ def _second_order_angular_iteration(
             (max(value, 0.0) / signed_gap_scale[name]) ** 2
             for name, value in trial_signed_gap.items()
         )
+        trial_guard_signed_gap = {
+            name: trial_signed_gap[name] for name in guard_row_names
+        }
+        if weighted_guard_debt_enabled:
+            trial_guard_positive_debt_merit = sum(
+                guard_debt_weight[name]
+                * (
+                    max(value, 0.0) / guard_debt_scale[name]
+                ) ** 2
+                for name, value in trial_guard_signed_gap.items()
+            )
+            guard_debt_merit_progress = bool(
+                math.isfinite(trial_guard_positive_debt_merit)
+                and trial_guard_positive_debt_merit
+                < current_guard_positive_debt_merit
+                - float(
+                    train_repair_contract[
+                        "second_order_feasibility_tolerance"
+                    ]
+                )
+            )
+        else:
+            trial_guard_positive_debt_merit = None
+            guard_debt_merit_progress = None
         filter_boundary_tolerance = {
             **{
                 name: shadow_step_tolerance for name in guard_row_names
@@ -4646,6 +4753,14 @@ def _second_order_angular_iteration(
                 <= filter_boundary_tolerance[name]
             )
             for name in current_signed_gap
+        )
+        safe_guard_rows_remain_safe = all(
+            math.isfinite(trial_guard_signed_gap[name])
+            and (
+                guard_signed_gaps[name] > 0.0
+                or trial_guard_signed_gap[name] <= shadow_step_tolerance
+            )
+            for name in guard_signed_gaps
         )
         filter_merit_progress = bool(
             math.isfinite(trial_positive_gap_merit)
@@ -4667,10 +4782,16 @@ def _second_order_angular_iteration(
             and filter_merit_progress
             and full_shadow_strict_decrease
         )
+        weighted_guard_debt_filter_progress = bool(
+            weighted_guard_debt_enabled
+            and safe_guard_rows_remain_safe
+            and guard_debt_merit_progress
+            and full_shadow_strict_decrease
+        )
         authoritative_step_closure = bool(
             trial_shadow <= 0.0
             and science_margins[
-                "both_scientific_terms_strictly_improved"
+                "both_scientific_terms_strictly_passed"
             ]
             and radius_ok
             and scope_ok
@@ -4690,7 +4811,9 @@ def _second_order_angular_iteration(
             progress_decision = progress_policy.decide_intermediate(
                 authoritative_step_closure=authoritative_step_closure,
                 quota_progress=quota_progress,
-                authoritative_filter_progress=authoritative_filter_progress,
+                authoritative_filter_progress=(
+                    weighted_guard_debt_filter_progress
+                ),
                 both_scientific_terms_strictly_improved=(
                     science_step_strict_improvement
                 ),
@@ -4711,7 +4834,7 @@ def _second_order_angular_iteration(
                     failed_constraints.append("endpoint_temporal_step_progress")
                 failed_constraints.append("authoritative_remaining_gap_share")
             else:
-                if not authoritative_filter_progress:
+                if not weighted_guard_debt_filter_progress:
                     failed_constraints.append("weighted_debt_filter_progress")
                 if not science_step_strict_improvement:
                     failed_constraints.append("strict_science_improvement")
@@ -4800,6 +4923,20 @@ def _second_order_angular_iteration(
                 full_shadow_strict_decrease
             ),
             "authoritative_filter_progress": authoritative_filter_progress,
+            "guard_debt_definition": "hard_guard_witness_rows_only",
+            "guard_debt_scale_by_row": dict(guard_debt_scale),
+            "guard_debt_weight_by_row": dict(guard_debt_weight),
+            "current_guard_positive_debt_merit": (
+                current_guard_positive_debt_merit
+            ),
+            "trial_guard_positive_debt_merit": (
+                trial_guard_positive_debt_merit
+            ),
+            "guard_debt_merit_progress": guard_debt_merit_progress,
+            "safe_guard_rows_remain_safe": safe_guard_rows_remain_safe,
+            "weighted_guard_debt_filter_progress": (
+                weighted_guard_debt_filter_progress
+            ),
             "authoritative_progress_mode": accepted_progress_mode,
             "progress_policy_decision": progress_decision_audit,
             "metric_operator": metric_operator.audit(),
@@ -7169,6 +7306,7 @@ def run(args):
         or metric_operator.mode != g1f4_policies.IDENTITY_METRIC
     ):
         raise RuntimeError("g1f4 policy/metric modes require --activation-aware-g1f3")
+    diagnostic_case_uids = frozenset(args.diagnostic_case_uid or ())
     g1f2_family = bool(g1f2 or g1f3)
     g1f1_family = bool(g1f1 or g1f2_family)
     g1f_family = bool(g1f or g1f1_family)
@@ -7614,6 +7752,39 @@ def run(args):
                         metric_operator=metric_operator,
                     )
                 )
+            if g1f4 and (
+                progress_policy.mode
+                == g1f4_policies.WEIGHTED_DEBT_FILTER
+            ):
+                scales = train_shadow_contract.get(
+                    "guard_debt_scale_by_guard_term"
+                )
+                weights = train_shadow_contract.get(
+                    "debt_weight_by_guard_term"
+                )
+                if (
+                    train_shadow_contract.get("guard_debt_definition")
+                    != "hard_guard_witness_rows_only"
+                    or train_shadow_contract.get("debt_weight_schema")
+                    != "unit_by_constraint_row_v1"
+                    or not isinstance(scales, dict)
+                    or not scales
+                    or not isinstance(weights, dict)
+                    or set(weights) != set(scales)
+                    or any(float(value) != 1.0 for value in weights.values())
+                    or any(
+                        not math.isfinite(float(value)) or float(value) <= 0.0
+                        for value in scales.values()
+                    )
+                    or train_shadow_contract.get("debt_weight_sha256")
+                    != _canonical_json_sha256(weights)
+                    or train_shadow_contract.get("guard_debt_scale_sha256")
+                    != _canonical_json_sha256(scales)
+                ):
+                    raise RuntimeError(
+                        "g1f4 P requires immutable train-frozen Guard-only "
+                        "debt scales and unit weights"
+                    )
             train_shadow_contract.update({
                 "train_teacher_bank": str(train_teacher_path),
                 "train_teacher_bank_sha256": _file_sha256(train_teacher_path),
@@ -7753,6 +7924,14 @@ def run(args):
                     continue
                 uid = str(sample["case_uid"])
                 global_case = int(sample["case_index"])
+                if diagnostic_case_uids and uid not in diagnostic_case_uids:
+                    correction_reports[uid] = {
+                        "execution_skipped": True,
+                        "execution_skip_reason": "g1f4_p_k5_diagnostic_scope",
+                        "runtime_case_label_consumed": False,
+                        "numeric_failure": False,
+                    }
+                    continue
                 if g1f3:
                     if evaluation_role == "train_calibration":
                         severity = _discriminative_conformal_status(
@@ -8840,8 +9019,33 @@ def run(args):
             else SCHEMA
         ),
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
+        "diagnostic_only": bool(diagnostic_case_uids),
+        "diagnostic_case_uids": sorted(diagnostic_case_uids),
+        "diagnostic_results_must_not_be_used_as_train_acceptance": bool(
+            diagnostic_case_uids
+        ),
         "g1f4_shared_policy_metric_path": bool(g1f3),
         "progress_mode": progress_policy.mode,
+        "guard_debt_definition": (
+            train_shadow_contract.get("guard_debt_definition")
+            if g1f4 else None
+        ),
+        "guard_debt_scale_schema": (
+            train_shadow_contract.get("guard_debt_scale_schema")
+            if g1f4 else None
+        ),
+        "guard_debt_scale_sha256": (
+            train_shadow_contract.get("guard_debt_scale_sha256")
+            if g1f4 else None
+        ),
+        "debt_weight_schema": (
+            train_shadow_contract.get("debt_weight_schema")
+            if g1f4 else None
+        ),
+        "debt_weight_sha256": (
+            train_shadow_contract.get("debt_weight_sha256")
+            if g1f4 else None
+        ),
         "metric_operator": metric_operator.audit(),
         "g1f4_mode": (
             "baseline"
@@ -9377,6 +9581,8 @@ def run(args):
         "numeric_audit_complete": report["numeric_audit_complete"],
     }), flush=True)
     if g1f3 and evaluation_role == "train_calibration":
+        if diagnostic_case_uids:
+            return 0 if report["numeric_audit_complete"] else 2
         train_composite_complete = bool(
             activation_aware_supported
             and activation_summary
@@ -9437,6 +9643,12 @@ def main():
             "train-only equivalent-radius calibration; required before "
             "anchor_kinematic execution"
         ),
+    )
+    parser.add_argument(
+        "--diagnostic-case-uid",
+        action="append",
+        default=[],
+        help="g1f4 P-only train diagnostic scope; repeat for each case UID",
     )
     parser.add_argument(
         "--evaluation-role",
@@ -9585,7 +9797,24 @@ def main():
         parser.error("non-baseline g1f4 modes require --activation-aware-g1f3")
     if args.target_rms != 1.0e-4:
         parser.error("--target-rms must remain exactly 1e-4")
-    if tuple(sorted(set(args.steps))) != (2, 3, 5):
+    diagnostic_case_uids = frozenset(args.diagnostic_case_uid)
+    if diagnostic_case_uids:
+        if diagnostic_case_uids != frozenset(G1F4_P_DIAGNOSTIC_CASE_UIDS):
+            parser.error(
+                "g1f4 P diagnostic must contain exactly the three frozen case UIDs"
+            )
+        if (
+            not args.activation_aware_g1f3
+            or args.progress_mode != g1f4_policies.WEIGHTED_DEBT_FILTER
+            or args.metric_mode != g1f4_policies.IDENTITY_METRIC
+            or args.evaluation_role != "train_calibration"
+            or tuple(args.steps) != (5,)
+        ):
+            parser.error(
+                "diagnostic case scope requires P-only identity train calibration "
+                "with --steps 5"
+            )
+    elif tuple(sorted(set(args.steps))) != (2, 3, 5):
         parser.error("--steps must contain exactly 2 3 5")
     if args.step_size <= 0.0:
         parser.error("--step-size must be positive")
