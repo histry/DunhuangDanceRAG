@@ -1874,6 +1874,171 @@ def _case_isolated_transaction_tangent(baseline, scoped, local_case):
     return transaction_tangent
 
 
+def _metric_raw_audit(
+    *, model, domain, cfg, candidate, local_case, baseline_case,
+    workspace_floor, metric_operator, local_tangent=None,
+):
+    """Run the unchanged science/Guard/scope audit with metric radius."""
+    kernel = metric_operator.kernel
+    if kernel is None or kernel.rho_g is None:
+        raise RuntimeError("M candidate audit requires a frozen calibrated metric")
+    output_rms = projected_probe._motion_edit_rms(
+        domain["baseline"][local_case:local_case + 1],
+        candidate[local_case:local_case + 1],
+        domain["batch"]["seam"][local_case:local_case + 1],
+    )
+    if not math.isfinite(output_rms) or output_rms <= 0.0:
+        output_rms = 1.0e-30
+    raw = oracle._exact_audit(
+        model, domain["batch"], cfg, domain["baseline"],
+        domain["identity"], domain["baseline_guard"],
+        domain["contract"]["initial_anchor"],
+        domain["contract"]["relative_tolerance"],
+        domain["contract"]["absolute_tolerance"], candidate, local_case,
+        baseline_case, output_rms, workspace_floor,
+    )
+    tangent = (
+        local_tangent
+        if local_tangent is not None
+        else product_log_torch(domain["baseline"], candidate)[
+            local_case:local_case + 1
+        ]
+    )
+    metric_rms = kernel.rms(tangent)
+    metric_ok = bool(
+        math.isfinite(metric_rms)
+        and abs(metric_rms - float(kernel.rho_g)) <= 1.0e-12
+    )
+    raw["euclidean_owned_physical_tangent_rms"] = _rms(
+        tangent, kernel.mask
+    )
+    raw["metric_rms"] = metric_rms
+    raw["metric_target_rms"] = float(kernel.rho_g)
+    raw["metric_radius_relative_error"] = (
+        abs(metric_rms - float(kernel.rho_g)) / float(kernel.rho_g)
+    )
+    raw["task_space_norm_Jd_W"] = float(kernel.task_norm(tangent).detach())
+    raw["radius_contract"] = "frozen_anchor_kinematic_metric_rms"
+    raw["radius_equality_resolved"] = metric_ok
+    raw["passed"] = bool(raw["passed"] and metric_ok)
+    return raw
+
+
+def _metric_project_raw_candidate(
+    *, model, domain, cfg, raw_candidate, local_case, baseline_case,
+    workspace_floor, metric_operator, args,
+):
+    """Use the existing Projector, rematerialising each trial on M's shell."""
+    full_projected, projector_report = (
+        projected_probe.weighted_dls_contact_project_torch(
+            domain["batch"]["bad"], domain["baseline"], raw_candidate,
+            domain["batch"]["seam"], cfg,
+            iterations=args.ik_iterations, damping=args.damping,
+            jacobian_epsilon=args.jacobian_epsilon,
+            stiffness_ceiling=args.stiffness_ceiling,
+            acceleration_regularization=args.acceleration_regularization,
+            jerk_regularization=args.jerk_regularization,
+            scientific_context={
+                "model": model, "batch": domain["batch"],
+                "identity": domain["identity"],
+            },
+        )
+    )
+    trials, accepted, accepted_factor = [], None, None
+    kernel = metric_operator.kernel
+    for factor in oracle.closure_probe.PROJECTION_FACTORS:
+        projected = oracle.closure_probe._interpolate_projector_correction(
+            raw_candidate, full_projected, factor
+        )
+        local_tangent = product_log_torch(
+            domain["baseline"], projected
+        )[local_case:local_case + 1]
+        local_tangent, resolved = kernel.normalize(
+            local_tangent, float(kernel.rho_g)
+        )
+        transaction_tangent = _case_isolated_transaction_tangent(
+            domain["baseline"], local_tangent, local_case
+        )
+        candidate = product_exp_torch(
+            domain["baseline"], transaction_tangent
+        )
+        audit = _metric_raw_audit(
+            model=model, domain=domain, cfg=cfg, candidate=candidate,
+            local_case=local_case, baseline_case=baseline_case,
+            workspace_floor=workspace_floor,
+            metric_operator=metric_operator,
+            local_tangent=local_tangent,
+        )
+        trials.append({
+            "factor": factor,
+            "metric_radius_rematerialized": bool(resolved),
+            "audit": audit,
+        })
+        if audit["passed"] and projector_report["scope_safe"]:
+            accepted, accepted_factor = candidate.detach(), factor
+            break
+    return accepted, {
+        "projector": projector_report,
+        "projection_trials": trials,
+        "projection_backtracking_factor": accepted_factor,
+        "effective_projected_candidate": accepted is not None,
+        "radius_rematerialization": "frozen_anchor_kinematic_metric_shell",
+    }
+
+
+def _metric_aware_audit_step(
+    *, model, batch, cfg, tangent, c2_taper, ownership, baseline,
+    identity, baseline_terms, samples, target_rms, workspace_floor, args,
+    domains, additional_case_uids, metric_operator, metric_case_uids,
+):
+    rows = adapter._audit_step(
+        model, batch, cfg, tangent, tangent, c2_taper, ownership,
+        baseline, identity, None, {}, baseline_terms, samples, target_rms,
+        workspace_floor, args, transaction_domains=domains,
+        additional_case_uids=additional_case_uids,
+    )
+    metric_case_uids = set(metric_case_uids)
+    row_by_uid = {str(row["case_uid"]): row for row in rows}
+    sample_by_uid = {str(sample["case_uid"]): sample for sample in samples}
+    for uid in sorted(metric_case_uids):
+        row, sample = row_by_uid.get(uid), sample_by_uid.get(uid)
+        case_metric = metric_operator.for_case(uid)
+        if row is None or sample is None or case_metric.kernel is None:
+            continue
+        domain = domains[str(sample["transaction_id"])]
+        global_case, local_case = int(sample["case_index"]), int(sample["local_case_index"])
+        local_tangent = tangent[global_case:global_case + 1]
+        transaction_tangent = _case_isolated_transaction_tangent(
+            domain["baseline"], local_tangent, local_case
+        )
+        candidate = product_exp_torch(domain["baseline"], transaction_tangent)
+        baseline_case = {
+            key: float(baseline_terms[key][global_case].detach())
+            for key in ("endpoint", "temporal")
+        }
+        raw = _metric_raw_audit(
+            model=model, domain=domain, cfg=cfg, candidate=candidate,
+            local_case=local_case, baseline_case=baseline_case,
+            workspace_floor=workspace_floor, metric_operator=case_metric,
+            local_tangent=local_tangent,
+        )
+        projection, projection_report = (None, None)
+        if raw["passed"]:
+            projection, projection_report = _metric_project_raw_candidate(
+                model=model, domain=domain, cfg=cfg,
+                raw_candidate=candidate, local_case=local_case,
+                baseline_case=baseline_case, workspace_floor=workspace_floor,
+                metric_operator=case_metric, args=args,
+            )
+        row.update({
+            "raw_audit": raw,
+            "projector_stop_gradient": True,
+            "projector_result": projection_report,
+            "effective_projected_candidate": bool(projection is not None),
+        })
+    return rows
+
+
 def _g1c_candidate_evidence(
     *,
     model,
@@ -1885,6 +2050,8 @@ def _g1c_candidate_evidence(
     cfg,
     target_rms,
     workspace_floor,
+    metric_operator=None,
+    metric_candidate=False,
 ):
     """Audit one generated candidate in its complete frozen transaction."""
     transaction_id = str(sample["transaction_id"])
@@ -1904,22 +2071,23 @@ def _g1c_candidate_evidence(
         key: float(baseline_terms[key][global_case].detach())
         for key in ("endpoint", "temporal")
     }
-    raw = oracle._exact_audit(
-        model,
-        domain["batch"],
-        cfg,
-        domain["baseline"],
-        domain["identity"],
-        domain["baseline_guard"],
-        domain["contract"]["initial_anchor"],
-        domain["contract"]["relative_tolerance"],
-        domain["contract"]["absolute_tolerance"],
-        candidate,
-        local_case,
-        baseline_case,
-        target_rms,
-        workspace_floor,
-    )
+    if metric_candidate:
+        raw = _metric_raw_audit(
+            model=model, domain=domain, cfg=cfg, candidate=candidate,
+            local_case=local_case, baseline_case=baseline_case,
+            workspace_floor=workspace_floor,
+            metric_operator=metric_operator.for_case(str(sample["case_uid"])),
+            local_tangent=scoped,
+        )
+    else:
+        raw = oracle._exact_audit(
+            model, domain["batch"], cfg, domain["baseline"],
+            domain["identity"], domain["baseline_guard"],
+            domain["contract"]["initial_anchor"],
+            domain["contract"]["relative_tolerance"],
+            domain["contract"]["absolute_tolerance"], candidate,
+            local_case, baseline_case, target_rms, workspace_floor,
+        )
     case_candidate = candidate[local_case:local_case + 1]
     case_baseline = domain["baseline"][local_case:local_case + 1]
     case_batch = adapter._slice_batch(
@@ -1979,7 +2147,16 @@ def _g1c_candidate_evidence(
         "fixed_guard_passed": bool(raw["fixed_guard_passed"]),
         "fixed_guard_blockers": list(raw["fixed_guard_blockers"]),
         "case_scientific": dict(raw["case_scientific"]),
-        "radius_rms": float(raw["achieved_case_output_tangent_rms"]),
+        "radius_rms": float(
+            raw.get("metric_rms", raw["achieved_case_output_tangent_rms"])
+        ),
+        "euclidean_rms": raw.get(
+            "euclidean_owned_physical_tangent_rms"
+        ),
+        "task_space_norm_Jd_W": raw.get("task_space_norm_Jd_W"),
+        "radius_contract": raw.get(
+            "radius_contract", "euclidean_output_tangent_rms"
+        ),
         "radius_equality_resolved": bool(raw["radius_equality_resolved"]),
         "workspace_observable_resolved": bool(
             raw["workspace_observable_resolved"]
@@ -3453,6 +3630,7 @@ def _temporal_directional_consistency_probe(
     batch,
     cfg,
     local_case,
+    metric_operator=None,
 ):
     """Compare the z-Jacobian with the real post-retraction angular path."""
     physical_norm = m.torch.linalg.vector_norm(physical_direction[mask])
@@ -3476,7 +3654,15 @@ def _temporal_directional_consistency_probe(
     # The geodesic parameter is theta.  At theta=0 its physical derivative is
     # ||d|| p/||p||, whose matching free-coordinate derivative is
     # ||d|| z/||p|| because p=A z.
-    angular_scale = radial_norm / physical_norm
+    anchor_metric = bool(
+        metric_operator is not None
+        and metric_operator.mode
+        == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+    )
+    angular_scale = (
+        radial_norm.new_tensor(1.0)
+        if anchor_metric else radial_norm / physical_norm
+    )
     autograd_derivative = (
         temporal_gradient_z.detach()[mask]
         * optimization_direction_z.detach()[mask]
@@ -3488,14 +3674,26 @@ def _temporal_directional_consistency_probe(
         ("plus", float(epsilon_radians)),
         ("minus", -float(epsilon_radians)),
     ):
-        trial, ok, geodesic_audit = _exact_radius_geodesic_update(
-            current,
-            physical_direction,
-            mask,
-            theta,
-            direction_norm_floor,
-            direction_is_sphere_tangent=True,
-        )
+        if anchor_metric:
+            trial, ok, geodesic_audit = metric_operator.execute(
+                "exact_radius_geodesic_update",
+                _exact_radius_geodesic_update,
+                current,
+                physical_direction,
+                mask,
+                theta,
+                direction_norm_floor,
+                direction_is_sphere_tangent=True,
+            )
+        else:
+            trial, ok, geodesic_audit = _exact_radius_geodesic_update(
+                current,
+                physical_direction,
+                mask,
+                theta,
+                direction_norm_floor,
+                direction_is_sphere_tangent=True,
+            )
         geodesic_audits[label] = geodesic_audit
         if not ok:
             return {
@@ -4453,6 +4651,7 @@ def _second_order_angular_iteration(
             batch=batch,
             cfg=cfg,
             local_case=local_case,
+            metric_operator=metric_operator,
         )
         solver_audit["temporal_directional_consistency"] = (
             directional_consistency
@@ -4514,10 +4713,24 @@ def _second_order_angular_iteration(
         radius_rms = metric_operator.execute(
             "radius_rms", _rms, trial, mask
         )
+        euclidean_radius_rms = _rms(trial, mask)
+        radius_relative_error = (
+            abs(radius_rms - float(target_rms)) / float(target_rms)
+            if float(target_rms) > 0.0 else math.inf
+        )
+        task_space_norm_jd_w = (
+            float(metric_operator.kernel.task_norm(trial).detach())
+            if metric_operator.kernel is not None else None
+        )
         radius_ok = bool(
             math.isfinite(radius_rms)
             and abs(radius_rms - float(target_rms))
-            <= max(1.0e-12, float(target_rms) * 1.0e-6)
+            <= (
+                1.0e-12
+                if metric_operator.mode
+                == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+                else max(1.0e-12, float(target_rms) * 1.0e-6)
+            )
         )
         outside_scope = float(
             trial.masked_fill(mask, 0.0).abs().amax().detach()
@@ -4941,6 +5154,14 @@ def _second_order_angular_iteration(
             "progress_policy_decision": progress_decision_audit,
             "metric_operator": metric_operator.audit(),
             "trial_radius_rms": radius_rms,
+            "trial_metric_rms": (
+                radius_rms
+                if metric_operator.mode
+                == g1f4_policies.ANCHOR_KINEMATIC_METRIC else None
+            ),
+            "trial_euclidean_rms": euclidean_radius_rms,
+            "task_space_norm_Jd_W": task_space_norm_jd_w,
+            "radius_relative_error": radius_relative_error,
             "trial_outside_scope_abs_max": outside_scope,
             **science_margins,
             "geodesic_update": geodesic_audit,
@@ -5242,12 +5463,103 @@ def _correct_case_geodesic_joint_sqp(
     metric_operator = metric_operator or g1f4_policies.build_metric_operator(
         g1f4_policies.IDENTITY_METRIC
     )
+    metric_operator = metric_operator.for_case(str(case_uid))
+    if (
+        metric_operator.mode == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+        or metric_operator.collecting_calibration
+    ):
+        anchor_variable = m.torch.zeros_like(
+            initial_tangent
+        ).requires_grad_(True)
+        anchor_total = (
+            initial_tangent.detach()
+            + anchor_variable.masked_fill(~mask, 0.0) * taper
+        )
+        anchor_transaction = _case_isolated_transaction_tangent(
+            baseline, anchor_total, local_case
+        )
+        anchor_candidate = product_exp_torch(baseline, anchor_transaction)
+        (
+            _, _, anchor_constraints, anchor_science, anchor_guard_rows,
+        ) = _g1d_shadow_objective(
+            model=model,
+            batch=batch,
+            cfg=cfg,
+            baseline=baseline,
+            identity=identity,
+            candidate=anchor_candidate,
+            contract=contract,
+            local_case=local_case,
+            baseline_case=baseline_case,
+            local_tangent=anchor_total,
+            local_mask=mask,
+            train_repair_contract=train_repair_contract,
+            temporal_smoothness_weight=0.0,
+            require_shadow_constraint=True,
+        )
+        anchor_items = list(anchor_guard_rows.items())
+        anchor_gradient_terms = [
+            anchor_items[0],
+            ("endpoint", anchor_science["endpoint"]),
+            ("temporal", anchor_science["temporal"]),
+            *anchor_items[1:],
+        ]
+        anchor_gradients = {
+            name: _autograd_gradient_or_zero(
+                value,
+                anchor_variable,
+                retain_graph=index < len(anchor_gradient_terms) - 1,
+            )
+            for index, (name, value) in enumerate(anchor_gradient_terms)
+        }
+        internal_metadata = (
+            anchor_constraints.get(
+                "prediction_internal_witness_row_metadata"
+            ) or {}
+        )
+        anchor_base_names = {}
+        for name in anchor_guard_rows:
+            if name in internal_metadata:
+                anchor_base_names[name] = internal_metadata[name][
+                    "base_guard_name"
+                ]
+            else:
+                anchor_base_names[name] = name.removeprefix("guard::")
+        anchor_base_names.update({
+            "endpoint": "endpoint", "temporal": "temporal"
+        })
+        anchor_row_scales = dict(
+            train_repair_contract["guard_debt_scale_by_guard_term"]
+        )
+        science_tolerances = (
+            anchor_constraints.get("scientific_numeric_tolerance") or {}
+        )
+        for name in ("endpoint", "temporal"):
+            anchor_row_scales[name] = max(
+                float(science_tolerances.get(name, 0.0)),
+                float(train_repair_contract["science_strict_descent_floor"]),
+                1.0e-12,
+            )
+        metric_operator.bind_anchor(
+            current=initial_tangent.detach(),
+            mask=mask,
+            taper=taper,
+            gradients=anchor_gradients,
+            row_base_names=anchor_base_names,
+            row_scales=anchor_row_scales,
+            floor=float(train_repair_contract["joint_direction_norm_floor"]),
+        )
+    metric_target_rms = (
+        metric_operator.target_rms
+        if metric_operator.mode == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+        else float(target_rms)
+    )
     current, normalized = metric_operator.execute(
         "normalize_exact_radius",
         _normalize_exact_radius,
         initial_tangent,
         mask,
-        target_rms,
+        metric_target_rms,
     )
     zero_start = not normalized
     if zero_start:
@@ -5338,7 +5650,7 @@ def _correct_case_geodesic_joint_sqp(
                     baseline_case=baseline_case,
                     contract=contract,
                     train_repair_contract=train_repair_contract,
-                    target_rms=target_rms,
+                    target_rms=metric_target_rms,
                     iteration=iteration,
                     remaining_steps=int(steps) - iteration,
                     progress_policy=progress_policy,
@@ -5709,6 +6021,16 @@ def _correct_case_geodesic_joint_sqp(
         "teacher_eligible": False,
         "final_exact_radius_rms": metric_operator.execute(
             "radius_rms", _rms, current, mask
+        ),
+        "final_metric_rms": (
+            metric_operator.execute("radius_rms", _rms, current, mask)
+            if metric_operator.mode
+            == g1f4_policies.ANCHOR_KINEMATIC_METRIC else None
+        ),
+        "final_euclidean_rms": _rms(current, mask),
+        "final_task_space_norm_Jd_W": (
+            float(metric_operator.kernel.task_norm(current).detach())
+            if metric_operator.kernel is not None else None
         ),
         "history": history,
         "elapsed_seconds": time.perf_counter() - started,
@@ -6901,6 +7223,7 @@ def _g1c_fixed_guard_shadow_selection(
     workspace_floor,
     severity_envelope,
     evaluation_role="inference",
+    metric_operator=None,
 ):
     """Select with observable activation and authoritative Guard shadows.
 
@@ -6955,6 +7278,13 @@ def _g1c_fixed_guard_shadow_selection(
                     cfg=cfg,
                     target_rms=target_rms,
                     workspace_floor=workspace_floor,
+                    metric_operator=metric_operator,
+                    metric_candidate=bool(
+                        metric_operator is not None
+                        and metric_operator.mode
+                        == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+                        and method != "adapter"
+                    ),
                 )
                 correction = correction_reports.get(method, {}).get(uid, {})
                 numeric_failure = bool(
@@ -7293,12 +7623,15 @@ def run(args):
     metric_operator = g1f4_policies.build_metric_operator(
         args.metric_mode,
         calibration_path=args.metric_radius_calibration,
+        calibration_output=args.calibrate_anchor_metric_output,
+        preregistration_path=args.metric_preregistered_contract,
     )
     g1f4 = bool(
         g1f3
         and (
             progress_policy.mode != g1f4_policies.CURRENT_EQUAL_SHARE
             or metric_operator.mode != g1f4_policies.IDENTITY_METRIC
+            or metric_operator.collecting_calibration
         )
     )
     if not g1f3 and (
@@ -7557,6 +7890,16 @@ def run(args):
                     != metric_operator.mode
                 ):
                     raise RuntimeError("frozen g1f4 policy/metric mode mismatch")
+                if (
+                    metric_operator.mode
+                    == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+                    and train_shadow_contract.get(
+                        "metric_radius_calibration_sha256"
+                    ) != metric_operator.calibration_sha256
+                ):
+                    raise RuntimeError(
+                        "frozen g1f4 metric calibration hash mismatch"
+                    )
                 if train_shadow_contract.get(
                     "train_teacher_bank_sha256"
                 ) != _file_sha256(train_teacher_path):
@@ -8167,6 +8510,26 @@ def run(args):
                 G1F3_TRAIN_TARGET_CASE_UIDS if g1f3 else ()
             ),
         )
+        if (
+            metric_operator.mode
+            == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+            and method != "adapter"
+        ):
+            audits = _metric_aware_audit_step(
+                model=model, batch=batch, cfg=cfg, tangent=tangent,
+                c2_taper=trace["c2_taper"].detach(),
+                ownership=ownership.detach(), baseline=baseline,
+                identity=identity, baseline_terms=baseline_terms,
+                samples=samples, target_rms=float(args.target_rms),
+                workspace_floor=workspace_floor, args=args, domains=domains,
+                additional_case_uids=(
+                    G1F3_TRAIN_TARGET_CASE_UIDS if g1f3 else ()
+                ),
+                metric_operator=metric_operator,
+                metric_case_uids={
+                    str(sample["case_uid"]) for sample in samples
+                },
+            )
         key = method if method == "adapter" else f"{method}_k{budget}"
         variant_tangents[key] = tangent.detach().clone()
         variant_correction_reports[key] = correction_reports
@@ -8176,6 +8539,28 @@ def run(args):
             time.perf_counter() - variant_started,
         )
         audit_by_uid = {str(row["case_uid"]): row for row in audits}
+        if metric_operator.collecting_calibration and method != "adapter":
+            sample_by_uid_for_metric = {
+                str(sample["case_uid"]): sample for sample in samples
+            }
+            for uid, audit in audit_by_uid.items():
+                sample = sample_by_uid_for_metric.get(uid)
+                if sample is None or not (
+                    audit["raw_audit"]["passed"]
+                    and audit.get("projector_result") is not None
+                    and audit["effective_projected_candidate"]
+                ):
+                    continue
+                case_index = int(sample["case_index"])
+                local_value = tangent[case_index:case_index + 1]
+                local_mask = ownership[
+                    case_index:case_index + 1
+                ].expand_as(local_value)
+                metric_operator.for_case(uid).observe_calibration_candidate(
+                    variant=key,
+                    value=local_value,
+                    mask=local_mask,
+                )
         if g1f3:
             sample_by_uid = {
                 str(sample["case_uid"]): sample for sample in samples
@@ -8232,6 +8617,19 @@ def run(args):
             ],
         }), flush=True)
 
+    metric_calibration = None
+    if metric_operator.collecting_calibration:
+        metric_calibration = metric_operator.finalize_calibration(
+            implementation_commit=os.environ.get("EXPECTED_COMMIT")
+        )
+        print(json.dumps({
+            "stage": "v15_15g1f4_anchor_metric_calibration_complete",
+            "contract": metric_operator.calibration_output,
+            "observation_count": metric_calibration["observation_count"],
+            "alpha": metric_calibration["alpha"],
+            "rho_G": metric_calibration["rho_G"],
+        }), flush=True)
+
     feasible_intersection_summary = (
         _local_feasible_intersection_summary(variant_correction_reports)
         if g1e_family else None
@@ -8258,6 +8656,7 @@ def run(args):
                 workspace_floor=workspace_floor,
                 severity_envelope=severity_envelope,
                 evaluation_role=evaluation_role,
+                metric_operator=metric_operator,
             )
         elif args.activation_aware_g1b:
             (
@@ -8345,6 +8744,28 @@ def run(args):
                 G1F3_TRAIN_TARGET_CASE_UIDS if g1f3 else ()
             ),
         )
+        if (
+            metric_operator.mode
+            == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+        ):
+            selected_audits = _metric_aware_audit_step(
+                model=model, batch=batch, cfg=cfg,
+                tangent=selected_tangent.detach(),
+                c2_taper=trace["c2_taper"].detach(),
+                ownership=ownership.detach(), baseline=baseline,
+                identity=identity, baseline_terms=baseline_terms,
+                samples=samples, target_rms=float(args.target_rms),
+                workspace_floor=workspace_floor, args=args, domains=domains,
+                additional_case_uids=(
+                    G1F3_TRAIN_TARGET_CASE_UIDS if g1f3 else ()
+                ),
+                metric_operator=metric_operator,
+                metric_case_uids={
+                    uid for uid, decision in activation_decisions.items()
+                    if decision.get("selected_method")
+                    not in {"identity", "adapter"}
+                },
+            )
         selected_summary = _variant_summary(
             selected_audits,
             {},
@@ -9047,6 +9468,7 @@ def run(args):
             if g1f4 else None
         ),
         "metric_operator": metric_operator.audit(),
+        "anchor_metric_calibration": metric_calibration,
         "g1f4_mode": (
             "baseline"
             if progress_policy.mode == g1f4_policies.CURRENT_EQUAL_SHARE
@@ -9581,6 +10003,11 @@ def run(args):
         "numeric_audit_complete": report["numeric_audit_complete"],
     }), flush=True)
     if g1f3 and evaluation_role == "train_calibration":
+        if metric_operator.collecting_calibration:
+            return 0 if (
+                report["numeric_audit_complete"]
+                and metric_calibration is not None
+            ) else 2
         if diagnostic_case_uids:
             return 0 if report["numeric_audit_complete"] else 2
         train_composite_complete = bool(
@@ -9643,6 +10070,14 @@ def main():
             "train-only equivalent-radius calibration; required before "
             "anchor_kinematic execution"
         ),
+    )
+    parser.add_argument(
+        "--metric-preregistered-contract",
+        help="immutable M-v1 preregistration used only by train calibration",
+    )
+    parser.add_argument(
+        "--calibrate-anchor-metric-output",
+        help="write the completed train-only alpha/rho_G metric contract",
     )
     parser.add_argument(
         "--diagnostic-case-uid",
@@ -9789,6 +10224,23 @@ def main():
     ):
         parser.error(
             "anchor_kinematic requires train-only --metric-radius-calibration"
+        )
+    if args.calibrate_anchor_metric_output:
+        if (
+            args.metric_mode != g1f4_policies.IDENTITY_METRIC
+            or args.progress_mode != g1f4_policies.CURRENT_EQUAL_SHARE
+            or not args.metric_preregistered_contract
+            or args.evaluation_role != "train_calibration"
+            or not args.activation_aware_g1f3
+        ):
+            parser.error(
+                "M calibration requires train g1f3 current_equal_share + identity "
+                "and --metric-preregistered-contract"
+            )
+    elif args.metric_preregistered_contract:
+        parser.error(
+            "--metric-preregistered-contract is only valid with "
+            "--calibrate-anchor-metric-output"
         )
     if (
         args.progress_mode != g1f4_policies.CURRENT_EQUAL_SHARE

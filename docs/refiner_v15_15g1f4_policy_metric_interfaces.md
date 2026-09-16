@@ -7,8 +7,8 @@ authoritative g1f3 execution path:
 | --- | --- | --- | --- |
 | baseline | `current_equal_share` | `identity` | executable; Gate 0 only |
 | P-only | `weighted_debt_filter` | `identity` | executable |
-| M-only | `current_equal_share` | `anchor_kinematic` | interface only; fail-closed |
-| PM | `weighted_debt_filter` | `anchor_kinematic` | interface only; fail-closed |
+| M-only | `current_equal_share` | `anchor_kinematic` | executable after train-only calibration |
+| PM | `weighted_debt_filter` | `anchor_kinematic` | executable after M-only |
 
 No mode changes ownership, taper semantics, the fixed `1e-4` Euclidean
 baseline radius, the 2/3/5 correction budgets, the 12 frozen angles,
@@ -64,15 +64,22 @@ equal fraction of its remaining gap at every step. The last correction step
 is unchanged and accepts only real full closure. Candidate projection and the
 final composite full-Guard audit remain authoritative.
 
-## M staging contract
+## M kernel and calibration contract
 
 The metric interface is defined in the owned physical tangent coordinate. It
 does not reinterpret the correction budget in the free `z` coordinate.
-`anchor_kinematic` is intentionally fail-closed in this revision: supplying no
-calibration rejects the request, and supplying a calibration reports that the
-kernel is not yet implemented. It may be implemented only after P evidence
-shows additional accepted intermediate steps followed by stable positive hard
-shadow at k5.
+`anchor_kinematic` remains fail-closed without a completed train-only
+calibration.  The kernel is frozen once per case at the immutable Adapter
+physical-tangent anchor.  Boundary, jerk and science Jacobian rows form
+independent, train-scale-normalized outer-product groups.  The resulting
+`beta I + U.T U` metric is trace-normalized on owned active coordinates;
+matrix-vector products are low-rank and inverse products use the exact
+Woodbury solve.  The ambient metric and Hessian are never materialized.
+
+Metric inverse-gradient directions, tangent projection, Gram-Schmidt,
+direction normalization, differentiable curvature geodesics, finite-angle
+trials and radius audits all use the same frozen metric.  The closed-form
+update remains on one fixed metric shell for all 2/3/5 repair steps.
 
 Before any M-only or PM experiment, train-only equivalent-radius calibration
 must freeze:
@@ -84,6 +91,27 @@ must freeze:
 4. the calibration manifest and SHA256 in the frozen contract.
 
 Development and held-out data are forbidden during that calibration.
+
+The server entry point executes the preregistered order without mixing the
+factorial cells:
+
+```bash
+export M_PREREG_CONTRACT=$(cat outputs/LATEST_REFINER_V15_15G1F4_M_V1_PREREG_CONTRACT)
+bash scripts/run_refiner_v15_15g1f4_m_pm_server.sh
+```
+
+It first runs `current_equal_share + identity` only to collect the first
+successful train correction per case and freezes `alpha` as the deterministic
+median metric/Euclidean RMS ratio.  It then runs M-only followed by PM.  An
+uncalibrated preregistration, a calibration that consumed non-train evidence,
+or a calibration hash mismatch fails closed.
+
+For M candidates the unchanged Projector kernel and backtracking factors are
+used, but each projected trial is rematerialized on the frozen metric shell.
+There is no post-hoc Euclidean normalization.  Every such trial reports metric
+RMS, Euclidean RMS, `||Jd||_W` and relative metric-radius error before the
+authoritative full-transaction Guard decision.  Adapter incumbents retain the
+original Euclidean-radius contract.
 
 ## Experimental order
 

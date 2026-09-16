@@ -422,21 +422,33 @@ def evaluate_internal_guard_witness_rows(
     return rows, metadata
 
 
-def _inner(left, right, mask):
+def _inner(left, right, mask, metric_kernel=None):
+    if metric_kernel is not None:
+        return metric_kernel.inner(left, right)
     return (left[mask] * right[mask]).sum()
 
 
-def _unit_owned_sphere_tangent(vector, current, mask, *, floor):
+def _unit_owned_sphere_tangent(
+    vector, current, mask, *, floor, metric_kernel=None, covector=False
+):
     scoped = vector.masked_fill(~mask, 0.0)
+    if metric_kernel is not None and covector:
+        scoped = metric_kernel.solve(scoped)
     radial = current.masked_fill(~mask, 0.0)
-    radial_norm_sq = _inner(radial, radial, mask)
+    radial_norm_sq = _inner(radial, radial, mask, metric_kernel)
     if not bool(m.torch.isfinite(radial_norm_sq)) or float(
         radial_norm_sq.detach()
     ) <= float(floor) ** 2:
         return None
-    scoped = scoped - (_inner(scoped, radial, mask) / radial_norm_sq) * radial
+    scoped = scoped - (
+        _inner(scoped, radial, mask, metric_kernel) / radial_norm_sq
+    ) * radial
     scoped = scoped.masked_fill(~mask, 0.0)
-    norm = m.torch.linalg.vector_norm(scoped[mask])
+    norm = (
+        metric_kernel.norm(scoped)
+        if metric_kernel is not None
+        else m.torch.linalg.vector_norm(scoped[mask])
+    )
     if not bool(m.torch.isfinite(norm)) or float(norm.detach()) <= float(floor):
         return None
     return scoped / norm
@@ -451,6 +463,7 @@ def build_owned_tangent_basis(
     dimension: int,
     floor: float,
     maximum_guard_directions: int | None = None,
+    metric_kernel=None,
 ):
     """Build a deterministic physical basis in the ownership-sphere tangent.
 
@@ -485,14 +498,18 @@ def build_owned_tangent_basis(
         physical = m.torch.zeros_like(gradient64)
         physical[active] = gradient64[active] / taper64[active]
         unit = _unit_owned_sphere_tangent(
-            physical, current64, active, floor=float(floor)
+            physical, current64, active, floor=float(floor),
+            metric_kernel=metric_kernel, covector=metric_kernel is not None,
         )
         if unit is None:
             continue
         for existing in rows:
-            unit = unit - _inner(unit, existing, active) * existing
+            unit = unit - _inner(
+                unit, existing, active, metric_kernel
+            ) * existing
         unit = _unit_owned_sphere_tangent(
-            unit, current64, active, floor=float(floor)
+            unit, current64, active, floor=float(floor),
+            metric_kernel=metric_kernel,
         )
         if unit is None:
             continue
@@ -520,13 +537,22 @@ def build_owned_tangent_basis(
         "ambient_hessian_materialized": False,
         "scope_null_space_projection": "exact_boolean_ownership_mask",
         "sphere_tangent_projection": True,
+        "tangent_inner_product": (
+            "anchor_kinematic" if metric_kernel is not None else "identity"
+        ),
     }
 
 
-def differentiable_geodesic_trial(current, unit_direction, mask, theta):
+def differentiable_geodesic_trial(
+    current, unit_direction, mask, theta, metric_kernel=None
+):
     """Exact sphere geodesic without detach, used by the curvature graph."""
     radial = current.masked_fill(~mask, 0.0)
     direction = unit_direction.masked_fill(~mask, 0.0)
+    if metric_kernel is not None:
+        return metric_kernel.differentiable_geodesic(
+            radial, direction, theta
+        )
     radius = m.torch.linalg.vector_norm(radial[mask])
     return (
         m.torch.cos(theta) * radial
@@ -542,12 +568,13 @@ def _directional_first_derivative(
     metric_builder,
     name,
     theta_radians,
+    metric_kernel=None,
 ):
     theta = current.new_tensor(
         float(theta_radians), dtype=m.torch.float64, requires_grad=True
     )
     trial = differentiable_geodesic_trial(
-        current, unit_direction, mask, theta
+        current, unit_direction, mask, theta, metric_kernel
     )
     value = metric_builder(trial)[name]
     if value.numel() != 1 or not bool(m.torch.isfinite(value).all()):
@@ -573,6 +600,7 @@ def _recover_directional_hvp(
     unit_direction,
     metric_builder,
     name,
+    metric_kernel=None,
 ):
     """Recover a nonfinite autograd HvP from verified float64 first derivatives.
 
@@ -591,6 +619,7 @@ def _recover_directional_hvp(
             metric_builder=metric_builder,
             name=name,
             theta_radians=epsilon,
+            metric_kernel=metric_kernel,
         )
         negative = _directional_first_derivative(
             current=current,
@@ -599,6 +628,7 @@ def _recover_directional_hvp(
             metric_builder=metric_builder,
             name=name,
             theta_radians=-epsilon,
+            metric_kernel=metric_kernel,
         )
         if positive is None or negative is None:
             return None, {
@@ -678,6 +708,7 @@ def _directional_jet(
     unit_direction,
     metric_builder: Callable[[object], Mapping[str, object]],
     names: Sequence[str],
+    metric_kernel=None,
 ):
     """Return F(0), dF/dtheta and d2F/dtheta2 for one real path.
 
@@ -686,7 +717,9 @@ def _directional_jet(
     curvature subspace; a nonfinite derivative is never replaced by zero.
     """
     theta = current.new_zeros((), dtype=m.torch.float64, requires_grad=True)
-    trial = differentiable_geodesic_trial(current, unit_direction, mask, theta)
+    trial = differentiable_geodesic_trial(
+        current, unit_direction, mask, theta, metric_kernel
+    )
     metrics = metric_builder(trial)
     result = {}
     recovered_hvps = []
@@ -738,6 +771,7 @@ def _directional_jet(
                 unit_direction=unit_direction,
                 metric_builder=metric_builder,
                 name=name,
+                metric_kernel=metric_kernel,
             )
             if second is None:
                 return None, {
@@ -766,6 +800,7 @@ def build_second_order_models(
     basis,
     metric_builder: Callable[[object], Mapping[str, object]],
     names: Sequence[str] = ("shadow", "endpoint", "temporal"),
+    metric_kernel=None,
 ):
     """Build a Hessian in the largest deterministic verified subspace.
 
@@ -787,6 +822,7 @@ def build_second_order_models(
             unit_direction=basis[index],
             metric_builder=metric_builder,
             names=names,
+            metric_kernel=metric_kernel,
         )
         if jet is None:
             dropped.append({
@@ -818,14 +854,28 @@ def build_second_order_models(
         for left_position, left_index in enumerate(verified_indices):
             for right_index in verified_indices[left_position + 1:]:
                 direction = (
-                    basis[left_index] + basis[right_index]
-                ) / math.sqrt(2.0)
+                    (basis[left_index] + basis[right_index])
+                    / math.sqrt(2.0)
+                    if metric_kernel is None
+                    else _unit_owned_sphere_tangent(
+                        basis[left_index] + basis[right_index],
+                        current, mask, floor=1.0e-15,
+                        metric_kernel=metric_kernel,
+                    )
+                )
+                if direction is None:
+                    failed_pair = (left_index, right_index, {
+                        "status": "nonfinite_or_unverified_curvature",
+                        "reason": "pair_direction_normalization_failed",
+                    })
+                    break
                 jet, jet_audit = _directional_jet(
                     current=current,
                     mask=mask,
                     unit_direction=direction,
                     metric_builder=metric_builder,
                     names=names,
+                    metric_kernel=metric_kernel,
                 )
                 if jet is None:
                     failed_pair = (left_index, right_index, jet_audit)
@@ -1370,6 +1420,7 @@ def prepare_second_order_subproblem(
     direction_norm_floor,
     metric_names=None,
     maximum_guard_directions=None,
+    metric_kernel=None,
 ):
     """Build one curvature model for reuse by every frozen angle."""
     basis, basis_audit = build_owned_tangent_basis(
@@ -1380,6 +1431,7 @@ def prepare_second_order_subproblem(
         dimension=int(basis_dimension),
         floor=float(direction_norm_floor),
         maximum_guard_directions=maximum_guard_directions,
+        metric_kernel=metric_kernel,
     )
     if basis is None:
         return None, basis_audit
@@ -1390,6 +1442,7 @@ def prepare_second_order_subproblem(
         basis=basis,
         metric_builder=metric_builder,
         names=tuple(metric_names or gradients),
+        metric_kernel=metric_kernel,
     )
     if models is None:
         return None, {**basis_audit, **curvature_audit}
@@ -1418,6 +1471,7 @@ def prepare_second_order_subproblem(
         "current64": current64,
         "mask": mask,
         "direction_norm_floor": float(direction_norm_floor),
+        "metric_kernel": metric_kernel,
     }, {
         **basis_audit,
         **curvature_audit,
@@ -1460,9 +1514,11 @@ def solve_prepared_second_order_angle(
     current64 = prepared["current64"]
     mask = prepared["mask"]
     floor = prepared["direction_norm_floor"]
+    metric_kernel = prepared.get("metric_kernel")
     unit = m.torch.einsum("i,i...->...", coefficients, basis)
     unit = _unit_owned_sphere_tangent(
-        unit, current64, mask, floor=float(floor)
+        unit, current64, mask, floor=float(floor),
+        metric_kernel=metric_kernel,
     )
     if unit is None or not bool(m.torch.isfinite(unit).all()):
         return None, {
@@ -1471,16 +1527,24 @@ def solve_prepared_second_order_angle(
             "second_order_state": "second_order_solver_failure",
             "reason": "selected_direction_normalization_failed",
         }
-    radius = m.torch.linalg.vector_norm(current64[mask])
+    radius = (
+        metric_kernel.norm(current64)
+        if metric_kernel is not None
+        else m.torch.linalg.vector_norm(current64[mask])
+    )
     direction = (radius * unit).to(basis.dtype).masked_fill(~mask, 0.0)
     audit["selected_basis_coefficients"] = [
         float(value) for value in coefficients.detach().cpu()
     ]
     audit["geodesic_direction_norm"] = float(
-        m.torch.linalg.vector_norm(direction[mask]).detach()
+        (
+            metric_kernel.norm(direction)
+            if metric_kernel is not None
+            else m.torch.linalg.vector_norm(direction[mask])
+        ).detach()
     )
     audit["geodesic_radial_inner_product"] = float(
-        _inner(direction, current64, mask).detach()
+        _inner(direction, current64, mask, metric_kernel).detach()
     )
     return direction.detach(), audit
 
