@@ -336,7 +336,12 @@ class AnchorMetricKernel:
         radius, tangent_norm = self.norm(radial), self.norm(tangent)
         if (not bool(torch.isfinite(radius) and torch.isfinite(tangent_norm))
                 or float(radius) <= float(floor) or float(tangent_norm) <= float(floor)):
-            return current.detach(), False, {"geodesic_update_status": "zero_or_nonfinite_metric_geodesic_direction"}
+            return current.detach(), False, {
+                "geodesic_update_status": (
+                    "zero_or_nonfinite_metric_geodesic_direction"
+                ),
+                "metric_shell_dtype": METRIC_SHELL_DTYPE,
+            }
         radial_inner = self.inner(tangent, radial)
         tolerance = max(1.0e-12, float(radius) * float(tangent_norm) * 1.0e-6)
         if direction_is_tangent and abs(float(radial_inner.detach())) > tolerance:
@@ -344,10 +349,16 @@ class AnchorMetricKernel:
                 "geodesic_update_status": "physical_direction_not_metric_tangent",
                 "metric_geodesic_radial_inner_product": float(radial_inner.detach()),
                 "metric_geodesic_radial_tolerance": tolerance,
+                "metric_shell_dtype": METRIC_SHELL_DTYPE,
             }
         unit = self.unit_tangent(tangent, radial, floor)
         if unit is None:
-            return current.detach(), False, {"geodesic_update_status": "zero_or_nonfinite_metric_geodesic_direction"}
+            return current.detach(), False, {
+                "geodesic_update_status": (
+                    "zero_or_nonfinite_metric_geodesic_direction"
+                ),
+                "metric_shell_dtype": METRIC_SHELL_DTYPE,
+            }
         angle = radius.new_tensor(float(theta))
         trial = (
             torch.cos(angle) * radial + torch.sin(angle) * radius * unit
@@ -359,7 +370,10 @@ class AnchorMetricKernel:
             "metric_radius_after": self.rms(trial),
             "euclidean_radius_after": float(torch.sqrt(trial[mask].square().mean()).detach()),
             "post_update_normalization_applied": False,
-            "outside_scope_abs_max": float(trial.masked_fill(self.mask, 0.0).abs().amax().detach()),
+            "outside_scope_abs_max": float(
+                trial.masked_fill(mask, 0.0).abs().amax().detach()
+            ),
+            "metric_shell_dtype": METRIC_SHELL_DTYPE,
         }
 
     def audit(self):
@@ -473,10 +487,19 @@ class MetricOperator:
         self, *, selected_method, value, mask, projector_backtracking_factor,
         projected_candidate,
     ):
-        if not self.collecting_calibration or not self.case_uid or self.case_uid in self.calibration_observations:
+        if not self.collecting_calibration:
+            return
+        if not self.case_uid:
+            raise MetricCalibrationRequired(
+                "M calibration observation requires a case UID"
+            )
+        if self.case_uid in self.calibration_observations:
             return
         kernel = self.kernels.get(self.case_uid)
-        if kernel is None: return
+        if kernel is None:
+            raise MetricCalibrationRequired(
+                "M calibration observation has no frozen metric anchor"
+            )
         if selected_method in {"identity", "adapter"}:
             raise MetricCalibrationRequired(
                 "identity or Adapter incumbent cannot calibrate anchor metric"
@@ -489,6 +512,14 @@ class MetricOperator:
             raise MetricCalibrationRequired(
                 "M calibration requires the accepted Projector factor"
             )
+        projector_backtracking_factor = _strict_finite_positive(
+            projector_backtracking_factor,
+            "M calibration accepted Projector factor",
+        )
+        if projector_backtracking_factor > 1.0:
+            raise MetricCalibrationRequired(
+                "M calibration accepted Projector factor exceeds one"
+            )
         if value.dtype != torch.float64:
             raise MetricCalibrationRequired(
                 "M calibration projected tangent must use float64 shell dtype"
@@ -499,7 +530,15 @@ class MetricOperator:
             torch.sqrt(value[kernel.mask].square().mean()).detach()
         )
         metric = kernel.rms(value)
-        if not (math.isfinite(euclidean) and euclidean > 0 and math.isfinite(metric)): return
+        task_norm = float(kernel.task_norm(value).detach())
+        if not (
+            math.isfinite(euclidean) and euclidean > 0.0
+            and math.isfinite(metric) and metric > 0.0
+            and math.isfinite(task_norm) and task_norm >= 0.0
+        ):
+            raise MetricCalibrationRequired(
+                "M calibration selected projected tangent has invalid norms"
+            )
         self.calibration_observations[self.case_uid] = {
             "case_uid": self.case_uid,
             "calibration_case_uid": self.case_uid,
@@ -507,10 +546,10 @@ class MetricOperator:
             "calibration_source_stage": "post_composite_selector_post_projector",
             "projected_candidate": True,
             "adapter_incumbent_locked": False,
-            "projector_backtracking_factor": float(projector_backtracking_factor),
+            "projector_backtracking_factor": projector_backtracking_factor,
             "euclidean_rms": euclidean, "metric_rms_at_rho_E": metric,
             "metric_to_euclidean_ratio": metric / euclidean,
-            "task_space_norm_Jd_W": float(kernel.task_norm(value).detach()),
+            "task_space_norm_Jd_W": task_norm,
             "anchor_metric": kernel.audit(),
         }
 
@@ -518,6 +557,21 @@ class MetricOperator:
         rows = [self.calibration_observations[k] for k in sorted(self.calibration_observations)]
         if not self.collecting_calibration or not rows:
             raise MetricCalibrationRequired("no successful train correction calibrated M")
+        implementation_commit = str(implementation_commit or "").strip().lower()
+        if (
+            len(implementation_commit) != 40
+            or any(character not in "0123456789abcdef" for character in implementation_commit)
+        ):
+            raise MetricCalibrationRequired(
+                "M calibration requires the full implementation commit SHA"
+            )
+        if (
+            not self.preregistration_sha256
+            or len(self.preregistration_sha256) != 64
+        ):
+            raise MetricCalibrationRequired(
+                "M calibration requires the bound preregistration SHA256"
+            )
         alpha = float(statistics.median(float(r["metric_to_euclidean_ratio"]) for r in rows))
         payload = {
             "schema": CALIBRATION_SCHEMA, "status": "train_only_numerically_calibrated",
@@ -563,7 +617,10 @@ class MetricOperator:
             "preregistered_contract_path": self.preregistration_path,
             "preregistered_contract_sha256": self.preregistration_sha256,
             "ambient_metric_materialized": False, "inverse_method": "exact_low_rank_woodbury",
-            "metric_radius_tolerance": 1.0e-12,
+            "metric_radius_tolerance": _strict_finite_positive(
+                (self.calibration or {}).get("metric_radius_tolerance"),
+                "calibration metric_radius_tolerance",
+            ),
         }
         destination = Path(self.calibration_output)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -646,8 +703,12 @@ def build_metric_operator(
         raise MetricCalibrationRequired("anchor metric contract is not a completed train-only calibration")
     if payload.get("preregistered_contract_sha256") != prereg_sha:
         raise MetricCalibrationRequired("anchor calibration preregistration SHA256 mismatch")
-    expected_commit = os.environ.get("EXPECTED_COMMIT")
-    if not expected_commit or payload.get("implementation_commit") != expected_commit:
+    expected_commit = str(os.environ.get("EXPECTED_COMMIT") or "").strip().lower()
+    if (
+        len(expected_commit) != 40
+        or any(character not in "0123456789abcdef" for character in expected_commit)
+        or payload.get("implementation_commit") != expected_commit
+    ):
         raise MetricCalibrationRequired("anchor calibration implementation commit mismatch")
     if payload.get("coordinate") != "owned_physical_tangent":
         raise MetricCalibrationRequired("anchor calibration coordinate mismatch")
@@ -699,6 +760,8 @@ def build_metric_operator(
         raise MetricCalibrationRequired("anchor calibration observations are missing")
     if int(payload.get("observation_count", -1)) != len(observations):
         raise MetricCalibrationRequired("anchor calibration observation_count mismatch")
+    observed_case_uids: set[str] = set()
+    observed_ratios: list[float] = []
     for observation in observations:
         if not isinstance(observation, dict):
             raise MetricCalibrationRequired("anchor calibration observation is invalid")
@@ -713,6 +776,75 @@ def build_metric_operator(
             raise MetricCalibrationRequired(
                 "anchor calibration observation is not a selected projected correction"
             )
+        case_uid = observation.get("case_uid")
+        if (
+            not isinstance(case_uid, str)
+            or not case_uid
+            or observation.get("calibration_case_uid") != case_uid
+            or case_uid in observed_case_uids
+        ):
+            raise MetricCalibrationRequired(
+                "anchor calibration observation case identity is invalid"
+            )
+        observed_case_uids.add(case_uid)
+        projector_factor = _strict_finite_positive(
+            observation.get("projector_backtracking_factor"),
+            "anchor calibration observation projector_backtracking_factor",
+        )
+        if projector_factor > 1.0:
+            raise MetricCalibrationRequired(
+                "anchor calibration Projector factor exceeds one"
+            )
+        euclidean_rms = _strict_finite_positive(
+            observation.get("euclidean_rms"),
+            "anchor calibration observation euclidean_rms",
+        )
+        metric_rms = _strict_finite_positive(
+            observation.get("metric_rms_at_rho_E"),
+            "anchor calibration observation metric_rms_at_rho_E",
+        )
+        observed_ratio = _strict_finite_positive(
+            observation.get("metric_to_euclidean_ratio"),
+            "anchor calibration observation metric_to_euclidean_ratio",
+        )
+        recomputed_ratio = metric_rms / euclidean_rms
+        if not math.isclose(
+            observed_ratio, recomputed_ratio,
+            rel_tol=1.0e-12, abs_tol=1.0e-18,
+        ):
+            raise MetricCalibrationRequired(
+                "anchor calibration observation ratio is inconsistent"
+            )
+        try:
+            task_norm = float(observation.get("task_space_norm_Jd_W"))
+        except (TypeError, ValueError) as exc:
+            raise MetricCalibrationRequired(
+                "anchor calibration observation task norm is invalid"
+            ) from exc
+        if not math.isfinite(task_norm) or task_norm < 0.0:
+            raise MetricCalibrationRequired(
+                "anchor calibration observation task norm is invalid"
+            )
+        anchor_metric = _strict_mapping(
+            observation.get("anchor_metric"),
+            "anchor calibration observation anchor_metric",
+        )
+        if (
+            anchor_metric.get("case_uid") != case_uid
+            or anchor_metric.get("metric_shell_dtype") != METRIC_SHELL_DTYPE
+        ):
+            raise MetricCalibrationRequired(
+                "anchor calibration observation metric anchor mismatch"
+            )
+        observed_ratios.append(observed_ratio)
+    recomputed_alpha = float(statistics.median(observed_ratios))
+    if not math.isclose(
+        float(payload["alpha"]), recomputed_alpha,
+        rel_tol=1.0e-12, abs_tol=1.0e-18,
+    ):
+        raise MetricCalibrationRequired(
+            "anchor calibration alpha is not the deterministic observation median"
+        )
     return MetricOperator(mode=mode, calibration_path=str(path.resolve()),
         calibration_sha256=actual_calibration_sha, calibration=payload,
         preregistration_path=str(Path(preregistration_path).resolve()),

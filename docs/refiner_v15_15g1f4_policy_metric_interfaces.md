@@ -108,6 +108,9 @@ train case and freezes `alpha` as the deterministic median metric/Euclidean
 RMS ratio. It then runs M-only followed by PM. An uncalibrated preregistration,
 an expected calibration SHA mismatch, a preregistration/implementation binding
 mismatch, or a calibration that consumed non-train evidence fails closed.
+The loader also recomputes each observation's metric/Euclidean ratio and the
+deterministic median `alpha`; a merely self-consistent `rho_G = alpha * rho_E`
+cannot admit an M-only or PM run when the underlying observations disagree.
 
 For M candidates the unchanged Projector kernel and backtracking factors are
 used, but each projected trial is rematerialized on the frozen metric shell.

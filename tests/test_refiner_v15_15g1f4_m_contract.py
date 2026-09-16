@@ -48,7 +48,9 @@ def _calibration(prereg_sha):
         "metric_rms_at_rho_E": 2.0e-4,
         "metric_to_euclidean_ratio": 2.0,
         "task_space_norm_Jd_W": 0.0,
-        "anchor_metric": {"metric_shell_dtype": "float64"},
+        "anchor_metric": {
+            "case_uid": "txn:1", "metric_shell_dtype": "float64",
+        },
     }
     return {
         "schema": policies.CALIBRATION_SCHEMA,
@@ -126,6 +128,36 @@ def test_metric_loader_rejects_expected_sha_mismatch(tmp_path, monkeypatch):
     prereg, _, calibration, _ = _bound_paths(tmp_path, monkeypatch)
     with pytest.raises(policies.MetricCalibrationRequired):
         _load_metric(prereg, calibration, "0" * 64)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("metric_to_euclidean_ratio", 3.0),
+        ("calibration_case_uid", "txn:other"),
+    ],
+)
+def test_metric_loader_rejects_inconsistent_observation(
+    tmp_path, monkeypatch, field, value,
+):
+    prereg, _, calibration, _ = _bound_paths(tmp_path, monkeypatch)
+    payload = json.loads(calibration.read_text(encoding="utf-8"))
+    payload["observations"][0][field] = value
+    calibration_sha = _write_json(calibration, payload)
+    with pytest.raises(policies.MetricCalibrationRequired):
+        _load_metric(prereg, calibration, calibration_sha)
+
+
+def test_metric_loader_rejects_alpha_not_observation_median(
+    tmp_path, monkeypatch,
+):
+    prereg, _, calibration, _ = _bound_paths(tmp_path, monkeypatch)
+    payload = json.loads(calibration.read_text(encoding="utf-8"))
+    payload["alpha"] = 3.0
+    payload["rho_G"] = 3.0e-4
+    calibration_sha = _write_json(calibration, payload)
+    with pytest.raises(policies.MetricCalibrationRequired):
+        _load_metric(prereg, calibration, calibration_sha)
 
 
 @pytest.mark.parametrize("method", ["identity", "adapter"])

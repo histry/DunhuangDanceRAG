@@ -57,7 +57,9 @@ def calibration(prereg_sha: str) -> dict:
         "metric_rms_at_rho_E": 2.0e-4,
         "metric_to_euclidean_ratio": 2.0,
         "task_space_norm_Jd_W": 0.0,
-        "anchor_metric": {"metric_shell_dtype": "float64"},
+        "anchor_metric": {
+            "case_uid": "txn:1", "metric_shell_dtype": "float64",
+        },
     }
     return {
         "schema": policies.CALIBRATION_SCHEMA,
@@ -129,7 +131,7 @@ class G1F4MContractTests(unittest.TestCase):
         with self.assertRaises(policies.MetricCalibrationRequired):
             self.load("0" * 64)
 
-    def test_02_to_10_loader_binding_rejections(self):
+    def test_02_to_14_loader_binding_rejections(self):
         mutations = {
             "prereg_sha": lambda p: p.__setitem__("preregistered_contract_sha256", "bad"),
             "implementation": lambda p: p.__setitem__("implementation_commit", "bad"),
@@ -140,6 +142,10 @@ class G1F4MContractTests(unittest.TestCase):
             "source": lambda p: p.__setitem__("calibration_source", "pre_selector"),
             "identity_observation": lambda p: p["observations"][0].__setitem__("selected_method", "identity"),
             "adapter_observation": lambda p: p["observations"][0].__setitem__("selected_method", "adapter"),
+            "observation_ratio": lambda p: p["observations"][0].__setitem__("metric_to_euclidean_ratio", 3.0),
+            "alpha_not_median": lambda p: (p.__setitem__("alpha", 3.0), p.__setitem__("rho_G", 3.0e-4)),
+            "observation_case": lambda p: p["observations"][0].__setitem__("calibration_case_uid", "txn:other"),
+            "anchor_case": lambda p: p["observations"][0]["anchor_metric"].__setitem__("case_uid", "txn:other"),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):
@@ -149,7 +155,7 @@ class G1F4MContractTests(unittest.TestCase):
                 with self.assertRaises(policies.MetricCalibrationRequired):
                     self.load()
 
-    def test_11_missing_metric_scale_fails_closed(self):
+    def test_15_missing_metric_scale_fails_closed(self):
         operator = policies.MetricOperator(
             mode=policies.IDENTITY_METRIC,
             calibration={
@@ -174,7 +180,7 @@ class G1F4MContractTests(unittest.TestCase):
                 row_scales={}, floor=1.0e-8,
             )
 
-    def test_12_and_13_float64_normalize_and_geodesic(self):
+    def test_16_and_17_float64_normalize_and_geodesic(self):
         mask = torch.ones((1, 2), dtype=torch.bool)
         kernel = policies.AnchorMetricKernel(
             case_uid="txn:1", mask=mask,
@@ -197,12 +203,12 @@ class G1F4MContractTests(unittest.TestCase):
         self.assertEqual(audit["metric_shell_dtype"], "float64")
         self.assertLessEqual(abs(kernel.rms(trial) - kernel.rms(current)), 1.0e-12)
 
-    def test_14_identity_path_is_unchanged(self):
+    def test_18_identity_path_is_unchanged(self):
         marker = object()
         operator = policies.build_metric_operator(policies.IDENTITY_METRIC)
         self.assertIs(operator.execute("ignored", lambda: marker), marker)
 
-    def test_15_selector_eligibility(self):
+    def test_19_selector_eligibility(self):
         audit = {
             "raw_audit": {"passed": True},
             "projector_result": {"projection_backtracking_factor": 1.0},
