@@ -1904,20 +1904,25 @@ def _metric_raw_audit(
             local_case:local_case + 1
         ]
     )
-    metric_rms = kernel.rms(tangent)
+    shell_tangent = tangent.detach().to(m.torch.float64)
+    metric_rms = kernel.rms(shell_tangent)
+    radius_tolerance = float(
+        metric_operator.calibration["metric_radius_tolerance"]
+    )
     metric_ok = bool(
         math.isfinite(metric_rms)
-        and abs(metric_rms - float(kernel.rho_g)) <= 1.0e-12
+        and abs(metric_rms - float(kernel.rho_g)) <= radius_tolerance
     )
     raw["euclidean_owned_physical_tangent_rms"] = _rms(
-        tangent, kernel.mask
+        shell_tangent, kernel.mask
     )
     raw["metric_rms"] = metric_rms
     raw["metric_target_rms"] = float(kernel.rho_g)
     raw["metric_radius_relative_error"] = (
         abs(metric_rms - float(kernel.rho_g)) / float(kernel.rho_g)
     )
-    raw["task_space_norm_Jd_W"] = float(kernel.task_norm(tangent).detach())
+    raw["task_space_norm_Jd_W"] = float(kernel.task_norm(shell_tangent).detach())
+    raw["metric_shell_dtype"] = g1f4_policies.METRIC_SHELL_DTYPE
     raw["radius_contract"] = "frozen_anchor_kinematic_metric_rms"
     raw["radius_equality_resolved"] = metric_ok
     raw["passed"] = bool(raw["passed"] and metric_ok)
@@ -1984,6 +1989,97 @@ def _metric_project_raw_candidate(
         "effective_projected_candidate": accepted is not None,
         "radius_rematerialization": "frozen_anchor_kinematic_metric_shell",
     }
+
+
+def _materialize_selected_projected_tangent_for_calibration(
+    *, model, selected_tangent, selected_audit, sample, domains, ownership,
+    c2_taper, baseline_terms, cfg, target_rms, workspace_floor, args,
+):
+    """Recover the actual accepted Projector tangent without serialising it.
+
+    Calibration is deliberately post-selector.  This repeats the exact
+    identity-metric Projector path used by ``adapter._audit_step`` and checks
+    that its accepted backtracking factor agrees with that selected audit.
+    """
+    if not (
+        selected_audit.get("raw_audit", {}).get("passed") is True
+        and selected_audit.get("projector_result") is not None
+        and selected_audit.get("effective_projected_candidate") is True
+    ):
+        raise g1f4_policies.MetricCalibrationRequired(
+            "selected calibration case lacks an accepted raw/Projector audit"
+        )
+    transaction_id = str(sample["transaction_id"])
+    domain = domains[transaction_id]
+    global_case = int(sample["case_index"])
+    local_case = int(sample["local_case_index"])
+    start, stop = domain["slice"]
+    raw, _ = adapter._isolated_fixed_radius_candidate(
+        domain["baseline"],
+        selected_tangent[start:stop],
+        selected_tangent[start:stop],
+        c2_taper[start:stop],
+        ownership[start:stop],
+        domain["batch"],
+        local_case,
+        float(target_rms),
+    )
+    baseline_case = {
+        key: float(baseline_terms[key][global_case].detach())
+        for key in ("endpoint", "temporal")
+    }
+    projected, projection = oracle._project_raw_candidate(
+        model=model,
+        batch=domain["batch"],
+        cfg=cfg,
+        baseline=domain["baseline"],
+        identity=domain["identity"],
+        baseline_guard=domain["baseline_guard"],
+        guard_anchor=domain["contract"]["initial_anchor"],
+        guard_relative=domain["contract"]["relative_tolerance"],
+        guard_absolute=domain["contract"]["absolute_tolerance"],
+        raw=raw,
+        case_index=local_case,
+        baseline_case=baseline_case,
+        target_rms=float(target_rms),
+        workspace_floor=workspace_floor,
+        args=args,
+    )
+    expected_factor = selected_audit["projector_result"].get(
+        "projection_backtracking_factor"
+    )
+    observed_factor = projection.get("projection_backtracking_factor")
+    if (
+        projected is None
+        or projection.get("effective_projected_candidate") is not True
+        or observed_factor is None
+        or observed_factor != expected_factor
+    ):
+        raise g1f4_policies.MetricCalibrationRequired(
+            "selected calibration Projector reconstruction disagrees with audit"
+        )
+    accepted_trials = [
+        row for row in projection.get("projection_trials", [])
+        if row.get("factor") == observed_factor
+        and row.get("audit", {}).get("passed") is True
+    ]
+    if len(accepted_trials) != 1:
+        raise g1f4_policies.MetricCalibrationRequired(
+            "selected calibration Projector acceptance is not unique"
+        )
+    local_tangent = product_log_torch(domain["baseline"], projected)[
+        local_case:local_case + 1
+    ].detach().to(m.torch.float64)
+    mask = _owned_case_mask(
+        ownership[start:stop], local_tangent, local_case
+    )
+    if not bool(
+        (local_tangent.masked_fill(mask, 0.0).abs().amax() == 0.0).detach()
+    ):
+        raise g1f4_policies.MetricCalibrationRequired(
+            "selected calibration Projector tangent leaks outside ownership"
+        )
+    return local_tangent.masked_fill(~mask, 0.0), mask, float(observed_factor)
 
 
 def _metric_aware_audit_step(
@@ -4581,7 +4677,12 @@ def _second_order_angular_iteration(
                     )
                 )
                 if direction is not None:
-                    direction = direction.to(current.dtype)
+                    direction = direction.to(
+                        m.torch.float64
+                        if metric_operator.mode
+                        == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+                        else current.dtype
+                    )
             except (RuntimeError, ValueError, FloatingPointError) as exc:
                 direction = None
                 solver_audit = {
@@ -5563,7 +5664,15 @@ def _correct_case_geodesic_joint_sqp(
     )
     zero_start = not normalized
     if zero_start:
-        current = m.torch.zeros_like(initial_tangent).masked_fill(~mask, 0.0)
+        current = m.torch.zeros_like(
+            initial_tangent,
+            dtype=(
+                m.torch.float64
+                if metric_operator.mode
+                == g1f4_policies.ANCHOR_KINEMATIC_METRIC
+                else initial_tangent.dtype
+            ),
+        ).masked_fill(~mask, 0.0)
     history = []
     numeric_failure = False
     started = time.perf_counter()
@@ -7623,6 +7732,7 @@ def run(args):
     metric_operator = g1f4_policies.build_metric_operator(
         args.metric_mode,
         calibration_path=args.metric_radius_calibration,
+        calibration_sha256=args.metric_radius_calibration_sha256,
         calibration_output=args.calibrate_anchor_metric_output,
         preregistration_path=args.metric_preregistered_contract,
     )
@@ -8539,28 +8649,6 @@ def run(args):
             time.perf_counter() - variant_started,
         )
         audit_by_uid = {str(row["case_uid"]): row for row in audits}
-        if metric_operator.collecting_calibration and method != "adapter":
-            sample_by_uid_for_metric = {
-                str(sample["case_uid"]): sample for sample in samples
-            }
-            for uid, audit in audit_by_uid.items():
-                sample = sample_by_uid_for_metric.get(uid)
-                if sample is None or not (
-                    audit["raw_audit"]["passed"]
-                    and audit.get("projector_result") is not None
-                    and audit["effective_projected_candidate"]
-                ):
-                    continue
-                case_index = int(sample["case_index"])
-                local_value = tangent[case_index:case_index + 1]
-                local_mask = ownership[
-                    case_index:case_index + 1
-                ].expand_as(local_value)
-                metric_operator.for_case(uid).observe_calibration_candidate(
-                    variant=key,
-                    value=local_value,
-                    mask=local_mask,
-                )
         if g1f3:
             sample_by_uid = {
                 str(sample["case_uid"]): sample for sample in samples
@@ -8618,18 +8706,6 @@ def run(args):
         }), flush=True)
 
     metric_calibration = None
-    if metric_operator.collecting_calibration:
-        metric_calibration = metric_operator.finalize_calibration(
-            implementation_commit=os.environ.get("EXPECTED_COMMIT")
-        )
-        print(json.dumps({
-            "stage": "v15_15g1f4_anchor_metric_calibration_complete",
-            "contract": metric_operator.calibration_output,
-            "observation_count": metric_calibration["observation_count"],
-            "alpha": metric_calibration["alpha"],
-            "rho_G": metric_calibration["rho_G"],
-        }), flush=True)
-
     feasible_intersection_summary = (
         _local_feasible_intersection_summary(variant_correction_reports)
         if g1e_family else None
@@ -9369,6 +9445,71 @@ def run(args):
             "decisions": activation_decisions,
         }
 
+    if metric_operator.collecting_calibration:
+        if not activation_enabled or activation_summary is None:
+            raise g1f4_policies.MetricCalibrationRequired(
+                "M calibration requires completed composite selection"
+            )
+        samples_by_uid = {str(sample["case_uid"]): sample for sample in samples}
+        selected_audits_by_uid = {
+            str(audit["case_uid"]): audit for audit in selected_audits
+        }
+        for uid, decision in activation_decisions.items():
+            selected_method = str(decision.get("selected_method"))
+            sample = samples_by_uid.get(uid)
+            selected_audit = selected_audits_by_uid.get(uid)
+            if not g1f4_policies.is_post_selector_projected_calibration_candidate(
+                selected_method=selected_method,
+                selected_audit=selected_audit,
+                adapter_incumbent_locked=bool(
+                    decision.get("adapter_incumbent_locked")
+                ),
+            ):
+                continue
+            if sample is None or selected_audit is None:
+                raise g1f4_policies.MetricCalibrationRequired(
+                    f"selected calibration case {uid} has no selected audit"
+                )
+            projected_tangent, _local_mask, projection_factor = (
+                _materialize_selected_projected_tangent_for_calibration(
+                    model=model,
+                    selected_tangent=selected_tangent.detach(),
+                    selected_audit=selected_audit,
+                    sample=sample,
+                    domains=domains,
+                    ownership=ownership.detach(),
+                    c2_taper=trace["c2_taper"].detach(),
+                    baseline_terms=baseline_terms,
+                    cfg=cfg,
+                    target_rms=float(args.target_rms),
+                    workspace_floor=workspace_floor,
+                    args=args,
+                )
+            )
+            case_metric_operator = metric_operator.for_case(uid)
+            if case_metric_operator.kernel is None:
+                raise g1f4_policies.MetricCalibrationRequired(
+                    f"selected calibration case {uid} has no frozen metric anchor"
+                )
+            case_metric_operator.observe_calibration_candidate(
+                selected_method=selected_method,
+                value=projected_tangent,
+                mask=case_metric_operator.kernel.mask,
+                projector_backtracking_factor=projection_factor,
+                projected_candidate=True,
+            )
+        metric_calibration = metric_operator.finalize_calibration(
+            implementation_commit=os.environ.get("EXPECTED_COMMIT")
+        )
+        print(json.dumps({
+            "stage": "v15_15g1f4_anchor_metric_calibration_complete",
+            "contract": metric_operator.calibration_output,
+            "observation_count": metric_calibration["observation_count"],
+            "alpha": metric_calibration["alpha"],
+            "rho_G": metric_calibration["rho_G"],
+            "calibration_source": metric_calibration["calibration_source"],
+        }), flush=True)
+
     base_cross_long = variants["adapter"][
         "projected_pass_count_by_group"
     ].get("cross_long", 0)
@@ -10072,8 +10213,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--metric-radius-calibration-sha256",
+        help=(
+            "expected SHA256 of --metric-radius-calibration; required for "
+            "anchor_kinematic execution"
+        ),
+    )
+    parser.add_argument(
         "--metric-preregistered-contract",
-        help="immutable M-v1 preregistration used only by train calibration",
+        help=(
+            "immutable M-v1 preregistration required by calibration and "
+            "anchor_kinematic execution"
+        ),
     )
     parser.add_argument(
         "--calibrate-anchor-metric-output",
@@ -10217,13 +10368,18 @@ def main():
     args = parser.parse_args()
     if args.metric_mode == g1f4_policies.IDENTITY_METRIC and (
         args.metric_radius_calibration
+        or args.metric_radius_calibration_sha256
     ):
-        parser.error("identity metric must not receive --metric-radius-calibration")
+        parser.error("identity metric must not receive metric-radius calibration arguments")
     if args.metric_mode == g1f4_policies.ANCHOR_KINEMATIC_METRIC and not (
         args.metric_radius_calibration
+        and args.metric_radius_calibration_sha256
+        and args.metric_preregistered_contract
     ):
         parser.error(
-            "anchor_kinematic requires train-only --metric-radius-calibration"
+            "anchor_kinematic requires --metric-radius-calibration, "
+            "--metric-radius-calibration-sha256, and "
+            "--metric-preregistered-contract"
         )
     if args.calibrate_anchor_metric_output:
         if (
@@ -10237,10 +10393,13 @@ def main():
                 "M calibration requires train g1f3 current_equal_share + identity "
                 "and --metric-preregistered-contract"
             )
-    elif args.metric_preregistered_contract:
+    elif (
+        args.metric_preregistered_contract
+        and args.metric_mode != g1f4_policies.ANCHOR_KINEMATIC_METRIC
+    ):
         parser.error(
             "--metric-preregistered-contract is only valid with "
-            "--calibrate-anchor-metric-output"
+            "--calibrate-anchor-metric-output or anchor_kinematic"
         )
     if (
         args.progress_mode != g1f4_policies.CURRENT_EQUAL_SHARE

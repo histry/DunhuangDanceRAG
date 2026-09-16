@@ -1597,4 +1597,11 @@ def second_order_direction_for_angle(
     }
     if direction is None:
         return None, audit
-    return direction.to(current.dtype).detach(), audit
+    prepared_metric_kernel = prepared.get("metric_kernel")
+    output_dtype = (
+        m.torch.float64
+        if prepared_metric_kernel is not None else current.dtype
+    )
+    if prepared_metric_kernel is not None:
+        audit["metric_shell_dtype"] = "float64"
+    return direction.to(output_dtype).detach(), audit

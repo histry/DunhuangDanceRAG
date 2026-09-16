@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 from typing import Any, Mapping
@@ -19,6 +20,10 @@ PROGRESS_MODES = (CURRENT_EQUAL_SHARE, WEIGHTED_DEBT_FILTER)
 METRIC_MODES = (IDENTITY_METRIC, ANCHOR_KINEMATIC_METRIC)
 CALIBRATION_SCHEMA = "refiner_v15_15g1f4_anchor_metric_calibration_v1"
 PREREGISTRATION_SCHEMA = "refiner_v15_15g1f4_m_v1_preregistered_contract_v1"
+METRIC_SHELL_DTYPE = "float64"
+_REQUIRED_GROUP_WEIGHT_KEYS = (
+    "lambda_boundary", "lambda_jerk", "lambda_science",
+)
 
 
 class MetricCalibrationRequired(RuntimeError):
@@ -27,6 +32,22 @@ class MetricCalibrationRequired(RuntimeError):
 
 class MetricKernelUnavailable(RuntimeError):
     pass
+
+
+def is_post_selector_projected_calibration_candidate(
+    *, selected_method: str, selected_audit: Mapping[str, Any] | None,
+    adapter_incumbent_locked: bool,
+) -> bool:
+    """Return whether a final composite decision is eligible for M alpha."""
+    if selected_method in {"identity", "adapter"} or adapter_incumbent_locked:
+        return False
+    if not isinstance(selected_audit, Mapping):
+        return False
+    return bool(
+        selected_audit.get("raw_audit", {}).get("passed") is True
+        and selected_audit.get("projector_result") is not None
+        and selected_audit.get("effective_projected_candidate") is True
+    )
 
 
 @dataclass(frozen=True)
@@ -91,6 +112,105 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _strict_mapping(value: Any, description: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MetricCalibrationRequired(f"{description} must be a JSON object")
+    return value
+
+
+def _strict_finite_positive(value: Any, description: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise MetricCalibrationRequired(
+            f"{description} must be a finite positive number"
+        ) from exc
+    if not math.isfinite(result) or result <= 0.0:
+        raise MetricCalibrationRequired(
+            f"{description} must be a finite positive number"
+        )
+    return result
+
+
+def _strict_group_weights(value: Any, description: str) -> dict[str, float]:
+    mapping = _strict_mapping(value, description)
+    if set(mapping) != set(_REQUIRED_GROUP_WEIGHT_KEYS):
+        raise MetricCalibrationRequired(
+            f"{description} keys must be exactly "
+            f"{sorted(_REQUIRED_GROUP_WEIGHT_KEYS)}"
+        )
+    result = {}
+    for name in _REQUIRED_GROUP_WEIGHT_KEYS:
+        try:
+            weight = float(mapping[name])
+        except (TypeError, ValueError) as exc:
+            raise MetricCalibrationRequired(
+                f"{description}.{name} must be finite and nonnegative"
+            ) from exc
+        if not math.isfinite(weight) or weight < 0.0:
+            raise MetricCalibrationRequired(
+                f"{description}.{name} must be finite and nonnegative"
+            )
+        result[name] = weight
+    return result
+
+
+def _exact_float_match(left: Any, right: Any, description: str) -> None:
+    try:
+        left_value, right_value = float(left), float(right)
+    except (TypeError, ValueError) as exc:
+        raise MetricCalibrationRequired(f"invalid {description}") from exc
+    if not (math.isfinite(left_value) and math.isfinite(right_value)):
+        raise MetricCalibrationRequired(f"nonfinite {description}")
+    if left_value != right_value:
+        raise MetricCalibrationRequired(f"{description} mismatch")
+
+
+def _validate_preregistration(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("schema") != PREREGISTRATION_SCHEMA:
+        raise MetricCalibrationRequired("unexpected M preregistration schema")
+    if payload.get("status") != "protocol_frozen_not_numerically_calibrated":
+        raise MetricCalibrationRequired("M preregistration status is not frozen")
+    definition = _strict_mapping(
+        payload.get("metric_definition"), "M preregistration metric_definition"
+    )
+    beta = _strict_finite_positive(
+        definition.get("beta_identity_regularizer"),
+        "M preregistration beta_identity_regularizer",
+    )
+    weights = _strict_group_weights(
+        definition.get("group_weights_v1"),
+        "M preregistration group_weights_v1",
+    )
+    train_calibration = _strict_mapping(
+        payload.get("train_only_calibration"),
+        "M preregistration train_only_calibration",
+    )
+    rho_e = _strict_finite_positive(
+        train_calibration.get("rho_E"),
+        "M preregistration train_only_calibration.rho_E",
+    )
+    if rho_e != 1.0e-4:
+        raise MetricCalibrationRequired("M preregistration rho_E must remain 1e-4")
+    fairness = _strict_mapping(
+        payload.get("fairness_contract"), "M preregistration fairness_contract"
+    )
+    tolerance = _strict_finite_positive(
+        fairness.get("metric_radius_tolerance"),
+        "M preregistration fairness_contract.metric_radius_tolerance",
+    )
+    if tolerance != 1.0e-12:
+        raise MetricCalibrationRequired(
+            "M preregistration metric_radius_tolerance must remain 1e-12"
+        )
+    return {
+        "beta_identity_regularizer": beta,
+        "group_weights_v1": weights,
+        "rho_E": rho_e,
+        "metric_radius_tolerance": tolerance,
+    }
+
+
 def _metric_group(name: str) -> str | None:
     lowered = name.lower()
     if name in {"endpoint", "temporal"}:
@@ -121,23 +241,34 @@ class AnchorMetricKernel:
         return int(self.mask.sum().detach())
 
     def _rows_like(self, value):
-        return self.rows.to(device=value.device, dtype=value.dtype)
+        # The shell is deliberately float64 even when a model/FK boundary
+        # consumes float32.  Do not reintroduce dtype-dependent geometry here.
+        return self.rows.to(device=value.device, dtype=torch.float64)
+
+    def _shell_value(self, value):
+        mask = self.mask.to(device=value.device)
+        return value.to(dtype=torch.float64).masked_fill(~mask, 0.0)
 
     def apply(self, value):
-        scoped = value.masked_fill(~self.mask, 0.0)
+        scoped = self._shell_value(value)
+        mask = self.mask.to(device=scoped.device)
         rows = self._rows_like(scoped)
         if rows.numel():
             dots = (rows * scoped.unsqueeze(0)).reshape(rows.shape[0], -1).sum(1)
             low_rank = (rows * dots.reshape((-1,) + (1,) * scoped.ndim)).sum(0)
         else:
             low_rank = torch.zeros_like(scoped)
-        return (self.trace_scale * (self.beta * scoped + low_rank)).masked_fill(~self.mask, 0.0)
+        return (
+            self.trace_scale * (self.beta * scoped + low_rank)
+        ).masked_fill(~mask, 0.0)
 
     def inner(self, left, right):
-        return (left.masked_fill(~self.mask, 0.0) * self.apply(right)).sum()
+        scoped_left = self._shell_value(left)
+        return (scoped_left * self.apply(right)).sum()
 
     def solve(self, covector):
-        scoped = covector.masked_fill(~self.mask, 0.0)
+        scoped = self._shell_value(covector)
+        mask = self.mask.to(device=scoped.device)
         rows = self._rows_like(scoped)
         if not rows.numel():
             return scoped / (self.trace_scale * self.beta)
@@ -148,14 +279,14 @@ class AnchorMetricKernel:
         )
         coefficients = torch.linalg.solve(system, flat_rows @ flat)
         result = (flat - flat_rows.transpose(0, 1) @ coefficients) / self.beta
-        return (result.reshape_as(scoped) / self.trace_scale).masked_fill(~self.mask, 0.0)
+        return (result.reshape_as(scoped) / self.trace_scale).masked_fill(~mask, 0.0)
 
     def norm(self, value):
         return self.inner(value, value).clamp_min(0.0).sqrt()
 
     def task_norm(self, value):
         """Return the frozen normalized task-Jacobian norm ``||Jd||_W``."""
-        scoped = value.masked_fill(~self.mask, 0.0)
+        scoped = self._shell_value(value)
         rows = self._rows_like(scoped)
         if not rows.numel():
             return scoped.new_zeros(())
@@ -166,17 +297,21 @@ class AnchorMetricKernel:
         return float((self.norm(value) / math.sqrt(self.active_count)).detach()) if self.active_count else math.nan
 
     def normalize(self, value, target_rms: float):
-        scoped = value.masked_fill(~self.mask, 0.0)
+        scoped = self._shell_value(value)
+        mask = self.mask.to(device=scoped.device)
         norm = self.norm(scoped)
         if not bool(torch.isfinite(norm)) or float(norm.detach()) <= 1.0e-12:
             return scoped, False
         result = scoped * (float(target_rms) * math.sqrt(self.active_count) / norm.detach())
-        return result.masked_fill(~self.mask, 0.0), True
+        return result.masked_fill(~mask, 0.0), True
 
     def tangent_project(self, vector, current):
-        scoped, radial = vector.masked_fill(~self.mask, 0.0), current.masked_fill(~self.mask, 0.0)
+        scoped, radial = self._shell_value(vector), self._shell_value(current)
+        mask = self.mask.to(device=scoped.device)
         denominator = self.inner(radial, radial).clamp_min(1.0e-30)
-        return (scoped - self.inner(scoped, radial) / denominator * radial).masked_fill(~self.mask, 0.0)
+        return (
+            scoped - self.inner(scoped, radial) / denominator * radial
+        ).masked_fill(~mask, 0.0)
 
     def unit_tangent(self, vector, current, floor):
         projected = self.tangent_project(vector, current)
@@ -186,13 +321,18 @@ class AnchorMetricKernel:
         return projected / norm
 
     def differentiable_geodesic(self, current, unit_direction, theta):
-        radial = current.masked_fill(~self.mask, 0.0)
-        unit = unit_direction.masked_fill(~self.mask, 0.0)
-        return (torch.cos(theta) * radial + torch.sin(theta) * self.norm(radial) * unit).masked_fill(~self.mask, 0.0)
+        radial, unit = self._shell_value(current), self._shell_value(unit_direction)
+        mask = self.mask.to(device=radial.device)
+        angle = theta.to(dtype=torch.float64) if torch.is_tensor(theta) else radial.new_tensor(theta)
+        return (
+            torch.cos(angle) * radial
+            + torch.sin(angle) * self.norm(radial) * unit
+        ).masked_fill(~mask, 0.0)
 
     def geodesic_update(self, current, direction, theta, floor, *, direction_is_tangent):
-        radial = current.detach().masked_fill(~self.mask, 0.0)
-        tangent = direction.detach().masked_fill(~self.mask, 0.0)
+        radial = self._shell_value(current.detach())
+        tangent = self._shell_value(direction.detach())
+        mask = self.mask.to(device=radial.device)
         radius, tangent_norm = self.norm(radial), self.norm(tangent)
         if (not bool(torch.isfinite(radius) and torch.isfinite(tangent_norm))
                 or float(radius) <= float(floor) or float(tangent_norm) <= float(floor)):
@@ -209,13 +349,15 @@ class AnchorMetricKernel:
         if unit is None:
             return current.detach(), False, {"geodesic_update_status": "zero_or_nonfinite_metric_geodesic_direction"}
         angle = radius.new_tensor(float(theta))
-        trial = (torch.cos(angle) * radial + torch.sin(angle) * radius * unit).masked_fill(~self.mask, 0.0)
+        trial = (
+            torch.cos(angle) * radial + torch.sin(angle) * radius * unit
+        ).masked_fill(~mask, 0.0)
         return trial.detach(), bool(torch.isfinite(trial).all()), {
             "geodesic_update_status": "exact_anchor_metric_radius_geodesic_update",
             "theta_radians": float(theta),
             "metric_radius_before": self.rms(radial),
             "metric_radius_after": self.rms(trial),
-            "euclidean_radius_after": float(torch.sqrt(trial[self.mask].square().mean()).detach()),
+            "euclidean_radius_after": float(torch.sqrt(trial[mask].square().mean()).detach()),
             "post_update_normalization_applied": False,
             "outside_scope_abs_max": float(trial.masked_fill(self.mask, 0.0).abs().amax().detach()),
         }
@@ -231,6 +373,7 @@ class AnchorMetricKernel:
             "ambient_metric_materialized": False,
             "inverse_method": "exact_low_rank_woodbury",
             "anchor_frozen_across_repair_steps": True,
+            "metric_shell_dtype": METRIC_SHELL_DTYPE,
         }
 
 
@@ -284,7 +427,14 @@ class MetricOperator:
             physical = torch.zeros_like(gradient, dtype=torch.float64)
             gradient64, taper64 = gradient.detach().to(torch.float64), taper.detach().to(torch.float64)
             physical[active] = gradient64[active] / taper64[active]
-            scale = float(row_scales.get(base, row_scales.get(name, 1.0)))
+            if base in row_scales:
+                scale = float(row_scales[base])
+            elif name in row_scales:
+                scale = float(row_scales[name])
+            else:
+                raise MetricKernelUnavailable(
+                    f"missing frozen metric row scale for {name} ({base})"
+                )
             if not math.isfinite(scale) or scale <= 0.0:
                 raise MetricKernelUnavailable(f"invalid frozen metric row scale for {name}")
             normalized = physical / scale
@@ -293,8 +443,10 @@ class MetricOperator:
             if float(torch.linalg.vector_norm(normalized[active]).detach()) > float(floor):
                 groups[group].append((str(name), normalized, scale))
         packed, names, labels, scales = [], [], [], []
-        weights = ((self.calibration or {}).get("group_weights_v1") or {
-            "lambda_boundary": 1.0, "lambda_jerk": 1.0, "lambda_science": 1.0})
+        weights = _strict_group_weights(
+            (self.calibration or {}).get("group_weights_v1"),
+            "anchor metric group_weights_v1",
+        )
         for group in ("boundary", "jerk", "science"):
             entries = groups[group]
             if not entries: continue
@@ -303,7 +455,10 @@ class MetricOperator:
                 packed.append(row * coefficient); names.append(name); labels.append(group); scales.append(scale)
         rows = torch.stack(packed) if packed else torch.empty(
             (0,) + tuple(current.shape), dtype=torch.float64, device=current.device)
-        beta = float((self.calibration or {}).get("beta_identity_regularizer", 1.0))
+        beta = _strict_finite_positive(
+            (self.calibration or {}).get("beta_identity_regularizer"),
+            "anchor metric beta_identity_regularizer",
+        )
         count = int(active.sum().detach())
         trace_raw = beta * count + float(rows.square().sum().detach())
         if count <= 0 or not math.isfinite(trace_raw) or trace_raw <= 0.0:
@@ -314,19 +469,45 @@ class MetricOperator:
             tuple(names), tuple(labels), tuple(scales), anchor_sha)
         self.kernels[self.case_uid] = self.kernel
 
-    def observe_calibration_candidate(self, *, variant, value, mask):
+    def observe_calibration_candidate(
+        self, *, selected_method, value, mask, projector_backtracking_factor,
+        projected_candidate,
+    ):
         if not self.collecting_calibration or not self.case_uid or self.case_uid in self.calibration_observations:
             return
         kernel = self.kernels.get(self.case_uid)
         if kernel is None: return
-        del mask
+        if selected_method in {"identity", "adapter"}:
+            raise MetricCalibrationRequired(
+                "identity or Adapter incumbent cannot calibrate anchor metric"
+            )
+        if projected_candidate is not True:
+            raise MetricCalibrationRequired(
+                "M calibration requires an accepted projected candidate"
+            )
+        if projector_backtracking_factor is None:
+            raise MetricCalibrationRequired(
+                "M calibration requires the accepted Projector factor"
+            )
+        if value.dtype != torch.float64:
+            raise MetricCalibrationRequired(
+                "M calibration projected tangent must use float64 shell dtype"
+            )
+        if not bool(torch.equal(mask.to(torch.bool), kernel.mask.to(torch.bool))):
+            raise MetricCalibrationRequired("M calibration projected tangent mask mismatch")
         euclidean = float(
             torch.sqrt(value[kernel.mask].square().mean()).detach()
         )
         metric = kernel.rms(value)
         if not (math.isfinite(euclidean) and euclidean > 0 and math.isfinite(metric)): return
         self.calibration_observations[self.case_uid] = {
-            "case_uid": self.case_uid, "selected_successful_variant": str(variant),
+            "case_uid": self.case_uid,
+            "calibration_case_uid": self.case_uid,
+            "selected_method": str(selected_method),
+            "calibration_source_stage": "post_composite_selector_post_projector",
+            "projected_candidate": True,
+            "adapter_incumbent_locked": False,
+            "projector_backtracking_factor": float(projector_backtracking_factor),
             "euclidean_rms": euclidean, "metric_rms_at_rho_E": metric,
             "metric_to_euclidean_ratio": metric / euclidean,
             "task_space_norm_Jd_W": float(kernel.task_norm(value).detach()),
@@ -345,22 +526,39 @@ class MetricOperator:
             "anchor_definition": "immutable_adapter_physical_tangent_before_first_repair_step",
             "anchor_frozen_across_budgets_and_steps": True,
             "metric_formula": "M=(n_active/trace(M_raw))*(beta*I+sum_group lambda_group*mean((grad(row)/scale) outer (grad(row)/scale)))",
-            "beta_identity_regularizer": float(
-                (self.calibration or {}).get(
-                    "beta_identity_regularizer", 1.0
-                )
+            "beta_identity_regularizer": _strict_finite_positive(
+                (self.calibration or {}).get("beta_identity_regularizer"),
+                "calibration beta_identity_regularizer",
             ),
-            "group_weights_v1": dict(
-                (self.calibration or {}).get("group_weights_v1") or {
-                    "lambda_boundary": 1.0,
-                    "lambda_jerk": 1.0,
-                    "lambda_science": 1.0,
-                }
+            "group_weights_v1": _strict_group_weights(
+                (self.calibration or {}).get("group_weights_v1"),
+                "calibration group_weights_v1",
             ),
             "trace_normalization": "exact_low_rank_trace_on_owned_active_coordinates",
-            "alpha_estimator": "deterministic_median_metric_to_euclidean_rms_ratio_over_first_successful_train_correction_per_case",
-            "rho_E": 1.0e-4, "alpha": alpha, "rho_G": alpha * 1.0e-4,
+            "alpha_estimator": (
+                "deterministic_median_metric_to_euclidean_rms_ratio_over_"
+                "final_composite_selected_projector_accepted_"
+                "authoritative_guard_successful_nonidentity_train_"
+                "correction_per_case"
+            ),
+            "rho_E": _strict_finite_positive(
+                (self.calibration or {}).get("rho_E"), "calibration rho_E"
+            ),
+            "alpha": alpha,
+            "rho_G": alpha * _strict_finite_positive(
+                (self.calibration or {}).get("rho_E"), "calibration rho_E"
+            ),
             "calibration_split": "train", "development_or_held_out_consumed": False,
+            "calibration_source": (
+                "final_composite_selected_projected_train_corrections"
+            ),
+            "selection_stage": "post_composite_selector",
+            "projection_stage": "accepted_projected_candidate",
+            "adapter_incumbent_cases_excluded": True,
+            "identity_cases_excluded": True,
+            "raw_preselector_variants_used": False,
+            "projected_tangent_used": True,
+            "metric_shell_dtype": METRIC_SHELL_DTYPE,
             "observation_count": len(rows), "observations": rows,
             "preregistered_contract_path": self.preregistration_path,
             "preregistered_contract_sha256": self.preregistration_sha256,
@@ -381,6 +579,7 @@ class MetricOperator:
             "metric_radius_calibration_path": self.calibration_path,
             "metric_radius_calibration_sha256": self.calibration_sha256,
             "metric_target_rms": self.target_rms,
+            "metric_shell_dtype": METRIC_SHELL_DTYPE,
             "anchor_metric_kernel_implemented": True,
             "metric_operator_ready": bool(self.mode == IDENTITY_METRIC or self.calibration),
             "calibration_collection": self.collecting_calibration,
@@ -401,55 +600,123 @@ class MetricOperator:
         raise MetricKernelUnavailable(f"unsupported anchor metric stage {stage}")
 
 
-def build_metric_operator(mode, *, calibration_path=None, calibration_output=None, preregistration_path=None):
+def build_metric_operator(
+    mode, *, calibration_path=None, calibration_sha256=None,
+    calibration_output=None, preregistration_path=None,
+):
     if mode not in METRIC_MODES: raise ValueError(f"unsupported metric mode: {mode}")
     prereg_sha, prereg_payload = None, None
     if preregistration_path:
         prereg = Path(preregistration_path)
         if not prereg.is_file(): raise MetricCalibrationRequired(f"M preregistration does not exist: {prereg}")
         prereg_payload = _read_json(prereg)
-        if prereg_payload.get("schema") != PREREGISTRATION_SCHEMA:
-            raise MetricCalibrationRequired("unexpected M preregistration schema")
-        if prereg_payload.get("status") != "protocol_frozen_not_numerically_calibrated":
-            raise MetricCalibrationRequired("M preregistration status is not frozen")
+        prereg_config = _validate_preregistration(prereg_payload)
         prereg_sha = _sha256(prereg)
+    else:
+        prereg_config = None
     if calibration_output:
         if mode != IDENTITY_METRIC or not preregistration_path:
             raise MetricCalibrationRequired("calibration collection requires identity mode and an M preregistration")
-        definition = prereg_payload.get("metric_definition") or {}
         collector_config = {
-            "beta_identity_regularizer": float(
-                definition.get("beta_identity_regularizer", 1.0)
-            ),
-            "group_weights_v1": dict(
-                definition.get("group_weights_v1") or {
-                    "lambda_boundary": 1.0,
-                    "lambda_jerk": 1.0,
-                    "lambda_science": 1.0,
-                }
-            ),
+            **prereg_config,
         }
         return MetricOperator(mode=mode, calibration=collector_config,
             preregistration_path=str(Path(preregistration_path).resolve()),
             preregistration_sha256=prereg_sha,
             calibration_output=str(Path(calibration_output).resolve()))
     if mode == IDENTITY_METRIC:
-        if calibration_path: raise ValueError("identity metric must not receive a radius calibration")
+        if calibration_path or calibration_sha256:
+            raise ValueError("identity metric must not receive a radius calibration")
+        if preregistration_path:
+            raise ValueError(
+                "identity metric preregistration is valid only for calibration collection"
+            )
         return MetricOperator(mode=mode)
-    if not calibration_path: raise MetricCalibrationRequired("anchor_kinematic requires a train-only equivalent-radius calibration")
+    if not calibration_path or not calibration_sha256 or not preregistration_path:
+        raise MetricCalibrationRequired(
+            "anchor_kinematic requires calibration path, expected SHA256, and M preregistration"
+        )
     path = Path(calibration_path)
     if not path.is_file(): raise MetricCalibrationRequired(f"anchor metric calibration does not exist: {path}")
     payload = _read_json(path)
+    actual_calibration_sha = _sha256(path)
+    if actual_calibration_sha != str(calibration_sha256).strip().lower():
+        raise MetricCalibrationRequired("anchor metric calibration SHA256 mismatch")
     if payload.get("schema") != CALIBRATION_SCHEMA or payload.get("status") != "train_only_numerically_calibrated":
         raise MetricCalibrationRequired("anchor metric contract is not a completed train-only calibration")
-    for name in ("alpha", "rho_G"):
-        value = payload.get(name)
-        if value is None or not math.isfinite(float(value)) or float(value) <= 0:
-            raise MetricCalibrationRequired(f"anchor metric calibration has invalid {name}")
+    if payload.get("preregistered_contract_sha256") != prereg_sha:
+        raise MetricCalibrationRequired("anchor calibration preregistration SHA256 mismatch")
+    expected_commit = os.environ.get("EXPECTED_COMMIT")
+    if not expected_commit or payload.get("implementation_commit") != expected_commit:
+        raise MetricCalibrationRequired("anchor calibration implementation commit mismatch")
+    if payload.get("coordinate") != "owned_physical_tangent":
+        raise MetricCalibrationRequired("anchor calibration coordinate mismatch")
+    _exact_float_match(payload.get("rho_E"), prereg_config["rho_E"], "anchor calibration rho_E")
+    _exact_float_match(payload.get("rho_E"), 1.0e-4, "anchor calibration rho_E")
+    _exact_float_match(
+        payload.get("beta_identity_regularizer"),
+        prereg_config["beta_identity_regularizer"],
+        "anchor calibration beta_identity_regularizer",
+    )
+    weights = _strict_group_weights(
+        payload.get("group_weights_v1"), "anchor calibration group_weights_v1"
+    )
+    if weights != prereg_config["group_weights_v1"]:
+        raise MetricCalibrationRequired("anchor calibration group_weights_v1 mismatch")
+    _exact_float_match(
+        payload.get("metric_radius_tolerance"),
+        prereg_config["metric_radius_tolerance"],
+        "anchor calibration metric_radius_tolerance",
+    )
+    if payload.get("calibration_split") != "train":
+        raise MetricCalibrationRequired("anchor metric calibration split is not train")
     if payload.get("development_or_held_out_consumed") is not False:
         raise MetricCalibrationRequired("anchor metric calibration consumed non-train evidence")
+    for name in ("alpha", "rho_G"):
+        _strict_finite_positive(payload.get(name), f"anchor metric calibration {name}")
+    rho_e = _strict_finite_positive(payload.get("rho_E"), "anchor metric calibration rho_E")
+    expected_rho_g = float(payload["alpha"]) * rho_e
+    if not math.isclose(
+        float(payload["rho_G"]), expected_rho_g,
+        rel_tol=1.0e-12, abs_tol=1.0e-18,
+    ):
+        raise MetricCalibrationRequired("anchor calibration rho_G != alpha * rho_E")
+    required_top_level = {
+        "calibration_source": "final_composite_selected_projected_train_corrections",
+        "selection_stage": "post_composite_selector",
+        "projection_stage": "accepted_projected_candidate",
+        "adapter_incumbent_cases_excluded": True,
+        "identity_cases_excluded": True,
+        "raw_preselector_variants_used": False,
+        "projected_tangent_used": True,
+        "metric_shell_dtype": METRIC_SHELL_DTYPE,
+    }
+    for name, expected in required_top_level.items():
+        if payload.get(name) != expected:
+            raise MetricCalibrationRequired(f"anchor calibration {name} mismatch")
+    observations = payload.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise MetricCalibrationRequired("anchor calibration observations are missing")
+    if int(payload.get("observation_count", -1)) != len(observations):
+        raise MetricCalibrationRequired("anchor calibration observation_count mismatch")
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise MetricCalibrationRequired("anchor calibration observation is invalid")
+        if (
+            observation.get("calibration_source_stage")
+            != "post_composite_selector_post_projector"
+            or observation.get("projected_candidate") is not True
+            or observation.get("selected_method") in {None, "identity", "adapter"}
+            or observation.get("adapter_incumbent_locked") is not False
+            or observation.get("projector_backtracking_factor") is None
+        ):
+            raise MetricCalibrationRequired(
+                "anchor calibration observation is not a selected projected correction"
+            )
     return MetricOperator(mode=mode, calibration_path=str(path.resolve()),
-        calibration_sha256=_sha256(path), calibration=payload)
+        calibration_sha256=actual_calibration_sha, calibration=payload,
+        preregistration_path=str(Path(preregistration_path).resolve()),
+        preregistration_sha256=prereg_sha)
 
 
 def mode_grid() -> tuple[Mapping[str, str], ...]:

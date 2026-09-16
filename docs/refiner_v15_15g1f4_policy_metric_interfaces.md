@@ -85,8 +85,10 @@ Before any M-only or PM experiment, train-only equivalent-radius calibration
 must freeze:
 
 1. trace-normalized anchor metric scale on active physical coordinates;
-2. Euclidean RMS, metric RMS, and task-space `||Jd||_W` for successful train
-   corrections;
+2. Euclidean RMS, metric RMS, and task-space `||Jd||_W` only for final
+   composite-selected, non-Adapter, non-identity train corrections after the
+   actual Projector has accepted an authoritative full-Guard/science/scope
+   candidate;
 3. the train-only scale `rho_G = alpha * rho_E`; and
 4. the calibration manifest and SHA256 in the frozen contract.
 
@@ -100,11 +102,12 @@ export M_PREREG_CONTRACT=$(cat outputs/LATEST_REFINER_V15_15G1F4_M_V1_PREREG_CON
 bash scripts/run_refiner_v15_15g1f4_m_pm_server.sh
 ```
 
-It first runs `current_equal_share + identity` only to collect the first
-successful train correction per case and freezes `alpha` as the deterministic
-median metric/Euclidean RMS ratio.  It then runs M-only followed by PM.  An
-uncalibrated preregistration, a calibration that consumed non-train evidence,
-or a calibration hash mismatch fails closed.
+It first runs `current_equal_share + identity` only to collect the final
+composite-selected, Projector-accepted non-identity correction per eligible
+train case and freezes `alpha` as the deterministic median metric/Euclidean
+RMS ratio. It then runs M-only followed by PM. An uncalibrated preregistration,
+an expected calibration SHA mismatch, a preregistration/implementation binding
+mismatch, or a calibration that consumed non-train evidence fails closed.
 
 For M candidates the unchanged Projector kernel and backtracking factors are
 used, but each projected trial is rematerialized on the frozen metric shell.
@@ -120,9 +123,9 @@ original Euclidean-radius contract.
    as train acceptance.
 3. If promising, require all five targets, full group coverage, numeric audit,
    scope, single identity, and Adapter incumbent preservation.
-4. Run cold starts 2 and 3, then the frozen development bank.
-5. Implement/calibrate M only if P has removed the progress-policy bottleneck
-   but a stable k5 geometry bottleneck remains.
+4. Follow the immutable M protocol amendment before starting M calibration.
+   It authorizes train-only M-only then PM factorial cells after the P residual
+   audit, followed by cold-start replication and frozen development validation.
 
 This revision does not start development, held-out, packaging, whole-song
 generation, or Adapter retraining.
