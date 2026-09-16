@@ -4,6 +4,7 @@ set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 
 : "${EXPECTED_COMMIT:?Set EXPECTED_COMMIT to the supplied full commit SHA}"
+: "${V9_REFERENCE_REPORT:?Set V9_REFERENCE_REPORT to the canonical be71ae12 report}"
 PY="${PY:-/home/disk/lsm/conda_envs/edge/bin/python}"
 OUT_ROOT="${OUT_ROOT:-outputs/run_smpl14_formal_20260822_163915}"
 M_PREREG_CONTRACT="${M_PREREG_CONTRACT:-$(cat outputs/LATEST_REFINER_V15_15G1F4_M_V1_PREREG_CONTRACT)}"
@@ -13,6 +14,7 @@ test "$(git rev-parse origin/main)" = "$EXPECTED_COMMIT"
 test -z "$(git status --porcelain)"
 test -x "$PY"
 test -s "$M_PREREG_CONTRACT"
+test -s "$V9_REFERENCE_REPORT"
 
 ADAPTER_STATE=$(cat outputs/LATEST_REFINER_V15_15F1_GATE_RESTORATION_STATE)
 TEACHER_TAG=$(cat outputs/LATEST_REFINER_V15_15E_TEACHER_EXPANSION_TAG)
@@ -93,6 +95,15 @@ CALIBRATION_DIR="$ROOT/metric_calibration_identity"
 test -s "$CALIBRATION"
 printf '%s\n' "$CALIBRATION" > outputs/LATEST_REFINER_V15_15G1F4_M_CALIBRATION
 sha256sum "$CALIBRATION" > "$ROOT/anchor_kinematic_metric.calibration.sha256"
+
+CALIBRATION_REPORT="$CALIBRATION_DIR/fixed_budget_correction.report.json"
+PARITY_REPORT="$ROOT/v9_canonical_parity_gate.json"
+test -s "$CALIBRATION_REPORT"
+"$PY" -m training.refiner_v15_15g1f4_parity \
+  --v9-reference-report "$V9_REFERENCE_REPORT" \
+  --candidate-report "$CALIBRATION_REPORT" \
+  --output "$PARITY_REPORT"
+printf '%s\n' "$PARITY_REPORT" > outputs/LATEST_REFINER_V15_15G1F4_PARITY_REPORT
 
 run_cell() {
   local name=$1 progress=$2 output_dir="$ROOT/$1"
