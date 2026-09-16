@@ -1609,6 +1609,10 @@ def _g1d_shadow_objective(
     prediction_active_names=None,
     prediction_internal_witnesses=None,
     require_shadow_constraint=False,
+    precomputed_observable_terms=None,
+    precomputed_witness_context=None,
+    precomputed_science_tensors=None,
+    precomputed_scientific=None,
 ):
     hard_shadows, hard_values, limits = (
         _full_transaction_fixed_guard_shadows(
@@ -1652,28 +1656,47 @@ def _g1d_shadow_objective(
                 "frozen prediction Guard terms are unavailable: "
                 f"{unexpected}"
             )
-    objective_result = m._observable_refiner_objective(
-        candidate,
-        baseline.detach(),
-        batch["seam"],
-        cfg,
-        reduction="none",
-        return_witness_context=bool(require_shadow_constraint),
-    )
-    if require_shadow_constraint:
-        _, case_terms, witness_context = objective_result
+    if precomputed_observable_terms is not None:
+        case_terms = precomputed_observable_terms
+        witness_context = precomputed_witness_context
+        if require_shadow_constraint and witness_context is None:
+            raise RuntimeError(
+                "precomputed second-order terms require witness context"
+            )
     else:
-        _, case_terms = objective_result
-        witness_context = None
-    science_terms = oracle.case_probe._case_terms(candidate, batch, cfg)
-    science_tensors = {
-        key: science_terms[key][int(local_case)]
-        for key in ("endpoint", "temporal")
-    }
-    scientific = oracle._case_scientific_status(
-        {key: float(value.detach()) for key, value in science_tensors.items()},
-        baseline_case,
-    )
+        objective_result = m._observable_refiner_objective(
+            candidate,
+            baseline.detach(),
+            batch["seam"],
+            cfg,
+            reduction="none",
+            return_witness_context=bool(require_shadow_constraint),
+        )
+        if require_shadow_constraint:
+            _, case_terms, witness_context = objective_result
+        else:
+            _, case_terms = objective_result
+            witness_context = None
+    if precomputed_science_tensors is not None:
+        science_tensors = precomputed_science_tensors
+        if precomputed_scientific is None:
+            raise RuntimeError(
+                "precomputed science tensors require scientific status"
+            )
+        scientific = precomputed_scientific
+    else:
+        science_terms = oracle.case_probe._case_terms(candidate, batch, cfg)
+        science_tensors = {
+            key: science_terms[key][int(local_case)]
+            for key in ("endpoint", "temporal")
+        }
+        scientific = oracle._case_scientific_status(
+            {
+                key: float(value.detach())
+                for key, value in science_tensors.items()
+            },
+            baseline_case,
+        )
     smooth_shadows = {}
     for name in active_names:
         temperature = float(
@@ -2086,13 +2109,16 @@ def _metric_aware_audit_step(
     *, model, batch, cfg, tangent, c2_taper, ownership, baseline,
     identity, baseline_terms, samples, target_rms, workspace_floor, args,
     domains, additional_case_uids, metric_operator, metric_case_uids,
+    base_rows=None,
 ):
-    rows = adapter._audit_step(
-        model, batch, cfg, tangent, tangent, c2_taper, ownership,
-        baseline, identity, None, {}, baseline_terms, samples, target_rms,
-        workspace_floor, args, transaction_domains=domains,
-        additional_case_uids=additional_case_uids,
-    )
+    rows = base_rows
+    if rows is None:
+        rows = adapter._audit_step(
+            model, batch, cfg, tangent, tangent, c2_taper, ownership,
+            baseline, identity, None, {}, baseline_terms, samples, target_rms,
+            workspace_floor, args, transaction_domains=domains,
+            additional_case_uids=additional_case_uids,
+        )
     metric_case_uids = set(metric_case_uids)
     row_by_uid = {str(row["case_uid"]): row for row in rows}
     sample_by_uid = {str(sample["case_uid"]): sample for sample in samples}
@@ -4422,6 +4448,19 @@ def _second_order_angular_iteration(
     guard_constraint_names = tuple(
         name for name in gradients if name not in {"endpoint", "temporal"}
     )
+    print(json.dumps({
+        "stage": "v15_15g1f3_second_order_round_started",
+        "case_uid": case_uid,
+        "iteration": int(iteration),
+        "remaining_steps": int(remaining_steps),
+        "constraint_generation_depth": int(constraint_generation_depth),
+        "guard_row_count": len(guard_constraint_names),
+        "internal_witness_count": sum(
+            len(rows) for rows in frozen_internal_witnesses.values()
+        ),
+        "progress_mode": progress_policy.mode,
+        "metric_mode": metric_operator.mode,
+    }), flush=True)
     guard_row_base_name = {}
     current_guard_row_margin = {}
     internal_row_margin = (
@@ -4843,29 +4882,33 @@ def _second_order_angular_iteration(
         trial_candidate = product_exp_torch(
             baseline, trial_transaction_tangent
         )
-        _, trial_objective_terms, trial_witness_context = (
-            m._observable_refiner_objective(
-                trial_candidate,
-                baseline.detach(),
-                batch["seam"],
-                cfg,
-                reduction="none",
-                return_witness_context=True,
-            )
-        )
-        trial_case_terms = {
-            name: trial_objective_terms[f"{name}_scientific_deficit"]
-            for name in ("endpoint", "temporal")
-        }
-        trial_scientific = oracle._case_scientific_status(
-            {
-                key: float(
-                    trial_case_terms[key][int(local_case)].detach()
+        # Authoritative finite-angle trials are never differentiated.  Reuse
+        # their observable terms/witness context in the hard-Guard audit
+        # instead of building an unused graph and recomputing the same terms.
+        with m.torch.no_grad():
+            _, trial_objective_terms, trial_witness_context = (
+                m._observable_refiner_objective(
+                    trial_candidate,
+                    baseline.detach(),
+                    batch["seam"],
+                    cfg,
+                    reduction="none",
+                    return_witness_context=True,
                 )
-                for key in ("endpoint", "temporal")
-            },
-            baseline_case,
-        )
+            )
+            trial_case_terms = {
+                name: trial_objective_terms[f"{name}_scientific_deficit"]
+                for name in ("endpoint", "temporal")
+            }
+            trial_scientific = oracle._case_scientific_status(
+                {
+                    key: float(
+                        trial_case_terms[key][int(local_case)].detach()
+                    )
+                    for key in ("endpoint", "temporal")
+                },
+                baseline_case,
+            )
         science_margins = _science_pass_margin_diagnostics(trial_scientific)
         science_step_change = {
             name: float(trial_scientific[f"{name}_delta"])
@@ -4923,6 +4966,13 @@ def _second_order_angular_iteration(
                 prediction_active_names=frozen_active_names,
                 prediction_internal_witnesses=frozen_internal_witnesses,
                 require_shadow_constraint=True,
+                precomputed_observable_terms=trial_objective_terms,
+                precomputed_witness_context=trial_witness_context,
+                precomputed_science_tensors={
+                    name: trial_case_terms[name][int(local_case)]
+                    for name in ("endpoint", "temporal")
+                },
+                precomputed_scientific=trial_scientific,
             )
             trial_shadow_values = dict(
                 trial_guard_diagnostics[
@@ -8479,6 +8529,14 @@ def run(args):
                         for key in ("endpoint", "temporal")
                     }
                     local_contract = domain["contract"]
+                case_started = time.perf_counter()
+                print(json.dumps({
+                    "stage": "v15_15g_correction_case_started",
+                    "variant": f"{method}_k{budget}",
+                    "case_uid": uid,
+                    "progress_mode": progress_policy.mode,
+                    "metric_mode": metric_operator.mode,
+                }), flush=True)
                 if g1f_family:
                     corrected, correction_report = (
                         _correct_case_geodesic_joint_sqp(
@@ -8587,6 +8645,21 @@ def run(args):
                     correction_report = _g1c_name_case_physical_diagnostics(
                         correction_report
                     )
+                print(json.dumps({
+                    "stage": "v15_15g_correction_case_complete",
+                    "variant": f"{method}_k{budget}",
+                    "case_uid": uid,
+                    "elapsed_seconds": time.perf_counter() - case_started,
+                    "accepted_steps": correction_report.get(
+                        "accepted_steps"
+                    ),
+                    "second_order_state": correction_report.get(
+                        "second_order_state"
+                    ),
+                    "numeric_failure": correction_report.get(
+                        "numeric_failure"
+                    ),
+                }), flush=True)
                 if activation_enabled:
                     global_case = int(sample["case_index"])
                     tangent[global_case:global_case + 1] = corrected
@@ -8639,6 +8712,7 @@ def run(args):
                 metric_case_uids={
                     str(sample["case_uid"]) for sample in samples
                 },
+                base_rows=audits,
             )
         key = method if method == "adapter" else f"{method}_k{budget}"
         variant_tangents[key] = tangent.detach().clone()
@@ -8841,6 +8915,7 @@ def run(args):
                     if decision.get("selected_method")
                     not in {"identity", "adapter"}
                 },
+                base_rows=selected_audits,
             )
         selected_summary = _variant_summary(
             selected_audits,
