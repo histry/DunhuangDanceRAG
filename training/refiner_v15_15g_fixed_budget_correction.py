@@ -3509,11 +3509,18 @@ def _joint_geodesic_finite_gap_direction_for_angle(
     tangent_norms = {}
     for name in names:
         gradient_z = gradients.get(name)
-        if gradient_z is None or not bool(m.torch.isfinite(gradient_z).all()):
+        if gradient_z is None:
+            raise RuntimeError(
+                "g1f2 joint-gradient contract missing required term "
+                f"{name!r}; available terms={sorted(gradients)}"
+            )
+        if not bool(m.torch.isfinite(gradient_z).all()):
             return None, {
                 "solver_status": "nonfinite_joint_jacobian",
                 "solver_failure_reason": "nonfinite_joint_jacobian",
                 "joint_jacobian_status": "nonfinite_joint_jacobian",
+                "nonfinite_gradient_term": name,
+                "available_gradient_terms": sorted(gradients),
                 "theta_radians": theta,
             }
         physical_covector = m.torch.zeros_like(gradient_z)
@@ -4563,9 +4570,21 @@ def _finite_gap_angular_iteration(
         audit.get("solver_failure_reason") == "zero_science_gradient"
         for audit in angle_solver_audits
     )
+    numeric_rejection_reason = next(
+        (
+            str(row.get("reason"))
+            for row in trial_rows
+            if str(row.get("reason") or "").startswith("nonfinite")
+        ),
+        None,
+    )
     rejection_reason = None
     if not accepted:
-        if zero_science:
+        if numeric_failure:
+            rejection_reason = (
+                numeric_rejection_reason or "nonfinite_joint_jacobian"
+            )
+        elif zero_science:
             rejection_reason = "empty_geodesic_joint_feasible_intersection"
         elif any_authoritative_trial:
             rejection_reason = "finite_radius_model_mismatch"
@@ -4605,7 +4624,11 @@ def _finite_gap_angular_iteration(
         "exact_radius_rms": _rms(accepted_tangent, mask),
         "outside_scope_abs_max": 0.0 if accepted else None,
         "solver_failure_reason": (
-            "zero_science_gradient" if zero_science else None
+            rejection_reason
+            if numeric_failure
+            else "zero_science_gradient"
+            if zero_science
+            else None
         ),
         "second_order_hessian_used": False,
     }, numeric_failure
@@ -6758,13 +6781,26 @@ def _correct_case_geodesic_joint_sqp(
                 "angular_line_search_trials": [],
             })
             break
-        guard_items = list(guard_rows.items())
-        gradient_terms = [
-            guard_items[0],
-            ("endpoint", science_tensors["endpoint"]),
-            ("temporal", science_tensors["temporal"]),
-            *guard_items[1:],
-        ]
+        if second_order_joint_sqp:
+            guard_items = list(guard_rows.items())
+            if not guard_items:
+                raise RuntimeError(
+                    "g1f3 row-wise gradient contract requires a Guard row"
+                )
+            gradient_terms = [
+                guard_items[0],
+                ("endpoint", science_tensors["endpoint"]),
+                ("temporal", science_tensors["temporal"]),
+                *guard_items[1:],
+            ]
+        else:
+            # G1F/G1F1/G1F2 use the original aggregate full-shadow row.
+            # The row-wise guard::<name> interface belongs only to G1F3.
+            gradient_terms = [
+                ("shadow", primary_loss),
+                ("endpoint", science_tensors["endpoint"]),
+                ("temporal", science_tensors["temporal"]),
+            ]
         gradients = {
             name: _autograd_gradient_or_zero(
                 value,
