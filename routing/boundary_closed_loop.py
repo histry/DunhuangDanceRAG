@@ -1764,7 +1764,12 @@ def gar_evaluation_trace_context(
             motion_runtime, "DIFFUSION_MODEL_VERSION", None
         ),
         "behavior_config_fingerprint": behavior_config_fingerprint(
-            config, runtime_environment=runtime_environment
+            config,
+            runtime_environment={
+                key: value
+                for key, value in runtime_environment.items()
+                if not key.startswith("REPAIRABILITY_")
+            },
         ),
     }
     checkpoint_fingerprint = checkpoint_bundle_fingerprint(
@@ -1948,6 +1953,25 @@ def collect_repairability_outcome_bank(
     if runtime_mode != "off":
         raise RuntimeError(
             "Outcome Bank capture requires REPAIRABILITY_MODE=off to avoid circular labels"
+        )
+    required_final_gates = {
+        "ROUTING_SAFETY_REQUIRE_FINAL_PHYSICAL_GATE": env_bool(
+            "ROUTING_SAFETY_REQUIRE_FINAL_PHYSICAL_GATE", True
+        ),
+        "BOUNDARY_REQUIRE_FINAL_BOUNDARY_GATE": env_bool(
+            "BOUNDARY_REQUIRE_FINAL_BOUNDARY_GATE", True
+        ),
+        "MOTION_ACTIVITY_FINAL_GATE": env_bool(
+            "MOTION_ACTIVITY_FINAL_GATE", True
+        ),
+    }
+    disabled_final_gates = sorted(
+        name for name, enabled in required_final_gates.items() if not enabled
+    )
+    if disabled_final_gates:
+        raise RuntimeError(
+            "Outcome Bank capture requires every production final quality gate; "
+            "disabled=" + ",".join(disabled_final_gates)
         )
     if env_bool("BOUNDARY_STAGE_DIAGNOSTICS", False):
         raise RuntimeError(
@@ -2133,8 +2157,13 @@ def collect_repairability_outcome_bank(
                         "Outcome Bank trial did not produce exactly one target audit"
                     )
                 audit = matching[0]
+                boundary_gate = evaluate_boundary_continuity(
+                    audits,
+                    expected_boundaries=max(0, len(assembly) - 1),
+                )
                 boundary_reasons = tuple(
-                    str(value) for value in audit.get("failure_reasons", ())
+                    f"boundary:{value}"
+                    for value in boundary_gate.get("reasons", ())
                 )
                 physical_gate = dict(
                     trial_stage_reports.get("final_physical_gate", {})
@@ -2147,7 +2176,73 @@ def collect_repairability_outcome_bank(
                     f"physical:{value}"
                     for value in physical_gate.get("reasons", ())
                 )
-                reasons = tuple(dict.fromkeys(boundary_reasons + physical_reasons))
+                activity_gate = evaluate_final_motion_activity(
+                    motion,
+                    slots=slots,
+                    assembly_report=assembly,
+                    fps=float(getattr(cfg, "fps", 30.0)),
+                )
+                activity_reasons = tuple(
+                    f"activity:{value}"
+                    for value in activity_gate.get("reasons", ())
+                )
+                schedule_safe = True
+                schedule_reasons: tuple[str, ...] = ()
+                try:
+                    constraint_rows = final_selection_constraint_rows(
+                        dict(db), assembly
+                    )
+                    assert_schedule_hard_constraints(
+                        constraint_rows,
+                        max_pose_hold_ratio=env_float(
+                            "GENERATION_MAX_POSE_HOLD_RATIO",
+                            DEFAULT_MAX_POSE_HOLD_RATIO,
+                        ),
+                        max_single_source_ratio=env_float(
+                            "ROUTING_SAFETY_MAX_SOURCE_SHARE",
+                            DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+                        ),
+                        max_single_recording_ratio=env_float(
+                            "ROUTING_SAFETY_MAX_RECORDING_SHARE",
+                            DEFAULT_MAX_SINGLE_SOURCE_RATIO,
+                        ),
+                        min_unique_events=env_int(
+                            "GENERATION_MIN_UNIQUE_EVENTS",
+                            DEFAULT_MIN_UNIQUE_EVENTS,
+                        ),
+                        min_core_frame_ratio=env_float(
+                            "GENERATION_MIN_CORE_FRAME_RATIO",
+                            DEFAULT_MIN_CORE_FRAME_RATIO,
+                        ),
+                    )
+                except (RuntimeError, ValueError, AssertionError) as exc:
+                    schedule_safe = False
+                    schedule_reasons = (
+                        f"schedule:{type(exc).__name__}:{exc}",
+                    )
+                boundary_safe = bool(boundary_gate.get("ok", False))
+                physical_safe = bool(physical_gate.get("ok", False))
+                activity_safe = bool(activity_gate.get("ok", False))
+                if boundary_safe:
+                    boundary_reasons = ()
+                if physical_safe:
+                    physical_reasons = ()
+                if activity_safe:
+                    activity_reasons = ()
+                if not boundary_safe and not boundary_reasons:
+                    boundary_reasons = ("boundary:unspecified_failure",)
+                if not physical_safe and not physical_reasons:
+                    physical_reasons = ("physical:unspecified_failure",)
+                if not activity_safe and not activity_reasons:
+                    activity_reasons = ("activity:unspecified_failure",)
+                reasons = tuple(
+                    dict.fromkeys(
+                        boundary_reasons
+                        + physical_reasons
+                        + activity_reasons
+                        + schedule_reasons
+                    )
+                )
                 recording_value = (
                     None
                     if "recording_uids" not in db
@@ -2179,10 +2274,16 @@ def collect_repairability_outcome_bank(
                     features=features,
                     pre_safe=bool(selected_row["safe_predicted"]),
                     pre_risk=float(selected_row["risk_score_predicted"]),
-                    boundary_safe=bool(audit.get("safe", False)),
-                    physical_safe=bool(physical_gate.get("ok", False)),
-                    post_safe=bool(audit.get("safe", False))
-                    and bool(physical_gate.get("ok", False)),
+                    boundary_safe=boundary_safe,
+                    physical_safe=physical_safe,
+                    activity_safe=activity_safe,
+                    schedule_safe=schedule_safe,
+                    post_safe=bool(
+                        boundary_safe
+                        and physical_safe
+                        and activity_safe
+                        and schedule_safe
+                    ),
                     post_risk=float(audit.get("actual_risk_score", 0.0)),
                     failure_reasons=reasons,
                     violation_families=reason_families(reasons),

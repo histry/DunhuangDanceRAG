@@ -8,6 +8,7 @@ import torch
 
 from evaluation.repairability_outcome_bank import (
     OUTCOME_BANK_RECORD_SCHEMA,
+    OutcomeBankWriter,
     OutcomeRecord,
     reason_families,
 )
@@ -63,6 +64,8 @@ def test_outcome_record_derives_authoritative_safety_from_reasons():
         pre_risk=0.2,
         boundary_safe=False,
         physical_safe=True,
+        activity_safe=True,
+        schedule_safe=True,
         post_safe=False,
         post_risk=0.8,
         failure_reasons=("foot_slip_p95_exceeded",),
@@ -77,6 +80,52 @@ def test_outcome_record_derives_authoritative_safety_from_reasons():
     assert record.violation_families == ("foot_slip",)
     with pytest.raises(ValueError, match="post_safe"):
         dataclasses.replace(record, post_safe=True)
+
+
+def test_outcome_bank_rejects_mixed_candidate_pools(tmp_path):
+    record = OutcomeRecord(
+        schema=OUTCOME_BANK_RECORD_SCHEMA,
+        sequence_id="seq",
+        boundary_id="boundary",
+        evaluation_case_id="case",
+        group_id="recording-group",
+        slot_index=1,
+        candidate_id="event-a",
+        candidate_event_index=3,
+        source_recording_id="recording",
+        source_performer_id="performer",
+        original_rank=0,
+        candidate_pool_size=2,
+        random_seed=7,
+        features=feature_fixture(),
+        pre_safe=True,
+        pre_risk=0.2,
+        boundary_safe=True,
+        physical_safe=True,
+        activity_safe=True,
+        schedule_safe=True,
+        post_safe=True,
+        post_risk=0.1,
+        failure_reasons=(),
+        violation_families=(),
+        runtime_ms=10.0,
+        runtime_commit="commit",
+        config_fingerprint="config",
+        candidate_pool_fingerprint="pool-a",
+        generator_fingerprint="generator",
+        repair_fingerprint="repair",
+    )
+    writer = OutcomeBankWriter(tmp_path / "bank.jsonl")
+    assert writer.append(record) is True
+    changed_pool = dataclasses.replace(
+        record,
+        candidate_id="event-b",
+        candidate_event_index=4,
+        random_seed=8,
+        candidate_pool_fingerprint="pool-b",
+    )
+    with pytest.raises(ValueError, match="candidate pools"):
+        writer.append(changed_pool)
 
 
 def test_ranker_abstains_on_indistinguishable_candidates():

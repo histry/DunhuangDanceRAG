@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 PY="${PY:-/home/disk/lsm/conda_envs/edge/bin/python}"
 OUT_ROOT="${REPAIRABILITY_OUT_ROOT:-outputs/repairability_$(date +%Y%m%d_%H%M%S)}"
 LOG="${REPAIRABILITY_LOG:-logs/repairability_$(date +%Y%m%d_%H%M%S).log}"
-SPLIT_ISOLATION="${REPAIRABILITY_SPLIT_ISOLATION:-sequence}"
+SPLIT_ISOLATION="${REPAIRABILITY_SPLIT_ISOLATION:-all}"
 
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test "$(git rev-parse origin/main)" = "$EXPECTED_COMMIT"

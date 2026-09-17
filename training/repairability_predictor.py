@@ -93,6 +93,18 @@ def grouped_split(
 ) -> Dict[str, list[Example]]:
     if isolation not in {"sequence", "recording", "performer", "all"}:
         raise ValueError("unsupported repairability split isolation")
+    if isolation in {"recording", "all"} and any(
+        not example.source_recording_id for example in examples
+    ):
+        raise ValueError(
+            f"{isolation} isolation requires source_recording_id for every example"
+        )
+    if isolation in {"performer", "all"} and any(
+        not example.source_performer_id for example in examples
+    ):
+        raise ValueError(
+            f"{isolation} isolation requires source_performer_id for every example"
+        )
     groups = sorted({example.group_id for example in examples})
     parent = {group: group for group in groups}
 
@@ -521,7 +533,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--split-isolation",
         choices=["sequence", "recording", "performer", "all"],
-        default="sequence",
+        default="all",
     )
     args = parser.parse_args(argv)
 

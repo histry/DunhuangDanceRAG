@@ -9,6 +9,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import numpy as np
 
 from evaluation.gar_evaluation_readiness import GARSelectionTrace
+from evaluation.repairability_outcome_bank import read_outcome_bank
 
 
 def load_traces(paths: Sequence[str]) -> list[GARSelectionTrace]:
@@ -40,7 +41,39 @@ def boundary_rows(traces: Sequence[GARSelectionTrace]) -> Dict[tuple[str, int, i
             final_id = boundary.summary.final_candidate_id
             selected_entry = manifest.get(final_id) if final_id is not None else None
             rows[key] = {
+                "runtime_commit": boundary.runtime_commit,
+                "retrieval_index_fingerprint": (
+                    boundary.retrieval_index_fingerprint
+                ),
                 "candidate_pool_fingerprint": boundary.candidate_pool_fingerprint,
+                "candidate_pool_contract": tuple(
+                    (
+                        entry.candidate_id,
+                        int(entry.retrieval_rank),
+                        (
+                            None
+                            if entry.retrieval_score is None
+                            else float(entry.retrieval_score)
+                        ),
+                        entry.source_event_id,
+                        entry.source_recording_id,
+                        entry.candidate_metadata_fingerprint,
+                    )
+                    for entry in boundary.candidate_pool_manifest
+                ),
+                "source_recording_ids": tuple(
+                    sorted(
+                        {
+                            str(entry.source_recording_id)
+                            for entry in boundary.candidate_pool_manifest
+                            if entry.source_recording_id not in (None, "")
+                        }
+                    )
+                ),
+                "source_recording_ids_complete": all(
+                    entry.source_recording_id not in (None, "")
+                    for entry in boundary.candidate_pool_manifest
+                ),
                 "generator": (
                     boundary.generator_id,
                     boundary.generator_version,
@@ -51,6 +84,16 @@ def boundary_rows(traces: Sequence[GARSelectionTrace]) -> Dict[tuple[str, int, i
                     boundary.repair_operator_id,
                     boundary.repair_operator_version,
                     boundary.repair_config_fingerprint,
+                ),
+                "guard": (
+                    boundary.risk_threshold_source,
+                    boundary.risk_threshold_value,
+                    json.dumps(
+                        boundary.risk_thresholds,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
                 ),
                 "initial_post_safe": boundary.summary.initial_post_safe,
                 "final_post_safe": boundary.summary.final_post_safe,
@@ -125,7 +168,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-ubr-increase", type=float, default=0.0)
     parser.add_argument("--max-router-score-drop", type=float, default=0.02)
+    parser.add_argument("--minimum-seeds", type=int, default=2)
+    parser.add_argument("--training-bank")
+    parser.add_argument("--require-sealed-isolation", action="store_true")
     args = parser.parse_args(argv)
+    if int(args.minimum_seeds) < 2:
+        raise ValueError("paired evaluation requires at least two seeds")
+    if args.require_sealed_isolation and not args.training_bank:
+        raise ValueError(
+            "--require-sealed-isolation requires --training-bank"
+        )
     baseline_traces = load_traces(args.baseline)
     method_traces = load_traces(args.method)
     baseline = boundary_rows(baseline_traces)
@@ -133,14 +185,107 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if set(baseline) != set(method):
         raise ValueError("paired trace case/seed sets do not match")
     keys = sorted(baseline)
+    seeds_by_case: Dict[tuple[str, int], set[int]] = {}
+    for sequence_id, slot_index, random_seed in keys:
+        if int(random_seed) < 0:
+            raise ValueError(
+                "paired multi-seed evaluation requires an explicit random seed"
+            )
+        seeds_by_case.setdefault((sequence_id, slot_index), set()).add(
+            int(random_seed)
+        )
+    under_sampled = {
+        f"{sequence_id}:{slot_index}": sorted(seeds)
+        for (sequence_id, slot_index), seeds in seeds_by_case.items()
+        if len(seeds) < int(args.minimum_seeds)
+    }
+    if under_sampled:
+        raise ValueError(
+            "paired evaluation lacks the required seeds for sequences: "
+            f"{under_sampled}"
+        )
     for key in keys:
         left, right = baseline[key], method[key]
+        if left["runtime_commit"] != right["runtime_commit"]:
+            raise ValueError(f"runtime commit mismatch for {key}")
+        if (
+            left["retrieval_index_fingerprint"]
+            != right["retrieval_index_fingerprint"]
+        ):
+            raise ValueError(f"retrieval index mismatch for {key}")
         if left["candidate_pool_fingerprint"] != right["candidate_pool_fingerprint"]:
             raise ValueError(f"candidate pool mismatch for {key}")
+        if left["candidate_pool_contract"] != right["candidate_pool_contract"]:
+            raise ValueError(f"candidate pool metadata mismatch for {key}")
         if left["generator"] != right["generator"]:
             raise ValueError(f"generator mismatch for {key}")
         if left["repair"] != right["repair"]:
             raise ValueError(f"repair operator mismatch for {key}")
+        if left["guard"] != right["guard"]:
+            raise ValueError(f"Guard contract mismatch for {key}")
+        if left["source_recording_ids"] != right["source_recording_ids"]:
+            raise ValueError(f"source recording set mismatch for {key}")
+
+    evaluation_sequence_ids = {key[0] for key in keys}
+    evaluation_recording_ids = {
+        recording_id
+        for row in baseline.values()
+        for recording_id in row["source_recording_ids"]
+    }
+    sealed_isolation: Dict[str, Any] = {
+        "required": bool(args.require_sealed_isolation),
+        "verified": False,
+        "training_bank": None,
+        "sequence_overlap": [],
+        "source_recording_overlap": [],
+    }
+    if args.training_bank:
+        training_records = read_outcome_bank(args.training_bank)
+        if not training_records:
+            raise ValueError("sealed isolation training Outcome Bank is empty")
+        if args.require_sealed_isolation and any(
+            not bool(row["source_recording_ids_complete"])
+            for row in baseline.values()
+        ):
+            raise ValueError(
+                "sealed evaluation cannot prove source-recording isolation: "
+                "one or more candidate-pool entries lack source_recording_id"
+            )
+        if args.require_sealed_isolation and any(
+            record.source_recording_id in (None, "")
+            for record in training_records
+        ):
+            raise ValueError(
+                "sealed evaluation cannot prove source-recording isolation: "
+                "the training Outcome Bank has missing source_recording_id"
+            )
+        training_sequence_ids = {
+            record.sequence_id for record in training_records
+        }
+        training_recording_ids = {
+            str(record.source_recording_id)
+            for record in training_records
+            if record.source_recording_id not in (None, "")
+        }
+        sequence_overlap = sorted(
+            evaluation_sequence_ids.intersection(training_sequence_ids)
+        )
+        recording_overlap = sorted(
+            evaluation_recording_ids.intersection(training_recording_ids)
+        )
+        sealed_isolation.update(
+            {
+                "verified": not sequence_overlap and not recording_overlap,
+                "training_bank": str(Path(args.training_bank).resolve()),
+                "sequence_overlap": sequence_overlap,
+                "source_recording_overlap": recording_overlap,
+            }
+        )
+        if args.require_sealed_isolation and not sealed_isolation["verified"]:
+            raise ValueError(
+                "sealed evaluation overlaps training sequences or source recordings: "
+                f"sequences={sequence_overlap}, recordings={recording_overlap}"
+            )
     baseline_rows = [baseline[key] for key in keys]
     method_rows = [method[key] for key in keys]
     baseline_metrics = aggregate(baseline_rows, baseline_traces)
@@ -187,8 +332,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         - method_metrics["mean_selected_router_score"]
     )
     report = {
-        "schema": "repairability_paired_evaluation_v1",
+        "schema": "repairability_paired_evaluation_v2",
         "same_pool_generator_guard": True,
+        "minimum_seeds": int(args.minimum_seeds),
+        "seed_count_by_case": {
+            f"{sequence_id}:{slot_index}": len(seeds)
+            for (sequence_id, slot_index), seeds in sorted(seeds_by_case.items())
+        },
+        "sealed_isolation": sealed_isolation,
         "baseline": baseline_metrics,
         "method": method_metrics,
         "paired_bootstrap": paired,

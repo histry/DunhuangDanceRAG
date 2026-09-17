@@ -13,8 +13,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 from model.repairability_predictor import FEATURE_NAMES, VIOLATION_FAMILIES
 
 
-OUTCOME_BANK_RECORD_SCHEMA = "repairability_outcome_record_v1"
-OUTCOME_BANK_SUMMARY_SCHEMA = "repairability_outcome_bank_summary_v1"
+OUTCOME_BANK_RECORD_SCHEMA = "repairability_outcome_record_v2"
+OUTCOME_BANK_SUMMARY_SCHEMA = "repairability_outcome_bank_summary_v2"
 
 
 def canonical_fingerprint(value: Any) -> str:
@@ -69,6 +69,8 @@ class OutcomeRecord:
     pre_risk: float
     boundary_safe: bool
     physical_safe: bool
+    activity_safe: bool
+    schedule_safe: bool
     post_safe: bool
     post_risk: float
     failure_reasons: tuple[str, ...]
@@ -116,9 +118,14 @@ class OutcomeRecord:
         if bool(self.post_safe) != (len(self.failure_reasons) == 0):
             raise ValueError("Outcome Bank post_safe must be derived from Guard reasons")
         if bool(self.post_safe) != (
-            bool(self.boundary_safe) and bool(self.physical_safe)
+            bool(self.boundary_safe)
+            and bool(self.physical_safe)
+            and bool(self.activity_safe)
+            and bool(self.schedule_safe)
         ):
-            raise ValueError("Outcome Bank post_safe must combine boundary and physical gates")
+            raise ValueError(
+                "Outcome Bank post_safe must combine every final quality gate"
+            )
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -160,6 +167,8 @@ def outcome_record_from_mapping(value: Mapping[str, Any]) -> OutcomeRecord:
         pre_risk=float(value.get("pre_risk", 0.0)),
         boundary_safe=bool(value.get("boundary_safe", False)),
         physical_safe=bool(value.get("physical_safe", False)),
+        activity_safe=bool(value.get("activity_safe", False)),
+        schedule_safe=bool(value.get("schedule_safe", False)),
         post_safe=bool(value.get("post_safe", False)),
         post_risk=float(value.get("post_risk", 0.0)),
         failure_reasons=tuple(str(item) for item in value.get("failure_reasons", ())),
@@ -214,6 +223,19 @@ class OutcomeBankWriter:
         }
         if len(self.provenance) > 1:
             raise ValueError("Outcome Bank mixes incompatible execution provenance")
+        self.case_pool_contract = {}
+        for record in existing:
+            contract = (
+                record.candidate_pool_fingerprint,
+                int(record.candidate_pool_size),
+            )
+            previous = self.case_pool_contract.setdefault(
+                record.evaluation_case_id, contract
+            )
+            if previous != contract:
+                raise ValueError(
+                    "Outcome Bank mixes candidate pools within an evaluation case"
+                )
 
     def contains(self, key: tuple[str, str, int]) -> bool:
         return key in self.keys
@@ -232,6 +254,15 @@ class OutcomeBankWriter:
         )
         if self.provenance and provenance not in self.provenance:
             raise ValueError("refusing to mix Outcome Bank execution provenance")
+        pool_contract = (
+            record.candidate_pool_fingerprint,
+            int(record.candidate_pool_size),
+        )
+        previous_pool = self.case_pool_contract.get(record.evaluation_case_id)
+        if previous_pool is not None and previous_pool != pool_contract:
+            raise ValueError(
+                "refusing to mix candidate pools within an evaluation case"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(
@@ -248,6 +279,9 @@ class OutcomeBankWriter:
         self.keys.add(record.key)
         self.records_by_key[record.key] = record
         self.provenance.add(provenance)
+        self.case_pool_contract.setdefault(
+            record.evaluation_case_id, pool_contract
+        )
         return True
 
 
@@ -286,6 +320,18 @@ def summarize_outcome_bank(
         "boundary_count": len({record.evaluation_case_id for record in records}),
         "candidate_count": len({record.candidate_id for record in records}),
         "safe_rate": safe_count / float(max(1, len(records))),
+        "boundary_safe_rate": sum(
+            int(record.boundary_safe) for record in records
+        ) / float(max(1, len(records))),
+        "physical_safe_rate": sum(
+            int(record.physical_safe) for record in records
+        ) / float(max(1, len(records))),
+        "activity_safe_rate": sum(
+            int(record.activity_safe) for record in records
+        ) / float(max(1, len(records))),
+        "schedule_safe_rate": sum(
+            int(record.schedule_safe) for record in records
+        ) / float(max(1, len(records))),
         "seed_sensitive_candidate_groups": heterogeneous,
         "outcome_heterogeneous_boundaries": sum(
             int(len(values) > 1) for values in boundary_outcomes.values()
