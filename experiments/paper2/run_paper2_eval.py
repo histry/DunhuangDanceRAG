@@ -186,6 +186,8 @@ def main():
         "methods": list(methods),
         "budgets": list(budgets),
     }
+    if protocol.get("compute_budget"):
+        binding["compute_budget"] = dict(protocol["compute_budget"])
     if args.frozen_severity_envelope:
         binding["frozen_severity_envelope"] = str(
             Path(args.frozen_severity_envelope).resolve()

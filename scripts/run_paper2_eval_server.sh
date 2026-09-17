@@ -8,7 +8,23 @@ cd "$(dirname "$0")/.."
 : "${PAPER2_CASE_MANIFEST:?path to immutable paper2 case manifest}"
 PY="${PY:-/home/disk/lsm/conda_envs/edge/bin/python}"
 OUT_ROOT="${OUT_ROOT:-outputs/run_smpl14_formal_20260822_163915}"
-PAPER2_PROTOCOL="${PAPER2_PROTOCOL:-experiments/paper2/protocol.json}"
+PAPER2_COMPUTE_PROFILE="${PAPER2_COMPUTE_PROFILE:-fast_budget_v1}"
+if test -z "${PAPER2_PROTOCOL:-}"; then
+  case "$PAPER2_COMPUTE_PROFILE" in
+    fast_budget_v1)
+      PAPER2_PROTOCOL="experiments/paper2/protocol_fast_budget_v1.json"
+      ;;
+    full_reference)
+      PAPER2_PROTOCOL="experiments/paper2/protocol.json"
+      ;;
+    *)
+      echo "unsupported PAPER2_COMPUTE_PROFILE=$PAPER2_COMPUTE_PROFILE" >&2
+      exit 2
+      ;;
+  esac
+else
+  PAPER2_COMPUTE_PROFILE="explicit_protocol"
+fi
 
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test "$(git rev-parse origin/main)" = "$EXPECTED_COMMIT"
@@ -38,6 +54,8 @@ mkdir -p "$RUN_ROOT" logs outputs
 printf '%s\n' "$RUN_ROOT" > "outputs/LATEST_PAPER2_${PAPER2_PHASE^^}_ROOT"
 printf '%s\n' "$LOG" > "outputs/LATEST_PAPER2_${PAPER2_PHASE^^}_LOG"
 exec > >(tee -a "$LOG") 2>&1
+echo "Paper-2 compute profile: $PAPER2_COMPUTE_PROFILE"
+echo "Paper-2 protocol: $PAPER2_PROTOCOL"
 
 ROOT_DIR=$(pwd)
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"

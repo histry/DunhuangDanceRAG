@@ -124,6 +124,14 @@ def _closure_rows(indices):
             correction = variant["correction_by_case"][uid]
             timing = correction.get("stage_timing_seconds") or {}
             counts = correction.get("function_call_counts") or {}
+            iteration_rows = correction.get("history") or []
+            angle_rows = [
+                angle
+                for iteration in iteration_rows
+                for angle in (
+                    iteration.get("angle_specific_second_order_solvers") or []
+                )
+            ]
             rows.append({
                 "phase": phase,
                 "case_uid": uid,
@@ -136,6 +144,20 @@ def _closure_rows(indices):
                 "numeric_failure": bool(correction.get("numeric_failure")),
                 "accepted_steps": correction.get("accepted_steps"),
                 "second_order_state": correction.get("second_order_state"),
+                "constraint_generation_budget_exhausted": bool(
+                    correction.get("constraint_generation_budget_exhausted")
+                ),
+                "maximum_constraint_generation_depth_observed": max(
+                    (
+                        int(row.get("constraint_generation_depth", 0))
+                        for row in iteration_rows
+                    ),
+                    default=0,
+                ),
+                "adaptive_full_search_execution_count": sum(
+                    bool(row.get("adaptive_full_search_executed"))
+                    for row in angle_rows
+                ),
                 "runtime_seconds": correction.get("elapsed_seconds"),
                 **{f"time_{key}": value for key, value in timing.items()},
                 **{f"calls_{key}": value for key, value in counts.items()},
@@ -186,6 +208,14 @@ def _closure_summary(rows):
             ) / len(group),
             "numeric_failure_count": sum(
                 row["numeric_failure"] for row in group
+            ),
+            "constraint_generation_budget_exhausted_count": sum(
+                bool(row.get("constraint_generation_budget_exhausted"))
+                for row in group
+            ),
+            "adaptive_full_search_execution_count": sum(
+                int(row.get("adaptive_full_search_execution_count", 0))
+                for row in group
             ),
             "median_runtime_seconds": (
                 statistics.median(runtime) if runtime else None

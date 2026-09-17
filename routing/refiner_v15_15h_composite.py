@@ -89,8 +89,15 @@ def _load_composite(model_path, contract_path, cfg):
     _require(fixed.get(
         "second_order_active_set_constraint_generation_termination"
     ) == "strict_new_guard_row_or_internal_witness_from_finite_"
-         "transaction_case_frame_joint_window_universe",
+         "transaction_case_frame_joint_window_universe_or_fail_closed_"
+         "depth_budget",
              "V15.15h active-set generation termination changed")
+    _require(int(fixed.get(
+        "second_order_max_constraint_generation_depth", -2
+    )) >= -1, "V15.15h constraint-generation budget is invalid")
+    _require(fixed.get("second_order_constraint_generation_budget_policy") ==
+             "fail_closed_identity_abstention_without_consuming_correction_step",
+             "V15.15h constraint-generation fail-closed policy changed")
     _require(fixed.get("second_order_physical_guard_row_scope") ==
              "edited_case_exact_signed_margin_no_cross_case_softmax",
              "V15.15h physical Guard row scope changed")
@@ -136,15 +143,46 @@ def _load_composite(model_path, contract_path, cfg):
              "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
              "linearly_dependent_projection",
              "V15.15h Guard basis replenishment changed")
-    _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
+    initial_coarse = int(fixed.get(
+        "second_order_initial_max_coarse_grid_directions", 0
+    ))
+    full_coarse = int(fixed.get(
+        "second_order_full_max_coarse_grid_directions", 0
+    ))
+    initial_starts = int(fixed.get(
+        "second_order_initial_sqp_refinement_starts", 0
+    ))
+    full_starts = int(fixed.get("second_order_sqp_refinement_starts", 0))
+    initial_iterations = int(fixed.get(
+        "second_order_initial_sqp_refinement_iterations", 0
+    ))
+    full_iterations = int(fixed.get(
+        "second_order_sqp_refinement_iterations", 0
+    ))
+    _require(10 <= initial_coarse <= full_coarse <=
              second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
-             "V15.15h coarse grid bound changed")
-    _require(fixed.get("second_order_sqp_refinement_starts") ==
+             "V15.15h coarse search budgets are invalid")
+    _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
+             full_coarse,
+             "V15.15h legacy/full coarse bounds disagree")
+    _require(1 <= initial_starts <= full_starts <=
              second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
-             "V15.15h SQP start count changed")
-    _require(fixed.get("second_order_sqp_refinement_iterations") ==
+             "V15.15h SQP start budgets are invalid")
+    _require(1 <= initial_iterations <= full_iterations <=
              second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
-             "V15.15h SQP iteration count changed")
+             "V15.15h SQP iteration budgets are invalid")
+    reduced_search = bool(
+        initial_coarse < full_coarse
+        or initial_starts < full_starts
+        or initial_iterations < full_iterations
+    )
+    _require(
+        not reduced_search or fixed.get("second_order_adaptive_full_search") is True,
+        "V15.15h reduced search lacks deterministic full escalation",
+    )
+    _require(fixed.get("second_order_adaptive_full_search_trigger") ==
+             "initial_search_has_no_predicted_feasible_candidate",
+             "V15.15h adaptive full-search trigger changed")
     _require(fixed.get("second_order_sqp_smoothing") == [
         float(value) for value in second_order.SECOND_ORDER_SQP_SMOOTHING
     ], "V15.15h SQP smoothing schedule changed")
@@ -509,6 +547,9 @@ def _apply_one_transaction(
         feasibility_tolerance = float(
             fixed["second_order_feasibility_tolerance"]
         )
+        maximum_constraint_generation_depth = int(
+            fixed["second_order_max_constraint_generation_depth"]
+        )
         for budget in (2, 3, 5):
             report["budgets_attempted"].append(budget)
             budget_current = current.clone()
@@ -712,6 +753,35 @@ def _apply_one_transaction(
                             restoration_required_reduction=(
                                 remaining_closure_gap
                             ),
+                            initial_max_coarse_grid_directions=int(
+                                fixed[
+                                    "second_order_initial_max_coarse_grid_directions"
+                                ]
+                            ),
+                            initial_refinement_starts=int(
+                                fixed[
+                                    "second_order_initial_sqp_refinement_starts"
+                                ]
+                            ),
+                            initial_refinement_iterations=int(
+                                fixed[
+                                    "second_order_initial_sqp_refinement_iterations"
+                                ]
+                            ),
+                            adaptive_full_search=bool(
+                                fixed["second_order_adaptive_full_search"]
+                            ),
+                            full_max_coarse_grid_directions=int(
+                                fixed[
+                                    "second_order_full_max_coarse_grid_directions"
+                                ]
+                            ),
+                            full_refinement_starts=int(
+                                fixed["second_order_sqp_refinement_starts"]
+                            ),
+                            full_refinement_iterations=int(
+                                fixed["second_order_sqp_refinement_iterations"]
+                            ),
                         )
                         if direction is not None:
                             direction = direction.to(budget_current.dtype)
@@ -791,6 +861,34 @@ def _apply_one_transaction(
                         discovered_internal_witnesses,
                     )
                     if newly_exposed_internal_witnesses:
+                        budget_exhausted = bool(
+                            maximum_constraint_generation_depth >= 0
+                            and int(constraint_generation_depth)
+                            >= maximum_constraint_generation_depth
+                        )
+                        if budget_exhausted:
+                            attempt.update({
+                                "state": (
+                                    "constraint_generation_budget_exhausted"
+                                ),
+                                "reason": (
+                                    "new_internal_guard_witness_at_depth_limit"
+                                ),
+                                "internal_active_witness_transition": True,
+                                "newly_exposed_internal_witnesses": (
+                                    newly_exposed_internal_witnesses
+                                ),
+                                "maximum_constraint_generation_depth": (
+                                    maximum_constraint_generation_depth
+                                ),
+                                "constraint_generation_budget_exhausted": True,
+                                "constraint_generation_fail_closed": True,
+                                "constraint_generation_consumed_correction_step": (
+                                    False
+                                ),
+                            })
+                            report["attempts"].append(attempt)
+                            break
                         frozen_internal_witnesses = (
                             expanded_internal_witnesses
                         )

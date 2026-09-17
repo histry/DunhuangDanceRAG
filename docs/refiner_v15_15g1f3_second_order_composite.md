@@ -126,6 +126,7 @@ train 冻结合约锁定后原样用于 development、held-out 和整曲推断�
 - `insufficient_second_order_predicted_progress`
 - `second_order_finite_radius_model_mismatch`
 - `active_set_transition_model_mismatch`
+- `constraint_generation_budget_exhausted`
 - `nonfinite_or_unverified_curvature`
 - `second_order_solver_failure`
 

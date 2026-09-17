@@ -979,6 +979,26 @@ def _freeze_train_full_shadow_repair_contract(
     second_order_grid_levels=9,
     second_order_feasibility_tolerance=1.0e-12,
     second_order_guard_transition_band=1.0e-5,
+    second_order_max_constraint_generation_depth=-1,
+    second_order_initial_max_coarse_directions=(
+        second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ),
+    second_order_initial_refinement_starts=(
+        second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS
+    ),
+    second_order_initial_refinement_iterations=(
+        second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS
+    ),
+    second_order_adaptive_full_search=False,
+    second_order_full_max_coarse_directions=(
+        second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ),
+    second_order_full_refinement_starts=(
+        second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS
+    ),
+    second_order_full_refinement_iterations=(
+        second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS
+    ),
     progress_policy=None,
     metric_operator=None,
 ):
@@ -1207,7 +1227,39 @@ def _freeze_train_full_shadow_repair_contract(
             int(second_order_grid_levels) if second_order_joint_sqp else None
         ),
         "second_order_max_coarse_grid_directions": (
-            int(second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS)
+            int(second_order_full_max_coarse_directions)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_max_constraint_generation_depth": (
+            int(second_order_max_constraint_generation_depth)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_constraint_generation_budget_policy": (
+            "fail_closed_identity_abstention_without_consuming_correction_step"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_initial_max_coarse_grid_directions": (
+            int(second_order_initial_max_coarse_directions)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_initial_sqp_refinement_starts": (
+            int(second_order_initial_refinement_starts)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_initial_sqp_refinement_iterations": (
+            int(second_order_initial_refinement_iterations)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_adaptive_full_search": (
+            bool(second_order_adaptive_full_search)
+            if second_order_joint_sqp else None
+        ),
+        "second_order_adaptive_full_search_trigger": (
+            "initial_search_has_no_predicted_feasible_candidate"
+            if second_order_joint_sqp else None
+        ),
+        "second_order_full_max_coarse_grid_directions": (
+            int(second_order_full_max_coarse_directions)
             if second_order_joint_sqp else None
         ),
         "second_order_feasibility_tolerance": (
@@ -1237,7 +1289,8 @@ def _freeze_train_full_shadow_repair_contract(
         ),
         "second_order_active_set_constraint_generation_termination": (
             "strict_new_guard_row_or_internal_witness_from_finite_"
-            "transaction_case_frame_joint_window_universe"
+            "transaction_case_frame_joint_window_universe_or_fail_closed_"
+            "depth_budget"
             if second_order_joint_sqp else None
         ),
         "second_order_physical_guard_row_scope": (
@@ -1295,11 +1348,11 @@ def _freeze_train_full_shadow_repair_contract(
             if second_order_joint_sqp else None
         ),
         "second_order_sqp_refinement_starts": (
-            int(second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS)
+            int(second_order_full_refinement_starts)
             if second_order_joint_sqp else None
         ),
         "second_order_sqp_refinement_iterations": (
-            int(second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS)
+            int(second_order_full_refinement_iterations)
             if second_order_joint_sqp else None
         ),
         "second_order_sqp_smoothing": (
@@ -5336,6 +5389,41 @@ def _second_order_angular_iteration(
                         ),
                         permit_restoration_candidate=True,
                         restoration_required_reduction=current_signed_gap,
+                        initial_max_coarse_grid_directions=int(
+                            train_repair_contract[
+                                "second_order_initial_max_coarse_grid_directions"
+                            ]
+                        ),
+                        initial_refinement_starts=int(
+                            train_repair_contract[
+                                "second_order_initial_sqp_refinement_starts"
+                            ]
+                        ),
+                        initial_refinement_iterations=int(
+                            train_repair_contract[
+                                "second_order_initial_sqp_refinement_iterations"
+                            ]
+                        ),
+                        adaptive_full_search=bool(
+                            train_repair_contract[
+                                "second_order_adaptive_full_search"
+                            ]
+                        ),
+                        full_max_coarse_grid_directions=int(
+                            train_repair_contract[
+                                "second_order_full_max_coarse_grid_directions"
+                            ]
+                        ),
+                        full_refinement_starts=int(
+                            train_repair_contract[
+                                "second_order_sqp_refinement_starts"
+                            ]
+                        ),
+                        full_refinement_iterations=int(
+                            train_repair_contract[
+                                "second_order_sqp_refinement_iterations"
+                            ]
+                        ),
                     )
                 )
                 if direction is not None:
@@ -6066,10 +6154,41 @@ def _second_order_angular_iteration(
             discovered_witness_union,
         )
     )
-    if (
+    constraint_generation_requested = bool(
         not accepted
         and (newly_violated_guard_terms or newly_exposed_internal_witnesses)
         and not numeric_failure
+    )
+    maximum_constraint_generation_depth = int(
+        train_repair_contract.get(
+            "second_order_max_constraint_generation_depth", -1
+        )
+    )
+    constraint_generation_budget_exhausted = bool(
+        constraint_generation_requested
+        and maximum_constraint_generation_depth >= 0
+        and int(constraint_generation_depth)
+        >= maximum_constraint_generation_depth
+    )
+    if constraint_generation_budget_exhausted:
+        print(json.dumps({
+            "stage": "v15_15g1f3_constraint_generation_budget_exhausted",
+            "case_uid": case_uid,
+            "iteration": int(iteration),
+            "constraint_generation_depth": int(constraint_generation_depth),
+            "maximum_constraint_generation_depth": (
+                maximum_constraint_generation_depth
+            ),
+            "new_guard_term_count": len(newly_violated_guard_terms),
+            "new_internal_witness_count": sum(
+                len(rows)
+                for rows in newly_exposed_internal_witnesses.values()
+            ),
+            "fail_closed": True,
+        }), flush=True)
+    if (
+        constraint_generation_requested
+        and not constraint_generation_budget_exhausted
     ):
         expanded_active_names = tuple(dict.fromkeys((
             *frozen_active_names,
@@ -6234,6 +6353,8 @@ def _second_order_angular_iteration(
     )
     if accepted:
         rejection_reason = None
+    elif constraint_generation_budget_exhausted:
+        rejection_reason = "constraint_generation_budget_exhausted"
     elif any_authoritative_trial and any_active_transition:
         rejection_reason = "active_set_transition_model_mismatch"
     elif any_authoritative_trial:
@@ -6267,6 +6388,16 @@ def _second_order_angular_iteration(
         "joint_solver": representative_solver,
         "second_order_model_preparation": model_preparation_audit,
         "constraint_generation_depth": int(constraint_generation_depth),
+        "maximum_constraint_generation_depth": (
+            maximum_constraint_generation_depth
+        ),
+        "constraint_generation_budget_exhausted": bool(
+            constraint_generation_budget_exhausted
+        ),
+        "constraint_generation_fail_closed": bool(
+            constraint_generation_budget_exhausted
+        ),
+        "constraint_generation_consumed_correction_step": False,
         "effective_guard_basis_capacity": int(guard_basis_capacity),
         "angle_specific_second_order_solvers": solver_audits,
         "finite_gap_science_requirements": science_requirements,
@@ -6889,6 +7020,56 @@ def _correct_case_geodesic_joint_sqp(
             finite_gap_angular_feasibility
         ),
         "second_order_joint_sqp": bool(second_order_joint_sqp),
+        "second_order_max_constraint_generation_depth": (
+            int(train_repair_contract.get(
+                "second_order_max_constraint_generation_depth", -1
+            ))
+            if second_order_joint_sqp else None
+        ),
+        "constraint_generation_budget_exhausted": any(
+            bool(row.get("constraint_generation_budget_exhausted"))
+            for row in history
+        ),
+        "second_order_search_budget": (
+            {
+                "initial_max_coarse_grid_directions": int(
+                    train_repair_contract[
+                        "second_order_initial_max_coarse_grid_directions"
+                    ]
+                ),
+                "initial_refinement_starts": int(
+                    train_repair_contract[
+                        "second_order_initial_sqp_refinement_starts"
+                    ]
+                ),
+                "initial_refinement_iterations": int(
+                    train_repair_contract[
+                        "second_order_initial_sqp_refinement_iterations"
+                    ]
+                ),
+                "adaptive_full_search": bool(
+                    train_repair_contract[
+                        "second_order_adaptive_full_search"
+                    ]
+                ),
+                "full_max_coarse_grid_directions": int(
+                    train_repair_contract[
+                        "second_order_full_max_coarse_grid_directions"
+                    ]
+                ),
+                "full_refinement_starts": int(
+                    train_repair_contract[
+                        "second_order_sqp_refinement_starts"
+                    ]
+                ),
+                "full_refinement_iterations": int(
+                    train_repair_contract[
+                        "second_order_sqp_refinement_iterations"
+                    ]
+                ),
+            }
+            if second_order_joint_sqp else None
+        ),
         "progress_mode": progress_policy.mode,
         "metric_operator": metric_operator.audit(),
         "scope_null_space_projection": "exact_boolean_ownership_mask",
@@ -8977,6 +9158,38 @@ def run(args):
                                 raise RuntimeError(
                                     "g1f3 contract omits geodesic acceleration"
                                 )
+                            requested_compute_budget = {
+                                "second_order_max_constraint_generation_depth": int(
+                                    args.second_order_max_constraint_generation_depth
+                                ),
+                                "second_order_initial_max_coarse_grid_directions": int(
+                                    args.second_order_initial_max_coarse_directions
+                                ),
+                                "second_order_initial_sqp_refinement_starts": int(
+                                    args.second_order_initial_refinement_starts
+                                ),
+                                "second_order_initial_sqp_refinement_iterations": int(
+                                    args.second_order_initial_refinement_iterations
+                                ),
+                                "second_order_adaptive_full_search": bool(
+                                    args.second_order_adaptive_full_search
+                                ),
+                                "second_order_full_max_coarse_grid_directions": int(
+                                    args.second_order_full_max_coarse_directions
+                                ),
+                                "second_order_sqp_refinement_starts": int(
+                                    args.second_order_full_refinement_starts
+                                ),
+                                "second_order_sqp_refinement_iterations": int(
+                                    args.second_order_full_refinement_iterations
+                                ),
+                            }
+                            for key, expected in requested_compute_budget.items():
+                                if train_shadow_contract.get(key) != expected:
+                                    raise RuntimeError(
+                                        "frozen g1f3 compute-budget mismatch: "
+                                        f"{key}"
+                                    )
             else:
                 train_shadow_contract = (
                     _freeze_train_full_shadow_repair_contract(
@@ -9063,6 +9276,30 @@ def run(args):
                         ),
                         second_order_guard_transition_band=float(
                             args.second_order_guard_transition_band
+                        ),
+                        second_order_max_constraint_generation_depth=int(
+                            args.second_order_max_constraint_generation_depth
+                        ),
+                        second_order_initial_max_coarse_directions=int(
+                            args.second_order_initial_max_coarse_directions
+                        ),
+                        second_order_initial_refinement_starts=int(
+                            args.second_order_initial_refinement_starts
+                        ),
+                        second_order_initial_refinement_iterations=int(
+                            args.second_order_initial_refinement_iterations
+                        ),
+                        second_order_adaptive_full_search=bool(
+                            args.second_order_adaptive_full_search
+                        ),
+                        second_order_full_max_coarse_directions=int(
+                            args.second_order_full_max_coarse_directions
+                        ),
+                        second_order_full_refinement_starts=int(
+                            args.second_order_full_refinement_starts
+                        ),
+                        second_order_full_refinement_iterations=int(
+                            args.second_order_full_refinement_iterations
                         ),
                         progress_policy=progress_policy,
                         metric_operator=metric_operator,
@@ -11360,6 +11597,53 @@ def main():
     parser.add_argument(
         "--second-order-guard-transition-band", type=float, default=1.0e-5
     )
+    parser.add_argument(
+        "--second-order-max-constraint-generation-depth",
+        type=int,
+        default=-1,
+        help=(
+            "maximum same-expansion witness rebuild depth; -1 preserves "
+            "the finite-universe unbounded reference path"
+        ),
+    )
+    parser.add_argument(
+        "--second-order-initial-max-coarse-directions",
+        type=int,
+        default=second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
+    )
+    parser.add_argument(
+        "--second-order-initial-refinement-starts",
+        type=int,
+        default=second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    )
+    parser.add_argument(
+        "--second-order-initial-refinement-iterations",
+        type=int,
+        default=second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
+    )
+    parser.add_argument(
+        "--second-order-adaptive-full-search",
+        action="store_true",
+        help=(
+            "escalate deterministically to the full search budget only when "
+            "the initial tier has no predicted-feasible candidate"
+        ),
+    )
+    parser.add_argument(
+        "--second-order-full-max-coarse-directions",
+        type=int,
+        default=second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
+    )
+    parser.add_argument(
+        "--second-order-full-refinement-starts",
+        type=int,
+        default=second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    )
+    parser.add_argument(
+        "--second-order-full-refinement-iterations",
+        type=int,
+        default=second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
+    )
     parser.add_argument("--ik-iterations", type=int, default=6)
     parser.add_argument("--damping", type=float, default=1.0e-4)
     parser.add_argument("--jacobian-epsilon", type=float, default=1.0e-4)
@@ -11584,6 +11868,52 @@ def main():
         parser.error("second-order feasibility tolerance must be non-negative")
     if not 0.0 < args.second_order_guard_transition_band <= 1.0e-5:
         parser.error("second-order Guard transition band must be in (0, 1e-5]")
+    if args.second_order_max_constraint_generation_depth < -1:
+        parser.error(
+            "second-order constraint-generation depth must be -1 or non-negative"
+        )
+    minimum_signed_axes = 2 * int(args.second_order_basis_dimension)
+    if not (
+        minimum_signed_axes
+        <= args.second_order_initial_max_coarse_directions
+        <= args.second_order_full_max_coarse_directions
+        <= second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ):
+        parser.error(
+            "second-order coarse budgets must preserve signed axes and satisfy "
+            "initial <= full <= canonical maximum"
+        )
+    if not (
+        1 <= args.second_order_initial_refinement_starts
+        <= args.second_order_full_refinement_starts
+        <= second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS
+    ):
+        parser.error(
+            "second-order refinement starts must satisfy "
+            "1 <= initial <= full <= canonical maximum"
+        )
+    if not (
+        1 <= args.second_order_initial_refinement_iterations
+        <= args.second_order_full_refinement_iterations
+        <= second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS
+    ):
+        parser.error(
+            "second-order refinement iterations must satisfy "
+            "1 <= initial <= full <= canonical maximum"
+        )
+    reduced_search_budget = bool(
+        args.second_order_initial_max_coarse_directions
+        < args.second_order_full_max_coarse_directions
+        or args.second_order_initial_refinement_starts
+        < args.second_order_full_refinement_starts
+        or args.second_order_initial_refinement_iterations
+        < args.second_order_full_refinement_iterations
+    )
+    if reduced_search_budget and not args.second_order_adaptive_full_search:
+        parser.error(
+            "a reduced initial search budget requires deterministic adaptive "
+            "full-search escalation"
+        )
     if (
         args.activation_aware_g1f2
         and args.evaluation_role != "train_calibration"

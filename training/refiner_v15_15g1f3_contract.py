@@ -31,6 +31,7 @@ FAILURE_STATES = {
     "insufficient_second_order_predicted_progress",
     "second_order_finite_radius_model_mismatch",
     "active_set_transition_model_mismatch",
+    "constraint_generation_budget_exhausted",
     "nonfinite_or_unverified_curvature",
     "second_order_solver_failure",
 }
@@ -122,8 +123,17 @@ def _unchanged_contract(report):
     _require(report.get(
         "second_order_active_set_constraint_generation_termination"
     ) == "strict_new_guard_row_or_internal_witness_from_finite_"
-         "transaction_case_frame_joint_window_universe",
+         "transaction_case_frame_joint_window_universe_or_fail_closed_"
+         "depth_budget",
              "second-order active-set generation termination changed")
+    maximum_generation_depth = int(report.get(
+        "second_order_max_constraint_generation_depth", -2
+    ))
+    _require(maximum_generation_depth >= -1,
+             "second-order constraint-generation budget is invalid")
+    _require(report.get("second_order_constraint_generation_budget_policy") ==
+             "fail_closed_identity_abstention_without_consuming_correction_step",
+             "second-order constraint-generation fail-closed policy changed")
     _require(report.get("second_order_physical_guard_row_scope") ==
              "edited_case_exact_signed_margin_no_cross_case_softmax",
              "second-order physical Guard row scope changed")
@@ -169,15 +179,46 @@ def _unchanged_contract(report):
              "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
              "linearly_dependent_projection",
              "second-order Guard basis replenishment changed")
-    _require(int(report.get("second_order_max_coarse_grid_directions", 0)) ==
+    initial_coarse = int(report.get(
+        "second_order_initial_max_coarse_grid_directions", 0
+    ))
+    full_coarse = int(report.get(
+        "second_order_full_max_coarse_grid_directions", 0
+    ))
+    initial_starts = int(report.get(
+        "second_order_initial_sqp_refinement_starts", 0
+    ))
+    full_starts = int(report.get("second_order_sqp_refinement_starts", 0))
+    initial_iterations = int(report.get(
+        "second_order_initial_sqp_refinement_iterations", 0
+    ))
+    full_iterations = int(report.get(
+        "second_order_sqp_refinement_iterations", 0
+    ))
+    _require(10 <= initial_coarse <= full_coarse <=
              second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
-             "second-order coarse grid bound changed")
-    _require(report.get("second_order_sqp_refinement_starts") ==
+             "second-order coarse search budgets are invalid")
+    _require(int(report.get("second_order_max_coarse_grid_directions", 0)) ==
+             full_coarse,
+             "second-order legacy/full coarse bounds disagree")
+    _require(1 <= initial_starts <= full_starts <=
              second_order.SECOND_ORDER_SQP_REFINEMENT_STARTS,
-             "second-order SQP start count changed")
-    _require(report.get("second_order_sqp_refinement_iterations") ==
+             "second-order SQP start budgets are invalid")
+    _require(1 <= initial_iterations <= full_iterations <=
              second_order.SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
-             "second-order SQP iteration count changed")
+             "second-order SQP iteration budgets are invalid")
+    reduced_search = bool(
+        initial_coarse < full_coarse
+        or initial_starts < full_starts
+        or initial_iterations < full_iterations
+    )
+    _require(
+        not reduced_search or report.get("second_order_adaptive_full_search") is True,
+        "reduced second-order search lacks deterministic full escalation",
+    )
+    _require(report.get("second_order_adaptive_full_search_trigger") ==
+             "initial_search_has_no_predicted_feasible_candidate",
+             "second-order adaptive full-search trigger changed")
     _require(report.get("second_order_sqp_smoothing") == [
         float(value) for value in second_order.SECOND_ORDER_SQP_SMOOTHING
     ], "second-order SQP smoothing schedule changed")
@@ -469,6 +510,12 @@ def freeze_contract(args):
             "second_order_active_set_constraint_generation_termination": repair[
                 "second_order_active_set_constraint_generation_termination"
             ],
+            "second_order_max_constraint_generation_depth": int(
+                repair["second_order_max_constraint_generation_depth"]
+            ),
+            "second_order_constraint_generation_budget_policy": repair[
+                "second_order_constraint_generation_budget_policy"
+            ],
             "second_order_physical_guard_row_scope": repair[
                 "second_order_physical_guard_row_scope"
             ],
@@ -494,6 +541,26 @@ def freeze_contract(args):
                 "same_cuda_device_as_motion",
             "second_order_joint_subproblem_solver":
                 "deterministic_device_resident_riemannian_continuous_sqp",
+            "second_order_initial_max_coarse_grid_directions": int(
+                repair[
+                    "second_order_initial_max_coarse_grid_directions"
+                ]
+            ),
+            "second_order_initial_sqp_refinement_starts": int(
+                repair["second_order_initial_sqp_refinement_starts"]
+            ),
+            "second_order_initial_sqp_refinement_iterations": int(
+                repair["second_order_initial_sqp_refinement_iterations"]
+            ),
+            "second_order_adaptive_full_search": bool(
+                repair["second_order_adaptive_full_search"]
+            ),
+            "second_order_adaptive_full_search_trigger": repair[
+                "second_order_adaptive_full_search_trigger"
+            ],
+            "second_order_full_max_coarse_grid_directions": int(
+                repair["second_order_full_max_coarse_grid_directions"]
+            ),
             "second_order_sqp_refinement_starts": int(
                 repair["second_order_sqp_refinement_starts"]
             ),

@@ -28,6 +28,7 @@ SECOND_ORDER_STATES = (
     "insufficient_second_order_predicted_progress",
     "second_order_finite_radius_model_mismatch",
     "active_set_transition_model_mismatch",
+    "constraint_generation_budget_exhausted",
     "nonfinite_or_unverified_curvature",
     "second_order_solver_failure",
 )
@@ -1080,11 +1081,22 @@ def build_second_order_models(
     }
 
 
-def _deterministic_unit_grid(dimension: int, levels: int, *, device):
+def _deterministic_unit_grid(
+    dimension: int,
+    levels: int,
+    *,
+    device,
+    maximum_directions: int = SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
+):
     levels = int(levels)
     if dimension <= 0 or levels < 3 or levels % 2 == 0:
         raise ValueError("second-order grid requires dimension>0 and odd levels>=3")
-    key = (str(device), int(dimension), levels)
+    maximum = int(maximum_directions)
+    if maximum < 2 * int(dimension):
+        raise ValueError(
+            "second-order coarse-grid budget must preserve both signed axes"
+        )
+    key = (str(device), int(dimension), levels, maximum)
     cached = _UNIT_GRID_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1098,7 +1110,6 @@ def _deterministic_unit_grid(dimension: int, levels: int, *, device):
     rows = rows[norms > 1.0e-15]
     norms = m.torch.linalg.vector_norm(rows, dim=1, keepdim=True)
     rows = rows / norms
-    maximum = int(SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS)
     if int(rows.shape[0]) > maximum:
         axes = m.torch.cat([
             m.torch.eye(
@@ -1158,6 +1169,8 @@ def _continuous_joint_sqp_refinement(
     scales,
     coarse_directions,
     feasibility_tolerance,
+    refinement_starts=SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    refinement_iterations=SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
 ):
     """Refine the best coarse seeds on the coefficient unit sphere.
 
@@ -1173,9 +1186,14 @@ def _continuous_joint_sqp_refinement(
     ) / scales.unsqueeze(0)
     coarse_worst = coarse_residual.amax(dim=1)
     start_count = min(
-        int(SECOND_ORDER_SQP_REFINEMENT_STARTS),
+        int(refinement_starts),
         int(coarse_directions.shape[0]),
     )
+    if start_count <= 0:
+        raise ValueError("second-order refinement requires at least one start")
+    total_iterations = int(refinement_iterations)
+    if total_iterations <= 0:
+        raise ValueError("second-order refinement iterations must be positive")
     start_indices = m.torch.argsort(
         coarse_worst, stable=True
     )[:start_count]
@@ -1188,10 +1206,12 @@ def _continuous_joint_sqp_refinement(
     hessian = m.torch.stack([models[name]["hessian"] for name in names])
 
     iteration_count = 0
-    for smoothing in SECOND_ORDER_SQP_SMOOTHING:
-        stage_iterations = int(SECOND_ORDER_SQP_REFINEMENT_ITERATIONS) // len(
-            SECOND_ORDER_SQP_SMOOTHING
-        )
+    smoothing_count = len(SECOND_ORDER_SQP_SMOOTHING)
+    base_stage_iterations, remainder = divmod(
+        total_iterations, smoothing_count
+    )
+    for stage_index, smoothing in enumerate(SECOND_ORDER_SQP_SMOOTHING):
+        stage_iterations = base_stage_iterations + int(stage_index < remainder)
         for _ in range(stage_iterations):
             iteration_count += 1
             changes = _quadratic_changes(models, current, theta)
@@ -1262,6 +1282,7 @@ def _continuous_joint_sqp_refinement(
     return current, refined_changes, {
         "continuous_sqp_start_count": start_count,
         "continuous_sqp_iteration_count": iteration_count,
+        "continuous_sqp_requested_iteration_count": total_iterations,
         "continuous_sqp_smoothing": [
             float(value) for value in SECOND_ORDER_SQP_SMOOTHING
         ],
@@ -1283,6 +1304,19 @@ def solve_angle_subproblem(
     feasibility_tolerance: float,
     permit_restoration_candidate: bool = False,
     restoration_required_reduction: Mapping[str, float] | None = None,
+    initial_max_coarse_grid_directions: int = (
+        SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ),
+    initial_refinement_starts: int = SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    initial_refinement_iterations: int = (
+        SECOND_ORDER_SQP_REFINEMENT_ITERATIONS
+    ),
+    adaptive_full_search: bool = False,
+    full_max_coarse_grid_directions: int = (
+        SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ),
+    full_refinement_starts: int = SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    full_refinement_iterations: int = SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
 ):
     """Solve the frozen-angle joint quadratic model on the unit sphere."""
     names = tuple(models)
@@ -1291,7 +1325,10 @@ def solve_angle_subproblem(
     first_name = names[0]
     dimension = int(models[first_name]["first"].numel())
     coarse_directions = _deterministic_unit_grid(
-        dimension, int(grid_levels), device=models[first_name]["first"].device
+        dimension,
+        int(grid_levels),
+        device=models[first_name]["first"].device,
+        maximum_directions=int(initial_max_coarse_grid_directions),
     )
     theta = float(theta_radians)
     required = coarse_directions.new_tensor([
@@ -1323,6 +1360,8 @@ def solve_angle_subproblem(
                 scales=scales,
                 coarse_directions=coarse_directions,
                 feasibility_tolerance=float(feasibility_tolerance),
+                refinement_starts=int(initial_refinement_starts),
+                refinement_iterations=int(initial_refinement_iterations),
             )
         )
         refinement_audit["continuous_sqp_executed"] = True
@@ -1330,6 +1369,98 @@ def solve_angle_subproblem(
             [coarse_directions, refined_directions], dim=0
         )
         changes = m.torch.cat([coarse_changes, refined_changes], dim=0)
+    initial_search_audit = {
+        "maximum_coarse_grid_directions": int(
+            initial_max_coarse_grid_directions
+        ),
+        "coarse_candidate_count": int(coarse_directions.shape[0]),
+        "refinement_starts": int(initial_refinement_starts),
+        "refinement_iterations": int(initial_refinement_iterations),
+        "feasible_candidate_count": int((
+            changes
+            <= -required.unsqueeze(0) + float(feasibility_tolerance)
+        ).all(dim=1).sum().detach()),
+        **refinement_audit,
+    }
+    full_budget_differs = bool(
+        int(full_max_coarse_grid_directions)
+        != int(initial_max_coarse_grid_directions)
+        or int(full_refinement_starts) != int(initial_refinement_starts)
+        or int(full_refinement_iterations) != int(initial_refinement_iterations)
+    )
+    initial_feasible = (
+        changes
+        <= -required.unsqueeze(0) + float(feasibility_tolerance)
+    ).all(dim=1)
+    adaptive_full_search_executed = bool(
+        adaptive_full_search
+        and full_budget_differs
+        and not bool(initial_feasible.any())
+    )
+    if adaptive_full_search_executed:
+        coarse_directions = _deterministic_unit_grid(
+            dimension,
+            int(grid_levels),
+            device=models[first_name]["first"].device,
+            maximum_directions=int(full_max_coarse_grid_directions),
+        )
+        coarse_changes = _quadratic_changes(
+            models, coarse_directions, theta
+        )
+        coarse_feasible = (
+            coarse_changes
+            <= -required.unsqueeze(0) + float(feasibility_tolerance)
+        ).all(dim=1)
+        if bool(coarse_feasible.any()):
+            directions = coarse_directions
+            changes = coarse_changes
+            refinement_audit = {
+                "continuous_sqp_executed": False,
+                "continuous_sqp_skip_reason": (
+                    "full_coarse_joint_candidate_feasible"
+                ),
+                "continuous_sqp_start_count": 0,
+                "continuous_sqp_iteration_count": 0,
+            }
+        else:
+            refined_directions, refined_changes, refinement_audit = (
+                _continuous_joint_sqp_refinement(
+                    models=models,
+                    theta=theta,
+                    required=required,
+                    scales=scales,
+                    coarse_directions=coarse_directions,
+                    feasibility_tolerance=float(feasibility_tolerance),
+                    refinement_starts=int(full_refinement_starts),
+                    refinement_iterations=int(full_refinement_iterations),
+                )
+            )
+            refinement_audit["continuous_sqp_executed"] = True
+            directions = m.torch.cat(
+                [coarse_directions, refined_directions], dim=0
+            )
+            changes = m.torch.cat(
+                [coarse_changes, refined_changes], dim=0
+            )
+    search_budget_audit = {
+        "adaptive_full_search_enabled": bool(adaptive_full_search),
+        "adaptive_full_search_executed": adaptive_full_search_executed,
+        "adaptive_full_search_trigger": (
+            "initial_search_has_no_predicted_feasible_candidate"
+            if adaptive_full_search_executed else None
+        ),
+        "selected_search_tier": (
+            "full" if adaptive_full_search_executed else "initial"
+        ),
+        "initial_search": initial_search_audit,
+        "full_search_budget": {
+            "maximum_coarse_grid_directions": int(
+                full_max_coarse_grid_directions
+            ),
+            "refinement_starts": int(full_refinement_starts),
+            "refinement_iterations": int(full_refinement_iterations),
+        },
+    }
     feasible = (
         changes
         <= -required.unsqueeze(0) + float(feasibility_tolerance)
@@ -1369,6 +1500,7 @@ def solve_angle_subproblem(
                 for index, name in enumerate(names)
             },
             **refinement_audit,
+            **search_budget_audit,
         }
         if not bool(permit_restoration_candidate):
             return None, infeasible_audit
@@ -1396,6 +1528,16 @@ def solve_angle_subproblem(
                 scales=restoration_scales,
                 coarse_directions=directions,
                 feasibility_tolerance=float(feasibility_tolerance),
+                refinement_starts=(
+                    int(full_refinement_starts)
+                    if adaptive_full_search_executed
+                    else int(initial_refinement_starts)
+                ),
+                refinement_iterations=(
+                    int(full_refinement_iterations)
+                    if adaptive_full_search_executed
+                    else int(initial_refinement_iterations)
+                ),
             )
         )
         restoration_pool = m.torch.cat(
@@ -1436,6 +1578,7 @@ def solve_angle_subproblem(
                 restoration_residual[nearest_restoration].amax().detach()
             ),
             "restoration_refinement": restoration_audit,
+            **search_budget_audit,
         }
     indices = m.torch.nonzero(feasible, as_tuple=False).reshape(-1)
     feasible_rows = directions.index_select(0, indices)
@@ -1488,6 +1631,7 @@ def solve_angle_subproblem(
             for index, name in enumerate(names)
         },
         **refinement_audit,
+        **search_budget_audit,
     }
 
 
@@ -1573,6 +1717,17 @@ def solve_prepared_second_order_angle(
     feasibility_tolerance,
     permit_restoration_candidate=False,
     restoration_required_reduction=None,
+    initial_max_coarse_grid_directions=(
+        SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ),
+    initial_refinement_starts=SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    initial_refinement_iterations=SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
+    adaptive_full_search=False,
+    full_max_coarse_grid_directions=(
+        SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS
+    ),
+    full_refinement_starts=SECOND_ORDER_SQP_REFINEMENT_STARTS,
+    full_refinement_iterations=SECOND_ORDER_SQP_REFINEMENT_ITERATIONS,
 ):
     """Solve one angle using a prepared on-device curvature model."""
     coefficients, solver_audit = solve_angle_subproblem(
@@ -1583,6 +1738,17 @@ def solve_prepared_second_order_angle(
         feasibility_tolerance=float(feasibility_tolerance),
         permit_restoration_candidate=bool(permit_restoration_candidate),
         restoration_required_reduction=restoration_required_reduction,
+        initial_max_coarse_grid_directions=int(
+            initial_max_coarse_grid_directions
+        ),
+        initial_refinement_starts=int(initial_refinement_starts),
+        initial_refinement_iterations=int(initial_refinement_iterations),
+        adaptive_full_search=bool(adaptive_full_search),
+        full_max_coarse_grid_directions=int(
+            full_max_coarse_grid_directions
+        ),
+        full_refinement_starts=int(full_refinement_starts),
+        full_refinement_iterations=int(full_refinement_iterations),
     )
     audit = {
         **solver_audit,

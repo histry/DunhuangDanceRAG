@@ -111,9 +111,24 @@ def run(args):
              "scan_remaining_margin_ordered_witness_rows_after_zero_or_"
              "linearly_dependent_projection",
              "frozen Guard basis replenishment changed")
-    _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
+    initial_coarse = int(fixed.get(
+        "second_order_initial_max_coarse_grid_directions", 0
+    ))
+    full_coarse = int(fixed.get(
+        "second_order_full_max_coarse_grid_directions", 0
+    ))
+    _require(10 <= initial_coarse <= full_coarse <=
              second_order.SECOND_ORDER_MAX_COARSE_GRID_DIRECTIONS,
-             "frozen coarse grid bound changed")
+             "frozen coarse search budgets are invalid")
+    _require(int(fixed.get("second_order_max_coarse_grid_directions", 0)) ==
+             full_coarse,
+             "frozen legacy/full coarse bounds disagree")
+    _require(int(fixed.get(
+        "second_order_max_constraint_generation_depth", -2
+    )) >= -1, "frozen constraint-generation budget is invalid")
+    _require(fixed.get("second_order_constraint_generation_budget_policy") ==
+             "fail_closed_identity_abstention_without_consuming_correction_step",
+             "frozen constraint-generation fail-closed policy changed")
 
     base_payload = m.torch.load(
         args.base_refiner_checkpoint, map_location="cpu", weights_only=False
@@ -216,6 +231,12 @@ def run(args):
             "second_order_active_set_constraint_generation_termination": fixed[
                 "second_order_active_set_constraint_generation_termination"
             ],
+            "second_order_max_constraint_generation_depth": int(
+                fixed["second_order_max_constraint_generation_depth"]
+            ),
+            "second_order_constraint_generation_budget_policy": fixed[
+                "second_order_constraint_generation_budget_policy"
+            ],
             "second_order_physical_guard_row_scope": fixed[
                 "second_order_physical_guard_row_scope"
             ],
@@ -245,6 +266,26 @@ def run(args):
             "second_order_joint_subproblem_solver": fixed[
                 "second_order_joint_subproblem_solver"
             ],
+            "second_order_initial_max_coarse_grid_directions": int(
+                fixed[
+                    "second_order_initial_max_coarse_grid_directions"
+                ]
+            ),
+            "second_order_initial_sqp_refinement_starts": int(
+                fixed["second_order_initial_sqp_refinement_starts"]
+            ),
+            "second_order_initial_sqp_refinement_iterations": int(
+                fixed["second_order_initial_sqp_refinement_iterations"]
+            ),
+            "second_order_adaptive_full_search": bool(
+                fixed["second_order_adaptive_full_search"]
+            ),
+            "second_order_adaptive_full_search_trigger": fixed[
+                "second_order_adaptive_full_search_trigger"
+            ],
+            "second_order_full_max_coarse_grid_directions": int(
+                fixed["second_order_full_max_coarse_grid_directions"]
+            ),
             "second_order_sqp_refinement_starts": int(
                 fixed["second_order_sqp_refinement_starts"]
             ),
