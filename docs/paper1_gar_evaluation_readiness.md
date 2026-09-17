@@ -4,9 +4,11 @@
 
 This change adds a passive primitive-data interface for a future Geometry-Aware
 Routing (GAR) evaluation. It does not run or implement the Paper 1 comparison.
-The current retrieval order, candidate simulation, boundary decision, transition
-builder, neural generation, post-generation audit, and reselection behavior remain
-authoritative and unchanged.
+With `REPAIRABILITY_MODE=off` (the default), the current retrieval order,
+candidate simulation, boundary decision, transition builder, neural generation,
+post-generation audit, and reselection behavior remain authoritative and
+unchanged.  Explicit `shadow` and `rank` experiments are documented separately in
+`docs/REPAIRABILITY_PREDICTOR.md`.
 
 The trace schema is `gar_selection_trace_v1`. It is implemented in
 `evaluation/gar_evaluation_readiness.py` and is emitted only after all production
@@ -210,11 +212,12 @@ Paper 1 experiments implemented = false
 Oracle implemented = false
 Statistical tests implemented = false
 Long-horizon benchmark implemented = false
-Production selection behavior changed = false
+Production selection behavior changed = false, except explicit rank mode
 ```
 
-The contract does not implement Top-1/Greedy/GAR comparisons, exhaustive
-generation, a new candidate selector, a new repair operator, a Delta-Interpolator,
-Paper 1 aggregate metrics, tables, figures, significance tests, or a pilot. Passing
-the readiness tests proves only that future experiments can record auditable
-primitive data; it does not show that GAR is effective.
+The readiness contract itself still does not prove GAR or Repairability effective.
+The companion Outcome Bank, matched linear/MLP trainer and paired evaluator now
+implement the experiment interfaces, but all remain opt-in.  In explicit `rank`
+mode the trace derives `production_selection_behavior_changed=true` from the
+runtime capability; it may never be serialized as an unchanged production path.
+No new repair operator or Delta-Interpolator is introduced.

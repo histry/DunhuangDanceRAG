@@ -609,11 +609,19 @@ class GARSelectionTrace:
             "oracle_implemented",
             "statistical_tests_implemented",
             "long_horizon_benchmark_implemented",
-            "production_selection_behavior_changed",
         )
         for key in required_false:
             if bool(self.experiment_status.get(key, True)):
                 raise TraceContractError(f"readiness-only contract requires {key}=false")
+        expected_selection_change = bool(
+            self.capabilities.get("repairability_rank_enabled", False)
+        )
+        if bool(
+            self.experiment_status.get("production_selection_behavior_changed", False)
+        ) != expected_selection_change:
+            raise TraceContractError(
+                "production selection change status must match repairability rank capability"
+            )
         pool_by_slot = {pool.slot_index: pool for pool in self.candidate_pools}
         if tuple(sorted(pool_by_slot)) != tuple(range(self.sequence.sequence_event_count)):
             raise TraceContractError("candidate pools must cover every sequence slot")
@@ -1143,7 +1151,9 @@ def build_closed_loop_trace(
             "oracle_implemented": False,
             "statistical_tests_implemented": False,
             "long_horizon_benchmark_implemented": False,
-            "production_selection_behavior_changed": False,
+            "production_selection_behavior_changed": bool(
+                capabilities.get("repairability_rank_enabled", False)
+            ),
         },
         planned_evaluation_horizons=PLANNED_EVALUATION_HORIZONS,
         sequence=sequence,

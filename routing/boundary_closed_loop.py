@@ -100,6 +100,9 @@ from evaluation.gar_evaluation_readiness import (
     checkpoint_bundle_fingerprint,
     current_git_commit,
     write_trace as write_gar_trace,
+    make_boundary_id,
+    make_evaluation_case_id,
+    make_sequence_id,
 )
 
 
@@ -163,6 +166,81 @@ def save_json(obj: Any, path: str | Path) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(jsonable(obj), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _seed_everything(motion_runtime: Any, seed: int) -> None:
+    """Reset all generator RNGs so candidate comparisons use common randomness."""
+
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    if hasattr(motion_runtime, "torch") and motion_runtime.torch is not None:
+        motion_runtime.torch.manual_seed(int(seed))
+        if motion_runtime.torch.cuda.is_available():
+            motion_runtime.torch.cuda.manual_seed_all(int(seed))
+
+
+def _comma_separated_ints(value: str) -> List[int]:
+    result: List[int] = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parsed = int(item)
+        if parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def repairability_runtime_settings(args: argparse.Namespace) -> Dict[str, Any]:
+    mode = str(
+        getattr(args, "repairability_mode", None)
+        or os.environ.get("REPAIRABILITY_MODE", "off")
+    ).strip().lower()
+    if mode not in {"off", "shadow", "rank"}:
+        raise ValueError("REPAIRABILITY_MODE must be off, shadow, or rank")
+    checkpoint = str(
+        getattr(args, "repairability_checkpoint", None)
+        or os.environ.get("REPAIRABILITY_CHECKPOINT", "")
+    ).strip()
+    if mode != "off" and not checkpoint:
+        raise ValueError("repairability shadow/rank mode requires a checkpoint")
+    return {
+        "mode": mode,
+        "checkpoint": checkpoint or None,
+        "device": str(os.environ.get("REPAIRABILITY_DEVICE", "cpu")).strip(),
+    }
+
+
+def load_repairability_ranker(settings: Mapping[str, Any]) -> Optional[Any]:
+    if settings.get("mode") == "off":
+        return None
+    from model.repairability_predictor import RepairabilityRanker
+
+    ranker = RepairabilityRanker.load(
+        str(settings["checkpoint"]), device=str(settings.get("device", "cpu"))
+    )
+    if settings.get("mode") == "rank" and not bool(
+        ranker.checkpoint_metadata.get("rank_authorized", False)
+    ):
+        raise RuntimeError(
+            "repairability checkpoint is shadow-only because its promotion gate did not pass"
+        )
+    return ranker
+
+
+def candidate_router_probability_maps(
+    retrieval_report: Sequence[Mapping[str, Any]],
+) -> List[Dict[int, float]]:
+    result: List[Dict[int, float]] = []
+    for row in retrieval_report:
+        indices = list(row.get("candidate_event_indices", ()))
+        probabilities = list(row.get("candidate_router_probabilities", ()))
+        if len(indices) != len(probabilities):
+            raise RuntimeError("candidate Router probability alignment mismatch")
+        result.append(
+            {int(index): float(probability) for index, probability in zip(indices, probabilities)}
+        )
+    return result
 
 
 def import_motion_runtime():
@@ -503,6 +581,8 @@ def build_candidate_proposal(
             }
     has_prev = prev_motion is not None and len(prev_motion) > 0
     core_len, trans_len, length_info = choose_transition_lengths(motion_runtime, prev_motion, raw.shape[0], target_len, raw, slot, cfg)
+    length_info = dict(length_info)
+    length_info.setdefault("source_frames", int(raw.shape[0]))
     core = resample_motion(motion_runtime, raw, core_len)
     core = enforce_contract(motion_runtime, core, cfg, source_hint=f"boundary_closed_loop_core_resample:{event_id}")
     if trace is not None:
@@ -590,6 +670,9 @@ def assemble_closed_loop_reference(
     cfg: Any,
     banned: Optional[Dict[int, set]] = None,
     diagnostic_dir: Optional[Path] = None,
+    candidate_router_probabilities: Optional[Sequence[Mapping[int, float]]] = None,
+    repairability_ranker: Optional[Any] = None,
+    repairability_mode: str = "off",
 ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[List[int]]]:
     paths = np.asarray(db["paths"], dtype=object)
     banned = banned or {}
@@ -597,16 +680,32 @@ def assemble_closed_loop_reference(
     report: List[Dict[str, Any]] = []
     selected: List[List[int]] = []
     cursor = 0
+    if repairability_mode not in {"off", "shadow", "rank"}:
+        raise ValueError("repairability_mode must be off, shadow, or rank")
+    if repairability_mode != "off" and repairability_ranker is None:
+        raise ValueError("repairability mode requires a loaded ranker")
     for slot_idx, slot in enumerate(slots):
         target_len = slot_target_frames(slot, cfg)
         prev = np.concatenate(pieces, axis=0).astype(np.float32) if pieces else None
+        original_rank_by_event = {
+            int(event_id): int(rank)
+            for rank, event_id in enumerate(candidate_lists[slot_idx])
+        }
         candidates = [int(x) for x in candidate_lists[slot_idx] if int(x) not in banned.get(slot_idx, set())]
         if not candidates:
             candidates = [int(candidate_lists[slot_idx][0])]
         proposals: List[CandidateProposal] = []
         best: Optional[CandidateProposal] = None
         selected_prop: Optional[CandidateProposal] = None
-        for rank, event_id in enumerate(candidates):
+        evaluate_complete_pool = (
+            slot_idx >= 1 and repairability_mode in {"shadow", "rank"}
+        )
+        for evaluation_rank, event_id in enumerate(candidates):
+            original_rank = (
+                original_rank_by_event.get(event_id, evaluation_rank)
+                if repairability_mode != "off"
+                else evaluation_rank
+            )
             p = build_candidate_proposal(
                 motion_runtime=motion_runtime,
                 prev_motion=prev,
@@ -614,7 +713,7 @@ def assemble_closed_loop_reference(
                 event_path=str(paths[event_id]),
                 slot=slot,
                 slot_idx=slot_idx,
-                candidate_rank=rank,
+                candidate_rank=original_rank,
                 target_len=target_len,
                 cfg=cfg,
             )
@@ -622,14 +721,88 @@ def assemble_closed_loop_reference(
             if best is None or p.risk_score < best.risk_score:
                 best = p
             if p.safe:
-                selected_prop = p
-                selected_prop.decision = "accepted_first_safe" if rank == 0 else "reselected_safe"
-                break
+                if selected_prop is None:
+                    selected_prop = p
+                if not evaluate_complete_pool:
+                    break
+        repairability_by_event: Dict[int, Dict[str, Any]] = {}
+        repairability_abstained = False
+        if repairability_ranker is not None and slot_idx >= 1:
+            from model.repairability_predictor import proposal_feature_mapping
+
+            probability_map = (
+                dict(candidate_router_probabilities[slot_idx])
+                if candidate_router_probabilities is not None
+                and slot_idx < len(candidate_router_probabilities)
+                else {}
+            )
+            eligible_predictions = []
+            eligible_proposals = []
+            for proposal in proposals:
+                features = proposal_feature_mapping(
+                    router_probability=float(probability_map.get(proposal.event_id, 0.0)),
+                    original_rank=int(proposal.rank),
+                    pool_size=len(candidate_lists[slot_idx]),
+                    target_frames=target_len,
+                    transition_frames=len(proposal.bridge),
+                    core_frames=len(proposal.core),
+                    core_warp=float(
+                        len(proposal.core)
+                        / max(
+                            1,
+                            int(
+                                proposal.length_info.get(
+                                    "raw_core_frames",
+                                    proposal.length_info.get(
+                                        "source_frames", len(proposal.core)
+                                    ),
+                                )
+                            ),
+                        )
+                    ),
+                    pre_safe=proposal.safe,
+                    pre_risk_score=proposal.risk_score,
+                    risk=proposal.risk,
+                )
+                prediction = repairability_ranker.predict(features)
+                repairability_by_event[proposal.event_id] = {
+                    "features": features,
+                    "prediction": prediction.as_dict(),
+                }
+                if proposal.safe:
+                    eligible_proposals.append(proposal)
+                    eligible_predictions.append(prediction)
+            repairability_abstained = repairability_ranker.should_abstain(
+                eligible_predictions
+            )
+            if (
+                repairability_mode == "rank"
+                and eligible_proposals
+                and not repairability_abstained
+            ):
+                selected_prop = max(
+                    eligible_proposals,
+                    key=lambda proposal: repairability_by_event[proposal.event_id][
+                        "prediction"
+                    ]["utility"],
+                )
         if selected_prop is None:
             selected_prop = best
             if selected_prop is None:
                 raise RuntimeError(f"No proposal for slot {slot_idx}")
             selected_prop.decision = "accepted_best_unsafe_fallback"
+        elif (
+            repairability_mode == "rank"
+            and selected_prop.event_id in repairability_by_event
+            and not repairability_abstained
+        ):
+            selected_prop.decision = "accepted_repairability_ranked_pre_safe"
+        else:
+            selected_prop.decision = (
+                "accepted_first_safe"
+                if selected_prop.rank == 0
+                else "reselected_safe"
+            )
         piece = selected_prop.motion_piece.astype(np.float32)
         transition_span = None
         if selected_prop.transition_span_local is not None:
@@ -649,11 +822,23 @@ def assemble_closed_loop_reference(
             "core_span": core_span,
             "transition_in_frames": int(selected_prop.bridge.shape[0]),
             "core_frames": int(selected_prop.core.shape[0]),
-            "core_warp": float(selected_prop.core.shape[0] / max(1, load_event_motion(motion_runtime, selected_prop.event_path, cfg, "boundary_closed_loop_warp_probe").shape[0])),
+            "core_warp": float(
+                selected_prop.core.shape[0]
+                / max(1, int(selected_prop.length_info.get("source_frames", selected_prop.core.shape[0])))
+            ),
             "risk_predicted": selected_prop.risk,
             "risk_score_predicted": float(selected_prop.risk_score),
             "safe_predicted": bool(selected_prop.safe),
             "decision": selected_prop.decision,
+            "repairability": {
+                "mode": repairability_mode,
+                "abstained": bool(repairability_abstained),
+                "selected_prediction": repairability_by_event.get(
+                    selected_prop.event_id
+                ),
+                "guard_is_authoritative": True,
+                "pre_safe_gate_is_authoritative": True,
+            },
             "conditioning_contract": str(
                 slot.get(
                     "closed_loop_conditioning_contract",
@@ -671,6 +856,7 @@ def assemble_closed_loop_reference(
                     "risk": pp.risk,
                     "transition_frames": int(pp.bridge.shape[0]),
                     "decision": pp.decision,
+                    "repairability": repairability_by_event.get(pp.event_id),
                 }
                 for pp in proposals
             ],
@@ -1553,6 +1739,7 @@ def gar_evaluation_trace_context(
                 "GRAPH_ROUTE_",
                 "EVENT_HEADING_",
                 "ROUTING_BUDGET_",
+                "REPAIRABILITY_",
             )
         )
     }
@@ -1631,7 +1818,27 @@ def gar_evaluation_trace_context(
         and "event_geometry_grounding" in row.get("risk_predicted", {})
         for row in assembly_report
     )
-    if geometry_grounding_present and env_bool(
+    repairability_modes = {
+        str(
+            row.get("repairability", {}).get("mode", "off")
+            if isinstance(row.get("repairability", {}), Mapping)
+            else "off"
+        )
+        for row in assembly_report
+    }
+    if "rank" in repairability_modes:
+        selection_policy_id = (
+            "fisher_rao_graph_sb_preorder_repairability_ranked_"
+            "pre_safe_boundary_reselection_v1"
+        )
+        inferred_method_variant_id = "repairability_ranked_boundary_routing"
+    elif "shadow" in repairability_modes:
+        selection_policy_id = (
+            "fisher_rao_graph_sb_preorder_repairability_shadow_"
+            "boundary_reselection_v1"
+        )
+        inferred_method_variant_id = "repairability_shadow_boundary_routing"
+    elif geometry_grounding_present and env_bool(
         "GROUNDING_GLOBAL_ROUTE_ENABLE", True
     ):
         selection_policy_id = (
@@ -1690,6 +1897,9 @@ def gar_evaluation_trace_context(
             ),
             "post_audit_enabled": True,
             "reselection_enabled": env_bool("BOUNDARY_RESELECT_ENABLE", True),
+            "repairability_shadow_enabled": "shadow" in repairability_modes,
+            "repairability_rank_enabled": "rank" in repairability_modes,
+            "guard_remains_authoritative": True,
         },
     }
 
@@ -1704,6 +1914,303 @@ def _gar_add_runtime(
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     previous = runtime.get(key)
     runtime[key] = float(elapsed_ms + (0.0 if previous is None else previous))
+
+
+def collect_repairability_outcome_bank(
+    *,
+    motion_runtime: Any,
+    args: argparse.Namespace,
+    cfg: Any,
+    db: Mapping[str, Any],
+    slots: Sequence[Mapping[str, Any]],
+    slot_feat: np.ndarray,
+    candidate_lists: Sequence[Sequence[int]],
+    router_probabilities: Sequence[Mapping[int, float]],
+    baseline_assembly: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Generate exhaustive local counterfactuals without changing production selection.
+
+    Every trial freezes the final baseline event path except for one candidate at
+    one boundary, resets a common random seed, runs the complete downstream
+    generator and records the authoritative post-audit result.  The append-only
+    writer makes a preempted 4090 run resumable.
+    """
+
+    enabled = bool(getattr(args, "outcome_bank", None)) or env_bool(
+        "GAR_OUTCOME_BANK_ENABLE", False
+    )
+    if not enabled:
+        return None
+    runtime_mode = str(
+        getattr(args, "repairability_mode", None)
+        or os.environ.get("REPAIRABILITY_MODE", "off")
+    ).strip().lower()
+    if runtime_mode != "off":
+        raise RuntimeError(
+            "Outcome Bank capture requires REPAIRABILITY_MODE=off to avoid circular labels"
+        )
+    if env_bool("BOUNDARY_STAGE_DIAGNOSTICS", False):
+        raise RuntimeError(
+            "Outcome Bank capture cannot be combined with stage snapshot diagnostics"
+        )
+    bank_path = str(
+        getattr(args, "outcome_bank", None)
+        or os.environ.get("GAR_OUTCOME_BANK_PATH", "")
+    ).strip()
+    if not bank_path:
+        raise ValueError("Outcome Bank capture requires an output JSONL path")
+    seed_text = str(
+        getattr(args, "outcome_seeds", None)
+        or os.environ.get("GAR_OUTCOME_BANK_SEEDS", "")
+    )
+    seeds = _comma_separated_ints(seed_text)
+    if len(seeds) < 2:
+        raise ValueError(
+            "Outcome Bank probability supervision requires at least two common seeds"
+        )
+    full_pool_size = max((len(pool) for pool in candidate_lists[1:]), default=1)
+    configured_top_k = max(
+        1,
+        int(
+            getattr(args, "outcome_topk", None)
+            or env_int("GAR_OUTCOME_BANK_TOPK", full_pool_size)
+        ),
+    )
+    if configured_top_k < full_pool_size:
+        raise ValueError(
+            "GAR_OUTCOME_BANK_TOPK cannot truncate the production candidate pool; "
+            "reduce BOUNDARY_RESELECT_TOPK for the entire frozen protocol instead"
+        )
+    top_k = full_pool_size
+    requested_trials = sum(
+        min(top_k, len(candidate_lists[slot])) * len(seeds)
+        for slot in range(1, len(candidate_lists))
+    )
+    max_trials = max(1, env_int("GAR_OUTCOME_BANK_MAX_TRIALS", 4096))
+    if requested_trials > max_trials:
+        raise RuntimeError(
+            f"Outcome Bank requests {requested_trials} trials, above "
+            f"GAR_OUTCOME_BANK_MAX_TRIALS={max_trials}"
+        )
+
+    from evaluation.repairability_outcome_bank import (
+        OUTCOME_BANK_RECORD_SCHEMA,
+        OutcomeBankWriter,
+        OutcomeRecord,
+        canonical_fingerprint as bank_fingerprint,
+        reason_families,
+        read_outcome_bank,
+        summarize_outcome_bank,
+    )
+    from model.repairability_predictor import proposal_feature_mapping
+
+    event_uids = [str(value) for value in db["event_uids"]]
+    sequence_id = make_sequence_id(args.audio, slots)
+    baseline_events = [int(row["event_id"]) for row in baseline_assembly]
+    if len(baseline_events) != len(slots):
+        raise RuntimeError("Outcome Bank baseline path/slot count mismatch")
+    context = gar_evaluation_trace_context(
+        motion_runtime, args, cfg, db, baseline_assembly
+    )
+    generator_fingerprint = bank_fingerprint(
+        {
+            "id": context["generator_id"],
+            "version": context["generator_version"],
+            "checkpoint": context["generator_checkpoint_fingerprint"],
+            "config": context["generator_config_fingerprint"],
+        }
+    )
+    repair_fingerprint = bank_fingerprint(
+        {
+            "id": context["repair_operator_id"],
+            "version": context["repair_operator_version"],
+            "config": context["repair_config_fingerprint"],
+        }
+    )
+    writer = OutcomeBankWriter(bank_path)
+    bank_args = argparse.Namespace(**vars(args))
+    bank_args.out = None
+    bank_args.render_output = None
+    completed_now = 0
+    skipped_existing = 0
+    started = time.perf_counter()
+    for slot_index in range(1, len(slots)):
+        pool = [int(value) for value in candidate_lists[slot_index][:top_k]]
+        probability_map = dict(router_probabilities[slot_index])
+        pool_fingerprint = bank_fingerprint(
+            [
+                {
+                    "candidate_id": event_uids[event_id],
+                    "rank": rank,
+                    "router_probability": float(probability_map.get(event_id, 0.0)),
+                }
+                for rank, event_id in enumerate(pool)
+            ]
+        )
+        boundary_id = make_boundary_id(sequence_id, slot_index)
+        case_id = make_evaluation_case_id(sequence_id, slot_index)
+        for original_rank, event_id in enumerate(pool):
+            candidate_id = event_uids[event_id]
+            for trial_seed in seeds:
+                key = (case_id, candidate_id, int(trial_seed))
+                existing_record = writer.get(key)
+                if existing_record is not None:
+                    if (
+                        existing_record.candidate_pool_fingerprint
+                        != pool_fingerprint
+                        or existing_record.original_rank != original_rank
+                        or existing_record.candidate_pool_size != len(pool)
+                    ):
+                        raise RuntimeError(
+                            "existing Outcome Bank trial uses a different candidate pool"
+                        )
+                    skipped_existing += 1
+                    continue
+                _seed_everything(motion_runtime, trial_seed)
+                forced_lists = [[event_id_] for event_id_ in baseline_events]
+                forced_lists[slot_index] = [event_id]
+                trial_started = time.perf_counter()
+                motion_ref, assembly, _ = assemble_closed_loop_reference(
+                    motion_runtime,
+                    slots,
+                    forced_lists,
+                    dict(db),
+                    cfg,
+                    candidate_router_probabilities=router_probabilities,
+                    repairability_mode="off",
+                )
+                selected_row = assembly[slot_index]
+                risk = dict(selected_row.get("risk_predicted", {}))
+                source_frames = max(
+                    1,
+                    int(
+                        selected_row.get("length_policy", {}).get(
+                            "source_frames", selected_row.get("core_frames", 1)
+                        )
+                    ),
+                )
+                features = proposal_feature_mapping(
+                    router_probability=float(probability_map.get(event_id, 0.0)),
+                    original_rank=original_rank,
+                    pool_size=len(pool),
+                    target_frames=int(selected_row["target_frames"]),
+                    transition_frames=int(selected_row["transition_in_frames"]),
+                    core_frames=int(selected_row["core_frames"]),
+                    core_warp=float(selected_row["core_frames"]) / source_frames,
+                    pre_safe=bool(selected_row["safe_predicted"]),
+                    pre_risk_score=float(selected_row["risk_score_predicted"]),
+                    risk=risk,
+                )
+                condition = compute_condition(
+                    motion_runtime,
+                    slot_feat,
+                    assembly,
+                    motion_ref.shape[0],
+                    dict(db),
+                )
+                transition_spans = transition_spans_from_report(assembly)
+                seam_mask, _, _ = make_seam_mask(
+                    motion_runtime, motion_ref.shape[0], transition_spans, cfg
+                )
+                slide_eligible, _ = sliding_support_eligibility(
+                    dict(db), assembly, motion_ref.shape[0]
+                )
+                motion, trial_stage_reports = apply_generators(
+                    motion_runtime,
+                    motion_ref,
+                    condition,
+                    seam_mask,
+                    bank_args,
+                    cfg,
+                    sliding_support_eligible=slide_eligible,
+                )
+                audits = audit_boundaries(motion_runtime, motion, assembly, cfg)
+                matching = [
+                    row for row in audits if int(row.get("slot", -1)) == slot_index
+                ]
+                if len(matching) != 1:
+                    raise RuntimeError(
+                        "Outcome Bank trial did not produce exactly one target audit"
+                    )
+                audit = matching[0]
+                boundary_reasons = tuple(
+                    str(value) for value in audit.get("failure_reasons", ())
+                )
+                physical_gate = dict(
+                    trial_stage_reports.get("final_physical_gate", {})
+                )
+                if physical_gate.get("schema") != "final_generation_physical_gate_v1":
+                    raise RuntimeError(
+                        "Outcome Bank trial is missing the authoritative physical gate"
+                    )
+                physical_reasons = tuple(
+                    f"physical:{value}"
+                    for value in physical_gate.get("reasons", ())
+                )
+                reasons = tuple(dict.fromkeys(boundary_reasons + physical_reasons))
+                recording_value = (
+                    None
+                    if "recording_uids" not in db
+                    else np.asarray(db["recording_uids"], dtype=object)[event_id]
+                )
+                performer_value = (
+                    None
+                    if "dancer_ids" not in db
+                    else np.asarray(db["dancer_ids"], dtype=object)[event_id]
+                )
+                record = OutcomeRecord(
+                    schema=OUTCOME_BANK_RECORD_SCHEMA,
+                    sequence_id=sequence_id,
+                    boundary_id=boundary_id,
+                    evaluation_case_id=case_id,
+                    group_id=sequence_id,
+                    slot_index=slot_index,
+                    candidate_id=candidate_id,
+                    candidate_event_index=event_id,
+                    source_recording_id=(
+                        None if recording_value in (None, "") else str(recording_value)
+                    ),
+                    source_performer_id=(
+                        None if performer_value in (None, "") else str(performer_value)
+                    ),
+                    original_rank=original_rank,
+                    candidate_pool_size=len(pool),
+                    random_seed=int(trial_seed),
+                    features=features,
+                    pre_safe=bool(selected_row["safe_predicted"]),
+                    pre_risk=float(selected_row["risk_score_predicted"]),
+                    boundary_safe=bool(audit.get("safe", False)),
+                    physical_safe=bool(physical_gate.get("ok", False)),
+                    post_safe=bool(audit.get("safe", False))
+                    and bool(physical_gate.get("ok", False)),
+                    post_risk=float(audit.get("actual_risk_score", 0.0)),
+                    failure_reasons=reasons,
+                    violation_families=reason_families(reasons),
+                    runtime_ms=(time.perf_counter() - trial_started) * 1000.0,
+                    runtime_commit=str(context["runtime_commit"]),
+                    config_fingerprint=str(context["config_fingerprint"]),
+                    candidate_pool_fingerprint=pool_fingerprint,
+                    generator_fingerprint=generator_fingerprint,
+                    repair_fingerprint=repair_fingerprint,
+                )
+                writer.append(record)
+                completed_now += 1
+    _seed_everything(motion_runtime, int(getattr(cfg, "seed", 42)))
+    all_records = read_outcome_bank(bank_path)
+    summary = summarize_outcome_bank(all_records, required_seeds=seeds)
+    summary.update(
+        {
+            "path": bank_path,
+            "requested_trials_this_sequence": requested_trials,
+            "completed_now": completed_now,
+            "skipped_existing": skipped_existing,
+            "capture_runtime_ms": (time.perf_counter() - started) * 1000.0,
+            "common_random_seeds": seeds,
+            "top_k": top_k,
+            "production_selection_changed": False,
+        }
+    )
+    return summary
 
 
 def generate_closed_loop(args: argparse.Namespace) -> int:
@@ -1730,16 +2237,13 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
     gar_round_records: List[Dict[str, Any]] = []
 
     seed = int(getattr(cfg, "seed", 1234))
-    random.seed(seed)
-    np.random.seed(seed)
-    if hasattr(motion_runtime, "torch") and motion_runtime.torch is not None:
-        try:
-            motion_runtime.torch.manual_seed(seed)
-        except Exception:
-            pass
+    _seed_everything(motion_runtime, seed)
 
     gar_stage_started = time.perf_counter() if gar_trace_enabled else None
     db, slots, slot_feat, path_idx, retrieval_report, candidate_lists = load_slots_and_candidates(motion_runtime, args, cfg)
+    router_probability_maps = candidate_router_probability_maps(retrieval_report)
+    repairability_settings = repairability_runtime_settings(args)
+    repairability_ranker = load_repairability_ranker(repairability_settings)
     _gar_add_runtime(gar_runtime, "retrieval_runtime_ms", gar_stage_started)
 
     banned: Dict[int, set] = {}
@@ -1757,6 +2261,9 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         motion_ref, assembly_report, selected_pairs = assemble_closed_loop_reference(
             motion_runtime, slots, candidate_lists, db, cfg, banned=banned,
             diagnostic_dir=round_diagnostic_dir,
+            candidate_router_probabilities=router_probability_maps,
+            repairability_ranker=repairability_ranker,
+            repairability_mode=str(repairability_settings["mode"]),
         )
         _gar_add_runtime(
             gar_runtime, "candidate_simulation_runtime_ms", gar_stage_started
@@ -1882,6 +2389,8 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
 
     if best_payload is None:
         raise RuntimeError("Closed-loop generation produced no payload")
+
+    outcome_bank_summary = None
 
     final_constraint_rows = final_selection_constraint_rows(
         db,
@@ -2040,6 +2549,18 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         write_gar_trace(gar_trace, gar_trace_path)
         gar_method_variant_id = gar_trace.method_variant_id
 
+    outcome_bank_summary = collect_repairability_outcome_bank(
+        motion_runtime=motion_runtime,
+        args=args,
+        cfg=cfg,
+        db=db,
+        slots=slots,
+        slot_feat=slot_feat,
+        candidate_lists=candidate_lists,
+        router_probabilities=router_probability_maps,
+        baseline_assembly=best_payload["assembly_report"],
+    )
+
     gar_readiness = {
         "schema": GAR_READINESS_INTERFACE_SCHEMA,
         "trace_enabled": gar_trace_enabled,
@@ -2049,7 +2570,9 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
         "oracle_implemented": False,
         "statistical_tests_implemented": False,
         "long_horizon_benchmark_implemented": False,
-        "production_selection_behavior_changed": False,
+        "production_selection_behavior_changed": bool(
+            repairability_settings["mode"] == "rank"
+        ),
     }
 
     report = {
@@ -2090,6 +2613,19 @@ def generate_closed_loop(args: argparse.Namespace) -> int:
             "reselect_enabled": bool(enable_reselect),
             "risk_adaptive_transition_enabled": env_bool("BOUNDARY_RISK_ADAPT_TRANSITION_ENABLE", True),
             "simulated_edge_risk_enabled": True,
+            "repairability": {
+                "mode": str(repairability_settings["mode"]),
+                "checkpoint": repairability_settings.get("checkpoint"),
+                "ranker_metadata": (
+                    None
+                    if repairability_ranker is None
+                    else dict(repairability_ranker.checkpoint_metadata)
+                ),
+                "graph_sb_unary_changed": False,
+                "guard_is_authoritative": True,
+                "pre_safe_gate_is_authoritative": True,
+            },
+            "outcome_bank": outcome_bank_summary,
             "env": {k: v for k, v in os.environ.items() if k.startswith("BOUNDARY_")},
             "diversity_env": {k: v for k, v in os.environ.items() if k.startswith("ROUTING_SAFETY_")},
         },
@@ -2190,6 +2726,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--json", default=None)
     p.add_argument("--render_output", default=None)
     p.add_argument("--render_script", default="rendering/render_motion.py")
+    p.add_argument(
+        "--repairability-mode",
+        choices=["off", "shadow", "rank"],
+        default=None,
+        help="off preserves production; shadow records scores; rank reorders only pre-safe candidates",
+    )
+    p.add_argument("--repairability-checkpoint", default=None)
+    p.add_argument(
+        "--outcome-bank",
+        default=None,
+        help="append-only JSONL path; enabling this runs full multi-seed counterfactual generation",
+    )
+    p.add_argument(
+        "--outcome-seeds",
+        default=None,
+        help="comma-separated common random seeds (at least two)",
+    )
+    p.add_argument("--outcome-topk", type=int, default=None)
     return p.parse_args(argv)
 
 
