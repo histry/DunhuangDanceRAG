@@ -2093,9 +2093,15 @@ def _materialize_selected_projected_tangent_for_calibration(
     local_tangent = product_log_torch(domain["baseline"], projected)[
         local_case:local_case + 1
     ].detach().to(m.torch.float64)
-    mask = _owned_case_mask(
-        ownership[start:stop], local_tangent, local_case
-    )
+    transaction_ownership = ownership[start:stop]
+    if not (0 <= local_case < int(transaction_ownership.shape[0])):
+        raise g1f4_policies.MetricCalibrationRequired(
+            "selected calibration case index is outside its transaction"
+        )
+    local_ownership = transaction_ownership[
+        local_case:local_case + 1
+    ].to(m.torch.bool)
+    mask = local_ownership.expand_as(local_tangent)
     if not bool(
         (local_tangent.masked_fill(mask, 0.0).abs().amax() == 0.0).detach()
     ):
