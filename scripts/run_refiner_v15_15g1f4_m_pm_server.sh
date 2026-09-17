@@ -110,6 +110,7 @@ COMMON_ARGS=(
 
 CALIBRATION="$ROOT/anchor_kinematic_metric.calibration.json"
 CALIBRATION_DIR="$ROOT/metric_calibration_identity"
+set +e
 "$PY" -u -m training.refiner_v15_15g_fixed_budget_correction \
   "${COMMON_ARGS[@]}" \
   --progress-mode current_equal_share \
@@ -117,14 +118,35 @@ CALIBRATION_DIR="$ROOT/metric_calibration_identity"
   --metric-preregistered-contract "$M_PREREG_CONTRACT" \
   --calibrate-anchor-metric-output "$CALIBRATION" \
   --output-dir "$CALIBRATION_DIR"
+CALIBRATION_NATIVE_RC=$?
+set -e
+if test "$CALIBRATION_NATIVE_RC" -ne 0 \
+    && test "$CALIBRATION_NATIVE_RC" -ne 2; then
+  exit "$CALIBRATION_NATIVE_RC"
+fi
 test -s "$CALIBRATION"
 printf '%s\n' "$CALIBRATION" > outputs/LATEST_REFINER_V15_15G1F4_M_CALIBRATION
 CALIBRATION_SHA=$(sha256sum "$CALIBRATION" | awk '{print $1}')
 printf '%s\n' "$CALIBRATION_SHA" > "$ROOT/anchor_kinematic_metric.calibration.sha256"
+printf '%s\n' "$CALIBRATION_NATIVE_RC" \
+  > "$ROOT/metric_calibration_identity.native_rc.txt"
 
 CALIBRATION_REPORT="$CALIBRATION_DIR/fixed_budget_correction.report.json"
 PARITY_REPORT="$ROOT/v9_canonical_parity_gate.json"
 test -s "$CALIBRATION_REPORT"
+"$PY" - "$CALIBRATION_REPORT" "$CALIBRATION_NATIVE_RC" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+if not report.get("numeric_audit_complete"):
+    raise SystemExit("identity metric calibration numeric audit failed")
+print(json.dumps({
+    "stage": "g1f4_metric_calibration_complete",
+    "native_exit_status": int(sys.argv[2]),
+    "activation_aware_supported": report.get("activation_aware_supported"),
+    "numeric_audit_complete": report.get("numeric_audit_complete"),
+    "report": sys.argv[1],
+}, ensure_ascii=False), flush=True)
+PY
 "$PY" -m training.refiner_v15_15g1f4_parity \
   --v9-reference-report "$V9_REFERENCE_REPORT" \
   --candidate-report "$CALIBRATION_REPORT" \
