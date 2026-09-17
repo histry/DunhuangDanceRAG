@@ -544,16 +544,38 @@ def build_owned_tangent_basis(
 
 
 def differentiable_geodesic_trial(
-    current, unit_direction, mask, theta, metric_kernel=None
+    current,
+    unit_direction,
+    mask,
+    theta,
+    metric_kernel=None,
+    path_mode="exact_geodesic",
 ):
-    """Exact sphere geodesic without detach, used by the curvature graph."""
+    """Differentiable trial path used by curvature and paper diagnostics.
+
+    ``exact_geodesic`` is the only mode permitted by the solver.  The tangent
+    line mode deliberately removes the sphere-geodesic acceleration and is
+    exposed solely as a matched-candidate explanatory ablation; it does not
+    remain on the radius shell and must never be used for acceptance.
+    """
     radial = current.masked_fill(~mask, 0.0)
     direction = unit_direction.masked_fill(~mask, 0.0)
+    if path_mode not in {
+        "exact_geodesic",
+        "tangent_line_no_geodesic_acceleration",
+    }:
+        raise ValueError(f"unsupported differentiable path mode: {path_mode}")
     if metric_kernel is not None:
+        if path_mode != "exact_geodesic":
+            raise ValueError(
+                "geodesic-acceleration ablation is currently identity-metric only"
+            )
         return metric_kernel.differentiable_geodesic(
             radial, direction, theta
         )
     radius = m.torch.linalg.vector_norm(radial[mask])
+    if path_mode == "tangent_line_no_geodesic_acceleration":
+        return (radial + theta * radius * direction).masked_fill(~mask, 0.0)
     return (
         m.torch.cos(theta) * radial
         + m.torch.sin(theta) * radius * direction
@@ -569,12 +591,18 @@ def _directional_first_derivative(
     name,
     theta_radians,
     metric_kernel=None,
+    path_mode="exact_geodesic",
 ):
     theta = current.new_tensor(
         float(theta_radians), dtype=m.torch.float64, requires_grad=True
     )
     trial = differentiable_geodesic_trial(
-        current, unit_direction, mask, theta, metric_kernel
+        current,
+        unit_direction,
+        mask,
+        theta,
+        metric_kernel,
+        path_mode=path_mode,
     )
     value = metric_builder(trial)[name]
     if value.numel() != 1 or not bool(m.torch.isfinite(value).all()):
@@ -601,6 +629,7 @@ def _recover_directional_hvp(
     metric_builder,
     name,
     metric_kernel=None,
+    path_mode="exact_geodesic",
 ):
     """Recover a nonfinite autograd HvP from verified float64 first derivatives.
 
@@ -620,6 +649,7 @@ def _recover_directional_hvp(
             name=name,
             theta_radians=epsilon,
             metric_kernel=metric_kernel,
+            path_mode=path_mode,
         )
         negative = _directional_first_derivative(
             current=current,
@@ -629,6 +659,7 @@ def _recover_directional_hvp(
             name=name,
             theta_radians=-epsilon,
             metric_kernel=metric_kernel,
+            path_mode=path_mode,
         )
         if positive is None or negative is None:
             return None, {
@@ -709,6 +740,7 @@ def _directional_jet(
     metric_builder: Callable[[object], Mapping[str, object]],
     names: Sequence[str],
     metric_kernel=None,
+    path_mode="exact_geodesic",
 ):
     """Return F(0), dF/dtheta and d2F/dtheta2 for one real path.
 
@@ -718,7 +750,12 @@ def _directional_jet(
     """
     theta = current.new_zeros((), dtype=m.torch.float64, requires_grad=True)
     trial = differentiable_geodesic_trial(
-        current, unit_direction, mask, theta, metric_kernel
+        current,
+        unit_direction,
+        mask,
+        theta,
+        metric_kernel,
+        path_mode=path_mode,
     )
     metrics = metric_builder(trial)
     result = {}
@@ -772,6 +809,7 @@ def _directional_jet(
                 metric_builder=metric_builder,
                 name=name,
                 metric_kernel=metric_kernel,
+                path_mode=path_mode,
             )
             if second is None:
                 return None, {
@@ -789,8 +827,52 @@ def _directional_jet(
     return result, {
         "status": "directional_curvature_verified",
         "derivative_order": 2,
+        "path_mode": path_mode,
+        "geodesic_acceleration_included": path_mode == "exact_geodesic",
         "autograd_hvp_recovery": recovered_hvps,
     }
+
+
+def directional_metric_jet(
+    *,
+    current,
+    mask,
+    unit_direction,
+    metric_builder,
+    names,
+    metric_kernel=None,
+    path_mode="exact_geodesic",
+    cache=None,
+    cache_key=None,
+):
+    """Public one-ray jet API for matched-candidate mechanism experiments.
+
+    A caller-owned cache is intentionally optional and requires an explicit
+    key containing the anchor, physical direction, witness bundle, metric and
+    code/contract hashes.  This prevents unsafe reuse after a basis or witness
+    transition while allowing repeated reporting passes to avoid autograd.
+    """
+    key = None
+    if cache is not None:
+        if cache_key is None:
+            raise ValueError("directional jet cache requires an explicit key")
+        key = (str(cache_key), str(path_mode), tuple(names))
+        if key in cache:
+            cached_jet, cached_audit = cache[key]
+            return cached_jet, {**cached_audit, "cache_hit": True}
+    jet, audit = _directional_jet(
+        current=current,
+        mask=mask,
+        unit_direction=unit_direction,
+        metric_builder=metric_builder,
+        names=tuple(names),
+        metric_kernel=metric_kernel,
+        path_mode=path_mode,
+    )
+    audit = {**audit, "cache_hit": False}
+    if cache is not None and jet is not None:
+        cache[key] = (jet, audit)
+    return jet, audit
 
 
 def build_second_order_models(
@@ -1533,9 +1615,37 @@ def solve_prepared_second_order_angle(
         else m.torch.linalg.vector_norm(current64[mask])
     )
     direction = (radius * unit).to(basis.dtype).masked_fill(~mask, 0.0)
+    # Reproject the normalized physical direction so the matched first- and
+    # second-order predictions refer to the exact direction that is executed.
+    effective_coefficients = m.torch.stack([
+        _inner(unit, row, mask, metric_kernel) for row in basis
+    ])
+    theta = float(theta_radians)
+    first_order_changes = {}
+    second_order_changes = {}
+    curvature_contributions = {}
+    for name, model in prepared["models"].items():
+        first = theta * m.torch.dot(
+            model["first"], effective_coefficients
+        )
+        curvature = 0.5 * theta * theta * m.torch.einsum(
+            "i,ij,j->",
+            effective_coefficients,
+            model["hessian"],
+            effective_coefficients,
+        )
+        first_order_changes[name] = float(first.detach())
+        curvature_contributions[name] = float(curvature.detach())
+        second_order_changes[name] = float((first + curvature).detach())
     audit["selected_basis_coefficients"] = [
-        float(value) for value in coefficients.detach().cpu()
+        float(value) for value in effective_coefficients.detach().cpu()
     ]
+    audit["matched_first_order_change_by_term"] = first_order_changes
+    audit["matched_second_order_change_by_term"] = second_order_changes
+    audit["matched_curvature_contribution_by_term"] = (
+        curvature_contributions
+    )
+    audit["matched_prediction_uses_executed_normalized_direction"] = True
     audit["geodesic_direction_norm"] = float(
         (
             metric_kernel.norm(direction)
@@ -1547,6 +1657,64 @@ def solve_prepared_second_order_angle(
         _inner(direction, current64, mask, metric_kernel).detach()
     )
     return direction.detach(), audit
+
+
+def matched_prediction_for_physical_direction(
+    *, prepared, physical_direction, theta_radians
+):
+    """Predict along the exact (possibly dtype-rounded) executed direction."""
+    basis = prepared["basis"]
+    current = prepared["current64"]
+    mask = prepared["mask"]
+    metric_kernel = prepared.get("metric_kernel")
+    direction = physical_direction.detach().to(m.torch.float64).masked_fill(
+        ~mask, 0.0
+    )
+    norm = (
+        metric_kernel.norm(direction)
+        if metric_kernel is not None
+        else m.torch.linalg.vector_norm(direction[mask])
+    )
+    if not bool(m.torch.isfinite(norm)) or float(norm) <= 0.0:
+        raise ValueError("matched prediction received a zero/nonfinite direction")
+    unit = direction / norm
+    coefficients = m.torch.stack([
+        _inner(unit, row, mask, metric_kernel) for row in basis
+    ])
+    reconstructed = m.torch.einsum("i,i...->...", coefficients, basis)
+    residual = unit - reconstructed
+    residual_norm = (
+        metric_kernel.norm(residual)
+        if metric_kernel is not None
+        else m.torch.linalg.vector_norm(residual[mask])
+    )
+    theta = float(theta_radians)
+    first_order = {}
+    second_order = {}
+    curvature = {}
+    for name, model in prepared["models"].items():
+        first = theta * m.torch.dot(model["first"], coefficients)
+        curved = 0.5 * theta * theta * m.torch.einsum(
+            "i,ij,j->", coefficients, model["hessian"], coefficients
+        )
+        first_order[name] = float(first.detach())
+        curvature[name] = float(curved.detach())
+        second_order[name] = float((first + curved).detach())
+    return {
+        "selected_basis_coefficients": [
+            float(value) for value in coefficients.detach().cpu()
+        ],
+        "matched_first_order_change_by_term": first_order,
+        "matched_second_order_change_by_term": second_order,
+        "matched_curvature_contribution_by_term": curvature,
+        "matched_prediction_uses_executed_normalized_direction": True,
+        "matched_prediction_recomputed_after_execution_dtype_cast": True,
+        "matched_basis_residual_norm": float(residual_norm.detach()),
+        "matched_basis_residual_tolerance": 1.0e-6,
+        "matched_basis_residual_within_tolerance": bool(
+            float(residual_norm.detach()) <= 1.0e-6
+        ),
+    }
 
 
 def second_order_direction_for_angle(

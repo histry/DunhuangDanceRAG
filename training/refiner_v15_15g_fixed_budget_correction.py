@@ -83,6 +83,7 @@ from training import refiner_bridge_diagnostics as diagnostic
 from training import refiner_case_local_full_tangent_oracle as oracle
 from training import refiner_observable_adapter_probe as adapter
 from training import refiner_projected_candidate_probe as projected_probe
+from training import refiner_paper2_matched_trial as paper2_audit
 from training import refiner_v15_15g1f3_second_order as second_order
 from training import refiner_v15_15g1f4_policies as g1f4_policies
 
@@ -4081,6 +4082,11 @@ def _finite_gap_angular_iteration(
     target_rms,
     iteration,
     case_uid=None,
+    paper2_recorder=None,
+    paper2_budget=None,
+    paper2_radii=(),
+    paper2_geodesic_acceleration_ablation=False,
+    paper2_jet_cache=None,
 ):
     """Run one g1f2 iteration with one active-set solve per frozen angle."""
     current_shadow = float(
@@ -4326,6 +4332,52 @@ def _finite_gap_angular_iteration(
             failed_constraints.append("exact_radius")
         if not scope_ok:
             failed_constraints.append("scope")
+        paper2_candidate_id = None
+        if paper2_recorder is not None:
+            source = "g1f2_selected_physical_direction"
+            paper2_candidate_id = paper2_recorder.candidate_id(
+                case_uid=case_uid,
+                budget=paper2_budget,
+                iteration=iteration,
+                theta_radians=theta,
+                backtrack=backtrack,
+                candidate_source=source,
+            )
+            if paper2_recorder.should_record(
+                candidate_id=paper2_candidate_id,
+                case_uid=case_uid,
+                budget=paper2_budget,
+                candidate_source=source,
+            ):
+                mechanism_record = _paper2_same_ray_radius_audit(
+                    candidate_id=paper2_candidate_id,
+                    candidate_source=source,
+                    case_uid=case_uid,
+                    budget=paper2_budget,
+                    iteration=iteration,
+                    backtrack=backtrack,
+                    theta=theta,
+                    radii=paper2_radii,
+                    main_target_rms=target_rms,
+                    main_matched_audit=None,
+                    model=model,
+                    current=current,
+                    direction=direction,
+                    mask=mask,
+                    baseline=baseline,
+                    identity=identity,
+                    batch=batch,
+                    cfg=cfg,
+                    local_case=local_case,
+                    baseline_case=baseline_case,
+                    contract=contract,
+                    train_repair_contract=train_repair_contract,
+                    include_geodesic_acceleration_ablation=(
+                        paper2_geodesic_acceleration_ablation
+                    ),
+                    jet_cache=paper2_jet_cache,
+                )
+                paper2_recorder.append(mechanism_record)
         trial_row = {
             "backtrack": backtrack,
             "theta_radians": theta,
@@ -4343,6 +4395,7 @@ def _finite_gap_angular_iteration(
             **science_margins,
             "geodesic_update": geodesic_audit,
             "angle_specific_joint_solver": solver_audit,
+            "paper2_mechanism_candidate_id": paper2_candidate_id,
         }
         trial_rows.append(trial_row)
         if not failed_constraints:
@@ -4405,6 +4458,477 @@ def _finite_gap_angular_iteration(
     }, numeric_failure
 
 
+def _paper2_main_radius_matched_audit(
+    *,
+    solver_audit,
+    current_guard_row_margin,
+    trial_frozen_witness_values,
+    science_step_change,
+    guard_row_base_name,
+    train_repair_contract,
+    constraints,
+    current_hard_margins,
+    trial_hard_margins,
+    frozen_active_names,
+    trial_active_names,
+    internal_witness_transition,
+):
+    """Pair first/second predictions with the exact same raw scalar rows."""
+    first = solver_audit.get("matched_first_order_change_by_term") or {}
+    second = solver_audit.get("matched_second_order_change_by_term") or {}
+    curvature = solver_audit.get("matched_curvature_contribution_by_term") or {}
+    actual = {
+        name: float(trial_frozen_witness_values[name])
+        - float(current_guard_row_margin[name])
+        for name in current_guard_row_margin
+    }
+    actual.update({
+        name: float(science_step_change[name])
+        for name in ("endpoint", "temporal")
+    })
+    guard_scales = train_repair_contract.get(
+        "guard_debt_scale_by_guard_term"
+    )
+    if not isinstance(guard_scales, dict):
+        raise RuntimeError(
+            "paper2 matched audit requires frozen Guard row scales"
+        )
+    scales = {}
+    for row_name, base_name in guard_row_base_name.items():
+        if base_name not in guard_scales:
+            raise RuntimeError(
+                f"paper2 matched audit lacks frozen scale for {base_name}"
+            )
+        scales[row_name] = float(guard_scales[base_name])
+    science_tolerance = constraints.get("scientific_numeric_tolerance") or {}
+    for name in ("endpoint", "temporal"):
+        scales[name] = max(
+            float(science_tolerance.get(name, 0.0)),
+            float(train_repair_contract["science_strict_descent_floor"]),
+            1.0e-12,
+        )
+    if set(first) != set(actual) or set(second) != set(actual):
+        raise RuntimeError(
+            "paper2 matched prediction rows differ from executed frozen rows"
+        )
+    hard_names = sorted(set(current_hard_margins) | set(trial_hard_margins))
+    authoritative_change = {
+        name: (
+            float(trial_hard_margins.get(name, -math.inf))
+            - float(current_hard_margins.get(name, -math.inf))
+            if name in current_hard_margins and name in trial_hard_margins
+            else None
+        )
+        for name in hard_names
+    }
+    return {
+        "schema": paper2_audit.SCHEMA,
+        "audit_scope": "raw_pre_projector_same_candidate",
+        "same_anchor": True,
+        "same_ownership_support": True,
+        "same_physical_direction": bool(
+            solver_audit.get(
+                "matched_basis_residual_within_tolerance", False
+            )
+        ),
+        "matched_basis_residual_norm": solver_audit.get(
+            "matched_basis_residual_norm"
+        ),
+        "same_angle": True,
+        "same_frozen_scalar_rows": True,
+        "rows": paper2_audit.matched_row_audit(
+            first_order_change=first,
+            second_order_change=second,
+            actual_frozen_change=actual,
+            row_scale=scales,
+            curvature_change=curvature,
+        ),
+        "authoritative_hard_guard_change_by_term": authoritative_change,
+        "frozen_active_guard_terms": list(frozen_active_names),
+        "authoritative_trial_active_guard_terms": list(trial_active_names),
+        "stable_internal_witness": not bool(internal_witness_transition),
+        "internal_witness_transition": bool(internal_witness_transition),
+        "projector_executed": False,
+        "authoritative_closure_claimed": False,
+    }
+
+
+def _sum_numeric_mappings(*rows):
+    result = {}
+    for row in rows:
+        for name, value in (row or {}).items():
+            result[name] = result.get(name, 0) + value
+    return result
+
+
+def _paper2_same_ray_radius_audit(
+    *,
+    candidate_id,
+    candidate_source,
+    case_uid,
+    budget,
+    iteration,
+    backtrack,
+    theta,
+    radii,
+    main_target_rms,
+    main_matched_audit,
+    model,
+    current,
+    direction,
+    mask,
+    baseline,
+    identity,
+    batch,
+    cfg,
+    local_case,
+    baseline_case,
+    contract,
+    train_repair_contract,
+    include_geodesic_acceleration_ablation,
+    jet_cache,
+):
+    """Audit one selected physical ray without rerunning candidate search."""
+    started = time.perf_counter()
+    rows = []
+    call_counts = {
+        "directional_jet": 0,
+        "raw_trial": 0,
+        "hard_guard_audit": 0,
+    }
+    dtype = m.torch.float64
+    baseline64 = baseline.detach().to(dtype)
+    identity64 = identity.detach().to(dtype)
+    batch64 = _floating_tree_to_dtype(batch, dtype)
+    for radius_rms in radii:
+        radius_rms = float(radius_rms)
+        if (
+            abs(radius_rms - float(main_target_rms)) <= 1.0e-15
+            and not include_geodesic_acceleration_ablation
+            and main_matched_audit is not None
+        ):
+            rows.append({
+                "radius_rms": radius_rms,
+                "main_radius_reused_without_new_autograd": True,
+                "exact_path": main_matched_audit,
+                "no_geodesic_acceleration_ablation": None,
+            })
+            continue
+        anchor, unit_direction = paper2_audit.same_ray_identity_geometry(
+            current, direction, mask, radius_rms
+        )
+        anchor = anchor.to(dtype)
+        unit_direction = unit_direction.to(dtype)
+        with m.torch.no_grad():
+            anchor_transaction = _case_isolated_transaction_tangent(
+                baseline64, anchor, local_case
+            )
+            anchor_candidate = product_exp_torch(
+                baseline64, anchor_transaction
+            )
+            (
+                _,
+                _,
+                anchor_constraints,
+                _,
+                _,
+            ) = _g1d_shadow_objective(
+                model=model,
+                batch=batch64,
+                cfg=cfg,
+                baseline=baseline64,
+                identity=identity64,
+                candidate=anchor_candidate,
+                contract=contract,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                local_tangent=anchor,
+                local_mask=mask,
+                train_repair_contract=train_repair_contract,
+                temporal_smoothness_weight=0.0,
+                require_shadow_constraint=True,
+            )
+        frozen_names = tuple(anchor_constraints["active_full_shadow_terms"])
+        frozen_witnesses = {
+            str(name): [dict(item) for item in items]
+            for name, items in (
+                anchor_constraints.get(
+                    "prediction_internal_witness_bundle"
+                ) or {}
+            ).items()
+        }
+
+        def radius_metric_builder(trial64):
+            transaction = _case_isolated_transaction_tangent(
+                baseline64, trial64, local_case
+            )
+            candidate = product_exp_torch(baseline64, transaction)
+            _, _, diagnostics, science, guard_rows = _g1d_shadow_objective(
+                model=model,
+                batch=batch64,
+                cfg=cfg,
+                baseline=baseline64,
+                identity=identity64,
+                candidate=candidate,
+                contract=contract,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                local_tangent=trial64,
+                local_mask=mask,
+                train_repair_contract=train_repair_contract,
+                temporal_smoothness_weight=0.0,
+                prediction_active_names=frozen_names,
+                prediction_internal_witnesses=frozen_witnesses,
+                require_shadow_constraint=True,
+            )
+            if tuple(diagnostics["active_full_shadow_terms"]) != frozen_names:
+                raise RuntimeError(
+                    "same-ray frozen active rows changed inside a jet"
+                )
+            if diagnostics.get(
+                "prediction_internal_witness_bundle"
+            ) != frozen_witnesses:
+                raise RuntimeError(
+                    "same-ray frozen witness rows changed inside a jet"
+                )
+            return {
+                **guard_rows,
+                "endpoint": science["endpoint"],
+                "temporal": science["temporal"],
+            }
+
+        with m.torch.no_grad():
+            base_metrics = radius_metric_builder(anchor)
+        metric_names = tuple(base_metrics)
+        witness_hash = paper2_audit.canonical_json_sha256({
+            "active": frozen_names,
+            "witness": frozen_witnesses,
+        })
+        cache_prefix = (
+            f"{candidate_id}:{radius_rms:.17g}:{witness_hash}"
+        )
+        exact_jet, exact_jet_audit = second_order.directional_metric_jet(
+            current=anchor,
+            mask=mask,
+            unit_direction=unit_direction,
+            metric_builder=radius_metric_builder,
+            names=metric_names,
+            path_mode="exact_geodesic",
+            cache=jet_cache,
+            cache_key=cache_prefix,
+        )
+        call_counts["directional_jet"] += int(
+            not exact_jet_audit.get("cache_hit", False)
+        )
+        if exact_jet is None:
+            rows.append({
+                "radius_rms": radius_rms,
+                "main_radius_reused_without_new_autograd": False,
+                "status": "jet_failure",
+                "jet_audit": exact_jet_audit,
+            })
+            continue
+        theta_tensor = anchor.new_tensor(float(theta))
+        trial = second_order.differentiable_geodesic_trial(
+            anchor,
+            unit_direction,
+            mask,
+            theta_tensor,
+            path_mode="exact_geodesic",
+        ).detach()
+        call_counts["raw_trial"] += 1
+        with m.torch.no_grad():
+            trial_metrics = radius_metric_builder(trial)
+            trial_transaction = _case_isolated_transaction_tangent(
+                baseline64, trial, local_case
+            )
+            trial_candidate = product_exp_torch(
+                baseline64, trial_transaction
+            )
+            (
+                _,
+                _,
+                trial_hard,
+                _,
+                _,
+            ) = _g1d_shadow_objective(
+                model=model,
+                batch=batch64,
+                cfg=cfg,
+                baseline=baseline64,
+                identity=identity64,
+                candidate=trial_candidate,
+                contract=contract,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                local_tangent=trial,
+                local_mask=mask,
+                train_repair_contract=train_repair_contract,
+                temporal_smoothness_weight=0.0,
+                require_shadow_constraint=True,
+            )
+        call_counts["hard_guard_audit"] += 1
+        first = {
+            name: float(theta) * float(exact_jet[name][1])
+            for name in metric_names
+        }
+        second = {
+            name: first[name]
+            + 0.5 * float(theta) ** 2 * float(exact_jet[name][2])
+            for name in metric_names
+        }
+        curvature = {
+            name: second[name] - first[name] for name in metric_names
+        }
+        actual = {
+            name: float(trial_metrics[name].detach())
+            - float(exact_jet[name][0])
+            for name in metric_names
+        }
+        metadata = (
+            anchor_constraints.get(
+                "prediction_internal_witness_row_metadata"
+            ) or {}
+        )
+        guard_scales = train_repair_contract.get(
+            "guard_debt_scale_by_guard_term"
+        ) or {}
+        scales = {}
+        for name in metric_names:
+            if name in {"endpoint", "temporal"}:
+                scales[name] = max(
+                    float(
+                        (anchor_constraints.get(
+                            "scientific_numeric_tolerance"
+                        ) or {}).get(name, 0.0)
+                    ),
+                    float(
+                        train_repair_contract[
+                            "science_strict_descent_floor"
+                        ]
+                    ),
+                    1.0e-12,
+                )
+                continue
+            base_name = (
+                metadata[name]["base_guard_name"]
+                if name in metadata else name.removeprefix("guard::")
+            )
+            if base_name not in guard_scales:
+                raise RuntimeError(
+                    f"same-ray audit lacks frozen scale for {base_name}"
+                )
+            scales[name] = float(guard_scales[base_name])
+        hard_before = anchor_constraints[
+            "full_transaction_fixed_guard_shadow_margin_by_term"
+        ]
+        hard_after = trial_hard[
+            "full_transaction_fixed_guard_shadow_margin_by_term"
+        ]
+        hard_change = {
+            name: float(hard_after[name]) - float(hard_before[name])
+            for name in sorted(set(hard_before) & set(hard_after))
+        }
+        hard_active_after = tuple(sorted(
+            name for name, value in hard_after.items() if float(value) > 0.0
+        ))
+        trial_witnesses = trial_hard.get(
+            "prediction_internal_witness_bundle"
+        ) or {}
+        exact_record = {
+            "schema": paper2_audit.SCHEMA,
+            "audit_scope": "same_ray_raw_pre_projector",
+            "path_mode": "exact_geodesic",
+            "rows": paper2_audit.matched_row_audit(
+                first_order_change=first,
+                second_order_change=second,
+                actual_frozen_change=actual,
+                row_scale=scales,
+                curvature_change=curvature,
+            ),
+            "jet_audit": exact_jet_audit,
+            "frozen_active_guard_terms": list(frozen_names),
+            "authoritative_trial_active_guard_terms": list(
+                hard_active_after
+            ),
+            "authoritative_hard_guard_change_by_term": hard_change,
+            "internal_witness_transition": bool(
+                trial_witnesses != frozen_witnesses
+            ),
+            "projector_executed": False,
+            "authoritative_closure_claimed": False,
+        }
+        ablation_record = None
+        if include_geodesic_acceleration_ablation:
+            ablation_jet, ablation_audit = (
+                second_order.directional_metric_jet(
+                    current=anchor,
+                    mask=mask,
+                    unit_direction=unit_direction,
+                    metric_builder=radius_metric_builder,
+                    names=metric_names,
+                    path_mode=(
+                        "tangent_line_no_geodesic_acceleration"
+                    ),
+                    cache=jet_cache,
+                    cache_key=cache_prefix,
+                )
+            )
+            call_counts["directional_jet"] += int(
+                not ablation_audit.get("cache_hit", False)
+            )
+            if ablation_jet is not None:
+                ablation_first = {
+                    name: float(theta) * float(ablation_jet[name][1])
+                    for name in metric_names
+                }
+                ablation_second = {
+                    name: ablation_first[name]
+                    + 0.5 * float(theta) ** 2
+                    * float(ablation_jet[name][2])
+                    for name in metric_names
+                }
+                ablation_record = {
+                    "path_mode": (
+                        "tangent_line_no_geodesic_acceleration"
+                    ),
+                    "rows": paper2_audit.matched_row_audit(
+                        first_order_change=ablation_first,
+                        second_order_change=ablation_second,
+                        actual_frozen_change=actual,
+                        row_scale=scales,
+                    ),
+                    "jet_audit": ablation_audit,
+                    "diagnostic_only_not_on_radius_shell": True,
+                }
+            else:
+                ablation_record = {
+                    "status": "jet_failure",
+                    "jet_audit": ablation_audit,
+                }
+        rows.append({
+            "radius_rms": radius_rms,
+            "main_radius_reused_without_new_autograd": False,
+            "exact_path": exact_record,
+            "no_geodesic_acceleration_ablation": ablation_record,
+        })
+    return {
+        "candidate_id": candidate_id,
+        "case_uid": str(case_uid),
+        "budget": int(budget),
+        "iteration": int(iteration),
+        "backtrack": int(backtrack),
+        "theta_radians": float(theta),
+        "candidate_source": str(candidate_source),
+        "fixed_actual_owned_space_ray": True,
+        "radius_rows": rows,
+        "stage_timing_seconds": {
+            "same_ray_mechanism_audit": time.perf_counter() - started
+        },
+        "function_call_counts": call_counts,
+    }
+
+
 def _second_order_angular_iteration(
     *,
     model,
@@ -4430,8 +4954,27 @@ def _second_order_angular_iteration(
     metric_operator,
     case_uid=None,
     constraint_generation_depth=0,
+    paper2_recorder=None,
+    paper2_budget=None,
+    paper2_radii=(),
+    paper2_geodesic_acceleration_ablation=False,
+    paper2_jet_cache=None,
 ):
     """Run one g1f3 iteration with a real-path second-order model per angle."""
+    stage_timing_seconds = {
+        "curvature_model_build": 0.0,
+        "angle_subproblem_solve": 0.0,
+        "directional_consistency": 0.0,
+        "authoritative_raw_trial": 0.0,
+        "same_ray_mechanism_audit": 0.0,
+    }
+    function_call_counts = {
+        "curvature_model_build": 0,
+        "angle_subproblem_solve": 0,
+        "directional_consistency": 0,
+        "authoritative_raw_trial": 0,
+        "same_ray_mechanism_candidate": 0,
+    }
     current_shadow = float(
         constraints["maximum_full_transaction_fixed_guard_shadow_margin"]
     )
@@ -4666,7 +5209,9 @@ def _second_order_angular_iteration(
         for name in basis_gradient_names
     }
 
+    model_build_started = time.perf_counter()
     try:
+        function_call_counts["curvature_model_build"] += 1
         prepared_model, model_preparation_audit = (
             metric_operator.execute(
                 "prepare_second_order_subproblem",
@@ -4694,6 +5239,76 @@ def _second_order_angular_iteration(
             "second_order_hessian_used": True,
             "model_reused_across_frozen_angles": True,
         }
+    stage_timing_seconds["curvature_model_build"] += (
+        time.perf_counter() - model_build_started
+    )
+
+    # A deterministic basis ray supplies a selection-independent reference
+    # direction for the fixed candidate pool.  It is audited, never proposed
+    # to or consumed by the authoritative solver.
+    if (
+        paper2_recorder is not None
+        and prepared_model is not None
+        and int(constraint_generation_depth) == 0
+    ):
+        reference_source = "deterministic_verified_basis_0"
+        reference_theta = float(
+            angular_scales[min(7, len(angular_scales) - 1)]
+        )
+        reference_id = paper2_recorder.candidate_id(
+            case_uid=case_uid,
+            budget=paper2_budget,
+            iteration=iteration,
+            theta_radians=reference_theta,
+            backtrack=-1,
+            candidate_source=reference_source,
+        )
+        if paper2_recorder.should_record(
+            candidate_id=reference_id,
+            case_uid=case_uid,
+            budget=paper2_budget,
+            candidate_source=reference_source,
+        ):
+            reference_radius = m.torch.linalg.vector_norm(current[mask])
+            reference_direction = (
+                reference_radius * prepared_model["basis"][0]
+            ).to(current.dtype).masked_fill(~mask, 0.0)
+            mechanism_started = time.perf_counter()
+            reference_record = _paper2_same_ray_radius_audit(
+                candidate_id=reference_id,
+                candidate_source=reference_source,
+                case_uid=case_uid,
+                budget=paper2_budget,
+                iteration=iteration,
+                backtrack=-1,
+                theta=reference_theta,
+                radii=paper2_radii,
+                main_target_rms=target_rms,
+                main_matched_audit=None,
+                model=model,
+                current=current,
+                direction=reference_direction,
+                mask=mask,
+                baseline=baseline,
+                identity=identity,
+                batch=batch,
+                cfg=cfg,
+                local_case=local_case,
+                baseline_case=baseline_case,
+                contract=contract,
+                train_repair_contract=train_repair_contract,
+                include_geodesic_acceleration_ablation=(
+                    paper2_geodesic_acceleration_ablation
+                ),
+                jet_cache=paper2_jet_cache,
+            )
+            paper2_recorder.append(reference_record)
+            stage_timing_seconds[
+                "same_ray_mechanism_audit"
+            ] += time.perf_counter() - mechanism_started
+            function_call_counts[
+                "same_ray_mechanism_candidate"
+            ] += 1
 
     for backtrack, theta in enumerate(angular_scales):
         if prepared_model is None:
@@ -4703,7 +5318,9 @@ def _second_order_angular_iteration(
                 "theta_radians": float(theta),
             }
         else:
+            angle_solve_started = time.perf_counter()
             try:
+                function_call_counts["angle_subproblem_solve"] += 1
                 direction, solver_audit = (
                     second_order.solve_prepared_second_order_angle(
                         prepared=prepared_model,
@@ -4728,6 +5345,22 @@ def _second_order_angular_iteration(
                         == g1f4_policies.ANCHOR_KINEMATIC_METRIC
                         else current.dtype
                     )
+                    solver_audit.update(
+                        second_order.matched_prediction_for_physical_direction(
+                            prepared=prepared_model,
+                            physical_direction=direction,
+                            theta_radians=float(theta),
+                        )
+                    )
+                    if (
+                        paper2_recorder is not None
+                        and not solver_audit[
+                            "matched_basis_residual_within_tolerance"
+                        ]
+                    ):
+                        raise RuntimeError(
+                            "paper2 candidate left the verified reduced basis"
+                        )
             except (RuntimeError, ValueError, FloatingPointError) as exc:
                 direction = None
                 solver_audit = {
@@ -4738,6 +5371,9 @@ def _second_order_angular_iteration(
                     "second_order_hessian_used": True,
                     "curvature_model_reused": True,
                 }
+            stage_timing_seconds["angle_subproblem_solve"] += (
+                time.perf_counter() - angle_solve_started
+            )
         solver_audits.append(solver_audit)
         if direction is None:
             state = str(
@@ -4775,6 +5411,8 @@ def _second_order_angular_iteration(
         optimization_direction_z[active_mask] = (
             direction[active_mask] / taper[active_mask]
         )
+        directional_probe_started = time.perf_counter()
+        function_call_counts["directional_consistency"] += 1
         directional_consistency = _temporal_directional_consistency_probe(
             current=current,
             physical_direction=direction,
@@ -4798,6 +5436,9 @@ def _second_order_angular_iteration(
             cfg=cfg,
             local_case=local_case,
             metric_operator=metric_operator,
+        )
+        stage_timing_seconds["directional_consistency"] += (
+            time.perf_counter() - directional_probe_started
         )
         solver_audit["temporal_directional_consistency"] = (
             directional_consistency
@@ -4826,6 +5467,8 @@ def _second_order_angular_iteration(
             continue
 
         any_authoritative_trial = True
+        authoritative_trial_started = time.perf_counter()
+        function_call_counts["authoritative_raw_trial"] += 1
         trial, geodesic_ok, geodesic_audit = metric_operator.execute(
             "exact_radius_geodesic_update",
             _exact_radius_geodesic_update,
@@ -4989,6 +5632,9 @@ def _second_order_angular_iteration(
                 name: float(value.detach())
                 for name, value in trial_frozen_witness_rows.items()
             }
+        stage_timing_seconds["authoritative_raw_trial"] += (
+            time.perf_counter() - authoritative_trial_started
+        )
         trial_active_names = tuple(sorted(
             name for name, value in trial_shadow_values.items() if value > 0.0
         ))
@@ -5226,6 +5872,72 @@ def _second_order_angular_iteration(
             # This is deliberately not called closure: final closure belongs to
             # the composite selector + Projector + complete Guard audit below.
             reason = None
+        matched_trial_audit = _paper2_main_radius_matched_audit(
+            solver_audit=solver_audit,
+            current_guard_row_margin=current_guard_row_margin,
+            trial_frozen_witness_values=trial_frozen_witness_values,
+            science_step_change=science_step_change,
+            guard_row_base_name=guard_row_base_name,
+            train_repair_contract=train_repair_contract,
+            constraints=constraints,
+            current_hard_margins=hard_margins,
+            trial_hard_margins=trial_shadow_values,
+            frozen_active_names=frozen_active_names,
+            trial_active_names=trial_active_names,
+            internal_witness_transition=internal_witness_transition,
+        )
+        paper2_candidate_id = None
+        if paper2_recorder is not None:
+            paper2_candidate_id = paper2_recorder.candidate_id(
+                case_uid=case_uid,
+                budget=paper2_budget,
+                iteration=iteration,
+                theta_radians=theta,
+                backtrack=backtrack,
+                candidate_source="g1f3_selected_physical_direction",
+            )
+            if paper2_recorder.should_record(
+                candidate_id=paper2_candidate_id,
+                case_uid=case_uid,
+                budget=paper2_budget,
+                candidate_source="g1f3_selected_physical_direction",
+            ):
+                mechanism_started = time.perf_counter()
+                mechanism_record = _paper2_same_ray_radius_audit(
+                    candidate_id=paper2_candidate_id,
+                    candidate_source="g1f3_selected_physical_direction",
+                    case_uid=case_uid,
+                    budget=paper2_budget,
+                    iteration=iteration,
+                    backtrack=backtrack,
+                    theta=theta,
+                    radii=paper2_radii,
+                    main_target_rms=target_rms,
+                    main_matched_audit=matched_trial_audit,
+                    model=model,
+                    current=current,
+                    direction=direction,
+                    mask=mask,
+                    baseline=baseline,
+                    identity=identity,
+                    batch=batch,
+                    cfg=cfg,
+                    local_case=local_case,
+                    baseline_case=baseline_case,
+                    contract=contract,
+                    train_repair_contract=train_repair_contract,
+                    include_geodesic_acceleration_ablation=(
+                        paper2_geodesic_acceleration_ablation
+                    ),
+                    jet_cache=paper2_jet_cache,
+                )
+                paper2_recorder.append(mechanism_record)
+                stage_timing_seconds[
+                    "same_ray_mechanism_audit"
+                ] += time.perf_counter() - mechanism_started
+                function_call_counts[
+                    "same_ray_mechanism_candidate"
+                ] += 1
         trial_row = {
             "backtrack": backtrack,
             "theta_radians": float(theta),
@@ -5323,6 +6035,8 @@ def _second_order_angular_iteration(
             **science_margins,
             "geodesic_update": geodesic_audit,
             "angle_specific_second_order_solver": solver_audit,
+            "matched_candidate_curvature_audit": matched_trial_audit,
+            "paper2_mechanism_candidate_id": paper2_candidate_id,
         }
         trial_rows.append(trial_row)
         if not failed_constraints:
@@ -5434,6 +6148,13 @@ def _second_order_angular_iteration(
                 constraint_generation_depth=(
                     int(constraint_generation_depth) + 1
                 ),
+                paper2_recorder=paper2_recorder,
+                paper2_budget=paper2_budget,
+                paper2_radii=paper2_radii,
+                paper2_geodesic_acceleration_ablation=(
+                    paper2_geodesic_acceleration_ablation
+                ),
+                paper2_jet_cache=paper2_jet_cache,
             )
         )
         enrichment_round = {
@@ -5489,6 +6210,14 @@ def _second_order_angular_iteration(
         ]
         enriched_report["active_set_constraint_generation_round_count"] = (
             len(enriched_report["active_set_constraint_generation"])
+        )
+        enriched_report["stage_timing_seconds"] = _sum_numeric_mappings(
+            stage_timing_seconds,
+            enriched_report.get("stage_timing_seconds"),
+        )
+        enriched_report["function_call_counts"] = _sum_numeric_mappings(
+            function_call_counts,
+            enriched_report.get("function_call_counts"),
         )
         return (
             enriched_tangent,
@@ -5585,6 +6314,8 @@ def _second_order_angular_iteration(
         "closure_deferred_to_composite_selector": True,
         "progress_mode": progress_policy.mode,
         "metric_operator": metric_operator.audit(),
+        "stage_timing_seconds": stage_timing_seconds,
+        "function_call_counts": function_call_counts,
     }, numeric_failure
 
 
@@ -5610,6 +6341,10 @@ def _correct_case_geodesic_joint_sqp(
     progress_policy=None,
     metric_operator=None,
     case_uid=None,
+    paper2_recorder=None,
+    paper2_radii=(),
+    paper2_geodesic_acceleration_ablation=False,
+    paper2_jet_cache=None,
 ):
     """Run bounded exact-radius geodesic joint active-set SQP."""
     mask = _owned_case_mask(ownership, initial_tangent, 0)
@@ -5821,6 +6556,13 @@ def _correct_case_geodesic_joint_sqp(
                     progress_policy=progress_policy,
                     metric_operator=metric_operator,
                     case_uid=case_uid,
+                    paper2_recorder=paper2_recorder,
+                    paper2_budget=int(steps),
+                    paper2_radii=paper2_radii,
+                    paper2_geodesic_acceleration_ablation=(
+                        paper2_geodesic_acceleration_ablation
+                    ),
+                    paper2_jet_cache=paper2_jet_cache,
                 )
             )
             numeric_failure = numeric_failure or iteration_numeric_failure
@@ -5856,6 +6598,13 @@ def _correct_case_geodesic_joint_sqp(
                     target_rms=target_rms,
                     iteration=iteration,
                     case_uid=case_uid,
+                    paper2_recorder=paper2_recorder,
+                    paper2_budget=int(steps),
+                    paper2_radii=paper2_radii,
+                    paper2_geodesic_acceleration_ablation=(
+                        paper2_geodesic_acceleration_ablation
+                    ),
+                    paper2_jet_cache=paper2_jet_cache,
                 )
             )
             numeric_failure = numeric_failure or iteration_numeric_failure
@@ -6198,6 +6947,12 @@ def _correct_case_geodesic_joint_sqp(
             if metric_operator.kernel is not None else None
         ),
         "history": history,
+        "stage_timing_seconds": _sum_numeric_mappings(*[
+            row.get("stage_timing_seconds") for row in history
+        ]),
+        "function_call_counts": _sum_numeric_mappings(*[
+            row.get("function_call_counts") for row in history
+        ]),
         "elapsed_seconds": time.perf_counter() - started,
     }
 
@@ -7780,6 +8535,31 @@ def _local_feasible_intersection_summary(correction_reports):
 
 def run(args):
     started = time.perf_counter()
+    paper2_case_uids = frozenset(args.paper2_case_uid or ())
+    paper2_protocol_path = (
+        Path(args.paper2_protocol).resolve()
+        if args.paper2_protocol else None
+    )
+    paper2_protocol = None
+    paper2_protocol_sha256 = None
+    if paper2_protocol_path is not None:
+        paper2_protocol = json.loads(
+            paper2_protocol_path.read_text(encoding="utf-8")
+        )
+        if paper2_protocol.get("schema") != "paper2_eval_protocol_v1":
+            raise RuntimeError("unsupported paper2 protocol schema")
+        paper2_protocol_sha256 = _file_sha256(paper2_protocol_path)
+        if float(paper2_protocol["primary_radius_rms"]) != float(
+            args.target_rms
+        ):
+            raise RuntimeError(
+                "paper2 primary radius differs from the solver radius"
+            )
+        required_commit = paper2_protocol.get("implementation_commit")
+        if required_commit not in {None, "RUNTIME_BOUND"} and (
+            required_commit != os.environ.get("EXPECTED_COMMIT")
+        ):
+            raise RuntimeError("paper2 protocol implementation commit mismatch")
     g1f = bool(args.activation_aware_g1f)
     g1f1 = bool(args.activation_aware_g1f1)
     g1f2 = bool(args.activation_aware_g1f2)
@@ -7836,8 +8616,14 @@ def run(args):
     evaluation_role = (
         args.evaluation_role if g1e_family else "validation"
     )
-    if g1f2 and evaluation_role != "train_calibration":
-        raise RuntimeError("V15.15g1f2 is train-calibration-only")
+    if (
+        g1f2
+        and evaluation_role != "train_calibration"
+        and paper2_protocol is None
+    ):
+        raise RuntimeError(
+            "V15.15g1f2 validation is reserved for a frozen paper2 protocol"
+        )
     if (
         g1e_family
         and evaluation_role == "final_held_out"
@@ -7871,7 +8657,11 @@ def run(args):
     evaluation_case_uids = {
         str(sample["case_uid"]) for sample in teacher.get("samples", [])
     }
-    if g1f2 and REUSED_DEVELOPMENT_CASE_UID in evaluation_case_uids:
+    if (
+        g1f2
+        and paper2_protocol is None
+        and REUSED_DEVELOPMENT_CASE_UID in evaluation_case_uids
+    ):
         raise RuntimeError("V15.15g1f2 must not run development case 53")
     if (
         g1e_family
@@ -8047,7 +8837,12 @@ def run(args):
                     if g1f
                     else G1E_TRAIN_CONTRACT_SCHEMA
                 )
-                if train_shadow_contract.get("schema") != expected_contract_schema:
+                allowed_contract_schemas = {expected_contract_schema}
+                if g1f2 and paper2_protocol is not None:
+                    allowed_contract_schemas.add(G1F3_TRAIN_CONTRACT_SCHEMA)
+                if train_shadow_contract.get("schema") not in (
+                    allowed_contract_schemas
+                ):
                     raise RuntimeError("frozen g1e/g1f repair contract mismatch")
                 if g1f3 and (
                     train_shadow_contract.get("progress_mode")
@@ -8072,9 +8867,21 @@ def run(args):
                     raise RuntimeError(
                         "frozen g1e repair contract train-bank hash mismatch"
                     )
-                if train_shadow_contract.get("correction_budgets") != [
+                frozen_budgets = {
+                    int(value)
+                    for value in train_shadow_contract.get(
+                        "correction_budgets", []
+                    )
+                }
+                requested_budgets = {
                     int(value) for value in args.steps
-                ]:
+                }
+                budget_match = (
+                    requested_budgets.issubset(frozen_budgets)
+                    if paper2_protocol is not None
+                    else requested_budgets == frozen_budgets
+                )
+                if not budget_match:
                     raise RuntimeError("frozen g1e correction budget mismatch")
                 if float(train_shadow_contract.get("target_rms")) != float(
                     args.target_rms
@@ -8396,6 +9203,40 @@ def run(args):
                 "teacher_or_label_consumed": False,
             }
 
+    paper2_recorder = None
+    paper2_jet_cache = {}
+    if args.paper2_mechanism_output:
+        binding = {
+            "schema": "paper2_mechanism_binding_v1",
+            "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
+            "protocol_sha256": paper2_protocol_sha256,
+            "evaluation_teacher_bank_sha256": _file_sha256(teacher_path),
+            "train_teacher_bank_sha256": _file_sha256(train_teacher_path),
+            "adapter_state_sha256": _file_sha256(state_path),
+            "full_shadow_contract_sha256": _file_sha256(
+                train_shadow_contract_path
+            ),
+            "case_uids": sorted(args.paper2_mechanism_case_uid),
+            "radii_rms": [
+                float(value) for value in args.paper2_mechanism_radii
+            ],
+            "candidate_source": "selected_physical_direction_by_method",
+            "candidate_quota_per_case_budget": int(
+                args.paper2_mechanism_max_candidates_per_case_budget
+            ),
+            "progress_mode": progress_policy.mode,
+            "metric_mode": metric_operator.mode,
+            "authoritative_acceptance_path_changed": False,
+        }
+        paper2_recorder = paper2_audit.JsonlMechanismRecorder(
+            path=args.paper2_mechanism_output,
+            binding=binding,
+            case_uids=args.paper2_mechanism_case_uid,
+            max_candidates_per_case_budget=(
+                args.paper2_mechanism_max_candidates_per_case_budget
+            ),
+        )
+
     variants = {}
     variant_tangents = {}
     variant_correction_reports = {}
@@ -8433,6 +9274,14 @@ def run(args):
                     continue
                 uid = str(sample["case_uid"])
                 global_case = int(sample["case_index"])
+                if paper2_case_uids and uid not in paper2_case_uids:
+                    correction_reports[uid] = {
+                        "execution_skipped": True,
+                        "execution_skip_reason": "paper2_case_shard",
+                        "runtime_case_label_consumed": False,
+                        "numeric_failure": False,
+                    }
+                    continue
                 if diagnostic_case_uids and uid not in diagnostic_case_uids:
                     correction_reports[uid] = {
                         "execution_skipped": True,
@@ -8566,6 +9415,15 @@ def run(args):
                             progress_policy=progress_policy,
                             metric_operator=metric_operator,
                             case_uid=str(sample["case_uid"]),
+                            paper2_recorder=paper2_recorder,
+                            paper2_radii=tuple(
+                                float(value)
+                                for value in args.paper2_mechanism_radii
+                            ),
+                            paper2_geodesic_acceleration_ablation=bool(
+                                args.paper2_geodesic_acceleration_ablation
+                            ),
+                            paper2_jet_cache=paper2_jet_cache,
                         )
                     )
                 elif g1d_family:
@@ -9662,7 +10520,29 @@ def run(args):
             else SCHEMA
         ),
         "implementation_commit": os.environ.get("EXPECTED_COMMIT"),
-        "diagnostic_only": bool(diagnostic_case_uids),
+        "paper2_protocol": (
+            str(paper2_protocol_path) if paper2_protocol_path else None
+        ),
+        "paper2_protocol_sha256": paper2_protocol_sha256,
+        "paper2_case_shard_uids": sorted(paper2_case_uids),
+        "paper2_mechanism_audit": (
+            paper2_recorder.audit() if paper2_recorder else None
+        ),
+        "paper2_mechanism_artifact_sha256": (
+            _file_sha256(paper2_recorder.path)
+            if paper2_recorder is not None
+            and paper2_recorder.path.exists()
+            else None
+        ),
+        "paper2_main_radius_matched_audit_embedded": bool(g1f3),
+        "paper2_raw_model_audit_separated_from_projected_closure": bool(
+            g1f3
+        ),
+        "diagnostic_only": bool(
+            diagnostic_case_uids
+            or paper2_case_uids
+            or paper2_recorder is not None
+        ),
         "diagnostic_case_uids": sorted(diagnostic_case_uids),
         "diagnostic_results_must_not_be_used_as_train_acceptance": bool(
             diagnostic_case_uids
@@ -10318,6 +11198,48 @@ def main():
         help="g1f4 P-only train diagnostic scope; repeat for each case UID",
     )
     parser.add_argument(
+        "--paper2-protocol",
+        help="immutable paper-2 experiment protocol JSON",
+    )
+    parser.add_argument(
+        "--paper2-case-uid",
+        action="append",
+        default=[],
+        help=(
+            "diagnostic execution shard; repeat to run only preregistered "
+            "case UIDs while retaining the complete authoritative transaction"
+        ),
+    )
+    parser.add_argument(
+        "--paper2-mechanism-output",
+        help="append resumable matched-candidate same-ray records as JSONL",
+    )
+    parser.add_argument(
+        "--paper2-mechanism-case-uid",
+        action="append",
+        default=[],
+        help="preregistered train case eligible for the mechanism pool",
+    )
+    parser.add_argument(
+        "--paper2-mechanism-radii",
+        type=float,
+        nargs="+",
+        default=(3.0e-5, 1.0e-4, 3.0e-4),
+    )
+    parser.add_argument(
+        "--paper2-mechanism-max-candidates-per-case-budget",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--paper2-geodesic-acceleration-ablation",
+        action="store_true",
+        help=(
+            "diagnostic-only tangent-line curvature contrast; never used "
+            "for candidate selection or acceptance"
+        ),
+    )
+    parser.add_argument(
         "--evaluation-role",
         choices=(
             "train_calibration",
@@ -10506,8 +11428,57 @@ def main():
                 "diagnostic case scope requires P-only identity train calibration "
                 "with --steps 5"
             )
+    elif args.paper2_case_uid:
+        if (
+            len(set(args.steps)) != len(args.steps)
+            or not set(args.steps).issubset({2, 3, 5})
+        ):
+            parser.error(
+                "paper2 case shards may select unique budgets from 2 3 5"
+            )
     elif tuple(sorted(set(args.steps))) != (2, 3, 5):
         parser.error("--steps must contain exactly 2 3 5")
+    paper2_enabled = bool(
+        args.paper2_case_uid or args.paper2_mechanism_output
+    )
+    if paper2_enabled and not args.paper2_protocol:
+        parser.error("paper2 execution requires --paper2-protocol")
+    if args.paper2_protocol and not paper2_enabled:
+        parser.error(
+            "--paper2-protocol requires a paper2 case shard or mechanism output"
+        )
+    if args.paper2_mechanism_output:
+        if (
+            not (
+                args.activation_aware_g1f2
+                or args.activation_aware_g1f3
+            )
+            or args.metric_mode != g1f4_policies.IDENTITY_METRIC
+            or args.evaluation_role != "train_calibration"
+            or not args.paper2_mechanism_case_uid
+        ):
+            parser.error(
+                "same-ray mechanism audit requires train g1f2/g1f3 identity mode "
+                "and a preregistered mechanism case list"
+            )
+        radii = tuple(float(value) for value in args.paper2_mechanism_radii)
+        if (
+            tuple(sorted(set(radii))) != radii
+            or any(not math.isfinite(value) or value <= 0.0 for value in radii)
+            or 1.0e-4 not in radii
+        ):
+            parser.error(
+                "mechanism radii must be sorted, unique, positive and include 1e-4"
+            )
+        if not 1 <= args.paper2_mechanism_max_candidates_per_case_budget <= 3:
+            parser.error("mechanism candidate quota must be in [1, 3]")
+    elif (
+        args.paper2_mechanism_case_uid
+        or args.paper2_geodesic_acceleration_ablation
+    ):
+        parser.error(
+            "mechanism cases/ablation require --paper2-mechanism-output"
+        )
     if args.step_size <= 0.0:
         parser.error("--step-size must be positive")
     if not 0.0 < args.trust_fraction <= 1.0:
@@ -10616,8 +11587,11 @@ def main():
     if (
         args.activation_aware_g1f2
         and args.evaluation_role != "train_calibration"
+        and not args.paper2_protocol
     ):
-        parser.error("V15.15g1f2 is train-calibration-only")
+        parser.error(
+            "V15.15g1f2 validation requires a frozen paper2 protocol"
+        )
     if (
         not (
             args.activation_aware_g1e

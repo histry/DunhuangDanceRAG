@@ -1,0 +1,89 @@
+{
+  "schema": "paper2_eval_protocol_v1",
+  "title": "Finite-radius matched-candidate and single-radius closure evaluation",
+  "implementation_commit": "RUNTIME_BOUND",
+  "primary_radius_rms": 0.0001,
+  "mechanism_audit": {
+    "split": "train",
+    "case_count_min": 12,
+    "case_count_max": 20,
+    "case_selection": "deterministic_preregistered_manifest",
+    "radii_rms": [0.00003, 0.0001, 0.0003],
+    "candidate_sources": [
+      "g1f2_selected_physical_direction",
+      "g1f3_selected_physical_direction",
+      "deterministic_verified_basis_0"
+    ],
+    "max_candidates_per_case_budget_source": 2,
+    "include_rejected_candidates": true,
+    "same_ray_definition": "owned_identity_unit_radial_and_tangent_vectors",
+    "recompute_jet_at_each_radius": true,
+    "separate_frozen_witness_and_authoritative_hard_guard": true,
+    "geodesic_acceleration_ablation": true,
+    "projector_in_model_audit": false
+  },
+  "closure_evaluation": {
+    "primary_radius_rms": 0.0001,
+    "methods": ["adapter", "g1f2", "g1f3"],
+    "development_budgets": [5],
+    "formal_budgets": [2, 3, 5],
+    "primary_endpoint": "Closure@5",
+    "secondary_endpoint": "Closure@2/3/5",
+    "projector_and_authoritative_guard_required": true,
+    "k5_prefix_may_substitute_for_k2_or_k3": false,
+    "p_m_factorial_role": "secondary_diagnostic_only"
+  },
+  "splits": {
+    "train": "mechanism_and_contract_calibration_only",
+    "development": "design_validation_then_protocol_freeze",
+    "sealed_held_out": "one_shot_after_freeze"
+  },
+  "reporting": {
+    "normalized_by_frozen_contract_scale": true,
+    "metrics": [
+      "E1",
+      "E2",
+      "E1_minus_E2",
+      "log_E2_over_E1",
+      "probability_E2_less_than_E1",
+      "witness_transition",
+      "Closure@budget",
+      "runtime_seconds",
+      "function_call_counts"
+    ],
+    "stratify_by_witness_transition": true,
+    "raw_model_accuracy_separate_from_end_to_end_closure": true
+  },
+  "solver_common_args": [
+    "--severity-envelope-absolute-margin", "1e-6",
+    "--severity-scale-floor", "1e-6",
+    "--severity-conformal-shrinkage", "0.1",
+    "--severity-conformal-uncertainty-fraction", "0.05",
+    "--guard-proxy-nonregression-tolerance", "1e-6",
+    "--guard-smooth-max-temperature", "1e-3",
+    "--correction-temporal-smoothness-weight", "0.05",
+    "--guard-minimum-reduction", "1e-12",
+    "--guard-safe-interior-margin", "1e-6",
+    "--full-shadow-lse-allowance-fraction", "0.01",
+    "--full-shadow-lse-temperature-floor", "1e-8",
+    "--full-shadow-projection-damping", "1e-12",
+    "--full-shadow-line-search-backtracks", "12",
+    "--full-shadow-line-search-decay", "0.5",
+    "--science-restoration-damping", "1e-8",
+    "--science-restoration-safety-fraction", "0.25",
+    "--geodesic-angular-max-radians", "0.7853981633974483",
+    "--joint-svd-relative-cutoff", "1e-6",
+    "--joint-direction-norm-floor", "1e-8",
+    "--joint-directional-margin", "1e-6",
+    "--temporal-fd-epsilon-radians", "1e-4",
+    "--temporal-fd-relative-error-tolerance", "0.1",
+    "--temporal-fd-absolute-floor", "1e-8",
+    "--temporal-fd-near-zero-threshold", "1e-5",
+    "--second-order-basis-dimension", "5",
+    "--second-order-grid-levels", "9",
+    "--second-order-feasibility-tolerance", "1e-12",
+    "--second-order-guard-transition-band", "1e-5",
+    "--target-rms", "1e-4"
+  ],
+  "authoritative_solver_or_witness_selection_changed": false
+}
