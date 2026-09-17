@@ -14,6 +14,8 @@ from pathlib import Path
 PROTOCOL_SCHEMA = "paper2_eval_protocol_v1"
 MANIFEST_SCHEMA = "paper2_case_manifest_v1"
 ALLOWED_NATIVE_RETURN_CODES = {0, 2}
+PAPER2_EXECUTION_STANDARD = "standard"
+PAPER2_EXECUTION_MECHANISM_PREREGISTERED = "mechanism_preregistered"
 
 
 def _canonical_sha(value):
@@ -92,8 +94,21 @@ def _numeric_failure_diagnostics(case):
     }
 
 
-def _validate_case_result(report_path, case_uid, method, budget):
+def _validate_case_result(report_path, case_uid, method, budget, phase):
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    expected_intent = (
+        PAPER2_EXECUTION_MECHANISM_PREREGISTERED
+        if phase == "mechanism"
+        else PAPER2_EXECUTION_STANDARD
+    )
+    if report.get("paper2_phase") != phase:
+        raise RuntimeError(
+            f"{method} k{budget} report phase mismatch for {case_uid}"
+        )
+    if report.get("paper2_execution_intent") != expected_intent:
+        raise RuntimeError(
+            f"{method} k{budget} execution intent mismatch for {case_uid}"
+        )
     variant = f"geodesic_joint_sqp_k{int(budget)}"
     case = (
         report.get("variants", {}).get(variant, {})
@@ -109,6 +124,55 @@ def _validate_case_result(report_path, case_uid, method, budget):
             f"{method} k{budget} numeric failure for {case_uid}: "
             f"{json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)}"
         )
+    if phase == "mechanism" and method == "g1f3":
+        expected = {
+            "paper2_preregistered_evaluation": True,
+            "candidate_execution_required": True,
+            "diagnostic_only": True,
+            "runtime_activation_overridden": False,
+            "runtime_case_label_consumed": False,
+        }
+        mismatches = {
+            key: {"expected": value, "actual": case.get(key)}
+            for key, value in expected.items()
+            if case.get(key) is not value
+        }
+        runtime_activation_authorized = case.get(
+            "runtime_activation_authorized"
+        )
+        runtime_selection_eligible = case.get(
+            "runtime_selection_eligible"
+        )
+        if not isinstance(runtime_activation_authorized, bool):
+            mismatches["runtime_activation_authorized"] = {
+                "expected": "bool",
+                "actual": runtime_activation_authorized,
+            }
+        if (
+            not isinstance(runtime_selection_eligible, bool)
+            or runtime_selection_eligible is not runtime_activation_authorized
+        ):
+            mismatches["runtime_selection_eligible"] = {
+                "expected": runtime_activation_authorized,
+                "actual": runtime_selection_eligible,
+            }
+        mechanism_audit = case.get("mechanism_audit") or {}
+        runtime_closure = case.get("runtime_closure") or {}
+        if mechanism_audit.get("preregistered_evaluation") is not True:
+            mismatches["mechanism_audit.preregistered_evaluation"] = {
+                "expected": True,
+                "actual": mechanism_audit.get("preregistered_evaluation"),
+            }
+        if runtime_closure.get("activation_overridden") is not False:
+            mismatches["runtime_closure.activation_overridden"] = {
+                "expected": False,
+                "actual": runtime_closure.get("activation_overridden"),
+            }
+        if mismatches:
+            raise RuntimeError(
+                f"{method} k{budget} execution-policy mismatch for "
+                f"{case_uid}: {json.dumps(mismatches, sort_keys=True)}"
+            )
     return {
         "report": str(Path(report_path).resolve()),
         "report_sha256": _file_sha(report_path),
@@ -205,6 +269,11 @@ def main():
     if len(set(budgets)) != len(budgets) or not set(budgets) <= {2, 3, 5}:
         raise RuntimeError("budgets must be unique members of 2, 3, 5")
     methods = ("g1f2", "g1f3") if args.method == "both" else (args.method,)
+    execution_intent = (
+        PAPER2_EXECUTION_MECHANISM_PREREGISTERED
+        if args.phase == "mechanism"
+        else PAPER2_EXECUTION_STANDARD
+    )
     output_root = Path(args.output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -212,6 +281,7 @@ def main():
         "schema": "paper2_run_binding_v1",
         "implementation_commit": expected_commit,
         "phase": args.phase,
+        "paper2_execution_intent": execution_intent,
         "protocol": str(protocol_path),
         "protocol_sha256": _file_sha(protocol_path),
         "case_manifest": str(manifest_path),
@@ -324,6 +394,8 @@ def main():
                     ),
                     "--steps", str(budget),
                     "--paper2-protocol", str(protocol_path),
+                    "--paper2-phase", args.phase,
+                    "--paper2-execution-intent", execution_intent,
                     "--paper2-case-uid", case_uid,
                     "--output-dir", str(attempt_root),
                     *[str(value) for value in protocol["solver_common_args"]],
@@ -370,7 +442,7 @@ def main():
                     raise RuntimeError(f"{job_name} did not produce a report")
                 try:
                     result = _validate_case_result(
-                        report_path, case_uid, method, budget
+                        report_path, case_uid, method, budget, args.phase
                     )
                 except Exception as exc:
                     failure = {

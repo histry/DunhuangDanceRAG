@@ -154,6 +154,13 @@ G1F4_P_DIAGNOSTIC_CASE_UIDS = (
     "txn_0005_a6fbd294b71c:169",
     "txn_0007_0d8eea4df4f1:137",
 )
+PAPER2_EXECUTION_STANDARD = "standard"
+PAPER2_EXECUTION_MECHANISM_PREREGISTERED = "mechanism_preregistered"
+PAPER2_EXECUTION_INTENTS = (
+    PAPER2_EXECUTION_STANDARD,
+    PAPER2_EXECUTION_MECHANISM_PREREGISTERED,
+)
+PAPER2_PHASES = ("mechanism", "development", "formal", "sealed")
 HARD_NEGATIVE_SCHEMA = "refiner_v15_15g_guard_rejected_direction_bank_v1"
 TEACHER_SCHEMA = adapter.V15_15E_TEACHER_SCHEMA
 METHODS = ("adapter", "euclidean_projected", "riemannian_retraction")
@@ -223,6 +230,76 @@ def _file_sha256(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _paper2_candidate_execution_policy(
+    *,
+    execution_intent,
+    evaluation_role,
+    case_uid,
+    preregistered_case_uids,
+    runtime_activation_authorized,
+    calibration_forced_evaluation,
+):
+    """Separate diagnostic computation from deployment selection authority."""
+    if execution_intent not in PAPER2_EXECUTION_INTENTS:
+        raise ValueError(f"unsupported paper2 execution intent: {execution_intent}")
+    paper2_preregistered_evaluation = bool(
+        execution_intent == PAPER2_EXECUTION_MECHANISM_PREREGISTERED
+        and evaluation_role == "train_calibration"
+        and str(case_uid) in frozenset(preregistered_case_uids)
+    )
+    runtime_activation_authorized = bool(runtime_activation_authorized)
+    calibration_forced_evaluation = bool(calibration_forced_evaluation)
+    candidate_execution_required = bool(
+        runtime_activation_authorized
+        or paper2_preregistered_evaluation
+        or calibration_forced_evaluation
+    )
+    if runtime_activation_authorized:
+        execution_reason = "runtime_activation_authorized"
+    elif paper2_preregistered_evaluation:
+        execution_reason = "paper2_mechanism_preregistered_audit"
+    elif calibration_forced_evaluation:
+        execution_reason = "train_calibration_forced_audit"
+    else:
+        execution_reason = "observable_activation_not_authorized"
+    runtime_selection_eligible = runtime_activation_authorized
+    policy = {
+        "runtime_activation_authorized": runtime_activation_authorized,
+        "paper2_preregistered_evaluation": paper2_preregistered_evaluation,
+        "candidate_execution_required": candidate_execution_required,
+        "runtime_selection_eligible": runtime_selection_eligible,
+        "execution_reason": execution_reason,
+        "diagnostic_only": paper2_preregistered_evaluation,
+        "runtime_activation_overridden": False,
+        "runtime_case_label_consumed": False,
+    }
+    policy["mechanism_audit"] = {
+        "preregistered_evaluation": paper2_preregistered_evaluation,
+        "candidate_execution_required": candidate_execution_required,
+        "execution_reason": execution_reason,
+        "diagnostic_only": paper2_preregistered_evaluation,
+    }
+    policy["runtime_closure"] = {
+        "activation_authorized": runtime_activation_authorized,
+        "selection_eligible": runtime_selection_eligible,
+        "activation_overridden": False,
+        "case_label_consumed": False,
+    }
+    return policy
+
+
+def _assert_paper2_runtime_selection_isolated(policy, selected_method):
+    if (
+        policy["paper2_preregistered_evaluation"]
+        and not policy["runtime_selection_eligible"]
+        and selected_method != "identity"
+    ):
+        raise RuntimeError(
+            "paper2 diagnostic candidate reached runtime selection without "
+            "observable activation authorization"
+        )
 
 
 def _canonical_json_sha256(value):
@@ -8486,6 +8563,8 @@ def _g1c_fixed_guard_shadow_selection(
     severity_envelope,
     evaluation_role="inference",
     metric_operator=None,
+    paper2_execution_intent=PAPER2_EXECUTION_STANDARD,
+    paper2_case_uids=(),
 ):
     """Select with observable activation and authoritative Guard shadows.
 
@@ -8524,10 +8603,33 @@ def _g1c_fixed_guard_shadow_selection(
         calibration_probe_forced_evaluation = bool(
             declared_target_probe or train_cross_calibration_probe
         )
-        candidate_evaluation_authorized = bool(
-            severity["activation_supported_by_observables"]
-            or calibration_probe_forced_evaluation
+        execution_policy = _paper2_candidate_execution_policy(
+            execution_intent=paper2_execution_intent,
+            evaluation_role=evaluation_role,
+            case_uid=uid,
+            preregistered_case_uids=paper2_case_uids,
+            runtime_activation_authorized=severity[
+                "activation_supported_by_observables"
+            ],
+            calibration_forced_evaluation=(
+                calibration_probe_forced_evaluation
+            ),
         )
+        candidate_evaluation_authorized = bool(
+            (
+                execution_policy["runtime_selection_eligible"]
+                or calibration_probe_forced_evaluation
+            )
+            and not (
+                execution_policy["paper2_preregistered_evaluation"]
+                and not execution_policy["runtime_selection_eligible"]
+            )
+        )
+        if (
+            execution_policy["paper2_preregistered_evaluation"]
+            and not execution_policy["runtime_selection_eligible"]
+        ):
+            assert not candidate_evaluation_authorized
         if candidate_evaluation_authorized:
             for method, tangent in variants.items():
                 evidence = _g1c_candidate_evidence(
@@ -8635,9 +8737,20 @@ def _g1c_fixed_guard_shadow_selection(
                     ~mask, 0.0
                 )
 
+        _assert_paper2_runtime_selection_isolated(
+            execution_policy, selected_method
+        )
+
         fallback_reason = None
         if selected_method == "identity":
-            if calibration_probe_forced_evaluation:
+            if (
+                execution_policy["paper2_preregistered_evaluation"]
+                and not execution_policy["runtime_selection_eligible"]
+            ):
+                fallback_reason = (
+                    "paper2_mechanism_diagnostic_not_runtime_eligible"
+                )
+            elif calibration_probe_forced_evaluation:
                 fallback_reason = "train_calibration_probe_no_exact_candidate"
             elif severity["severity_abstained"]:
                 fallback_reason = "discriminative_conformal_uncertain"
@@ -8663,6 +8776,7 @@ def _g1c_fixed_guard_shadow_selection(
             "runtime_activation_supported_by_observables": bool(
                 severity["activation_supported_by_observables"]
             ),
+            **execution_policy,
             "selection": {
                 "anchor_severity": severity,
                 "activation_condition": (
@@ -8878,6 +8992,8 @@ def _local_feasible_intersection_summary(correction_reports):
 def run(args):
     started = time.perf_counter()
     paper2_case_uids = frozenset(args.paper2_case_uid or ())
+    paper2_phase = args.paper2_phase
+    paper2_execution_intent = args.paper2_execution_intent
     paper2_protocol_path = (
         Path(args.paper2_protocol).resolve()
         if args.paper2_protocol else None
@@ -9688,6 +9804,7 @@ def run(args):
                         "numeric_failure": False,
                     }
                     continue
+                execution_policy = None
                 if g1f3:
                     if evaluation_role == "train_calibration":
                         severity = _discriminative_conformal_status(
@@ -9707,18 +9824,26 @@ def run(args):
                             == "exact_projected_direction"
                         )
                     )
-                    generation_authorized = bool(
-                        severity["activation_supported_by_observables"]
-                        or forced_train_audit
+                    execution_policy = _paper2_candidate_execution_policy(
+                        execution_intent=paper2_execution_intent,
+                        evaluation_role=evaluation_role,
+                        case_uid=uid,
+                        preregistered_case_uids=paper2_case_uids,
+                        runtime_activation_authorized=severity[
+                            "activation_supported_by_observables"
+                        ],
+                        calibration_forced_evaluation=forced_train_audit,
                     )
-                    if not generation_authorized:
+                    if not execution_policy[
+                        "candidate_execution_required"
+                    ]:
                         correction_reports[uid] = {
                             "execution_skipped": True,
-                            "execution_skip_reason": (
-                                "observable_activation_not_authorized"
-                            ),
-                            "runtime_case_label_consumed": False,
+                            "execution_skip_reason": execution_policy[
+                                "execution_reason"
+                            ],
                             "numeric_failure": False,
+                            **execution_policy,
                         }
                         continue
                     cached = g1f3_closure_tangent_by_uid.get(uid)
@@ -9734,6 +9859,7 @@ def run(args):
                             ),
                             "raw_projector_full_guard_reaudit_required": True,
                             "numeric_failure": False,
+                            **execution_policy,
                         }
                         continue
                 transaction_id = str(sample["transaction_id"])
@@ -9907,6 +10033,8 @@ def run(args):
                     correction_report = _g1c_name_case_physical_diagnostics(
                         correction_report
                     )
+                if execution_policy is not None:
+                    correction_report.update(execution_policy)
                 print(json.dumps({
                     "stage": "v15_15g_correction_case_complete",
                     "variant": f"{method}_k{budget}",
@@ -10069,6 +10197,8 @@ def run(args):
                 severity_envelope=severity_envelope,
                 evaluation_role=evaluation_role,
                 metric_operator=metric_operator,
+                paper2_execution_intent=paper2_execution_intent,
+                paper2_case_uids=paper2_case_uids,
             )
         elif args.activation_aware_g1b:
             (
@@ -10922,6 +11052,8 @@ def run(args):
             str(paper2_protocol_path) if paper2_protocol_path else None
         ),
         "paper2_protocol_sha256": paper2_protocol_sha256,
+        "paper2_phase": paper2_phase,
+        "paper2_execution_intent": paper2_execution_intent,
         "paper2_case_shard_uids": sorted(paper2_case_uids),
         "paper2_mechanism_audit": (
             paper2_recorder.audit() if paper2_recorder else None
@@ -10936,6 +11068,16 @@ def run(args):
         "paper2_raw_model_audit_separated_from_projected_closure": bool(
             g1f3
         ),
+        "mechanism_audit": {
+            "execution_intent": paper2_execution_intent,
+            "preregistered_case_uids": sorted(paper2_case_uids),
+            "candidate_computation_independent_of_runtime_selection": True,
+        } if paper2_phase == "mechanism" else None,
+        "runtime_closure": {
+            "paper2_diagnostic_selection_requires_runtime_activation": True,
+            "activation_overridden": False,
+            "paper2_diagnostic_runtime_case_label_consumed": False,
+        } if paper2_protocol_path is not None else None,
         "diagnostic_only": bool(
             diagnostic_case_uids
             or paper2_case_uids
@@ -10944,6 +11086,8 @@ def run(args):
         "diagnostic_case_uids": sorted(diagnostic_case_uids),
         "diagnostic_results_must_not_be_used_as_train_acceptance": bool(
             diagnostic_case_uids
+            or paper2_execution_intent
+            == PAPER2_EXECUTION_MECHANISM_PREREGISTERED
         ),
         "g1f4_shared_policy_metric_path": bool(g1f3),
         "progress_mode": progress_policy.mode,
@@ -11600,6 +11744,21 @@ def main():
         help="immutable paper-2 experiment protocol JSON",
     )
     parser.add_argument(
+        "--paper2-phase",
+        choices=PAPER2_PHASES,
+        help="paper-2 phase bound by the experiment runner",
+    )
+    parser.add_argument(
+        "--paper2-execution-intent",
+        choices=PAPER2_EXECUTION_INTENTS,
+        default=PAPER2_EXECUTION_STANDARD,
+        help=(
+            "candidate-computation intent; mechanism_preregistered may "
+            "require diagnostic computation but never overrides runtime "
+            "selection eligibility"
+        ),
+    )
+    parser.add_argument(
         "--paper2-case-uid",
         action="append",
         default=[],
@@ -11892,6 +12051,54 @@ def main():
         parser.error(
             "--paper2-protocol requires a paper2 case shard or mechanism output"
         )
+    if paper2_enabled and not args.paper2_phase:
+        parser.error("paper2 execution requires an explicit --paper2-phase")
+    if not paper2_enabled and (
+        args.paper2_phase
+        or args.paper2_execution_intent != PAPER2_EXECUTION_STANDARD
+    ):
+        parser.error(
+            "paper2 phase/execution intent requires a paper2 case shard or "
+            "mechanism output"
+        )
+    expected_evaluation_role = {
+        "mechanism": "train_calibration",
+        "development": "development_validation",
+        "formal": "development_validation",
+        "sealed": "final_held_out",
+    }.get(args.paper2_phase)
+    if (
+        expected_evaluation_role is not None
+        and args.evaluation_role != expected_evaluation_role
+    ):
+        parser.error(
+            f"paper2 phase {args.paper2_phase} requires evaluation role "
+            f"{expected_evaluation_role}"
+        )
+    if (
+        args.paper2_execution_intent
+        == PAPER2_EXECUTION_MECHANISM_PREREGISTERED
+    ):
+        if (
+            args.paper2_phase != "mechanism"
+            or args.evaluation_role != "train_calibration"
+            or not args.paper2_mechanism_output
+        ):
+            parser.error(
+                "mechanism_preregistered intent requires paper2 mechanism "
+                "phase, train_calibration, and --paper2-mechanism-output"
+            )
+    elif args.paper2_phase == "mechanism":
+        parser.error(
+            "paper2 mechanism phase requires --paper2-execution-intent "
+            "mechanism_preregistered"
+        )
+    if args.paper2_phase in {"development", "formal", "sealed"} and (
+        args.paper2_execution_intent != PAPER2_EXECUTION_STANDARD
+    ):
+        parser.error(
+            "development/formal/sealed require standard paper2 execution"
+        )
     if args.paper2_mechanism_output:
         if (
             not (
@@ -11905,6 +12112,13 @@ def main():
             parser.error(
                 "same-ray mechanism audit requires train g1f2/g1f3 identity mode "
                 "and a preregistered mechanism case list"
+            )
+        if not set(args.paper2_case_uid).issubset(
+            set(args.paper2_mechanism_case_uid)
+        ):
+            parser.error(
+                "paper2 mechanism shard must be contained in the "
+                "preregistered mechanism case list"
             )
         radii = tuple(float(value) for value in args.paper2_mechanism_radii)
         if (

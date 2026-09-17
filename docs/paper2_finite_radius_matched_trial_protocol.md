@@ -14,6 +14,25 @@ the `1e-4` production radius, fixed angles, or correction budgets.
 - Projector and final full Guard remain the only source of end-to-end closure.
   A smaller model error is never reported as a safety or closure certificate.
 
+## Execution and selection separation
+
+The mechanism runner binds the explicit execution intent
+`mechanism_preregistered`.  For a preregistered train mechanism case this
+intent may require candidate computation even when the observable activation
+gate is false.  It does not change that gate and does not make the candidate
+eligible for runtime selection.  Reports preserve both decisions separately:
+
+```text
+candidate_execution_required
+runtime_selection_eligible
+```
+
+An inactive diagnostic candidate is available only to the matched-trial
+recorder; the runtime selector must return identity for that candidate.  The
+`development`, `formal`, and `sealed` phases bind the `standard` execution
+intent and cannot use the mechanism privilege.  Each phase report separates
+the `mechanism_audit` namespace from `runtime_closure` evidence.
+
 ## Low-compute mechanism pool
 
 Freeze a 12--20 case train manifest before running.  The mechanism runner
