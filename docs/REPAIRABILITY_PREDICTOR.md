@@ -84,6 +84,8 @@ from being justified merely by adding features.
 First run full songs with:
 
 ```bash
+export GAR_EVALUATION_TRACE_ENABLE=1
+export GAR_EVALUATION_METHOD_VARIANT_ID=repairability_shadow
 export REPAIRABILITY_MODE=shadow
 export REPAIRABILITY_CHECKPOINT=/absolute/path/repairability_mlp.pt
 bash run.sh
@@ -96,6 +98,9 @@ rate, reselection count and end-to-end runtime.  Final unsafe-boundary rate is a
 non-inferiority constraint; Router quality, motion activity, diversity and
 fidelity must not regress.  MLP forward time alone is not a runtime claim—the
 complete-pool bridge feature cost is included in end-to-end time.
+Set `GAR_EVALUATION_METHOD_VARIANT_ID=repairability_baseline` for the paired
+`off` run and `repairability_rank` for the paired `rank` run; this field is
+trace metadata and does not alter the decision path.
 
 Paired baseline/rank GAR traces can be checked with:
 

@@ -1162,6 +1162,14 @@ class MotionGenerationConfig:
             "MOTION_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
             "MOTION_DIFFUSION_STEPS": ("diffusion_steps", int),
             "MOTION_DEVICE": ("device", str),
+            "GAR_EVALUATION_TRACE_ENABLE": (
+                "gar_evaluation_trace_enable",
+                lambda x: bool(int(x)),
+            ),
+            "GAR_EVALUATION_METHOD_VARIANT_ID": (
+                "gar_evaluation_method_variant_id",
+                str,
+            ),
         }
         for e, (attr, caster) in env_map.items():
             if e in os.environ:
