@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "refiner_v15_15g1f4_v9_canonical_parity_gate_v1"
+SCHEMA = "refiner_v15_15g1f4_v9_canonical_parity_gate_v2"
 CANONICAL_V9_COMMIT = "be71ae12a637073714d602525166c620f41bd243"
 IGNORED_ADDITIVE_KEYS = {
     "elapsed_seconds",
@@ -95,6 +95,57 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _project_candidate_to_reference_schema(
+    reference: Any,
+    candidate: Any,
+    *,
+    path: str = "$",
+) -> tuple[Any, list[str]]:
+    """Project a newer report onto the canonical report's schema.
+
+    Canonical v9 parity is an operational backward-compatibility check. A
+    newer implementation may add diagnostics, but every value that existed in
+    the canonical report must remain present and equal. The previous
+    implementation compared the union of dictionary keys, so any newly added
+    diagnostic field caused a false parity failure even when all canonical
+    operational values were unchanged.
+    """
+    if isinstance(reference, dict) and isinstance(candidate, dict):
+        projected: dict[str, Any] = {}
+        additive_paths = [
+            f"{path}.{key}"
+            for key in sorted(set(candidate) - set(reference))
+        ]
+        for key, reference_item in reference.items():
+            if key not in candidate:
+                continue
+            projected_item, nested_paths = _project_candidate_to_reference_schema(
+                reference_item,
+                candidate[key],
+                path=f"{path}.{key}",
+            )
+            projected[key] = projected_item
+            additive_paths.extend(nested_paths)
+        return projected, additive_paths
+    if isinstance(reference, list) and isinstance(candidate, list):
+        if len(reference) != len(candidate):
+            return candidate, []
+        projected_items = []
+        additive_paths: list[str] = []
+        for index, (reference_item, candidate_item) in enumerate(
+            zip(reference, candidate)
+        ):
+            projected_item, nested_paths = _project_candidate_to_reference_schema(
+                reference_item,
+                candidate_item,
+                path=f"{path}[{index}]",
+            )
+            projected_items.append(projected_item)
+            additive_paths.extend(nested_paths)
+        return projected_items, additive_paths
+    return candidate, []
+
+
 def _first_differences(
     reference: Any,
     candidate: Any,
@@ -165,13 +216,21 @@ def main() -> int:
         raise RuntimeError("parity candidate is not identity metric")
 
     reference = _canonical_payload(reference_report)
-    candidate = _canonical_payload(candidate_report)
+    candidate_full = _canonical_payload(candidate_report)
+    candidate, additive_paths = _project_candidate_to_reference_schema(
+        reference,
+        candidate_full,
+    )
     differences = _first_differences(reference, candidate)
     accepted = not differences
     result = {
         "schema": SCHEMA,
         "accepted": accepted,
         "comparison": "exact_canonical_v9_operational_parity",
+        "comparison_schema_policy": (
+            "all canonical fields and list structure must match exactly; "
+            "candidate-only additive diagnostics are audited but do not fail parity"
+        ),
         "canonical_v9_commit": CANONICAL_V9_COMMIT,
         "reference": {
             "path": str(reference_path),
@@ -182,6 +241,7 @@ def main() -> int:
             "path": str(candidate_path),
             "sha256": _sha256_file(candidate_path),
             "canonical_sha256": _canonical_sha256(candidate),
+            "full_canonical_sha256": _canonical_sha256(candidate_full),
         },
         "required_equal_fields": [
             "case selection and candidate metrics",
@@ -192,6 +252,9 @@ def main() -> int:
             "active-set and internal-witness generation sequence",
         ],
         "ignored_fields": sorted(IGNORED_ADDITIVE_KEYS),
+        "candidate_only_additive_path_count": len(additive_paths),
+        "candidate_only_additive_paths": additive_paths[:200],
+        "candidate_only_additive_paths_truncated": len(additive_paths) > 200,
         "differences": differences,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,6 +267,7 @@ def main() -> int:
         "accepted": accepted,
         "report": str(output_path),
         "difference_count": len(differences),
+        "candidate_only_additive_path_count": len(additive_paths),
     }), flush=True)
     return 0 if accepted else 2
 
