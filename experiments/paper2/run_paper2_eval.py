@@ -55,6 +55,43 @@ def _git_output(*args):
     ).strip()
 
 
+def _numeric_failure_diagnostics(case):
+    history = []
+    for step in case.get("history") or ():
+        trial_failures = []
+        for trial in step.get("angular_line_search_trials") or ():
+            failed_constraints = tuple(trial.get("failed_constraints") or ())
+            geodesic_update = trial.get("geodesic_update") or {}
+            reason = trial.get("reason")
+            if "numeric" not in failed_constraints and not str(reason).startswith(
+                "nonfinite"
+            ):
+                continue
+            trial_failures.append({
+                "backtrack": trial.get("backtrack"),
+                "theta_radians": trial.get("theta_radians"),
+                "reason": reason,
+                "failed_constraints": list(failed_constraints),
+                "geodesic_update_status": geodesic_update.get(
+                    "geodesic_update_status"
+                ),
+            })
+        history.append({
+            "iteration": step.get("iteration"),
+            "step_rejection_reason": step.get("step_rejection_reason"),
+            "joint_solver_status": (step.get("joint_solver") or {}).get(
+                "solver_status"
+            ),
+            "numeric_trial_failures": trial_failures,
+        })
+    return {
+        "second_order_state": case.get("second_order_state"),
+        "step_rejection_reason": case.get("step_rejection_reason"),
+        "rejection_reason": case.get("rejection_reason"),
+        "history": history,
+    }
+
+
 def _validate_case_result(report_path, case_uid, method, budget):
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
     variant = f"geodesic_joint_sqp_k{int(budget)}"
@@ -67,8 +104,10 @@ def _validate_case_result(report_path, case_uid, method, budget):
             f"{method} k{budget} did not execute preregistered case {case_uid}"
         )
     if case.get("numeric_failure"):
+        diagnostics = _numeric_failure_diagnostics(case)
         raise RuntimeError(
-            f"{method} k{budget} numeric failure for {case_uid}"
+            f"{method} k{budget} numeric failure for {case_uid}: "
+            f"{json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)}"
         )
     return {
         "report": str(Path(report_path).resolve()),
@@ -329,9 +368,31 @@ def main():
                     )
                 if not report_path.is_file():
                     raise RuntimeError(f"{job_name} did not produce a report")
-                result = _validate_case_result(
-                    report_path, case_uid, method, budget
-                )
+                try:
+                    result = _validate_case_result(
+                        report_path, case_uid, method, budget
+                    )
+                except Exception as exc:
+                    failure = {
+                        "schema": "paper2_job_failure_v1",
+                        "job_sha256": job_sha,
+                        "job": job_name,
+                        "native_return_code": native_rc,
+                        "report": str(report_path.resolve()),
+                        "report_sha256": _file_sha(report_path),
+                        "error": str(exc),
+                        **job_spec,
+                    }
+                    failure_path = attempt_root / "paper2_job_failure.json"
+                    _write_json(failure_path, failure)
+                    print(json.dumps({
+                        "stage": "paper2_job_failed",
+                        "job": job_name,
+                        "native_return_code": native_rc,
+                        "failure": str(failure_path),
+                        "error": str(exc),
+                    }, ensure_ascii=False), flush=True)
+                    raise
                 complete = {
                     "schema": "paper2_job_complete_v1",
                     "job_sha256": job_sha,

@@ -52,3 +52,12 @@ The original `protocol.json` remains unchanged so earlier full-reference
 outputs retain their exact protocol hash. A fast run must use a new output
 root because the run binding includes the protocol SHA256 and implementation
 commit.
+
+## Numeric-failure boundary
+
+Finite, explicitly verified execution rejections are not numerical failures.
+A zero geodesic direction/radius or a finite sphere-tangency violation remains
+a fail-closed model/execution abstention. NaN/Inf in the direction, projected
+direction, temporal probe, or generated trial remains a hard numerical
+failure. Paper-2 jobs persist a `paper2_job_failure.json` receipt with the
+exact numeric status before terminating.

@@ -3740,16 +3740,31 @@ def _exact_radius_geodesic_update(
     tangent = direction.detach().masked_fill(~mask, 0.0)
     radial_norm = m.torch.linalg.vector_norm(radial[mask])
     tangent_norm = m.torch.linalg.vector_norm(tangent[mask])
-    if (
-        not bool(m.torch.isfinite(radial_norm))
-        or not bool(m.torch.isfinite(tangent_norm))
-        or float(radial_norm.detach()) <= float(norm_floor)
-        or float(tangent_norm.detach()) <= float(norm_floor)
-    ):
+    radial_finite = bool(m.torch.isfinite(radial_norm))
+    tangent_finite = bool(m.torch.isfinite(tangent_norm))
+    if not radial_finite or not tangent_finite:
         return current.detach(), False, {
-            "geodesic_update_status": "zero_or_nonfinite_geodesic_direction",
+            "geodesic_update_status": "nonfinite_geodesic_direction",
+            "radial_norm_finite": radial_finite,
+            "tangent_norm_finite": tangent_finite,
+        }
+    if float(radial_norm.detach()) <= float(norm_floor):
+        return current.detach(), False, {
+            "geodesic_update_status": "zero_geodesic_radius",
+            "radius_norm_before": float(radial_norm.detach()),
+            "norm_floor": float(norm_floor),
+        }
+    if float(tangent_norm.detach()) <= float(norm_floor):
+        return current.detach(), False, {
+            "geodesic_update_status": "zero_geodesic_direction",
+            "tangent_norm_before": float(tangent_norm.detach()),
+            "norm_floor": float(norm_floor),
         }
     radial_inner = (tangent[mask] * radial[mask]).sum()
+    if not bool(m.torch.isfinite(radial_inner)):
+        return current.detach(), False, {
+            "geodesic_update_status": "nonfinite_geodesic_radial_inner_product",
+        }
     radial_tolerance = max(
         1.0e-12,
         float(radial_norm.detach())
@@ -3771,16 +3786,23 @@ def _exact_radius_geodesic_update(
             m.torch.ones_like(tangent),
         )
     tangent_norm = m.torch.linalg.vector_norm(tangent[mask])
+    if not bool(m.torch.isfinite(tangent_norm)):
+        return current.detach(), False, {
+            "geodesic_update_status": "nonfinite_projected_geodesic_direction",
+        }
     if float(tangent_norm.detach()) <= float(norm_floor):
         return current.detach(), False, {
-            "geodesic_update_status": "zero_or_nonfinite_geodesic_direction",
+            "geodesic_update_status": "zero_projected_geodesic_direction",
+            "tangent_norm_after_projection": float(tangent_norm.detach()),
+            "norm_floor": float(norm_floor),
         }
     theta_tensor = radial_norm.new_tensor(float(theta))
     trial = (
         m.torch.cos(theta_tensor) * radial
         + m.torch.sin(theta_tensor) * radial_norm * tangent / tangent_norm
     ).masked_fill(~mask, 0.0)
-    return trial.detach(), bool(m.torch.isfinite(trial).all()), {
+    trial_finite = bool(m.torch.isfinite(trial).all())
+    audit = {
         "geodesic_update_status": "exact_radius_geodesic_update",
         "theta_radians": float(theta),
         "radius_norm_before": float(radial_norm.detach()),
@@ -3795,6 +3817,27 @@ def _exact_radius_geodesic_update(
             direction_is_sphere_tangent
         ),
     }
+    if not trial_finite:
+        audit["geodesic_update_status"] = "nonfinite_geodesic_trial"
+    return trial.detach(), trial_finite, audit
+
+
+_FINITE_VERIFIED_GEODESIC_REJECTIONS = frozenset({
+    "physical_direction_not_sphere_tangent",
+    "zero_geodesic_radius",
+    "zero_geodesic_direction",
+    "zero_projected_geodesic_direction",
+})
+
+
+def _geodesic_update_is_numeric_failure(audit):
+    """Keep finite fail-closed abstentions out of the numeric-failure gate."""
+    status = str((audit or {}).get("geodesic_update_status") or "")
+    if status in _FINITE_VERIFIED_GEODESIC_REJECTIONS:
+        return False
+    # Unknown failure states stay fail-closed. All currently known genuine
+    # numeric failures use a nonfinite_* status.
+    return status != "exact_radius_geodesic_update"
 
 
 def _temporal_directional_consistency_probe(
@@ -3822,15 +3865,27 @@ def _temporal_directional_consistency_probe(
         and m.torch.isfinite(radial_norm)
         and m.torch.isfinite(temporal_gradient_z).all()
     )
-    if (
-        not finite_direction
-        or float(physical_norm.detach()) <= float(direction_norm_floor)
-        or float(radial_norm.detach()) <= float(direction_norm_floor)
-    ):
+    if not finite_direction:
         return {
             "passed": False,
             "status": "nonfinite_temporal_directional_probe",
             "epsilon_radians": float(epsilon_radians),
+        }
+    if float(physical_norm.detach()) <= float(direction_norm_floor):
+        return {
+            "passed": False,
+            "status": "zero_temporal_directional_probe_direction",
+            "epsilon_radians": float(epsilon_radians),
+            "physical_direction_norm": float(physical_norm.detach()),
+            "direction_norm_floor": float(direction_norm_floor),
+        }
+    if float(radial_norm.detach()) <= float(direction_norm_floor):
+        return {
+            "passed": False,
+            "status": "zero_temporal_directional_probe_radius",
+            "epsilon_radians": float(epsilon_radians),
+            "radial_norm": float(radial_norm.detach()),
+            "direction_norm_floor": float(direction_norm_floor),
         }
 
     # The geodesic parameter is theta.  At theta=0 its physical derivative is
@@ -3878,9 +3933,16 @@ def _temporal_directional_consistency_probe(
             )
         geodesic_audits[label] = geodesic_audit
         if not ok:
+            numeric_failure = _geodesic_update_is_numeric_failure(
+                geodesic_audit
+            )
             return {
                 "passed": False,
-                "status": "nonfinite_temporal_directional_probe",
+                "status": (
+                    "nonfinite_temporal_directional_probe"
+                    if numeric_failure
+                    else "geodesic_rejected_temporal_directional_probe"
+                ),
                 "epsilon_radians": float(epsilon_radians),
                 "geodesic_update_by_side": geodesic_audits,
             }
@@ -4006,16 +4068,30 @@ def _temporal_directional_float64_epsilon_ladder(
         and m.torch.isfinite(physical_norm)
         and m.torch.isfinite(radial_norm)
     )
-    if (
-        not finite
-        or float(physical_norm.detach()) <= float(direction_norm_floor)
-        or float(radial_norm.detach()) <= float(direction_norm_floor)
-    ):
+    if not finite:
         return {
             "passed": False,
             "status": "nonfinite_temporal_float64_epsilon_ladder",
             "dtype": "float64",
             "epsilon_radians": [float(value) for value in epsilon_ladder],
+        }
+    if float(physical_norm.detach()) <= float(direction_norm_floor):
+        return {
+            "passed": False,
+            "status": "zero_temporal_float64_direction",
+            "dtype": "float64",
+            "epsilon_radians": [float(value) for value in epsilon_ladder],
+            "physical_direction_norm": float(physical_norm.detach()),
+            "direction_norm_floor": float(direction_norm_floor),
+        }
+    if float(radial_norm.detach()) <= float(direction_norm_floor):
+        return {
+            "passed": False,
+            "status": "zero_temporal_float64_radius",
+            "dtype": "float64",
+            "epsilon_radians": [float(value) for value in epsilon_ladder],
+            "radial_norm": float(radial_norm.detach()),
+            "direction_norm_floor": float(direction_norm_floor),
         }
 
     autograd_derivative = float((
@@ -4025,12 +4101,14 @@ def _temporal_directional_float64_epsilon_ladder(
     ).detach())
     rows = []
     all_passed = True
+    numeric_failure = False
     for epsilon in epsilon_ladder:
         epsilon = float(epsilon)
         temporal_values = {}
         geodesic_ok = True
+        failed_geodesic_audit = None
         for label, theta in (("plus", epsilon), ("minus", -epsilon)):
-            trial64, ok, _ = _exact_radius_geodesic_update(
+            trial64, ok, geodesic_audit = _exact_radius_geodesic_update(
                 current64,
                 direction64,
                 mask,
@@ -4040,6 +4118,11 @@ def _temporal_directional_float64_epsilon_ladder(
             )
             geodesic_ok = geodesic_ok and ok
             if not ok:
+                failed_geodesic_audit = geodesic_audit
+                numeric_failure = (
+                    numeric_failure
+                    or _geodesic_update_is_numeric_failure(geodesic_audit)
+                )
                 break
             transaction_tangent = _case_isolated_transaction_tangent(
                 baseline64, trial64, local_case
@@ -4058,6 +4141,7 @@ def _temporal_directional_float64_epsilon_ladder(
                 "epsilon_radians": epsilon,
                 "finite": False,
                 "passed": False,
+                "geodesic_update": failed_geodesic_audit,
             }
         else:
             finite_difference = (
@@ -4067,6 +4151,7 @@ def _temporal_directional_float64_epsilon_ladder(
                 math.isfinite(finite_difference)
                 and math.isfinite(autograd_derivative)
             )
+            numeric_failure = numeric_failure or not row_finite
             sign_mismatch = bool(
                 row_finite
                 and abs(finite_difference) > float(absolute_floor)
@@ -4103,6 +4188,8 @@ def _temporal_directional_float64_epsilon_ladder(
         "status": (
             "temporal_float64_epsilon_ladder_passed"
             if all_passed
+            else "nonfinite_temporal_float64_epsilon_ladder"
+            if numeric_failure
             else "temporal_directional_derivative_mismatch"
         ),
         "dtype": "float64",
@@ -4235,6 +4322,7 @@ def _finite_gap_angular_iteration(
             directional_consistency
         )
         directional_passed = bool(directional_consistency["passed"])
+        effective_directional_consistency = directional_consistency
         autograd_temporal = float(
             directional_consistency.get(
                 "autograd_temporal_angular_derivative", math.inf
@@ -4274,9 +4362,10 @@ def _finite_gap_angular_iteration(
             )
             solver_audit["temporal_float64_epsilon_ladder"] = float64_ladder
             directional_passed = bool(float64_ladder["passed"])
+            effective_directional_consistency = float64_ladder
         if not directional_passed:
             any_directional_mismatch = True
-            reason = str(directional_consistency["status"])
+            reason = str(effective_directional_consistency["status"])
             numeric_failure = numeric_failure or reason.startswith("nonfinite")
             solver_audit["temporal_directional_mismatch_dump"] = {
                 "optimization_direction_z": (
@@ -4284,12 +4373,12 @@ def _finite_gap_angular_iteration(
                 ),
                 "physical_direction_p": direction.detach().cpu().tolist(),
                 "autograd_temporal_angular_derivative": (
-                    directional_consistency.get(
+                    effective_directional_consistency.get(
                         "autograd_temporal_angular_derivative"
                     )
                 ),
                 "finite_difference_temporal_angular_derivative": (
-                    directional_consistency.get(
+                    effective_directional_consistency.get(
                         "finite_difference_temporal_angular_derivative"
                     )
                 ),
@@ -4315,13 +4404,24 @@ def _finite_gap_angular_iteration(
             direction_is_sphere_tangent=True,
         )
         if not geodesic_ok:
-            numeric_failure = True
+            geodesic_numeric_failure = (
+                _geodesic_update_is_numeric_failure(geodesic_audit)
+            )
+            numeric_failure = numeric_failure or geodesic_numeric_failure
             trial_rows.append({
                 "backtrack": backtrack,
                 "theta_radians": theta,
                 "accepted": False,
-                "reason": "finite_radius_model_mismatch",
-                "failed_constraints": ["numeric"],
+                "reason": (
+                    "nonfinite_geodesic_update"
+                    if geodesic_numeric_failure
+                    else "finite_radius_model_mismatch"
+                ),
+                "failed_constraints": (
+                    ["numeric"]
+                    if geodesic_numeric_failure
+                    else ["geodesic_execution"]
+                ),
                 "linearized_prediction_passed": True,
                 "authoritative_trial_executed": True,
                 "geodesic_update": geodesic_audit,
@@ -5568,13 +5668,24 @@ def _second_order_angular_iteration(
             direction_is_sphere_tangent=True,
         )
         if not geodesic_ok:
-            numeric_failure = True
+            geodesic_numeric_failure = (
+                _geodesic_update_is_numeric_failure(geodesic_audit)
+            )
+            numeric_failure = numeric_failure or geodesic_numeric_failure
             trial_rows.append({
                 "backtrack": backtrack,
                 "theta_radians": float(theta),
                 "accepted": False,
-                "reason": "nonfinite_or_unverified_curvature",
-                "failed_constraints": ["numeric"],
+                "reason": (
+                    "nonfinite_or_unverified_curvature"
+                    if geodesic_numeric_failure
+                    else "second_order_finite_radius_model_mismatch"
+                ),
+                "failed_constraints": (
+                    ["numeric"]
+                    if geodesic_numeric_failure
+                    else ["geodesic_execution"]
+                ),
                 "second_order_prediction_passed": bool(
                     solver_audit.get("joint_predicted_feasible", True)
                 ),
@@ -6862,12 +6973,26 @@ def _correct_case_geodesic_joint_sqp(
                 direction_is_sphere_tangent=temporal_directional_consistency,
             )
             if not geodesic_ok:
+                geodesic_numeric_failure = (
+                    _geodesic_update_is_numeric_failure(geodesic_audit)
+                )
+                numeric_failure = (
+                    numeric_failure or geodesic_numeric_failure
+                )
                 trial_rows.append({
                     "backtrack": backtrack,
                     "theta_radians": theta,
                     "accepted": False,
-                    "reason": "nonfinite_geodesic_update",
-                    "failed_constraints": ["numeric"],
+                    "reason": (
+                        "nonfinite_geodesic_update"
+                        if geodesic_numeric_failure
+                        else "finite_radius_model_mismatch"
+                    ),
+                    "failed_constraints": (
+                        ["numeric"]
+                        if geodesic_numeric_failure
+                        else ["geodesic_execution"]
+                    ),
                     "geodesic_update": geodesic_audit,
                 })
                 continue
