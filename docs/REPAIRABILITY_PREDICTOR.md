@@ -100,7 +100,8 @@ fidelity must not regress.  MLP forward time alone is not a runtime claim—the
 complete-pool bridge feature cost is included in end-to-end time.
 Set `GAR_EVALUATION_METHOD_VARIANT_ID=repairability_baseline` for the paired
 `off` run and `repairability_rank` for the paired `rank` run; this field is
-trace metadata and does not alter the decision path.
+trace metadata and does not alter the decision path.  Set `MOTION_SEED` to the
+same declared seed for each baseline/rank pair.
 
 Paired baseline/rank GAR traces can be checked with:
 

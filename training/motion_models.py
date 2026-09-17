@@ -1162,6 +1162,7 @@ class MotionGenerationConfig:
             "MOTION_ROOT_Y_MAX_FLIGHT_SECONDS": ("root_y_max_flight_seconds", float),
             "MOTION_DIFFUSION_STEPS": ("diffusion_steps", int),
             "MOTION_DEVICE": ("device", str),
+            "MOTION_SEED": ("seed", int),
             "GAR_EVALUATION_TRACE_ENABLE": (
                 "gar_evaluation_trace_enable",
                 lambda x: bool(int(x)),
