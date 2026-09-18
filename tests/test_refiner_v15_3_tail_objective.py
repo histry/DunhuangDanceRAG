@@ -52,7 +52,7 @@ def test_v15_3_1_contract():
 
     assert (
         d.SCHEMA
-        == "refiner_observable_bridge_diagnostic_v15_12f"
+        == "refiner_observable_bridge_diagnostic_v15_13_film"
     )
 
     assert d.FIT_CONTEXT_COUNT == 5

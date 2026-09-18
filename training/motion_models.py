@@ -7938,6 +7938,28 @@ def _refiner_group_balanced_scientific_tail(
     return balanced, stats
 
 
+def _refiner_rms_group_attribution(group_risk, balanced_risk):
+    """Attribute an RMS aggregate to one group without changing its gradient.
+
+    For ``R = sqrt(mean_i(r_i**2))``, the detached contribution
+    ``(r_i / R).detach() * r_i`` has both of the properties needed by the
+    read-only group-gradient audit: the mean of the contributions equals R,
+    and the mean of their gradients equals ``grad(R)``.  The zero-RMS case
+    uses the zero subgradient selected by ``torch.linalg.vector_norm``.
+
+    This helper is diagnostic attribution only.  It does not change the
+    authoritative training objective or its group-tail aggregation.
+    """
+    if group_risk.ndim != 0 or balanced_risk.ndim != 0:
+        raise ValueError("RMS group attribution requires scalar risks")
+    denominator = balanced_risk.detach()
+    scale = (
+        group_risk.detach()
+        / denominator.clamp_min(torch.finfo(denominator.dtype).tiny)
+    )
+    return scale * group_risk
+
+
 def _refiner_observable_confidence_preconditioner(batch):
     """Legacy V15.7 helper, retained for reproducing its rejected experiment.
 
@@ -8337,8 +8359,29 @@ def _refiner_batch_objectives(
             selected = batch["group"] == index
             if not bool(selected.any()):
                 continue
-            group_repair = (non_scientific[selected].mean()
-                            + scientific_weight * tail_stats[label]["risk"])
+            # ``repair`` contains separate endpoint and temporal RMS
+            # aggregates.  A plain per-group risk here does not reconstruct
+            # either aggregate: averaging it yields an arithmetic mean and
+            # therefore a different parameter gradient.  Use detached Euler
+            # attribution for each RMS independently so this diagnostic group
+            # decomposition exactly recovers the full-transaction objective.
+            endpoint_attribution = _refiner_rms_group_attribution(
+                endpoint_tail_stats[label]["risk"],
+                endpoint_tail,
+            )
+            temporal_attribution = _refiner_rms_group_attribution(
+                temporal_tail_stats[label]["risk"],
+                temporal_tail,
+            )
+            group_scientific_attribution = (
+                endpoint_attribution
+                + REFINER_TEMPORAL_SCIENTIFIC_WEIGHT
+                * temporal_attribution
+            )
+            group_repair = (
+                non_scientific[selected].mean()
+                + scientific_weight * group_scientific_attribution
+            )
             group_clean, group_clean_terms = _product_refiner_clean_identity_loss(
                 identity[selected], batch["clean"][selected],
                 batch["clean_joint"][selected], batch["clean_root"][selected],

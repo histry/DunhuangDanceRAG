@@ -215,8 +215,8 @@ def compute_geometry(model, batch, cfg, *, observer=None):
     """Unclipped true parameter gradients; autograd.grad never populates .grad.
 
     Equal 48-case groups make the mean of training_total gradients equal to
-    the full 192-case objective gradient (including group CVaR and clean loss).
-    Endpoint/temporal means are diagnostics, not an additive CVaR decomposition.
+    the full 192-case objective gradient.  RMS tail terms use detached Euler
+    attribution, while endpoint/temporal means remain non-additive diagnostics.
     """
     if batch["group"].shape != (192,) or any(int((batch["group"] == i).sum()) != 48 for i in range(4)):
         raise ValueError("gradient geometry requires four 48-case TRAIN groups")
@@ -242,10 +242,18 @@ def compute_geometry(model, batch, cfg, *, observer=None):
             targets = parameters + ([] if observer is None else observer.targets())
             for group, label in enumerate(GROUPS):
                 objectives = grouped[label]
-                if set(objectives) != set(COMPONENTS):
-                    raise ValueError("incomplete group objective components")
+                missing = set(COMPONENTS) - set(objectives)
+                if missing:
+                    raise ValueError(
+                        "incomplete group objective components: "
+                        + ", ".join(sorted(missing))
+                    )
                 values[label] = {}
-                for component, objective in objectives.items():
+                # Group objective dictionaries also carry authoritative clean
+                # Guard diagnostics.  They are an intentional schema superset,
+                # not trainable components of this gradient-geometry audit.
+                for component in COMPONENTS:
+                    objective = objectives[component]
                     if not bool(torch.isfinite(objective)):
                         raise FloatingPointError(f"nonfinite {label}/{component} objective")
                     gradients = (torch.autograd.grad(objective, targets, retain_graph=True, allow_unused=True)
