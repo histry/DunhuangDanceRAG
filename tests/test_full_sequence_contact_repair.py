@@ -12,6 +12,8 @@ from training.motion_models import (
     _exact_audit_feasible_cone_directions,
     _exact_audit_candidate_rank,
     _finite_difference_contact_direction_sources,
+    _slice_eligibility,
+    _window_eligibility_or_false,
     _local_infeasibility_diagnosis,
     _partition_repair_windows_by_support_phase,
     _physical_nonregression_decision,
@@ -33,6 +35,37 @@ def _identity_motion(frames):
     ).copy()
     motion[:, 7:151] = matrix_to_rot6d_np(rotations).reshape(frames, -1)
     return motion
+
+
+def test_v12_missing_sliding_eligibility_means_no_frame_is_exempt():
+    resolved = _window_eligibility_or_false(
+        None,
+        17,
+        context="ownership finite-difference",
+    )
+    assert resolved.shape == (17,)
+    assert resolved.dtype == np.bool_
+    assert not resolved.any()
+
+
+def test_v12_eligibility_slices_match_first_last_and_halo_windows():
+    eligible = np.zeros(23, dtype=bool)
+    eligible[[0, 4, 18, 22]] = True
+    assert np.array_equal(_slice_eligibility(eligible, 0, 6), eligible[:6])
+    assert np.array_equal(_slice_eligibility(eligible, 3, 20), eligible[3:20])
+    assert np.array_equal(_slice_eligibility(eligible, 17, 23), eligible[17:])
+
+
+def test_v12_window_eligibility_rejects_true_time_axis_mismatch():
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "eligibility must match window length",
+    ):
+        _window_eligibility_or_false(
+            np.zeros(8, dtype=bool),
+            9,
+            context="ownership finite-difference",
+        )
 
 
 def test_v11_is_development_opt_in_and_keeps_gate_values():

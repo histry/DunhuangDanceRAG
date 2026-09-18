@@ -12588,7 +12588,49 @@ def _slice_eligibility(
     start: int,
     end: int,
 ) -> Optional[np.ndarray]:
-    return None if eligible is None else eligible[start:end]
+    if eligible is None:
+        return None
+    values = np.asarray(eligible, dtype=bool)
+    if values.ndim != 1:
+        raise ValueError(
+            "sliding-support eligibility must have one value per frame"
+        )
+    first = int(start)
+    last = int(end)
+    if first < 0 or last < first or last > len(values):
+        raise ValueError(
+            "eligibility window must stay inside the motion time axis: "
+            f"window=({first}, {last}), frames={len(values)}"
+        )
+    return values[first:last]
+
+
+def _window_eligibility_or_false(
+    eligible: Optional[np.ndarray],
+    length: int,
+    *,
+    context: str,
+) -> np.ndarray:
+    """Return the immutable frame eligibility for one motion window.
+
+    ``None`` means that no frame is eligible for the sliding-support
+    exception.  It must not be converted with ``np.asarray(None)`` because
+    NumPy represents that scalar as a length-one array, which previously made
+    first/last and halo-clipped IK transactions fail before exact auditing.
+    """
+
+    expected = int(length)
+    if expected < 0:
+        raise ValueError(f"{context} length must be non-negative")
+    if eligible is None:
+        return np.zeros(expected, dtype=bool)
+    values = np.asarray(eligible, dtype=bool)
+    if values.ndim != 1 or values.shape != (expected,):
+        raise ValueError(
+            f"{context} eligibility must match window length: "
+            f"expected=({expected},), actual={values.shape}"
+        )
+    return values
 
 
 def _finite_difference_contact_direction_sources(
@@ -12935,7 +12977,7 @@ def _finite_difference_cone_sources(
         Tuple[str, np.ndarray, Dict[str, Any]]
     ],
     cfg: MotionGenerationConfig,
-    ownership_eligible: np.ndarray,
+    ownership_eligible: Optional[np.ndarray],
     global_eligible: Optional[np.ndarray] = None,
     objective_metric_keys: Optional[Sequence[str]] = None,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
@@ -12972,11 +13014,11 @@ def _finite_difference_cone_sources(
             "finite-difference source must be full motion or ownership patch"
         )
 
-    before_eligible = np.asarray(ownership_eligible, dtype=bool).reshape(-1)
-    if before_eligible.shape != (end - start,):
-        raise ValueError(
-            "ownership finite-difference eligibility must match window length"
-        )
+    before_eligible = _window_eligibility_or_false(
+        ownership_eligible,
+        end - start,
+        context="ownership finite-difference",
+    )
 
     contact_envelope = _c3_transaction_weight(
         end - start,
@@ -13362,11 +13404,11 @@ def _finite_difference_cone_sources(
     full_eligible = None
     before_global_audit: Optional[Mapping[str, Any]] = None
     if global_eligible is not None:
-        full_eligible = np.asarray(global_eligible, dtype=bool)
-        if full_eligible.shape != (base.shape[0],):
-            raise ValueError(
-                "global finite-difference eligibility must match motion length"
-            )
+        full_eligible = _window_eligibility_or_false(
+            global_eligible,
+            base.shape[0],
+            context="global finite-difference",
+        )
         before_global_audit = audit_motion_np(
             base,
             cfg,
@@ -14963,11 +15005,15 @@ def true_lower_body_ik(
         return motion, {"enabled": False, "reason": "torch_unavailable"}
     motion = np.asarray(motion, dtype=np.float32)
     T = int(motion.shape[0])
-    eligible = None
-    if sliding_support_eligible is not None:
-        eligible = np.asarray(sliding_support_eligible, dtype=bool).reshape(-1)
-        if len(eligible) != T:
-            raise ValueError("sliding_support_eligible length mismatch")
+    # The absence of an eligibility mask means that no frame is exempt from
+    # static-support auditing.  Materialize that contract once so local,
+    # ownership, halo and global finite-difference audits all receive the same
+    # immutable time axis.
+    eligible = _window_eligibility_or_false(
+        sliding_support_eligible,
+        T,
+        context="true lower-body IK sliding-support",
+    )
     protected = np.zeros(T, dtype=bool)
     if protected_frame_mask is not None:
         protected = np.asarray(protected_frame_mask, dtype=bool).reshape(-1)

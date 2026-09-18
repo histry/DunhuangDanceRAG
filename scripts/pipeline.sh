@@ -183,6 +183,17 @@ printf "PY=%s\nOUT_ROOT=%s\nAUDIO=%s\nSOURCE_MODE=%s\nOFFICIAL_SMPL_DIR=%s\nCONF
 require_file "$AUDIO" "current WAV"
 require_file "$CONFIG" "Motion Generation config"
 
+# Reuse-only generation must prove that both learned motion assets exist
+# before source, scheduler, same-WAV and IK work begins.  generate_only.sh
+# additionally performs the Refiner contract/provenance validation and binds
+# its SHA256; this core check also protects direct pipeline.sh callers.
+if [[ "$GENERATION_RETRAIN_REFINER" != "1" ]]; then
+  require_file "$REFINER_CKPT" "Motion Refiner checkpoint (startup preflight)"
+fi
+if [[ "$GENERATION_RETRAIN_DIFFUSION" != "1" ]]; then
+  require_file "$MOTION_CKPT" "Motion Diffusion checkpoint (startup preflight)"
+fi
+
 echo "========== 1. SOURCE-AWARE SOURCE CACHE =========="
 if [[ "$GENERATION_REBUILD_RETARGET_CACHE" == "1" ]]; then
   "$PY" retargeting/official_smpl_source_preprocess.py \

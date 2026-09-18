@@ -20,7 +20,6 @@ if [[ -z "$TRAINED_RUN" ]]; then
       -exec test -s '{}/checkpoints/ctsr_weak_temporal_router.pt' ';' \
       -exec test -s '{}/checkpoints/duration_predictor.pt' ';' \
       -exec test -s '{}/checkpoints/whole_song_planner.pt' ';' \
-      -exec test -s '{}/motion_refiner_train_only_refiner.pt' ';' \
       -exec test -s '{}/motion_train_only_diffusion.pt' ';' -print 2>/dev/null \
       | sort | tail -1
   )"
@@ -34,6 +33,10 @@ fi
 TRAINED_RUN="$(realpath "$TRAINED_RUN")"
 export OUT_ROOT="$TRAINED_RUN"
 export AUDIO="$(realpath "$AUDIO")"
+
+TRACK_ID="$(basename "${AUDIO%.*}")"
+RESULT_ROOT="$TRAINED_RUN/test_results/$TRACK_ID/$PERFORMER_GROUP"
+mkdir -p "$RESULT_ROOT"
 
 # Reuse the trained database and checkpoints. Keep compatibility variable names
 # because the preserved internal pipeline still reads them.
@@ -59,12 +62,49 @@ export RETARGET_CLEAN_RETRAIN_PLANNER=0
 export FORMAL_ROUTER_CKPT="${FORMAL_ROUTER_CKPT:-$TRAINED_RUN/checkpoints/ctsr_weak_temporal_router.pt}"
 export FORMAL_DURATION_CKPT="${FORMAL_DURATION_CKPT:-$TRAINED_RUN/checkpoints/duration_predictor.pt}"
 export FORMAL_PLANNER_CKPT="${FORMAL_PLANNER_CKPT:-$TRAINED_RUN/checkpoints/whole_song_planner.pt}"
-export REFINER_CKPT="${REFINER_CKPT:-$TRAINED_RUN/motion_refiner_train_only_refiner.pt}"
 export MOTION_CKPT="${MOTION_CKPT:-$TRAINED_RUN/motion_train_only_diffusion.pt}"
 
-TRACK_ID="$(basename "${AUDIO%.*}")"
-RESULT_ROOT="$TRAINED_RUN/test_results/$TRACK_ID/$PERFORMER_GROUP"
-mkdir -p "$RESULT_ROOT"
+# Resolve and validate the formal Refiner before the expensive scheduler and
+# same-WAV regression stages.  An explicit REFINER_CKPT remains authoritative;
+# otherwise the selected run must contain exactly one valid published asset.
+PY="${GENERATION_PYTHON:-${PYTHON_BIN:-python}}"
+REFINER_BINDING="$RESULT_ROOT/refiner_checkpoint_binding.json"
+REFINER_RESOLVE_ARGS=(
+  --run-root "$TRAINED_RUN"
+  --config "$CONFIG"
+  --report "$REFINER_BINDING"
+)
+if [[ -n "${REFINER_CKPT:-}" ]]; then
+  REFINER_RESOLVE_ARGS+=(--explicit "$REFINER_CKPT")
+fi
+set +e
+RESOLVED_REFINER="$("$PY" scripts/resolve_generation_refiner.py \
+  "${REFINER_RESOLVE_ARGS[@]}")"
+REFINER_RESOLVE_RC=$?
+set -e
+if [[ "$REFINER_RESOLVE_RC" -ne 0 || -z "$RESOLVED_REFINER" ]]; then
+  echo "[FATAL] generate_only requires a formally published Motion Refiner." >&2
+  echo "[FATAL] Binding report: $REFINER_BINDING" >&2
+  echo "[FATAL] Either set REFINER_CKPT to a validated checkpoint, or train it with:" >&2
+  echo "  $PY training/motion_models.py --config $CONFIG train-refiner \\" >&2
+  echo "    --db $TRAINED_RUN/event_db_split/train/events_aesd.npz \\" >&2
+  echo "    --val_db $TRAINED_RUN/event_db_split/val/events_aesd.npz \\" >&2
+  echo "    --out $TRAINED_RUN/motion_refiner_train_only_refiner.pt \\" >&2
+  echo "    --steps ${REFINER_STEPS:-8000}" >&2
+  exit 2
+fi
+export REFINER_CKPT="$RESOLVED_REFINER"
+
+for required in \
+  "$FORMAL_ROUTER_CKPT" \
+  "$FORMAL_DURATION_CKPT" \
+  "$FORMAL_PLANNER_CKPT" \
+  "$MOTION_CKPT"; do
+  [[ -s "$required" ]] || {
+    echo "[FATAL] generate_only asset preflight missing: $required" >&2
+    exit 2
+  }
+done
 
 MARKER="$(mktemp)"
 touch "$MARKER"
@@ -73,6 +113,8 @@ echo "[GENERATE] AUDIO=$AUDIO"
 echo "[GENERATE] TRAINED_RUN=$TRAINED_RUN"
 echo "[GENERATE] PERFORMER_GROUP=$PERFORMER_GROUP"
 echo "[GENERATE] RESULT_ROOT=$RESULT_ROOT"
+echo "[GENERATE] REFINER_CKPT=$REFINER_CKPT"
+echo "[GENERATE] REFINER_BINDING=$REFINER_BINDING"
 
 bash scripts/research_pipeline.sh "$AUDIO"
 
@@ -94,7 +136,9 @@ cat > "$RESULT_ROOT/generation_manifest.json" <<JSON
   "track_id": "$TRACK_ID",
   "audio": "$AUDIO",
   "trained_run": "$TRAINED_RUN",
-  "performer_group": "$PERFORMER_GROUP"
+  "performer_group": "$PERFORMER_GROUP",
+  "refiner_checkpoint": "$REFINER_CKPT",
+  "refiner_binding": "$REFINER_BINDING"
 }
 JSON
 
