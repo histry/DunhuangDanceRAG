@@ -1174,7 +1174,11 @@ def apply_generators(
                 require_repair_gain=True,
             )
         motion = restore_protected_geometry(motion)
-        if composite_model and transaction.get("accepted"):
+        if (
+            transaction.get("accepted")
+            and protected is not None
+            and np.any(protected)
+        ):
             protected_reaudit = audit_fn(motion)
             protected_decision = evaluate_stage_candidate(
                 audit_fn(pre_refiner),
@@ -1196,6 +1200,8 @@ def apply_generators(
                     "reason": "post_protected_restore_full_guard_failed",
                     "selected_audit": audit_fn(pre_refiner),
                 })
+            else:
+                transaction["selected_audit"] = protected_reaudit
         stage["boundary_refiner_transaction"] = transaction
         stage["boundary_refiner_audit"] = audit_fn(motion)
     stage["motion_activity_refiner"] = save_stage_snapshot(
@@ -1208,6 +1214,7 @@ def apply_generators(
     if bool(getattr(cfg, "diffusion_enable", False)) and env_bool(
         "BOUNDARY_USE_DIFFUSION", True
     ):
+        pre_diffusion = motion.copy()
         diffusion_mask, mask_report = build_repair_mask(
             motion,
             seam_mask,
@@ -1231,11 +1238,164 @@ def apply_generators(
             require_repair_gain=True,
         )
         motion = restore_protected_geometry(motion)
+        if (
+            transaction.get("accepted")
+            and protected is not None
+            and np.any(protected)
+        ):
+            protected_reaudit = audit_fn(motion)
+            protected_decision = evaluate_stage_candidate(
+                audit_fn(pre_diffusion),
+                protected_reaudit,
+                limits=limits,
+                policy=policy,
+                require_repair_gain=True,
+            )
+            transaction["post_protected_restore_full_transaction_reaudit"] = (
+                protected_reaudit
+            )
+            transaction["post_protected_restore_guard"] = protected_decision
+            if not protected_decision["accepted"]:
+                motion = pre_diffusion
+                transaction.update({
+                    "accepted": False,
+                    "rolled_back": True,
+                    "selection": "identity",
+                    "reason": "post_protected_restore_full_guard_failed",
+                    "selected_audit": audit_fn(pre_diffusion),
+                })
+            else:
+                transaction["selected_audit"] = protected_reaudit
         stage["motion_diffusion_transaction"] = transaction
         stage["motion_diffusion_audit"] = audit_fn(motion)
     stage["motion_activity_diffusion"] = save_stage_snapshot(
         getattr(args, "out", None),
         "diffusion",
+        motion,
+        fps=float(getattr(cfg, "fps", 30.0)),
+    )
+
+    # Long-horizon root drift is a full-sequence metric and cannot be repaired
+    # reliably by a short ownership window whose local median recentres the
+    # trajectory.  Generate one deterministic, low-frequency candidate by
+    # scaling only root XZ displacement about the first-frame anchor.  This
+    # preserves the path shape and introduces no new temporal frequencies.
+    # The normal full physical transaction audit remains authoritative; any
+    # foot/contact/jerk/rotation regression atomically restores the snapshot.
+    pre_root_drift = motion.copy()
+    root_drift_before = audit_fn(pre_root_drift)
+    root_limits = {
+        "root_horizontal_radius_p95_m": float(
+            limits.root_horizontal_radius_p95_m
+        ),
+        "root_horizontal_radius_max_m": float(
+            limits.root_horizontal_radius_max_m
+        ),
+        "root_horizontal_net_displacement_m": float(
+            limits.root_horizontal_net_displacement_m
+        ),
+        "root_horizontal_drift_speed_mps": float(
+            limits.root_horizontal_drift_speed_mps
+        ),
+        "root_horizontal_window_displacement_max_m": float(
+            limits.root_horizontal_window_displacement_max_m
+        ),
+    }
+    required_scales = []
+    for key, maximum in root_limits.items():
+        value = float(root_drift_before.get(key, float("nan")))
+        if np.isfinite(value) and value > maximum and value > 0.0:
+            required_scales.append(float(maximum / value))
+    root_scale = (
+        max(0.0, min(1.0, 0.98 * min(required_scales)))
+        if required_scales
+        else 1.0
+    )
+    root_stage_enabled = env_bool(
+        "BOUNDARY_ROOT_DRIFT_RESTORATION", True
+    )
+    if root_stage_enabled and root_scale < 1.0 - 1.0e-8:
+        def root_drift_candidate(value: np.ndarray) -> np.ndarray:
+            candidate = np.asarray(value, dtype=np.float32).copy()
+            anchor = candidate[0, [ROOT_X_IDX, ROOT_Z_IDX]].copy()
+            candidate[:, [ROOT_X_IDX, ROOT_Z_IDX]] = (
+                anchor[None]
+                + float(root_scale)
+                * (
+                    candidate[:, [ROOT_X_IDX, ROOT_Z_IDX]]
+                    - anchor[None]
+                )
+            )
+            if protected is not None and np.any(protected):
+                candidate[protected, 4:] = motion_ref[protected, 4:]
+            return candidate
+
+        motion, root_transaction = run_stage_transaction(
+            stage_name="root_drift_restoration",
+            motion=motion,
+            apply_fn=root_drift_candidate,
+            audit_fn=audit_fn,
+            limits=limits,
+            policy=policy,
+            require_repair_gain=False,
+        )
+        triggered_root_metrics = [
+            key
+            for key, maximum in root_limits.items()
+            if float(root_drift_before.get(key, float("-inf"))) > maximum
+        ]
+        selected_root_audit = dict(
+            root_transaction.get("selected_audit", root_drift_before)
+        )
+        meaningful_root_gain = any(
+            float(selected_root_audit.get(key, float("inf")))
+            <= float(root_drift_before[key])
+            - max(1.0e-7, 0.01 * (
+                float(root_drift_before[key]) - root_limits[key]
+            ))
+            for key in triggered_root_metrics
+        )
+        if root_transaction.get("accepted") and not meaningful_root_gain:
+            motion = pre_root_drift
+            root_transaction.update({
+                "accepted": False,
+                "rolled_back": True,
+                "selection": "identity",
+                "reason": "no_meaningful_root_drift_gain",
+                "selected_audit": root_drift_before,
+            })
+        root_transaction["candidate_contract"] = {
+            "mode": "first_anchor_uniform_root_xz_path_scale_v1",
+            "scale": float(root_scale),
+            "triggered_metrics": triggered_root_metrics,
+            "meaningful_root_gain": bool(meaningful_root_gain),
+            "protected_geometry_restored_before_audit": bool(
+                protected is not None and np.any(protected)
+            ),
+            "final_guard_unchanged": True,
+        }
+    else:
+        root_transaction = {
+            "stage": "root_drift_restoration",
+            "accepted": False,
+            "rolled_back": False,
+            "reason": (
+                "disabled" if not root_stage_enabled else "not_required"
+            ),
+            "candidate_contract": {
+                "mode": "first_anchor_uniform_root_xz_path_scale_v1",
+                "scale": float(root_scale),
+                "triggered_metrics": [],
+                "final_guard_unchanged": True,
+            },
+            "before_audit": root_drift_before,
+            "selected_audit": root_drift_before,
+        }
+    stage["root_drift_restoration_transaction"] = root_transaction
+    stage["root_drift_restoration_audit"] = audit_fn(motion)
+    stage["motion_activity_root_drift_restoration"] = save_stage_snapshot(
+        getattr(args, "out", None),
+        "root_drift_restoration",
         motion,
         fps=float(getattr(cfg, "fps", 30.0)),
     )

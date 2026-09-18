@@ -31,6 +31,7 @@ from motion_geometry.physical import (
     SOURCE_REFERENCE_KINEMATICS_SCHEMA,
     SUPPORT_POLICY_SOURCE,
 )
+from motion_geometry.rotations import rot6d_to_matrix_np, so3_geodesic_np
 from motion_geometry.smpl24 import NUM_JOINTS, PARENTS
 
 
@@ -1579,7 +1580,7 @@ def evaluate_stage_candidate(
     pol = policy or StageAcceptancePolicy.from_environment()
     ignored = {str(layer) for layer in ignored_layers}
     reasons: list[str] = []
-    detail: Dict[str, float] = {}
+    detail: Dict[str, Any] = {}
 
     for label, audit in (("before", before_audit), ("candidate", candidate_audit)):
         schema = str(audit.get("schema", ""))
@@ -1658,6 +1659,49 @@ def evaluate_stage_candidate(
         detail["minimum_repair_gain"] = float(pol.minimum_repair_gain)
         if repair_gain < pol.minimum_repair_gain:
             reasons.append("no_meaningful_repair_gain")
+    elif require_repair_gain:
+        # The repair support now includes contact and SO(3) continuity risks,
+        # so a stage must not commit a harmless-but-irrelevant edit merely
+        # because the legacy jerk-only gain check was inactive.  Measure gain
+        # on normalized positive final-contract residuals and require at least
+        # one actually violated row to improve by the same frozen fraction.
+        active_repairs: Dict[str, float] = {}
+        for spec in physical_metric_specs(lim, pol):
+            if spec.layer in ignored:
+                continue
+            before_finite, before = _required_metric(before_audit, spec.key)
+            after_finite, after = _required_metric(candidate_audit, spec.key)
+            if not before_finite or not after_finite:
+                continue
+            scale = max(abs(float(spec.absolute_limit)), 1.0e-3)
+            if spec.direction == "high":
+                before_residual = max(
+                    0.0, before - float(spec.absolute_limit)
+                ) / scale
+                after_residual = max(
+                    0.0, after - float(spec.absolute_limit)
+                ) / scale
+            else:
+                before_residual = max(
+                    0.0, float(spec.absolute_limit) - before
+                ) / scale
+                after_residual = max(
+                    0.0, float(spec.absolute_limit) - after
+                ) / scale
+            if before_residual > 0.0:
+                active_repairs[spec.key] = float(
+                    (before_residual - after_residual)
+                    / max(before_residual, 1.0e-12)
+                )
+        if active_repairs:
+            best_key = max(active_repairs, key=active_repairs.get)
+            best_gain = float(active_repairs[best_key])
+            detail["best_physical_repair_metric"] = str(best_key)
+            detail["best_physical_residual_repair_gain"] = best_gain
+            detail["physical_residual_repair_gains"] = active_repairs
+            detail["minimum_repair_gain"] = float(pol.minimum_repair_gain)
+            if best_gain < float(pol.minimum_repair_gain):
+                reasons.append("no_meaningful_physical_repair_gain")
 
     reasons = list(dict.fromkeys(reasons))
     return {
@@ -1988,7 +2032,14 @@ def build_repair_mask(
     fps: float,
     config: Optional[PeakJerkMaskConfig] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Union the original seam mask with the localized Peak-Jerk mask."""
+    """Build the observable pre-repair support used by neural repair stages.
+
+    The final Guard has always audited jerk, planted-foot quality and SO(3)
+    continuity.  Restricting the model support to seams and jerk peaks made
+    foot/rotation failures detectable but not editable.  This mask only grants
+    edit support; it does not change any acceptance threshold.  Every resulting
+    candidate still passes the unchanged full physical transaction audit.
+    """
 
     x = np.asarray(motion, dtype=np.float32)
     seam = np.asarray(seam_mask, dtype=np.float32)
@@ -2001,12 +2052,96 @@ def build_repair_mask(
 
     peak = build_peak_jerk_risk_mask(x, fps=fps, config=config)
     peak_frame = np.asarray(peak["frame"], dtype=np.float32)[:, None]
+    limits = PhysicalQualityLimits.from_environment()
+    radius = _frames_at_rate(
+        (config or PeakJerkMaskConfig.from_environment()).radius_frames_at_30fps,
+        fps,
+    )
+
+    def expand_frames(active: np.ndarray) -> np.ndarray:
+        source = np.asarray(active, dtype=bool).reshape(-1)
+        expanded = source.copy()
+        for offset in range(1, radius + 1):
+            expanded[offset:] |= source[:-offset]
+            expanded[:-offset] |= source[offset:]
+        return expanded
+
+    # Rotation-window support is computed on the same SO(3) representation as
+    # the final audit.  Invalid Rot6D remains a pre-repair hard failure; this
+    # path is only for finite, repairable temporal discontinuity.
+    rotations = rot6d_to_matrix_np(
+        x[:, 7:151].reshape(len(x), NUM_JOINTS, 6),
+        project=False,
+    )
+    rotation_active = np.zeros(len(x), dtype=bool)
+    if len(x) > 1 and np.isfinite(rotations).all():
+        steps = so3_geodesic_np(
+            rotations[:-1], rotations[1:], project=False
+        )
+        bad_steps = np.max(steps, axis=1) > float(
+            limits.joint_rotation_step_window_p95_max_rad
+        )
+        rotation_active[:-1] |= bad_steps
+        rotation_active[1:] |= bad_steps
+    rotation_frame = expand_frames(rotation_active).astype(np.float32)[:, None]
+
+    # Contact support is deliberately an observable over-approximation.  It
+    # uses the declared-or-low-foot union used by the final fail-closed policy,
+    # then localizes excessive XZ speed and within-segment support drift.  A
+    # false positive only exposes a frame to the model; the authoritative
+    # transaction audit still prevents an unsafe commit.
+    joints = fk24_np(x).astype(np.float64)
+    feet = joints[:, [7, 8, 10, 11]]
+    foot_speed = np.zeros(feet.shape[:2], dtype=np.float64)
+    if len(feet) > 1:
+        foot_speed[1:] = np.linalg.norm(
+            np.diff(feet[..., (0, 2)], axis=0), axis=-1
+        ) * float(fps)
+    floor_y = float(np.percentile(feet[..., 1], 5))
+    declared = x[:, :4] > 0.5
+    support = declared | (feet[..., 1] <= floor_y + 0.055)
+    support_drift = np.zeros(support.shape, dtype=np.float64)
+    for foot_index in range(support.shape[1]):
+        start = None
+        for frame in range(len(support) + 1):
+            active = frame < len(support) and bool(support[frame, foot_index])
+            if active and start is None:
+                start = frame
+            if start is not None and not active:
+                anchor = feet[start, foot_index, (0, 2)]
+                support_drift[start:frame, foot_index] = np.linalg.norm(
+                    feet[start:frame, foot_index][:, (0, 2)] - anchor,
+                    axis=-1,
+                )
+                start = None
+    contact_active = np.any(
+        support
+        & (
+            (foot_speed > float(limits.foot_skate_mps_p95))
+            | (support_drift > float(limits.foot_support_drift_m_p95))
+        ),
+        axis=1,
+    )
+    contact_frame = expand_frames(contact_active).astype(np.float32)[:, None]
+
     repair = np.maximum(np.clip(seam, 0.0, 1.0), peak_frame)
+    repair = np.maximum(repair, rotation_frame)
+    repair = np.maximum(repair, contact_frame)
     report = {
         "seam_active_frames": int(np.count_nonzero(seam[:, 0] > 1.0e-6)),
         "peak_active_frames": int(np.count_nonzero(peak_frame[:, 0] > 1.0e-6)),
+        "rotation_active_frames": int(
+            np.count_nonzero(rotation_frame[:, 0] > 1.0e-6)
+        ),
+        "contact_active_frames": int(
+            np.count_nonzero(contact_frame[:, 0] > 1.0e-6)
+        ),
         "repair_active_frames": int(np.count_nonzero(repair[:, 0] > 1.0e-6)),
         "repair_active_ratio": float(np.mean(repair[:, 0] > 1.0e-6)),
         "peak_jerk": peak["report"],
+        "support_contract": (
+            "seam_union_peak_jerk_union_observable_contact_union_so3_rotation"
+        ),
+        "final_guard_unchanged": True,
     }
     return repair.astype(np.float32), report

@@ -15,6 +15,7 @@ from training.motion_models import (
     _local_infeasibility_diagnosis,
     _partition_repair_windows_by_support_phase,
     _physical_nonregression_decision,
+    _select_restoration_objective_keys,
     evaluate_fixed_support_contact_candidate_np,
     full_sequence_physical_diagnostics_np,
 )
@@ -48,7 +49,7 @@ def test_v11_is_development_opt_in_and_keeps_gate_values():
     assert "dominant_contact_residual_not_meaningfully_improved" in (
         decision["reasons"]
     )
-    assert diagnostics["schema"] == "full_sequence_physical_localization_v11"
+    assert diagnostics["schema"] == "full_sequence_physical_localization_v12"
     assert diagnostics["support_contract"] == (
         "final_fail_closed_with_sliding_eligibility"
     )
@@ -62,6 +63,22 @@ def test_v11_restoration_requires_a_real_dominant_contact_gain():
         cfg,
         sliding_support_eligible=np.zeros(30, dtype=bool),
     )
+
+
+def test_v12_window_objectives_follow_actual_temporal_violation():
+    audit = full_sequence_physical_diagnostics_np(
+        _identity_motion(30),
+        MotionGenerationConfig(),
+        sliding_support_eligible=np.zeros(30, dtype=bool),
+    )["audit"]
+    audit = dict(audit)
+    audit["joint_rotation_step_window_p95_max_rad"] = 0.75
+    objectives = _select_restoration_objective_keys(
+        audit,
+        has_static_support=True,
+    )
+    assert "joint_rotation_step_window_p95_max_rad" in objectives
+    assert "foot_skate_mps_p95" not in objectives
 
 
 def test_v11_global_guard_only_checks_nonregression():

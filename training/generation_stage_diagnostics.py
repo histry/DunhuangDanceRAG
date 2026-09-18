@@ -608,6 +608,15 @@ def _compact_candidate_attempt(attempt):
             attempt.get("blocking_absolute_reasons", [])
         ),
         "kbo_reasons": list(attempt.get("kbo_reasons", [])),
+        "dominant_objective_metric": exact.get(
+            "dominant_objective_metric",
+            exact.get("dominant_contact_metric"),
+        ),
+        "objective_metrics": exact.get("objective_metrics", []),
+        "meaningful_objective_metrics": exact.get(
+            "meaningful_objective_metrics",
+            exact.get("meaningful_contact_metrics", []),
+        ),
         "dominant_contact_metric": exact.get("dominant_contact_metric"),
         "dominant_contact_residual_before": exact.get(
             "dominant_contact_residual_before"
@@ -1261,7 +1270,7 @@ def replay_solutions(
             repaired_contact,
         )
         contact_repair_transaction = {
-            "schema": "observable_tolerant_contact_transactions_v11",
+            "schema": "observable_tolerant_physical_transactions_v12",
             "development_only": True,
             "training_started": False,
             "production_model_modified": False,

@@ -65,6 +65,7 @@ from motion_geometry.rotations import (
     matrix_to_rot6d_torch as _contract_matrix_to_rot6d_torch,
     rot6d_to_matrix_np as _contract_rot6d_to_matrix_np,
     rot6d_to_matrix_torch as _contract_rot6d_to_matrix_torch,
+    so3_geodesic_np,
     so3_exp_torch,
     so3_log_torch,
 )
@@ -719,8 +720,9 @@ class MotionGenerationConfig:
     rollback_root_delta_max_m: float = 0.12
     ik_post_stabilize_enable: bool = True
     ik_post_stabilize_passes: int = 2
-    # Development-only V11 repair.  The normal generation path never enables
-    # this automatically; hash-bound solution replay opts in explicitly.
+    # Fail-closed V12 physical restoration.  The dataclass remains disabled
+    # for library callers and historical parity; the formal whole-song
+    # scheduler opts in explicitly through its frozen environment contract.
     full_sequence_contact_repair_enable: bool = False
     full_sequence_contact_repair_top_k: int = 12
     full_sequence_contact_repair_halo_seconds: float = 12.0 / 30.0
@@ -12284,6 +12286,72 @@ def _physical_residuals(
     return residuals
 
 
+_CONTACT_RESTORATION_KEYS = (
+    "foot_penetration_min_m",
+    "foot_skate_mps_p95",
+    "foot_skate_mps_max",
+    "foot_support_drift_m_p95",
+    "foot_support_drift_m_max",
+)
+_TEMPORAL_RESTORATION_KEYS = (
+    "joint_jerk_mps3_p95",
+    "joint_jerk_mps3_max",
+    "joint_jerk_window_p95_max_mps3",
+    "extremity_jerk_mps3_p95",
+    "extremity_jerk_window_p95_max_mps3",
+    "joint_rotation_step_rad_p95",
+    "joint_rotation_step_rad_max",
+    "joint_rotation_step_window_p95_max_rad",
+    "extremity_rotation_step_rad_p95",
+    "extremity_rotation_step_rad_max",
+    "joint_angular_acceleration_rps2_p95",
+    "joint_angular_acceleration_rps2_max",
+    "joint_angular_acceleration_window_p95_max_rps2",
+)
+
+
+def _select_restoration_objective_keys(
+    audit: Mapping[str, Any],
+    *,
+    has_static_support: bool,
+) -> Tuple[str, ...]:
+    """Choose exact-audit objectives from the violations in this window.
+
+    V11 used contact objectives whenever *any* support foot was present.  A
+    jerk- or rotation-triggered window was consequently required to improve a
+    contact metric even when every contact residual was already zero.  That
+    produced a false ``local_infeasible_under_current_action_basis``.  The
+    action basis is now asked to improve the actual positive residuals it can
+    affect; all remaining registry rows stay strict non-regression constraints.
+    """
+
+    residuals = _physical_residuals(audit)
+    supported = (
+        _CONTACT_RESTORATION_KEYS + _TEMPORAL_RESTORATION_KEYS
+        if has_static_support
+        else _TEMPORAL_RESTORATION_KEYS
+    )
+    active = tuple(
+        key
+        for key in supported
+        if np.isfinite(float(residuals.get(key, float("inf"))))
+        and float(residuals.get(key, 0.0)) > 0.0
+    )
+    if active:
+        return active
+    # A localization window can straddle the exact witness by a halo.  Keep a
+    # deterministic fallback rather than treating an empty local residual set
+    # as permission for a no-op commit.
+    return (
+        _CONTACT_RESTORATION_KEYS
+        if has_static_support
+        else (
+            "joint_jerk_mps3_max",
+            "joint_jerk_window_p95_max_mps3",
+        )
+    )
+
+
 def _support_drift_by_frame(
     feet_xz: np.ndarray,
     static_support: np.ndarray,
@@ -12400,6 +12468,31 @@ def full_sequence_physical_diagnostics_np(
         )
         jerk[2:2 + len(jerk_values)] = jerk_values
 
+    rotation_step = np.zeros(len(value), dtype=np.float32)
+    if len(value) > 1:
+        rotations = rot6d_to_matrix_np(
+            value[:, ROT6D_START:ROT6D_END].reshape(
+                len(value), NUM_JOINTS, 6
+            ),
+            project=False,
+        )
+        rotation_step[1:] = np.max(
+            so3_geodesic_np(
+                rotations[:-1], rotations[1:], project=False
+            ),
+            axis=1,
+        )
+
+    root_xz = np.asarray(
+        value[:, [ROOT_X_IDX, ROOT_Z_IDX]], dtype=np.float64
+    )
+    root_center = (
+        np.median(root_xz, axis=0)
+        if len(root_xz)
+        else np.zeros(2, dtype=np.float64)
+    )
+    root_radius = np.linalg.norm(root_xz - root_center[None], axis=1)
+
     count = max(1, int(
         top_k
         if top_k is not None
@@ -12427,12 +12520,26 @@ def full_sequence_physical_diagnostics_np(
             "joint_jerk_mps3", jerk, limits.joint_jerk_mps3_max,
             direction="high", top_k=count, halo=halo,
         ),
+        "rotation_step": _rank_violation_frames(
+            "joint_rotation_step_rad", rotation_step,
+            limits.joint_rotation_step_window_p95_max_rad,
+            direction="high", top_k=count, halo=halo,
+        ),
+        "root_horizontal_radius": _rank_violation_frames(
+            "root_horizontal_radius_m", root_radius,
+            limits.root_horizontal_radius_p95_m,
+            direction="high", top_k=count, halo=halo,
+        ),
     }
     active = (
         (penetration < float(limits.foot_penetration_min_m))
         | (skate > float(limits.foot_skate_mps_p95))
         | (drift > float(limits.foot_support_drift_m_p95))
         | (jerk > float(limits.joint_jerk_mps3_max))
+        | (
+            rotation_step
+            > float(limits.joint_rotation_step_window_p95_max_rad)
+        )
     )
     expanded = np.zeros(len(active), dtype=bool)
     for start, end in contiguous_regions(active):
@@ -12454,7 +12561,7 @@ def full_sequence_physical_diagnostics_np(
         precomputed_joints=joints,
     )
     return {
-        "schema": "full_sequence_physical_localization_v11",
+        "schema": "full_sequence_physical_localization_v12",
         "support_contract": "final_fail_closed_with_sliding_eligibility",
         "frames": int(len(value)),
         "top_k": int(count),
@@ -12464,6 +12571,15 @@ def full_sequence_physical_diagnostics_np(
         "ranked_violations": ranked,
         "audit": audit,
         "residuals": _physical_residuals(audit, limits),
+        "localized_layers": [
+            "anti_jitter",
+            "foot_contact",
+            "long_horizon_root_drift",
+            "rotation_quality",
+        ],
+        "root_drift_repair_owner": (
+            "boundary_closed_loop.root_drift_restoration_transaction"
+        ),
     }
 
 
@@ -12821,6 +12937,7 @@ def _finite_difference_cone_sources(
     cfg: MotionGenerationConfig,
     ownership_eligible: np.ndarray,
     global_eligible: Optional[np.ndarray] = None,
+    objective_metric_keys: Optional[Sequence[str]] = None,
 ) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
     """Build a global sparse cone from measured local derivatives.
 
@@ -12841,6 +12958,9 @@ def _finite_difference_cone_sources(
     start, end = map(int, first_span)
     if end <= start:
         return []
+    requested_objective_keys = tuple(
+        dict.fromkeys(objective_metric_keys or _CONTACT_RESTORATION_KEYS)
+    )
 
     def local_patch(source_motion: np.ndarray) -> np.ndarray:
         value = np.asarray(source_motion, dtype=np.float32)
@@ -13204,7 +13324,13 @@ def _finite_difference_cone_sources(
         finite_difference_sources = tuple(
             list(finite_difference_sources) + temporal_sources
         )
-    anchor_sources = contact_anchor_sources()
+    anchor_sources = (
+        contact_anchor_sources()
+        if set(requested_objective_keys).intersection(
+            _CONTACT_RESTORATION_KEYS
+        )
+        else []
+    )
     if anchor_sources:
         finite_difference_sources = tuple(
             list(finite_difference_sources) + anchor_sources
@@ -13213,19 +13339,21 @@ def _finite_difference_cone_sources(
     limits = PhysicalQualityLimits.from_environment()
     policy = StageAcceptancePolicy.from_environment()
     specs = physical_metric_specs(limits, policy)
-    contact_keys = (
-        "foot_skate_mps_p95",
-        "foot_skate_mps_max",
-        "foot_support_drift_m_p95",
-        "foot_support_drift_m_max",
-        "foot_penetration_min_m",
-    )
     before_audit = audit_motion_np(
         base[start:end],
         cfg,
         sliding_support_eligible=before_eligible,
     )
     before_residuals = _physical_residuals(before_audit, limits)
+    objective_keys = requested_objective_keys
+    unknown_objectives = [
+        key for key in objective_keys if key not in before_residuals
+    ]
+    if unknown_objectives:
+        raise KeyError(
+            "unknown finite-difference objective metrics: "
+            + ", ".join(unknown_objectives)
+        )
 
     # The exact transaction selector applies a full-sequence non-regression
     # audit after local blending.  Estimate the same signed metric changes at
@@ -13273,7 +13401,7 @@ def _finite_difference_cone_sources(
     ) -> Dict[str, float]:
         values: Dict[str, float] = {}
         for spec in specs:
-            if spec.key in contact_keys:
+            if spec.key in objective_keys:
                 continue
             old = float(before_audit.get(spec.key, float("nan")))
             new = float(audit.get(spec.key, float("nan")))
@@ -13360,9 +13488,9 @@ def _finite_difference_cone_sources(
                 global_nonregression_tolerance,
             ) = global_nonregression_derivatives(source_global_audit)
         profiles[key] = {
-            "contact_derivative": {
+            "objective_derivative": {
                 metric: float(source_residuals[metric] - before_residuals[metric])
-                for metric in contact_keys
+                for metric in objective_keys
             },
             "hard_derivative": hard_derivatives(source_audit, source_seam),
             "hard_derivative_tolerance": hard_tolerances,
@@ -13419,8 +13547,8 @@ def _finite_difference_cone_sources(
         combo: Sequence[Tuple[str, int]],
         coefficients: Sequence[float],
     ) -> Dict[str, Any]:
-        contact_derivative = derivative_sum(
-            combo, coefficients, "contact_derivative"
+        objective_derivative = derivative_sum(
+            combo, coefficients, "objective_derivative"
         )
         hard_derivative = derivative_sum(
             combo, coefficients, "hard_derivative"
@@ -13430,22 +13558,23 @@ def _finite_difference_cone_sources(
             coefficients,
             "global_nonregression_derivative",
         )
-        contact_regression = sum(
+        objective_regression = sum(
             max(0.0, value - 1.0e-8)
-            for value in contact_derivative.values()
+            for value in objective_derivative.values()
         )
-        active_contact_metrics = [
-            key for key in contact_keys if before_residuals[key] > 0.0
+        active_objective_metrics = [
+            key for key in objective_keys if before_residuals[key] > 0.0
         ]
-        dominant_contact_metric = max(
-            active_contact_metrics or list(contact_keys),
+        dominant_objective_metric = max(
+            active_objective_metrics or list(objective_keys),
             key=lambda key: before_residuals[key],
         )
-        dominant_contact_nonregression = bool(
-            contact_derivative[dominant_contact_metric] <= 1.0e-8
+        dominant_objective_nonregression = bool(
+            objective_derivative[dominant_objective_metric] <= 1.0e-8
         )
         support_drift_nonregression = bool(
-            contact_derivative["foot_support_drift_m_p95"] <= 1.0e-8
+            "foot_support_drift_m_p95" not in objective_derivative
+            or objective_derivative["foot_support_drift_m_p95"] <= 1.0e-8
         )
         hard_regression = sum(
             1.0e6
@@ -13510,7 +13639,7 @@ def _finite_difference_cone_sources(
                 global_safe_backtracking_factor = 0.0
         meaningful_metrics = {
             key: float(value)
-            for key, value in contact_derivative.items()
+            for key, value in objective_derivative.items()
             if value <= -max(
                 1.0e-7,
                 before_residuals[key]
@@ -13519,18 +13648,18 @@ def _finite_difference_cone_sources(
         }
         derivative_feasible = bool(
             meaningful_metrics
-            and contact_regression <= 1.0e-8
-            and dominant_contact_nonregression
+            and objective_regression <= 1.0e-8
+            and dominant_objective_nonregression
             and support_drift_nonregression
             and hard_safe_backtracking_factor + 1.0e-12
             >= minimum_backtracking_factor
             and global_safe_backtracking_factor + 1.0e-12
             >= minimum_backtracking_factor
         )
-        contact_gain = sum(
+        objective_gain = sum(
             max(0.0, -value)
             / max(before_residuals[key], 1.0e-7)
-            for key, value in contact_derivative.items()
+            for key, value in objective_derivative.items()
         )
         # Keep diagnostic scores finite when a direction has no positive hard
         # derivative.  The unbounded safe factor is still reported verbatim;
@@ -13545,13 +13674,13 @@ def _finite_difference_cone_sources(
             float(global_nonregression_regression),
             float(-hard_safe_score),
             float(-global_safe_score),
-            float(contact_regression),
-            -float(contact_gain),
+            float(objective_regression),
+            -float(objective_gain),
             -float(len(meaningful_metrics)),
         )
         return {
             "score": score,
-            "contact_derivative": contact_derivative,
+            "objective_derivative": objective_derivative,
             "hard_derivative": hard_derivative,
             "global_nonregression_derivative": global_nonregression_derivative,
             "global_nonregression_regression": float(
@@ -13566,9 +13695,9 @@ def _finite_difference_cone_sources(
             "minimum_backtracking_factor": float(
                 minimum_backtracking_factor
             ),
-            "meaningful_contact_metrics": meaningful_metrics,
-            "dominant_contact_metric": dominant_contact_metric,
-            "dominant_contact_nonregression": dominant_contact_nonregression,
+            "meaningful_objective_metrics": meaningful_metrics,
+            "dominant_objective_metric": dominant_objective_metric,
+            "dominant_objective_nonregression": dominant_objective_nonregression,
             "support_drift_nonregression": support_drift_nonregression,
             "derivative_feasible": derivative_feasible,
         }
@@ -13590,8 +13719,12 @@ def _finite_difference_cone_sources(
     coefficient_rows: List[np.ndarray] = []
     for size in (1, 2, 3):
         for combo in combinations(directions, size):
-            if contact_direction_keys and not any(
+            if (
+                set(objective_keys).intersection(_CONTACT_RESTORATION_KEYS)
+                and contact_direction_keys
+                and not any(
                 direction in contact_direction_keys for direction in combo
+                )
             ):
                 continue
             for coefficients in coefficient_candidates(size):
@@ -13612,7 +13745,7 @@ def _finite_difference_cone_sources(
         matrix_device = requested_device
         if requested_device.type == "cuda" and not torch.cuda.is_available():
             matrix_device = torch.device("cpu")
-    contact_metric_keys = sorted(contact_keys)
+    objective_metric_keys = sorted(objective_keys)
     hard_metric_keys = sorted({
         key
         for direction in directions
@@ -13642,8 +13775,8 @@ def _finite_difference_cone_sources(
     coefficient_matrix_np = np.stack(coefficient_rows, axis=0)
     if torch is None:
         coefficient_matrix = None
-        contact_values_np = coefficient_matrix_np @ direction_derivative_matrix(
-            "contact_derivative", contact_metric_keys
+        objective_values_np = coefficient_matrix_np @ direction_derivative_matrix(
+            "objective_derivative", objective_metric_keys
         )
         hard_values_np = coefficient_matrix_np @ direction_derivative_matrix(
             "hard_derivative", hard_metric_keys
@@ -13651,7 +13784,7 @@ def _finite_difference_cone_sources(
         global_values_np = coefficient_matrix_np @ direction_derivative_matrix(
             "global_nonregression_derivative", global_metric_keys
         )
-        contact_values = np.asarray(contact_values_np)
+        objective_values = np.asarray(objective_values_np)
         hard_values = np.asarray(hard_values_np)
         global_values = np.asarray(global_values_np)
     else:
@@ -13660,9 +13793,9 @@ def _finite_difference_cone_sources(
             device=matrix_device,
             dtype=torch.float32,
         )
-        contact_values = coefficient_matrix @ torch.as_tensor(
+        objective_values = coefficient_matrix @ torch.as_tensor(
             direction_derivative_matrix(
-                "contact_derivative", contact_metric_keys
+                "objective_derivative", objective_metric_keys
             ),
             device=matrix_device,
             dtype=torch.float32,
@@ -13680,22 +13813,26 @@ def _finite_difference_cone_sources(
             dtype=torch.float32,
         )
 
-    active_contact_metrics = [
-        key for key in contact_keys if before_residuals[key] > 0.0
+    active_objective_metrics = [
+        key for key in objective_keys if before_residuals[key] > 0.0
     ]
-    dominant_contact_metric = max(
-        active_contact_metrics or list(contact_keys),
+    dominant_objective_metric = max(
+        active_objective_metrics or list(objective_keys),
         key=lambda key: before_residuals[key],
     )
-    dominant_index = contact_metric_keys.index(dominant_contact_metric)
-    drift_index = contact_metric_keys.index("foot_support_drift_m_p95")
+    dominant_index = objective_metric_keys.index(dominant_objective_metric)
+    drift_index = (
+        objective_metric_keys.index("foot_support_drift_m_p95")
+        if "foot_support_drift_m_p95" in objective_metric_keys
+        else None
+    )
     meaningful_threshold = np.asarray([
         max(
             1.0e-7,
             before_residuals[key]
             * float(cfg.full_sequence_contact_repair_min_gain),
         )
-        for key in contact_metric_keys
+        for key in objective_metric_keys
     ], dtype=np.float32)
     hard_tolerance_np = np.asarray([
         max(
@@ -13725,9 +13862,9 @@ def _finite_difference_cone_sources(
     )
 
     if torch is None:
-        meaningful = contact_values <= -meaningful_threshold[None]
-        contact_regression = np.maximum(
-            contact_values - 1.0e-8, 0.0
+        meaningful = objective_values <= -meaningful_threshold[None]
+        objective_regression = np.maximum(
+            objective_values - 1.0e-8, 0.0
         ).sum(axis=1)
         hard_regression = np.maximum(hard_values - 1.0e-8, 0.0).sum(axis=1)
         global_regression = np.maximum(
@@ -13749,17 +13886,21 @@ def _finite_difference_cone_sources(
         global_safe = safe_factor(global_values, global_tolerance_np)
         feasible_mask = (
             meaningful.any(axis=1)
-            & (contact_regression <= 1.0e-8)
-            & (contact_values[:, dominant_index] <= 1.0e-8)
-            & (contact_values[:, drift_index] <= 1.0e-8)
+            & (objective_regression <= 1.0e-8)
+            & (objective_values[:, dominant_index] <= 1.0e-8)
+            & (
+                True
+                if drift_index is None
+                else objective_values[:, drift_index] <= 1.0e-8
+            )
             & (hard_safe + 1.0e-12 >= minimum_backtracking_factor)
             & (global_safe + 1.0e-12 >= minimum_backtracking_factor)
         )
-        contact_gain = (
-            np.maximum(-contact_values, 0.0)
+        objective_gain = (
+            np.maximum(-objective_values, 0.0)
             / np.maximum(
                 np.asarray(
-                    [before_residuals[key] for key in contact_metric_keys]
+                    [before_residuals[key] for key in objective_metric_keys]
                 )[None],
                 1.0e-7,
             )
@@ -13768,8 +13909,8 @@ def _finite_difference_cone_sources(
             (~feasible_mask).astype(np.float64) * 1.0e12
             + hard_regression.astype(np.float64) * 1.0e8
             + global_regression.astype(np.float64) * 1.0e6
-            + contact_regression.astype(np.float64) * 1.0e4
-            - contact_gain.astype(np.float64)
+            + objective_regression.astype(np.float64) * 1.0e4
+            - objective_gain.astype(np.float64)
         )
         feasible_indices = np.flatnonzero(feasible_mask)
         candidate_indices = (
@@ -13787,8 +13928,10 @@ def _finite_difference_cone_sources(
         global_tolerance_t = torch.as_tensor(
             global_tolerance_np, device=matrix_device
         )
-        meaningful = contact_values <= -meaningful_threshold_t[None]
-        contact_regression = torch.relu(contact_values - 1.0e-8).sum(dim=1)
+        meaningful = objective_values <= -meaningful_threshold_t[None]
+        objective_regression = torch.relu(
+            objective_values - 1.0e-8
+        ).sum(dim=1)
         hard_regression = torch.relu(hard_values - 1.0e-8).sum(dim=1)
         global_regression = torch.relu(
             global_values - global_tolerance_t[None]
@@ -13813,26 +13956,30 @@ def _finite_difference_cone_sources(
         global_safe = safe_factor(global_values, global_tolerance_t)
         feasible_mask = (
             meaningful.any(dim=1)
-            & (contact_regression <= 1.0e-8)
-            & (contact_values[:, dominant_index] <= 1.0e-8)
-            & (contact_values[:, drift_index] <= 1.0e-8)
+            & (objective_regression <= 1.0e-8)
+            & (objective_values[:, dominant_index] <= 1.0e-8)
+            & (
+                torch.ones_like(meaningful.any(dim=1), dtype=torch.bool)
+                if drift_index is None
+                else objective_values[:, drift_index] <= 1.0e-8
+            )
             & (hard_safe + 1.0e-12 >= minimum_backtracking_factor)
             & (global_safe + 1.0e-12 >= minimum_backtracking_factor)
         )
         residual_scale = torch.as_tensor(
-            [max(before_residuals[key], 1.0e-7) for key in contact_metric_keys],
+            [max(before_residuals[key], 1.0e-7) for key in objective_metric_keys],
             device=matrix_device,
             dtype=torch.float32,
         )
-        contact_gain = (
-            torch.relu(-contact_values) / residual_scale[None]
+        objective_gain = (
+            torch.relu(-objective_values) / residual_scale[None]
         ).sum(dim=1)
         score_scalar = (
             (~feasible_mask).to(torch.float64) * 1.0e12
             + hard_regression.to(torch.float64) * 1.0e8
             + global_regression.to(torch.float64) * 1.0e6
-            + contact_regression.to(torch.float64) * 1.0e4
-            - contact_gain.to(torch.float64)
+            + objective_regression.to(torch.float64) * 1.0e4
+            - objective_gain.to(torch.float64)
         )
         feasible_indices_t = torch.nonzero(
             feasible_mask, as_tuple=False
@@ -13857,13 +14004,15 @@ def _finite_difference_cone_sources(
 
     feasible_count = int(len(feasible_indices))
     global_cone_feasible = bool(feasible_count)
-    for metric_index, key in enumerate(contact_metric_keys):
+    for metric_index, key in enumerate(objective_metric_keys):
         if torch is None:
-            count = int(np.sum(contact_values[:, metric_index] > 1.0e-8))
+            count = int(np.sum(objective_values[:, metric_index] > 1.0e-8))
         else:
-            count = int((contact_values[:, metric_index] > 1.0e-8).sum().item())
+            count = int((
+                objective_values[:, metric_index] > 1.0e-8
+            ).sum().item())
         if count:
-            rejected_constraint_counts[f"contact:{key}"] = count
+            rejected_constraint_counts[f"objective_nonregression:{key}"] = count
     for metric_index, key in enumerate(hard_metric_keys):
         if torch is None:
             count = int(np.sum(hard_values[:, metric_index] > 1.0e-8))
@@ -13889,13 +14038,13 @@ def _finite_difference_cone_sources(
     else:
         no_improvement_count = int((~meaningful.any(dim=1)).sum().item())
     if no_improvement_count:
-        rejected_constraint_counts["contact_improvement"] = no_improvement_count
+        rejected_constraint_counts["objective_improvement"] = no_improvement_count
 
     def selected_record(index: int) -> Dict[str, Any]:
         combo, coefficients = combination_specs[int(index)]
-        contact_derivative = {
-            key: float(contact_values[int(index), metric_index])
-            for metric_index, key in enumerate(contact_metric_keys)
+        objective_derivative = {
+            key: float(objective_values[int(index), metric_index])
+            for metric_index, key in enumerate(objective_metric_keys)
         }
         hard_derivative = {
             key: float(hard_values[int(index), metric_index])
@@ -13907,7 +14056,7 @@ def _finite_difference_cone_sources(
         }
         meaningful_metrics = {
             key: value
-            for key, value in contact_derivative.items()
+            for key, value in objective_derivative.items()
             if value <= -max(
                 1.0e-7,
                 before_residuals[key]
@@ -13917,38 +14066,39 @@ def _finite_difference_cone_sources(
         hard_safe_value = float(hard_safe[int(index)])
         global_safe_value = float(global_safe[int(index)])
         derivative_feasible = bool(feasible_mask[int(index)])
-        contact_regression_value = float(contact_regression[int(index)])
+        objective_regression_value = float(objective_regression[int(index)])
         hard_regression_value = float(hard_regression[int(index)])
         global_regression_value = float(global_regression[int(index)])
-        contact_gain_value = float(contact_gain[int(index)])
+        objective_gain_value = float(objective_gain[int(index)])
         score = (
             0 if derivative_feasible else 1,
             hard_regression_value,
             global_regression_value,
             -min(hard_safe_value, 1.0e6),
             -min(global_safe_value, 1.0e6),
-            contact_regression_value,
-            -contact_gain_value,
+            objective_regression_value,
+            -objective_gain_value,
             -float(len(meaningful_metrics)),
         )
         return {
             "combo": combo,
             "coefficients": coefficients,
             "score": score,
-            "contact_derivative": contact_derivative,
+            "objective_derivative": objective_derivative,
             "hard_derivative": hard_derivative,
             "global_nonregression_derivative": global_derivative,
             "global_nonregression_regression": global_regression_value,
             "hard_safe_backtracking_factor": hard_safe_value,
             "global_safe_backtracking_factor": global_safe_value,
             "minimum_backtracking_factor": minimum_backtracking_factor,
-            "meaningful_contact_metrics": meaningful_metrics,
-            "dominant_contact_metric": dominant_contact_metric,
-            "dominant_contact_nonregression": bool(
-                contact_derivative[dominant_contact_metric] <= 1.0e-8
+            "meaningful_objective_metrics": meaningful_metrics,
+            "dominant_objective_metric": dominant_objective_metric,
+            "dominant_objective_nonregression": bool(
+                objective_derivative[dominant_objective_metric] <= 1.0e-8
             ),
             "support_drift_nonregression": bool(
-                contact_derivative["foot_support_drift_m_p95"] <= 1.0e-8
+                "foot_support_drift_m_p95" not in objective_derivative
+                or objective_derivative["foot_support_drift_m_p95"] <= 1.0e-8
             ),
             "derivative_feasible": derivative_feasible,
         }
@@ -13996,7 +14146,8 @@ def _finite_difference_cone_sources(
             "global_cone_feasible": global_cone_feasible,
             "feasible_direction_count": int(feasible_count),
             "selected_direction_sources": feasible_direction_sources,
-            "contact_residual_derivative": record["contact_derivative"],
+            "objective_metric_keys": list(objective_metric_keys),
+            "objective_residual_derivative": record["objective_derivative"],
             "hard_metric_derivative": record["hard_derivative"],
             "global_nonregression_derivative": record[
                 "global_nonregression_derivative"
@@ -14013,14 +14164,14 @@ def _finite_difference_cone_sources(
             "minimum_backtracking_factor": record[
                 "minimum_backtracking_factor"
             ],
-            "meaningful_contact_metrics": record[
-                "meaningful_contact_metrics"
+            "meaningful_objective_metrics": record[
+                "meaningful_objective_metrics"
             ],
-            "dominant_contact_metric": record[
-                "dominant_contact_metric"
+            "dominant_objective_metric": record[
+                "dominant_objective_metric"
             ],
-            "dominant_contact_nonregression": record[
-                "dominant_contact_nonregression"
+            "dominant_objective_nonregression": record[
+                "dominant_objective_nonregression"
             ],
             "support_drift_nonregression": record[
                 "support_drift_nonregression"
@@ -14103,6 +14254,7 @@ def _gpu_prescreen_transaction_candidates(
     ownership_span: Sequence[int],
     audit_span: Sequence[int],
     static_support_mask: np.ndarray,
+    objective_metric_keys: Optional[Sequence[str]] = None,
 ) -> Tuple[set, Dict[str, Any]]:
     """Shortlist local patches on GPU before authoritative CPU exact audit."""
 
@@ -14149,21 +14301,21 @@ def _gpu_prescreen_transaction_candidates(
         cfg,
         static_support_mask=static_mask,
     )
-    contact_keys = (
-        "foot_skate_mps_p95",
-        "foot_skate_mps_max",
-        "foot_support_drift_m_p95",
-        "foot_support_drift_m_max",
-        "foot_penetration_min_m",
+    requested_objectives = tuple(
+        dict.fromkeys(objective_metric_keys or _CONTACT_RESTORATION_KEYS)
     )
-    hard_keys = (
+    measured_keys = set(baseline)
+    objective_keys = tuple(
+        key for key in requested_objectives if key in measured_keys
+    )
+    hard_keys = tuple(key for key in (
         "joint_jerk_mps3_p95",
         "joint_jerk_mps3_max",
         "joint_jerk_window_p95_max_mps3",
         "extremity_jerk_mps3_p95",
         "extremity_jerk_mps3_max",
         "extremity_jerk_window_p95_max_mps3",
-    )
+    ) if key not in objective_keys)
     all_scores: List["torch.Tensor"] = []
     all_near: List["torch.Tensor"] = []
     batch_size = max(
@@ -14201,34 +14353,62 @@ def _gpu_prescreen_transaction_candidates(
             cfg,
             static_support_mask=static_mask,
         )
-        contact_deltas = []
-        for key in contact_keys:
+        objective_deltas = []
+        for key in objective_keys:
             delta = measured[key] - baseline[key]
             if key == "foot_penetration_min_m":
                 delta = -delta
-            contact_deltas.append(delta)
-        hard_deltas = torch.stack([
-            measured[key] - baseline[key] for key in hard_keys
-        ], dim=1)
-        contact_delta = torch.stack(contact_deltas, dim=1)
-        normalized_contact = contact_delta / torch.stack([
+            objective_deltas.append(delta)
+        hard_deltas = (
+            torch.stack([
+                measured[key] - baseline[key] for key in hard_keys
+            ], dim=1)
+            if hard_keys
+            else torch.zeros(
+                (len(batch_plans), 0),
+                device=device,
+                dtype=patches.dtype,
+            )
+        )
+        objective_delta = (
+            torch.stack(objective_deltas, dim=1)
+            if objective_deltas
+            else torch.zeros(
+                (len(batch_plans), 0),
+                device=device,
+                dtype=patches.dtype,
+            )
+        )
+        normalized_objective = objective_delta / torch.stack([
             baseline[key].abs().clamp_min(1.0e-4)[0]
-            for key in contact_keys
-        ])[None]
-        normalized_hard = hard_deltas / torch.stack([
-            baseline[key].abs().clamp_min(1.0)[0] for key in hard_keys
-        ])[None]
-        contact_gain = torch.relu(-normalized_contact).sum(dim=1)
-        contact_regression = torch.relu(normalized_contact).sum(dim=1)
+            for key in objective_keys
+        ])[None] if objective_keys else objective_delta
+        normalized_hard = (
+            hard_deltas / torch.stack([
+                baseline[key].abs().clamp_min(1.0)[0] for key in hard_keys
+            ])[None]
+            if hard_keys
+            else hard_deltas
+        )
+        objective_gain = torch.relu(-normalized_objective).sum(dim=1)
+        objective_regression = torch.relu(normalized_objective).sum(dim=1)
         hard_regression = torch.relu(normalized_hard).sum(dim=1)
-        any_contact_gain = (contact_delta < -1.0e-7).any(dim=1)
-        hard_safe = (hard_deltas <= 1.0e-5).all(dim=1)
+        any_objective_gain = (
+            (objective_delta < -1.0e-7).any(dim=1)
+            if objective_keys
+            else torch.zeros(len(batch_plans), device=device, dtype=torch.bool)
+        )
+        hard_safe = (
+            (hard_deltas <= 1.0e-5).all(dim=1)
+            if hard_keys
+            else torch.ones(len(batch_plans), device=device, dtype=torch.bool)
+        )
         score = (
             (~hard_safe).to(torch.float64) * 1.0e12
-            + (~any_contact_gain).to(torch.float64) * 1.0e10
+            + (~any_objective_gain).to(torch.float64) * 1.0e10
             + hard_regression.to(torch.float64) * 1.0e7
-            + contact_regression.to(torch.float64) * 1.0e4
-            - contact_gain.to(torch.float64)
+            + objective_regression.to(torch.float64) * 1.0e4
+            - objective_gain.to(torch.float64)
         )
         nonzero_hard_delta = hard_deltas.abs() > 0.0
         near = (
@@ -14262,11 +14442,26 @@ def _gpu_prescreen_transaction_candidates(
             "post_stabilization",
         ):
             selected.add(int(index))
+        metadata = plan.get("source_metadata", {}) or {}
+        blocks = [
+            str(metadata.get("direction_block", "")),
+            *[str(value) for value in metadata.get("direction_blocks", ())],
+        ]
+        # Rotation objectives are not approximated by the conservative GPU
+        # pre-screen.  Keep every temporal direction for authoritative exact
+        # CPU audit rather than silently screening away the only useful basis.
+        if any("temporal_" in block for block in blocks) and any(
+            "rotation" in key or "angular_acceleration" in key
+            for key in requested_objectives
+        ):
+            selected.add(int(index))
     report.update({
         "backend": str(device),
         "shortlisted_candidates": int(len(selected)),
         "clear_gpu_rejections": int(len(plans) - len(selected)),
         "near_numeric_boundary_candidates": int(near.sum().item()),
+        "objective_metric_keys": list(requested_objectives),
+        "gpu_measured_objective_metric_keys": list(objective_keys),
         "seconds": float(time.perf_counter() - started),
     })
     return selected, report
@@ -14280,11 +14475,14 @@ def _local_infeasibility_diagnosis(
     reasons: Dict[str, int] = {}
     contact_reasons: Dict[str, int] = {}
     hard_reasons: Dict[str, int] = {}
-    contact_improving_attempts = 0
+    objective_improving_attempts = 0
     for attempt in attempts:
         exact_audit = attempt.get("exact_audit", {})
-        if exact_audit.get("meaningful_contact_metrics"):
-            contact_improving_attempts += 1
+        if exact_audit.get(
+            "meaningful_objective_metrics",
+            exact_audit.get("meaningful_contact_metrics", ()),
+        ):
+            objective_improving_attempts += 1
         for reason in attempt.get("blocking_reasons", ()):
             key = str(reason)
             reasons[key] = reasons.get(key, 0) + 1
@@ -14292,16 +14490,18 @@ def _local_infeasibility_diagnosis(
                 contact_reasons[key] = contact_reasons.get(key, 0) + 1
             if key.startswith(("hard_metric_regressed:", "audit_halo_metric_regressed:")):
                 hard_reasons[key] = hard_reasons.get(key, 0) + 1
-    if contact_improving_attempts:
-        blocking_class = "contact_direction_found_but_hard_constraints_blocked"
+    if objective_improving_attempts:
+        blocking_class = "objective_direction_found_but_hard_constraints_blocked"
     else:
-        blocking_class = "no_contact_improving_probe"
+        blocking_class = "no_objective_improving_probe"
     return {
         "status": "local_infeasible_under_current_action_basis",
         "blocking_class": blocking_class,
         "attempt_count": int(len(attempts)),
         "accepted_count": int(sum(bool(item.get("accepted")) for item in attempts)),
-        "contact_improving_attempt_count": int(contact_improving_attempts),
+        "objective_improving_attempt_count": int(objective_improving_attempts),
+        # Compatibility field for existing V11 report readers.
+        "contact_improving_attempt_count": int(objective_improving_attempts),
         "blocking_reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
         "contact_regressions": dict(sorted(contact_reasons.items(), key=lambda item: (-item[1], item[0]))),
         "hard_regressions": dict(sorted(hard_reasons.items(), key=lambda item: (-item[1], item[0]))),
@@ -14449,8 +14649,10 @@ def _contact_restoration_decision(
     return {
         "accepted": not reasons,
         "reasons": list(dict.fromkeys(reasons)),
+        "dominant_objective_metric": dominant,
         "dominant_contact_metric": dominant,
         "objective_metrics": list(objective_keys),
+        "meaningful_objective_metrics": list(meaningful_metrics),
         "meaningful_contact_metrics": list(meaningful_metrics),
         "contact_gains": contact_gains,
         "normalized_contact_gains": normalized_gains,
@@ -14550,7 +14752,7 @@ def _exact_audit_candidate_rank(
     dominant_gain_missing = (
         "dominant_contact_residual_not_meaningfully_improved" in reasons
     )
-    dominant = str(decision["dominant_contact_metric"])
+    dominant = str(decision["dominant_objective_metric"])
     dominant_after = float(decision["candidate_residuals"][dominant])
     limits = PhysicalQualityLimits.from_environment()
     jerk_specs = {
@@ -14600,6 +14802,8 @@ def _exact_audit_candidate_rank(
         },
         "hard_regression_count": int(len(all_regression_reasons)),
         "dominant_contact_metric": dominant,
+        "dominant_objective_metric": dominant,
+        "objective_metrics": list(decision.get("objective_metrics", [])),
         "objective_metrics": list(decision["objective_metrics"]),
         "dominant_contact_residual_before": float(
             decision["before_residuals"][dominant]
@@ -14608,6 +14812,9 @@ def _exact_audit_candidate_rank(
         "required_dominant_gain": float(decision["required_dominant_gain"]),
         "meaningful_contact_metrics": list(
             decision.get("meaningful_contact_metrics", [])
+        ),
+        "meaningful_objective_metrics": list(
+            decision.get("meaningful_objective_metrics", [])
         ),
         "contact_gains": {
             key: float(value)
@@ -14875,18 +15082,6 @@ def true_lower_body_ik(
         if v11_mode
         else np.zeros(T, dtype=np.int8)
     )
-    no_support_objective_keys = (
-        "foot_penetration_min_m",
-        "joint_jerk_mps3_max",
-        "joint_jerk_window_p95_max_mps3",
-    )
-    contact_objective_keys = (
-        "foot_penetration_min_m",
-        "foot_skate_mps_p95",
-        "foot_skate_mps_max",
-        "foot_support_drift_m_p95",
-        "foot_support_drift_m_max",
-    )
     for st, ed in solve_ranges:
         if ed - st < 4:
             continue
@@ -14907,11 +15102,6 @@ def true_lower_body_ik(
         base_root = root.detach().clone()
         base_joints = fk_24_torch(base).detach()
         if v11_mode:
-            chunk_objective_keys = (
-                no_support_objective_keys
-                if int(support_phase_codes[st]) == 0
-                else contact_objective_keys
-            )
             chunk_before_audit = audit_motion_np(
                 base_np,
                 cfg,
@@ -14920,6 +15110,12 @@ def true_lower_body_ik(
             chunk_before_residuals = _physical_residuals(
                 chunk_before_audit,
                 physical_limits,
+            )
+            chunk_objective_keys = _select_restoration_objective_keys(
+                chunk_before_audit,
+                has_static_support=bool(
+                    int(support_phase_codes[st]) != 0
+                ),
             )
             optimizer_dominant_metric = max(
                 chunk_objective_keys,
@@ -15660,8 +15856,9 @@ def true_lower_body_ik(
         before_absolute_reasons = set(
             evaluate_physical_audit(before_local, limits=ik_limits)["reasons"]
         )
-        transaction_objective_keys = (
-            None if has_contact else no_support_objective_keys
+        transaction_objective_keys = _select_restoration_objective_keys(
+            before_ownership,
+            has_static_support=has_contact,
         )
         source_candidates: List[Tuple[str, np.ndarray, Dict[str, Any]]] = (
             [("raw", raw_out_all, {"direction_source": "optimizer"})]
@@ -15696,6 +15893,7 @@ def true_lower_body_ik(
                 cfg,
                 ownership_eligible,
                 eligible,
+                objective_metric_keys=transaction_objective_keys,
             )
             source_candidates.extend(cone_sources)
             if cone_sources:
@@ -15790,6 +15988,7 @@ def true_lower_body_ik(
                 static_support_mask=solver_contacts[
                     audit_start:audit_end
                 ],
+                objective_metric_keys=transaction_objective_keys,
             )
             if v11_mode
             else (
@@ -16273,11 +16472,14 @@ def true_lower_body_ik(
                 "local_infeasibility": local_infeasibility,
                 "candidate_selection": {
                     "protocol": (
-                        "ownership_exact_audit_backtracking_v11"
+                        "ownership_exact_audit_multi_objective_backtracking_v12"
                         if v11_mode
                         else "legacy_single_candidate"
                     ),
                     "sources": [name for name, _, _ in localized_sources],
+                    "objective_metric_keys": list(
+                        transaction_objective_keys
+                    ),
                     "backtracking_factors": list(map(float, factors)),
                     "gpu_prescreen": gpu_prescreen,
                     "selected_source": selected_state["attempt"]["source"],
@@ -16456,7 +16658,7 @@ def true_lower_body_ik(
     report = {
         "version": "lower_body_ik_contact_transactions",
         "protocol": (
-            "observable_tolerant_contact_transactions_v11"
+            "observable_tolerant_physical_transactions_v12"
             if v11_mode
             else "legacy_lower_body_ik"
         ),
@@ -16505,7 +16707,7 @@ def true_lower_body_ik(
         },
         "rollback_policy": {
             "mode": (
-                "observable_tolerant_ownership_window_transactions_v11"
+                "observable_tolerant_ownership_window_transactions_v12"
                 if v11_mode
                 else "local_ownership_window_transactions"
             ),
@@ -17388,6 +17590,7 @@ def true_lower_body_ik(
             "window_transactions_v9",
             "window_transactions_v10",
             "window_transactions_v11",
+            "window_transactions_v12",
         ))
         # Local transactions have already passed physical and KBO checks with
         # derivative halos.  A second whole-song stage prior would modify
