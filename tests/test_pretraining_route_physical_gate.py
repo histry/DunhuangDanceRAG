@@ -54,6 +54,30 @@ def test_unrefined_jitter_skate_and_horizontal_drift_are_diagnostic_only():
     ] is True
 
 
+def test_rotation_window_smoothness_is_pre_repair_diagnostic_but_final_failure():
+    audit = _audit()
+    audit["joint_rotation_step_window_p95_max_rad"] = 0.5682746946811674
+
+    final_gate = evaluate_physical_audit(audit)
+    pretraining_gate = evaluate_pretraining_route_audit(audit)
+
+    reason = "joint_rotation_step_window_p95_max_rad_too_high"
+    assert final_gate["ok"] is False
+    assert reason in final_gate["reasons"]
+    assert pretraining_gate["schema"] == (
+        "pretraining_scheduler_route_physical_gate_v2"
+    )
+    assert pretraining_gate["ok"] is True
+    assert reason not in pretraining_gate["reasons"]
+    assert reason in pretraining_gate["diagnostic_only_reasons"]
+    assert pretraining_gate["rotation_reason_policy"] == {
+        "repairable_diagnostic_allowlist": [reason],
+        "hard_reasons": [],
+        "diagnostic_only_reasons": [reason],
+        "unknown_reasons_fail_closed": True,
+    }
+
+
 def test_rotation_integrity_remains_blocking_before_training():
     audit = _audit()
     audit["rot6d_degenerate_ratio"] = 0.01
@@ -62,6 +86,27 @@ def test_rotation_integrity_remains_blocking_before_training():
 
     assert gate["ok"] is False
     assert "rot6d_degenerate_ratio_too_high" in gate["reasons"]
+
+
+def test_unallowlisted_rotation_smoothness_failure_remains_blocking():
+    audit = _audit()
+    audit["joint_rotation_step_rad_max"] = 1.3
+
+    gate = evaluate_pretraining_route_audit(audit)
+
+    assert gate["ok"] is False
+    assert "joint_rotation_step_rad_max_too_high" in gate["reasons"]
+    assert gate["rotation_reason_policy"]["unknown_reasons_fail_closed"] is True
+
+
+def test_missing_rotation_integrity_metric_remains_blocking():
+    audit = _audit()
+    del audit["rot6d_degenerate_ratio"]
+
+    gate = evaluate_pretraining_route_audit(audit)
+
+    assert gate["ok"] is False
+    assert "missing_or_nonfinite:rot6d_degenerate_ratio" in gate["reasons"]
 
 
 def test_root_vertical_safety_remains_blocking_before_training():

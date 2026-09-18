@@ -1020,6 +1020,35 @@ def evaluate_physical_audit(
     }
 
 
+_PRETRAIN_REPAIRABLE_ROTATION_REASONS = frozenset(
+    {
+        # Stage 7E observes the Scheduler/IK result before learned Refiner,
+        # diffusion and boundary closed-loop repair.  Windowed rotation
+        # smoothness is therefore diagnostic here, while the unchanged final
+        # generation gate remains authoritative after those stages execute.
+        "joint_rotation_step_window_p95_max_rad_too_high",
+    }
+)
+
+
+def _partition_pretraining_rotation_reasons(reasons: Sequence[Any]):
+    """Partition rotation failures with an explicit fail-closed allowlist.
+
+    Unknown and newly introduced reasons remain hard by default.  This is
+    intentionally the inverse of a catastrophic-reason allowlist, which could
+    silently downgrade future integrity checks to diagnostics.
+    """
+    hard: list[str] = []
+    diagnostic: list[str] = []
+    for raw_reason in reasons:
+        reason = str(raw_reason)
+        if reason in _PRETRAIN_REPAIRABLE_ROTATION_REASONS:
+            diagnostic.append(reason)
+        else:
+            hard.append(reason)
+    return hard, diagnostic
+
+
 def evaluate_pretraining_route_audit(
     audit: Mapping[str, Any],
     limits: Optional[PhysicalQualityLimits] = None,
@@ -1032,13 +1061,15 @@ def evaluate_pretraining_route_audit(
     planted-foot, and long-horizon horizontal-drift failures are retained as
     diagnostics, but they cannot prevent the Refiner/diffusion/boundary stages
     from running. Contract failures, unsafe root-vertical motion, malformed
-    rotations, and sustained catastrophic floor penetration remain hard.
+    rotations, and sustained catastrophic floor penetration remain hard.  A
+    narrowly allowlisted rotation-window smoothness failure is diagnostic at
+    this pre-repair stage and remains blocking in the final-generation gate.
     """
 
     final_diagnostic = evaluate_physical_audit(audit, limits=limits)
     pol = policy or PretrainingRoutePhysicalPolicy.from_environment()
 
-    blocking_layers = ("contract", "root_vertical", "rotation_quality")
+    blocking_layers = ("contract", "root_vertical")
     diagnostic_only_layers = (
         "anti_jitter",
         "foot_contact",
@@ -1049,6 +1080,13 @@ def evaluate_pretraining_route_audit(
         for layer in blocking_layers
         for reason in final_diagnostic["layers"][layer]["reasons"]
     ]
+    (
+        hard_rotation_reasons,
+        diagnostic_rotation_reasons,
+    ) = _partition_pretraining_rotation_reasons(
+        final_diagnostic["layers"]["rotation_quality"]["reasons"]
+    )
+    hard_reasons.extend(hard_rotation_reasons)
 
     catastrophic_reasons: list[str] = []
     threshold_ok, observed_threshold = _required_metric(
@@ -1081,14 +1119,25 @@ def evaluate_pretraining_route_audit(
         for layer in diagnostic_only_layers
         for reason in final_diagnostic["layers"][layer]["reasons"]
     ]
+    diagnostic_only_reasons.extend(diagnostic_rotation_reasons)
+    diagnostic_only_reasons = list(dict.fromkeys(diagnostic_only_reasons))
     return {
-        "schema": "pretraining_scheduler_route_physical_gate_v1",
+        "schema": "pretraining_scheduler_route_physical_gate_v2",
         "contract_role": "pretraining_scheduler_route_smoke_test",
         "ok": not reasons,
         "reasons": reasons,
         "blocking_layers": list(blocking_layers),
         "diagnostic_only_layers": list(diagnostic_only_layers),
         "diagnostic_only_reasons": diagnostic_only_reasons,
+        "reason_partitioned_layers": ["rotation_quality"],
+        "rotation_reason_policy": {
+            "repairable_diagnostic_allowlist": sorted(
+                _PRETRAIN_REPAIRABLE_ROTATION_REASONS
+            ),
+            "hard_reasons": hard_rotation_reasons,
+            "diagnostic_only_reasons": diagnostic_rotation_reasons,
+            "unknown_reasons_fail_closed": True,
+        },
         "policy": pol.to_dict(),
         "catastrophic_penetration": {
             "observed_threshold_m": observed_threshold if threshold_ok else None,
