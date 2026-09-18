@@ -18,6 +18,13 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+# A path-invoked script receives ``scripts/`` rather than the repository root
+# on sys.path.  Keep the standalone preflight identical to ``python -m`` and
+# to generate_only.sh, which already exports PYTHONPATH explicitly.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
 from support.event_identity import normalize_event_db_contract
 from training.motion_models import (
     MotionGenerationConfig,
@@ -198,14 +205,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--explicit", type=Path)
     parser.add_argument("--report", required=True, type=Path)
     args = parser.parse_args(argv)
-    repository_root = Path(__file__).resolve().parents[1]
     try:
         binding = resolve(
             run_root=args.run_root.resolve(),
             config=args.config.resolve(),
             explicit=(None if args.explicit is None else args.explicit),
             report=args.report.resolve(),
-            repository_root=repository_root,
+            repository_root=REPOSITORY_ROOT,
         )
     except Exception as exc:
         print(f"[FATAL] Refiner checkpoint preflight failed: {exc}", file=sys.stderr)

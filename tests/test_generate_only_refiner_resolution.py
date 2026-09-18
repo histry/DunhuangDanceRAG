@@ -1,5 +1,10 @@
 """Lifecycle contracts for the generate-only Motion Refiner asset."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import scripts.resolve_generation_refiner as resolver
 
 
@@ -95,3 +100,23 @@ def test_formal_checkpoint_binding_records_hash_and_provenance(
     assert accepted["path"] == str(checkpoint.resolve())
     assert len(accepted["sha256"]) == 64
     assert accepted["training_event_db_contract"]["num_events"] == 3
+
+
+def test_path_invoked_resolver_bootstraps_repository_imports(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "resolve_generation_refiner.py"
+    )
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--run-root" in completed.stdout
