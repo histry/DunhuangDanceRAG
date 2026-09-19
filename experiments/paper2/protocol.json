@@ -20,7 +20,13 @@
     "recompute_jet_at_each_radius": true,
     "separate_frozen_witness_and_authoritative_hard_guard": true,
     "geodesic_acceleration_ablation": true,
-    "projector_in_model_audit": false
+    "projector_in_model_audit": false,
+    "candidate_identity_fields": [
+      "constraint_generation_depth",
+      "direction_sha256",
+      "support_sha256",
+      "witness_sha256"
+    ]
   },
   "closure_evaluation": {
     "primary_radius_rms": 0.0001,
@@ -40,6 +46,13 @@
   },
   "reporting": {
     "normalized_by_frozen_contract_scale": true,
+    "primary_unit": "candidate_trial_after_row_aggregation",
+    "row_aggregations": ["median", "worst"],
+    "normality_rule": "shapiro_p_ge_0.05_and_n_ge_8",
+    "paired_normal_test": "paired_t_with_cohen_dz",
+    "paired_non_normal_test": "wilcoxon_with_rank_biserial_correlation",
+    "bootstrap_mean_delta_ci_replicates": 2000,
+    "multiple_comparison_correction": "holm_across_radii_within_aggregation_and_witness_stratum",
     "metrics": [
       "E1",
       "E2",

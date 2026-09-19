@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+
 
 PROTOCOL_SCHEMA = "paper2_eval_protocol_v1"
 MANIFEST_SCHEMA = "paper2_case_manifest_v1"
@@ -51,10 +53,69 @@ def _write_json(path, value):
     temporary.replace(path)
 
 
+def _write_json_exclusive(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def _git_output(*args):
     return subprocess.check_output(
         ["git", *args], text=True, encoding="utf-8"
     ).strip()
+
+
+def _validate_manifest_against_bank(manifest, bank_path, expected_split):
+    bank = torch.load(bank_path, map_location="cpu", weights_only=False)
+    if bank.get("split") != expected_split:
+        raise RuntimeError(
+            f"evaluation bank split must be {expected_split}"
+        )
+    split_manifest_sha256 = bank.get("split_manifest_content_sha256")
+    if not split_manifest_sha256:
+        raise RuntimeError("evaluation bank lacks split-manifest provenance")
+    if (
+        manifest.get("source_split_manifest_content_sha256")
+        != split_manifest_sha256
+    ):
+        raise RuntimeError("manifest split provenance differs from evaluation bank")
+    samples = {}
+    for sample in bank.get("samples", ()):
+        case_uid = str(sample.get("case_uid") or "")
+        if not case_uid:
+            raise RuntimeError("evaluation bank contains a case without case_uid")
+        if case_uid in samples:
+            raise RuntimeError(
+                f"evaluation bank contains duplicate case UID: {case_uid}"
+            )
+        samples[case_uid] = sample
+    selected = []
+    for case_uid in manifest["case_uids"]:
+        sample = samples.get(str(case_uid))
+        if sample is None:
+            raise RuntimeError(
+                f"manifest case is absent from evaluation bank: {case_uid}"
+            )
+        source_case_uid = str(sample.get("source_case_uid") or "")
+        transaction_id = str(sample.get("transaction_id") or "")
+        if not source_case_uid or not transaction_id:
+            raise RuntimeError(
+                f"evaluation bank case lacks provenance: {case_uid}"
+            )
+        selected.append((source_case_uid, transaction_id))
+    selected_sources = [source for source, _ in selected]
+    if len(set(selected_sources)) != len(selected_sources):
+        raise RuntimeError("manifest cases reuse a source recording")
+    if set(selected_sources) != {
+        str(value) for value in manifest["source_case_uids"]
+    }:
+        raise RuntimeError("manifest source-case mapping differs from evaluation bank")
+    if {transaction for _, transaction in selected} != {
+        str(value) for value in manifest["transaction_ids"]
+    }:
+        raise RuntimeError("manifest transaction mapping differs from evaluation bank")
 
 
 def _numeric_failure_diagnostics(case):
@@ -94,7 +155,15 @@ def _numeric_failure_diagnostics(case):
     }
 
 
-def _validate_case_result(report_path, case_uid, method, budget, phase):
+def _validate_case_result(
+    report_path,
+    case_uid,
+    method,
+    budget,
+    phase,
+    expected_commit,
+    protocol_sha256,
+):
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
     expected_intent = (
         PAPER2_EXECUTION_MECHANISM_PREREGISTERED
@@ -108,6 +177,18 @@ def _validate_case_result(report_path, case_uid, method, budget, phase):
     if report.get("paper2_execution_intent") != expected_intent:
         raise RuntimeError(
             f"{method} k{budget} execution intent mismatch for {case_uid}"
+        )
+    if report.get("implementation_commit") != expected_commit:
+        raise RuntimeError(
+            f"{method} k{budget} report commit mismatch for {case_uid}"
+        )
+    if report.get("paper2_protocol_sha256") != protocol_sha256:
+        raise RuntimeError(
+            f"{method} k{budget} report protocol mismatch for {case_uid}"
+        )
+    if report.get("numeric_audit_complete") is not True:
+        raise RuntimeError(
+            f"{method} k{budget} numeric audit incomplete for {case_uid}"
         )
     variant = f"geodesic_joint_sqp_k{int(budget)}"
     case = (
@@ -199,6 +280,13 @@ def main():
     parser.add_argument("--evaluation-bank", required=True)
     parser.add_argument("--adapter-state", required=True)
     parser.add_argument("--output-root", required=True)
+    parser.add_argument(
+        "--sealed-consumption-root",
+        help=(
+            "persistent directory for manifest-hash receipts; required for "
+            "the sealed phase"
+        ),
+    )
     parser.add_argument("--frozen-severity-envelope")
     parser.add_argument("--frozen-repair-contract")
     parser.add_argument(
@@ -210,6 +298,28 @@ def main():
 
     protocol_path, protocol = _load_json(args.protocol, PROTOCOL_SCHEMA)
     manifest_path, manifest = _load_json(args.case_manifest, MANIFEST_SCHEMA)
+    expected_commit = os.environ.get("EXPECTED_COMMIT")
+    if not expected_commit:
+        raise RuntimeError("EXPECTED_COMMIT must be exported")
+    if _git_output("rev-parse", "HEAD") != expected_commit:
+        raise RuntimeError("working tree HEAD differs from EXPECTED_COMMIT")
+    if _git_output("rev-parse", "origin/main") != expected_commit:
+        raise RuntimeError("origin/main differs from EXPECTED_COMMIT")
+    if _git_output("status", "--porcelain"):
+        raise RuntimeError("paper2 runner requires a clean worktree")
+    if protocol.get("implementation_commit") != expected_commit:
+        raise RuntimeError("paper2 protocol is not frozen to EXPECTED_COMMIT")
+    protocol_sha256 = _file_sha(protocol_path)
+    manifest_content = dict(manifest)
+    manifest_content_sha256 = manifest_content.pop("content_sha256", None)
+    if manifest_content_sha256 != _canonical_sha(manifest_content):
+        raise RuntimeError("paper2 manifest content SHA256 mismatch")
+    if manifest.get("immutable") is not True:
+        raise RuntimeError("paper2 manifest is not immutable")
+    if manifest.get("implementation_commit") != expected_commit:
+        raise RuntimeError("paper2 manifest implementation commit mismatch")
+    if manifest.get("protocol_sha256") != protocol_sha256:
+        raise RuntimeError("paper2 manifest protocol SHA256 mismatch")
     role_by_phase = {
         "mechanism": "mechanism_train",
         "development": "development",
@@ -226,6 +336,20 @@ def main():
     case_uids = tuple(str(value) for value in manifest.get("case_uids", ()))
     if not case_uids or len(set(case_uids)) != len(case_uids):
         raise RuntimeError("case manifest must contain unique case UIDs")
+    source_case_uids = tuple(
+        str(value) for value in manifest.get("source_case_uids", ())
+    )
+    if not source_case_uids or len(set(source_case_uids)) != len(
+        source_case_uids
+    ):
+        raise RuntimeError("case manifest lacks unique source-case provenance")
+    transaction_ids = tuple(
+        str(value) for value in manifest.get("transaction_ids", ())
+    )
+    if not transaction_ids:
+        raise RuntimeError("case manifest lacks transaction provenance")
+    if args.phase == "sealed" and len(transaction_ids) != 1:
+        raise RuntimeError("sealed manifest must contain exactly one transaction")
     if args.phase == "mechanism" and not (
         int(protocol["mechanism_audit"]["case_count_min"])
         <= len(case_uids)
@@ -233,24 +357,26 @@ def main():
     ):
         raise RuntimeError("mechanism case count is outside the frozen range")
 
-    expected_commit = os.environ.get("EXPECTED_COMMIT")
-    if not expected_commit:
-        raise RuntimeError("EXPECTED_COMMIT must be exported")
-    if _git_output("rev-parse", "HEAD") != expected_commit:
-        raise RuntimeError("working tree HEAD differs from EXPECTED_COMMIT")
-    if _git_output("rev-parse", "origin/main") != expected_commit:
-        raise RuntimeError("origin/main differs from EXPECTED_COMMIT")
-    if _git_output("status", "--porcelain"):
-        raise RuntimeError("paper2 runner requires a clean worktree")
-
     train_bank = Path(args.train_bank).resolve()
     eval_bank = Path(args.evaluation_bank).resolve()
     adapter_state = Path(args.adapter_state).resolve()
     for path in (train_bank, eval_bank, adapter_state, protocol_path, manifest_path):
         if not path.is_file():
             raise FileNotFoundError(path)
+    train_bank_sha256 = _file_sha(train_bank)
+    evaluation_bank_sha256 = _file_sha(eval_bank)
+    adapter_state_sha256 = _file_sha(adapter_state)
+    if manifest.get("source_bank_sha256") != evaluation_bank_sha256:
+        raise RuntimeError("paper2 manifest does not bind the evaluation bank")
+    if not manifest.get("source_split_manifest_content_sha256"):
+        raise RuntimeError("paper2 manifest lacks split-manifest provenance")
     if args.phase == "mechanism" and train_bank != eval_bank:
         raise RuntimeError("mechanism phase must evaluate the train bank")
+    _validate_manifest_against_bank(
+        manifest,
+        eval_bank,
+        "train" if args.phase == "mechanism" else "validation",
+    )
     if args.phase != "mechanism" and not (
         args.frozen_severity_envelope and args.frozen_repair_contract
     ):
@@ -258,17 +384,40 @@ def main():
             "development/formal/sealed jobs require frozen train contracts"
         )
 
-    default_budgets = (
-        (5,)
+    closure_protocol = protocol["closure_evaluation"]
+    budget_key = (
+        "development_budgets"
         if args.phase in {"mechanism", "development"}
-        else (2, 3)
-        if args.phase == "formal"
-        else (2, 3, 5)
+        else "formal_budgets"
     )
-    budgets = tuple(args.budgets or default_budgets)
+    declared_budgets = tuple(
+        int(value) for value in closure_protocol[budget_key]
+    )
+    budgets = tuple(args.budgets or declared_budgets)
     if len(set(budgets)) != len(budgets) or not set(budgets) <= {2, 3, 5}:
         raise RuntimeError("budgets must be unique members of 2, 3, 5")
+    if budgets != declared_budgets:
+        raise RuntimeError(
+            f"{args.phase} budgets differ from the frozen protocol"
+        )
     methods = ("g1f2", "g1f3") if args.method == "both" else (args.method,)
+    declared_methods = tuple(
+        method
+        for method in closure_protocol["methods"]
+        if method != "adapter"
+    )
+    if methods != declared_methods:
+        raise RuntimeError("methods differ from the frozen protocol")
+    if (
+        args.phase == "mechanism"
+        and protocol["mechanism_audit"][
+            "geodesic_acceleration_ablation"
+        ]
+        and args.no_geodesic_acceleration_ablation
+    ):
+        raise RuntimeError(
+            "mechanism ablation is required by the frozen protocol"
+        )
     execution_intent = (
         PAPER2_EXECUTION_MECHANISM_PREREGISTERED
         if args.phase == "mechanism"
@@ -276,6 +425,15 @@ def main():
     )
     output_root = Path(args.output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    sealed_consumption_root = None
+    if args.phase == "sealed":
+        if not args.sealed_consumption_root:
+            raise RuntimeError(
+                "sealed phase requires --sealed-consumption-root"
+            )
+        sealed_consumption_root = Path(
+            args.sealed_consumption_root
+        ).resolve()
 
     binding = {
         "schema": "paper2_run_binding_v1",
@@ -283,18 +441,20 @@ def main():
         "phase": args.phase,
         "paper2_execution_intent": execution_intent,
         "protocol": str(protocol_path),
-        "protocol_sha256": _file_sha(protocol_path),
+        "protocol_sha256": protocol_sha256,
         "case_manifest": str(manifest_path),
         "case_manifest_sha256": _file_sha(manifest_path),
         "train_bank": str(train_bank),
-        "train_bank_sha256": _file_sha(train_bank),
+        "train_bank_sha256": train_bank_sha256,
         "evaluation_bank": str(eval_bank),
-        "evaluation_bank_sha256": _file_sha(eval_bank),
+        "evaluation_bank_sha256": evaluation_bank_sha256,
         "adapter_state": str(adapter_state),
-        "adapter_state_sha256": _file_sha(adapter_state),
+        "adapter_state_sha256": adapter_state_sha256,
         "methods": list(methods),
         "budgets": list(budgets),
     }
+    if sealed_consumption_root is not None:
+        binding["sealed_consumption_root"] = str(sealed_consumption_root)
     if protocol.get("compute_budget"):
         binding["compute_budget"] = dict(protocol["compute_budget"])
     if args.frozen_severity_envelope:
@@ -321,18 +481,37 @@ def main():
         _write_json(binding_path, binding)
 
     if args.phase == "sealed":
+        receipt_path = sealed_consumption_root / (
+            f"{manifest_content_sha256}.consumed.json"
+        )
+        if receipt_path.exists():
+            raise RuntimeError(
+                "sealed manifest was already consumed; freeze a new unseen "
+                "manifest for any later claim"
+            )
+        _write_json_exclusive(receipt_path, {
+            "schema": "paper2_sealed_manifest_consumption_v1",
+            "manifest": str(manifest_path),
+            "manifest_content_sha256": manifest_content_sha256,
+            "binding_sha256": binding["binding_sha256"],
+            "output_root": str(output_root),
+            "consumed_unix_time": time.time(),
+            "one_shot_batch": True,
+            "resume_allowed": False,
+        })
         launch_marker = output_root / "SEALED_LAUNCHED.json"
         if launch_marker.exists():
-            previous = json.loads(launch_marker.read_text(encoding="utf-8"))
-            if previous.get("binding_sha256") != binding["binding_sha256"]:
-                raise RuntimeError("sealed output root was already consumed")
-        else:
-            _write_json(launch_marker, {
-                "schema": "paper2_sealed_launch_v1",
-                "binding_sha256": binding["binding_sha256"],
-                "launched_unix_time": time.time(),
-                "one_shot": True,
-            })
+            raise RuntimeError(
+                "sealed output root was already consumed; any continuation "
+                "must use a new unseen manifest and claim"
+            )
+        _write_json_exclusive(launch_marker, {
+            "schema": "paper2_sealed_launch_v1",
+            "binding_sha256": binding["binding_sha256"],
+            "launched_unix_time": time.time(),
+            "one_shot_batch": True,
+            "resume_allowed": False,
+        })
 
     mechanism_outputs = {
         method: output_root / f"matched_candidate_same_ray_{method}.jsonl"
@@ -355,10 +534,30 @@ def main():
                 job_sha = _canonical_sha(job_spec)
                 if complete_path.exists():
                     complete = json.loads(complete_path.read_text(encoding="utf-8"))
+                    if complete.get("schema") != "paper2_job_complete_v1":
+                        raise RuntimeError(
+                            f"completed job schema mismatch: {job_name}"
+                        )
                     if complete.get("job_sha256") != job_sha:
                         raise RuntimeError(f"resume binding mismatch: {job_name}")
-                    if not Path(complete["report"]).is_file():
+                    completed_report = Path(complete["report"])
+                    if not completed_report.is_file():
                         raise RuntimeError(f"completed report is missing: {job_name}")
+                    if complete.get("report_sha256") != _file_sha(
+                        completed_report
+                    ):
+                        raise RuntimeError(
+                            f"completed report hash mismatch: {job_name}"
+                        )
+                    _validate_case_result(
+                        completed_report,
+                        case_uid,
+                        method,
+                        budget,
+                        args.phase,
+                        expected_commit,
+                        protocol_sha256,
+                    )
                     completed_jobs.append(complete)
                     print(json.dumps({
                         "stage": "paper2_job_resume_skip",
@@ -442,7 +641,13 @@ def main():
                     raise RuntimeError(f"{job_name} did not produce a report")
                 try:
                     result = _validate_case_result(
-                        report_path, case_uid, method, budget, args.phase
+                        report_path,
+                        case_uid,
+                        method,
+                        budget,
+                        args.phase,
+                        expected_commit,
+                        protocol_sha256,
                     )
                 except Exception as exc:
                     failure = {
@@ -481,6 +686,11 @@ def main():
                     "native_return_code": native_rc,
                 }), flush=True)
 
+    expected_job_count = len(methods) * len(budgets) * len(case_uids)
+    if len(completed_jobs) != expected_job_count:
+        raise RuntimeError(
+            "paper2 phase did not complete its full preregistered matrix"
+        )
     index = {
         "schema": "paper2_phase_index_v1",
         "binding": binding,
@@ -497,6 +707,13 @@ def main():
         ],
     }
     _write_json(output_root / "phase.index.json", index)
+    if args.phase == "sealed":
+        _write_json_exclusive(output_root / "SEALED_COMPLETED.json", {
+            "schema": "paper2_sealed_complete_v1",
+            "binding_sha256": binding["binding_sha256"],
+            "completed_unix_time": time.time(),
+            "completed_job_count": len(completed_jobs),
+        })
     print(json.dumps({
         "stage": "paper2_phase_complete",
         "phase": args.phase,

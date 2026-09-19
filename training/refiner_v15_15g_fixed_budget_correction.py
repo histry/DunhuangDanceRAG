@@ -4572,6 +4572,12 @@ def _finite_gap_angular_iteration(
         paper2_candidate_id = None
         if paper2_recorder is not None:
             source = "g1f2_selected_physical_direction"
+            candidate_identity = _paper2_candidate_identity(
+                direction=direction,
+                mask=mask,
+                witness_payload={},
+                constraint_generation_depth=0,
+            )
             paper2_candidate_id = paper2_recorder.candidate_id(
                 case_uid=case_uid,
                 budget=paper2_budget,
@@ -4579,6 +4585,7 @@ def _finite_gap_angular_iteration(
                 theta_radians=theta,
                 backtrack=backtrack,
                 candidate_source=source,
+                **candidate_identity,
             )
             if paper2_recorder.should_record(
                 candidate_id=paper2_candidate_id,
@@ -4613,6 +4620,7 @@ def _finite_gap_angular_iteration(
                         paper2_geodesic_acceleration_ablation
                     ),
                     jet_cache=paper2_jet_cache,
+                    candidate_identity=candidate_identity,
                 )
                 paper2_recorder.append(mechanism_record)
         trial_row = {
@@ -4814,6 +4822,24 @@ def _sum_numeric_mappings(*rows):
     return result
 
 
+def _paper2_candidate_identity(
+    *, direction, mask, witness_payload, constraint_generation_depth
+):
+    owned_direction = direction.detach().to(m.torch.float64).masked_fill(
+        ~mask, 0.0
+    )
+    return {
+        "constraint_generation_depth": int(constraint_generation_depth),
+        "direction_sha256": paper2_audit.tensor_sha256(owned_direction),
+        "support_sha256": paper2_audit.tensor_sha256(
+            mask.detach().to(m.torch.uint8)
+        ),
+        "witness_sha256": paper2_audit.canonical_json_sha256(
+            witness_payload or {}
+        ),
+    }
+
+
 def _paper2_same_ray_radius_audit(
     *,
     candidate_id,
@@ -4840,6 +4866,7 @@ def _paper2_same_ray_radius_audit(
     train_repair_contract,
     include_geodesic_acceleration_ablation,
     jet_cache,
+    candidate_identity,
 ):
     """Audit one selected physical ray without rerunning candidate search."""
     started = time.perf_counter()
@@ -5173,6 +5200,7 @@ def _paper2_same_ray_radius_audit(
         "backtrack": int(backtrack),
         "theta_radians": float(theta),
         "candidate_source": str(candidate_source),
+        **dict(candidate_identity),
         "fixed_actual_owned_space_ray": True,
         "radius_rows": rows,
         "stage_timing_seconds": {
@@ -5508,6 +5536,19 @@ def _second_order_angular_iteration(
         reference_theta = float(
             angular_scales[min(7, len(angular_scales) - 1)]
         )
+        reference_radius = m.torch.linalg.vector_norm(current[mask])
+        reference_direction = (
+            reference_radius * prepared_model["basis"][0]
+        ).to(current.dtype).masked_fill(~mask, 0.0)
+        reference_identity = _paper2_candidate_identity(
+            direction=reference_direction,
+            mask=mask,
+            witness_payload={
+                "active_guard_terms": list(frozen_active_names),
+                "internal_witnesses": frozen_internal_witnesses,
+            },
+            constraint_generation_depth=constraint_generation_depth,
+        )
         reference_id = paper2_recorder.candidate_id(
             case_uid=case_uid,
             budget=paper2_budget,
@@ -5515,6 +5556,7 @@ def _second_order_angular_iteration(
             theta_radians=reference_theta,
             backtrack=-1,
             candidate_source=reference_source,
+            **reference_identity,
         )
         if paper2_recorder.should_record(
             candidate_id=reference_id,
@@ -5522,10 +5564,6 @@ def _second_order_angular_iteration(
             budget=paper2_budget,
             candidate_source=reference_source,
         ):
-            reference_radius = m.torch.linalg.vector_norm(current[mask])
-            reference_direction = (
-                reference_radius * prepared_model["basis"][0]
-            ).to(current.dtype).masked_fill(~mask, 0.0)
             mechanism_started = time.perf_counter()
             reference_record = _paper2_same_ray_radius_audit(
                 candidate_id=reference_id,
@@ -5554,6 +5592,7 @@ def _second_order_angular_iteration(
                     paper2_geodesic_acceleration_ablation
                 ),
                 jet_cache=paper2_jet_cache,
+                candidate_identity=reference_identity,
             )
             paper2_recorder.append(reference_record)
             stage_timing_seconds[
@@ -6187,6 +6226,15 @@ def _second_order_angular_iteration(
         )
         paper2_candidate_id = None
         if paper2_recorder is not None:
+            candidate_identity = _paper2_candidate_identity(
+                direction=direction,
+                mask=mask,
+                witness_payload={
+                    "active_guard_terms": list(frozen_active_names),
+                    "internal_witnesses": frozen_internal_witnesses,
+                },
+                constraint_generation_depth=constraint_generation_depth,
+            )
             paper2_candidate_id = paper2_recorder.candidate_id(
                 case_uid=case_uid,
                 budget=paper2_budget,
@@ -6194,6 +6242,7 @@ def _second_order_angular_iteration(
                 theta_radians=theta,
                 backtrack=backtrack,
                 candidate_source="g1f3_selected_physical_direction",
+                **candidate_identity,
             )
             if paper2_recorder.should_record(
                 candidate_id=paper2_candidate_id,
@@ -6229,6 +6278,7 @@ def _second_order_angular_iteration(
                         paper2_geodesic_acceleration_ablation
                     ),
                     jet_cache=paper2_jet_cache,
+                    candidate_identity=candidate_identity,
                 )
                 paper2_recorder.append(mechanism_record)
                 stage_timing_seconds[

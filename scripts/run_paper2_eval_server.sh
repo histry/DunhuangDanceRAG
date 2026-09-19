@@ -6,25 +6,9 @@ cd "$(dirname "$0")/.."
 : "${EXPECTED_COMMIT:?export EXPECTED_COMMIT=<full main SHA>}"
 : "${PAPER2_PHASE:?mechanism|development|formal|sealed}"
 : "${PAPER2_CASE_MANIFEST:?path to immutable paper2 case manifest}"
+: "${PAPER2_PROTOCOL:?path to protocol frozen to EXPECTED_COMMIT}"
 PY="${PY:-/home/disk/lsm/conda_envs/edge/bin/python}"
 OUT_ROOT="${OUT_ROOT:-outputs/run_smpl14_formal_20260822_163915}"
-PAPER2_COMPUTE_PROFILE="${PAPER2_COMPUTE_PROFILE:-fast_budget_v1}"
-if test -z "${PAPER2_PROTOCOL:-}"; then
-  case "$PAPER2_COMPUTE_PROFILE" in
-    fast_budget_v1)
-      PAPER2_PROTOCOL="experiments/paper2/protocol_fast_budget_v1.json"
-      ;;
-    full_reference)
-      PAPER2_PROTOCOL="experiments/paper2/protocol.json"
-      ;;
-    *)
-      echo "unsupported PAPER2_COMPUTE_PROFILE=$PAPER2_COMPUTE_PROFILE" >&2
-      exit 2
-      ;;
-  esac
-else
-  PAPER2_COMPUTE_PROFILE="explicit_protocol"
-fi
 
 test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 test "$(git rev-parse origin/main)" = "$EXPECTED_COMMIT"
@@ -42,6 +26,8 @@ else
   : "${EVALUATION_BANK:?set the frozen development or sealed bank}"
   : "${FROZEN_SEVERITY_ENVELOPE:?set frozen train conformal envelope}"
   : "${FROZEN_REPAIR_CONTRACT:?set frozen train repair contract}"
+  test -s "$FROZEN_SEVERITY_ENVELOPE"
+  test -s "$FROZEN_REPAIR_CONTRACT"
 fi
 for path in "$ADAPTER_STATE" "$TRAIN_BANK" "$EVALUATION_BANK"; do
   test -s "$path"
@@ -54,7 +40,6 @@ mkdir -p "$RUN_ROOT" logs outputs
 printf '%s\n' "$RUN_ROOT" > "outputs/LATEST_PAPER2_${PAPER2_PHASE^^}_ROOT"
 printf '%s\n' "$LOG" > "outputs/LATEST_PAPER2_${PAPER2_PHASE^^}_LOG"
 exec > >(tee -a "$LOG") 2>&1
-echo "Paper-2 compute profile: $PAPER2_COMPUTE_PROFILE"
 echo "Paper-2 protocol: $PAPER2_PROTOCOL"
 
 ROOT_DIR=$(pwd)
@@ -81,6 +66,12 @@ COMMAND=(
   --adapter-state "$ADAPTER_STATE"
   --output-root "$RUN_ROOT"
 )
+if test "$PAPER2_PHASE" = sealed; then
+  PAPER2_SEALED_CONSUMPTION_ROOT="${PAPER2_SEALED_CONSUMPTION_ROOT:-$ROOT_DIR/outputs/paper2_sealed_receipts}"
+  COMMAND+=(
+    --sealed-consumption-root "$PAPER2_SEALED_CONSUMPTION_ROOT"
+  )
+fi
 if test "$PAPER2_PHASE" != mechanism; then
   COMMAND+=(
     --frozen-severity-envelope "$FROZEN_SEVERITY_ENVELOPE"

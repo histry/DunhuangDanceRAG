@@ -35,6 +35,16 @@ def file_sha256(path) -> str:
     return digest.hexdigest()
 
 
+def tensor_sha256(value) -> str:
+    """Hash one detached CPU tensor including dtype and shape."""
+    tensor = value.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("ascii"))
+    digest.update(str(tuple(tensor.shape)).encode("ascii"))
+    digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
 def same_ray_identity_geometry(current, direction, mask, target_rms):
     """Rescale one actual owned-space ray without changing its shape.
 
@@ -172,6 +182,10 @@ class JsonlMechanismRecorder:
         theta_radians,
         backtrack,
         candidate_source,
+        constraint_generation_depth,
+        direction_sha256,
+        support_sha256,
+        witness_sha256,
     ):
         return canonical_json_sha256({
             "binding_sha256": self.binding_sha256,
@@ -181,6 +195,10 @@ class JsonlMechanismRecorder:
             "theta_radians": float(theta_radians),
             "backtrack": int(backtrack),
             "source": str(candidate_source),
+            "constraint_generation_depth": int(constraint_generation_depth),
+            "direction_sha256": str(direction_sha256),
+            "support_sha256": str(support_sha256),
+            "witness_sha256": str(witness_sha256),
         })
 
     def should_record(
