@@ -149,6 +149,8 @@ REFINER_COMPONENT_GUARD_DEADBAND = 1.0e-3
 REFINER_FEASIBILITY_GUARD_DEADBAND = 2.0e-3
 REFINER_PHYSICAL_GUARD_DEADBAND = 1.0e-3
 REFINER_PHYSICAL_GUARD_NEAR_THRESHOLD = 5.0e-2
+REFINER_V14_1_MAX_TRIALS_PER_DIRECTION = 4
+REFINER_TRAINING_PROGRESS_INTERVAL = 20
 
 # V14 protects the physical rows that actually blocked V13 publication.
 REFINER_PHYSICAL_GROUP_GUARD_TERMS = (
@@ -4731,6 +4733,8 @@ def _product_refiner_clean_identity_loss(
     root_mask,
     contact_mask,
     cfg: MotionGenerationConfig,
+    *,
+    clean_joints=None,
 ):
     """Formal dead-band safety plus a small no-dead-band minimum-edit prior."""
     geometry_cap = float(cfg.checkpoint_validation_max_clean_identity_product_log_l1)
@@ -4754,8 +4758,11 @@ def _product_refiner_clean_identity_loss(
     noop_contact = contact_per_window.mean() / contact_cap
     noop = noop_geometry + 0.25 * noop_contact
 
-    joints = fk_24_torch(torch.cat([prediction, clean], dim=0))
-    predicted_joints, clean_joints = joints.split(prediction.shape[0], dim=0)
+    if clean_joints is None:
+        joints = fk_24_torch(torch.cat([prediction, clean], dim=0))
+        predicted_joints, clean_joints = joints.split(prediction.shape[0], dim=0)
+    else:
+        predicted_joints = fk_24_torch(prediction)
     fk_temporal, jerk_terms = _clean_jerk_tolerance_loss_torch(
         predicted_joints, clean_joints, cfg
     )
@@ -8206,6 +8213,49 @@ def _refiner_observable_confidence_preconditioner(batch):
     return weight.detach()
 
 
+def _prepare_refiner_objective_static_context(batch, cfg):
+    """Cache fixed reference work shared by every trial in one transaction."""
+    reference = batch["bad"]
+    seam = batch["seam"]
+    with torch.no_grad():
+        reference_joints = fk_24_torch(reference.detach())
+        reference_metric_joints = _observable_boundary_joints_torch(
+            reference.detach()
+        )
+        before = boundary_metrics_torch(
+            reference_metric_joints,
+            seam,
+            cfg.fps,
+        )
+        feet = list(DEFAULT_FOOT_JOINTS)
+        floor = torch.quantile(
+            reference_joints[..., feet, 1].flatten(1),
+            0.05,
+            dim=1,
+        )
+        penetration_min = (
+            reference_joints[..., feet, 1] - floor[:, None, None]
+        ).flatten(1).amin(dim=1)
+        clean_joints = fk_24_torch(batch["clean"].detach())
+    return {
+        "observable": {
+            "reference_joints": reference_joints,
+            "reference_metric_joints": reference_metric_joints,
+            "before": before,
+            "floor": floor,
+            "penetration_min": penetration_min,
+            "physical_specs": {
+                spec.key: spec
+                for spec in physical_metric_specs(
+                    PhysicalQualityLimits.from_environment(),
+                    StageAcceptancePolicy.from_environment(),
+                )
+            },
+        },
+        "clean_joints": clean_joints,
+    }
+
+
 def _refiner_batch_objectives(
     model,
     batch,
@@ -8215,6 +8265,7 @@ def _refiner_batch_objectives(
     trace=None,
     prediction_override=None,
     identity_override=None,
+    static_context=None,
 ):
     # Optional detached decoder measurements; no extra forward or changed loss.
     if prediction_override is None:
@@ -8232,7 +8283,14 @@ def _refiner_batch_objectives(
                 "Refiner objective overrides must match the batch motion shape"
             )
     per_case, case_terms = _observable_refiner_objective(
-        pred, batch["bad"], batch["seam"], cfg, reduction="none"
+        pred,
+        batch["bad"],
+        batch["seam"],
+        cfg,
+        reduction="none",
+        static_context=(
+            None if static_context is None else static_context["observable"]
+        ),
     )
     terms = {
         key: value.mean()
@@ -8543,6 +8601,9 @@ def _refiner_batch_objectives(
         batch["clean_root"],
         batch["clean_contact"],
         cfg,
+        clean_joints=(
+            None if static_context is None else static_context["clean_joints"]
+        ),
     )
     if group_objectives is not None:
         # Read-only audits must slice the SAME full-transaction computation.
@@ -8580,7 +8641,13 @@ def _refiner_batch_objectives(
             group_clean, group_clean_terms = _product_refiner_clean_identity_loss(
                 identity[selected], batch["clean"][selected],
                 batch["clean_joint"][selected], batch["clean_root"][selected],
-                batch["clean_contact"][selected], cfg)
+                batch["clean_contact"][selected], cfg,
+                clean_joints=(
+                    None
+                    if static_context is None
+                    else static_context["clean_joints"][selected]
+                ),
+            )
             group_objectives[label] = {
                 "repair_objective": group_repair,
                 "endpoint_deficit_mean": case_terms["endpoint_scientific_deficit"][selected].mean(),
@@ -8782,13 +8849,19 @@ def _refiner_guarded_total_batch_loss(
     *,
     require_all_groups=False,
     normalized_physical=False,
+    static_context=None,
 ):
     """Return scalar objective plus stable subgroup objectives for Armijo guard.
 
     Small formal minibatches guard every subgroup they contain. The V12
     fixed-bank diagnostic requests all four groups explicitly.
     """
-    repair, protection, terms, _ = _refiner_batch_objectives(model, batch, cfg)
+    repair, protection, terms, _ = _refiner_batch_objectives(
+        model,
+        batch,
+        cfg,
+        static_context=static_context,
+    )
     total = repair + cfg.product_refiner_clean_identity_weight * protection
     return total, _refiner_group_repair_losses(
         terms,
@@ -9045,6 +9118,7 @@ def _observable_refiner_objective(
     *,
     reduction="mean",
     return_witness_context=False,
+    static_context=None,
 ):
     """Repair observable boundary defects, with no hidden clean target.
 
@@ -9055,14 +9129,23 @@ def _observable_refiner_objective(
     count = prediction.shape[0]
     if reduction not in {"mean","none"}:
         raise ValueError("invalid observable loss reduction")
-    joints = fk_24_torch(torch.cat([prediction, reference.detach()]))
-    proposed_joints, reference_joints = joints.split(count)
-    # Support/penetration use their existing physical-loss coordinates. Only
-    # observable temporal metrics share the higher-precision audit FK path.
-    metric_joints = _observable_boundary_joints_torch(torch.cat([prediction, reference.detach()]))
-    proposed_metric_joints, reference_metric_joints = metric_joints.split(count)
+    if static_context is None:
+        joints = fk_24_torch(torch.cat([prediction, reference.detach()]))
+        proposed_joints, reference_joints = joints.split(count)
+        # Support/penetration use their existing physical-loss coordinates.
+        # Observable temporal metrics use the higher-precision audit FK path.
+        metric_joints = _observable_boundary_joints_torch(
+            torch.cat([prediction, reference.detach()])
+        )
+        proposed_metric_joints, reference_metric_joints = metric_joints.split(count)
+        before = boundary_metrics_torch(reference_metric_joints, seam, cfg.fps)
+    else:
+        proposed_joints = fk_24_torch(prediction)
+        proposed_metric_joints = _observable_boundary_joints_torch(prediction)
+        reference_joints = static_context["reference_joints"]
+        reference_metric_joints = static_context["reference_metric_joints"]
+        before = static_context["before"]
     proposed = boundary_metrics_torch(proposed_metric_joints, seam, cfg.fps)
-    before = boundary_metrics_torch(reference_metric_joints.detach(), seam, cfg.fps)
     # Historical 10% margin is retained only for V12/V13 comparison.
     training_gain = float(
         cfg.product_refiner_training_target_repair_gain
@@ -9195,18 +9278,34 @@ def _observable_refiner_objective(
         return_terms=True,
     )
     feet = list(DEFAULT_FOOT_JOINTS)
-    floor = torch.quantile(reference_joints[..., feet, 1].flatten(1), .05, dim=1).detach()
+    floor = (
+        torch.quantile(
+            reference_joints[..., feet, 1].flatten(1),
+            0.05,
+            dim=1,
+        ).detach()
+        if static_context is None
+        else static_context["floor"]
+    )
     proposed_foot_height = proposed_joints[..., feet, 1] - floor[:, None, None]
     reference_foot_height = reference_joints[..., feet, 1] - floor[:, None, None]
     penetration_min = proposed_foot_height.flatten(1).amin(dim=1)
-    reference_penetration_min = reference_foot_height.flatten(1).amin(dim=1).detach()
-    physical_specs = {
-        spec.key: spec
-        for spec in physical_metric_specs(
-            PhysicalQualityLimits.from_environment(),
-            StageAcceptancePolicy.from_environment(),
-        )
-    }
+    reference_penetration_min = (
+        reference_foot_height.flatten(1).amin(dim=1).detach()
+        if static_context is None
+        else static_context["penetration_min"]
+    )
+    physical_specs = (
+        {
+            spec.key: spec
+            for spec in physical_metric_specs(
+                PhysicalQualityLimits.from_environment(),
+                StageAcceptancePolicy.from_environment(),
+            )
+        }
+        if static_context is None
+        else static_context["physical_specs"]
+    )
     (
         penetration,
         penetration_allowed,
@@ -9367,6 +9466,11 @@ def train_refiner(args: argparse.Namespace) -> int:
     probe_windows = int(getattr(args, "train_probe_windows", 8))
     if not 0 <= probe_windows <= 16:
         raise ValueError("--train_probe_windows must be within [0,16]")
+    max_consecutive_rejected_steps = int(
+        getattr(args, "max_consecutive_rejected_steps", 0)
+    )
+    if max_consecutive_rejected_steps < 0:
+        raise ValueError("--max_consecutive_rejected_steps must be non-negative")
     out = Path(args.out)
     snapshot_path, resume_path, snapshot_interval = (
         _resolve_training_snapshot_options(args, cfg, out)
@@ -9456,6 +9560,7 @@ def train_refiner(args: argparse.Namespace) -> int:
     else:
         risk_executor, _ = _training_risk_mask_executor(bs)
     training_started_at = time.perf_counter() - resumed_elapsed_seconds
+    consecutive_rejected_steps = 0
     for step in range(start_step, steps):
         clean_batch = []
         bad_batch = []
@@ -9501,14 +9606,18 @@ def train_refiner(args: argparse.Namespace) -> int:
         )
         batch["clean_cond"] = torch.as_tensor(np.stack(clean_cond_batch), dtype=torch.float32, device=device)
         batch["group"] = torch.as_tensor(group_batch,device=device)
+        static_context = _prepare_refiner_objective_static_context(batch, cfg)
         repair_loss, identity_loss, loss_terms, identity_terms = _refiner_batch_objectives(
-            model, batch, cfg
+            model,
+            batch,
+            cfg,
+            static_context=static_context,
         )
         loss = repair_loss + float(
             cfg.product_refiner_clean_identity_weight
         ) * identity_loss
         rec = loss_terms["reconstruction"]
-        logging_update = step == start_step or (step + 1) % gradient_interval == 0
+        logging_update = (step + 1) % gradient_interval == 0
         if logging_update:
             gradient_report = {
                 "stage": "refiner_gradient_diagnostics", "completed_steps": step + 1,
@@ -9536,13 +9645,20 @@ def train_refiner(args: argparse.Namespace) -> int:
                 batch,
                 cfg,
                 normalized_physical=True,
+                static_context=static_context,
             ),
+            max_trials=REFINER_V14_1_MAX_TRIALS_PER_DIRECTION,
             gradient_unscale=max(1.0, clip_norm + 1.0e-6),
             group_guard_before=group_guard_before,
             group_guard_relative_tolerance=group_guard_relative_tolerance,
             group_guard_absolute_tolerance=group_guard_absolute_tolerance,
         )
         record_update(optimizer_updates, update_report)
+        consecutive_rejected_steps = (
+            0
+            if update_report["optimizer_update_accepted"]
+            else consecutive_rejected_steps + 1
+        )
         if logging_update:
             gradient_report["optimizer_update"] = update_report
             gradient_report["optimizer_updates"] = dict(optimizer_updates)
@@ -9551,7 +9667,13 @@ def train_refiner(args: argparse.Namespace) -> int:
                 handle.write(json.dumps(gradient_report, allow_nan=False) + "\n")
             print(json.dumps(gradient_report, allow_nan=False), flush=True)
         completed_steps = step + 1
-        pausing = stop_after is not None and completed_steps >= stop_after
+        rejection_early_stop = bool(
+            max_consecutive_rejected_steps
+            and consecutive_rejected_steps >= max_consecutive_rejected_steps
+        )
+        pausing = (
+            stop_after is not None and completed_steps >= stop_after
+        ) or rejection_early_stop
         if (
             completed_steps % snapshot_interval == 0
             or completed_steps == steps
@@ -9651,7 +9773,12 @@ def train_refiner(args: argparse.Namespace) -> int:
                     validation_contract=validation_contract,
                 )
                 best_score = periodic_score
-        if step == 0 or (step + 1) % 200 == 0 or step == steps - 1:
+        if (
+            step == start_step
+            or completed_steps % REFINER_TRAINING_PROGRESS_INTERVAL == 0
+            or step == steps - 1
+            or pausing
+        ):
             _emit_training_progress(
                 "[Boundary Refiner]",
                 step,
@@ -9661,6 +9788,7 @@ def train_refiner(args: argparse.Namespace) -> int:
                 loss_after_update=update_report["loss_after"],
                 update_accepted=int(update_report["optimizer_update_accepted"]),
                 update_trials=update_report["trial_evaluations"],
+                consecutive_rejected_steps=consecutive_rejected_steps,
                 rec=rec.item(),
                 active=loss_terms["active_reconstruction"].item(),
                 repair=loss_terms["repair_margin"].item(),
@@ -9679,15 +9807,24 @@ def train_refiner(args: argparse.Namespace) -> int:
             if risk_executor is not None:
                 risk_executor.shutdown(wait=True)
             print(json.dumps({
-                "stage": "refiner_pilot_paused",
+                "stage": (
+                    "refiner_pilot_rejected_update_early_stop"
+                    if rejection_early_stop
+                    else "refiner_pilot_paused"
+                ),
                 "completed_steps": completed_steps,
                 "target_steps": steps,
                 "snapshot": str(snapshot_path),
                 "best_candidate": str(best_validation_path),
                 "published": False,
-                "next_action": "inspect validation before resuming the same target/config/revision",
+                "consecutive_rejected_steps": consecutive_rejected_steps,
+                "next_action": (
+                    "inspect the failed transaction evidence; do not resume"
+                    if rejection_early_stop
+                    else "inspect validation before resuming the same target/config/revision"
+                ),
             }), flush=True)
-            return 0
+            return 2 if rejection_early_stop else 0
     if risk_executor is not None:
         risk_executor.shutdown(wait=True)
     if best_validation is None:
@@ -17255,6 +17392,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     r.add_argument(
         "--train_probe_windows", type=int, default=8,
         help="Fixed train-fit diagnostic windows (0 disables); never used to select or accept checkpoints",
+    )
+    r.add_argument(
+        "--max_consecutive_rejected_steps",
+        type=int,
+        default=0,
+        help=(
+            "Fail closed after N consecutive optimizer rollbacks; "
+            "0 disables this pilot safeguard"
+        ),
     )
     r.set_defaults(func=train_refiner)
 

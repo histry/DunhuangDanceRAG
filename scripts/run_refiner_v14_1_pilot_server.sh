@@ -54,6 +54,7 @@ printf '%s\n' "$LOG" > outputs/LATEST_REFINER_V14_1_PILOT_LOG
   --snapshot_every 200 \
   --validation_every 500 \
   --train_probe_windows 8 \
+  --max_consecutive_rejected_steps 50 \
   2>&1 | tee "$LOG"
 
 test -s "$SNAPSHOT"

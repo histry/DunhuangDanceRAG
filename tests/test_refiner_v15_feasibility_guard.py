@@ -9,7 +9,7 @@ from training.refiner_optimizer import REFINER_UPDATE_PROTOCOL
 def test_v15_optimizer_protocol():
     assert (
         REFINER_UPDATE_PROTOCOL
-        == "exact_guard_constrained_fixed_anchor_armijo_v9"
+        == "exact_guard_constrained_fixed_anchor_armijo_v10"
     )
 
 

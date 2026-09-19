@@ -62,7 +62,7 @@ def test_v15_4_contract_preserves_scientific_objective():
 
     assert (
         REFINER_UPDATE_PROTOCOL
-        == "exact_guard_constrained_fixed_anchor_armijo_v9"
+        == "exact_guard_constrained_fixed_anchor_armijo_v10"
     )
 
 
@@ -464,4 +464,3 @@ def test_production_run_materializes_only_current_reservoir_transaction():
         '"fit_transaction_materialization":"lazy_current_step_only"'
         in compact
     )
-

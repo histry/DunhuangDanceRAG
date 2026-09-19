@@ -15,7 +15,7 @@ import math
 import torch
 
 
-REFINER_UPDATE_PROTOCOL = "exact_guard_constrained_fixed_anchor_armijo_v9"
+REFINER_UPDATE_PROTOCOL = "exact_guard_constrained_fixed_anchor_armijo_v10"
 MAX_BACKTRACK_TRIALS = 12  # per direction; at most 24 extra forward evaluations
 ARMIJO_FACTOR = 1.0e-4
 MIN_RELATIVE_DECREASE = 1.0e-8  # optimization progress, NOT a motion-quality gate
@@ -218,6 +218,7 @@ def checked_refiner_step(
         "group_guard_after": None,
         "group_guard_rejected_trials": 0,
         "group_guard_last_violations": {},
+        "guard_limited_scale_proposals": 0,
         "minimum_audited_scale": None,
         "minimum_accepted_scale": None,
         "minimum_acceptable_scale": None,
@@ -466,7 +467,34 @@ def checked_refiner_step(
                     if math.isfinite(curvature) and curvature > 0
                     else scale * 0.5
                 )
-                scale = min(scale * 0.5, max(scale * 0.01, proposal))
+                next_scale = min(scale * 0.5, max(scale * 0.01, proposal))
+                if loss_ok and violations:
+                    # A rejected closure already measured how far each Guard
+                    # row moved. Jump close to the strict boundary instead of
+                    # paying for repeated blind halvings. The next closure is
+                    # still authoritative and must pass every unchanged Guard.
+                    guard_caps = []
+                    for key in violations:
+                        delta = current_delta[key]
+                        if not math.isfinite(delta) or delta <= 0.0:
+                            continue
+                        baseline = guard_reference[key]
+                        allowance = max(
+                            abs(baseline) * guard_relative_tolerance[key],
+                            guard_absolute_tolerance[key],
+                        )
+                        room = max(0.0, baseline + allowance - guard_before[key])
+                        guard_caps.append(0.9 * scale * room / delta)
+                    if guard_caps:
+                        # Keep a representable exploratory step when the
+                        # current row lies exactly on the boundary. Acceptance
+                        # remains fail-closed because it is checked below.
+                        next_scale = min(
+                            next_scale,
+                            max(scale * 0.01, min(guard_caps)),
+                        )
+                        report["guard_limited_scale_proposals"] += 1
+                scale = next_scale
         return False
 
     try:

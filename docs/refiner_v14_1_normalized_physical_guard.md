@@ -16,6 +16,22 @@ V14.1 changes only the optimizer's differentiable training Guard:
 4. Any previously safe row that becomes positive is rejected, including a
    violation smaller than the training deadband.
 
+The V14.1a execution path reduces wasted work without changing acceptance:
+
+- A rejected trial uses its measured Guard headroom and residual change to
+  propose the next scale near the strict boundary. The next full closure still
+  decides acceptance. This is recorded as optimizer protocol
+  `exact_guard_constrained_fixed_anchor_armijo_v10`.
+- Formal Refiner training permits four trials per direction, at most eight
+  full trial closures per step.
+- Reference and clean FK/boundary quantities that are fixed within one
+  optimizer transaction are computed once and reused by its trial closures.
+- Lightweight progress prints every 20 steps. Full component-gradient
+  diagnostics remain every 200 steps and no longer distort the first-step ETA.
+- The pilot fails closed with exit status 2 after 50 consecutive rolled-back
+  updates. It saves a snapshot and validation report for diagnosis and must not
+  be resumed after this early stop.
+
 The independent validation audit, checkpoint thresholds, authoritative
 whole-sequence physical Guard, model architecture, data split and generation
 thresholds are unchanged.

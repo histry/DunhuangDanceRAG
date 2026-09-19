@@ -353,6 +353,26 @@ def test_group_guard_accepts_non_regressing_subgroup():
     assert report['group_guard_after']['single_short']<=0.0
 
 
+def test_group_guard_uses_measured_headroom_to_skip_blind_backtracking():
+    p=torch.nn.Parameter(torch.zeros(1,dtype=torch.float64))
+    opt=torch.optim.SGD([p],lr=.1)
+    def objective():
+        return (p-1).square().sum(), {'physical': p.sum()}
+    loss,groups=objective()
+    loss.backward()
+    report=checked_refiner_step(
+        opt,loss,objective,
+        group_guard_before=groups,
+        group_guard_relative_tolerance=0.0,
+        group_guard_absolute_tolerance=.02,
+        max_trials=2,
+    )
+    assert report['optimizer_update_accepted']
+    assert report['trial_evaluations']==2
+    assert report['guard_limited_scale_proposals']==1
+    assert report['group_guard_after']['physical']<=.02
+
+
 def test_persistent_group_guard_rejects_cumulative_rolling_regression():
     p=torch.nn.Parameter(torch.zeros(1,dtype=torch.float64))
     opt=torch.optim.SGD([p],lr=.1)

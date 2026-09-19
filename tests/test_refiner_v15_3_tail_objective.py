@@ -47,7 +47,7 @@ def test_v15_3_1_contract():
 
     assert (
         REFINER_UPDATE_PROTOCOL
-        == "exact_guard_constrained_fixed_anchor_armijo_v9"
+        == "exact_guard_constrained_fixed_anchor_armijo_v10"
     )
 
     assert (
@@ -384,4 +384,3 @@ def test_smooth_cvar_fails_closed():
         raise AssertionError(
             "negative scientific deficit must fail closed"
         )
-

@@ -424,6 +424,6 @@ def test_termination_protocol_does_not_change_optimizer_contract_constants():
     # change the scientific Armijo/group-guard implementation.
     from training import refiner_optimizer as optimizer
     assert optimizer.REFINER_UPDATE_PROTOCOL == (
-        "exact_guard_constrained_fixed_anchor_armijo_v9"
+        "exact_guard_constrained_fixed_anchor_armijo_v10"
     )
     assert optimizer.MAX_BACKTRACK_TRIALS == 12
