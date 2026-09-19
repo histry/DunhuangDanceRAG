@@ -9788,6 +9788,18 @@ def train_refiner(args: argparse.Namespace) -> int:
                 loss_after_update=update_report["loss_after"],
                 update_accepted=int(update_report["optimizer_update_accepted"]),
                 update_trials=update_report["trial_evaluations"],
+                accepted_update_rate=(
+                    optimizer_updates["accepted_steps"]
+                    / optimizer_updates["attempted_steps"]
+                ),
+                average_update_trials=(
+                    optimizer_updates["trial_evaluations"]
+                    / optimizer_updates["attempted_steps"]
+                ),
+                guard_limited_scale_proposals=optimizer_updates.get(
+                    "guard_limited_scale_proposals",
+                    0,
+                ),
                 consecutive_rejected_steps=consecutive_rejected_steps,
                 rec=rec.item(),
                 active=loss_terms["active_reconstruction"].item(),

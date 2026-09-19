@@ -545,6 +545,9 @@ def record_update(summary, update):
         "nonfinite_trials": int(update["nonfinite_trials"]),
         "insufficient_decrease_trials": int(update.get("insufficient_decrease_trials", 0)),
         "group_guard_rejected_trials": int(update.get("group_guard_rejected_trials", 0)),
+        "guard_limited_scale_proposals": int(
+            update.get("guard_limited_scale_proposals", 0)
+        ),
         "resolution_limited_steps": int(
             update.get("resolution_limited_under_exact_guard", False)
         ),
