@@ -147,12 +147,10 @@ REFINER_CONFIDENCE_PRECONDITION_MAX = 5.0
 REFINER_TEMPORAL_SCIENTIFIC_WEIGHT = 3.0
 REFINER_COMPONENT_GUARD_DEADBAND = 1.0e-3
 REFINER_FEASIBILITY_GUARD_DEADBAND = 2.0e-3
+REFINER_PHYSICAL_GUARD_DEADBAND = 1.0e-3
+REFINER_PHYSICAL_GUARD_NEAR_THRESHOLD = 5.0e-2
 
-# V14 protects the physical rows that actually blocked V13 publication.  Each
-# source term is the maximum signed stage-registry residual in one role/width
-# subgroup.  ``_refiner_group_repair_losses`` applies ReLU so safe negative
-# headroom is represented by exact zero, while an existing violation remains
-# independently non-regressing under the transactional optimizer Guard.
+# V14 protects the physical rows that actually blocked V13 publication.
 REFINER_PHYSICAL_GROUP_GUARD_TERMS = (
     (
         "joint_jerk_max",
@@ -178,6 +176,17 @@ REFINER_PHYSICAL_GROUP_GUARD_TERMS = (
         "foot_support_drift_p95",
         "repair_foot_support_drift_m_p95_signed_margin_max",
     ),
+)
+
+# V14.1 opt-in training terms. Zero is the unchanged authoritative threshold,
+# negative is safe headroom and positive is a violation. Existing diagnostics
+# keep the V14 raw-excess contract unless they explicitly request this mapping.
+REFINER_NORMALIZED_PHYSICAL_GROUP_GUARD_TERMS = tuple(
+    (
+        guard_name,
+        term_name.replace("_signed_margin_max", "_normalized_signed_margin_max"),
+    )
+    for guard_name, term_name in REFINER_PHYSICAL_GROUP_GUARD_TERMS
 )
 
 
@@ -4861,7 +4870,7 @@ def _clean_support_tolerance_loss_torch(
             # Repair-input budget: match ratio PLUS margin and epsilon from
             # evaluate_stage_candidate. Do not apply this to clean identity,
             # whose separate fidelity audit uses max(ratio, margin).
-            penalty, allowed, epsilon, signed_margin = (
+            penalty, allowed, epsilon, signed_margin, normalized_signed_margin = (
                 _stage_high_guard_terms_torch(pred, ref, spec)
             )
         else:
@@ -4871,6 +4880,9 @@ def _clean_support_tolerance_loss_torch(
             penalty = torch.relu(pred - allowed) / (allowed - ref).clamp_min(1e-4)
             epsilon = torch.zeros_like(pred)
             signed_margin = pred - allowed
+            normalized_signed_margin = signed_margin / (allowed - ref).clamp_min(
+                1e-4
+            )
         penalties.append(penalty)
         terms[f"repair_{spec.key}_excess"] = penalty
         terms[f"repair_{spec.key}_value"] = pred
@@ -4878,6 +4890,9 @@ def _clean_support_tolerance_loss_torch(
         terms[f"repair_{spec.key}_allowed"] = allowed
         terms[f"repair_{spec.key}_comparison_epsilon"] = epsilon
         terms[f"repair_{spec.key}_signed_margin"] = signed_margin
+        terms[f"repair_{spec.key}_normalized_signed_margin"] = (
+            normalized_signed_margin
+        )
     loss = sum(penalties) / max(1, len(penalties))
     reduced = loss if reduction == "none" else loss.mean()
     if return_terms:
@@ -4977,7 +4992,7 @@ def _clean_jerk_tolerance_loss_torch(predicted_joints, clean_joints, cfg):
 
 
 def _stage_high_guard_terms_torch(predicted, baseline, spec):
-    """Return the exact high-is-bad stage boundary and signed residual."""
+    """Return the exact high-is-bad boundary and dimensionless residual."""
     if (not np.isfinite(spec.stage_ratio) or spec.stage_ratio < 1
             or not np.isfinite(spec.stage_margin) or spec.stage_margin < 0):
         raise ValueError("invalid repair safety policy")
@@ -4999,11 +5014,11 @@ def _stage_high_guard_terms_torch(predicted, baseline, spec):
     gap = torch.relu(signed_margin) / scale
     shoulder = gap.clamp_max(1.0)
     penalty = 0.5 * shoulder.square() + (gap - shoulder)
-    return penalty, allowed, epsilon, signed_margin
+    return penalty, allowed, epsilon, signed_margin, signed_margin / scale
 
 
 def _stage_low_guard_terms_torch(predicted, baseline, spec):
-    """Return the exact low-is-bad stage boundary and signed residual."""
+    """Return the exact low-is-bad boundary and dimensionless residual."""
     if not np.isfinite(spec.stage_margin) or spec.stage_margin < 0:
         raise ValueError("invalid repair safety policy")
     baseline = baseline.detach()
@@ -5023,7 +5038,7 @@ def _stage_low_guard_terms_torch(predicted, baseline, spec):
     gap = torch.relu(signed_margin) / scale
     shoulder = gap.clamp_max(1.0)
     penalty = 0.5 * shoulder.square() + (gap - shoulder)
-    return penalty, allowed, epsilon, signed_margin
+    return penalty, allowed, epsilon, signed_margin, signed_margin / scale
 
 
 def _smooth_stage_safety_excess(predicted, baseline, spec):
@@ -5071,7 +5086,7 @@ def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
     penalties = []
     for label, key in labels.items():
         spec, baseline = specs[key], before[label]
-        penalty, allowed, epsilon, signed_margin = (
+        penalty, allowed, epsilon, signed_margin, normalized_signed_margin = (
             _stage_high_guard_terms_torch(after[label], baseline, spec)
         )
         penalties.append(penalty)
@@ -5081,6 +5096,9 @@ def _repair_jerk_safety_loss_torch(predicted_joints, reference_joints, cfg):
         terms[f"repair_{key}_allowed"] = allowed
         terms[f"repair_{key}_comparison_epsilon"] = epsilon
         terms[f"repair_{key}_signed_margin"] = signed_margin
+        terms[f"repair_{key}_normalized_signed_margin"] = (
+            normalized_signed_margin
+        )
     return sum(penalties), terms
 
 
@@ -8489,6 +8507,17 @@ def _refiner_batch_objectives(
                         selected
                     ].max()
                 for key in (
+                    "repair_joint_jerk_mps3_max_normalized_signed_margin",
+                    "repair_joint_jerk_window_p95_max_mps3_normalized_signed_margin",
+                    "repair_extremity_jerk_mps3_p95_normalized_signed_margin",
+                    "repair_extremity_jerk_window_p95_max_mps3_normalized_signed_margin",
+                    "repair_foot_support_drift_m_p95_normalized_signed_margin",
+                    "repair_foot_penetration_min_m_normalized_signed_margin",
+                ):
+                    terms[f"group_{label}_{key}_max"] = case_terms[key][
+                        selected
+                    ].max()
+                for key in (
                     "repair_joint_jerk_mps3_p95_value",
                     "repair_joint_jerk_mps3_max_value",
                     "repair_joint_jerk_window_p95_max_mps3_value",
@@ -8568,7 +8597,12 @@ def _refiner_batch_objectives(
     return repair, protection, terms, identity_terms
 
 
-def _refiner_group_repair_losses(terms, *, require_all=False):
+def _refiner_group_repair_losses(
+    terms,
+    *,
+    require_all=False,
+    normalized_physical=False,
+):
     """Guard subgroup total, joint, endpoint and temporal objectives.
 
     Every present role/width subgroup contributes ten protected quantities:
@@ -8591,7 +8625,10 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
     sum of the two component deadbands. Crossing either component deadband,
     crossing their joint deadband, or regressing any unresolved component
     still fails closed. The exact per-case 0.03 acceptance gate is evaluated
-    separately and remains unchanged.
+    separately and remains unchanged. V14.1 expresses each physical row as a
+    dimensionless signed residual. Its transaction tolerance is resolved by
+    ``_refiner_group_guard_tolerances``; validation never reads that training
+    deadband.
     """
     values = {}
     missing = []
@@ -8603,9 +8640,14 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
         )
         endpoint_key = f"group_{label}_endpoint_scientific_tail_risk"
         temporal_key = f"group_{label}_temporal_scientific_tail_risk"
+        physical_terms = (
+            REFINER_NORMALIZED_PHYSICAL_GROUP_GUARD_TERMS
+            if normalized_physical
+            else REFINER_PHYSICAL_GROUP_GUARD_TERMS
+        )
         physical_keys = {
             guard_name: f"group_{label}_{term_name}"
-            for guard_name, term_name in REFINER_PHYSICAL_GROUP_GUARD_TERMS
+            for guard_name, term_name in physical_terms
         }
 
         total_present = total_key in terms
@@ -8670,8 +8712,9 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
                 terms[temporal_key] - deadband
             )
             for guard_name, key in physical_keys.items():
-                values[f"{label}.physical.{guard_name}"] = torch.relu(
-                    terms[key]
+                value = terms[key]
+                values[f"{label}.physical.{guard_name}"] = (
+                    value if normalized_physical else torch.relu(value)
                 )
         else:
             missing.append(label)
@@ -8690,6 +8733,41 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
     return values
 
 
+def _refiner_group_guard_tolerances(group_guard_before, cfg):
+    """Resolve V14.1 training allowances without changing formal thresholds.
+
+    Nonphysical rows retain the existing configured tolerance. Physical rows
+    are dimensionless signed residuals. Active or near-threshold rows receive
+    one fixed training-resolution deadband. Far-safe rows are free inside the
+    safe half-space, while the zero cap rejects every newly exposed violation.
+    """
+    relative = {}
+    absolute = {}
+    base_relative = float(cfg.product_refiner_group_guard_relative_tolerance)
+    base_absolute = float(cfg.product_refiner_group_guard_absolute_tolerance)
+    for name, value in group_guard_before.items():
+        if ".physical." not in name:
+            relative[name] = base_relative
+            absolute[name] = base_absolute
+            continue
+        residual = float(value.detach() if torch.is_tensor(value) else value)
+        if not math.isfinite(residual):
+            raise FloatingPointError(
+                f"nonfinite normalized physical Guard residual: {name}"
+            )
+        relative[name] = 0.0
+        if residual > 0.0:
+            absolute[name] = REFINER_PHYSICAL_GUARD_DEADBAND
+        elif residual >= -REFINER_PHYSICAL_GUARD_NEAR_THRESHOLD:
+            absolute[name] = min(
+                REFINER_PHYSICAL_GUARD_DEADBAND,
+                -residual,
+            )
+        else:
+            absolute[name] = -residual
+    return relative, absolute
+
+
 
 def _refiner_total_batch_loss(model, batch, cfg):
     """The same deterministic objective for post-update trials; no resampling."""
@@ -8703,6 +8781,7 @@ def _refiner_guarded_total_batch_loss(
     cfg,
     *,
     require_all_groups=False,
+    normalized_physical=False,
 ):
     """Return scalar objective plus stable subgroup objectives for Armijo guard.
 
@@ -8714,6 +8793,7 @@ def _refiner_guarded_total_batch_loss(
     return total, _refiner_group_repair_losses(
         terms,
         require_all=require_all_groups,
+        normalized_physical=normalized_physical,
     )
 
 
@@ -9132,6 +9212,7 @@ def _observable_refiner_objective(
         penetration_allowed,
         penetration_epsilon,
         penetration_signed_margin,
+        penetration_normalized_signed_margin,
     ) = _stage_low_guard_terms_torch(
         penetration_min,
         reference_penetration_min,
@@ -9219,6 +9300,9 @@ def _observable_refiner_objective(
         ),
         "repair_foot_penetration_min_m_signed_margin": (
             penetration_signed_margin
+        ),
+        "repair_foot_penetration_min_m_normalized_signed_margin": (
+            penetration_normalized_signed_margin
         ),
         "tangent_supervision": zero, "degraded_active_product_l1": zero,
     }
@@ -9436,19 +9520,27 @@ def train_refiner(args: argparse.Namespace) -> int:
         opt.zero_grad(set_to_none=True)
         loss.backward()
         clip_norm = float(nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True))
-        group_guard_before = _refiner_group_repair_losses(loss_terms)
+        group_guard_before = _refiner_group_repair_losses(
+            loss_terms,
+            normalized_physical=True,
+        )
+        (
+            group_guard_relative_tolerance,
+            group_guard_absolute_tolerance,
+        ) = _refiner_group_guard_tolerances(group_guard_before, cfg)
         update_report = checked_refiner_step(
             opt,
             loss,
-            lambda: _refiner_guarded_total_batch_loss(model, batch, cfg),
+            lambda: _refiner_guarded_total_batch_loss(
+                model,
+                batch,
+                cfg,
+                normalized_physical=True,
+            ),
             gradient_unscale=max(1.0, clip_norm + 1.0e-6),
             group_guard_before=group_guard_before,
-            group_guard_relative_tolerance=float(
-                cfg.product_refiner_group_guard_relative_tolerance
-            ),
-            group_guard_absolute_tolerance=float(
-                cfg.product_refiner_group_guard_absolute_tolerance
-            ),
+            group_guard_relative_tolerance=group_guard_relative_tolerance,
+            group_guard_absolute_tolerance=group_guard_absolute_tolerance,
         )
         record_update(optimizer_updates, update_report)
         if logging_update:
@@ -9725,6 +9817,15 @@ def train_refiner(args: argparse.Namespace) -> int:
             ),
             "feasibility_guard_deadband": float(
                 REFINER_FEASIBILITY_GUARD_DEADBAND
+            ),
+            "physical_guard_protocol": (
+                "normalized_active_or_near_threshold_fail_closed_v14_1"
+            ),
+            "physical_guard_deadband": float(
+                REFINER_PHYSICAL_GUARD_DEADBAND
+            ),
+            "physical_guard_near_threshold": float(
+                REFINER_PHYSICAL_GUARD_NEAR_THRESHOLD
             ),
             "clean_identity_weight": float(
                 cfg.product_refiner_clean_identity_weight

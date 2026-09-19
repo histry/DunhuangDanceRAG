@@ -260,6 +260,8 @@ def _group_terms():
 
         for _, term_name in m.REFINER_PHYSICAL_GROUP_GUARD_TERMS:
             terms[f"group_{label}_{term_name}"] = torch.tensor(-value)
+        for _, term_name in m.REFINER_NORMALIZED_PHYSICAL_GROUP_GUARD_TERMS:
+            terms[f"group_{label}_{term_name}"] = torch.tensor(-value)
 
     return terms
 
@@ -309,6 +311,52 @@ def test_v14_guard_preserves_each_physical_row_independently():
     assert float(
         guards["single_short.physical.extremity_jerk_p95"]
     ) == 0.0
+
+
+def test_v14_1_guard_uses_dimensionless_signed_physical_rows():
+    terms = _group_terms()
+    terms[
+        "group_single_short_repair_joint_jerk_mps3_max_normalized_signed_margin_max"
+    ] = torch.tensor(0.25)
+
+    guards = m._refiner_group_repair_losses(
+        terms,
+        require_all=True,
+        normalized_physical=True,
+    )
+
+    assert float(
+        guards["single_short.physical.joint_jerk_max"]
+    ) == pytest.approx(0.25)
+    assert float(
+        guards["single_short.physical.extremity_jerk_p95"]
+    ) == -1.0
+
+
+def test_v14_1_physical_guard_tolerances_keep_safe_region_open_and_fail_closed():
+    cfg = m.MotionGenerationConfig()
+    guards = {
+        "single_short": torch.tensor(1.0),
+        "single_short.physical.far_safe": torch.tensor(-0.25),
+        "single_short.physical.near_safe": torch.tensor(-5.0e-4),
+        "single_short.physical.at_limit": torch.tensor(0.0),
+        "single_short.physical.active": torch.tensor(0.10),
+    }
+
+    relative, absolute = m._refiner_group_guard_tolerances(guards, cfg)
+
+    assert relative["single_short"] == pytest.approx(
+        cfg.product_refiner_group_guard_relative_tolerance
+    )
+    assert absolute["single_short"] == pytest.approx(
+        cfg.product_refiner_group_guard_absolute_tolerance
+    )
+    assert absolute["single_short.physical.far_safe"] == pytest.approx(0.25)
+    assert absolute["single_short.physical.near_safe"] == pytest.approx(5.0e-4)
+    assert absolute["single_short.physical.at_limit"] == 0.0
+    assert absolute["single_short.physical.active"] == pytest.approx(
+        m.REFINER_PHYSICAL_GUARD_DEADBAND
+    )
 
 
 def test_v15_11_guard_ignores_only_subresolution_slack():
