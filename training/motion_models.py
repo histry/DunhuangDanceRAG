@@ -110,7 +110,7 @@ from training.refiner_optimizer import checked_refiner_step, record_update, REFI
 
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 FK_TREE_SOURCE = SMPL24_SKELETON_SCHEMA
-REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v13"
+REFINER_MODEL_VERSION = "product_manifold_boundary_refiner_v14"
 REFINER_INPUT_PROTOCOL = (
     "local_frame_norm_world_fk_dynamics_condition_path_support_v5"
 )
@@ -135,7 +135,7 @@ REFINER_OBSERVABLE_ADAPTER_PROTOCOL = (
 )
 DIFFUSION_MODEL_VERSION = "reference_tangent_motion_diffusion_v4"
 REFINER_REPAIR_SAFETY_PROTOCOL = (
-    "stage_registry_exact_signed_guard_tail_support_root_v5"
+    "stage_registry_exact_signed_guard_tail_support_root_v6"
 )
 REFINER_OBSERVABLE_OBJECTIVE_PROTOCOL = (
     "gate_aligned_temporal_exact_guard_observable_v15_12f"
@@ -147,6 +147,38 @@ REFINER_CONFIDENCE_PRECONDITION_MAX = 5.0
 REFINER_TEMPORAL_SCIENTIFIC_WEIGHT = 3.0
 REFINER_COMPONENT_GUARD_DEADBAND = 1.0e-3
 REFINER_FEASIBILITY_GUARD_DEADBAND = 2.0e-3
+
+# V14 protects the physical rows that actually blocked V13 publication.  Each
+# source term is the maximum signed stage-registry residual in one role/width
+# subgroup.  ``_refiner_group_repair_losses`` applies ReLU so safe negative
+# headroom is represented by exact zero, while an existing violation remains
+# independently non-regressing under the transactional optimizer Guard.
+REFINER_PHYSICAL_GROUP_GUARD_TERMS = (
+    (
+        "joint_jerk_max",
+        "repair_joint_jerk_mps3_max_signed_margin_max",
+    ),
+    (
+        "joint_jerk_window_p95",
+        "repair_joint_jerk_window_p95_max_mps3_signed_margin_max",
+    ),
+    (
+        "extremity_jerk_p95",
+        "repair_extremity_jerk_mps3_p95_signed_margin_max",
+    ),
+    (
+        "extremity_jerk_window_p95",
+        "repair_extremity_jerk_window_p95_max_mps3_signed_margin_max",
+    ),
+    (
+        "foot_penetration",
+        "repair_foot_penetration_min_m_signed_margin_max",
+    ),
+    (
+        "foot_support_drift_p95",
+        "repair_foot_support_drift_m_p95_signed_margin_max",
+    ),
+)
 
 
 def now_tag() -> str:
@@ -6122,6 +6154,63 @@ def _summarize_validation_gates(
     }
 
 
+def _summarize_joint_boundary_closure(
+    observable_gates: Sequence[Mapping[str, Any]],
+    physical_gates: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Count same-window endpoint/temporal/physical closure.
+
+    This is deliberately separate from ``stage_repair``.  The latter measures
+    hidden-clean product-geometry improvement and is only a diagnostic.  V14
+    joint closure is inference-observable and requires all three authoritative
+    stage decisions on the same candidate window.
+    """
+
+    if len(observable_gates) != len(physical_gates):
+        raise ValueError(
+            "observable and physical joint-closure gates must have equal length"
+        )
+
+    passed = 0
+    endpoint_failed = 0
+    temporal_failed = 0
+    physical_failed = 0
+    rows = []
+
+    for observable, physical in zip(observable_gates, physical_gates):
+        endpoint = bool(observable.get("endpoint_accepted", False))
+        temporal = bool(observable.get("temporal_accepted", False))
+        physical_ok = bool(physical.get("accepted", False))
+        accepted = endpoint and temporal and physical_ok
+        passed += int(accepted)
+        endpoint_failed += int(not endpoint)
+        temporal_failed += int(not temporal)
+        physical_failed += int(not physical_ok)
+        rows.append(
+            {
+                "endpoint_accepted": endpoint,
+                "temporal_accepted": temporal,
+                "physical_non_regression_accepted": physical_ok,
+                "joint_closure_accepted": accepted,
+            }
+        )
+
+    count = len(rows)
+    return {
+        "schema": "same_window_boundary_joint_closure_v1",
+        "count": int(passed),
+        "rate": float(passed / count) if count else None,
+        "num_windows": int(count),
+        "failed_windows": int(count - passed),
+        "component_failure_counts": {
+            "endpoint": int(endpoint_failed),
+            "temporal": int(temporal_failed),
+            "physical_non_regression": int(physical_failed),
+        },
+        "rows": rows,
+    }
+
+
 def _summarize_validation_physical_metrics(
     accumulator: Mapping[str, Any],
 ) -> Dict[str, Any]:
@@ -6177,13 +6266,21 @@ def _summarize_validation_physical_metrics(
         return summarize_gate_detail(stage_repair_gates, key)
 
     observable = list(accumulator.get("observable_boundary_gates", []))
+    observable_physical = [
+        gate["physical_non_regression"] for gate in observable
+    ]
+    observable_joint = _summarize_joint_boundary_closure(
+        observable,
+        observable_physical,
+    )
     return {
         "observable_boundary": {
             "schema": BOUNDARY_PROTOCOL, "num_windows": len(observable),
             "endpoint": _summarize_validation_gates(observable, accepted_key="endpoint_accepted"),
             "temporal": _summarize_validation_gates(observable, accepted_key="temporal_accepted"),
             "physical_non_regression": _summarize_validation_gates(
-                [g["physical_non_regression"] for g in observable], accepted_key="accepted"),
+                observable_physical, accepted_key="accepted"),
+            "joint_closure": observable_joint,
             "endpoint_informative": sum(g["endpoint_informative"] for g in observable),
             "temporal_informative": sum(g["temporal_informative"] for g in observable),
             "hidden_clean_used": False,
@@ -6193,6 +6290,8 @@ def _summarize_validation_physical_metrics(
         },
         "schema": "motion_checkpoint_stage_validation_v3",
         "num_windows": len(prediction_audits),
+        "observable_joint_closure_count": observable_joint["count"],
+        "observable_joint_closure_rate": observable_joint["rate"],
         "fk_position_error_m_mean": float(np.mean(errors)) if errors.size else None,
         "fk_position_error_m_p95": float(np.percentile(errors, 95)) if errors.size else None,
         "fk_position_error_m_max": float(np.max(errors)) if errors.size else None,
@@ -6510,17 +6609,33 @@ def evaluate_cross_event_boundaries(model, db, train_db, cfg, device, *, stage="
                 safety = _fixed_support_stage_gate(before, after, cfg)
                 if not gate["reference_fidelity_accepted"]:
                     safety = {**safety,"accepted":False,"reasons":[*safety.get("reasons",[]),"cross_reference_geometry_budget_exceeded"]}
-                rows.append({"left_source": sources[index], "right_source": sources[partner],
-                             "hidden_clean_available": False, "observable": gate, "safety": safety})
+                rows.append({
+                    "left_source": sources[index],
+                    "right_source": sources[partner],
+                    "source_pair": f"{sources[index]}->{sources[partner]}",
+                    "hidden_clean_available": False,
+                    "observable": gate,
+                    "safety": safety,
+                    "joint_closure_accepted": bool(
+                        gate.get("endpoint_accepted", False)
+                        and gate.get("temporal_accepted", False)
+                        and safety.get("accepted", False)
+                    ),
+                })
                 print(json.dumps({"stage": "cross_event_validation", "model": stage,
                                   "completed": len(rows), "requested": len(indices)}), flush=True)
     finally:
         model.train(was_training)
     gates = [row["observable"] for row in rows]
+    safety_gates = [row["safety"] for row in rows]
+    joint = _summarize_joint_boundary_closure(gates, safety_gates)
     return {"schema": BOUNDARY_PROTOCOL, "num_windows": len(rows), "hidden_clean_used": False,
             "endpoint": _summarize_validation_gates(gates, accepted_key="endpoint_accepted"),
             "temporal": _summarize_validation_gates(gates, accepted_key="temporal_accepted"),
-            "physical_non_regression": _summarize_validation_gates([row["safety"] for row in rows], accepted_key="accepted"),
+            "physical_non_regression": _summarize_validation_gates(safety_gates, accepted_key="accepted"),
+            "joint_closure": joint,
+            "cross_event_joint_closure_count": joint["count"],
+            "cross_event_joint_closure_rate": joint["rate"],
             "endpoint_informative": sum(g["endpoint_informative"] for g in gates),
             "temporal_informative": sum(g["temporal_informative"] for g in gates), "windows": rows}
 
@@ -6639,6 +6754,8 @@ def _evaluate_refiner_validation(
                     clean,
                     cfg,
                 )
+                observable_row = physical["observable_boundary_gates"][-1]
+                physical_row = observable_row["physical_non_regression"]
                 window_details.append({
                     "event_index": int(idx),
                     "path": str(validation_db["paths"][idx]),
@@ -6647,7 +6764,12 @@ def _evaluate_refiner_validation(
                     "geometry": physical["stage_repair_gates"][-1],
                     "temporal": physical["temporal_repair_gates"][-1],
                     "clean_identity": physical["clean_identity_gates"][-1],
-                    "observable": physical["observable_boundary_gates"][-1],
+                    "observable": observable_row,
+                    "joint_closure_accepted": bool(
+                        observable_row.get("endpoint_accepted", False)
+                        and observable_row.get("temporal_accepted", False)
+                        and physical_row.get("accepted", False)
+                    ),
                 })
     finally:
         random.setstate(python_state)
@@ -6873,6 +6995,12 @@ def _checkpoint_validation_decision(
         "observable_endpoint_rate": observable.get("endpoint", {}).get("pass_rate"),
         "observable_temporal_rate": observable.get("temporal", {}).get("pass_rate"),
         "observable_physical_non_regression_rate": observable.get("physical_non_regression", {}).get("pass_rate"),
+        "observable_joint_closure_count": physical.get(
+            "observable_joint_closure_count"
+        ),
+        "observable_joint_closure_rate": physical.get(
+            "observable_joint_closure_rate"
+        ),
         "reference_fk_p95_m": observable.get("reference_fk_p95_m"),
         "reference_fk_max_m": observable.get("reference_fk_max_m"),
         "reference_product_log_l1": observable.get("reference_product_log_l1"),
@@ -6940,6 +7068,12 @@ def _checkpoint_validation_decision(
     if not observable.get("endpoint_informative", 0) or not observable.get("temporal_informative", 0):
         reasons.append("informative_boundary_cases_missing")
     cross = metrics.get("cross_event", {})
+    observed["cross_event_joint_closure_count"] = cross.get(
+        "cross_event_joint_closure_count"
+    )
+    observed["cross_event_joint_closure_rate"] = cross.get(
+        "cross_event_joint_closure_rate"
+    )
     if cross.get("schema") != BOUNDARY_PROTOCOL or not cross.get("num_windows", 0):
         reasons.append("cross_event_validation_missing")
     for key, threshold in (("endpoint", cfg.checkpoint_validation_min_stage_repair_rate),
@@ -7149,6 +7283,10 @@ def _refiner_validation_score(
 
     physical = metrics.get("physical_quality", {})
     observable = physical.get("observable_boundary", {})
+    observable_joint_rate = _finite_score_value(
+        physical.get("observable_joint_closure_rate"),
+        default=-1.0,
+    )
     geometry_rate = _finite_score_value(
         observable.get("endpoint", {}).get("pass_rate"),
         default=-1.0,
@@ -7157,8 +7295,25 @@ def _refiner_validation_score(
         observable.get("temporal", {}).get("pass_rate"),
         default=-1.0,
     )
-    identity_rate = _finite_score_value(
-        physical.get("clean_input_identity", {}).get("pass_rate"),
+    physical_rate = _finite_score_value(
+        observable.get("physical_non_regression", {}).get("pass_rate"),
+        default=-1.0,
+    )
+    cross = metrics.get("cross_event", {})
+    cross_joint_rate = _finite_score_value(
+        cross.get("cross_event_joint_closure_rate"),
+        default=-1.0,
+    )
+    cross_endpoint_rate = _finite_score_value(
+        cross.get("endpoint", {}).get("pass_rate"),
+        default=-1.0,
+    )
+    cross_temporal_rate = _finite_score_value(
+        cross.get("temporal", {}).get("pass_rate"),
+        default=-1.0,
+    )
+    cross_physical_rate = _finite_score_value(
+        cross.get("physical_non_regression", {}).get("pass_rate"),
         default=-1.0,
     )
     reconstruction = _finite_score_value(
@@ -7169,10 +7324,19 @@ def _refiner_validation_score(
         observable.get("reference_fk_p95_m"),
         default=float("inf"),
     )
+    closure_rates = (
+        geometry_rate,
+        temporal_rate,
+        physical_rate,
+        cross_endpoint_rate,
+        cross_temporal_rate,
+        cross_physical_rate,
+    )
     return (
         float(bool(decision.get("scientific_acceptance", False))),
-        min(geometry_rate, temporal_rate, identity_rate),
-        geometry_rate + temporal_rate + identity_rate,
+        min(observable_joint_rate, cross_joint_rate),
+        min(closure_rates),
+        sum(closure_rates),
         -reconstruction,
         -fk_p95,
     )
@@ -8407,12 +8571,13 @@ def _refiner_batch_objectives(
 def _refiner_group_repair_losses(terms, *, require_all=False):
     """Guard subgroup total, joint, endpoint and temporal objectives.
 
-    Every present role/width subgroup contributes four protected quantities:
+    Every present role/width subgroup contributes ten protected quantities:
 
       1. the complete subgroup repair objective;
       2. the joint endpoint/temporal scientific deficit;
       3. the endpoint tail risk;
       4. the temporal tail risk.
+      5-10. the six V13-blocking physical stage rows, independently.
 
     V15.8 showed that a joint sum could improve while one exact gate lost pass
     rate. Component guards preserve the two unchanged 0.03 requirements
@@ -8438,17 +8603,25 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
         )
         endpoint_key = f"group_{label}_endpoint_scientific_tail_risk"
         temporal_key = f"group_{label}_temporal_scientific_tail_risk"
+        physical_keys = {
+            guard_name: f"group_{label}_{term_name}"
+            for guard_name, term_name in REFINER_PHYSICAL_GROUP_GUARD_TERMS
+        }
 
         total_present = total_key in terms
         feasibility_present = feasibility_key in terms
         endpoint_present = endpoint_key in terms
         temporal_present = temporal_key in terms
+        physical_present = {
+            name: key in terms for name, key in physical_keys.items()
+        }
 
         if len({
             total_present,
             feasibility_present,
             endpoint_present,
             temporal_present,
+            *physical_present.values(),
         }) != 1:
             absent = []
 
@@ -8463,6 +8636,12 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
 
             if not temporal_present:
                 absent.append("temporal")
+
+            absent.extend(
+                f"physical.{name}"
+                for name, present in physical_present.items()
+                if not present
+            )
 
             raise RuntimeError(
                 f"incomplete Refiner subgroup objectives for {label}: "
@@ -8490,6 +8669,10 @@ def _refiner_group_repair_losses(terms, *, require_all=False):
             values[f"{label}.temporal"] = torch.relu(
                 terms[temporal_key] - deadband
             )
+            for guard_name, key in physical_keys.items():
+                values[f"{label}.physical.{guard_name}"] = torch.relu(
+                    terms[key]
+                )
         else:
             missing.append(label)
 

@@ -154,6 +154,92 @@ def test_refiner_best_score_prioritizes_all_gates_over_lower_error():
     assert accepted_score > rejected_score
 
 
+def _v14_validation_metrics(
+    *,
+    observable_joint,
+    cross_joint,
+    observable_rates,
+    cross_rates,
+    product_error=0.01,
+    fk_error=0.02,
+):
+    return {
+        "physical_quality": {
+            "observable_joint_closure_rate": observable_joint,
+            "observable_boundary": {
+                "endpoint": {"pass_rate": observable_rates[0]},
+                "temporal": {"pass_rate": observable_rates[1]},
+                "physical_non_regression": {
+                    "pass_rate": observable_rates[2]
+                },
+                "reference_product_log_l1": product_error,
+                "reference_fk_p95_m": fk_error,
+            },
+        },
+        "cross_event": {
+            "cross_event_joint_closure_rate": cross_joint,
+            "endpoint": {"pass_rate": cross_rates[0]},
+            "temporal": {"pass_rate": cross_rates[1]},
+            "physical_non_regression": {"pass_rate": cross_rates[2]},
+        },
+    }
+
+
+def test_v14_refiner_score_prioritizes_joint_closure_and_weakest_gate():
+    weaker_joint = _v14_validation_metrics(
+        observable_joint=0.25,
+        cross_joint=0.25,
+        observable_rates=(1.0, 1.0, 1.0),
+        cross_rates=(1.0, 1.0, 1.0),
+        product_error=0.0001,
+        fk_error=0.001,
+    )
+    stronger_joint = _v14_validation_metrics(
+        observable_joint=0.50,
+        cross_joint=0.375,
+        observable_rates=(0.75, 0.75, 0.75),
+        cross_rates=(0.75, 0.75, 0.75),
+        product_error=0.02,
+        fk_error=0.05,
+    )
+
+    assert models._refiner_validation_score(
+        stronger_joint,
+        {"scientific_acceptance": False},
+    ) > models._refiner_validation_score(
+        weaker_joint,
+        {"scientific_acceptance": False},
+    )
+
+
+def test_v14_same_window_joint_closure_is_not_marginal_pass_rate():
+    observable = [
+        {"endpoint_accepted": True, "temporal_accepted": True},
+        {"endpoint_accepted": True, "temporal_accepted": False},
+        {"endpoint_accepted": False, "temporal_accepted": True},
+        {"endpoint_accepted": True, "temporal_accepted": True},
+    ]
+    physical = [
+        {"accepted": True},
+        {"accepted": True},
+        {"accepted": True},
+        {"accepted": False},
+    ]
+
+    summary = models._summarize_joint_boundary_closure(
+        observable,
+        physical,
+    )
+
+    assert summary["count"] == 1
+    assert summary["rate"] == 0.25
+    assert summary["component_failure_counts"] == {
+        "endpoint": 1,
+        "temporal": 1,
+        "physical_non_regression": 1,
+    }
+
+
 def test_refiner_pilot_pauses_without_publishing_and_keeps_full_resume_target(tmp_path):
     train = _write_training_db(tmp_path, "pilot_train")
     val = _write_training_db(tmp_path, "pilot_val")

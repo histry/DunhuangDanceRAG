@@ -258,10 +258,13 @@ def _group_terms():
             f"group_{label}_temporal_supervision_raw"
         ] = torch.tensor(value + 0.3)
 
+        for _, term_name in m.REFINER_PHYSICAL_GROUP_GUARD_TERMS:
+            terms[f"group_{label}_{term_name}"] = torch.tensor(-value)
+
     return terms
 
 
-def test_v15_11_guard_has_sixteen_keys_and_resolution_deadbands():
+def test_v14_guard_has_joint_component_and_physical_rows():
     guards = m._refiner_group_repair_losses(
         _group_terms(),
         require_all=True,
@@ -276,15 +279,36 @@ def test_v15_11_guard_has_sixteen_keys_and_resolution_deadbands():
         )
         expected.add(f"{label}.endpoint")
         expected.add(f"{label}.temporal")
+        expected.update(
+            f"{label}.physical.{guard_name}"
+            for guard_name, _ in m.REFINER_PHYSICAL_GROUP_GUARD_TERMS
+        )
 
     assert set(guards) == expected
-    assert len(guards) == 16
+    assert len(guards) == 40
 
     assert m.REFINER_COMPONENT_GUARD_DEADBAND == 1.0e-3
     assert m.REFINER_FEASIBILITY_GUARD_DEADBAND == 2.0e-3
     assert float(guards["single_short.feasibility"]) == pytest.approx(1.098)
     assert float(guards["single_short.endpoint"]) == pytest.approx(1.199)
     assert float(guards["single_short.temporal"]) == pytest.approx(1.299)
+    assert float(guards["single_short.physical.joint_jerk_max"]) == 0.0
+
+
+def test_v14_guard_preserves_each_physical_row_independently():
+    terms = _group_terms()
+    terms[
+        "group_single_short_repair_joint_jerk_mps3_max_signed_margin_max"
+    ] = torch.tensor(2.5)
+
+    guards = m._refiner_group_repair_losses(terms, require_all=True)
+
+    assert float(
+        guards["single_short.physical.joint_jerk_max"]
+    ) == pytest.approx(2.5)
+    assert float(
+        guards["single_short.physical.extremity_jerk_p95"]
+    ) == 0.0
 
 
 def test_v15_11_guard_ignores_only_subresolution_slack():
