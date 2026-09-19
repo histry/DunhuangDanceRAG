@@ -9463,6 +9463,7 @@ def train_refiner(args: argparse.Namespace) -> int:
     stop_after = None if stop_after is None else int(stop_after)
     if stop_after is not None and not 0 < stop_after < steps:
         raise ValueError("--stop_after_steps must be between 1 and target steps - 1")
+    run_target_steps = steps if stop_after is None else stop_after
     probe_windows = int(getattr(args, "train_probe_windows", 8))
     if not 0 <= probe_windows <= 16:
         raise ValueError("--train_probe_windows must be within [0,16]")
@@ -9782,7 +9783,7 @@ def train_refiner(args: argparse.Namespace) -> int:
             _emit_training_progress(
                 "[Boundary Refiner]",
                 step,
-                steps,
+                run_target_steps,
                 training_started_at,
                 loss=loss.item(),
                 loss_after_update=update_report["loss_after"],
